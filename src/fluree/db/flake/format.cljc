@@ -1,12 +1,12 @@
 (ns fluree.db.flake.format
-  (:require [fluree.db.query.exec.select.subject :as subject]
-            [clojure.core.async :as async :refer [go]]
-            [fluree.db.query.range :as query-range]
+  (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.constants :as const]
-            [fluree.db.util.core :as util]
-            [fluree.db.json-ld.iri :as iri]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.exec.select.subject :as subject]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]))
 
 #?(:clj (set! *warn-on-reflection* true))

@@ -1,6 +1,6 @@
 (ns fluree.db.reasoner.util
-  (:require [fluree.json-ld :as json-ld]
-            [fluree.db.util.core :as util]))
+  (:require [fluree.db.util.core :as util]
+            [fluree.json-ld :as json-ld]))
 
 (defn parse-rules-graph
   [rules-graph]

@@ -1,6 +1,5 @@
 (ns user)
 
-
 ; commands to test cljs
 (comment
 
@@ -15,8 +14,8 @@
 
   (let [block-map {:start 1 :end 5}]
     (-> (flureedb/block-range-with-txn my-conn "test/chat" block-map)
-      (.then #(print %))
-      (.catch #(print (str "Error: " %)))))
+        (.then #(print %))
+        (.catch #(print (str "Error: " %)))))
 
   ; returns transaction id to be used in a query
   (-> (flureedb/new-ledger my-conn "test/subcontract")
@@ -46,26 +45,23 @@
       (.then #(print %))
       (.catch #(print (str "Error: " %))))
 
-
   (let [my-tx [{:_id "_collection"
                 :name "categories"}]]
     (-> (flureedb/transact my-conn "test/jinkies" (clj->js my-tx))
         (.then #(print %))
         (.catch #(print %))))
 
-
   (let [block-map {:start 5 :end 6}]
     (-> (flureedb/block-range-with-txn my-conn "test/chat" (clj->js block-map))
         (.then #(print %))
-        (.catch #(print (str "Error: " %)))
-        ))
+        (.catch #(print (str "Error: " %)))))
 
   (let [my-block-query {:block [5 6]}]
     (-> (flureedb/block-query my-conn "test/chat" (clj->js my-block-query))
         (.then #(print %))
         (.catch #(print "Error: " %))))
 
-  (let [my-block-query {:block [1] :pretty-print true} ]
+  (let [my-block-query {:block [1] :pretty-print true}]
     (-> (flureedb/block-query my-conn "test/chat" (clj->js my-block-query))
         (.then #(print %))
         (.catch #(print "Error: " %))))
@@ -82,11 +78,10 @@
         (.then #(print %))
         (.catch #(print "Error: " %))))
 
-
   (let [my-multi-query {"collections" {:select ["*"]
                                        :from "_collection"}
                         "persons" {:select ["*"]
-                                  :from "person"}}
+                                   :from "person"}}
         my-db          (flureedb/db my-conn "test/chat")]
     (-> (flureedb/multi-query my-db (clj->js my-multi-query))
         (.then #(print %))
@@ -117,9 +112,7 @@
   ;  (-> (flureedb/sparql my-db my-query-encoded)
   ;      (.then #(print %))
   ;      (.catch #(print "Error: " %))))
-
   )
-
 ; transactions wo/signatures
 (comment
 
@@ -131,10 +124,7 @@
         (.then #(print %))
         (.catch #(print %))))
 
-  (flureedb/close my-conn)
-
-  )
-
+  (flureedb/close my-conn))
 
 ; open-api = false
 (comment
@@ -163,8 +153,7 @@
                          (.then (fn [qry-results] (do
                                                     (print "the results are " qry-results)
                                                     qry-results)))
-                         (.catch #(print "Error" %)))
-                     ))))
+                         (.catch #(print "Error" %)))))))
         (.catch (fn [error] (print "the error is" error)))))
 
   ;; open-api = true/false; signed-query works
@@ -181,8 +170,7 @@
         (.catch #(print "Error" %))))
   (flureedb/close the-conn)
 
-
-  ;; .net using pattern - example 1
+;; .net using pattern - example 1
   (let [my-query (clj->js {:select ["*"] :from "_collection" :block 1})]
     (-> (flureedb/connect-p "http://localhost:8090")
         (.then (fn [my-conn]
@@ -256,8 +244,7 @@
                                  (print "closing the connection..." (flureedb/close my-conn))))))))
         (.catch (fn [error] (print "the error is" error)))))
 
-
-  ;; block-query - signed w/valid auth
+;; block-query - signed w/valid auth
   ;; [auth authority]= [Tf8FLEAryuQ6Y6wohBiGFRQLgWnr1QPTwvy Tf4Kj79GkbvQTgAB7yULwdc39vRZMba76u7]
   (let [my-query    (clj->js {:block 1})
         auth        "TfDRfWTgmBqGev1Hc94UvZG6QnuxB6KAXtY"
@@ -278,12 +265,11 @@
                                  (print "closing the connection..." (flureedb/close my-conn))))))))
         (.catch (fn [error] (print "the error is" error)))))
 
-
-  ;; multi-query
+;; multi-query
   (let [my-query    (clj->js {"collections" {:select ["*"]
-                                    :from "_collection"}
-                     "persons" {:select ["*"]
-                                :from "person"}})
+                                             :from "_collection"}
+                              "persons" {:select ["*"]
+                                         :from "person"}})
         auth        "TfDRfWTgmBqGev1Hc94UvZG6QnuxB6KAXtY"
         private-key "5d1a431f6eba9d5fad9ee7e8d05a3da2f8f3649d349c5566b1638946892d132d"
         my-opts     (clj->js {:private-key private-key
@@ -326,9 +312,7 @@
                                (do
                                  (print "Error" error)
                                  (print "closing the connection..." (flureedb/close my-conn))))))))
-        (.catch (fn [error] (print "the error is" error)))))
-
-  )
+        (.catch (fn [error] (print "the error is" error))))))
 
 ;; time-travel
 (comment
@@ -370,8 +354,7 @@
         (.then #(print %))
         (.catch #(print "Error: " %))))
 
-   (flureedb/close my-conn)
-  )
+  (flureedb/close my-conn))
 
 (comment
 
@@ -385,18 +368,15 @@
 
   ;; fails with #object[Error Error: cljs.core/*eval* not bound]
   (let [my-db (flureedb/db my-conn "test/password")
-        my-query {
-                  :select ["?handle", "?num"]
-                  :where [  ["?person", "person/handle", "?handle"],
-                            ["?person", "person/favNums", "?num"] ]
-                  :filter [ "(> 10 ?num)"]
-                  }]
+        my-query {:select ["?handle", "?num"]
+                  :where [["?person", "person/handle", "?handle"],
+                          ["?person", "person/favNums", "?num"]]
+                  :filter ["(> 10 ?num)"]}]
     (-> (flureedb/q my-db (clj->js my-query))
         (.then #(print "response is" %))
         (.catch #(print "Error" %))))
 
-   (flureedb/close my-conn)
-  )
+  (flureedb/close my-conn))
 
 ;password-auth
 (comment
@@ -409,12 +389,10 @@
         (.then #(print "token is" %))
         (.catch #(print "error! " %))))
 
-  (let [token "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ0ZXN0L3B3ZCIsInN1YiI6IlRmS0xvMzh2bmRucGJZOE51REVXcExDbXN2aVFFMlhQaWFlIiwiZXhwIjoxNjIyMDYxNzA3Njc2LCJpYXQiOjE1OTA1MjU3MDc2NzYsInByaSI6IjNjNjFhYzRhODU2ZmMxNjUwZGI4MmM4NWU4ZTJiZjcyNTgyMzdiYjBlZDZiN2FhZjdmZmNhMmEzYWZhNzRiYTdmNjhhOWQ3NTYzMjYwNjk0ZTQxOWVkODQxZmRiNTgzZWNhYTg4MzViNjE3YTE1MDYwNDhmODcxY2JjNjlhZTQxNTE1NDE5OTRmOGJlNzYwMGNkN2M0MmY3NWQ5YmY2NGYifQ.sUfc7EIzcbv39AFv5PZIWq4rOPlIntzBHTLAXCbLqLc"
-        ]
+  (let [token "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ0ZXN0L3B3ZCIsInN1YiI6IlRmS0xvMzh2bmRucGJZOE51REVXcExDbXN2aVFFMlhQaWFlIiwiZXhwIjoxNjIyMDYxNzA3Njc2LCJpYXQiOjE1OTA1MjU3MDc2NzYsInByaSI6IjNjNjFhYzRhODU2ZmMxNjUwZGI4MmM4NWU4ZTJiZjcyNTgyMzdiYjBlZDZiN2FhZjdmZmNhMmEzYWZhNzRiYTdmNjhhOWQ3NTYzMjYwNjk0ZTQxOWVkODQxZmRiNTgzZWNhYTg4MzViNjE3YTE1MDYwNDhmODcxY2JjNjlhZTQxNTE1NDE5OTRmOGJlNzYwMGNkN2M0MmY3NWQ5YmY2NGYifQ.sUfc7EIzcbv39AFv5PZIWq4rOPlIntzBHTLAXCbLqLc"]
     (-> (flureedb/renew-token my-conn token)
         (.then #(print "token is" %))
         (.catch #(print "error! " %))))
-
 
   (let [ledger   "test/pwd"
         user     "telly"
@@ -425,7 +403,6 @@
         (.then #(print %))
         (.catch #(print "Error: " %))))
 
-
   (let [ledger   "test/pwd"
         user     "ldw1007"
         password "fluree"
@@ -434,7 +411,6 @@
     (-> (flureedb/generate-user my-conn ledger password user auth)
         (.then #(print %))
         (.catch #(print "Error: " %))))
-
 
   (let [ledger   "test/pwd"
         user     "ldeakwilliams"
@@ -454,7 +430,6 @@
         (.then #(print %))
         (.catch #(print %))))
 
-
   (let [ledger "test/pwd"
         jwt "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ0ZXN0L3B3ZCIsInN1YiI6IlRmS0xvMzh2bmRucGJZOE51REVXcExDbXN2aVFFMlhQaWFlIiwiZXhwIjoxNjE0NzgwNjExNTQ2LCJpYXQiOjE1ODMyNDQ2MTE1NDYsInByaSI6IjNjNjFhYzRhODU2ZmMxNjUwZGI4MmM4NWU4ZTJiZjcyNTgyMzdiYjBlZDZiN2FhZjdmZmNhMmEzYWZhNzRiYTdmNjhhOWQ3NTYzMjYwNjk0ZTQxOWVkODQxZmRiNTgzZWNhYTg4MzViNjE3YTE1MDYwNDhmODcxY2JjNjlhZTQxNTE1NDE5OTRmOGJlNzYwMGNkN2M0MmY3NWQ5YmY2NGYifQ.w8W-rNJdcwWjoOlXu7u8xakxyX02G6fl2OMFRhOSIRE"
         private-key "3a9cc8be7e77db18d18eb7c98c1f4a6a850b0489675e8161ae1552437756d608"
@@ -463,7 +438,6 @@
     (-> (flureedb/signed-query my-conn ledger my-query my-opts)
         (.then #(print %))
         (.catch #(print "error: " %))))
-
 
   (def my-conn (flureedb/connect "http://localhost:8090"))
 
@@ -481,8 +455,6 @@
         payload (fluree.db.token-auth/verify-jwt secret jwt)]
     payload)
 
-  (flureedb/close my-conn)
-
-  )
+  (flureedb/close my-conn))
 
 

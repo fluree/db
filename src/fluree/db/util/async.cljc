@@ -1,8 +1,8 @@
 (ns fluree.db.util.async
   (:require
-    [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-    [clojure.core.async :as async]
-    [clojure.core.async.impl.protocols :as async-protocols])
+   [clojure.core.async :as async]
+   [clojure.core.async.impl.protocols :as async-protocols]
+   [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]])
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -32,8 +32,8 @@
      "Like <! but throws errors."
      [ch]
      `(if-cljs
-        (throw-err (cljs.core.async/<! ~ch))
-        (throw-err (clojure.core.async/<! ~ch)))))
+       (throw-err (cljs.core.async/<! ~ch))
+       (throw-err (clojure.core.async/<! ~ch)))))
 
 #?(:clj
    (defmacro <??
@@ -53,14 +53,14 @@
      "Like go but catches the first thrown error and puts it on the returned channel."
      [& body]
      `(if-cljs
-        (cljs.core.async/go
-          (try
-            ~@body
-            (catch js/Error e# e#)))
-        (clojure.core.async/go
-          (try
-            ~@body
-            (catch Throwable t# t#))))))
+       (cljs.core.async/go
+         (try
+           ~@body
+           (catch js/Error e# e#)))
+       (clojure.core.async/go
+         (try
+           ~@body
+           (catch Throwable t# t#))))))
 
 (defn throw-if-exception
   "Helper method that checks if x is Exception and if yes, wraps it in a new
@@ -86,7 +86,7 @@
           acc
           (recur r (conj acc (<? c)))))
       (catch* e
-              e))))
+        e))))
 
 (defn into?
   "Like async/into, but checks each item for an error response and returns exception
@@ -99,7 +99,7 @@
           (recur (conj acc v))
           acc))
       (catch* e
-              e))))
+        e))))
 
 (defn channel?
   "Returns true if core async channel."

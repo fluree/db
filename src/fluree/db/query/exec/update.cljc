@@ -1,12 +1,10 @@
 (ns fluree.db.query.exec.update
-  (:require [fluree.db.flake :as flake]
+  (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.iri :as iri]
             [fluree.db.datatype :as datatype]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.util.log :as log]
-            [clojure.core.async :as async]))
+            [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.exec.where :as where]))
 
 (defn assign-clause
   [clause solution]
@@ -69,7 +67,7 @@
     (flake/create sid pid oid dt t true m)))
 
 (defn create-scalar-flake
-  [db-vol p-iri sid pid o-mch t m]
+  [db-vol _p-iri sid pid o-mch t m]
   (let [v  (where/get-value o-mch)
         dt (or (some-> o-mch
                        where/get-datatype-iri

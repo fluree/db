@@ -1,10 +1,10 @@
 (ns fluree.db.storage.ipfs
-  (:require [fluree.db.method.ipfs.xhttp :as ipfs]
+  (:require [clojure.string :as str]
+            [fluree.db.method.ipfs.xhttp :as ipfs]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.json :as json]
-            [fluree.json-ld :as json-ld]
-            [clojure.string :as str]))
+            [fluree.json-ld :as json-ld]))
 
 (def method-name "ipfs")
 
@@ -45,9 +45,9 @@
             {:keys [hash size] :as res} (<? (ipfs/add endpoint path content))]
         (when-not size
           (throw
-            (ex-info
-              "IPFS publish error, unable to retrieve IPFS name."
-              {:status 500 :error :db/push-ipfs :result res})))
+           (ex-info
+            "IPFS publish error, unable to retrieve IPFS name."
+            {:status 500 :error :db/push-ipfs :result res})))
         {:path    hash
          :hash    hash
          :address (ipfs-address identifier hash)

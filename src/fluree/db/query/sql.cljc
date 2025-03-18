@@ -1,10 +1,10 @@
 (ns fluree.db.query.sql
-  (:require [fluree.db.query.sql.template :as template]
-            [clojure.string :as str]
-            #?(:clj  [clojure.java.io :as io]
+  (:require #?(:clj  [clojure.java.io :as io]
                :cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
-            #?(:clj  [instaparse.core :as insta :refer [defparser]]
-               :cljs [instaparse.core :as insta :refer-macros [defparser]])))
+            #?(:clj  [instaparse.core :as insta]
+               :cljs [instaparse.core :as insta :refer-macros [defparser]])
+            [clojure.string :as str]
+            [fluree.db.query.sql.template :as template]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -40,7 +40,6 @@
     :intersect :is :join :left :limit :local :natural :not :null :nullif :on
     :or :offset :order-by :right :select :some :table :then :trim :true :unique
     :unknown :using :values :when :where})
-
 
 (def rules
   "Hierarchy of SQL BNF rule name keywords for parsing equivalence"
@@ -99,11 +98,9 @@
     (constantly v)
     (constantly [v])))
 
-
 (defmethod rule-parser :default
   [[_ & rst]]
   (->> rst parse-all bounce))
-
 
 (defmethod rule-parser ::reserved
   [[_ & words]]
@@ -114,7 +111,6 @@
        str/upper-case
        bounce))
 
-
 (defmethod rule-parser :unsigned-integer
   [[_ & rst]]
   (->> rst
@@ -124,11 +120,9 @@
           :cljs js/Number.parseInt)
        bounce))
 
-
 (defmethod rule-parser :double-quote
   [_]
   (bounce \"))
-
 
 (defmethod rule-parser ::string
   [[_ & rst]]
@@ -138,7 +132,6 @@
        (apply str)
        bounce))
 
-
 (defmethod rule-parser :qualifier
   [[_ q]]
   (-> q
@@ -147,7 +140,6 @@
       ::coll
       bounce))
 
-
 (defmethod rule-parser :subject-placeholder
   [[_ _ & rst]]
   (bounce {::obj (->> rst
@@ -155,11 +147,9 @@
                       (apply str)
                       (template/combine-str template/collection-var))}))
 
-
 (defmethod rule-parser :unsigned-value-specification
   [[_ v]]
   (bounce {::obj (-> v parse-element first)}))
-
 
 (defmethod rule-parser :column-reference
   [[_ & rst]]
@@ -180,23 +170,19 @@
       coll (template/fill-in-collection coll)
       true bounce)))
 
-
 (defmethod rule-parser :set-quantifier
   [[_ q]]
   (let [quantifier (-> q parse-element first)
         k          (if (= quantifier "DISTINCT") :selectDistinct :select)]
     (bounce k)))
 
-
 (defmethod rule-parser :asterisk
   [_]
   (bounce {::select {template/collection-var ["*"]}}))
 
-
 (defmethod rule-parser :set-function-type
   [[_ t]]
   (-> t rule-tag name bounce))
-
 
 (defmethod rule-parser :general-set-function
   [[_ & rst]]
@@ -219,7 +205,6 @@
       true      (-> (update ::obj (partial template/build-fn-call func))
                     bounce))))
 
-
 (defmethod rule-parser :select-list-element
   [[_ & rst]]
   (let [parse-map                (parse-into-map rst)
@@ -231,14 +216,12 @@
       (template/predicate? pred) (assoc ::where [triple])
       true                       bounce)))
 
-
 (defmethod rule-parser :select-list
   [[_ & rst]]
   (->> rst
        parse-all
        (apply merge-parsed)
        bounce))
-
 
 (defmethod rule-parser :between-predicate
   [[_ & rst]]
@@ -257,12 +240,11 @@
                                (template/build-fn-call ["<=" field-var upper])]})]
     (bounce [selector refinement])))
 
-
 (defmethod rule-parser :comparison-predicate
   [[_ & rst]]
   (let [parse-map    (parse-into-map rst)
         comp         (-> parse-map :comp-op first)
-        [left right] ( :row-value-constructor parse-map)]
+        [left right] (:row-value-constructor parse-map)]
     (bounce (cond
               (#{\=} comp) (cond
                              (or (::obj left)
@@ -284,7 +266,6 @@
                                                       [[template/collection-var pred field-var]
                                                        {:filter [filter-fn]}]))))))
 
-
 (defmethod rule-parser :in-predicate
   [[_ & rst]]
   (let [parse-map      (parse-into-map rst)
@@ -303,7 +284,6 @@
         filter-func    (str "(" filter-junc " " filter-clauses ")")]
     (bounce [selector {:filter filter-func}])))
 
-
 (defmethod rule-parser :null-predicate
   [[_ & rst]]
   (let [parsed    (parse-all rst)
@@ -315,7 +295,6 @@
                {:optional [[template/collection-var pred field-var]]}
                {:filter [(template/build-fn-call ["nil?" field-var])]}]))))
 
-
 (defmethod rule-parser :boolean-term
   [[_ & rst]]
   (->> rst
@@ -323,7 +302,6 @@
                  (not= :and (rule-tag r))))
        parse-all
        bounce))
-
 
 (defmethod rule-parser :search-condition
   [[_ & rst]]
@@ -335,14 +313,12 @@
                          (->> back rest vec)]}))
       (bounce parsed))))
 
-
 (defmethod rule-parser :table-name
   [[_ & rst]]
   (let [parsed-name (->> rst
                          parse-all
                          (apply str))]
     (bounce {::coll [parsed-name]})))
-
 
 (defmethod rule-parser :from-clause
   [[_ _ & rst]]
@@ -355,14 +331,12 @@
   [[_ _ & rst]]
   (bounce {::where (->> rst parse-all vec)}))
 
-
 (defmethod rule-parser :group-by-clause
   [[_ _ & rst]]
   (->> rst
        parse-all
        (map (comp template/build-var ::pred))
        bounce))
-
 
 (defmethod rule-parser :table-expression
   [[_ & rst]]
@@ -376,7 +350,6 @@
         (assoc ::group grouping)
         (->> (template/fill-in-collection from))
         bounce)))
-
 
 (defmethod rule-parser :query-specification
   [[_ _ & rst]]
@@ -397,11 +370,9 @@
       (seq group) (assoc :opts {:groupBy group})
       true        bounce)))
 
-
 (defmethod rule-parser :join-condition
   [[_ _ & rst]]
   (bounce {::where (->> rst parse-all vec)}))
-
 
 (defmethod rule-parser :outer-join-type
   [[_ t]]
@@ -410,19 +381,16 @@
             "RIGHT" ::right
             "FULL"  ::full)))
 
-
 (defmethod rule-parser :join-type
-  [[_ t & rst]]
+  [[_ t & _rst]]
   (bounce (case t
             "INNER" ::inner
             "UNION" ::union
             (parse-element t)))) ; `:outer-join-type` case
 
-
 (defmethod rule-parser :named-columns-join
   [[_ _ & rst]]
   (->> rst parse-all bounce))
-
 
 (defmethod rule-parser :qualified-join
   [[_ & rst]]
@@ -442,7 +410,6 @@
     (bounce (case join-type
               ::inner join-ref))))
 
-
 (defmethod rule-parser :sort-specification
   [[_ & rst]]
   (let [parse-map (parse-into-map rst)
@@ -453,7 +420,6 @@
     (if-let [order (some->> parse-map :ordering-specification first)]
       (bounce [[order pred]])
       (bounce pred))))
-
 
 (defmethod rule-parser :order-by-clause
   [[_ _ & rst]]
@@ -482,7 +448,6 @@
       limit    (assoc-in [:opts :limit] limit)
       offset   (assoc-in [:opts :offset] offset)
       true     bounce)))
-
 
 (defn parse
   [q]

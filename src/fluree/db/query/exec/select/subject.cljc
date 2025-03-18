@@ -1,8 +1,8 @@
 (ns fluree.db.query.exec.select.subject
-  (:require [fluree.db.util.async :refer [<?]]
-            [clojure.core.async :as async :refer [<! >! go]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+  (:require [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.constants :as const]
+            [fluree.db.util.async :refer [<?]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -41,8 +41,8 @@
                      node)]
          (not-empty node*))
        (catch* e
-               (log/error e "Error appending subject iri")
-               (>! error-ch e))))))
+         (log/error e "Error appending subject iri")
+         (>! error-ch e))))))
 
 (defn encode-reference
   [iri spec]

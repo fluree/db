@@ -1,14 +1,14 @@
 (ns fluree.db.json-ld.branch
-  (:require [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.indexer :as indexer]
-            [fluree.json-ld :as json-ld]
+  (:require [clojure.core.async :as async :refer [go <! go-loop]]
             [fluree.db.async-db :as async-db]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.indexer :as indexer]
+            [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<?]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [clojure.core.async :as async :refer [go <! go-loop]]
-            [fluree.db.nameservice :as nameservice]))
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -111,7 +111,7 @@
     (let [updated-db (or (use-latest-db db idx-commit branch-state)
                          (try* (dbproto/-index-update db (:index idx-commit))
                                (catch* e (log/error e "Exception updating db with new index, attempting full reload. Exception:" (ex-message e))
-                                 (reload-with-index db alias branch (:index idx-commit)))))]
+                                       (reload-with-index db alias branch (:index idx-commit)))))]
       updated-db)
     db))
 

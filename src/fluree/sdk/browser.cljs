@@ -24,7 +24,6 @@
   (fluree/connect (js->clj opts :keywordize-keys false)))
 
 (defn ^:export create
-  ([conn] (fluree/create conn))
   ([conn ledger-alias] (fluree/create conn ledger-alias))
   ([conn ledger-alias opts] (fluree/create conn ledger-alias (js->clj opts :keywordize-keys true))))
 
@@ -54,8 +53,8 @@
   ([ledger branch] (clj->js (fluree/status ledger branch))))
 
 (defn ^:export db
-  ([ledger] (fluree/db ledger))
-  ([ledger opts] (fluree/db ledger (js->clj opts :keywordize-keys true))))
+  [ledger]
+  (fluree/db ledger))
 
 (defn ^:export query
   [db query]

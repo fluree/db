@@ -1,10 +1,10 @@
 (ns fluree.db.util.filesystem
   (:refer-clojure :exclude [exists?])
-  (:require [fluree.db.util.log :as log]
-            #?(:clj [clojure.java.io :as io])
+  (:require #?(:clj [clojure.java.io :as io])
             #?@(:cljs [["fs" :as fs]
                        ["path" :as path]])
-            [clojure.core.async :as async])
+            [clojure.core.async :as async]
+            [fluree.db.util.log :as log])
   #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -24,7 +24,7 @@
                (.write out val))
              (catch Exception e
                (log/error e "Unable to create storage directory:" path ".")
-               (log/error (str "Fatal Error, shutting down!"))
+               (log/error "Fatal Error, shutting down!")
                (System/exit 1))))
          (catch Exception e (throw e))))
      :cljs
@@ -47,7 +47,7 @@
                    (js/process.exit 1)))
                (catch :default e
                  (log/error e "Unable to create storage directory:" path ".")
-                 (log/error (str "Fatal Error, shutting down!"))
+                 (log/error "Fatal Error, shutting down!")
                  (js/process.exit 1)))
              (throw (ex-info "Error writing file."
                              {"errno"   ^String (.-errno e)
@@ -122,7 +122,6 @@
   [path]
   #?(:clj  (async/thread (->> path io/file .exists))
      :cljs (async/go (fs/existsSync path))))
-
 
 (defn local-path
   "Gives absolute full local path if input path is not already absolute."

@@ -1,8 +1,8 @@
 (ns fluree.db.query.history-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.crypto :as crypto]
-            [fluree.db.did :as did]
             [fluree.db.api :as fluree]
+            [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
@@ -11,63 +11,63 @@
 (deftest ^:integration history-query-test
   (let [ts-primeval (util/current-time-iso)
 
-        conn        (test-utils/create-conn)
-        ledger-id   "historytest"
-        context     [test-utils/default-context {:ex "http://example.org/ns/"}]
+        conn      (test-utils/create-conn)
+        ledger-id "historytest"
+        context   [test-utils/default-context {:ex "http://example.org/ns/"}]
 
-        db1         @(fluree/create-with-txn conn {"@context" context
-                                                   "ledger"   ledger-id
-                                                   "insert"   [{:id   :ex/dan
-                                                                :ex/x "foo-1"
-                                                                :ex/y "bar-1"}
-                                                               {:id   :ex/cat
-                                                                :ex/x "foo-1"
-                                                                :ex/y "bar-1"}
-                                                               {:id   :ex/dog
-                                                                :ex/x "foo-1"
-                                                                :ex/y "bar-1"}]})
-        db2         @(fluree/transact! conn {"@context" context
-                                             "ledger"   ledger-id
-                                             "delete"   {:id   :ex/dan
+        _db1 @(fluree/create-with-txn conn {"@context" context
+                                            "ledger"   ledger-id
+                                            "insert"   [{:id   :ex/dan
                                                          :ex/x "foo-1"
                                                          :ex/y "bar-1"}
-                                             "insert"   {:id   :ex/dan
-                                                         :ex/x "foo-2"
-                                                         :ex/y "bar-2"}})
-        ts2         (-> db2 :commit :time)
-        db3         @(fluree/transact! conn {"@context" context
-                                             "ledger"   ledger-id
-                                             "delete"   {:id   :ex/dan
-                                                         :ex/x "foo-2"
-                                                         :ex/y "bar-2"}
-                                             "insert"   {:id   :ex/dan
-                                                         :ex/x "foo-3"
-                                                         :ex/y "bar-3"}})
+                                                        {:id   :ex/cat
+                                                         :ex/x "foo-1"
+                                                         :ex/y "bar-1"}
+                                                        {:id   :ex/dog
+                                                         :ex/x "foo-1"
+                                                         :ex/y "bar-1"}]})
+        db2  @(fluree/transact! conn {"@context" context
+                                      "ledger"   ledger-id
+                                      "delete"   {:id   :ex/dan
+                                                  :ex/x "foo-1"
+                                                  :ex/y "bar-1"}
+                                      "insert"   {:id   :ex/dan
+                                                  :ex/x "foo-2"
+                                                  :ex/y "bar-2"}})
+        ts2  (-> db2 :commit :time)
+        db3  @(fluree/transact! conn {"@context" context
+                                      "ledger"   ledger-id
+                                      "delete"   {:id   :ex/dan
+                                                  :ex/x "foo-2"
+                                                  :ex/y "bar-2"}
+                                      "insert"   {:id   :ex/dan
+                                                  :ex/x "foo-3"
+                                                  :ex/y "bar-3"}})
 
-        ts3         (-> db3 :commit :time)
-        db4         @(fluree/transact! conn {"@context" context
-                                             "ledger"   ledger-id
-                                             "delete"   [{:id   :ex/cat
-                                                          :ex/x "foo-1"
-                                                          :ex/y "bar-1"}
-                                                         {:id   :ex/dog
-                                                          :ex/x "foo-1"
-                                                          :ex/y "bar-1"}]
-                                             "insert"   [{:id   :ex/cat
-                                                          :ex/x "foo-cat"
-                                                          :ex/y "bar-cat"}
-                                                         {:id   :ex/dog
-                                                          :ex/x "foo-dog"
-                                                          :ex/y "bar-dog"}]})
-        db5         @(fluree/transact! conn {"@context" context
-                                             "ledger"   ledger-id
-                                             "delete"   {:id   :ex/dan
-                                                         :ex/x "foo-3"
-                                                         :ex/y "bar-3"}
-                                             "insert"   {:id   :ex/dan
-                                                         :ex/x "foo-cat"
-                                                         :ex/y "bar-cat"}})
-        ledger      @(fluree/load conn ledger-id)]
+        ts3    (-> db3 :commit :time)
+        _db4   @(fluree/transact! conn {"@context" context
+                                        "ledger"   ledger-id
+                                        "delete"   [{:id   :ex/cat
+                                                     :ex/x "foo-1"
+                                                     :ex/y "bar-1"}
+                                                    {:id   :ex/dog
+                                                     :ex/x "foo-1"
+                                                     :ex/y "bar-1"}]
+                                        "insert"   [{:id   :ex/cat
+                                                     :ex/x "foo-cat"
+                                                     :ex/y "bar-cat"}
+                                                    {:id   :ex/dog
+                                                     :ex/x "foo-dog"
+                                                     :ex/y "bar-dog"}]})
+        _db5   @(fluree/transact! conn {"@context" context
+                                        "ledger"   ledger-id
+                                        "delete"   {:id   :ex/dan
+                                                    :ex/x "foo-3"
+                                                    :ex/y "bar-3"}
+                                        "insert"   {:id   :ex/dan
+                                                    :ex/x "foo-cat"
+                                                    :ex/y "bar-cat"}})
+        ledger @(fluree/load conn ledger-id)]
     (testing "subject history"
       (is (= [{:f/t       1
                :f/assert  [{:id :ex/dan :ex/x "foo-1" :ex/y "bar-1"}]
@@ -243,20 +243,20 @@
             ledger-id "historycachetest"
             context   [test-utils/default-context {:ex "http://example.org/ns/"}]
 
-            db1       @(fluree/create-with-txn conn {"@context" context
-                                                     "ledger"   ledger-id
-                                                     "insert"   [{:id   :ex/dan
-                                                                  :ex/x "foo-1"
-                                                                  :ex/y "bar-1"}]})
-            db2       @(fluree/transact! conn {"@context" context
-                                               "ledger"   ledger-id
-                                               "delete"   {:id   :ex/dan
-                                                           :ex/x "foo-1"
-                                                           :ex/y "bar-1"}
-                                               "insert"   {:id   :ex/dan
-                                                           :ex/x "foo-2"
-                                                           :ex/y "bar-2"}})
-            ledger    @(fluree/load conn ledger-id)]
+            _db1   @(fluree/create-with-txn conn {"@context" context
+                                                  "ledger"   ledger-id
+                                                  "insert"   [{:id   :ex/dan
+                                                               :ex/x "foo-1"
+                                                               :ex/y "bar-1"}]})
+            _db2   @(fluree/transact! conn {"@context" context
+                                            "ledger"   ledger-id
+                                            "delete"   {:id   :ex/dan
+                                                        :ex/x "foo-1"
+                                                        :ex/y "bar-1"}
+                                            "insert"   {:id   :ex/dan
+                                                        :ex/x "foo-2"
+                                                        :ex/y "bar-2"}})
+            ledger @(fluree/load conn ledger-id)]
 
         (testing "no t-range cache collision"
           (is (= [{:f/t       2
@@ -272,33 +272,33 @@
           ledger-id "committest"
           context   [test-utils/default-context {:ex "http://example.org/ns/"}]
 
-          db1       @(fluree/create-with-txn conn {"@context" context
-                                                   "ledger"   ledger-id
-                                                   "insert"   {:id   :ex/alice
-                                                               :ex/x "foo-1"
-                                                               :ex/y "bar-1"}})
-          db2       @(fluree/transact! conn {"@context" context
-                                             "ledger"   ledger-id
-                                             "insert"   {:id   :ex/alice
-                                                         :ex/x "foo-2"
-                                                         :ex/y "bar-2"}})
-          db3       @(fluree/transact! conn {"@context" context
-                                             "ledger"   ledger-id
-                                             "insert"   {:id   :ex/alice
-                                                         :ex/x "foo-3"
-                                                         :ex/y "bar-3"}})
-          db4       @(fluree/transact! conn {"@context" context
-                                             "ledger"   ledger-id
-                                             "insert"   {:id   :ex/cat
-                                                         :ex/x "foo-cat"
-                                                         :ex/y "bar-cat"}})
-          db5       @(fluree/transact! conn {"@context" context
-                                             "ledger"   ledger-id
-                                             "insert"   {:id   :ex/alice
-                                                         :ex/x "foo-cat"
-                                                         :ex/y "bar-cat"}}
-                                       {:message "meow"})
-          ledger    @(fluree/load conn ledger-id)]
+          _db1   @(fluree/create-with-txn conn {"@context" context
+                                                "ledger"   ledger-id
+                                                "insert"   {:id   :ex/alice
+                                                            :ex/x "foo-1"
+                                                            :ex/y "bar-1"}})
+          _db2   @(fluree/transact! conn {"@context" context
+                                          "ledger"   ledger-id
+                                          "insert"   {:id   :ex/alice
+                                                      :ex/x "foo-2"
+                                                      :ex/y "bar-2"}})
+          _db3   @(fluree/transact! conn {"@context" context
+                                          "ledger"   ledger-id
+                                          "insert"   {:id   :ex/alice
+                                                      :ex/x "foo-3"
+                                                      :ex/y "bar-3"}})
+          _db4   @(fluree/transact! conn {"@context" context
+                                          "ledger"   ledger-id
+                                          "insert"   {:id   :ex/cat
+                                                      :ex/x "foo-cat"
+                                                      :ex/y "bar-cat"}})
+          _db5   @(fluree/transact! conn {"@context" context
+                                          "ledger"   ledger-id
+                                          "insert"   {:id   :ex/alice
+                                                      :ex/x "foo-cat"
+                                                      :ex/y "bar-cat"}}
+                                    {:message "meow"})
+          ledger @(fluree/load conn ledger-id)]
 
       (testing "at time t"
         (is (pred-match?
@@ -309,15 +309,15 @@
                           :f/branch  "main"
                           :f/previous
                           {:id test-utils/commit-id?}
-                          :f/data    {:f/address  test-utils/address?
-                                      :f/assert   [{:ex/x "foo-1"
-                                                    :ex/y "bar-1"
-                                                    :id   :ex/alice}]
-                                      :f/flakes   2
-                                      :f/retract  []
-                                      :f/size     pos-int?
-                                      :f/t        1
-                                      :id         test-utils/db-id?}
+                          :f/data    {:f/address test-utils/address?
+                                      :f/assert  [{:ex/x "foo-1"
+                                                   :ex/y "bar-1"
+                                                   :id   :ex/alice}]
+                                      :f/flakes  2
+                                      :f/retract []
+                                      :f/size    pos-int?
+                                      :f/t       1
+                                      :id        test-utils/db-id?}
                           :f/time    720000
                           :f/v       1
                           :id        test-utils/commit-id?}}]
@@ -328,17 +328,17 @@
                                    :f/address                                   test-utils/address?
                                    :f/alias                                     "committest"
                                    :f/branch                                    "main"
-                                   :f/data                                      {:f/address  test-utils/address?
-                                                                                 :f/assert   [{:ex/x "foo-cat"
-                                                                                               :ex/y "bar-cat"
-                                                                                               :id   :ex/alice}]
-                                                                                 :f/flakes   58
-                                                                                 :f/retract  [#_{:ex/x "foo-3"
-                                                                                                 :ex/y "bar-3"
-                                                                                                 :id   :ex/alice}]
-                                                                                 :f/size     pos-int?
-                                                                                 :f/t        5
-                                                                                 :id         test-utils/db-id?}
+                                   :f/data                                      {:f/address test-utils/address?
+                                                                                 :f/assert  [{:ex/x "foo-cat"
+                                                                                              :ex/y "bar-cat"
+                                                                                              :id   :ex/alice}]
+                                                                                 :f/flakes  58
+                                                                                 :f/retract [#_{:ex/x "foo-3"
+                                                                                                :ex/y "bar-3"
+                                                                                                :id   :ex/alice}]
+                                                                                 :f/size    pos-int?
+                                                                                 :f/t       5
+                                                                                 :id        test-utils/db-id?}
                                    :f/message                                   "meow"
                                    :f/previous                                  {:id test-utils/commit-id?}
                                    :f/time                                      720000
@@ -349,15 +349,15 @@
                                    :f/address  test-utils/address?
                                    :f/alias    "committest"
                                    :f/branch   "main"
-                                   :f/data     {:f/address  test-utils/address?
-                                                :f/assert   [{:ex/x "foo-cat"
-                                                              :ex/y "bar-cat"
-                                                              :id   :ex/cat}]
-                                                :f/flakes   44
-                                                :f/retract  []
-                                                :f/size     pos-int?
-                                                :f/t        4
-                                                :id         test-utils/db-id?}
+                                   :f/data     {:f/address test-utils/address?
+                                                :f/assert  [{:ex/x "foo-cat"
+                                                             :ex/y "bar-cat"
+                                                             :id   :ex/cat}]
+                                                :f/flakes  44
+                                                :f/retract []
+                                                :f/size    pos-int?
+                                                :f/t       4
+                                                :id        test-utils/db-id?}
                                    :f/previous {:id test-utils/commit-id?}
                                    :f/time     720000
                                    :f/v        1
@@ -387,15 +387,15 @@
                              :f/address  test-utils/address?
                              :f/alias    "committest"
                              :f/branch   "main"
-                             :f/data     {:f/address  test-utils/address?
-                                          :f/assert   [{:ex/x "foo-cat"
-                                                        :ex/y "bar-cat"
-                                                        :id   :ex/cat}]
-                                          :f/flakes   44
-                                          :f/retract  []
-                                          :f/size     pos-int?
-                                          :f/t        4
-                                          :id         test-utils/db-id?}
+                             :f/data     {:f/address test-utils/address?
+                                          :f/assert  [{:ex/x "foo-cat"
+                                                       :ex/y "bar-cat"
+                                                       :id   :ex/cat}]
+                                          :f/flakes  44
+                                          :f/retract []
+                                          :f/size    pos-int?
+                                          :f/t       4
+                                          :id        test-utils/db-id?}
                              :f/previous {:id test-utils/commit-id?}
                              :f/time     720000
                              :f/v        1
@@ -407,17 +407,17 @@
                            :f/address  test-utils/address?
                            :f/alias    "committest"
                            :f/branch   "main"
-                           :f/data     {:f/address  test-utils/address?
-                                        :f/assert   [{:ex/x "foo-3"
-                                                      :ex/y "bar-3"
-                                                      :id   :ex/alice}]
-                                        :f/flakes   30
-                                        :f/retract  [{:ex/x "foo-2"
-                                                      :ex/y "bar-2"
-                                                      :id   :ex/alice}]
-                                        :f/size     pos-int?
-                                        :f/t        3
-                                        :id         test-utils/db-id?}
+                           :f/data     {:f/address test-utils/address?
+                                        :f/assert  [{:ex/x "foo-3"
+                                                     :ex/y "bar-3"
+                                                     :id   :ex/alice}]
+                                        :f/flakes  30
+                                        :f/retract [{:ex/x "foo-2"
+                                                     :ex/y "bar-2"
+                                                     :id   :ex/alice}]
+                                        :f/size    pos-int?
+                                        :f/t       3
+                                        :id        test-utils/db-id?}
                            :f/previous {:id test-utils/commit-id?}
                            :f/time     720000
                            :f/v        1
@@ -429,17 +429,17 @@
                            :f/address  test-utils/address?
                            :f/alias    "committest"
                            :f/branch   "main"
-                           :f/data     {:f/address  test-utils/address?
-                                        :f/assert   [{:ex/x "foo-2"
-                                                      :ex/y "bar-2"
-                                                      :id   :ex/alice}]
-                                        :f/flakes   16
-                                        :f/retract  [{:ex/x "foo-1"
-                                                      :ex/y "bar-1"
-                                                      :id   :ex/alice}]
-                                        :f/size     pos-int?
-                                        :f/t        2
-                                        :id         test-utils/db-id?}
+                           :f/data     {:f/address test-utils/address?
+                                        :f/assert  [{:ex/x "foo-2"
+                                                     :ex/y "bar-2"
+                                                     :id   :ex/alice}]
+                                        :f/flakes  16
+                                        :f/retract [{:ex/x "foo-1"
+                                                     :ex/y "bar-1"
+                                                     :id   :ex/alice}]
+                                        :f/size    pos-int?
+                                        :f/t       2
+                                        :id        test-utils/db-id?}
                            :f/previous {:id test-utils/commit-id?}
                            :f/time     720000
                            :f/v        1
@@ -501,15 +501,15 @@
                           :f/alias    "committest"
                           :f/branch   "main"
                           :f/previous {:id test-utils/commit-id?}
-                          :f/data     {:f/address  test-utils/address?
-                                       :f/assert   [{:ex/x "foo-1"
-                                                     :ex/y "bar-1"
-                                                     :id   :ex/alice}]
-                                       :f/flakes   2
-                                       :f/retract  []
-                                       :f/size     pos-int?
-                                       :f/t        1
-                                       :id         test-utils/db-id?}
+                          :f/data     {:f/address test-utils/address?
+                                       :f/assert  [{:ex/x "foo-1"
+                                                    :ex/y "bar-1"
+                                                    :id   :ex/alice}]
+                                       :f/flakes  2
+                                       :f/retract []
+                                       :f/size    pos-int?
+                                       :f/t       1
+                                       :id        test-utils/db-id?}
                           :f/time     720000
                           :f/v        1
                           :id         test-utils/commit-id?}}]
@@ -527,17 +527,17 @@
                             :f/address  test-utils/address?
                             :f/alias    "committest"
                             :f/branch   "main"
-                            :f/data     {:f/address  test-utils/address?
-                                         :f/assert   [{:ex/x "foo-3"
-                                                       :ex/y "bar-3"
-                                                       :id   :ex/alice}]
-                                         :f/flakes   30
-                                         :f/retract  [{:ex/x "foo-2"
-                                                       :ex/y "bar-2"
-                                                       :id   :ex/alice}]
-                                         :f/size     pos-int?
-                                         :f/t        3
-                                         :id         test-utils/db-id?}
+                            :f/data     {:f/address test-utils/address?
+                                         :f/assert  [{:ex/x "foo-3"
+                                                      :ex/y "bar-3"
+                                                      :id   :ex/alice}]
+                                         :f/flakes  30
+                                         :f/retract [{:ex/x "foo-2"
+                                                      :ex/y "bar-2"
+                                                      :id   :ex/alice}]
+                                         :f/size    pos-int?
+                                         :f/t       3
+                                         :id        test-utils/db-id?}
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
                             :f/v        1
@@ -554,17 +554,17 @@
                             :f/address  test-utils/address?
                             :f/alias    "committest"
                             :f/branch   "main"
-                            :f/data     {:f/address  test-utils/address?
-                                         :f/assert   [{:ex/x "foo-cat"
-                                                       :ex/y "bar-cat"
-                                                       :id   :ex/alice}]
-                                         :f/flakes   58
-                                         :f/retract  [{:ex/x "foo-3"
-                                                       :ex/y "bar-3"
-                                                       :id   :ex/alice}]
-                                         :f/size     pos-int?
-                                         :f/t        5
-                                         :id         test-utils/db-id?}
+                            :f/data     {:f/address test-utils/address?
+                                         :f/assert  [{:ex/x "foo-cat"
+                                                      :ex/y "bar-cat"
+                                                      :id   :ex/alice}]
+                                         :f/flakes  58
+                                         :f/retract [{:ex/x "foo-3"
+                                                      :ex/y "bar-3"
+                                                      :id   :ex/alice}]
+                                         :f/size    pos-int?
+                                         :f/t       5
+                                         :id        test-utils/db-id?}
                             :f/message  "meow"
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
@@ -638,63 +638,63 @@
             loaded-ledger (test-utils/retry-load conn ledger-name 100)]
 
         (is (pred-match?
-              [#:f{:assert  [{:ex/x "foo-3"
-                              :ex/y "bar-3"
-                              :id   :ex/alice}]
-                   :commit  {:f/address  test-utils/address?
-                             :f/alias    ledger-name
-                             :f/branch   "main"
-                             :f/data     {:f/address  test-utils/address?
-                                          :f/assert   [{:ex/x "foo-3"
-                                                        :ex/y "bar-3"
-                                                        :id   :ex/alice}]
-                                          :f/flakes   34
-                                          :f/previous {:id test-utils/db-id?}
-                                          :f/retract  [{:ex/x "foo-2"
-                                                        :ex/y "bar-2"
-                                                        :id   :ex/alice}]
-                                          :f/size     pos-int?
-                                          :f/t        3
-                                          :id         test-utils/db-id?}
-                             :f/previous {:id test-utils/commit-id?}
-                             :f/time     720000
-                             :f/v        1
-                             :id         test-utils/commit-id?}
-                   :retract [{:ex/x "foo-2"
-                              :ex/y "bar-2"
-                              :id   :ex/alice}]
-                   :t       3}
-               #:f{:assert  [{:ex/x "foo-cat"
-                              :ex/y "bar-cat"
-                              :id   :ex/alice}]
-                   :commit  {:f/address  test-utils/address?
-                             :f/alias    ledger-name
-                             :f/branch   "main"
-                             :f/data     {:f/address  test-utils/address?
-                                          :f/assert   [{:ex/x "foo-cat"
-                                                        :ex/y "bar-cat"
-                                                        :id   :ex/alice}]
-                                          :f/flakes   64
-                                          :f/previous {:id test-utils/db-id?}
-                                          :f/retract  [{:ex/x "foo-3"
-                                                        :ex/y "bar-3"
-                                                        :id   :ex/alice}]
-                                          :f/size     pos-int?
-                                          :f/t        5
-                                          :id         test-utils/db-id?}
-                             :f/message  "meow"
-                             :f/previous {:id test-utils/commit-id?}
-                             :f/time     720000
-                             :f/v        1
-                             :id         test-utils/commit-id?}
-                   :retract [{:ex/x "foo-3"
-                              :ex/y "bar-3"
-                              :id   :ex/alice}]
-                   :t       5}]
-              @(fluree/history loaded-ledger {:context        context
-                                              :history        :ex/alice
-                                              :commit-details true
-                                              :t              {:from 3}})))))
+             [#:f{:assert  [{:ex/x "foo-3"
+                             :ex/y "bar-3"
+                             :id   :ex/alice}]
+                  :commit  {:f/address  test-utils/address?
+                            :f/alias    ledger-name
+                            :f/branch   "main"
+                            :f/data     {:f/address  test-utils/address?
+                                         :f/assert   [{:ex/x "foo-3"
+                                                       :ex/y "bar-3"
+                                                       :id   :ex/alice}]
+                                         :f/flakes   34
+                                         :f/previous {:id test-utils/db-id?}
+                                         :f/retract  [{:ex/x "foo-2"
+                                                       :ex/y "bar-2"
+                                                       :id   :ex/alice}]
+                                         :f/size     pos-int?
+                                         :f/t        3
+                                         :id         test-utils/db-id?}
+                            :f/previous {:id test-utils/commit-id?}
+                            :f/time     720000
+                            :f/v        1
+                            :id         test-utils/commit-id?}
+                  :retract [{:ex/x "foo-2"
+                             :ex/y "bar-2"
+                             :id   :ex/alice}]
+                  :t       3}
+              #:f{:assert  [{:ex/x "foo-cat"
+                             :ex/y "bar-cat"
+                             :id   :ex/alice}]
+                  :commit  {:f/address  test-utils/address?
+                            :f/alias    ledger-name
+                            :f/branch   "main"
+                            :f/data     {:f/address  test-utils/address?
+                                         :f/assert   [{:ex/x "foo-cat"
+                                                       :ex/y "bar-cat"
+                                                       :id   :ex/alice}]
+                                         :f/flakes   64
+                                         :f/previous {:id test-utils/db-id?}
+                                         :f/retract  [{:ex/x "foo-3"
+                                                       :ex/y "bar-3"
+                                                       :id   :ex/alice}]
+                                         :f/size     pos-int?
+                                         :f/t        5
+                                         :id         test-utils/db-id?}
+                            :f/message  "meow"
+                            :f/previous {:id test-utils/commit-id?}
+                            :f/time     720000
+                            :f/v        1
+                            :id         test-utils/commit-id?}
+                  :retract [{:ex/x "foo-3"
+                             :ex/y "bar-3"
+                             :id   :ex/alice}]
+                  :t       5}]
+             @(fluree/history loaded-ledger {:context        context
+                                             :history        :ex/alice
+                                             :commit-details true
+                                             :t              {:from 3}})))))
 
     (testing "history commit details on a loaded memory ledger w/ issuer"
       (let [ledger-name "loaded-history-mem-issuer"
@@ -729,67 +729,67 @@
                                              {:message "meow"})
             loaded-ledger (test-utils/retry-load conn ledger-name 100)]
         (is (pred-match?
-              [#:f{:assert  [{:ex/x "foo-3"
-                              :ex/y "bar-3"
-                              :id   :ex/alice}]
-                   :commit  {"https://www.w3.org/2018/credentials#issuer"
-                             {:id test-utils/did?}
-                             :f/address  test-utils/address?
-                             :f/alias    ledger-name
-                             :f/branch   "main"
-                             :f/data     {:f/address  test-utils/address?
-                                          :f/assert   [{:ex/x "foo-3"
-                                                        :ex/y "bar-3"
-                                                        :id   :ex/alice}]
-                                          :f/flakes   32
-                                          :f/previous {:id test-utils/db-id?}
-                                          :f/retract  [{:ex/x "foo-2"
-                                                        :ex/y "bar-2"
-                                                        :id   :ex/alice}]
-                                          :f/size     pos-int?
-                                          :f/t        3
-                                          :id         test-utils/db-id?}
-                             :f/previous {:id test-utils/commit-id?}
-                             :f/time     720000
-                             :f/v        1
-                             :id         test-utils/commit-id?}
-                   :retract [{:ex/x "foo-2"
-                              :ex/y "bar-2"
-                              :id   :ex/alice}]
-                   :t       3}
-               #:f{:assert  [{:ex/x "foo-cat"
-                              :ex/y "bar-cat"
-                              :id   :ex/alice}]
-                   :commit  {"https://www.w3.org/2018/credentials#issuer"
-                             {:id test-utils/did?}
-                             :f/address  test-utils/address?
-                             :f/alias    ledger-name
-                             :f/branch   "main"
-                             :f/data     {:f/address  test-utils/address?
-                                          :f/assert   [{:ex/x "foo-cat"
-                                                        :ex/y "bar-cat"
-                                                        :id   :ex/alice}]
-                                          :f/flakes   62
-                                          :f/previous {:id test-utils/db-id?}
-                                          :f/retract  [{:ex/x "foo-3"
-                                                        :ex/y "bar-3"
-                                                        :id   :ex/alice}]
-                                          :f/size     pos-int?
-                                          :f/t        5
-                                          :id         test-utils/db-id?}
-                             :f/message  "meow"
-                             :f/previous {:id test-utils/commit-id?}
-                             :f/time     720000
-                             :f/v        1
-                             :id         test-utils/commit-id?}
-                   :retract [{:ex/x "foo-3"
-                              :ex/y "bar-3"
-                              :id   :ex/alice}]
-                   :t       5}]
-              @(fluree/history loaded-ledger {:context        context
-                                              :history        :ex/alice
-                                              :commit-details true
-                                              :t              {:from 3}})))))))
+             [#:f{:assert  [{:ex/x "foo-3"
+                             :ex/y "bar-3"
+                             :id   :ex/alice}]
+                  :commit  {"https://www.w3.org/2018/credentials#issuer"
+                            {:id test-utils/did?}
+                            :f/address  test-utils/address?
+                            :f/alias    ledger-name
+                            :f/branch   "main"
+                            :f/data     {:f/address  test-utils/address?
+                                         :f/assert   [{:ex/x "foo-3"
+                                                       :ex/y "bar-3"
+                                                       :id   :ex/alice}]
+                                         :f/flakes   32
+                                         :f/previous {:id test-utils/db-id?}
+                                         :f/retract  [{:ex/x "foo-2"
+                                                       :ex/y "bar-2"
+                                                       :id   :ex/alice}]
+                                         :f/size     pos-int?
+                                         :f/t        3
+                                         :id         test-utils/db-id?}
+                            :f/previous {:id test-utils/commit-id?}
+                            :f/time     720000
+                            :f/v        1
+                            :id         test-utils/commit-id?}
+                  :retract [{:ex/x "foo-2"
+                             :ex/y "bar-2"
+                             :id   :ex/alice}]
+                  :t       3}
+              #:f{:assert  [{:ex/x "foo-cat"
+                             :ex/y "bar-cat"
+                             :id   :ex/alice}]
+                  :commit  {"https://www.w3.org/2018/credentials#issuer"
+                            {:id test-utils/did?}
+                            :f/address  test-utils/address?
+                            :f/alias    ledger-name
+                            :f/branch   "main"
+                            :f/data     {:f/address  test-utils/address?
+                                         :f/assert   [{:ex/x "foo-cat"
+                                                       :ex/y "bar-cat"
+                                                       :id   :ex/alice}]
+                                         :f/flakes   62
+                                         :f/previous {:id test-utils/db-id?}
+                                         :f/retract  [{:ex/x "foo-3"
+                                                       :ex/y "bar-3"
+                                                       :id   :ex/alice}]
+                                         :f/size     pos-int?
+                                         :f/t        5
+                                         :id         test-utils/db-id?}
+                            :f/message  "meow"
+                            :f/previous {:id test-utils/commit-id?}
+                            :f/time     720000
+                            :f/v        1
+                            :id         test-utils/commit-id?}
+                  :retract [{:ex/x "foo-3"
+                             :ex/y "bar-3"
+                             :id   :ex/alice}]
+                  :t       5}]
+             @(fluree/history loaded-ledger {:context        context
+                                             :history        :ex/alice
+                                             :commit-details true
+                                             :t              {:from 3}})))))))
 
 (deftest loaded-file-ledger-history-test
   (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
@@ -798,16 +798,16 @@
         (let [ledger-name "loaded-history-file"
               conn        @(fluree/connect-file {:storage-path storage-path
                                                  :defaults     {:identity (did/private->did-map
-                                                                            test-utils/default-private-key)}})
+                                                                           test-utils/default-private-key)}})
               context     [test-utils/default-context {:ex   "http://example.org/ns/"
                                                        :cred "https://www.w3.org/2018/credentials#"}]
 
-              a             @(fluree/create-with-txn conn {"@context" context
+              _a            @(fluree/create-with-txn conn {"@context" context
                                                            "ledger"   ledger-name
                                                            "insert"   {:id   :ex/alice
                                                                        :ex/x "foo-1"
                                                                        :ex/y "bar-1"}})
-              b             @(fluree/transact! conn {"@context" context
+              _b            @(fluree/transact! conn {"@context" context
                                                      "ledger"   ledger-name
                                                      "delete"   {:id   :ex/alice
                                                                  :ex/x "foo-1"
@@ -815,7 +815,7 @@
                                                      "insert"   {:id   :ex/alice
                                                                  :ex/x "foo-2"
                                                                  :ex/y "bar-2"}})
-              c             @(fluree/transact! conn {"@context" context
+              _c            @(fluree/transact! conn {"@context" context
                                                      "ledger"   ledger-name
                                                      "delete"   {:id   :ex/alice
                                                                  :ex/x "foo-2"
@@ -823,12 +823,12 @@
                                                      "insert"   {:id   :ex/alice
                                                                  :ex/x "foo-3"
                                                                  :ex/y "bar-3"}})
-              d             @(fluree/transact! conn {"@context" context
+              _d            @(fluree/transact! conn {"@context" context
                                                      "ledger"   ledger-name
                                                      "insert"   {:id   :ex/cat
                                                                  :ex/x "foo-cat"
                                                                  :ex/y "bar-cat"}})
-              e             @(fluree/transact! conn {"@context" context
+              _e            @(fluree/transact! conn {"@context" context
                                                      "ledger"   ledger-name
                                                      "delete"   {:id   :ex/alice
                                                                  :ex/x "foo-3"
@@ -838,64 +838,64 @@
                                                                  :ex/y "bar-cat"}}
                                                {:message "meow"})
               loaded-ledger (test-utils/retry-load conn ledger-name 100)]
-                      (is (pred-match?
-                            [#:f{:assert  [{:ex/x "foo-3"
-                                            :ex/y "bar-3"
-                                            :id   :ex/alice}]
-                                 :commit  {:cred/issuer {:id test-utils/did?}
-                                           :f/address  test-utils/address?
-                                           :f/alias    ledger-name
-                                           :f/branch   "main"
-                                           :f/data     {:f/address  test-utils/address?
-                                                        :f/assert   [{:ex/x "foo-3"
-                                                                      :ex/y "bar-3"
-                                                                      :id   :ex/alice}]
-                                                        :f/flakes   34
-                                                        :f/retract  [{:ex/x "foo-2"
-                                                                      :ex/y "bar-2"
-                                                                      :id   :ex/alice}]
-                                                        :f/size     pos-int?
-                                                        :f/t        3
-                                                        :id         test-utils/db-id?}
-                                           :f/previous {:id test-utils/commit-id?}
-                                           :f/time     720000
-                                           :f/v        1
-                                           :id         test-utils/commit-id?}
-                                 :retract [{:ex/x "foo-2"
-                                            :ex/y "bar-2"
-                                            :id   :ex/alice}]
-                                 :t       3}
-                             #:f{:assert  [{:ex/x "foo-cat"
-                                            :ex/y "bar-cat"
-                                            :id   :ex/alice}]
-                                 :commit  {:cred/issuer {:id test-utils/did?}
-                                           :f/address  test-utils/address?
-                                           :f/alias    ledger-name
-                                           :f/branch   "main"
-                                           :f/data     {:f/address  test-utils/address?
-                                                        :f/assert   [{:ex/x "foo-cat"
-                                                                      :ex/y "bar-cat"
-                                                                      :id   :ex/alice}]
-                                                        :f/flakes   64
-                                                        :f/retract  [{:ex/x "foo-3"
-                                                                      :ex/y "bar-3"
-                                                                      :id   :ex/alice}]
-                                                        :f/size     pos-int?
-                                                        :f/t        5
-                                                        :id         test-utils/db-id?}
-                                           :f/message  "meow"
-                                           :f/previous {:id test-utils/commit-id?}
-                                           :f/time     720000
-                                           :f/v        1
-                                           :id         test-utils/commit-id?}
-                                 :retract [{:ex/x "foo-3"
-                                            :ex/y "bar-3"
-                                            :id   :ex/alice}]
-                                 :t       5}]
-                            @(fluree/history loaded-ledger {:context        context
-                                                            :history        :ex/alice
-                                                            :commit-details true
-                                                            :t              {:from 3}}))))))))
+          (is (pred-match?
+               [#:f{:assert  [{:ex/x "foo-3"
+                               :ex/y "bar-3"
+                               :id   :ex/alice}]
+                    :commit  {:cred/issuer {:id test-utils/did?}
+                              :f/address   test-utils/address?
+                              :f/alias     ledger-name
+                              :f/branch    "main"
+                              :f/data      {:f/address test-utils/address?
+                                            :f/assert  [{:ex/x "foo-3"
+                                                         :ex/y "bar-3"
+                                                         :id   :ex/alice}]
+                                            :f/flakes  34
+                                            :f/retract [{:ex/x "foo-2"
+                                                         :ex/y "bar-2"
+                                                         :id   :ex/alice}]
+                                            :f/size    pos-int?
+                                            :f/t       3
+                                            :id        test-utils/db-id?}
+                              :f/previous  {:id test-utils/commit-id?}
+                              :f/time      720000
+                              :f/v         1
+                              :id          test-utils/commit-id?}
+                    :retract [{:ex/x "foo-2"
+                               :ex/y "bar-2"
+                               :id   :ex/alice}]
+                    :t       3}
+                #:f{:assert  [{:ex/x "foo-cat"
+                               :ex/y "bar-cat"
+                               :id   :ex/alice}]
+                    :commit  {:cred/issuer {:id test-utils/did?}
+                              :f/address   test-utils/address?
+                              :f/alias     ledger-name
+                              :f/branch    "main"
+                              :f/data      {:f/address test-utils/address?
+                                            :f/assert  [{:ex/x "foo-cat"
+                                                         :ex/y "bar-cat"
+                                                         :id   :ex/alice}]
+                                            :f/flakes  64
+                                            :f/retract [{:ex/x "foo-3"
+                                                         :ex/y "bar-3"
+                                                         :id   :ex/alice}]
+                                            :f/size    pos-int?
+                                            :f/t       5
+                                            :id        test-utils/db-id?}
+                              :f/message   "meow"
+                              :f/previous  {:id test-utils/commit-id?}
+                              :f/time      720000
+                              :f/v         1
+                              :id          test-utils/commit-id?}
+                    :retract [{:ex/x "foo-3"
+                               :ex/y "bar-3"
+                               :id   :ex/alice}]
+                    :t       5}]
+               @(fluree/history loaded-ledger {:context        context
+                                               :history        :ex/alice
+                                               :commit-details true
+                                               :t              {:from 3}}))))))))
 
 (deftest ^:integration author-and-txn-id
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
@@ -907,49 +907,49 @@
           root-privkey "89e0ab9ac36fb82b172890c89e9e231224264c7c757d58cfd8fcd6f3d4442199"
           root-did     (:id (did/private->did-map root-privkey))
 
-          db0          (fluree/db ledger)
-          db1          @(fluree/stage db0 {"@context" context
-                                           "insert"   [{"@id"         "ex:betty"
-                                                        "@type"       "ex:Yeti"
-                                                        "schema:name" "Betty"
-                                                        "schema:age"  55}
-                                                       {"@id"         "ex:freddy"
-                                                        "@type"       "ex:Yeti"
-                                                        "schema:name" "Freddy"
-                                                        "schema:age"  1002}
-                                                       {"@id"         "ex:letty"
-                                                        "@type"       "ex:Yeti"
-                                                        "schema:name" "Leticia"
-                                                        "schema:age"  38}
-                                                       {"@id"           root-did
-                                                        "f:policyClass" [{"@id" "ex:RootPolicy"}]}]})
-          db2          (->> @(fluree/stage db1 {"@context" context
-                                                "insert"   [{"@id"      "ex:defaultAllowViewModify"
-                                                             "@type"    ["f:AccessPolicy" "ex:RootPolicy"]
-                                                             "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
-                                                             "f:query"  {"@type"  "@json"
-                                                                         "@value" {}}}]})
-                            (fluree/commit! ledger)
-                            (deref))
+          db0  (fluree/db ledger)
+          db1  @(fluree/stage db0 {"@context" context
+                                   "insert"   [{"@id"         "ex:betty"
+                                                "@type"       "ex:Yeti"
+                                                "schema:name" "Betty"
+                                                "schema:age"  55}
+                                               {"@id"         "ex:freddy"
+                                                "@type"       "ex:Yeti"
+                                                "schema:name" "Freddy"
+                                                "schema:age"  1002}
+                                               {"@id"         "ex:letty"
+                                                "@type"       "ex:Yeti"
+                                                "schema:name" "Leticia"
+                                                "schema:age"  38}
+                                               {"@id"           root-did
+                                                "f:policyClass" [{"@id" "ex:RootPolicy"}]}]})
+          _db2 (->> @(fluree/stage db1 {"@context" context
+                                        "insert"   [{"@id"      "ex:defaultAllowViewModify"
+                                                     "@type"    ["f:AccessPolicy" "ex:RootPolicy"]
+                                                     "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
+                                                     "f:query"  {"@type"  "@json"
+                                                                 "@value" {}}}]})
+                    (fluree/commit! ledger)
+                    (deref))
 
-          db3          @(fluree/credential-transact! conn (crypto/create-jws
-                                                           (json/stringify {"@context" context
-                                                                            "ledger"   ledger-name
-                                                                            "insert"   {"ex:foo" 3}})
-                                                           root-privkey))
+          _db3 @(fluree/credential-transact! conn (crypto/create-jws
+                                                   (json/stringify {"@context" context
+                                                                    "ledger"   ledger-name
+                                                                    "insert"   {"ex:foo" 3}})
+                                                   root-privkey))
 
-          db4          @(fluree/credential-transact! conn (crypto/create-jws
-                                                           (json/stringify {"@context" context
-                                                                            "ledger"   ledger-name
-                                                                            "insert"   {"ex:foo" 5}})
-                                                           root-privkey))]
+          _db4 @(fluree/credential-transact! conn (crypto/create-jws
+                                                   (json/stringify {"@context" context
+                                                                    "ledger"   ledger-name
+                                                                    "insert"   {"ex:foo" 5}})
+                                                   root-privkey))]
       (is (= [{"f:data" {"f:t" 1}}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-               "f:data" {"f:t" 2},
-               "f:txn" "fluree:memory://bmpe6riaeyz6i54k2mjwwp6sn7tanw6jkighv4arnkoexqungnet"}
+               "f:data"   {"f:t" 2},
+               "f:txn"    "fluree:memory://bmpe6riaeyz6i54k2mjwwp6sn7tanw6jkighv4arnkoexqungnet"}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
-               "f:data" {"f:t" 3},
-               "f:txn" "fluree:memory://ueaysvwnt36afj5kf5hsju2xbai556cn7sn4exwu4pmsjglg5ql"}]
+               "f:data"   {"f:t" 3},
+               "f:txn"    "fluree:memory://ueaysvwnt36afj5kf5hsju2xbai556cn7sn4exwu4pmsjglg5ql"}]
              (->> @(fluree/history ledger {:context        context
                                            :commit-details true
                                            :t              {:from 1 :to :latest}})
@@ -968,44 +968,44 @@
           root-privkey "89e0ab9ac36fb82b172890c89e9e231224264c7c757d58cfd8fcd6f3d4442199"
           root-did     (:id (did/private->did-map root-privkey))
 
-          db0          (fluree/db ledger)
-          db1          @(fluree/stage db0 {"@context" context
-                                           "insert"   [{"@id"         "ex:betty"
-                                                        "@type"       "ex:Yeti"
-                                                        "schema:name" "Betty"
-                                                        "schema:age"  55}
-                                                       {"@id"         "ex:freddy"
-                                                        "@type"       "ex:Yeti"
-                                                        "schema:name" "Freddy"
-                                                        "schema:age"  1002}
-                                                       {"@id"         "ex:letty"
-                                                        "@type"       "ex:Yeti"
-                                                        "schema:name" "Leticia"
-                                                        "schema:age"  38}
-                                                       {"@id"           root-did
-                                                        "f:policyClass" [{"@id" "ex:RootPolicy"}]}]})
-          db2          (->> @(fluree/stage db1 {"@context" context
-                                                "insert"   [{"@id"      "ex:defaultAllowViewModify"
-                                                             "@type"    ["f:AccessPolicy" "ex:RootPolicy"]
-                                                             "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
-                                                             "f:query"  {"@type"  "@json"
-                                                                         "@value" {}}}]})
-                            (fluree/commit! ledger)
-                            (deref))
+          db0  (fluree/db ledger)
+          db1  @(fluree/stage db0 {"@context" context
+                                   "insert"   [{"@id"         "ex:betty"
+                                                "@type"       "ex:Yeti"
+                                                "schema:name" "Betty"
+                                                "schema:age"  55}
+                                               {"@id"         "ex:freddy"
+                                                "@type"       "ex:Yeti"
+                                                "schema:name" "Freddy"
+                                                "schema:age"  1002}
+                                               {"@id"         "ex:letty"
+                                                "@type"       "ex:Yeti"
+                                                "schema:name" "Leticia"
+                                                "schema:age"  38}
+                                               {"@id"           root-did
+                                                "f:policyClass" [{"@id" "ex:RootPolicy"}]}]})
+          _db2 (->> @(fluree/stage db1 {"@context" context
+                                        "insert"   [{"@id"      "ex:defaultAllowViewModify"
+                                                     "@type"    ["f:AccessPolicy" "ex:RootPolicy"]
+                                                     "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
+                                                     "f:query"  {"@type"  "@json"
+                                                                 "@value" {}}}]})
+                    (fluree/commit! ledger)
+                    (deref))
 
-          jws1         (crypto/create-jws
-                        (json/stringify {"@context" context
-                                         "ledger"   ledger-name
-                                         "insert"   {"ex:foo" 3}})
-                        root-privkey)
-          db3          @(fluree/credential-transact! conn jws1)
+          jws1 (crypto/create-jws
+                (json/stringify {"@context" context
+                                 "ledger"   ledger-name
+                                 "insert"   {"ex:foo" 3}})
+                root-privkey)
+          _db3 @(fluree/credential-transact! conn jws1)
 
-          jws2         (crypto/create-jws
-                        (json/stringify {"@context" context
-                                         "ledger"   ledger-name
-                                         "insert"   {"ex:foo" 5}})
-                        root-privkey)
-          db4          @(fluree/credential-transact! conn jws2)]
+          jws2 (crypto/create-jws
+                (json/stringify {"@context" context
+                                 "ledger"   ledger-name
+                                 "insert"   {"ex:foo" 5}})
+                root-privkey)
+          _db4 @(fluree/credential-transact! conn jws2)]
 
       (testing ":txn returns the raw transaction"
         (is (= [{"f:txn" nil}
@@ -1082,7 +1082,7 @@
                                                   {"id"          "ex:freddy"
                                                    "type"        "ex:Yeti",
                                                    "schema:age"  1002,
-                                                   "schema:name" "Freddy",}
+                                                   "schema:name" "Freddy"}
                                                   {"id"          "ex:letty"
                                                    "type"        "ex:Yeti",
                                                    "schema:age"  38,
@@ -1284,24 +1284,22 @@
                               "f:targetNode" {"id" "f:allNodes"},
                               "id"           "ex:rootPolicy"}],
                             "f:retract" []}}]
-             @(fluree/history ledger {:context        context
-                                      :history        "ex:freddy"
-                                      :txn            true
-                                      :data           true
-                                      :commit         true
-                                      :t              {:from 1 :to :latest}})))))))
+             @(fluree/history ledger {:context context
+                                      :history "ex:freddy"
+                                      :txn     true
+                                      :data    true
+                                      :commit  true
+                                      :t       {:from 1 :to :latest}})))))))
 
 (deftest ^:integration txn-annotation
-  (let [bnode-counter (atom 0)
+  (let [conn        @(fluree/connect-memory)
+        ledger-name "annotationtest"
+        ledger      @(fluree/create conn ledger-name)
+        context     [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
 
-        conn          @(fluree/connect-memory)
-        ledger-name   "annotationtest"
-        ledger        @(fluree/create conn ledger-name)
-        context       [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
-
-        db0           (fluree/db ledger)]
+        db0 (fluree/db ledger)]
     (testing "valid annotations"
-      (with-redefs [fluree.db.util.core/current-time-iso    (fn [] "1970-01-01T00:12:00.00000Z")]
+      (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
         (let [db1 (->> @(fluree/stage db0 {"@context" context
                                            "insert"   [{"@id"         "ex:betty"
                                                         "@type"       "ex:Yeti"
@@ -1319,14 +1317,14 @@
                        (fluree/commit! ledger)
                        (deref))
 
-              db3 (->> @(fluree/stage db2 {"@context" context
-                                           "insert"   [{"@id"         "ex:letty"
-                                                        "@type"       "ex:Yeti"
-                                                        "schema:name" "Leticia"
-                                                        "schema:age"  38}]
-                                           "opts"     {"annotation" {"ex:originator" "txn" "ex:data" "ok"}}})
-                       (fluree/commit! ledger)
-                       (deref))]
+              _db3 (->> @(fluree/stage db2 {"@context" context
+                                            "insert"   [{"@id"         "ex:letty"
+                                                         "@type"       "ex:Yeti"
+                                                         "schema:name" "Leticia"
+                                                         "schema:age"  38}]
+                                            "opts"     {"annotation" {"ex:originator" "txn" "ex:data" "ok"}}})
+                        (fluree/commit! ledger)
+                        (deref))]
           (testing "annotations in commit-details"
             (is (pred-match? [{}
                               {"f:annotation" {"id" test-utils/blank-node-id? "ex:data" "ok" "ex:originator" "opts"}}

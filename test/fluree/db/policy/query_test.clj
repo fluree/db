@@ -1,7 +1,7 @@
 (ns fluree.db.policy.query-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.did :as did]
             [fluree.db.api :as fluree]
+            [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils]))
 
 (deftest ^:integration property-policy-query-enforcement
@@ -100,7 +100,6 @@
                   "select"   {"?s" ["*"]}
                   "where"    {"@id"   "?s"
                               "@type" "ex:User"}})))))))
-
 
 (deftest ^:integration class-policy-query-enforcement
   (testing "Restrict an entire class for viewing via relationship "
@@ -229,8 +228,7 @@
                                        "@type"        "ex:Referrer",
                                        "ex:referData" [{"@id" "ex:data-0"}
                                                        {"@id" "ex:data-1"}
-                                                       {"@id" "ex:data-2"}]}
-                                      ]})
+                                                       {"@id" "ex:data-2"}]}]})
 
           policy       [{"@context"  {"ex" "http://example.org/ns/"
                                       "f"  "https://ns.flur.ee/ledger#"}

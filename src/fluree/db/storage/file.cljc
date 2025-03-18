@@ -1,11 +1,11 @@
 (ns fluree.db.storage.file
-  (:require [fluree.crypto :as crypto]
+  (:require [clojure.string :as str]
+            [fluree.crypto :as crypto]
+            [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
-            [fluree.db.util.json :as json]
             [fluree.db.util.filesystem :as fs]
-            [fluree.db.storage :as storage]
-            [clojure.string :as str]))
+            [fluree.db.util.json :as json]))
 
 (def method-name "file")
 

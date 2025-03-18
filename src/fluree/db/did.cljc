@@ -1,8 +1,8 @@
 (ns fluree.db.did
-  (:require [fluree.crypto :as crypto]
+  (:require [alphabase.base58 :as base58]
             [alphabase.core :as alphabase]
-            [alphabase.base58 :as base58]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [fluree.crypto :as crypto]))
 
 ;; did operations
 

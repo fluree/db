@@ -1,7 +1,7 @@
 (ns fluree.db.query.datatype-test
-  (:require [clojure.test :refer :all]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.api :as fluree]))
+  (:require [clojure.test :refer [deftest is testing]]
+            [fluree.db.api :as fluree]
+            [fluree.db.test-utils :as test-utils]))
 
 (def default-context
   {:id     "@id"
@@ -16,19 +16,19 @@
         ledger @(fluree/create conn "ledger/datatype")]
     (testing "Querying predicates with mixed datatypes"
       (let [mixed-db @(fluree/stage (fluree/db ledger)
-                                     {"insert"
-                                      [{:context     default-context
-                                        :id          :ex/coco
-                                        :type        :schema/Person
-                                        :schema/name "Coco"}
-                                       {:context     default-context
-                                        :id          :ex/halie
-                                        :type        :schema/Person
-                                        :schema/name "Halie"}
-                                       {:context     default-context
-                                        :id          :ex/john
-                                        :type        :schema/Person
-                                        :schema/name 3}]})]
+                                    {"insert"
+                                     [{:context     default-context
+                                       :id          :ex/coco
+                                       :type        :schema/Person
+                                       :schema/name "Coco"}
+                                      {:context     default-context
+                                       :id          :ex/halie
+                                       :type        :schema/Person
+                                       :schema/name "Halie"}
+                                      {:context     default-context
+                                       :id          :ex/john
+                                       :type        :schema/Person
+                                       :schema/name 3}]})]
         (is (= [{:id          :ex/halie
                  :type        :schema/Person
                  :schema/name "Halie"}]

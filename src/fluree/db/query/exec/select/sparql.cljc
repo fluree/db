@@ -10,27 +10,30 @@
   [var]
   (subs (name var) 1))
 
-(defmulti display (fn [match compact] (where/get-datatype-iri match)))
+(defmulti display
+  (fn [match _compact]
+    (where/get-datatype-iri match)))
+
 (defmethod display :default
-  [match compact]
+  [match _compact]
   (let [v  (where/get-value match)
         dt (where/get-datatype-iri match)]
     (cond-> {"value" (str v) "type" "literal"}
       (and v (not= const/iri-string dt)) (assoc "datatype" dt))))
 
 (defmethod display const/iri-rdf-json
-  [match compact]
+  [match _compact]
   {"value" (where/get-value match) "type" "literal" "datatype" const/iri-rdf-json})
 
 (defmethod display const/iri-id
-  [match compact]
+  [match _compact]
   (let [iri (where/get-iri match)]
     (if (= \_ (first iri))
       {"type" "bnode" "value" (subs iri 1)}
       {"type" "uri" "value" iri})))
 
 (defmethod display const/iri-vector
-  [match compact]
+  [match _compact]
   {"type" "literal" "value" (some-> match where/get-value vec str) "datatype" const/iri-vector})
 
 (defn disaggregate
@@ -38,7 +41,9 @@
   tabular. This function unpacks a single result into potentially multiple 'rows' of
   results."
   [result]
-  (let [aggregated (filter (fn [[k v]] (sequential? v)) result)]
+  (let [aggregated (filter (fn [[_k v]]
+                             (sequential? v))
+                           result)]
     (loop [[[agg-var agg-vals] & r] aggregated
            results [result]]
       (if agg-var
@@ -54,8 +59,8 @@
   (fn [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
     (go (try* {(var-name var) (-> solution (get var) (display compact))}
               (catch* e
-                      (log/error e "Error formatting variable:" var)
-                      (>! error-ch e))))))
+                (log/error e "Error formatting variable:" var)
+                (>! error-ch e))))))
 
 (defn format-wildcard-selector-value
   [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
@@ -68,8 +73,8 @@
             (recur vars (assoc result (var-name var) output)))
           result))
       (catch* e
-              (log/error e "Error formatting wildcard")
-              (>! error-ch e)))))
+        (log/error e "Error formatting wildcard")
+        (>! error-ch e)))))
 
 (defn format-as-selector-value
   [bind-var]

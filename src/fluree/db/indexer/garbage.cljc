@@ -1,7 +1,7 @@
 (ns fluree.db.indexer.garbage
   (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.flake.index.storage :as storage]
-            [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
+            [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]))
 
@@ -11,31 +11,31 @@
   "Garbage file metadata that will be passed to the
   garbage cleaning function that allows it to report
   on status and have filename addresses."
-  [{:keys [prev-index garbage] :as idx-root}]
+  [{:keys [prev-index garbage] :as _idx-root}]
   (when garbage ;; first index will not have garbage
     (assoc garbage
       ;; retain not the current index file, but the previous one
       ;; where the garbage in this file originated
-      :t (:t prev-index)
-      :index (:address prev-index))))
+           :t (:t prev-index)
+           :index (:address prev-index))))
 
 (defn trace-idx-roots
   [index-catalog commit]
   (go-try
     (loop [next-idx-root (<! (storage/read-db-root index-catalog
                                                    (-> commit :index :address)))
-          garbage       []]
-     (if (or (nil? next-idx-root) ;; no more idx-roots
-             (util/exception? next-idx-root)) ;; if idx-root already deleted, will be exception
-       garbage
-       (let [garbage-meta  (garbage-meta-map next-idx-root)
-             prev-idx-addr (get-in next-idx-root [:prev-index :address])
-             garbage*      (if garbage-meta
-                             (conj garbage garbage-meta)
-                             garbage)]
-         (recur (when prev-idx-addr ;; first index won't have a prev-index
-                  (<! (storage/read-db-root index-catalog prev-idx-addr)))
-                garbage*))))))
+           garbage       []]
+      (if (or (nil? next-idx-root) ;; no more idx-roots
+              (util/exception? next-idx-root)) ;; if idx-root already deleted, will be exception
+        garbage
+        (let [garbage-meta  (garbage-meta-map next-idx-root)
+              prev-idx-addr (get-in next-idx-root [:prev-index :address])
+              garbage*      (if garbage-meta
+                              (conj garbage garbage-meta)
+                              garbage)]
+          (recur (when prev-idx-addr ;; first index won't have a prev-index
+                   (<! (storage/read-db-root index-catalog prev-idx-addr)))
+                 garbage*))))))
 
 (defn clean-garbage-record
   "Cleans up a complete garbage file, which will contain

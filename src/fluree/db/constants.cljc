@@ -223,7 +223,6 @@
 (def ^:const $rdfs:subPropertyOf (iri/iri->sid iri-rdfs:subPropertyOf))
 (def ^:const $rdfs:Class (iri/iri->sid iri-rdfs:Class))
 
-
 ;; shacl
 (def ^:const sh_NodeShape (iri/iri->sid "http://www.w3.org/ns/shacl#NodeShape"))
 (def ^:const sh_deactivated (iri/iri->sid "http://www.w3.org/ns/shacl#deactivated"))

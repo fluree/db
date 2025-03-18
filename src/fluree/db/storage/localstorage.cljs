@@ -2,9 +2,9 @@
   (:refer-clojure :exclude [read list])
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.crypto :as crypto]
-            [fluree.db.util.json :as json]
             [fluree.db.platform :as platform]
-            [fluree.db.storage :as storage]))
+            [fluree.db.storage :as storage]
+            [fluree.db.util.json :as json]))
 
 (def method-name "localstorage")
 

@@ -1,6 +1,5 @@
 (ns fluree.db.virtual-graph.bm25.search
-  (:require [fluree.db.virtual-graph.bm25.update :as update]
-            [fluree.db.util.log :as log]))
+  (:require [fluree.db.virtual-graph.bm25.update :as update]))
 
 (set! *warn-on-reflection* true)
 

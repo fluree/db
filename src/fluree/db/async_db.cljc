@@ -7,11 +7,11 @@
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.transact :as transact]
+            [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.history :as history]
-            [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.time-travel :as time-travel]
+            [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log])
@@ -23,7 +23,7 @@
 
 (defrecord AsyncDB [alias branch commit t db-chan]
   dbproto/IFlureeDb
-  (-query [this query-map]
+  (-query [_ query-map]
     (go-try
       (let [db (<? db-chan)]
         (<? (dbproto/-query db query-map)))))
@@ -176,8 +176,8 @@
   policy/Restrictable
   (wrap-policy [_ policy policy-values]
     (go-try
-     (let [db (<? db-chan)]
-       (<? (policy/wrap-policy db policy policy-values)))))
+      (let [db (<? db-chan)]
+        (<? (policy/wrap-policy db policy policy-values)))))
   (root [_]
     (let [root-ch (async/promise-chan)
           root-db (->AsyncDB alias branch commit t root-ch)]

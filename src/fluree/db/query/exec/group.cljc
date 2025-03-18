@@ -4,8 +4,7 @@
             [fluree.db.query.exec.select.fql :as select.fql]
             [fluree.db.query.exec.select.sparql :as select.sparql]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

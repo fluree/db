@@ -1,9 +1,9 @@
 (ns fluree.db.util.json-test
-  (:require #?@(:clj  [[clojure.test :refer :all]
-                       [cheshire.core :as cjson]]
-                :cljs [[cljs.test :refer-macros [deftest is testing]]])
-            [fluree.db.util.bytes :as u-bytes]
-            [fluree.db.util.json :as json])
+  (:require #?@(:clj  [[clojure.test :refer [deftest is testing]]
+                       [cheshire.core :as cjson]
+                       [fluree.db.util.bytes :as u-bytes]
+                       [fluree.db.util.json :as json]]
+                :cljs [[cljs.test :refer-macros [deftest is testing]]]))
   #?(:clj
      (:import (java.io ByteArrayInputStream)
               (java.math BigDecimal)
@@ -18,7 +18,6 @@
       (-> s
           (.getBytes encoding)
           (ByteArrayInputStream.)))))
-
 
 ;; General Comments
 ;; all java.lang.Float, java.lang.Double and java.math.BigDecimal values

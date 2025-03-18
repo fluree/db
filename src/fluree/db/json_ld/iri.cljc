@@ -1,12 +1,10 @@
 (ns fluree.db.json-ld.iri
-  (:require [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
+  (:require [clojure.set :refer [map-invert]]
             [clojure.string :as str]
-            [clojure.set :refer [map-invert]]
+            [fluree.db.util.core :as util]
             [nano-id.core :refer [nano-id]]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const f-t-ns "https://ns.flur.ee/ledger/transaction#")
@@ -76,13 +74,13 @@
                 :cljs [^number namespace-code name])
   #?@(:clj  [Object
              (equals [this sid]
-               (sid-equiv? this sid))
+                     (sid-equiv? this sid))
              (hashCode [_]
-               (clojure.lang.Util/hashCombine namespace-code (hash name)))
+                       (clojure.lang.Util/hashCombine namespace-code (hash name)))
 
              clojure.lang.IHashEq
              (hasheq [_]
-               (clojure.lang.Util/hashCombine namespace-code (hash name)))
+                     (clojure.lang.Util/hashCombine namespace-code (hash name)))
 
              java.lang.Comparable
              (compareTo [this other] (compare-SIDs this other))]
@@ -109,7 +107,7 @@
        (= (.-namespace-code sid) (.-namespace-code other))
        (= (.-name sid) (.-name other))))
 
-(defn ^SID ->sid
+(defn ->sid ^SID
   [ns-code nme]
   (->SID #?(:clj (int ns-code) :cljs ns-code) nme))
 

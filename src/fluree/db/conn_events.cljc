@@ -1,7 +1,7 @@
 (ns fluree.db.conn-events
-  (:require [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
-            [clojure.core.async :as async]))
+  (:require [clojure.core.async :as async]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -14,7 +14,6 @@
   (log/trace "set websocket id:" ws-id)
   (swap! (:state conn) assoc :socket-id ws-id))
 
-
 (defmethod process-event :default
   [conn event-type subject event-data]
   ;; any event not explicitly captured above is assumed to be a 'global' event.
@@ -25,10 +24,9 @@
       (#?(:clj future :cljs do)
         (try* (f event-type event-data)
               (catch* e
-                      (log/error e
-                                 (str "Error calling registered callback: " (pr-str k) " for db: " subject
-                                      ". Event: " event-type " Data: " (pr-str event-data) "."))))))))
-
+                (log/error e
+                           (str "Error calling registered callback: " (pr-str k) " for db: " subject
+                                ". Event: " event-type " Data: " (pr-str event-data) "."))))))))
 
 (defn process-events
   "Processes incoming events from the ledger.
@@ -64,4 +62,4 @@
         ;; else
         (process-event conn event-type subject event-data)))
     (catch* e
-            (log/error e))))
+      (log/error e))))

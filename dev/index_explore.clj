@@ -1,7 +1,7 @@
 (ns index-explore
   (:require [clojure.java.io :as io]
-            [fluree.db.util.json :as json]
-            [fluree.db.storage :as storage]))
+            [fluree.db.storage :as storage]
+            [fluree.db.util.json :as json]))
 
 (def data-directory "./dev/data")
 
@@ -126,6 +126,4 @@
   ;; get the depth (how many parents) of index type
   (-> (read-roots ledger-name)
       (latest-root)
-      (idx-depth :spot))
-
-  )
+      (idx-depth :spot)))

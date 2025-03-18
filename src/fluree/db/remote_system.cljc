@@ -1,6 +1,6 @@
 (ns fluree.db.remote-system
-  (:require [clojure.string :as str]
-            [clojure.core.async :as async :refer [<! go]]
+  (:require [clojure.core.async :as async :refer [<! go]]
+            [clojure.string :as str]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
@@ -49,12 +49,12 @@
           (swap! system-state assoc :connected-socket ws)
           ws)
         (catch* e
-                (let [msg (ex-message e)]
-                  (log/warn "Error establishing web socket:" msg)
-                  (clear-connected-server system-state)
-                  (ex-info (str "Error establishing websocket connection: " msg)
-                           {:status 400
-                            :error  :db/websocket-error})))))))
+          (let [msg (ex-message e)]
+            (log/warn "Error establishing web socket:" msg)
+            (clear-connected-server system-state)
+            (ex-info (str "Error establishing websocket connection: " msg)
+                     {:status 400
+                      :error  :db/websocket-error})))))))
 
 (defn remote-read
   "Returns a core async channel with value of remote resource."

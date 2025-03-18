@@ -1,8 +1,8 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async :refer [<! go]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.query.exec :as exec]
             [fluree.db.query.fql.parse :as parse]
-            [fluree.db.query.exec :as exec])
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -28,11 +28,17 @@
                 (async/put! pc res)))
             pc)))))
 
-(defn cache?
-  "Returns true if query was requested to run from the cache."
-  [{:keys [opts] :as _query-map}]
-  #?(:clj (:cache opts)
-     :cljs false))
+#?(:clj
+   (defn cache?
+     "Returns true if query was requested to run from the cache."
+     [query-map]
+     (-> query-map :opts :cache))
+
+   :cljs
+   (defn cache?
+     "Always returns false because caching is not supported from CLJS."
+     [_]
+     false))
 
 (defn query
   "Returns core async channel with results or exception"

@@ -1,26 +1,25 @@
 (ns user
-  (:require [fluree.db.api :as fluree]
+  (:require [clojure.core.async :as async]
             [clojure.java.io :as io]
-            [clojure.tools.namespace.repl :as tn :refer [refresh refresh-all]]
-            [clojure.core.async :as async]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.did :as did]
-            [fluree.db.util.async :refer [<? <?? go-try merge-into?]]
-            [fluree.db.flake :as flake]
-            [fluree.db.util.json :as json]
-            [fluree.db.serde.json :as serdejson]
-            [fluree.db.query.fql :as fql]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.constants :as const]
-            [fluree.json-ld :as json-ld]
             [clojure.string :as str]
+            [clojure.tools.namespace.repl :as tn :refer [refresh refresh-all]]
             [criterium.core :refer [bench]]
             ;; cljs
-            [figwheel-sidecar.repl-api :as ra]))
+            [figwheel-sidecar.repl-api :as ra]
+            [fluree.db.api :as fluree]
+            [fluree.db.constants :as const]
+            [fluree.db.did :as did]
+            [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.fql :as fql]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.serde.json :as serdejson]
+            [fluree.db.util.async :refer [<? <?? go-try merge-into?]]
+            [fluree.db.util.json :as json]
+            [fluree.json-ld :as json-ld]))
 
 ;; make sure all of following response are async
 ;; http-api/db-handler* (transator)
-
 
 (set! *warn-on-reflection* true)
 
@@ -30,10 +29,8 @@
   [rsc]
   (some-> rsc io/resource slurp (json/parse false)))
 
-
 (def default-private-key
   "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")
-
 
 (def did (did/private->did-map default-private-key))
 
@@ -60,27 +57,27 @@
   (def ledger @(fluree/create file-conn ledger-alias))
 
   (def db1 @(fluree/stage
-              (fluree/db ledger)
-              {"@context" default-context
-               "insert"   [{:id           :ex/brian,
-                            :type         :ex/User,
-                            :schema/name  "Brian"
-                            :schema/email "brian@example.org"
-                            :schema/age   50
-                            :ex/favNums   7}
-                           {:id           :ex/alice,
-                            :type         :ex/User,
-                            :schema/name  "Alice"
-                            :schema/email "alice@example.org"
-                            :schema/age   50
-                            :ex/favNums   [42, 76, 9]}
-                           {:id           :ex/cam,
-                            :type         :ex/User,
-                            :schema/name  "Cam"
-                            :schema/email "cam@example.org"
-                            :schema/age   34
-                            :ex/favNums   [5, 10]
-                            :ex/friend    [:ex/brian :ex/alice]}]}))
+             (fluree/db ledger)
+             {"@context" default-context
+              "insert"   [{:id           :ex/brian,
+                           :type         :ex/User,
+                           :schema/name  "Brian"
+                           :schema/email "brian@example.org"
+                           :schema/age   50
+                           :ex/favNums   7}
+                          {:id           :ex/alice,
+                           :type         :ex/User,
+                           :schema/name  "Alice"
+                           :schema/email "alice@example.org"
+                           :schema/age   50
+                           :ex/favNums   [42, 76, 9]}
+                          {:id           :ex/cam,
+                           :type         :ex/User,
+                           :schema/name  "Cam"
+                           :schema/email "cam@example.org"
+                           :schema/age   34
+                           :ex/favNums   [5, 10]
+                           :ex/friend    [:ex/brian :ex/alice]}]}))
 
   @(fluree/query db1 {:context default-context
                       :select  '[?e ?n]
@@ -95,14 +92,9 @@
                      :select  '[?e ?n]
                      :where   '{:id          ?e
                                 :schema/name ?n}})
-      deref)
+      deref))
 
-  )
-
-
-
-
-                                        ;cljs-stuff
+;cljs-stuff
 (defn start [] (ra/start-figwheel!))
 (defn start-cljs [] (ra/cljs-repl "dev"))
                                         ;(defn stop [] (ra/stop-figwheel!))  ;; errs

@@ -81,7 +81,6 @@
                   ["ex:bart" 0.6708203932499369 [0.1 0.9]]]
                  results)))))))
 
-
 (deftest ^:integration vector-index-search-extra
   (testing "Vector results can join with additional properties"
     (let [conn   (test-utils/create-conn)
@@ -121,7 +120,6 @@
                   ["ex:bart" "Bart Title" 0.68 [0.2, 0.9]]
                   ["ex:bart" "Bart Title" 0.61 [0.1, 0.9]]]
                  results)))))))
-
 
 (deftest ^:integration vector-index-multi-bindings
   (testing "Initial 'solutions' before the search call will produce multiple search results"

@@ -1,16 +1,16 @@
 (ns fluree.db.flake.history
   (:require [clojure.core.async :as async :refer [go >! <!]]
-            [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
-            [fluree.db.storage :as storage]
-            [fluree.db.flake.format :as jld-format]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.format :as jld-format]
             [fluree.db.flake.index :as index]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.json-ld.iri :as iri]))
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -72,26 +72,26 @@
      (fn [t-flakes ch]
        (-> (go
              (try*
-              (let [{assert-flakes  true
-                     retract-flakes false} (group-by flake/op t-flakes)
+               (let [{assert-flakes  true
+                      retract-flakes false} (group-by flake/op t-flakes)
 
-                    t        (flake/t (first t-flakes))
+                     t        (flake/t (first t-flakes))
 
-                    asserts  (->> assert-flakes
-                                  (t-flakes->json-ld db context compact cache error-ch)
-                                  (async/into [])
-                                  <!)
+                     asserts  (->> assert-flakes
+                                   (t-flakes->json-ld db context compact cache error-ch)
+                                   (async/into [])
+                                   <!)
 
-                    retracts (->> retract-flakes
-                                  (t-flakes->json-ld db context compact cache error-ch)
-                                  (async/into [])
-                                  <!)]
-                {t-key       t
-                 assert-key  asserts
-                 retract-key retracts})
-              (catch* e
-                (log/error e "Error converting history flakes.")
-                (>! error-ch e))))
+                     retracts (->> retract-flakes
+                                   (t-flakes->json-ld db context compact cache error-ch)
+                                   (async/into [])
+                                   <!)]
+                 {t-key       t
+                  assert-key  asserts
+                  retract-key retracts})
+               (catch* e
+                 (log/error e "Error converting history flakes.")
+                 (>! error-ch e))))
 
            (async/pipe ch)))
      t-flakes-ch)
@@ -162,79 +162,79 @@
   [{:keys [commit-catalog] :as db} context {:keys [commit data txn] :as include} compact cache error-ch t-flakes]
   (go
     (try*
-     (let [{commit-wrapper-flakes :commit-wrapper
-            commit-meta-flakes    :commit-meta
-            assert-flakes         :assert-flakes
-            retract-flakes        :retract-flakes}
-           (group-by (fn [f]
-                       (cond
-                         (commit-wrapper-flake? f)
-                         :commit-wrapper
+      (let [{commit-wrapper-flakes :commit-wrapper
+             commit-meta-flakes    :commit-meta
+             assert-flakes         :assert-flakes
+             retract-flakes        :retract-flakes}
+            (group-by (fn [f]
+                        (cond
+                          (commit-wrapper-flake? f)
+                          :commit-wrapper
 
-                         (commit-metadata-flake? f)
-                         :commit-meta
+                          (commit-metadata-flake? f)
+                          :commit-meta
 
-                         (and (flake/op f)
-                              (not (extra-data-flake? f)))
-                         :assert-flakes
+                          (and (flake/op f)
+                               (not (extra-data-flake? f)))
+                          :assert-flakes
 
-                         (and (not (flake/op f))
-                              (not (extra-data-flake? f)))
-                         :retract-flakes
+                          (and (not (flake/op f))
+                               (not (extra-data-flake? f)))
+                          :retract-flakes
 
-                         :else
-                         :ignore-flakes))
-                     t-flakes)
-           [assert-flakes* annotation-flakes] (extract-annotation-flakes commit-wrapper-flakes assert-flakes)
+                          :else
+                          :ignore-flakes))
+                      t-flakes)
+            [_ annotation-flakes] (extract-annotation-flakes commit-wrapper-flakes assert-flakes)
 
-           commit-wrapper-chan (jld-format/format-subject-flakes db cache context compact
-                                                             {:wildcard? true, :depth 0}
-                                                             0 nil error-ch commit-wrapper-flakes)
+            commit-wrapper-chan (jld-format/format-subject-flakes db cache context compact
+                                                                  {:wildcard? true, :depth 0}
+                                                                  0 nil error-ch commit-wrapper-flakes)
 
-           commit-meta-chan    (jld-format/format-subject-flakes db cache context compact
-                                                             {:wildcard? true, :depth 0}
-                                                             0 nil error-ch commit-meta-flakes)
+            commit-meta-chan    (jld-format/format-subject-flakes db cache context compact
+                                                                  {:wildcard? true, :depth 0}
+                                                                  0 nil error-ch commit-meta-flakes)
 
-           commit-wrapper      (<! commit-wrapper-chan)
-           commit-meta         (<! commit-meta-chan)
-           asserts             (->> assert-flakes
-                                    (t-flakes->json-ld db context compact cache error-ch)
-                                    (async/into [])
-                                    <!)
-           retracts            (->> retract-flakes
-                                    (t-flakes->json-ld db context compact cache error-ch)
-                                    (async/into [])
-                                    <!)
-           annotation          (<? (t-flakes->json-ld db context compact cache error-ch annotation-flakes))
+            commit-wrapper      (<! commit-wrapper-chan)
+            commit-meta         (<! commit-meta-chan)
+            asserts             (->> assert-flakes
+                                     (t-flakes->json-ld db context compact cache error-ch)
+                                     (async/into [])
+                                     <!)
+            retracts            (->> retract-flakes
+                                     (t-flakes->json-ld db context compact cache error-ch)
+                                     (async/into [])
+                                     <!)
+            annotation          (<? (t-flakes->json-ld db context compact cache error-ch annotation-flakes))
 
-           assert-key          (json-ld/compact const/iri-assert compact)
-           retract-key         (json-ld/compact const/iri-retract compact)
-           t-key               (json-ld/compact const/iri-fluree-t compact)
-           data-key            (json-ld/compact const/iri-data compact)
-           commit-key          (json-ld/compact const/iri-commit compact)
-           annotation-key      (json-ld/compact const/iri-annotation compact)]
-       (if include
-         (cond-> (if txn
-                   (let [txn-key     (json-ld/compact const/iri-txn compact)
-                         txn-address (get commit-wrapper txn-key)
-                         raw-txn     (when txn-address
-                                       (<? (storage/read-json commit-catalog txn-address)))]
-                     (assoc {} txn-key raw-txn))
-                   {})
-           commit (-> (assoc commit-key commit-wrapper)
-                      (assoc-in [commit-key data-key] commit-meta)
-                      (cond-> annotation (assoc-in [commit-key annotation-key] annotation)))
-           data   (-> (assoc-in [data-key assert-key] asserts)
-                      (assoc-in [data-key retract-key] retracts)
-                      (assoc-in [data-key t-key] (get commit-meta t-key))))
-         (-> {commit-key commit-wrapper}
-             (assoc-in [commit-key data-key] commit-meta)
-             (assoc-in [commit-key data-key assert-key] asserts)
-             (assoc-in [commit-key data-key retract-key] retracts)
-             (cond-> annotation (assoc-in [commit-key annotation-key] annotation)))))
-     (catch* e
-       (log/error e "Error converting commit flakes.")
-       (>! error-ch e)))))
+            assert-key          (json-ld/compact const/iri-assert compact)
+            retract-key         (json-ld/compact const/iri-retract compact)
+            t-key               (json-ld/compact const/iri-fluree-t compact)
+            data-key            (json-ld/compact const/iri-data compact)
+            commit-key          (json-ld/compact const/iri-commit compact)
+            annotation-key      (json-ld/compact const/iri-annotation compact)]
+        (if include
+          (cond-> (if txn
+                    (let [txn-key     (json-ld/compact const/iri-txn compact)
+                          txn-address (get commit-wrapper txn-key)
+                          raw-txn     (when txn-address
+                                        (<? (storage/read-json commit-catalog txn-address)))]
+                      (assoc {} txn-key raw-txn))
+                    {})
+            commit (-> (assoc commit-key commit-wrapper)
+                       (assoc-in [commit-key data-key] commit-meta)
+                       (cond-> annotation (assoc-in [commit-key annotation-key] annotation)))
+            data   (-> (assoc-in [data-key assert-key] asserts)
+                       (assoc-in [data-key retract-key] retracts)
+                       (assoc-in [data-key t-key] (get commit-meta t-key))))
+          (-> {commit-key commit-wrapper}
+              (assoc-in [commit-key data-key] commit-meta)
+              (assoc-in [commit-key data-key assert-key] asserts)
+              (assoc-in [commit-key data-key retract-key] retracts)
+              (cond-> annotation (assoc-in [commit-key annotation-key] annotation)))))
+      (catch* e
+        (log/error e "Error converting commit flakes.")
+        (>! error-ch e)))))
 
 (defn commit-flakes->json-ld
   "Create a collection of commit maps."
@@ -296,7 +296,7 @@
                                             {:from-t from-t, :to-t to-t})
                 consecutive-commit-details (<! (->> flake-slices-ch
                                                     (commit-flakes->json-ld
-                                                      db context include error-ch)
+                                                     db context include error-ch)
                                                     (async/into [])))]
             (map into chunk consecutive-commit-details)))
         ch))

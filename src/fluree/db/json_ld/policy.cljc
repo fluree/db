@@ -34,14 +34,14 @@
   would looses the @type information."
   [query-results]
   (mapv
-    (fn [{q   const/iri-query
-          t-s const/iri-targetSubject
-          t-p const/iri-targetProperty :as policy}]
-      (cond-> policy
-        q   (assoc const/iri-query {"@value" q "@type" "@json"})
-        t-s (assoc const/iri-targetSubject  (mapv #(if (get % "@id") % {"@value" % "@type" "@json"}) (util/sequential t-s)))
-        t-p (assoc const/iri-targetProperty (mapv #(if (get % "@id") % {"@value" % "@type" "@json"}) (util/sequential t-p)))))
-    query-results))
+   (fn [{q   const/iri-query
+         t-s const/iri-targetSubject
+         t-p const/iri-targetProperty :as policy}]
+     (cond-> policy
+       q   (assoc const/iri-query {"@value" q "@type" "@json"})
+       t-s (assoc const/iri-targetSubject  (mapv #(if (get % "@id") % {"@value" % "@type" "@json"}) (util/sequential t-s)))
+       t-p (assoc const/iri-targetProperty (mapv #(if (get % "@id") % {"@value" % "@type" "@json"}) (util/sequential t-p)))))
+   query-results))
 
 (defn wrap-class-policy
   "Given one or more policy classes, queries for policies

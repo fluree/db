@@ -1,14 +1,14 @@
 (ns fluree.db.json-ld.commit-data
   (:require [fluree.crypto :as crypto]
+            [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.exec.update :as update]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.util.core :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]
-            [fluree.db.constants :as const]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.query.fql.parse :as q-parse]
-            [fluree.db.query.exec.update :as update]
-            [fluree.db.query.exec.where :as where]))
+            [fluree.db.util.log :as log]))
 
 (def commit-version 1)
 
@@ -56,7 +56,6 @@
               :opst    "fluree:ipfs://opst"
               :tspo    "fluree:ipfs://tspo"}})
 
-
 (def json-ld-base-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
   [["@context" "https://ns.flur.ee/ledger/v1"]
@@ -78,7 +77,6 @@
    ["ns" :ns]             ;; refer to :ns template
    ["index" :index]]) ;; refer to :index template
 
-
 (def json-ld-prev-commit-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
   [["id" :id]
@@ -90,7 +88,6 @@
   [["id" :id]
    ["type" ["DB"]]
    ["address" :address]])
-
 
 (def json-ld-data-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
@@ -203,19 +200,19 @@
              :tag    (mapv :value tags)
              :data   (parse-db-data data)
              :author author}
-            txn (assoc :txn txn)
-            address (assoc :address address)
-            prev-commit (assoc :previous {:id      (:id prev-commit)
-                                          :address (get-first-value prev-commit const/iri-address)})
-            message (assoc :message message)
-            ns (assoc :ns (->> ns
-                               util/sequential
-                               (mapv (fn [namespace]
-                                       (select-keys namespace [:id])))))
-            index (assoc :index {:id      (:id index)
-                                 :address (get-first-value index const/iri-address)
-                                 :data    (parse-db-data (get-first index const/iri-data))})
-            issuer (assoc :issuer (select-keys issuer [:id])))))
+      txn (assoc :txn txn)
+      address (assoc :address address)
+      prev-commit (assoc :previous {:id      (:id prev-commit)
+                                    :address (get-first-value prev-commit const/iri-address)})
+      message (assoc :message message)
+      ns (assoc :ns (->> ns
+                         util/sequential
+                         (mapv (fn [namespace]
+                                 (select-keys namespace [:id])))))
+      index (assoc :index {:id      (:id index)
+                           :address (get-first-value index const/iri-address)
+                           :data    (parse-db-data (get-first index const/iri-data))})
+      issuer (assoc :issuer (select-keys issuer [:id])))))
 
 (defn update-index-roots
   [commit-map {:keys [spot post opst tspo]}]
@@ -342,7 +339,7 @@
            :address db-address ;; address to locate db
            :flakes  flakes
            :size    size}
-          (not-empty prev-data) (assoc :previous prev-data)))
+    (not-empty prev-data) (assoc :previous prev-data)))
 
 (defn data
   "Given a commit map, returns them most recent data map."
@@ -374,13 +371,13 @@
                                :data data-commit
                                :time time))]
     (cond-> commit
-            txn-id (assoc :txn txn-id)
-            author (assoc :author author)
-            issuer (assoc :issuer {:id issuer})
-            prev-commit (assoc :previous prev-commit)
-            message (assoc :message message)
-            annotation (assoc :annotation annotation)
-            tag (assoc :tag tag))))
+      txn-id (assoc :txn txn-id)
+      author (assoc :author author)
+      issuer (assoc :issuer {:id issuer})
+      prev-commit (assoc :previous prev-commit)
+      message (assoc :message message)
+      annotation (assoc :annotation annotation)
+      tag (assoc :tag tag))))
 
 (defn ref?
   [f]
@@ -397,8 +394,8 @@
 (defn calc-flake-size
   [add rem]
   (cond-> 0
-          add (+ (flake/size-bytes add))
-          rem (- (flake/size-bytes rem))))
+    add (+ (flake/size-bytes add))
+    rem (- (flake/size-bytes rem))))
 
 (defn update-novelty
   ([db add]
@@ -407,8 +404,8 @@
   ([{:keys [t] :as db} add rem]
    (try*
      (let [flake-count (cond-> 0
-                               add (+ (count add))
-                               rem (- (count rem)))
+                         add (+ (count add))
+                         rem (- (count rem)))
            ;; launch futures for parallellism on JVM
            flake-size  #?(:clj  (future (calc-flake-size add rem))
                           :cljs (calc-flake-size add rem))
@@ -430,10 +427,10 @@
                                           :cljs flake-size))
            (update-in [:stats :flakes] + flake-count)))
      (catch* e
-             (log/error (str "Update novelty unexpected error while attempting to updated db: "
-                             (pr-str db) " due to exception: " (ex-message e))
-                        {:add-flakes add
-                         :rem-flakes rem})
+       (log/error (str "Update novelty unexpected error while attempting to updated db: "
+                       (pr-str db) " due to exception: " (ex-message e))
+                  {:add-flakes add
+                   :rem-flakes rem})
        (throw e)))))
 
 (defn add-tt-id
@@ -445,15 +442,15 @@
   (let [tt-id   (random-uuid)
         indexes [:spot :post :opst :tspo]]
     (-> (reduce
-          (fn [db* idx]
-            (let [{:keys [children] :as node} (get db* idx)
-                  children* (reduce-kv
-                              (fn [children* k v]
-                                (assoc children* k (assoc v :tt-id tt-id)))
-                              (empty children) children)]
-              (assoc db* idx (assoc node :tt-id tt-id
-                                         :children children*))))
-          db indexes)
+         (fn [db* idx]
+           (let [{:keys [children] :as node} (get db* idx)
+                 children* (reduce-kv
+                            (fn [children* k v]
+                              (assoc children* k (assoc v :tt-id tt-id)))
+                            (empty children) children)]
+             (assoc db* idx (assoc node :tt-id tt-id
+                                   :children children*))))
+         db indexes)
         (assoc :tt-id tt-id))))
 
 (defn commit-metadata-flakes
@@ -490,22 +487,22 @@
       ;; flakes
       (flake/create db-sid const/$_commitdata:flakes flakes const/$xsd:int t true nil)]
 
-     (:id previous)
-     (conj (flake/create commit-sid const/$_previous (iri/encode-iri db (:id previous)) const/$id t true nil))
+      (:id previous)
+      (conj (flake/create commit-sid const/$_previous (iri/encode-iri db (:id previous)) const/$id t true nil))
 
-     (:id issuer)
-     (conj (flake/create commit-sid const/$_commit:signer (iri/encode-iri db (:id issuer)) const/$id t true nil))
+      (:id issuer)
+      (conj (flake/create commit-sid const/$_commit:signer (iri/encode-iri db (:id issuer)) const/$id t true nil))
 
-     message
-     (conj (flake/create commit-sid const/$_commit:message message const/$xsd:string t true nil))
+      message
+      (conj (flake/create commit-sid const/$_commit:message message const/$xsd:string t true nil))
 
      ;; TODO - author should really be an IRI, not a string
-     author
-     (conj (flake/create commit-sid const/$_commit:author author const/$xsd:string t true nil))
+      author
+      (conj (flake/create commit-sid const/$_commit:author author const/$xsd:string t true nil))
 
      ;; TODO - txn should really be an IRI, not a string
-     txn
-     (conj (flake/create commit-sid const/$_commit:txn txn const/$xsd:string t true nil)))))
+      txn
+      (conj (flake/create commit-sid const/$_commit:txn txn const/$xsd:string t true nil)))))
 
 (defn annotation-flakes
   [db t commit-sid annotation]
@@ -532,7 +529,7 @@
         [db* annotation-flakes] (annotation-flakes db t commit-sid annotation)
 
         commit-flakes      (cond-> base-flakes
-                                   annotation-flakes (into annotation-flakes))]
+                             annotation-flakes (into annotation-flakes))]
     (-> db*
         (update-novelty commit-flakes)
         add-tt-id)))

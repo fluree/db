@@ -1,7 +1,9 @@
 .PHONY: all deps jar install deploy nodejs browser webworker cljtest	\
 	cljs-browser-test cljs-node-test cljstest test eastwood ci clean	\
 	js-packages sync-package-json publish-nodejs publish-browser		\
-	publish-webworker publish-js pending-tests pt
+	publish-webworker publish-js pending-tests pt clj-kondo-lint            \
+	clj-kondo-lint-ci cljfmt-check
+
 
 DOCS_MARKDOWN := $(shell find docs -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
@@ -116,12 +118,24 @@ pending-tests:
 
 pt: pending-tests
 
+clj-kondo-lint:
+	clj-kondo --lint src:test:build.clj
+
+clj-kondo-lint-ci:
+	clj-kondo --lint src:test:build.clj --config .clj-kondo/ci-config.edn
+
+cljfmt-check:
+	cljfmt check src dev test build.clj
+
+cljfmt-fix:
+	cljfmt fix src dev test build.clj
+
 test: cljtest cljstest nodejs-test browser-test
 
 eastwood:
 	clojure -M:dev:cljtest:eastwood
 
-ci: test eastwood
+ci: test eastwood clj-kondo-lint-ci cljfmt-check
 
 clean:
 	clojure -T:build clean

@@ -1,9 +1,9 @@
 (ns fluree.db.method.ipfs.xhttp
-  (:require [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.xhttp :as xhttp]
+  (:require [clojure.core.async :as async]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
-            [clojure.core.async :as async]
-            [fluree.db.util.log :as log :include-macros true])
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.xhttp :as xhttp])
   (:refer-clojure :exclude [cat]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -20,7 +20,6 @@
                      (assoc acc Name Id))
                    {})))))
 
-
 (defn ls
   "Performs ipfs directory list. Returns vector of directory items.
   If a directory item is a sub-directory, :type will = 1.
@@ -33,13 +32,13 @@
                        first
                        :Links)]
       (mapv
-        (fn [{:keys [Name Hash Size Type Target]}]
-          {:name   Name
-           :hash   Hash
-           :size   Size
-           :type   Type
-           :target Target})
-        nodes))))
+       (fn [{:keys [Name Hash Size Type Target]}]
+         {:name   Name
+          :hash   Hash
+          :size   Size
+          :type   Type
+          :target Target})
+       nodes))))
 
 (defn add
   "Adds payload data to IPFS.
@@ -86,7 +85,6 @@
                    {:status 500 :error :db/ipfs-failure} res))
         res))))
 
-
 (defn publish
   "Publishes ipfs-cid to IPNS server using specified IPNS address key.
   Returns core async channel with response."
@@ -94,8 +92,8 @@
   (log/debug "Publishing IPNS update for key:" key "with IPFS CID:" ipfs-cid)
   (go-try
     (let [endpoint (cond-> (str ipfs-endpoint "api/v0/name/publish?")
-                           key (str "key=" key "&")
-                           true (str "arg=" ipfs-cid))
+                     key (str "key=" key "&")
+                     true (str "arg=" ipfs-cid))
           {:keys [Name Value] :as res} (<? (xhttp/post-json endpoint nil {:request-timeout 200000}))]
       (log/debug "IPNS publish complete with response: " res)
       {:name  Name
@@ -105,7 +103,7 @@
   [ipfs-endpoint ipns-key]
   (go-try
     (let [endpoint (cond-> (str ipfs-endpoint "api/v0/name/resolve?")
-                           ipns-key (str "arg=" ipns-key))
+                     ipns-key (str "arg=" ipns-key))
           {:keys [Path] :as res} (<? (xhttp/post-json endpoint nil {:request-timeout 200000}))]
       (log/debug "IPNS name resolve complete with response: " res)
       Path)))
