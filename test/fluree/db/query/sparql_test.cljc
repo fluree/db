@@ -769,6 +769,32 @@
              (try* (sparql/->fql query)
                    (catch* e (ex-message e))))))))
 
+(deftest parse-update
+  (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+               PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+               INSERT
+                 { GRAPH <http://example/addresses>
+                   {
+                     ?person  foaf:name  ?name .
+                     ?person  foaf:mbox  ?email
+                   } }
+              WHERE
+                { GRAPH  <http://example/people>
+                  {
+                    ?person  foaf:name  ?name .
+                    OPTIONAL { ?person  foaf:mbox  ?email }
+                  } }"]
+    (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/",
+                      "rdf" "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
+            :insert [[:graph "http://example/addresses"
+                      [{"@id" "?person", "foaf:mbox" "?email"}]]],
+            :where [[:graph "http://example/people"
+                     [{"@id" "?person", "foaf:name" "?name"}
+                      [:optional [{"@id" "?person", "foaf:mbox" "?email"}]]]]]}
+           (try* (sparql/->fql query)
+                 (catch* e (ex-message e)))))))
+
 (deftest parsing-error
   (testing "invalid query throws expected error"
     (let [query "SELECT ?person
