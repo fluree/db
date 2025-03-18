@@ -823,7 +823,7 @@
   ;; DeleteClause ::= <'DELETE'> WS QuadPattern
   ;; <QuadPattern> ::= <'{'> WS Quads <'}'> WS
   [[_ quad-pattern]]
-  [[:delete (parse-term quad-pattern)]])
+  [(into [:delete] (parse-term quad-pattern))])
 
 (defmethod parse-rule :InsertData
   ;; InsertClause ::= <'INSERT DATA'> WS QuadData
@@ -835,7 +835,7 @@
   ;; InsertClause ::= <'INSERT'> WS QuadPattern
   ;; <QuadPattern> ::= <'{'> WS Quads <'}'> WS
   [[_ quad-pattern]]
-  [[:insert (parse-term quad-pattern)]])
+  [(into [:insert] (parse-term quad-pattern))])
 
 (defmethod parse-rule :ModifyClause
   ;; ModifyClause ::= ( DeleteClause InsertClause? | InsertClause )
@@ -849,9 +849,9 @@
 
 (defmethod parse-rule :ModifyWith
   ;; ModifyWith ::= <'WITH'> WS iri ModifyClause UsingClause* ModifyWhere
-  [_]
-  (throw (ex-info "WITH is not a supported SPARQL pattern."
-                  {:status 400 :error :db/invalid-query})))
+  [[_ iri & clauses]]
+  (into [[:ledger (parse-term iri)]]
+        (mapcat parse-rule clauses)))
 
 (defmethod parse-rule :Update
   ;; Update ::= Prologue ( Update1 ( ';' Update )? )?
