@@ -791,6 +791,19 @@
                      {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
            (sparql/->fql query))))
   (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+               WITH <http://example/addresses>
+               DELETE { ?person foaf:givenName 'Bill' }
+               INSERT { ?person foaf:givenName 'William' }
+               WHERE
+                 { ?person foaf:givenName 'Bill'
+                 }"]
+    (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/"},
+            :ledger "http://example/addresses",
+            :delete [{"@id" "?person", "foaf:givenName" "Bill"}],
+            :insert [{"@id" "?person", "foaf:givenName" "William"}],
+            :where [{"@id" "?person", "foaf:givenName" "Bill"}]}
+           (sparql/->fql query))))
+  (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
                PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 
                INSERT
