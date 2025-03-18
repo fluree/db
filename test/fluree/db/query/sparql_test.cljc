@@ -771,6 +771,26 @@
                   (catch* e (ex-message e))))))))
 
 (deftest parse-update
+  (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+               INSERT DATA
+                 {
+                   <http://example/book1> dc:title \"A new book\" ;
+                                          dc:creator \"A.N.Other\" .
+                 }"]
+    (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
+            :insert [{"@id" "http://example/book1", "dc:title" "A new book"}
+                     {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
+           (sparql/->fql query))))
+  (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+               DELETE DATA
+                 {
+                   <http://example/book1> dc:title \"A new book\" ;
+                                          dc:creator \"A.N.Other\" .
+                 }"]
+    (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
+            :delete [{"@id" "http://example/book1", "dc:title" "A new book"}
+                     {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
+           (sparql/->fql query))))
   (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
                PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 
