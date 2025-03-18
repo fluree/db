@@ -813,6 +813,13 @@
   [[_ & quads]]
   (mapv parse-term quads))
 
+(defmethod parse-rule :DeleteWhere
+  ;; DeleteWhere ::= <'DELETE WHERE'> WS QuadPattern
+  [[_ quad-pattern]]
+  (let [pattern (parse-term quad-pattern)]
+    [(into [:where] pattern)
+     (into [:delete] pattern)]))
+
 (defmethod parse-rule :DeleteData
   ;; DeleteClause ::= <'DELETE DATA'> WS QuadData
   ;; <QuadData> ::= <'{'> WS Quads <'}'> WS
