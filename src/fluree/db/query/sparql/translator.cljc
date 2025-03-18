@@ -803,7 +803,10 @@
 (defmethod parse-term :QuadsNotTriples
   ;; QuadsNotTriples ::= <'GRAPH'> WS VarOrIri <'{'> WS TriplesTemplate? <'}'> WS
   [[_ graph-iri triples & triples-template]]
-  (into [:graph (parse-term graph-iri)] (map parse-term triples-template)))
+  ;; This is how we would translate it if we supported it in FQL
+  ;; (into [:graph (parse-term graph-iri)] (map parse-term triples-template))
+  (throw (ex-info "GRAPH is not supported in SPARQL Update."
+                  {:status 400 :error :db/invalid-update })))
 
 (defmethod parse-term :Quads
   ;; <Quads> ::= TriplesTemplate? ( QuadsNotTriples '.'? TriplesTemplate? )*

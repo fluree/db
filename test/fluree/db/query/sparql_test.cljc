@@ -785,13 +785,7 @@
                     ?person  foaf:name  ?name .
                     OPTIONAL { ?person  foaf:mbox  ?email }
                   } }"]
-    (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/",
-                      "rdf" "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
-            :insert [[:graph "http://example/addresses"
-                      [{"@id" "?person", "foaf:mbox" "?email"}]]],
-            :where [[:graph "http://example/people"
-                     [{"@id" "?person", "foaf:name" "?name"}
-                      [:optional [{"@id" "?person", "foaf:mbox" "?email"}]]]]]}
+    (is (= "GRAPH is not supported in SPARQL Update."
            (try* (sparql/->fql query)
                  (catch* e (ex-message e)))))))
 
