@@ -30,7 +30,11 @@
     "foaf:family_name" "Hacker"}
    {"@id"            "ex:bob"
     "foaf:firstname" "Bob"
-    "foaf:surname"   "Hacker"}])
+    "foaf:surname"   "Hacker"}
+   {"@id"    "ex:fran"
+    "name"   {"@value" "Francois" "@language" "fr"}
+    "config" {"@type" "@json" "@value" {"paths" ["dev" "src"]}}
+    "date"   {"@value" "2020-10-20" "@type" "http://www.w3.org/2001/XMLSchema#date"}}])
 
 (deftest construct-test
   (let [conn    @(fluree/connect-memory)
@@ -83,6 +87,23 @@
                                               {"@id" "?s" "friendname" "?friendName"}
                                               {"@id" "?friend" "name" "?friendName"}
                                               {"@id" "?friend" "num" "?friendNum"}]}))))
+    (testing "value metadata displays"
+      (is (= {"@graph"
+              [{"@id" "ex:fran",
+                "json" [{"@value" "{\"paths\":[\"dev\",\"src\"]}",
+                         "@type" "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}],
+                "name" [{"@value" "Francois", "@language" "fr"}],
+                "date" [{"@value" #time/date "2020-10-20",
+                         "@type" "http://www.w3.org/2001/XMLSchema#date"}]}],
+              "@context"
+              {"person" "http://example.org/Person#", "ex" "http://example.org/"}}
+             @(fluree/query db1 {"@context" context
+                                 "where" [{"@id" "?s" "config" "?config"}
+                                          {"@id" "?s" "name" "?name"}
+                                          {"@id" "?s" "date" "?date"}]
+                                 "construct" [{"@id" "?s" "json" "?config"}
+                                              {"@id" "?s" "name" "?name"}
+                                              {"@id" "?s" "date" "?date"}]}))))
     #_(testing "bnode template"
       (is (= {"@context" {"person" "http://example.org/Person#", "ex" "http://example.org/"}
               "@graph"
