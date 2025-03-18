@@ -770,50 +770,87 @@
                    (catch* e (ex-message e))))))))
 
 (deftest parse-update
-  (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+  (testing "insert data"
+    (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
                INSERT DATA
                  {
                    <http://example/book1> dc:title \"A new book\" ;
                                           dc:creator \"A.N.Other\" .
                  }"]
-    (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
-            :insert [{"@id" "http://example/book1", "dc:title" "A new book"}
-                     {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
-           (sparql/->fql query))))
-  (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+      (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
+              :insert  [{"@id" "http://example/book1", "dc:title" "A new book"}
+                        {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
+             (sparql/->fql query)))))
+  (testing "delete-data"
+    (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
                DELETE DATA
                  {
                    <http://example/book1> dc:title \"A new book\" ;
                                           dc:creator \"A.N.Other\" .
                  }"]
-    (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
-            :delete [{"@id" "http://example/book1", "dc:title" "A new book"}
-                     {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
-           (sparql/->fql query))))
-  (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+      (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
+              :delete  [{"@id" "http://example/book1", "dc:title" "A new book"}
+                        {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
+             (sparql/->fql query)))))
+  (testing "delete/insert where"
+    (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
                WITH <http://example/addresses>
                DELETE { ?person foaf:givenName 'Bill' }
                INSERT { ?person foaf:givenName 'William' }
                WHERE
                  { ?person foaf:givenName 'Bill'
                  }"]
-    (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/"},
-            :ledger "http://example/addresses",
-            :delete [{"@id" "?person", "foaf:givenName" "Bill"}],
-            :insert [{"@id" "?person", "foaf:givenName" "William"}],
-            :where [{"@id" "?person", "foaf:givenName" "Bill"}]}
-           (sparql/->fql query))))
-  (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+      (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/"},
+              :ledger  "http://example/addresses",
+              :delete  [{"@id" "?person", "foaf:givenName" "Bill"}],
+              :insert  [{"@id" "?person", "foaf:givenName" "William"}],
+              :where   [{"@id" "?person", "foaf:givenName" "Bill"}]}
+             (sparql/->fql query)))))
+  (testing "delete where"
+    (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
                DELETE WHERE { ?person foaf:givenName 'Fred';
                                       ?property      ?value }"]
-    (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/"},
-            :where   [{"@id" "?person", "foaf:givenName" "Fred"}
-                      {"@id" "?person", "?property" "?value"}],
-            :delete  [{"@id" "?person", "foaf:givenName" "Fred"}
-                      {"@id" "?person", "?property" "?value"}]}
-           (sparql/->fql query))))
+      (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/"},
+              :where   [{"@id" "?person", "foaf:givenName" "Fred"}
+                        {"@id" "?person", "?property" "?value"}],
+              :delete  [{"@id" "?person", "foaf:givenName" "Fred"}
+                        {"@id" "?person", "?property" "?value"}]}
+             (sparql/->fql query)))))
+  (testing "using clauses"
+    (testing "one USING clause"
+      (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+                 DELETE { ?person ?property ?value }
+                 USING <http://flur.ee/ledger1>
+                 WHERE { ?person foaf:givenName 'Fred';
+                                 ?property      ?value }"]
+        (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/"},
+                :delete [{"@id" "?person", "?property" "?value"}],
+                :ledger "http://flur.ee/ledger1",
+                :where [{"@id" "?person", "foaf:givenName" "Fred"}
+                        {"@id" "?person", "?property" "?value"}]}
+               (sparql/->fql query)))))
+    (testing "one USING NAMED clause"
+      (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+                 DELETE { ?person ?property ?value }
+                 USING NAMED <http://flur.ee/ledger2>
+                 WHERE { ?person foaf:givenName 'Fred';
+                                 ?property      ?value }"]
+        (is (= "USING NAMED is not supported in SPARQL Update."
+               (try* (sparql/->fql query)
+                     (catch* e (ex-message e)))))))
+    (testing "more than one"
+      (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+                 DELETE { ?person ?property ?value }
+                 USING <http://flur.ee/ledger1>
+                 USING NAMED <http://flur.ee/ledger2>
+                 WHERE { ?person foaf:givenName 'Fred';
+                                 ?property      ?value }"]
+        (is (= "More than one USING clause is not supported in SPARQL Update."
+               (try* (sparql/->fql query)
+                     (catch* e (ex-message e))))))))
 
-  (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+  (testing "graph patterns"
+    (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
                PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 
                INSERT
@@ -828,9 +865,9 @@
                     ?person  foaf:name  ?name .
                     OPTIONAL { ?person  foaf:mbox  ?email }
                   } }"]
-    (is (= "GRAPH is not supported in SPARQL Update."
-           (try* (sparql/->fql query)
-                 (catch* e (ex-message e)))))))
+      (is (= "GRAPH is not supported in SPARQL Update."
+             (try* (sparql/->fql query)
+                   (catch* e (ex-message e))))))))
 
 (deftest parsing-error
   (testing "invalid query throws expected error"
