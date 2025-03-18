@@ -849,16 +849,40 @@
   [[_ & clauses ]]
   (mapcat parse-rule clauses))
 
-(defmethod parse-rule :Modify
-  ;; Modify ::= ModifyClause UsingClause* ModifyWhere
-  [[_ & clauses]]
-  (mapcat parse-rule clauses))
+(defmethod parse-rule :UsingNamed
+  ;; UsingNamed ::= <'USING NAMED'> WS iri
+  [[_ iri]]
+  (throw (ex-info "USING NAMED is not supported in SPARQL Update."
+                  {:status 400 :error :db/invalid-update})))
+
+(defmethod parse-rule :UsingDefault
+  ;; UsingDefault ::= <'USING'> WS iri
+  [[_ iri]]
+  [[:ledger (parse-term iri)]])
+
+(defmethod parse-rule :UsingClause
+  ;; UsingClause ::= (UsingDefault | UsingNamed)*
+  [[_ & using-clauses]]
+  (cond (zero? (count using-clauses))
+        []
+
+        (= 1 (count using-clauses))
+        (parse-rule (first using-clauses))
+
+        :else
+        (throw (ex-info "More than one USING clause is not supported in SPARQL Update."
+                        {:status 400 :error :db/invalid-update}))))
 
 (defmethod parse-rule :ModifyWith
   ;; ModifyWith ::= <'WITH'> WS iri ModifyClause UsingClause* ModifyWhere
   [[_ iri & clauses]]
   (into [[:ledger (parse-term iri)]]
         (mapcat parse-rule clauses)))
+
+(defmethod parse-rule :Modify
+  ;; Modify ::= ModifyClause UsingClause* ModifyWhere
+  [[_ & clauses]]
+  (mapcat parse-rule clauses))
 
 (defmethod parse-rule :Update
   ;; Update ::= Prologue ( Update1 ( ';' Update )? )?
