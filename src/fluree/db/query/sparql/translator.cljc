@@ -795,6 +795,54 @@
           []
           construct-query))
 
+(defmethod parse-rule :ModifyWhere
+  ;; ModifyWhere ::= <'WHERE'> GroupGraphPattern
+  [[_ group-pattern]]
+  [[:where (vec (parse-term group-pattern))]])
+
+(defmethod parse-term :QuadsNotTriples
+  ;; QuadsNotTriples ::= <'GRAPH'> WS VarOrIri <'{'> WS TriplesTemplate? <'}'> WS
+  [[_ graph-iri triples & triples-template]]
+  (into [:graph (parse-term graph-iri)] (map parse-term triples-template)))
+
+(defmethod parse-term :Quads
+  ;; <Quads> ::= TriplesTemplate? ( QuadsNotTriples '.'? TriplesTemplate? )*
+  [[_ & quads]]
+  (mapv parse-term quads))
+
+(defmethod parse-rule :DeleteClause
+  ;; DeleteClause ::= <'DELETE'> WS QuadPattern
+  [[_ quad-pattern]]
+  [[:delete (parse-term quad-pattern)]])
+
+(defmethod parse-rule :InsertClause
+  ;; InsertClause ::= <'INSERT'> WS QuadPattern
+  [[_ quad-pattern]]
+  [[:insert (parse-term quad-pattern)]])
+
+(defmethod parse-rule :ModifyClause
+  ;; ModifyClause ::= ( DeleteClause InsertClause? | InsertClause )
+  [[_ & clauses ]]
+  (mapcat parse-rule clauses))
+
+(defmethod parse-rule :Modify
+  ;; Modify ::= ModifyClause UsingClause* ModifyWhere
+  [[_ & clauses]]
+  (mapcat parse-rule clauses))
+
+(defmethod parse-rule :ModifyWith
+  ;; ModifyWith ::= <'WITH'> WS iri ModifyClause UsingClause* ModifyWhere
+  [_]
+  (throw (ex-info "WITH is not a supported SPARQL pattern."
+                  {:status 400 :error :db/invalid-query})))
+
+(defmethod parse-rule :Update
+  ;; Update ::= Prologue ( Update1 ( ';' Update )? )?
+  [[_ & update-op]]
+  (reduce (fn [entries rule] (into entries (parse-rule rule)))
+          []
+          update-op))
+
 (defmethod parse-rule :PrettyPrint
   [_]
   [[:prettyPrint true]])
