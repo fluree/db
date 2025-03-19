@@ -584,7 +584,7 @@
   ;; PathPrimary    ::=   iri | Type | '!' PathNegatedPropertySet | '(' Path ')'
   ;; PathNegatedPropertySet   ::=   PathOneInPropertySet | '(' ( PathOneInPropertySet ( '|' PathOneInPropertySet )* )? ')'
   ;; PathOneInPropertySet   ::=   iri | Type | '^' ( iri | Type )
-  ;; Type ::= (WS 'a' WS)
+  ;; Type ::= (WS <'a'> WS)
   [[_ el]]
   (cond (rule? el) (parse-term el)
         (= el "a") const/iri-type
