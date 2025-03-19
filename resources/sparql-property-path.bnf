@@ -1,0 +1,22 @@
+<Path> ::= PathAlternative
+<PathAlternative> ::= PathSequence ( <'|'> PathSequence )*
+PathSequence ::= PathEltOrInverse ( <'/'> PathEltOrInverse )*
+<PathEltOrInverse> ::= PathElt | <'^'> PathElt
+<PathElt> ::= PathPrimary PathMod?
+PathPrimary ::= iri | '!' PathNegatedPropertySet | '(' Path ')'
+PathMod ::= '?' | '*' | ('+' INTEGER?) WS
+PathNegatedPropertySet ::= PathOneInPropertySet | '(' ( PathOneInPropertySet ( '|' PathOneInPropertySet )* )? ')'
+PathOneInPropertySet ::= iri | '^' iri
+iri   ::=  ( IRIREF | PrefixedName ) WS
+
+<INTEGER>   ::=   #"[0-9]+"
+IRIREF    ::=   #"<[^<>\"{}|^`\x00-\x20]*>" WS
+<WS>    ::=   <#"[\x20\x09\x0D\x0A]*\#[^\n]*\n*[\x20\x09\x0D\x0A]*|[\x20\x09\x0D\x0A]*">
+
+PrefixedName    ::=   ( PNAME_LN WS ) | ( PNAME_NS WS)
+<PNAME_LN>    ::=   PNAME_NS PN_LOCAL '*'?
+<PN_LOCAL>    ::=   ( PN_CHARS_U | #"[0-9]" ) ((PN_CHARS|#"\.")* PN_CHARS)?
+<PN_CHARS>    ::=   PN_CHARS_U | #"-|[0-9]|\u00B7|[\u0300-\u036F]|[\u203F-\u2040]|/"
+<PN_PREFIX>   ::=   PN_CHARS_BASE ((PN_CHARS|#"\.")* PN_CHARS)?
+<PN_CHARS_U>    ::=   PN_CHARS_BASE | #"_"
+<PNAME_NS>    ::=   PN_PREFIX? ':'

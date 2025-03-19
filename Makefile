@@ -8,14 +8,14 @@ DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
 
 SOURCES := $(shell find src)
 RESOURCES := $(shell find resources)
-BROWSER_SOURCES := src/clj/fluree/sdk/browser.cljs
-NODEJS_SOURCES := src/clj/fluree/sdk/node.cljs
-WEBWORKER_SOURCES := src/clj/fluree/sdk/webworker.cljs
+BROWSER_SOURCES := src/fluree/sdk/browser.cljs
+NODEJS_SOURCES := src/fluree/sdk/node.cljs
+WEBWORKER_SOURCES := src/fluree/sdk/webworker.cljs
 ALL_SOURCES := $(SOURCES) $(BROWSER_SOURCES) $(WEBWORKER_SOURCES) $(NODEJS_SOURCES)
 
 all: jar browser nodejs webworker js-packages docs
 
-target/fluree-db.jar: out node_modules src/clj/deps.cljs $(ALL_SOURCES) $(RESOURCES)
+target/fluree-db.jar: out node_modules src/deps.cljs $(ALL_SOURCES) $(RESOURCES)
 	clojure -T:build jar
 
 jar: target/fluree-db.jar
@@ -23,17 +23,17 @@ jar: target/fluree-db.jar
 package-lock.json node_modules: package.json
 	npm install && touch package-lock.json node_modules
 
-out/fluree-node-sdk.js: package.json package-lock.json node_modules deps.edn src/clj/deps.cljs shadow-cljs.edn $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
+out/fluree-node-sdk.js: package.json package-lock.json node_modules deps.edn src/deps.cljs shadow-cljs.edn $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
 	npx shadow-cljs release fluree-node-sdk && cp out/nodejs/fluree-node-sdk.js out/fluree-node-sdk.js
 
 nodejs: out/fluree-node-sdk.js
 
-out/fluree-browser-sdk.js: package.json package-lock.json node_modules deps.edn src/clj/deps.cljs shadow-cljs.edn $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
+out/fluree-browser-sdk.js: package.json package-lock.json node_modules deps.edn src/deps.cljs shadow-cljs.edn $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
 	npx shadow-cljs release fluree-browser-sdk && cp out/browser/fluree-browser-sdk.js out/fluree-browser-sdk.js
 
 browser: out/fluree-browser-sdk.js
 
-out/fluree-webworker.js: package.json package-lock.json node_modules deps.edn src/clj/deps.cljs shadow-cljs.edn $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
+out/fluree-webworker.js: package.json package-lock.json node_modules deps.edn src/deps.cljs shadow-cljs.edn $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
 	npx shadow-cljs release fluree-webworker && cp out/webworker/fluree-webworker.js out/fluree-webworker.js
 
 webworker: out/fluree-webworker.js
@@ -41,7 +41,7 @@ webworker: out/fluree-webworker.js
 deps:
 	clojure -A:cljtest:cljstest:eastwood:docs -P
 
-src/clj/deps.cljs: package.json
+src/deps.cljs: package.json
 	clojure -M:js-deps
 
 install: target/fluree-db.jar
@@ -85,7 +85,7 @@ publish-webworker: js-packages/webworker/fluree-webworker.js js-packages/webwork
 
 publish-js: publish-nodejs publish-browser publish-webworker
 
-docs/fluree.db.json-ld.api.html docs/index.html: src/clj/fluree/db/json_ld/api.cljc
+docs/fluree.db.json-ld.api.html docs/index.html: src/fluree/db/json_ld/api.cljc
 	clojure -T:build docs :output-path "\"$(@D)\""
 
 docs/%.html: docs/%.md
