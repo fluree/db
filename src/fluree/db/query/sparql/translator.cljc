@@ -815,38 +815,38 @@
 (defmethod parse-term :Quads
   ;; <Quads> ::= TriplesTemplate? ( QuadsNotTriples '.'? TriplesTemplate? )*
   [[_ & quads]]
-  (mapv parse-term quads))
+  (vec (mapcat parse-term quads)))
 
 (defmethod parse-rule :DeleteWhere
   ;; DeleteWhere ::= <'DELETE WHERE'> WS QuadPattern
   [[_ quad-pattern]]
   (let [pattern (parse-term quad-pattern)]
-    [(into [:where] pattern)
-     (into [:delete] pattern)]))
+    [[:where pattern]
+     [:delete pattern]]))
 
 (defmethod parse-rule :DeleteData
   ;; DeleteClause ::= <'DELETE DATA'> WS QuadData
   ;; <QuadData> ::= <'{'> WS Quads <'}'> WS
   [[_ quad-pattern]]
-  [(into [:delete] (parse-term quad-pattern))])
+  [[:delete (parse-term quad-pattern)]])
 
 (defmethod parse-rule :DeleteClause
   ;; DeleteClause ::= <'DELETE'> WS QuadPattern
   ;; <QuadPattern> ::= <'{'> WS Quads <'}'> WS
   [[_ quad-pattern]]
-  [(into [:delete] (parse-term quad-pattern))])
+  [[:delete (parse-term quad-pattern)]])
 
 (defmethod parse-rule :InsertData
   ;; InsertClause ::= <'INSERT DATA'> WS QuadData
   ;; <QuadData> ::= <'{'> WS Quads <'}'> WS
   [[_ quad-pattern]]
-  [(into [:insert] (parse-term quad-pattern))])
+  [[:insert (parse-term quad-pattern)]])
 
 (defmethod parse-rule :InsertClause
   ;; InsertClause ::= <'INSERT'> WS QuadPattern
   ;; <QuadPattern> ::= <'{'> WS Quads <'}'> WS
   [[_ quad-pattern]]
-  [(into [:insert] (parse-term quad-pattern))])
+  [[:insert (parse-term quad-pattern)]])
 
 (defmethod parse-rule :ModifyClause
   ;; ModifyClause ::= ( DeleteClause InsertClause? | InsertClause )
