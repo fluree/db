@@ -19,7 +19,6 @@
     (-> opts
         (assoc :context txn-context)
         (update :identity #(or % (:did opts)))
-        (update :format #(or % :fql))
         (dissoc :did))))
 
 (defn track-fuel?
@@ -30,14 +29,14 @@
 (defn stage
   [db txn opts]
   (go-try
-   (let [txn-context (or (ctx-util/txn-context txn)
-                         (:context opts))
-         parsed-opts (parse-opts txn opts txn-context)
-         parsed-txn  (if (= :sparql (:format parsed-opts))
-                       (-> (sparql/->fql txn)
-                           (q-parse/parse-txn txn-context))
-                       (q-parse/parse-txn txn txn-context))]
-     (<? (connection/stage-triples db parsed-txn parsed-opts)))))
+    (let [txn*        (if (= :sparql (:format opts))
+                        (sparql/->fql txn)
+                        txn)
+          txn-context (or (ctx-util/txn-context txn*)
+                          (:context opts))
+          parsed-opts (parse-opts txn* opts txn-context)
+          parsed-txn  (q-parse/parse-txn txn* txn-context)]
+      (<? (connection/stage-triples db parsed-txn parsed-opts)))))
 
 (defn extract-ledger-id
   "Extracts ledger-id from expanded json-ld transaction"
