@@ -813,11 +813,9 @@
 
 (defmethod parse-term :QuadsNotTriples
   ;; QuadsNotTriples ::= <'GRAPH'> WS VarOrIri <'{'> WS TriplesTemplate? <'}'> WS
-  [[_ _graph-iri _triples & _triples-template]]
+  [[_ graph-iri & triples]]
   ;; This is how we would translate it if we supported it in FQL
-  ;; (into [:graph (parse-term graph-iri)] (map parse-term triples-template))
-  (throw (ex-info "GRAPH is not supported in SPARQL Update."
-                  {:status 400 :error :db/invalid-update})))
+  [(into [:graph (parse-term graph-iri)] (mapv parse-term triples))])
 
 (defmethod parse-term :Quads
   ;; <Quads> ::= TriplesTemplate? ( QuadsNotTriples '.'? TriplesTemplate? )*
@@ -835,25 +833,55 @@
   ;; DeleteClause ::= <'DELETE DATA'> WS QuadData
   ;; <QuadData> ::= <'{'> WS Quads <'}'> WS
   [[_ quad-pattern]]
-  [[:delete (parse-term quad-pattern)]])
+  (let [{graph-patterns true
+         default-patterns false}
+        (->> (parse-term quad-pattern)
+             (group-by (comp (partial = :graph) first)))]
+    (cond (>= (count graph-patterns) 2)
+          (throw (ex-info "Multiple GRAPH declarations not supported in DELETE DATA."
+                          {:status 400 :error :db/invalid-update}))
+          (= (count graph-patterns) 1)
+          (let [[[_ graph-iri data]] graph-patterns]
+            [[:ledger graph-iri] [:insert data]])
+          :else
+          [[:delete default-patterns]])))
 
 (defmethod parse-rule :DeleteClause
   ;; DeleteClause ::= <'DELETE'> WS QuadPattern
   ;; <QuadPattern> ::= <'{'> WS Quads <'}'> WS
   [[_ quad-pattern]]
-  [[:delete (parse-term quad-pattern)]])
+  (let [quad-data (parse-term quad-pattern)]
+    (when (not-empty (filter (comp (partial = :graph) first) quad-data))
+      (throw (ex-info "GRAPH not supported in DELETE. Use WITH or USING instead."
+                      {:status 400 :error :db/invalid-update})))
+    [[:delete quad-data]]))
 
 (defmethod parse-rule :InsertData
   ;; InsertClause ::= <'INSERT DATA'> WS QuadData
   ;; <QuadData> ::= <'{'> WS Quads <'}'> WS
   [[_ quad-pattern]]
-  [[:insert (parse-term quad-pattern)]])
+  (let [{graph-patterns true
+         default-patterns false}
+        (->> (parse-term quad-pattern)
+             (group-by (comp (partial = :graph) first)))]
+    (cond (>= (count graph-patterns) 2)
+          (throw (ex-info "Multiple GRAPH declarations not supported in INSERT DATA."
+                          {:status 400 :error :db/invalid-update}))
+          (= (count graph-patterns) 1)
+          (let [[[_ graph-iri data]] graph-patterns]
+            [[:ledger graph-iri] [:insert data]])
+          :else
+          [[:insert default-patterns]])))
 
 (defmethod parse-rule :InsertClause
   ;; InsertClause ::= <'INSERT'> WS QuadPattern
   ;; <QuadPattern> ::= <'{'> WS Quads <'}'> WS
   [[_ quad-pattern]]
-  [[:insert (parse-term quad-pattern)]])
+  (let [quad-data (parse-term quad-pattern)]
+    (when (not-empty (filter (comp (partial = :graph) first) quad-data))
+      (throw (ex-info "GRAPH not supported in INSERT. Use WITH or USING instead."
+                      {:status 400 :error :db/invalid-update})))
+    [[:insert quad-data]]))
 
 (defmethod parse-rule :ModifyClause
   ;; ModifyClause ::= ( DeleteClause InsertClause? | InsertClause )

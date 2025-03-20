@@ -867,7 +867,7 @@
                     ?person  foaf:name  ?name .
                     OPTIONAL { ?person  foaf:mbox  ?email }
                   } }"]
-      (is (= "GRAPH is not supported in SPARQL Update."
+      (is (= "GRAPH not supported in INSERT. Use WITH or USING instead."
              (try* (sparql/->fql query)
                    (catch* e (ex-message e))))))))
 
