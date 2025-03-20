@@ -400,12 +400,19 @@
               (recur nil term))
         [[select-key result]]))))
 
-(defmethod parse-term :PropertyListNotEmpty
-  ;; PropertyListNotEmpty ::= Verb ObjectList ( <';'>  WS ( Verb ObjectList )? )*
+(defmethod parse-term :PropertyObjectList
+  ;; PropertyObjectList ::= Verb ObjectList
   ;; <Verb> ::= VarOrIri | Type
+  [[_ verb objects]]
+  (let [p (parse-term verb)]
+    (mapv #(vector p (if (= const/iri-type p)
+                       (get % const/iri-id)
+                       %)) (parse-term objects))))
+
+(defmethod parse-term :PropertyListNotEmpty
+  ;; PropertyListNotEmpty ::= PropertyObjectList ( <';'>  WS ( PropertyObjectList )? )*
   [[_ & properties]]
-  (->> (partition-all 2 properties)
-       (mapcat (fn [[p os]] (let [p (parse-term p)] (map #(vector p %) (parse-term os)))))))
+  (mapcat parse-term properties))
 
 (defmethod parse-term :TriplesSameSubject
   ;; TriplesSameSubject ::= VarOrTerm PropertyListNotEmpty | TriplesNode PropertyList
