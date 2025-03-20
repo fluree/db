@@ -50,13 +50,17 @@
    (transact! conn txn nil))
   ([conn txn override-opts]
    (go-try
-     (let [context     (or (ctx-util/txn-context txn)
+     (let [txn*           (if (= :sparql (:format override-opts))
+                            (sparql/->fql txn)
+                            txn)
+           override-opts* (assoc override-opts :format :fql)
+           context        (or (ctx-util/txn-context txn*)
                            ;; parent context might come from a Verifiable
                            ;; Credential's context
-                           (:context override-opts))
-           ledger-id   (extract-ledger-id txn)
-           triples     (q-parse/parse-txn txn context)
-           parsed-opts (parse-opts txn override-opts context)]
+                           (:context override-opts*))
+           ledger-id      (extract-ledger-id txn*)
+           triples        (q-parse/parse-txn txn* context)
+           parsed-opts    (parse-opts txn override-opts* context)]
        (<? (connection/transact! conn ledger-id triples parsed-opts))))))
 
 (defn credential-transact!
