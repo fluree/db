@@ -436,10 +436,12 @@
 (defn write-transaction!
   [storage ledger-alias staged]
   (go-try
-    (let [[txn author-did annotation] staged]
+    (let [{:keys [txn author annotation]} staged]
       (if txn
         (let [{txn-id :address} (<? (write-transaction storage ledger-alias txn))]
-          [txn-id author-did annotation])
+          {:txn-id     txn-id
+           :author     author
+           :annotation annotation})
         staged))))
 
 (defn update-commit-address
@@ -550,7 +552,7 @@
           {:keys [db-jsonld staged-txn]}
           (flake-db/db->jsonld staged-db commit-data-opts)
 
-          [txn-id author annotation]
+          {:keys [txn-id author annotation]}
           (<? (write-transaction! commit-catalog ledger-alias staged-txn))
 
           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))

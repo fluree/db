@@ -115,7 +115,7 @@
                          [new-flakes nil])
           db-after     (-> db
                            (assoc :t t
-                                  :staged [txn author annotation]
+                                  :staged {:txn txn, :author author, :annotation annotation}
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
                            (commit-data/add-tt-id)
