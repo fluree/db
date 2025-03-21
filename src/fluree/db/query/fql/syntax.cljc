@@ -112,6 +112,7 @@
     ::issuer            [:maybe string?]
     ::role              :any
     ::identity          :any
+    ::format            [:enum :sparql :fql]
     ::opts              [:map
                          [:max-fuel {:optional true} ::max-fuel]
                          [:identity {:optional true} ::identity]
@@ -119,7 +120,7 @@
                          [:policy-class {:optional true} :any]
                          [:policy-values {:optional true} :any]
                          [:meta {:optional true} :boolean]
-                         [:format {:optional true} [:enum :sparql :fql]]
+                         [:format {:optional true} ::format]
                          [:output {:optional true} [:enum :sparql :fql]]
                          ;; deprecated
                          [:role {:optional true} ::role]
@@ -132,6 +133,7 @@
                          [:meta {:optional true} :boolean]
                          [:max-fuel {:optional true} ::max-fuel]
                          [:identity {:optional true} ::identity]
+                         [:format {:optional true} ::format]
                          [:did {:optional true} ::identity]
                          [:context {:optional true} ::context]
                          [:raw-txn {:optional true} :any]

@@ -4,6 +4,7 @@
        :cljs [[cljs.test :refer-macros [deftest is testing async]]
               [clojure.core.async :refer [go <!]]
               [clojure.core.async.interop :refer [<p!]]])
+   [clojure.string :as str]
    [fluree.db.api :as fluree]
    [fluree.db.query.sparql :as sparql]
    [fluree.db.test-utils :as test-utils]
@@ -770,6 +771,106 @@
              (try* (sparql/->fql query)
                   (catch* e (ex-message e))))))))
 
+(deftest parse-update
+  (testing "insert data"
+    (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+               INSERT DATA
+                 {
+                   <http://example/book1> dc:title \"A new book\" ;
+                                          dc:creator \"A.N.Other\" .
+                 }"]
+      (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
+              :insert  [{"@id" "http://example/book1", "dc:title" "A new book"}
+                        {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
+             (sparql/->fql query)))))
+  (testing "delete-data"
+    (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+               DELETE DATA
+                 {
+                   <http://example/book1> dc:title \"A new book\" ;
+                                          dc:creator \"A.N.Other\" .
+                 }"]
+      (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
+              :delete  [{"@id" "http://example/book1", "dc:title" "A new book"}
+                        {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
+             (sparql/->fql query)))))
+  (testing "delete/insert where"
+    (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+               WITH <http://example/addresses>
+               DELETE { ?person foaf:givenName 'Bill' }
+               INSERT { ?person foaf:givenName 'William' }
+               WHERE
+                 { ?person foaf:givenName 'Bill'
+                 }"]
+      (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/"},
+              :ledger  "http://example/addresses",
+              :delete  [{"@id" "?person", "foaf:givenName" "Bill"}],
+              :insert  [{"@id" "?person", "foaf:givenName" "William"}],
+              :where   [{"@id" "?person", "foaf:givenName" "Bill"}]}
+             (sparql/->fql query)))))
+  (testing "delete where"
+    (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+               DELETE WHERE { ?person foaf:givenName 'Fred';
+                                      ?property      ?value }"]
+      (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/"},
+              :where   [{"@id" "?person", "foaf:givenName" "Fred"}
+                        {"@id" "?person", "?property" "?value"}],
+              :delete  [{"@id" "?person", "foaf:givenName" "Fred"}
+                        {"@id" "?person", "?property" "?value"}]}
+             (sparql/->fql query)))))
+  (testing "using clauses"
+    (testing "one USING clause"
+      (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+                 DELETE { ?person ?property ?value }
+                 USING <http://flur.ee/ledger1>
+                 WHERE { ?person foaf:givenName 'Fred';
+                                 ?property      ?value }"]
+        (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/"},
+                :delete [{"@id" "?person", "?property" "?value"}],
+                :ledger "http://flur.ee/ledger1",
+                :where [{"@id" "?person", "foaf:givenName" "Fred"}
+                        {"@id" "?person", "?property" "?value"}]}
+               (sparql/->fql query)))))
+    (testing "one USING NAMED clause"
+      (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+                 DELETE { ?person ?property ?value }
+                 USING NAMED <http://flur.ee/ledger2>
+                 WHERE { ?person foaf:givenName 'Fred';
+                                 ?property      ?value }"]
+        (is (= "USING NAMED is not supported in SPARQL Update."
+               (try* (sparql/->fql query)
+                     (catch* e (ex-message e)))))))
+    (testing "more than one"
+      (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+                 DELETE { ?person ?property ?value }
+                 USING <http://flur.ee/ledger1>
+                 USING NAMED <http://flur.ee/ledger2>
+                 WHERE { ?person foaf:givenName 'Fred';
+                                 ?property      ?value }"]
+        (is (= "More than one USING clause is not supported in SPARQL Update."
+               (try* (sparql/->fql query)
+                     (catch* e (ex-message e))))))))
+
+  (testing "graph patterns"
+    (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+               PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+               INSERT
+                 { GRAPH <http://example/addresses>
+                   {
+                     ?person  foaf:name  ?name .
+                     ?person  foaf:mbox  ?email
+                   } }
+              WHERE
+                { GRAPH  <http://example/people>
+                  {
+                    ?person  foaf:name  ?name .
+                    OPTIONAL { ?person  foaf:mbox  ?email }
+                  } }"]
+      (is (= "GRAPH not supported in INSERT. Use WITH or USING instead."
+             (try* (sparql/->fql query)
+                   (catch* e (ex-message e))))))))
+
 (deftest parsing-error
   (testing "invalid query throws expected error"
     (let [query "SELECT ?person
@@ -783,39 +884,23 @@
                          :cljs :default) e (ex-data e))))))))
 
 (deftest ^:integration query-test
-  (let [people-data [{"id"              "ex:jdoe"
-                      "type"            "ex:Person"
-                      "person:handle"   "jdoe"
-                      "person:fullName" "Jane Doe"
-                      "person:favNums"  [3 7 42 99]}
-                     {"id"              "ex:bbob"
-                      "type"            "ex:Person"
-                      "person:handle"   "bbob"
-                      "person:fullName" "Billy Bob"
-                      "person:favNums"  [23]}
-                     {"id"              "ex:jbob"
-                      "type"            "ex:Person"
-                      "person:handle"   "jbob"
-                      "person:fullName" "Jenny Bob"
-                      "person:favNums"  [8 6 7 5 3 0 9]}
-                     {"id"              "ex:fbueller"
-                      "type"            "ex:Person"
-                      "person:handle"   "dankeshön"
-                      "person:fullName" "Ferris Bueller"}
-                     {"@id"              "ex:alice"
-                      "foaf:givenname"   "Alice"
-                      "foaf:family_name" "Hacker"}
-                     {"@id" "ex:bob"
-                      "foaf:firstname" "Bob"
-                      "foaf:surname" "Hacker"}]]
+  (let [txn (str/join "\n"
+                      ["PREFIX person: <http://example.org/Person#>"
+                       "PREFIX foaf: <http://xmlns.com/foaf/0.1/>"
+                       "INSERT DATA {"
+                       "ex:jdoe a ex:Person; person:handle \"jdoe\"; person:fullName \"Jane Doe\"; person:favNums 3, 7, 42, 99."
+                       "ex:bbob a ex:Person; person:handle \"bbob\"; person:fullName \"Billy Bob\"; person:favNums 23."
+                       "ex:jbob a ex:Person; person:handle \"jbob\"; person:fullName \"Jenny Bob\"; person:favNums 8, 6, 7, 5, 3, 0, 9."
+                       "ex:fbueller a ex:Person; person:handle \"dankeshön\"; person:fullName \"Ferris Bueller\"."
+                       "ex:alice foaf:givenname \"Alice\"; foaf:family_name \"Hacker\"."
+                       "ex:bob foaf:firstname \"Bob\"; foaf:surname \"Hacker\"."
+                       "}"])]
     #?(#_#_:cljs
        (async done
          (go
            (let [conn   (<! (test-utils/create-conn))
-                ledger (<p! (fluree/create conn "people"))
-                db     (<p! (fluree/stage (fluree/db ledger) {"@context" [test-utils/default-str-context
-                                                                          {"person" "http://example.org/Person#"}]
-                                                               "insert" people-data}))]
+                 ledger (<p! (fluree/create conn "people"))
+                 db     (<p! (fluree/stage (fluree/db ledger) txn {:format :sparql}))]
             (testing "basic query works"
               (let [query   "SELECT ?person ?fullName
                              WHERE {?person person:handle \"jdoe\".
@@ -826,17 +911,11 @@
                 (done))))))
 
        :clj
-       (let [conn @(fluree/connect-memory)
-             db   (-> conn
-                      (fluree/create "people")
-                      deref
-                      fluree/db
-                      (fluree/stage {"@context" [test-utils/default-str-context
-                                                 {"person" "http://example.org/Person#"}]
-                                      "insert" people-data})
-                      deref)]
+       (let [conn   @(fluree/connect-memory)
+             ledger @(fluree/create conn "people")
+             db     @(fluree/stage (fluree/db ledger) txn {:format :sparql})]
          (testing "basic query works"
-           (let [query   "PREFIX person: <http://example.org/Person#>
+           (let [query "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?fullName
                           WHERE {?person person:handle \"jdoe\".
                                  ?person person:fullName ?fullName.}"]
