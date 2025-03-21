@@ -29,7 +29,7 @@
 (defn stage
   [db txn opts]
   (go-try
-    (let [txn*        (if (= :sparql (:format opts))
+    (let [txn*        (if (sparql/sparql-format? opts)
                         (sparql/->fql txn)
                         txn)
           txn-context (or (ctx-util/txn-context txn*)
@@ -50,7 +50,7 @@
    (transact! conn txn nil))
   ([conn txn override-opts]
    (go-try
-     (let [txn*           (if (= :sparql (:format override-opts))
+     (let [txn*           (if (sparql/sparql-format? override-opts)
                             (sparql/->fql txn)
                             txn)
            override-opts* (assoc override-opts :format :fql)
