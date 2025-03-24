@@ -192,12 +192,12 @@
   [conn ledger-alias-or-address]
   (validate-connection conn)
   (promise-wrap
-    (go
+    (go-try
       (let [address (if (address? ledger-alias-or-address)
                       ledger-alias-or-address
-                      (<! (alias->address conn ledger-alias-or-address)))]
+                      (<? (alias->address conn ledger-alias-or-address)))]
         (log/debug "exists? - ledger address:" address)
-        (<! (connection/ledger-exists? conn address))))))
+        (<? (connection/ledger-exists? conn address))))))
 
 (defn notify
   "Notifies the connection with a new commit map (parsed JSON commit with string keys).
