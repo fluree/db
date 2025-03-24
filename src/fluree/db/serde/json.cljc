@@ -49,7 +49,7 @@
       (update :first deserialize-flake-bound)
       (update :rhs deserialize-flake-bound)))
 
-(defn parse->int
+(defn parse-int
   [k]
   (-> k name util/str->int))
 
@@ -59,7 +59,7 @@
   otherwise."
   [m]
   (reduce-kv (fn [numerized k v]
-               (let [int-k (parse->int k)]
+               (let [int-k (parse-int k)]
                  (assoc numerized int-k v)))
              {} m))
 

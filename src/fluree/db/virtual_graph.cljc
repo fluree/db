@@ -19,8 +19,8 @@
             (vg-type-kw vg)))
 
 (defn storage-path
-  [vg-type-kw db-alias vg-alias]
-  (str/join "/" [db-alias (name vg-type-kw) vg-alias]))
+  [vg-type db-alias vg-alias]
+  (str/join "/" [db-alias (name vg-type) vg-alias]))
 
 (defmulti read-vg
   (fn [_index-catalog storage-meta]

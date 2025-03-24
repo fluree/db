@@ -256,8 +256,15 @@
   (-match-class [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
 
+  ;; activate-alias should not be called on an index VG, return empty chan
+  (-activate-alias [_ _]
+    (let [ch (async/chan)]
+      (async/close! ch)
+      ch))
+
   ;; return db-alias here, as it is used when encoding/decoding IRIs in the search function which is original db-dependent
-  (-aliases [_] [db-alias]))
+  (-aliases [_]
+    [db-alias]))
 
 (defn bm25-iri?
   [idx-rdf-type]
