@@ -3,7 +3,6 @@
 
 (set! *warn-on-reflection* true)
 
-
 ;; Identity serializer doens't serialize anything.
 
 (defrecord Serializer []

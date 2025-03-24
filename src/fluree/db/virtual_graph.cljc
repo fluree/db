@@ -15,8 +15,8 @@
   (keyword (vg-type-name vg)))
 
 (defmulti write-vg
-          (fn [_index-catalog vg]
-            (vg-type-kw vg)))
+  (fn [_index-catalog vg]
+    (vg-type-kw vg)))
 
 (defn storage-path
   [vg-type db-alias vg-alias]

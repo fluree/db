@@ -4,12 +4,12 @@
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util.async :refer [<?]]
             [fluree.db.query.range :as query-range]
-            [fluree.db.vector.scoring :refer [dot-product cosine-similarity euclidian-distance]]
-            [fluree.db.virtual-graph.parse :as vg-parse]
+            [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :refer [try* catch*]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.vector.scoring :refer [dot-product cosine-similarity euclidian-distance]]
+            [fluree.db.virtual-graph.parse :as vg-parse]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

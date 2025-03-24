@@ -1,6 +1,5 @@
 (ns fluree.db.util.context
-  (:require [fluree.json-ld :as json-ld]
-            [fluree.db.util.core :as util]))
+  (:require [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -29,14 +28,14 @@
     (mapv stringify context)
     (if (map? context)
       (reduce-kv
-        (fn [acc k v]
-          (let [k* (if (keyword? k)
-                     (name k)
-                     k)
-                v* (if (and (map? v)
-                            (not (contains? v :id)))
-                     (stringify v)
-                     v)]
-            (assoc acc k* v*)))
-        {} context)
+       (fn [acc k v]
+         (let [k* (if (keyword? k)
+                    (name k)
+                    k)
+               v* (if (and (map? v)
+                           (not (contains? v :id)))
+                    (stringify v)
+                    v)]
+           (assoc acc k* v*)))
+       {} context)
       context)))

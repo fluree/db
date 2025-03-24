@@ -3,40 +3,40 @@
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [go <! >! close!]]
             [clojure.set :refer [map-invert]]
+            [fluree.db.commit.storage :as commit-storage]
+            [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.time-travel :refer [TimeTravel]]
-            [fluree.db.query.history :refer [AuditLog]]
-            [fluree.db.flake.history :as history]
-            [fluree.db.flake.format :as jld-format]
-            [fluree.db.flake.match :as match]
-            [fluree.db.constants :as const]
-            [fluree.db.reasoner :as reasoner]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.format :as jld-format]
+            [fluree.db.flake.history :as history]
+            [fluree.db.flake.index :as index]
+            [fluree.db.flake.index.novelty :as novelty]
+            [fluree.db.flake.index.storage :as index-storage]
+            [fluree.db.flake.match :as match]
             [fluree.db.flake.reasoner :as flake.reasoner]
             [fluree.db.flake.transact :as flake.transact]
-            [fluree.db.util.core :as util :refer [get-first get-first-value get-first-id]]
-            [fluree.db.flake.index :as index]
             [fluree.db.indexer :as indexer]
-            [fluree.db.flake.index.novelty :as novelty]
-            [fluree.db.query.fql :as fql]
-            [fluree.db.flake.index.storage :as index-storage]
-            [fluree.db.virtual-graph.flat-rank :as flat-rank]
-            [fluree.db.virtual-graph.index-graph :as vg]
             [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
             [fluree.db.json-ld.policy.rules :as policy-rules]
-            [fluree.db.commit.storage :as commit-storage]
-            [fluree.db.transact :as transact]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.query.exec.select.subject :as subject]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.query.fql :as fql]
+            [fluree.db.query.history :refer [AuditLog]]
             [fluree.db.query.range :as query-range]
+            [fluree.db.reasoner :as reasoner]
             [fluree.db.serde.json :as serde-json]
+            [fluree.db.time-travel :refer [TimeTravel]]
+            [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.core :as util :refer [get-first get-first-value]]
+            [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph.flat-rank :as flat-rank]
+            [fluree.db.virtual-graph.index-graph :as vg])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -66,8 +66,8 @@
     (flake/t-before? t (:t db))
     (let [novelty (reduce (fn [acc idx]
                             (assoc acc idx
-                                       #?(:clj  (future (novelty-after-t db t idx))
-                                          :cljs (novelty-after-t db t idx))))
+                                   #?(:clj  (future (novelty-after-t db t idx))
+                                      :cljs (novelty-after-t db t idx))))
                           {} index/types)
           size    (flake/size-bytes #?(:clj  @(:spot novelty)
                                        :cljs (:spot novelty)))
@@ -124,7 +124,6 @@
            :namespaces new-ns-map
            :namespace-codes new-ns-codes
            :max-namespace-code max-namespace-code*)))
-
 
 (defn db-assert
   [db-data]
@@ -189,7 +188,6 @@
         (flake/create sid pid ref-sid const/$id t assert? meta))
       (let [[value dt] (datatype/from-expanded db v-map)]
         (flake/create sid pid value dt t assert? meta)))))
-
 
 (defn property->flake
   [assert? db sid pid t value]
@@ -361,9 +359,9 @@
             flakes         (-> db
                                policy/root
                                (query-range/index-range
-                                 :post
-                                 > [const/$_commit:time start]
-                                 < [const/$_commit:time end])
+                                :post
+                                > [const/$_commit:time start]
+                                < [const/$_commit:time end])
                                <?)]
         (log/debug "datetime->t index-range:" (pr-str flakes))
         (if (empty? flakes)
@@ -501,8 +499,8 @@
       (throw (ex-info "Invalid max-old-indexes value. Must be a non-negative integer."
                       {:status 400, :error :db/invalid-config})))
     (assoc root-map :reindex-min-bytes reindex-min-bytes
-                    :reindex-max-bytes reindex-max-bytes
-                    :max-old-indexes max-old-indexes)))
+           :reindex-max-bytes reindex-max-bytes
+           :max-old-indexes max-old-indexes)))
 
 ;; TODO - VG - need to reify vg from db-root!!
 (defn load
@@ -573,7 +571,7 @@
   (loop [[p-flake & r] p-flakes
          acc nil]
     (let [obj-ser (cond-> (serialize-obj p-flake db compact-fn)
-                          list? (add-obj-list-meta p-flake))
+                    list? (add-obj-list-meta p-flake))
           acc'    (conj acc obj-ser)]
       (if (seq r)
         (recur r acc')
@@ -594,8 +592,8 @@
           objs   (subject-block-pred db compact-fn list?
                                      p-flakes)
           objs*  (cond-> objs
-                         list? handle-list-values
-                         (= 1 (count objs)) first)
+                   list? handle-list-values
+                   (= 1 (count objs)) first)
           acc'   (assoc acc p-iri objs*)]
       (if (seq r)
         (recur r acc')

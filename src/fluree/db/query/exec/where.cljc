@@ -2,16 +2,16 @@
   (:require [clojure.core.async :as async :refer [>! go]]
             [clojure.set :as set]
             [clojure.string :as str]
+            [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
-            [fluree.db.fuel :as fuel]
             [fluree.db.flake.index :as index]
+            [fluree.db.fuel :as fuel]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.datatype :as datatype]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.constants :as const]
-            [fluree.db.json-ld.iri :as iri]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (clojure.lang MapEntry))))
 
@@ -446,7 +446,8 @@
   [db idx s p o o-fn]
   (if (and (#{:spot} idx)
            (nil? p)
-           (and s o))
+           s
+           o)
     (let [f (if o-fn
               (fn [mch]
                 (and (#{o} (or (get-value mch)
@@ -470,8 +471,8 @@
 
         idx         (try* (index/for-components s p o o-dt)
                           (catch* e
-                                  (log/error e "Error resolving flake range")
-                                  (async/put! error-ch e)))
+                            (log/error e "Error resolving flake range")
+                            (async/put! error-ch e)))
         [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
         start-flake (flake/create s p o* o-dt nil nil util/min-integer)
         end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
@@ -493,15 +494,14 @@
                                     (match-object db f)
                                     o-fn*))))
         flake-xf    (->> [subj-filter pred-filter obj-filter track-fuel]
-                        (remove nil?)
-                        (apply comp))
+                         (remove nil?)
+                         (apply comp))
         opts        {:idx         idx
                      :to-t        t
                      :start-flake start-flake
                      :end-flake   end-flake
                      :flake-xf    flake-xf}]
     (query-range/resolve-flake-slices db idx error-ch opts)))
-
 
 (defn compute-sid
   [s-mch db]
@@ -560,7 +560,7 @@
 
 (defn filter-exception
   "Reformats raw filter exception to try to provide more useful feedback."
-  [e solution f]
+  [e f]
   (let [fn-str (->> f meta :fns (str/join " "))
         ex-msg (or (ex-message e)
                    ;; note: NullPointerException is common but has no ex-message, create one
@@ -593,7 +593,7 @@
         (let [result (f solution)]
           (when result
             solution))
-        (catch* e (>! error-ch (filter-exception e solution f)))))))
+        (catch* e (>! error-ch (filter-exception e f)))))))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the
@@ -637,7 +637,7 @@
           (-> (match-clause graph fuel-tracker solution clause error-ch)
               (async/pipe res-ch)))
         (catch* e
-                (log/error e "Error activating alias" alias)
+          (log/error e "Error activating alias" alias)
           (>! error-ch (ex-info (str "Error activating alias: " alias
                                      " due to exception: " (ex-message e))
                                 {:status 400, :error :db/invalid-query}
@@ -719,7 +719,7 @@
     out-ch))
 
 (defmethod match-pattern :values
-  [db fuel-tracker solution pattern error-ch]
+  [_db _fuel-tracker solution pattern _error-ch]
   (let [inline-solutions (pattern-data pattern)
         ;; transform a match into its identity for equality checks
         match-identity   (juxt get-iri get-value get-datatype-iri (comp get-meta :lang))
@@ -730,9 +730,9 @@
                     (let [matches (not-empty (select-keys solution* (keys inline-solution)))]
                       (or
                         ;; no overlapping matches
-                        (nil? matches)
+                       (nil? matches)
                         ;; matches are the same
-                        (= matches (update-vals inline-solution match-identity))))))
+                       (= matches (update-vals inline-solution match-identity))))))
          (mapv (fn [inline-solution]
                  (let [existing-vars (set (keys solution))
                        inline-vars   (set (keys inline-solution))

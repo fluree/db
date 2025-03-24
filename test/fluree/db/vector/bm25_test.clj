@@ -1,10 +1,9 @@
 (ns fluree.db.vector.bm25-test
-  (:require [clojure.test :refer [deftest is testing]]
-            [clojure.core.async :as async]
+  (:require [clojure.core.async :as async]
+            [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
             [test-with-files.tools :refer [with-tmp-dir]]))
 
 (defn full-text-search
@@ -318,7 +317,6 @@
       (is (= [["ex:hobby-article" 0.28768207245178085 "This is an article about hobbies"]]
              (full-text-search db-r2 "Apples for snacks for John")))
 
-
       (testing "Score after adding and retracting article is same as score with just one article"
         (let [ledger2 @(fluree/create conn "bm25-retract-verify-same-score")
 
@@ -419,105 +417,103 @@
 
 (deftest ^:integration bm25-search-persist
   (with-tmp-dir storage-path
-                (testing "Loading bm25 from disk is identical to inital transactions"
+    (testing "Loading bm25 from disk is identical to inital transactions"
 
-                  (testing "where an index was written"
-                    (let [conn            @(fluree/connect-file {:storage-path storage-path
-                                                                 :defaults     {:indexing {:reindex-min-bytes 1e2 ;; be sure to generate an index
-                                                                                           :reindex-max-bytes 1e9}}})
-                          ledger-name     "bm25-search-persist-idx"
-                          ledger          @(fluree/create conn ledger-name)
-                          db1             @(fluree/stage
-                                            (fluree/db ledger)
-                                            {"@context" {"ex" "http://example.org/ns/"}
-                                             "insert"
-                                             [{"@id"        "ex:food-article"
-                                               "ex:author"  "Jane Smith"
-                                               "ex:title"   "This is one title of a document about food"
-                                               "ex:summary" "This is a summary of the document about food including apples and oranges"}
-                                              {"@id"        "ex:hobby-article"
-                                               "ex:author"  "John Doe"
-                                               "ex:title"   "This is an article about hobbies"
-                                               "ex:summary" "Hobbies include reading and hiking"}]})
+      (testing "where an index was written"
+        (let [conn            @(fluree/connect-file {:storage-path storage-path
+                                                     :defaults     {:indexing {:reindex-min-bytes 1e2 ;; be sure to generate an index
+                                                                               :reindex-max-bytes 1e9}}})
+              ledger-name     "bm25-search-persist-idx"
+              ledger          @(fluree/create conn ledger-name)
+              db1             @(fluree/stage
+                                (fluree/db ledger)
+                                {"@context" {"ex" "http://example.org/ns/"}
+                                 "insert"
+                                 [{"@id"        "ex:food-article"
+                                   "ex:author"  "Jane Smith"
+                                   "ex:title"   "This is one title of a document about food"
+                                   "ex:summary" "This is a summary of the document about food including apples and oranges"}
+                                  {"@id"        "ex:hobby-article"
+                                   "ex:author"  "John Doe"
+                                   "ex:title"   "This is an article about hobbies"
+                                   "ex:summary" "Hobbies include reading and hiking"}]})
 
-                          db2             @(fluree/stage
-                                            db1
-                                            {"insert"
-                                             {"@context"       {"f"    "https://ns.flur.ee/ledger#"
-                                                                "fvg"  "https://ns.flur.ee/virtualgraph#"
-                                                                "fidx" "https://ns.flur.ee/index#"
-                                                                "ex"   "http://example.org/"},
-                                              "@id"            "ex:articleSearch"
-                                              "@type"          ["f:VirtualGraph" "fidx:BM25"]
-                                              "f:virtualGraph" "articleSearch"
-                                              "fidx:stemmer"   {"@id" "fidx:snowballStemmer-en"}
-                                              "fidx:stopwords" {"@id" "fidx:stopwords-en"}
-                                              "f:query"        {"@type"  "@json"
-                                                                "@value" {"@context" {"ex" "http://example.org/ns/"}
-                                                                          "where"    [{"@id"       "?x"
-                                                                                       "ex:author" "?author"}]
-                                                                          "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
+              db2             @(fluree/stage
+                                db1
+                                {"insert"
+                                 {"@context"       {"f"    "https://ns.flur.ee/ledger#"
+                                                    "fvg"  "https://ns.flur.ee/virtualgraph#"
+                                                    "fidx" "https://ns.flur.ee/index#"
+                                                    "ex"   "http://example.org/"},
+                                  "@id"            "ex:articleSearch"
+                                  "@type"          ["f:VirtualGraph" "fidx:BM25"]
+                                  "f:virtualGraph" "articleSearch"
+                                  "fidx:stemmer"   {"@id" "fidx:snowballStemmer-en"}
+                                  "fidx:stopwords" {"@id" "fidx:stopwords-en"}
+                                  "f:query"        {"@type"  "@json"
+                                                    "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                              "where"    [{"@id"       "?x"
+                                                                           "ex:author" "?author"}]
+                                                              "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
 
-                          db2-c           @(fluree/commit! ledger db2)
-                          _               (Thread/sleep 1000) ;; wait for index to complete and write new NS record - ideally replace with a force load
-                          db2-l           (db-with-index {:storage-path storage-path} ledger-name)
-                          expected-result [["ex:hobby-article" 0.741011563872269 "This is an article about hobbies"]
-                                           ["ex:food-article" 0.6510910594922633 "This is one title of a document about food"]]]
-                      (is (= expected-result
-                             (full-text-search db2-c "Apples for snacks for John"))
-                          "db returned from (fluree/commit! ...) had issues")
-                      (is (= expected-result
-                             (full-text-search db2-l "Apples for snacks for John"))
-                          "db returned from (fluree/load ...) had issues")))
+              db2-c           @(fluree/commit! ledger db2)
+              _               (Thread/sleep 1000) ;; wait for index to complete and write new NS record - ideally replace with a force load
+              db2-l           (db-with-index {:storage-path storage-path} ledger-name)
+              expected-result [["ex:hobby-article" 0.741011563872269 "This is an article about hobbies"]
+                               ["ex:food-article" 0.6510910594922633 "This is one title of a document about food"]]]
+          (is (= expected-result
+                 (full-text-search db2-c "Apples for snacks for John"))
+              "db returned from (fluree/commit! ...) had issues")
+          (is (= expected-result
+                 (full-text-search db2-l "Apples for snacks for John"))
+              "db returned from (fluree/load ...) had issues")))
 
-                  (testing "Loading where an index was not written"
-                      (let [conn            @(fluree/connect-file {:storage-path storage-path
-                                                                   :defaults     {:indexing {:reindex-min-bytes 1e8 ;; be sure *not* to generate an index
-                                                                                             :reindex-max-bytes 1e9}}})
-                            ledger-name     "bm25-search-persist-no-idx"
-                            ledger          @(fluree/create conn ledger-name)
-                            db1             @(fluree/stage
-                                              (fluree/db ledger)
-                                              {"@context" {"ex" "http://example.org/ns/"}
-                                               "insert"
-                                               [{"@id"        "ex:food-article"
-                                                 "ex:author"  "Jane Smith"
-                                                 "ex:title"   "This is one title of a document about food"
-                                                 "ex:summary" "This is a summary of the document about food including apples and oranges"}
-                                                {"@id"        "ex:hobby-article"
-                                                 "ex:author"  "John Doe"
-                                                 "ex:title"   "This is an article about hobbies"
-                                                 "ex:summary" "Hobbies include reading and hiking"}]})
+      (testing "Loading where an index was not written"
+        (let [conn            @(fluree/connect-file {:storage-path storage-path
+                                                     :defaults     {:indexing {:reindex-min-bytes 1e8 ;; be sure *not* to generate an index
+                                                                               :reindex-max-bytes 1e9}}})
+              ledger-name     "bm25-search-persist-no-idx"
+              ledger          @(fluree/create conn ledger-name)
+              db1             @(fluree/stage
+                                (fluree/db ledger)
+                                {"@context" {"ex" "http://example.org/ns/"}
+                                 "insert"
+                                 [{"@id"        "ex:food-article"
+                                   "ex:author"  "Jane Smith"
+                                   "ex:title"   "This is one title of a document about food"
+                                   "ex:summary" "This is a summary of the document about food including apples and oranges"}
+                                  {"@id"        "ex:hobby-article"
+                                   "ex:author"  "John Doe"
+                                   "ex:title"   "This is an article about hobbies"
+                                   "ex:summary" "Hobbies include reading and hiking"}]})
 
-                            db2             @(fluree/stage
-                                              db1
-                                              {"insert"
-                                               {"@context"       {"f"    "https://ns.flur.ee/ledger#"
-                                                                  "fvg"  "https://ns.flur.ee/virtualgraph#"
-                                                                  "fidx" "https://ns.flur.ee/index#"
-                                                                  "ex"   "http://example.org/"},
-                                                "@id"            "ex:articleSearch"
-                                                "@type"          ["f:VirtualGraph" "fidx:BM25"]
-                                                "f:virtualGraph" "articleSearch"
-                                                "fidx:stemmer"   {"@id" "fidx:snowballStemmer-en"}
-                                                "fidx:stopwords" {"@id" "fidx:stopwords-en"}
-                                                "f:query"        {"@type"  "@json"
-                                                                  "@value" {"@context" {"ex" "http://example.org/ns/"}
-                                                                            "where"    [{"@id"       "?x"
-                                                                                         "ex:author" "?author"}]
-                                                                            "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
+              db2             @(fluree/stage
+                                db1
+                                {"insert"
+                                 {"@context"       {"f"    "https://ns.flur.ee/ledger#"
+                                                    "fvg"  "https://ns.flur.ee/virtualgraph#"
+                                                    "fidx" "https://ns.flur.ee/index#"
+                                                    "ex"   "http://example.org/"},
+                                  "@id"            "ex:articleSearch"
+                                  "@type"          ["f:VirtualGraph" "fidx:BM25"]
+                                  "f:virtualGraph" "articleSearch"
+                                  "fidx:stemmer"   {"@id" "fidx:snowballStemmer-en"}
+                                  "fidx:stopwords" {"@id" "fidx:stopwords-en"}
+                                  "f:query"        {"@type"  "@json"
+                                                    "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                              "where"    [{"@id"       "?x"
+                                                                           "ex:author" "?author"}]
+                                                              "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
 
-                            db2-c           @(fluree/commit! ledger db2)
-                            conn2           @(fluree/connect-file {:storage-path storage-path})
-                            loaded          @(fluree/load conn2 ledger-name)
-                            db2-l           (fluree/db loaded)
-                            expected-result [["ex:hobby-article" 0.741011563872269 "This is an article about hobbies"]
-                                             ["ex:food-article" 0.6510910594922633 "This is one title of a document about food"]]]
-                        (is (= expected-result
-                               (full-text-search db2-c "Apples for snacks for John"))
-                            "db returned from (fluree/commit! ...) had issues")
-                        (is (= expected-result
-                               (full-text-search db2-l "Apples for snacks for John"))
-                            "db returned from (fluree/load ...) had issues"))))))
-
-
+              db2-c           @(fluree/commit! ledger db2)
+              conn2           @(fluree/connect-file {:storage-path storage-path})
+              loaded          @(fluree/load conn2 ledger-name)
+              db2-l           (fluree/db loaded)
+              expected-result [["ex:hobby-article" 0.741011563872269 "This is an article about hobbies"]
+                               ["ex:food-article" 0.6510910594922633 "This is one title of a document about food"]]]
+          (is (= expected-result
+                 (full-text-search db2-c "Apples for snacks for John"))
+              "db returned from (fluree/commit! ...) had issues")
+          (is (= expected-result
+                 (full-text-search db2-l "Apples for snacks for John"))
+              "db returned from (fluree/load ...) had issues"))))))

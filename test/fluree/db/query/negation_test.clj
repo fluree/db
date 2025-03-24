@@ -40,7 +40,6 @@
                                                    ["exists" [{"@id" "?person" "ex:name" "?name"}]]]}))
                 "returns no subjects")))
 
-
         (testing "checking for the non-existence of a pattern"
           (testing "when the pattern does not exist in the data"
             (is (= [["ex:bob"] ["ex:carol"]]

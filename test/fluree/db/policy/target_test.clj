@@ -1,7 +1,6 @@
 (ns fluree.db.policy.target-test
   (:require [clojure.test :as t :refer [deftest testing is]]
-            [fluree.db.api :as fluree]
-            [fluree.crypto :as crypto]))
+            [fluree.db.api :as fluree]))
 
 (def burt
   {:id    "did:fluree:TfE2Frz2qkMjnCNJM5yPv7B8gq5Xhk5bqkm"
@@ -15,7 +14,6 @@
   {:id    "did:fluree:Tf5g1aNMuamUWW8hMSks9YsYTNSmGQBYCK1"
    :private "7804d4c1ef6f22087bd81d030c6377f6065a831627351fd9e99d845fdfd5bcd2",
    :public "02e1495d9a165732684fd17c074e99a7e236e8db90252380ec3160ecdd1a38a5ed"})
-
 
 (def wishlist-create {"@context"     {"a" "http://a.co/"
                                       "f" "https://ns.flur.ee/ledger#"}
@@ -52,7 +50,6 @@
                      "@value" {"@context" {"a" "http://a.co/"}
                                "where"    [["filter" "(= ?$this ?$identity)"]]}}})
 
-
 (def item-create {"@context"     {"a" "http://a.co/"
                                   "f" "https://ns.flur.ee/ledger#"}
                   "@id"          "a:wishlistItemCreatePolicy"
@@ -83,7 +80,6 @@
 (def item-view {"@context" {"a" "http://a.co/"
                             "f" "https://ns.flur.ee/ledger#"}
                 "@id"      "a:wishlistItemViewPolicy"
-
 
                 "f:targetProperty" [{"@id" "a:title"}
                                     {"@id" "a:description"}
@@ -329,7 +325,7 @@
                 (is (= [{"a:title"       "helicopter"
                          "a:description" "for enhanced mobility in the sky",
                          "a:rank"        1,
-                         "a:available"   true,}]
+                         "a:available"   true}]
                        (:result result)))
                 (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 0, :allowed 0},
                         "http://a.co/wishlistModifyPolicy"     {:executed 0, :allowed 0},
@@ -406,15 +402,15 @@
 
                                  classification-policy double-property-policy]})]
     (testing "without default allow"
-        (is (= [{"@type"             "ex:Data"
-                 "ex:classification" 0
-                 "@id"               "ex:data-0"}]
-               @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"
-                                               "f"  "https://ns.flur.ee/ledger#"},
-                                   "where"    {"@id"   "?s",
-                                               "@type" "ex:Data"},
-                                   "select"   {"?s" ["*"]}
-                                   "opts"     {"policyClass" "ex:UnclassPolicy"}}))
+      (is (= [{"@type"             "ex:Data"
+               "ex:classification" 0
+               "@id"               "ex:data-0"}]
+             @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"
+                                             "f"  "https://ns.flur.ee/ledger#"},
+                                 "where"    {"@id"   "?s",
+                                             "@type" "ex:Data"},
+                                 "select"   {"?s" ["*"]}
+                                 "opts"     {"policyClass" "ex:UnclassPolicy"}}))
           "only data with classification < 1 should be visible when using opts.policyClass")
       (is (= []
              @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"
@@ -430,14 +426,14 @@
                                     "insert"   [default-policy]})]
         (testing "using opts.policyClass"
           (is (= [{"@type"             "ex:Data"
-                     "ex:classification" 0
-                     "@id"               "ex:data-0"}]
-                   @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"
-                                                   "f"  "https://ns.flur.ee/ledger#"},
-                                       "where"    {"@id"   "?s",
-                                                   "@type" "ex:Data"},
-                                       "select"   {"?s" ["*"]}
-                                       "opts"     {"policyClass" "ex:UnclassPolicy"}}))
+                   "ex:classification" 0
+                   "@id"               "ex:data-0"}]
+                 @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"
+                                                 "f"  "https://ns.flur.ee/ledger#"},
+                                     "where"    {"@id"   "?s",
+                                                 "@type" "ex:Data"},
+                                     "select"   {"?s" ["*"]}
+                                     "opts"     {"policyClass" "ex:UnclassPolicy"}}))
               "only data with classification < 1 should be visible when using opts.policyClass")
           (is (= [{"@id"               "ex:other",
                    "@type"             "ex:Other",
@@ -478,13 +474,13 @@
                                      "opts"     {"policyClass" "ex:DoublePropertyPolicy"}}))
               "all properties besides secretProperty and secretPropertyTwo should be visible when using opts.policyClass"))
         (testing "using opts.policy"
-            (is (= [{"@type"             "ex:Data"
-                     "ex:classification" 0
-                     "@id"               "ex:data-0"}]
-                   @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"
-                                                   "f"  "https://ns.flur.ee/ledger#"},
-                                       "where"    {"@id"   "?s",
-                                                   "@type" "ex:Data"},
-                                       "select"   {"?s" ["*"]}
-                                       "opts"     {"policy" [default-policy classification-policy]}}))
+          (is (= [{"@type"             "ex:Data"
+                   "ex:classification" 0
+                   "@id"               "ex:data-0"}]
+                 @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"
+                                                 "f"  "https://ns.flur.ee/ledger#"},
+                                     "where"    {"@id"   "?s",
+                                                 "@type" "ex:Data"},
+                                     "select"   {"?s" ["*"]}
+                                     "opts"     {"policy" [default-policy classification-policy]}}))
               "only data with classification < 1 should be visible when using opts.policy"))))))

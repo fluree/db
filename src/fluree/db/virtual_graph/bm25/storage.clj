@@ -1,13 +1,13 @@
 (ns fluree.db.virtual-graph.bm25.storage
   (:require [clojure.set :refer [map-invert]]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.storage :as storage]
             [fluree.db.serde.protocol :as serde]
+            [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.virtual-graph :as vg]
+            [fluree.db.virtual-graph.bm25.index :as bm25]
             [fluree.db.virtual-graph.bm25.stemmer :as stemmer]
             [fluree.db.virtual-graph.bm25.stopwords :as stopwords]
-            [fluree.db.virtual-graph.bm25.index :as bm25]
             [fluree.db.virtual-graph.parse :as parse]))
 
 (set! *warn-on-reflection* true)
@@ -128,7 +128,7 @@
       (assoc write-res :type "bm25"))))
 
 (defmethod vg/read-vg :bm25
-  [{:keys [storage serializer] :as _index-catalog} {:keys [address] :as vg-meta}]
+  [{:keys [storage serializer] :as _index-catalog} {:keys [address] :as _vg-meta}]
   (go-try
     (if-let [serialized-data (<? (storage/read-json storage address false))]
       (-> (serde/-deserialize-bm25 serializer serialized-data)

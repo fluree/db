@@ -1,7 +1,7 @@
 (ns fluree.db.virtual-graph.bm25.stopwords
-  (:require [clojure.string :as str]
+  (:require [clojure.java.io :as io]
             [clojure.set :as set]
-            [clojure.java.io :as io]))
+            [clojure.string :as str]))
 
 (set! *warn-on-reflection* true)
 

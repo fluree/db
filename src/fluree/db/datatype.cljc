@@ -1,18 +1,17 @@
 (ns fluree.db.datatype
-  (:require [fluree.db.constants :as const]
-            [time-literals.read-write :as time-literals]
+  (:require #?@(:clj  [[fluree.db.util.clj-const :as uc]
+                       [time-literals.read-write :as time-literals]]
+                :cljs [[fluree.db.util.cljs-const :as uc]])
+            [clojure.string :as str]
+            [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]
-            [clojure.string :as str]
             [fluree.db.vector.scoring :as vector.score]
-            #?(:clj  [fluree.db.util.clj-const :as uc]
-               :cljs [fluree.db.util.cljs-const :as uc]))
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.time LocalDate LocalTime LocalDateTime
-                              OffsetDateTime OffsetTime ZoneOffset)
-                   (java.time.format DateTimeFormatter))))
+                              OffsetDateTime OffsetTime ZoneOffset))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -108,7 +107,7 @@
 (def iso8601-time-pattern
   (str #?(:clj  "([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\\.([0-9]{1,9}))?"
           :cljs "([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\\.([0-9]{1,3}))?")
-        iso8601-offset-pattern))
+       iso8601-offset-pattern))
 
 (def iso8601-time-re
   (re-pattern iso8601-time-pattern))
@@ -179,11 +178,15 @@
         NB: If you don't supply a timezone JS will assume it's in your current,
         local timezone according to your device."
   [s]
-  (when-let [matches (re-matches iso8601-time-re s)]
-    #?(:clj  (if-let [offset     (peek matches)]
-               (OffsetTime/parse s)
-               (LocalTime/parse s))
-       :cljs (js/Date. (str "1970-01-01T" s)))))
+  #?(:clj
+     (when-let [matches (re-matches iso8601-time-re s)]
+       (if (peek matches)
+         (OffsetTime/parse s)
+         (LocalTime/parse s)))
+
+     :cljs
+     (when (re-matches iso8601-time-re s)
+       (js/Date. (str "1970-01-01T" s)))))
 
 (defn- parse-iso8601-datetime
   "Parses string s into one of the following:
@@ -192,12 +195,14 @@
   - JS: a Javascript Date object. NB: If you don't supply a timezone JS will
         assume it's in your current, local timezone according to your device."
   [s]
-  (when-let [matches (re-matches iso8601-datetime-re s)]
-    #?(:clj
-       (if-let [offset         (peek matches)]
+  #?(:clj
+     (when-let [matches (re-matches iso8601-datetime-re s)]
+       (if (peek matches)
          (OffsetDateTime/parse s)
-         (LocalDateTime/parse s))
-       :cljs
+         (LocalDateTime/parse s)))
+
+     :cljs
+     (when (re-matches iso8601-datetime-re s)
        (js/Date. s))))
 
 (defn- coerce-boolean
@@ -308,46 +313,76 @@
                                       :error  :db/invalid-value})))))
        :cljs nil)))
 
-(defn- coerce-int-fn
-  "Returns a fn for coercing int-like values (e.g. short, long) from strings and
-  integers. Arguments are CLJ-only parse-str and cast-num fns (CLJS is always
-  the same because in JS it's all just Numbers)."
-  [parse-str cast-num]
-  (fn [value]
-    (cond
-      (string? value)
-      #?(:clj  (try (parse-str value) (catch Exception _ nil))
-         :cljs (when-not (str/includes? value ".")
-                 (let [n (js/parseInt value)] (if (js/Number.isNaN n) nil n))))
+#?(:clj
+   (defn- coerce-int-fn
+     "Returns a fn for coercing int-like values (e.g. short, long) from strings and
+     integers. Arguments are CLJ-only parse-str and cast-num fns (CLJS is always
+     the same because in JS it's all just Numbers)."
+     [parse-str cast-num]
+     (fn [value]
+       (cond
+         (string? value)
+         (try (parse-str value)
+              (catch Exception _
+                nil))
 
-      (integer? value)
-      #?(:clj (try (cast-num value) (catch Exception _ nil)) :cljs value)
+         (integer? value)
+         (try (cast-num value)
+              (catch Exception _
+                nil))
 
-      :else nil)))
+         :else nil)))
+
+   :cljs
+   (defn- coerce-int
+     [value]
+     (cond
+       (string? value)
+       (when-not (str/includes? value ".")
+         (let [n (js/parseInt value)]
+           (when-not (js/Number.isNaN n)
+             n)))
+
+       (integer? value)
+       value
+
+       :else nil)))
 
 (defn- coerce-integer
   [value]
-  (let [coerce-fn (coerce-int-fn #?(:clj #(Integer/parseInt %) :cljs nil)
-                                 #?(:clj int :cljs nil))]
-    (coerce-fn value)))
+  #?(:clj
+     (let [coerce-fn (coerce-int-fn #(Integer/parseInt %) int)]
+       (coerce-fn value))
+
+     :cljs
+     (coerce-int value)))
 
 (defn- coerce-long
   [value]
-  (let [coerce-fn (coerce-int-fn #?(:clj #(Long/parseLong %) :cljs nil)
-                                 #?(:clj long :cljs nil))]
-    (coerce-fn value)))
+  #?(:clj
+     (let [coerce-fn (coerce-int-fn #(Long/parseLong %) long)]
+       (coerce-fn value))
+
+     :cljs
+     (coerce-int value)))
 
 (defn- coerce-short
   [value]
-  (let [coerce-fn (coerce-int-fn #?(:clj #(Short/parseShort %) :cljs nil)
-                                 #?(:clj short :cljs nil))]
-    (coerce-fn value)))
+  #?(:clj
+     (let [coerce-fn (coerce-int-fn #(Short/parseShort %) short)]
+       (coerce-fn value))
+
+     :cljs
+     (coerce-int value)))
 
 (defn- coerce-byte
   [value]
-  (let [coerce-fn (coerce-int-fn #?(:clj #(Byte/parseByte %) :cljs nil)
-                                 #?(:clj byte :cljs nil))]
-    (coerce-fn value)))
+  #?(:clj
+     (let [coerce-fn (coerce-int-fn  #(Byte/parseByte %) byte)]
+       (coerce-fn value))
+
+     :cljs
+     (coerce-int value)))
 
 (defn- coerce-normalized-string
   [value]
@@ -368,10 +403,10 @@
       value
       (json-ld/normalize-data value))
     (catch* e
-            (throw (ex-info (str "Unable to normalize value to json" value)
-                            {:status 400
-                             :error  :db/invalid-json}
-                            e)))))
+      (throw (ex-info (str "Unable to normalize value to json" value)
+                      {:status 400
+                       :error  :db/invalid-json}
+                      e)))))
 
 (defn- coerce-dense-vector
   [value]
@@ -381,11 +416,11 @@
           (vector.score/vectorize))
       (vector.score/vectorize value))
     (catch* e
-           (log/error e "Unrecognized value for dense vector: " value)
-           (throw (ex-info (str "Unrecognized value for dense vector: " value)
-                           {:status 400
-                            :error  :db/invalid-dense-vector}
-                           e)))))
+      (log/error e "Unrecognized value for dense vector: " value)
+      (throw (ex-info (str "Unrecognized value for dense vector: " value)
+                      {:status 400
+                       :error  :db/invalid-dense-vector}
+                      e)))))
 
 (defn- check-signed
   "Returns nil if required-type and n conflict in terms of signedness
@@ -398,7 +433,7 @@
       (if (>= 0 n) nil n)
 
       (const/$xsd:nonNegativeInteger const/$xsd:unsignedInt
-       const/$xsd:unsignedLong const/$xsd:unsignedByte)
+                                     const/$xsd:unsignedLong const/$xsd:unsignedByte)
       (if (> 0 n) nil n)
 
       const/$xsd:negativeInteger
@@ -424,18 +459,18 @@
   [value required-type]
   (uc/case required-type
     (const/$xsd:string
-      const/iri-string
-      const/$rdf:langString
-      const/iri-lang-string)
+     const/iri-string
+     const/$rdf:langString
+     const/iri-lang-string)
     (when (string? value)
       value)
 
     (const/$xsd:boolean
-      const/iri-xsd-boolean)
+     const/iri-xsd-boolean)
     (coerce-boolean value)
 
     (const/$xsd:date
-      const/iri-xsd-date)
+     const/iri-xsd-date)
     (cond (string? value)
           (parse-iso8601-date value)
           #?(:clj
@@ -445,7 +480,7 @@
           value)
 
     (const/$xsd:dateTime
-      const/iri-xsd-dateTime)
+     const/iri-xsd-dateTime)
     (cond (string? value)
           (parse-iso8601-datetime value)
           ;; these values don't need coercion
@@ -455,10 +490,8 @@
              :cljs (instance? js/Date value))
           value)
 
-
-
     (const/$xsd:time
-      const/iri-xsd-time)
+     const/iri-xsd-time)
     (cond (string? value)
           (parse-iso8601-time value)
           #?(:clj
@@ -469,70 +502,70 @@
           value)
 
     (const/$xsd:decimal
-      const/iri-xsd-decimal)
+     const/iri-xsd-decimal)
     (coerce-decimal value)
 
     (const/$xsd:double
-      const/iri-xsd-double)
+     const/iri-xsd-double)
     (coerce-double value)
 
     (const/$xsd:float
-      const/iri-xsd-float)
+     const/iri-xsd-float)
     (coerce-float value)
 
     ;; ·maxInclusive· to be 2147483647 and ·minInclusive· to be -2147483648
     ;; https://www.w3.org/TR/xmlschema-2/#int
     (const/$xsd:int
-      const/iri-xsd-int
-      const/$xsd:unsignedShort ;; unsigned short will be outside of 'Short' value range
-      const/iri-xsd-unsignedShort)
+     const/iri-xsd-int
+     const/$xsd:unsignedShort ;; unsigned short will be outside of 'Short' value range
+     const/iri-xsd-unsignedShort)
     (-> value coerce-integer (check-signed required-type))
 
     ;; xsd:integer and parent of long and others - different from xsd:int which is 32-bit
     (const/$xsd:integer
-      const/iri-xsd-integer
-      const/$xsd:long
-      const/iri-long
-      const/$xsd:nonNegativeInteger
-      const/iri-xsd-nonNegativeInteger
-      const/$xsd:unsignedLong
-      const/iri-xsd-unsignedLong
-      const/$xsd:positiveInteger
-      const/iri-xsd-positiveInteger
-      const/$xsd:unsignedInt ;; unsigned int can be outside of xsd:int max range
-      const/iri-xsd-unsignedInt
-      const/$xsd:nonPositiveInteger
-      const/iri-xsd-nonPositiveInteger
-      const/$xsd:negativeInteger
-      const/iri-xsd-negativeInteger)
+     const/iri-xsd-integer
+     const/$xsd:long
+     const/iri-long
+     const/$xsd:nonNegativeInteger
+     const/iri-xsd-nonNegativeInteger
+     const/$xsd:unsignedLong
+     const/iri-xsd-unsignedLong
+     const/$xsd:positiveInteger
+     const/iri-xsd-positiveInteger
+     const/$xsd:unsignedInt ;; unsigned int can be outside of xsd:int max range
+     const/iri-xsd-unsignedInt
+     const/$xsd:nonPositiveInteger
+     const/iri-xsd-nonPositiveInteger
+     const/$xsd:negativeInteger
+     const/iri-xsd-negativeInteger)
     (-> value coerce-long (check-signed required-type))
 
     (const/$xsd:short
-      const/iri-xsd-short)
+     const/iri-xsd-short)
     (-> value coerce-short (check-signed required-type))
 
     (const/$xsd:byte
-      const/iri-xsd-byte
-      const/$xsd:unsignedByte
-      const/iri-xsd-unsignedByte)
+     const/iri-xsd-byte
+     const/$xsd:unsignedByte
+     const/iri-xsd-unsignedByte)
     (-> value coerce-byte (check-signed required-type))
 
     (const/$xsd:normalizedString
-      const/iri-xsd-normalizedString)
+     const/iri-xsd-normalizedString)
     (coerce-normalized-string value)
 
     (const/$xsd:token
-      const/iri-xsd-token
-      const/$xsd:language
-      const/iri-xsd-language)
+     const/iri-xsd-token
+     const/$xsd:language
+     const/iri-xsd-language)
     (coerce-token value)
 
     (const/$rdf:json
-      const/iri-rdf-json)
+     const/iri-rdf-json)
     (coerce-json value)
 
     (const/$fluree:vector
-      const/iri-vector)
+     const/iri-vector)
     (coerce-dense-vector value)
 
     ;; else

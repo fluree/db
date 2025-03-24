@@ -1,9 +1,9 @@
 (ns fluree.db.dataset
-  (:require [fluree.db.util.core :as util]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.exec.where :as where]
+  (:require [clojure.core.async :as async]
             [fluree.db.query.exec.select.subject :as subject]
-            [clojure.core.async :as async]))
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util]))
 
 (defrecord DataSet [named default active])
 
@@ -89,7 +89,6 @@
   (-finalize [_ _ _ solution-ch]
     solution-ch)
 
-
   subject/SubjectFormatter
   (-forward-properties [ds iri select-spec context compact-fn cache fuel-tracker error-ch]
     (let [db-ch   (->> ds all async/to-chan!)
@@ -128,7 +127,6 @@
                    db
                    (recur r))
                  nil))))))
-
 
 (defn combine
   [named-map defaults]

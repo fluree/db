@@ -6,13 +6,16 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
 
-(defmulti display (fn [match compact] (where/get-datatype-iri match)))
+(defmulti display
+  (fn [match _compact]
+    (where/get-datatype-iri match)))
+
 (defmethod display :default
-  [match compact]
+  [match _compact]
   (where/get-value match))
 
 (defmethod display const/iri-rdf-json
-  [match compact]
+  [match _compact]
   (-> match where/get-value (json/parse false)))
 
 (defmethod display const/iri-id
@@ -20,7 +23,7 @@
   (some-> match where/get-iri compact))
 
 (defmethod display const/iri-vector
-  [match compact]
+  [match _compact]
   (some-> match where/get-value vec))
 
 (defn format-variable-selector-value
@@ -28,8 +31,8 @@
   (fn [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
     (go (try* (-> solution (get var) (display compact))
               (catch* e
-                      (log/error e "Error formatting variable:" var)
-                      (>! error-ch e))))))
+                (log/error e "Error formatting variable:" var)
+                (>! error-ch e))))))
 
 (defn format-wildcard-selector-value
   [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
@@ -42,8 +45,8 @@
             (recur vars (assoc result var output)))
           result))
       (catch* e
-              (log/error e "Error formatting wildcard")
-              (>! error-ch e)))))
+        (log/error e "Error formatting wildcard")
+        (>! error-ch e)))))
 
 (defn format-as-selector-value
   [bind-var]

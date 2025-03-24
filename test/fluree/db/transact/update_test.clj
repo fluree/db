@@ -1,8 +1,9 @@
 (ns fluree.db.transact.update-test
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [fluree.db.test-utils :as test-utils]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
-            [fluree.db.constants :as const])
+            [fluree.db.constants :as const]
+            [fluree.db.query.exec.eval :as eval]
+            [fluree.db.test-utils :as test-utils])
   (:import [java.time OffsetDateTime]))
 
 (defn const-now
@@ -162,7 +163,7 @@
         db1    (fluree/db ledger)]
 
     (testing "hash functions"
-      (with-redefs [fluree.db.query.exec.eval/now const-now]
+      (with-redefs [eval/now const-now]
         (let [updated (-> @(fluree/stage db1 {"@context" [test-utils/default-str-context
                                                           {"ex" "http://example.com/"}]
                                               "insert"   [{"id"     "ex:create-predicates"
@@ -195,48 +196,47 @@
                                         "ex:minutes" 0 "ex:seconds" 0 "ex:timezone" 0 "ex:tz"  0}
                                        {"id"                "ex:datetime-fns"
                                         "ex:localdatetime"  {"@value" "2023-06-13T14:17:22.435"
-                                                             "@type" const/iri-xsd-dateTime}
+                                                             "@type"  const/iri-xsd-dateTime}
                                         "ex:offsetdatetime" {"@value" "2023-06-13T14:17:22.435-05:00"
-                                                             "@type" const/iri-xsd-dateTime}
+                                                             "@type"  const/iri-xsd-dateTime}
                                         "ex:utcdatetime"    {"@value" "2023-06-13T14:17:22.435Z"
-                                                             "@type" const/iri-xsd-dateTime}}]})
+                                                             "@type"  const/iri-xsd-dateTime}}]})
               db3 @(fluree/stage db2 {"@context" [test-utils/default-str-context
                                                   {"ex" "http://example.com/"}]
-                                      "values" ["?s" [{"@value" "ex:datetime-fns" "@type" "@id"}]]
-                                      "where" [{"id" "?s"
-                                                "ex:localdatetime" "?localdatetime"
-                                                "ex:offsetdatetime" "?offsetdatetime"
-                                                "ex:utcdatetime" "?utcdatetime"}
-                                               ["bind"
-                                                "?now" "(str (now))"
-                                                "?year" "(year ?localdatetime)"
-                                                "?month" "(month ?localdatetime)"
-                                                "?day" "(day ?localdatetime)"
-                                                "?hours" "(hours ?localdatetime)"
-                                                "?minutes" "(minutes ?localdatetime)"
-                                                "?seconds" "(seconds ?localdatetime)"
-                                                "?tz1" "(tz ?utcdatetime)"
-                                                "?tz2" "(tz ?offsetdatetime)"
-                                                "?comp=" "(= ?localdatetime (now))"
-                                                "?comp<" "(< ?localdatetime (now))"
-                                                "?comp<=" "(<= ?localdatetime (now))"
-                                                "?comp>" "(> ?localdatetime (now))"
-                                                "?comp>=" "(>= ?localdatetime (now))"]]
-                                      "insert" [{"id" "?s"
-                                                 "ex:now"     "?now"
-                                                 "ex:year" "?year"
-                                                 "ex:month" "?month"
-                                                 "ex:day" "?day"
-                                                 "ex:hours" "?hours"
-                                                 "ex:minutes" "?minutes"
-                                                 "ex:seconds" "?seconds"
-                                                 "ex:tz" ["?tz1" "?tz2"]
-                                                 "ex:comp=" "?comp="
-                                                 "ex:comp<" "?comp<"
-                                                 "ex:comp<="  "?comp<="
-                                                 "ex:comp>"   "?comp>"
-                                                 "ex:comp>="  "?comp>="}]
-                                      })]
+                                      "values"   ["?s" [{"@value" "ex:datetime-fns" "@type" "@id"}]]
+                                      "where"    [{"id"                "?s"
+                                                   "ex:localdatetime"  "?localdatetime"
+                                                   "ex:offsetdatetime" "?offsetdatetime"
+                                                   "ex:utcdatetime"    "?utcdatetime"}
+                                                  ["bind"
+                                                   "?now" "(str (now))"
+                                                   "?year" "(year ?localdatetime)"
+                                                   "?month" "(month ?localdatetime)"
+                                                   "?day" "(day ?localdatetime)"
+                                                   "?hours" "(hours ?localdatetime)"
+                                                   "?minutes" "(minutes ?localdatetime)"
+                                                   "?seconds" "(seconds ?localdatetime)"
+                                                   "?tz1" "(tz ?utcdatetime)"
+                                                   "?tz2" "(tz ?offsetdatetime)"
+                                                   "?comp=" "(= ?localdatetime (now))"
+                                                   "?comp<" "(< ?localdatetime (now))"
+                                                   "?comp<=" "(<= ?localdatetime (now))"
+                                                   "?comp>" "(> ?localdatetime (now))"
+                                                   "?comp>=" "(>= ?localdatetime (now))"]]
+                                      "insert"   [{"id"         "?s"
+                                                   "ex:now"     "?now"
+                                                   "ex:year"    "?year"
+                                                   "ex:month"   "?month"
+                                                   "ex:day"     "?day"
+                                                   "ex:hours"   "?hours"
+                                                   "ex:minutes" "?minutes"
+                                                   "ex:seconds" "?seconds"
+                                                   "ex:tz"      ["?tz1" "?tz2"]
+                                                   "ex:comp="   "?comp="
+                                                   "ex:comp<"   "?comp<"
+                                                   "ex:comp<="  "?comp<="
+                                                   "ex:comp>"   "?comp>"
+                                                   "ex:comp>="  "?comp>="}]})]
           (is (= {"ex:now"     "2024-06-13T19:53:57Z"
                   "ex:year"    2023
                   "ex:month"   6
@@ -374,26 +374,26 @@
                     fluree.db.query.exec.eval/struuid (fn [] {:value "34bdb25f-9fae-419b-9c50-203b5f306e47" :datatype-iri const/iri-string})]
         (let [updated (-> @(fluree/stage db1 {"@context" [test-utils/default-str-context
                                                           {"ex" "http://example.com/"}]
-                                              "insert"   [{"id"         "ex:create-predicates"
-                                                           "ex:isBlank" 0 "ex:isNumeric"    0 "ex:str"        0 "ex:uuid" 0
-                                                           "ex:struuid" 0 "ex:isNotNumeric" 0 "ex:isNotBlank" 0
-                                                           "ex:lang" 0 "ex:datatype" 0 "ex:IRI" 0 "ex:isIRI" 0
-                                                           "ex:isLiteral" 0 "ex:strdt" 0 "ex:strLang" 0
-                                                           "ex:bnode" 0}
-                                                          {"id"        "ex:rdf-term-fns"
-                                                           "ex:text"   "Abcdefg"
-                                                           "ex:langText" {"@value" "hola"
+                                              "insert"   [{"id"           "ex:create-predicates"
+                                                           "ex:isBlank"   0 "ex:isNumeric"    0 "ex:str"        0 "ex:uuid"  0
+                                                           "ex:struuid"   0 "ex:isNotNumeric" 0 "ex:isNotBlank" 0
+                                                           "ex:lang"      0 "ex:datatype"     0 "ex:IRI"        0 "ex:isIRI" 0
+                                                           "ex:isLiteral" 0 "ex:strdt"        0 "ex:strLang"    0
+                                                           "ex:bnode"     0}
+                                                          {"id"          "ex:rdf-term-fns"
+                                                           "ex:text"     "Abcdefg"
+                                                           "ex:langText" {"@value"    "hola"
                                                                           "@language" "es"}
-                                                           "ex:number" 1
-                                                           "ex:ref"    {"ex:bool" false}}
+                                                           "ex:number"   1
+                                                           "ex:ref"      {"ex:bool" false}}
                                                           {"ex:foo" "bar"}]})
                           (fluree/stage {"@context" [test-utils/default-str-context
                                                      {"ex" "http://example.com/"}]
-                                         "where"    [{"id"        "?s"
-                                                      "ex:text"   "?text"
+                                         "where"    [{"id"          "?s"
+                                                      "ex:text"     "?text"
                                                       "ex:langText" "?langtext"
-                                                      "ex:number" "?num"
-                                                      "ex:ref"    "?r"}
+                                                      "ex:number"   "?num"
+                                                      "ex:ref"      "?r"}
                                                      ["bind"
                                                       "?str" "(str ?num)"
                                                       "?str2" "(str ?text)"
@@ -443,18 +443,18 @@
                                        "ex:strLang"      "Abcdefg"
                                        "ex:strdt"        "Abcdefg"
                                        "ex:bnode"        {"id" test-utils/blank-node-id?}}
-                 @(fluree/query @updated {"@context"  [test-utils/default-str-context
-                                                       {"ex" "http://example.com/"}]
-                                          "selectOne" {"ex:rdf-term-fns" ["ex:isIRI" "ex:isURI" "ex:isLiteral"
-                                                                          "ex:lang" "ex:datatype" "ex:IRI"
-                                                                          "ex:bnode" "ex:strdt" "ex:strLang"
-                                                                          "ex:isBlank"
-                                                                          "ex:isNotBlank"
-                                                                          "ex:isNumeric"
-                                                                          "ex:isNotNumeric"
-                                                                          "ex:str"
-                                                                          "ex:uuid"
-                                                                          "ex:struuid"]}}))))))
+                                      @(fluree/query @updated {"@context"  [test-utils/default-str-context
+                                                                            {"ex" "http://example.com/"}]
+                                                               "selectOne" {"ex:rdf-term-fns" ["ex:isIRI" "ex:isURI" "ex:isLiteral"
+                                                                                               "ex:lang" "ex:datatype" "ex:IRI"
+                                                                                               "ex:bnode" "ex:strdt" "ex:strLang"
+                                                                                               "ex:isBlank"
+                                                                                               "ex:isNotBlank"
+                                                                                               "ex:isNumeric"
+                                                                                               "ex:isNotNumeric"
+                                                                                               "ex:str"
+                                                                                               "ex:uuid"
+                                                                                               "ex:struuid"]}}))))))
 
     (testing "functional forms"
       (let [updated (-> @(fluree/stage db1 {"@context" [test-utils/default-str-context
@@ -516,12 +516,12 @@
                                           "insert"   {"id" "?s", "ex:text" "?err"}
                                           "values"   ["?s" [{"@value" "ex:error" "@type" "@id"}]]})
 
-            run-err @(fluree/stage db2 {"@context" [test-utils/default-str-context
-                                                    {"ex" "http://example.com/"}]
-                                        "where"    [{"id" "?s", "ex:text" "?text"}
-                                                    ["bind" "?err" "(abs ?text)"]]
-                                        "insert"   {"id" "?s", "ex:error" "?err"}
-                                        "values"   ["?s" [{"@value" "ex:error" "@type" "@id"}]]})]
+            _run-err @(fluree/stage db2 {"@context" [test-utils/default-str-context
+                                                     {"ex" "http://example.com/"}]
+                                         "where"    [{"id" "?s", "ex:text" "?text"}
+                                                     ["bind" "?err" "(abs ?text)"]]
+                                         "insert"   {"id" "?s", "ex:error" "?err"}
+                                         "values"   ["?s" [{"@value" "ex:error" "@type" "@id"}]]})]
         (is (= "Query function references illegal symbol: foo"
                (-> parse-err
                    Throwable->map
@@ -604,35 +604,34 @@
           ledger      @(fluree/create conn "rando-txn")
           db0         (fluree/db ledger)
           db1         @(fluree/stage
-                         db0
-                         {"@context" test-utils/default-str-context
-                          "ledger"   ledger-name
-                          "insert"
-                          [{"@id"                "ex:fluree"
-                            "@type"              "schema:Organization"
-                            "schema:description" "We ❤️ Data"}
-                           {"@id"                "ex:w3c"
-                            "@type"              "schema:Organization"
-                            "schema:description" "We ❤️ Internet"}
-                           {"@id"                "ex:mosquitos"
-                            "@type"              "ex:Monster"
-                            "schema:description" "We ❤️ Human Blood"}]})
+                        db0
+                        {"@context" test-utils/default-str-context
+                         "ledger"   ledger-name
+                         "insert"
+                         [{"@id"                "ex:fluree"
+                           "@type"              "schema:Organization"
+                           "schema:description" "We ❤️ Data"}
+                          {"@id"                "ex:w3c"
+                           "@type"              "schema:Organization"
+                           "schema:description" "We ❤️ Internet"}
+                          {"@id"                "ex:mosquitos"
+                           "@type"              "ex:Monster"
+                           "schema:description" "We ❤️ Human Blood"}]})
           db2         @(fluree/stage
-                         db1
-                         {"@context" [test-utils/default-str-context]
-                          "ledger"   ledger-name
-                          "where"    {"@id"                "ex:mosquitos"
-                                      "schema:description" "?o"}
-                          "delete"   {"@id"                "ex:mosquitos"
-                                      "schema:description" "?o"}
-                          "insert"   {"@id"                "ex:mosquitos"
-                                      "schema:description" "We ❤️ All Blood"}})]
+                        db1
+                        {"@context" [test-utils/default-str-context]
+                         "ledger"   ledger-name
+                         "where"    {"@id"                "ex:mosquitos"
+                                     "schema:description" "?o"}
+                         "delete"   {"@id"                "ex:mosquitos"
+                                     "schema:description" "?o"}
+                         "insert"   {"@id"                "ex:mosquitos"
+                                     "schema:description" "We ❤️ All Blood"}})]
       (is (= [{"id"                 "ex:mosquitos"
                "type"               "ex:Monster"
                "schema:description" "We ❤️ All Blood"}]
              @(fluree/query db2 {"@context" test-utils/default-str-context
                                  :select    {"ex:mosquitos" ["*"]}}))))))
-
 
 (deftest ^:integration updates-only-on-existence
   (testing "Updating data with iri values bindings"
@@ -654,13 +653,13 @@
                                            :schema/age  62}]}})]
       (testing "on existing subjects"
         (let [db2 @(fluree/stage
-                     db1
-                     {"@context" [{:ex "http://example.org/ns/", :id "@id", :value "@value"}
-                                  test-utils/default-context]
-                      "where"    {:id "?s", :schema/name "?o"}
-                      "delete"   {:id "?s", :schema/name "?o"}
-                      "insert"   {:id "?s", :schema/name "Rutherford B. Hayes"}
-                      "values"   ["?s" [{:value :ex/rutherford, :type :id}]]})]
+                    db1
+                    {"@context" [{:ex "http://example.org/ns/", :id "@id", :value "@value"}
+                                 test-utils/default-context]
+                     "where"    {:id "?s", :schema/name "?o"}
+                     "delete"   {:id "?s", :schema/name "?o"}
+                     "insert"   {:id "?s", :schema/name "Rutherford B. Hayes"}
+                     "values"   ["?s" [{:value :ex/rutherford, :type :id}]]})]
           (is (= [{:type :ex/User,
                    :schema/age 55,
                    :schema/email "rbhayes@usa.gov",
@@ -680,13 +679,13 @@
               "does not update different subjects")))
       (testing "on nonexistent subjects"
         (let [db2 @(fluree/stage
-                     db1
-                     {"@context" [{:ex "http://example.org/ns/", :id "@id", :value "@value"}
-                                  test-utils/default-context]
-                      "where"    {:id "?s", :schema/name "?o"}
-                      "delete"   {:id "?s", :schema/name "?o"}
-                      "insert"   {:id "?s", :schema/name "Chester A. Arthur"}
-                      "values"   ["?s" [{:value :ex/chester, :type :id}]]})]
+                    db1
+                    {"@context" [{:ex "http://example.org/ns/", :id "@id", :value "@value"}
+                                 test-utils/default-context]
+                     "where"    {:id "?s", :schema/name "?o"}
+                     "delete"   {:id "?s", :schema/name "?o"}
+                     "insert"   {:id "?s", :schema/name "Chester A. Arthur"}
+                     "values"   ["?s" [{:value :ex/chester, :type :id}]]})]
           (is (= [{:type :ex/User,
                    :schema/age 55,
                    :schema/email "rbhayes@usa.gov",

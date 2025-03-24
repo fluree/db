@@ -1,13 +1,13 @@
 (ns fluree.db.flake.match
   (:refer-clojure :exclude [load vswap!])
   (:require [clojure.core.async :as async :refer [<! >!]]
-            [fluree.db.query.exec.where :as where]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [ vswap!]]
             [fluree.db.json-ld.policy :as policy]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.async :refer [<? go-try]]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [vswap!]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -52,11 +52,11 @@
   (mapv #(if (where/get-variable %) :? :v) triple))
 
 (defmulti resolve-transitive
-  (fn [db fuel-tracker solution triple error-ch]
+  (fn [_db _fuel-tracker _solution triple _error-ch]
     (var-pattern triple)))
 
 (defmethod resolve-transitive :default
-  [_ _ _ triple error-ch]
+  [_ _ _ _triple error-ch]
   (async/put! error-ch (ex-info "Unsupported transitive path." {:status 400 :error :db/unsupported-transitive-path}))
   (doto (async/chan) async/close!))
 
@@ -109,22 +109,21 @@
     out-ch))
 
 (defn o-match->s-match
-  "Strip extra keys from a match on an o-var so taht it can be compared to a match from an
-  s-var."
+  "Strip extra keys from a match on an o-var so taht it can be compared to a match
+  from an s-var."
   [mch]
   (select-keys mch [::where/var ::where/sids ::where/iri]))
 
 (defn add-reflexive-solutions
   [s-var o-var solns]
-  (let [{s s-var} (first solns)]
-    (into #{}
-          (mapcat (fn [{s s-var o o-var :as soln}]
-                    (let [s* (assoc s ::where/var o-var)
-                          o* (assoc (o-match->s-match o) ::where/var s-var)]
-                      [{s-var s o-var s*}
-                       {s-var o* o-var (o-match->s-match o)}
-                       soln])))
-          solns)))
+  (into #{}
+        (mapcat (fn [{s s-var o o-var :as soln}]
+                  (let [s* (assoc s ::where/var o-var)
+                        o* (assoc (o-match->s-match o) ::where/var s-var)]
+                    [{s-var s o-var s*}
+                     {s-var o* o-var (o-match->s-match o)}
+                     soln])))
+        solns))
 
 (defn transitive-step
   [s-var o-var solns]
@@ -172,7 +171,6 @@
                           step-ch)
     soln-ch))
 
-
 (defn match-triple
   [db fuel-tracker solution tuple error-ch]
   (let [out-ch     (async/chan 2)
@@ -192,7 +190,7 @@
                                           (async/pipe ch))))
                                   prop-ch))
 
-          (if-let [transitive (where/get-transitive-property p)]
+          (if (where/get-transitive-property p)
             (-> (resolve-transitive db fuel-tracker solution [s p o] error-ch)
                 (async/pipe out-ch))
             (-> db

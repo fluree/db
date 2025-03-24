@@ -1,6 +1,6 @@
 (ns fluree.db.query.sparql-test
   (:require
-   #?@(:clj  [[clojure.test :refer :all]]
+   #?@(:clj  [[clojure.test :refer [deftest is testing]]]
        :cljs [[cljs.test :refer-macros [deftest is testing async]]
               [clojure.core.async :refer [go <!]]
               [clojure.core.async.interop :refer [<p!]]])
@@ -8,8 +8,7 @@
    [fluree.db.api :as fluree]
    [fluree.db.query.sparql :as sparql]
    [fluree.db.test-utils :as test-utils]
-   [fluree.db.util.core :as util :refer [try* catch*]])
-  #?(:clj (:import (clojure.lang ExceptionInfo))))
+   [fluree.db.util.core :as util :refer [try* catch*]]))
 
 (deftest parse-select
   (testing "basic SELECT"
@@ -400,12 +399,12 @@
                    }}"]
         (is (= [[:values
                  [["?color" "?direction"]
-                 [[{"@type" "@id",
-                    "@value" "dm:red"}
-                   "north"]
-                  [{"@type" "@id",
-                    "@value" "dm:blue"}
-                   "west"]]]]]
+                  [[{"@type" "@id",
+                     "@value" "dm:red"}
+                    "north"]
+                   [{"@type" "@id",
+                     "@value" "dm:blue"}
+                    "west"]]]]]
                (:where (sparql/->fql query)))
             "multiple vars, multiple values")))
     (testing "clause"
@@ -605,7 +604,7 @@
                          [:filter "(= ?n ?m)"]]]]
                where)))))
   (testing "subquery"
-      (let [query "PREFIX : <http://people.example/>
+    (let [query "PREFIX : <http://people.example/>
                  SELECT ?y ?minName
                  WHERE {
                   :alice :knows ?y .
@@ -616,15 +615,15 @@
                     } GROUP BY ?y
                   }
                 }"]
-        (is (= {:context {"" "http://people.example/"},
-                :select ["?y" "?minName"],
-                :where
-                [{"@id" ":alice", ":knows" "?y"}
-                 [:query
-                  {:select ["?y" "(as (min ?name) ?minName)"],
-                   :where [{"@id" "?y", ":name" "?name"}],
-                   :groupBy ["?y"]}]]}
-               (sparql/->fql query))))))
+      (is (= {:context {"" "http://people.example/"},
+              :select ["?y" "?minName"],
+              :where
+              [{"@id" ":alice", ":knows" "?y"}
+               [:query
+                {:select ["?y" "(as (min ?name) ?minName)"],
+                 :where [{"@id" "?y", ":name" "?name"}],
+                 :groupBy ["?y"]}]]}
+             (sparql/->fql query))))))
 
 (deftest parse-prefixes
   (testing "PREFIX"
@@ -769,7 +768,7 @@
                         ?follows person:handle ?followHandle.}"]
       (is (= "Depth modifiers on transitive path elements are not supported."
              (try* (sparql/->fql query)
-                  (catch* e (ex-message e))))))))
+                   (catch* e (ex-message e))))))))
 
 (deftest parse-update
   (testing "insert data"
@@ -895,20 +894,21 @@
                        "ex:alice foaf:givenname \"Alice\"; foaf:family_name \"Hacker\"."
                        "ex:bob foaf:firstname \"Bob\"; foaf:surname \"Hacker\"."
                        "}"])]
-    #?(#_#_:cljs
+    #?(:cljs
        (async done
-         (go
-           (let [conn   (<! (test-utils/create-conn))
-                 ledger (<p! (fluree/create conn "people"))
-                 db     (<p! (fluree/stage (fluree/db ledger) txn {:format :sparql}))]
-            (testing "basic query works"
-              (let [query   "SELECT ?person ?fullName
-                             WHERE {?person person:handle \"jdoe\".
-                                    ?person person:fullName ?fullName.}"
-                    results (<p! (fluree/query db query {:format :sparql}))]
-                (is (= [["ex:jdoe" "Jane Doe"]]
-                       results))
-                (done))))))
+              (go
+                (let [conn   (<! (test-utils/create-conn))
+                      ledger (<p! (fluree/create conn "people"))
+                      db     (<p! (fluree/stage (fluree/db ledger) txn {:format :sparql}))]
+                  (testing "basic query works"
+                    (let [query   "PREFIX person: <http://example.org/Person#>
+                                    SELECT ?person ?fullName
+                                    WHERE {?person person:handle \"jdoe\".
+                                           ?person person:fullName ?fullName.}"
+                          results (<p! (fluree/query db query {:format :sparql}))]
+                      (is (= [["ex:jdoe" "Jane Doe"]]
+                             results))
+                      (done))))))
 
        :clj
        (let [conn   @(fluree/connect-memory)
@@ -1829,7 +1829,7 @@
            (testing "BASE IRI gets prefixed onto relative IRIs"
              (let [book-db @(fluree/stage db {"@context" [test-utils/default-str-context
                                                           {"person" "http://example.org/Person#"}]
-                                               "insert" book-data})
+                                              "insert" book-data})
                    query   "BASE <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book <title> ?title.}"
@@ -1840,7 +1840,7 @@
            (testing "PREFIX declarations go into the context"
              (let [book-db @(fluree/stage db {"@context" [test-utils/default-str-context
                                                           {"person" "http://example.org/Person#"}]
-                                               "insert" book-data})
+                                              "insert" book-data})
                    query   "PREFIX book: <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book book:title ?title.}"
@@ -1861,9 +1861,9 @@
                     @(fluree/query db query {:format :sparql})))))
 
          (testing "VALUES query works"
-             (let [query   "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                             SELECT ?handle
                             WHERE {VALUES ?handle { \"jdoe\" }
                                   ?person person:handle ?handle.}"]
-               (is (= [["jdoe"]]
-                      @(fluree/query db query {:format :sparql})))))))))
+             (is (= [["jdoe"]]
+                    @(fluree/query db query {:format :sparql})))))))))

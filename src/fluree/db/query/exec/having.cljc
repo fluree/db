@@ -1,7 +1,7 @@
 (ns fluree.db.query.exec.having
-  (:require [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
-            [clojure.core.async :as async :refer [>! go]])
+  (:require [clojure.core.async :as async :refer [>! go]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true])
   (:refer-clojure :exclude [filter]))
 
 (defn filter
@@ -15,8 +15,8 @@
                                           (>! ch solution))
                                         (async/close! ch)
                                         (catch* e
-                                                (log/error e "Error applying having function")
-                                                (>! error-ch e)))))
+                                          (log/error e "Error applying having function")
+                                          (>! error-ch e)))))
                             solution-ch)
       filtered-ch)
     solution-ch))

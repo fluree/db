@@ -1,10 +1,10 @@
 (ns fluree.db.query.fql.syntax
-  (:require [fluree.db.util.core :refer [try* catch*]]
+  (:require [camel-snake-kebab.core :as csk]
+            [clojure.edn :as edn]
+            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util.docs :as docs]
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]
-            [fluree.db.util.docs :as docs]
-            [camel-snake-kebab.core :as csk]
-            [clojure.edn :as edn]
             [malli.core :as m]
             [malli.transform :as mt]))
 
@@ -224,9 +224,9 @@
 
 (def fql-transformer
   (mt/transformer
-    {:name     :fql
-     :decoders (mt/-json-decoders)}
-    (mt/key-transformer {:decode csk/->kebab-case-keyword})))
+   {:name     :fql
+    :decoders (mt/-json-decoders)}
+   (mt/key-transformer {:decode csk/->kebab-case-keyword})))
 
 (def coerce-query*
   (m/coercer ::query fql-transformer {:registry registry}))
@@ -243,12 +243,12 @@
 (defn coerce-query
   [qry]
   (try*
-   (coerce-query* qry)
-   (catch* e
-           (-> e
-               humanize-error
-               (ex-info {:status 400, :error :db/invalid-query})
-               throw))))
+    (coerce-query* qry)
+    (catch* e
+      (-> e
+          humanize-error
+          (ex-info {:status 400, :error :db/invalid-query})
+          throw))))
 
 (def coerce-subquery*
   (m/coercer ::subquery fql-transformer {:registry registry}))
@@ -259,12 +259,12 @@
 (defn coerce-subquery
   [qry]
   (try*
-   (coerce-subquery* qry)
-   (catch* e
-           (-> e
-               humanize-error
-               (ex-info {:status 400, :error :db/invalid-query})
-               throw))))
+    (coerce-subquery* qry)
+    (catch* e
+      (-> e
+          humanize-error
+          (ex-info {:status 400, :error :db/invalid-query})
+          throw))))
 
 (def coerce-where*
   (m/coercer ::where fql-transformer {:registry registry}))
@@ -303,7 +303,7 @@
   (try*
     (coerce-ledger-opts* opts)
     (catch* e
-            (-> e
-                humanize-error
-                (ex-info {:status 400, :error :db/invalid-ledger-opts})
-                throw))))
+      (-> e
+          humanize-error
+          (ex-info {:status 400, :error :db/invalid-ledger-opts})
+          throw))))

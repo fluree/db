@@ -1,7 +1,7 @@
 (ns fluree.db.query.property-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.test-utils :as test-utils]
             [fluree.db.api :as fluree]
+            [fluree.db.test-utils :as test-utils]
             [test-with-files.tools :refer [with-tmp-dir] :as twf]))
 
 (deftest ^:integration equivalent-properties-test
@@ -93,17 +93,17 @@
                                                  "@type"              "rdf:Property"
                                                  "rdfs:subPropertyOf" {"@id" "ex:parent"}}
                                                 {"@id"                "ex:stepParent"
-                                                   "@type"              "rdf:Property"
-                                                   "rdfs:subPropertyOf" {"@id" "ex:parent"}}
+                                                 "@type"              "rdf:Property"
+                                                 "rdfs:subPropertyOf" {"@id" "ex:parent"}}
                                                 {"@id"                "ex:father"
                                                  "@type"              "rdf:Property"
                                                  "rdfs:subPropertyOf" {"@id" "ex:parent"}}
                                                 {"@id"                "ex:stepFather"
-                                                   "@type"              "rdf:Property"
-                                                   "rdfs:subPropertyOf" {"@id" "ex:stepParent"}}
+                                                 "@type"              "rdf:Property"
+                                                 "rdfs:subPropertyOf" {"@id" "ex:stepParent"}}
                                                 {"@id"                "ex:stepMother"
-                                                   "@type"              "rdf:Property"
-                                                   "rdfs:subPropertyOf" {"@id" "ex:stepParent"}}]})
+                                                 "@type"              "rdf:Property"
+                                                 "rdfs:subPropertyOf" {"@id" "ex:stepParent"}}]})
                      deref
                      (fluree/stage {"@context" {"ex"   "http://example.org/ns/"
                                                 "rdf"  "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -125,21 +125,21 @@
       (testing "querying one-level up in subproperty hierarchy"
         (is (= ["ex:alice" "ex:george"]
                (vec
-                 (sort
-                   @(fluree/query db '{"@context" {"ex" "http://example.org/ns/"}
-                                       :select    ?parent
-                                       :where     {"@id"                 "ex:bob"
-                                                   "ex:biologicalParent" ?parent}}))))
+                (sort
+                 @(fluree/query db '{"@context" {"ex" "http://example.org/ns/"}
+                                     :select    ?parent
+                                     :where     {"@id"                 "ex:bob"
+                                                 "ex:biologicalParent" ?parent}}))))
             "returns all sub properties of ex:parent property"))
 
       (testing "querying the top level property which includes equivalent property"
         (is (= ["ex:alice" "ex:george" "ex:jerry" "ex:john" "ex:mary"]
                (vec
-                 (sort
-                   @(fluree/query db '{"@context" {"ex" "http://example.org/ns/"}
-                                       :select    ?parent
-                                       :where     {"@id"       "ex:bob"
-                                                   "ex:parent" ?parent}}))))
+                (sort
+                 @(fluree/query db '{"@context" {"ex" "http://example.org/ns/"}
+                                     :select    ?parent
+                                     :where     {"@id"       "ex:bob"
+                                                 "ex:parent" ?parent}}))))
             "returns all sub properties of ex:parent property")))))
 
 (deftest ^:integration subjects-as-predicates
@@ -219,13 +219,12 @@
                      {"ex"  "http://example.com/"
                       "owl" "http://www.w3.org/2002/07/owl#"}]
           ledger    @(fluree/create conn ledger-id)
-          db0       (->> @(fluree/stage (fluree/db ledger) {"@context" context
+          _db0      (->> @(fluree/stage (fluree/db ledger) {"@context" context
                                                             "insert"   {"ex:new" true}})
                          (fluree/commit! ledger)
                          (deref))
 
-
-          db1 @(fluree/transact!
+          _db1 @(fluree/transact!
                  conn {"ledger"   ledger-id
                        "@context" context
                        "insert"
@@ -239,16 +238,16 @@
                                                              "@type" "rdf:Property"}]}}]})
 
           db2    @(fluree/transact!
-                    conn {"ledger"   ledger-id
-                          "@context" context
-                          "insert"   [{"@id"          "ex:andrew"
-                                       "ex:firstName" "Andrew"
-                                       "ex:age"       35}
-                                      {"@id"          "ex:dan"
-                                       "ex:givenName" "Dan"}
-                                      {"@id"     "ex:other"
-                                       "ex:fool" false
-                                       "ex:cool" true}]})
+                   conn {"ledger"   ledger-id
+                         "@context" context
+                         "insert"   [{"@id"          "ex:andrew"
+                                      "ex:firstName" "Andrew"
+                                      "ex:age"       35}
+                                     {"@id"          "ex:dan"
+                                      "ex:givenName" "Dan"}
+                                     {"@id"     "ex:other"
+                                      "ex:fool" false
+                                      "ex:cool" true}]})
           loaded @(fluree/load conn ledger-id)
           dbl    (fluree/db loaded)]
       (testing "before load"

@@ -1,15 +1,13 @@
 (ns fluree.db.query.exec
   "Find and format results of queries against database values."
   (:require [clojure.core.async :as async :refer [go]]
-            [fluree.db.query.exec.select :as select]
-            [fluree.db.query.exec.where :as where]
+            [clojure.walk :as walk]
             [fluree.db.query.exec.group :as group]
-            [fluree.db.query.exec.order :as order]
             [fluree.db.query.exec.having :as having]
-            [fluree.db.util.core :as util]
+            [fluree.db.query.exec.order :as order]
+            [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.select.subject :as subject]
-            [fluree.db.util.log :as log :include-macros true]
-            [clojure.walk :as walk]))
+            [fluree.db.query.exec.where :as where]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

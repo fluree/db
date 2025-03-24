@@ -1,14 +1,13 @@
 (ns fluree.db.serde.json
-  (:require [fluree.db.constants :as const]
-            [fluree.db.serde.protocol :as serde]
+  (:require #?(:clj  [fluree.db.util.clj-const :as uc]
+               :cljs [fluree.db.util.cljs-const :as uc])
+            [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.json :as json]
             [fluree.db.flake.index :as index]
-            #?(:clj  [fluree.db.util.clj-const :as uc]
-               :cljs [fluree.db.util.cljs-const :as uc]))
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.serde.protocol :as serde]
+            [fluree.db.util.core :as util])
   #?(:clj (:import (java.time.format DateTimeFormatter))))
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -141,11 +140,11 @@
   types into seq."
   [m]
   (reduce-kv
-    (fn [acc k v]
-      (assoc acc (name k) (if (flake/flake? v)
-                            (serialize-flake v)
-                            v)))
-    {} m))
+   (fn [acc k v]
+     (assoc acc (name k) (if (flake/flake? v)
+                           (serialize-flake v)
+                           v)))
+   {} m))
 
 (defn serialize-garbage
   [{:keys [alias branch t garbage]}]
@@ -158,17 +157,17 @@
   serde/StorageSerializer
   (-serialize-db-root [_ db-root]
     (reduce-kv
-      (fn [acc k v]
-        (assoc acc (name k)
-                   (case k
-                     (:stats :config :garbage :prev-index)
-                     (util/stringify-keys v)
+     (fn [acc k v]
+       (assoc acc (name k)
+              (case k
+                (:stats :config :garbage :prev-index)
+                (util/stringify-keys v)
 
-                     (:spot :post :opst :tspo)
-                     (stringify-child v)
+                (:spot :post :opst :tspo)
+                (stringify-child v)
 
-                     v)))
-      {} db-root))
+                v)))
+     {} db-root))
   (-deserialize-db-root [_ db-root]
     (deserialize-db-root db-root))
   (-serialize-branch [_ {:keys [children] :as _branch}]
@@ -193,7 +192,6 @@
         util/keywordize-keys
         (update :namespace-codes numerize-keys)
         (update :index-state util/keywordize-keys))))
-
 
 (defn json-serde
   "Returns a JSON serializer / deserializer"

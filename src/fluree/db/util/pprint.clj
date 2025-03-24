@@ -5,7 +5,6 @@
 
 (set! *warn-on-reflection* true)
 
-
 (defn pprint-root
   [conn index count-atom depth pos-idx]
   (let [branch?      (index/branch? index)
@@ -38,13 +37,11 @@
                          (inc depth)
                          (conj pos-idx i))))))))
 
-
 (defn pprint-index
   [conn index]
   (let [count-atom (atom 0)]
     (pprint-root conn (async/<!! (index/resolve conn index)) count-atom 0 [])
     (println "Total count: " @count-atom)))
-
 
 (defn pprint-node
   [node & [prefix]]
@@ -55,7 +52,6 @@
                          (count (:flakes node)))
         full-str       (str prefix node-type " c-" children-count)]
     (println full-str)))
-
 
 (defn pprint-path
   "Pretty prints a lookup path."
@@ -68,7 +64,6 @@
           (pprint-node p (str dashes "> "))
           (when (and print-data? (index/leaf? p))
             (println (:flakes p))))))))
-
 
 (defn pprint-db
   [{:keys [conn spot post opst tspo]}]

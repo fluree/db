@@ -1,7 +1,7 @@
 (ns fluree.db.query.optional-query-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.api :as fluree]))
+            [fluree.db.api :as fluree]
+            [fluree.db.test-utils :as test-utils]))
 
 (deftest ^:integration optional-queries
   (testing "Testing various 'optional' query clauses."
@@ -9,23 +9,23 @@
           ledger  @(fluree/create conn "query/optional")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
           db      @(fluree/stage
-                     (fluree/db ledger)
-                     {"@context" context
-                      "insert"
-                      [{:id          :ex/brian,
-                        :type        :ex/User,
-                        :schema/name "Brian"
-                        :ex/friend   [:ex/alice]}
-                       {:id           :ex/alice,
-                        :type         :ex/User,
-                        :ex/favColor  "Green"
-                        :schema/email "alice@flur.ee"
-                        :schema/name  "Alice"}
-                       {:id           :ex/cam,
-                        :type         :ex/User,
-                        :schema/name  "Cam"
-                        :schema/email "cam@flur.ee"
-                        :ex/friend    [:ex/brian :ex/alice]}]})]
+                    (fluree/db ledger)
+                    {"@context" context
+                     "insert"
+                     [{:id          :ex/brian,
+                       :type        :ex/User,
+                       :schema/name "Brian"
+                       :ex/friend   [:ex/alice]}
+                      {:id           :ex/alice,
+                       :type         :ex/User,
+                       :ex/favColor  "Green"
+                       :schema/email "alice@flur.ee"
+                       :schema/name  "Alice"}
+                      {:id           :ex/cam,
+                       :type         :ex/User,
+                       :schema/name  "Cam"
+                       :schema/email "cam@flur.ee"
+                       :ex/friend    [:ex/brian :ex/alice]}]})]
 
       ;; basic single optional statement
       (is (= [["Alice" "Green"]
