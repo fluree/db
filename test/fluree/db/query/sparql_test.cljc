@@ -1,13 +1,14 @@
 (ns fluree.db.query.sparql-test
-  (:require #?@(:clj  [[clojure.test :refer [deftest is testing]]]
-                :cljs [[cljs.test :refer-macros [async deftest is testing]]
-                       [clojure.core.async :refer [<! go]]
-                       [clojure.core.async.interop :refer [<p!]]])
-            [fluree.db.api :as fluree]
-            [fluree.db.query.sparql :as sparql]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util :refer [try* catch*]])
-  #?(:clj (:import (clojure.lang ExceptionInfo))))
+  (:require
+   #?@(:clj  [[clojure.test :refer [deftest is testing]]]
+       :cljs [[cljs.test :refer-macros [deftest is testing async]]
+              [clojure.core.async :refer [go <!]]
+              [clojure.core.async.interop :refer [<p!]]])
+   [clojure.string :as str]
+   [fluree.db.api :as fluree]
+   [fluree.db.query.sparql :as sparql]
+   [fluree.db.test-utils :as test-utils]
+   [fluree.db.util.core :as util :refer [try* catch*]]))
 
 (deftest parse-select
   (testing "basic SELECT"
@@ -769,6 +770,106 @@
              (try* (sparql/->fql query)
                    (catch* e (ex-message e))))))))
 
+(deftest parse-update
+  (testing "insert data"
+    (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+               INSERT DATA
+                 {
+                   <http://example/book1> dc:title \"A new book\" ;
+                                          dc:creator \"A.N.Other\" .
+                 }"]
+      (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
+              :insert  [{"@id" "http://example/book1", "dc:title" "A new book"}
+                        {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
+             (sparql/->fql query)))))
+  (testing "delete-data"
+    (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+               DELETE DATA
+                 {
+                   <http://example/book1> dc:title \"A new book\" ;
+                                          dc:creator \"A.N.Other\" .
+                 }"]
+      (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
+              :delete  [{"@id" "http://example/book1", "dc:title" "A new book"}
+                        {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
+             (sparql/->fql query)))))
+  (testing "delete/insert where"
+    (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+               WITH <http://example/addresses>
+               DELETE { ?person foaf:givenName 'Bill' }
+               INSERT { ?person foaf:givenName 'William' }
+               WHERE
+                 { ?person foaf:givenName 'Bill'
+                 }"]
+      (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/"},
+              :ledger  "http://example/addresses",
+              :delete  [{"@id" "?person", "foaf:givenName" "Bill"}],
+              :insert  [{"@id" "?person", "foaf:givenName" "William"}],
+              :where   [{"@id" "?person", "foaf:givenName" "Bill"}]}
+             (sparql/->fql query)))))
+  (testing "delete where"
+    (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+               DELETE WHERE { ?person foaf:givenName 'Fred';
+                                      ?property      ?value }"]
+      (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/"},
+              :where   [{"@id" "?person", "foaf:givenName" "Fred"}
+                        {"@id" "?person", "?property" "?value"}],
+              :delete  [{"@id" "?person", "foaf:givenName" "Fred"}
+                        {"@id" "?person", "?property" "?value"}]}
+             (sparql/->fql query)))))
+  (testing "using clauses"
+    (testing "one USING clause"
+      (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+                 DELETE { ?person ?property ?value }
+                 USING <http://flur.ee/ledger1>
+                 WHERE { ?person foaf:givenName 'Fred';
+                                 ?property      ?value }"]
+        (is (= {:context {"foaf" "http://xmlns.com/foaf/0.1/"},
+                :delete [{"@id" "?person", "?property" "?value"}],
+                :ledger "http://flur.ee/ledger1",
+                :where [{"@id" "?person", "foaf:givenName" "Fred"}
+                        {"@id" "?person", "?property" "?value"}]}
+               (sparql/->fql query)))))
+    (testing "one USING NAMED clause"
+      (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+                 DELETE { ?person ?property ?value }
+                 USING NAMED <http://flur.ee/ledger2>
+                 WHERE { ?person foaf:givenName 'Fred';
+                                 ?property      ?value }"]
+        (is (= "USING NAMED is not supported in SPARQL Update."
+               (try* (sparql/->fql query)
+                     (catch* e (ex-message e)))))))
+    (testing "more than one"
+      (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+                 DELETE { ?person ?property ?value }
+                 USING <http://flur.ee/ledger1>
+                 USING NAMED <http://flur.ee/ledger2>
+                 WHERE { ?person foaf:givenName 'Fred';
+                                 ?property      ?value }"]
+        (is (= "More than one USING clause is not supported in SPARQL Update."
+               (try* (sparql/->fql query)
+                     (catch* e (ex-message e))))))))
+
+  (testing "graph patterns"
+    (let [query "PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+               PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+               INSERT
+                 { GRAPH <http://example/addresses>
+                   {
+                     ?person  foaf:name  ?name .
+                     ?person  foaf:mbox  ?email
+                   } }
+              WHERE
+                { GRAPH  <http://example/people>
+                  {
+                    ?person  foaf:name  ?name .
+                    OPTIONAL { ?person  foaf:mbox  ?email }
+                  } }"]
+      (is (= "GRAPH not supported in INSERT. Use WITH or USING instead."
+             (try* (sparql/->fql query)
+                   (catch* e (ex-message e))))))))
+
 (deftest parsing-error
   (testing "invalid query throws expected error"
     (let [query "SELECT ?person
@@ -778,63 +879,41 @@
              (try
                (sparql/->fql query)
                "should throw 400, :db/invalid-query"
-               (catch #?(:clj  ExceptionInfo
+               (catch #?(:clj  clojure.lang.ExceptionInfo
                          :cljs :default) e (ex-data e))))))))
 
 (deftest ^:integration query-test
-  (let [people-data [{"id"              "ex:jdoe"
-                      "type"            "ex:Person"
-                      "person:handle"   "jdoe"
-                      "person:fullName" "Jane Doe"
-                      "person:favNums"  [3 7 42 99]}
-                     {"id"              "ex:bbob"
-                      "type"            "ex:Person"
-                      "person:handle"   "bbob"
-                      "person:fullName" "Billy Bob"
-                      "person:favNums"  [23]}
-                     {"id"              "ex:jbob"
-                      "type"            "ex:Person"
-                      "person:handle"   "jbob"
-                      "person:fullName" "Jenny Bob"
-                      "person:favNums"  [8 6 7 5 3 0 9]}
-                     {"id"              "ex:fbueller"
-                      "type"            "ex:Person"
-                      "person:handle"   "dankeshön"
-                      "person:fullName" "Ferris Bueller"}
-                     {"@id"              "ex:alice"
-                      "foaf:givenname"   "Alice"
-                      "foaf:family_name" "Hacker"}
-                     {"@id"            "ex:bob"
-                      "foaf:firstname" "Bob"
-                      "foaf:surname"   "Hacker"}]]
+  (let [txn (str/join "\n"
+                      ["PREFIX person: <http://example.org/Person#>"
+                       "PREFIX foaf: <http://xmlns.com/foaf/0.1/>"
+                       "INSERT DATA {"
+                       "ex:jdoe a ex:Person; person:handle \"jdoe\"; person:fullName \"Jane Doe\"; person:favNums 3, 7, 42, 99."
+                       "ex:bbob a ex:Person; person:handle \"bbob\"; person:fullName \"Billy Bob\"; person:favNums 23."
+                       "ex:jbob a ex:Person; person:handle \"jbob\"; person:fullName \"Jenny Bob\"; person:favNums 8, 6, 7, 5, 3, 0, 9."
+                       "ex:fbueller a ex:Person; person:handle \"dankeshön\"; person:fullName \"Ferris Bueller\"."
+                       "ex:alice foaf:givenname \"Alice\"; foaf:family_name \"Hacker\"."
+                       "ex:bob foaf:firstname \"Bob\"; foaf:surname \"Hacker\"."
+                       "}"])]
     #?(:cljs
        (async done
               (go
                 (let [conn   (<! (test-utils/create-conn))
                       ledger (<p! (fluree/create conn "people"))
-                      db     (<p! (fluree/stage (fluree/db ledger) {"@context" [test-utils/default-str-context
-                                                                                {"person" "http://example.org/Person#"}]
-                                                                    "insert"   people-data}))]
+                      db     (<p! (fluree/stage (fluree/db ledger) txn {:format :sparql}))]
                   (testing "basic query works"
                     (let [query   "PREFIX person: <http://example.org/Person#>
-                                   SELECT ?person ?fullName
-                                   WHERE {?person person:handle \"jdoe\".
-                                          ?person person:fullName ?fullName.}"
+                                    SELECT ?person ?fullName
+                                    WHERE {?person person:handle \"jdoe\".
+                                           ?person person:fullName ?fullName.}"
                           results (<p! (fluree/query db query {:format :sparql}))]
                       (is (= [["ex:jdoe" "Jane Doe"]]
                              results))
                       (done))))))
 
        :clj
-       (let [conn @(fluree/connect-memory)
-             db   (-> conn
-                      (fluree/create "people")
-                      deref
-                      fluree/db
-                      (fluree/stage {"@context" [test-utils/default-str-context
-                                                 {"person" "http://example.org/Person#"}]
-                                     "insert"   people-data})
-                      deref)]
+       (let [conn   @(fluree/connect-memory)
+             ledger @(fluree/create conn "people")
+             db     @(fluree/stage (fluree/db ledger) txn {:format :sparql})]
          (testing "basic query works"
            (let [query "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?fullName
@@ -847,7 +926,7 @@
                (is (= {"head" {"vars" ["fullName" "person"]},
                        "results"
                        {"bindings"
-                        [{"person"   {"type" "uri", "value" "ex:jdoe"},
+                        [{"person" {"type" "uri", "value" "ex:jdoe"},
                           "fullName" {"value" "Jane Doe", "type" "literal"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic filter works"
@@ -865,22 +944,22 @@
                        {"bindings"
                         [{"handle" {"value" "bbob", "type" "literal"},
                           "favNum"
-                          {"value"    "23",
-                           "type"     "literal",
+                          {"value" "23",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"handle" {"value" "jdoe", "type" "literal"},
                           "favNum"
-                          {"value"    "42",
-                           "type"     "literal",
+                          {"value" "42",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"handle" {"value" "jdoe", "type" "literal"},
                           "favNum"
-                          {"value"    "99",
-                           "type"     "literal",
+                          {"value" "99",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic wildcard query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT *
                           WHERE {?person person:handle ?handle;
                                          person:favNums ?favNums.}"]
@@ -903,80 +982,80 @@
                        "results"
                        {"bindings"
                         [{"favNums"
-                          {"value"    "23",
-                           "type"     "literal",
+                          {"value" "23",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "bbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:bbob"}}
                          {"favNums"
-                          {"value"    "0",
-                           "type"     "literal",
+                          {"value" "0",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "3",
-                           "type"     "literal",
+                          {"value" "3",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "5",
-                           "type"     "literal",
+                          {"value" "5",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "6",
-                           "type"     "literal",
+                          {"value" "6",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "7",
-                           "type"     "literal",
+                          {"value" "7",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "8",
-                           "type"     "literal",
+                          {"value" "8",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "9",
-                           "type"     "literal",
+                          {"value" "9",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "3",
-                           "type"     "literal",
+                          {"value" "3",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jdoe", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jdoe"}}
                          {"favNums"
-                          {"value"    "7",
-                           "type"     "literal",
+                          {"value" "7",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jdoe", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jdoe"}}
                          {"favNums"
-                          {"value"    "42",
-                           "type"     "literal",
+                          {"value" "42",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jdoe", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jdoe"}}
                          {"favNums"
-                          {"value"    "99",
-                           "type"     "literal",
+                          {"value" "99",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jdoe", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jdoe"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic wildcard query w/ grouping works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT *
                           WHERE {?person person:handle ?handle;
                                          person:favNums ?favNums.}
@@ -991,80 +1070,80 @@
                        "results"
                        {"bindings"
                         [{"favNums"
-                          {"value"    "23",
-                           "type"     "literal",
+                          {"value" "23",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "bbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:bbob"}}
                          {"favNums"
-                          {"value"    "0",
-                           "type"     "literal",
+                          {"value" "0",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "3",
-                           "type"     "literal",
+                          {"value" "3",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "5",
-                           "type"     "literal",
+                          {"value" "5",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "6",
-                           "type"     "literal",
+                          {"value" "6",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "7",
-                           "type"     "literal",
+                          {"value" "7",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "8",
-                           "type"     "literal",
+                          {"value" "8",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "9",
-                           "type"     "literal",
+                          {"value" "9",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jbob"}}
                          {"favNums"
-                          {"value"    "3",
-                           "type"     "literal",
+                          {"value" "3",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jdoe", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jdoe"}}
                          {"favNums"
-                          {"value"    "7",
-                           "type"     "literal",
+                          {"value" "7",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jdoe", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jdoe"}}
                          {"favNums"
-                          {"value"    "42",
-                           "type"     "literal",
+                          {"value" "42",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jdoe", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jdoe"}}
                          {"favNums"
-                          {"value"    "99",
-                           "type"     "literal",
+                          {"value" "99",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "handle" {"value" "jdoe", "type" "literal"},
                           "person" {"type" "uri", "value" "ex:jdoe"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic query w/ OPTIONAL works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?favNums
                           WHERE {?person person:handle ?handle.
                                  OPTIONAL{?person person:favNums ?favNums.}}"]
@@ -1089,69 +1168,69 @@
                        {"bindings"
                         [{"person" {"type" "uri", "value" "ex:bbob"},
                           "favNums"
-                          {"value"    "23",
-                           "type"     "literal",
+                          {"value" "23",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
-                         {"person"  {"type" "uri", "value" "ex:fbueller"},
+                         {"person" {"type" "uri", "value" "ex:fbueller"},
                           "favNums" {"value" "", "type" "literal"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "0",
-                           "type"     "literal",
+                          {"value" "0",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "3",
-                           "type"     "literal",
+                          {"value" "3",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "5",
-                           "type"     "literal",
+                          {"value" "5",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "6",
-                           "type"     "literal",
+                          {"value" "6",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "7",
-                           "type"     "literal",
+                          {"value" "7",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "8",
-                           "type"     "literal",
+                          {"value" "8",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "9",
-                           "type"     "literal",
+                          {"value" "9",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jdoe"},
                           "favNums"
-                          {"value"    "3",
-                           "type"     "literal",
+                          {"value" "3",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jdoe"},
                           "favNums"
-                          {"value"    "7",
-                           "type"     "literal",
+                          {"value" "7",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jdoe"},
                           "favNums"
-                          {"value"    "42",
-                           "type"     "literal",
+                          {"value" "42",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jdoe"},
                           "favNums"
-                          {"value"    "99",
-                           "type"     "literal",
+                          {"value" "99",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic query w/ GROUP BY & OPTIONAL works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?favNums
                           WHERE {?person person:handle ?handle.
                                  OPTIONAL{?person person:favNums ?favNums.}}
@@ -1168,69 +1247,69 @@
                        {"bindings"
                         [{"person" {"type" "uri", "value" "ex:bbob"},
                           "favNums"
-                          {"value"    "23",
-                           "type"     "literal",
+                          {"value" "23",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
-                         {"person"  {"type" "uri", "value" "ex:fbueller"},
+                         {"person" {"type" "uri", "value" "ex:fbueller"},
                           "favNums" {"value" "", "type" "literal"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "0",
-                           "type"     "literal",
+                          {"value" "0",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "3",
-                           "type"     "literal",
+                          {"value" "3",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "5",
-                           "type"     "literal",
+                          {"value" "5",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "6",
-                           "type"     "literal",
+                          {"value" "6",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "7",
-                           "type"     "literal",
+                          {"value" "7",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "8",
-                           "type"     "literal",
+                          {"value" "8",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jbob"},
                           "favNums"
-                          {"value"    "9",
-                           "type"     "literal",
+                          {"value" "9",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jdoe"},
                           "favNums"
-                          {"value"    "3",
-                           "type"     "literal",
+                          {"value" "3",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jdoe"},
                           "favNums"
-                          {"value"    "7",
-                           "type"     "literal",
+                          {"value" "7",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jdoe"},
                           "favNums"
-                          {"value"    "42",
-                           "type"     "literal",
+                          {"value" "42",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"person" {"type" "uri", "value" "ex:jdoe"},
                           "favNums"
-                          {"value"    "99",
-                           "type"     "literal",
+                          {"value" "99",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic query w/ omitted subjects works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?fullName ?favNums
                           WHERE {?person person:handle \"jdoe\";
                                          person:fullName ?fullName;
@@ -1245,33 +1324,33 @@
                (is (= {"head" {"vars" ["favNums" "fullName" "person"]},
                        "results"
                        {"bindings"
-                        [{"person"   {"type" "uri", "value" "ex:jdoe"},
+                        [{"person" {"type" "uri", "value" "ex:jdoe"},
                           "fullName" {"value" "Jane Doe", "type" "literal"},
                           "favNums"
-                          {"value"    "3",
-                           "type"     "literal",
+                          {"value" "3",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
-                         {"person"   {"type" "uri", "value" "ex:jdoe"},
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
                           "fullName" {"value" "Jane Doe", "type" "literal"},
                           "favNums"
-                          {"value"    "7",
-                           "type"     "literal",
+                          {"value" "7",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
-                         {"person"   {"type" "uri", "value" "ex:jdoe"},
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
                           "fullName" {"value" "Jane Doe", "type" "literal"},
                           "favNums"
-                          {"value"    "42",
-                           "type"     "literal",
+                          {"value" "42",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
-                         {"person"   {"type" "uri", "value" "ex:jdoe"},
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
                           "fullName" {"value" "Jane Doe", "type" "literal"},
                           "favNums"
-                          {"value"    "99",
-                           "type"     "literal",
+                          {"value" "99",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "scalar fn query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (SHA512(?handle) AS ?handleHash)
                           WHERE {?person person:handle ?handle.}"]
              (testing "output :fql"
@@ -1303,7 +1382,7 @@
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "aggregate fn query works"
            ;; Select the bound var after the AS to make sure it is bound to the result
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (AVG(?favNums) AS ?avgFav) ?avgFav
                           WHERE {?person person:favNums ?favNums.}"]
              (testing "output :fql"
@@ -1315,12 +1394,12 @@
                        "results"
                        {"bindings"
                         [{"avgFav"
-                          {"value"    "17.66666666666667",
-                           "type"     "literal",
+                          {"value" "17.66666666666667",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "aggregate fn w/ GROUP BY query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (AVG(?favNums) AS ?avgFav)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"]
@@ -1332,20 +1411,20 @@
                        "results"
                        {"bindings"
                         [{"avgFav"
-                          {"value"    "5.428571428571429",
-                           "type"     "literal",
+                          {"value" "5.428571428571429",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"}}
                          {"avgFav"
-                          {"value"    "37.75",
-                           "type"     "literal",
+                          {"value" "37.75",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"}}
                          {"avgFav"
-                          {"value"    "23",
-                           "type"     "literal",
+                          {"value" "23",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "aggregate fn w/ GROUP BY ... HAVING query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (AVG(?favNums) AS ?avgFav)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person HAVING(AVG(?favNums) > 10)"]
@@ -1357,16 +1436,16 @@
                        "results"
                        {"bindings"
                         [{"avgFav"
-                          {"value"    "37.75",
-                           "type"     "literal",
+                          {"value" "37.75",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"}}
                          {"avgFav"
-                          {"value"    "23",
-                           "type"     "literal",
+                          {"value" "23",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "multi-arg fn query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (CONCAT(?handle, '-', ?fullName) AS ?hfn)
                           WHERE {?person person:handle ?handle.
                                  ?person person:fullName ?fullName.}"]
@@ -1386,7 +1465,7 @@
                          {"hfn" {"value" "jdoe-Jane Doe", "type" "literal"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "multiple AS selections query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (AVG(?favNums) AS ?avgFav) (CEIL(?avgFav) AS ?caf)
                           WHERE {?person person:favNums ?favNums.}"]
              (testing "output :fql"
@@ -1397,16 +1476,16 @@
                        "results"
                        {"bindings"
                         [{"avgFav"
-                          {"value"    "17.66666666666667",
-                           "type"     "literal",
+                          {"value" "17.66666666666667",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"},
                           "caf"
-                          {"value"    "18",
-                           "type"     "literal",
+                          {"value" "18",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "mix of bindings and variables in SELECT query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?favNums (AVG(?favNums) AS ?avg) ?person ?handle (MAX(?favNums) AS ?max)
                           WHERE  {?person person:handle ?handle.
                                   ?person person:favNums ?favNums.}
@@ -1421,176 +1500,176 @@
                        "results"
                        {"bindings"
                         [{"favNums"
-                          {"value"    "23",
-                           "type"     "literal",
+                          {"value" "23",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "avg"
-                          {"value"    "23",
-                           "type"     "literal",
+                          {"value" "23",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "person" {"type" "uri", "value" "ex:bbob"},
                           "handle" {"value" "bbob", "type" "literal"},
                           "max"
-                          {"value"    "23",
-                           "type"     "literal",
+                          {"value" "23",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNums"
-                          {"value"    "0",
-                           "type"     "literal",
+                          {"value" "0",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "avg"
-                          {"value"    "5.428571428571429",
-                           "type"     "literal",
+                          {"value" "5.428571428571429",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"},
                           "person" {"type" "uri", "value" "ex:jbob"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "max"
-                          {"value"    "9",
-                           "type"     "literal",
+                          {"value" "9",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNums"
-                          {"value"    "3",
-                           "type"     "literal",
+                          {"value" "3",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "avg"
-                          {"value"    "5.428571428571429",
-                           "type"     "literal",
+                          {"value" "5.428571428571429",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"},
                           "person" {"type" "uri", "value" "ex:jbob"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "max"
-                          {"value"    "9",
-                           "type"     "literal",
+                          {"value" "9",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNums"
-                          {"value"    "5",
-                           "type"     "literal",
+                          {"value" "5",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "avg"
-                          {"value"    "5.428571428571429",
-                           "type"     "literal",
+                          {"value" "5.428571428571429",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"},
                           "person" {"type" "uri", "value" "ex:jbob"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "max"
-                          {"value"    "9",
-                           "type"     "literal",
+                          {"value" "9",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNums"
-                          {"value"    "6",
-                           "type"     "literal",
+                          {"value" "6",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "avg"
-                          {"value"    "5.428571428571429",
-                           "type"     "literal",
+                          {"value" "5.428571428571429",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"},
                           "person" {"type" "uri", "value" "ex:jbob"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "max"
-                          {"value"    "9",
-                           "type"     "literal",
+                          {"value" "9",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNums"
-                          {"value"    "7",
-                           "type"     "literal",
+                          {"value" "7",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "avg"
-                          {"value"    "5.428571428571429",
-                           "type"     "literal",
+                          {"value" "5.428571428571429",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"},
                           "person" {"type" "uri", "value" "ex:jbob"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "max"
-                          {"value"    "9",
-                           "type"     "literal",
+                          {"value" "9",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNums"
-                          {"value"    "8",
-                           "type"     "literal",
+                          {"value" "8",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "avg"
-                          {"value"    "5.428571428571429",
-                           "type"     "literal",
+                          {"value" "5.428571428571429",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"},
                           "person" {"type" "uri", "value" "ex:jbob"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "max"
-                          {"value"    "9",
-                           "type"     "literal",
+                          {"value" "9",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNums"
-                          {"value"    "9",
-                           "type"     "literal",
+                          {"value" "9",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "avg"
-                          {"value"    "5.428571428571429",
-                           "type"     "literal",
+                          {"value" "5.428571428571429",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"},
                           "person" {"type" "uri", "value" "ex:jbob"},
                           "handle" {"value" "jbob", "type" "literal"},
                           "max"
-                          {"value"    "9",
-                           "type"     "literal",
+                          {"value" "9",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNums"
-                          {"value"    "3",
-                           "type"     "literal",
+                          {"value" "3",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "avg"
-                          {"value"    "37.75",
-                           "type"     "literal",
+                          {"value" "37.75",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"},
                           "person" {"type" "uri", "value" "ex:jdoe"},
                           "handle" {"value" "jdoe", "type" "literal"},
                           "max"
-                          {"value"    "99",
-                           "type"     "literal",
+                          {"value" "99",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNums"
-                          {"value"    "7",
-                           "type"     "literal",
+                          {"value" "7",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "avg"
-                          {"value"    "37.75",
-                           "type"     "literal",
+                          {"value" "37.75",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"},
                           "person" {"type" "uri", "value" "ex:jdoe"},
                           "handle" {"value" "jdoe", "type" "literal"},
                           "max"
-                          {"value"    "99",
-                           "type"     "literal",
+                          {"value" "99",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNums"
-                          {"value"    "42",
-                           "type"     "literal",
+                          {"value" "42",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "avg"
-                          {"value"    "37.75",
-                           "type"     "literal",
+                          {"value" "37.75",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"},
                           "person" {"type" "uri", "value" "ex:jdoe"},
                           "handle" {"value" "jdoe", "type" "literal"},
                           "max"
-                          {"value"    "99",
-                           "type"     "literal",
+                          {"value" "99",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNums"
-                          {"value"    "99",
-                           "type"     "literal",
+                          {"value" "99",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
                           "avg"
-                          {"value"    "37.75",
-                           "type"     "literal",
+                          {"value" "37.75",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"},
                           "person" {"type" "uri", "value" "ex:jdoe"},
                           "handle" {"value" "jdoe", "type" "literal"},
                           "max"
-                          {"value"    "99",
-                           "type"     "literal",
+                          {"value" "99",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "COUNT query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (COUNT(?favNums) AS ?numFavs)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"]
@@ -1602,20 +1681,20 @@
                        "results"
                        {"bindings"
                         [{"numFavs"
-                          {"value"    "7",
-                           "type"     "literal",
+                          {"value" "7",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"numFavs"
-                          {"value"    "4",
-                           "type"     "literal",
+                          {"value" "4",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"numFavs"
-                          {"value"    "1",
-                           "type"     "literal",
+                          {"value" "1",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "SAMPLE query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (SAMPLE(?favNums) AS ?favNum)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"]
@@ -1629,7 +1708,7 @@
                  (is (every? #(-> % (get "favNum") (get "datatype") (= "http://www.w3.org/2001/XMLSchema#integer"))
                              (-> results (get "results") (get "bindings"))))))))
          (testing "SUM query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (SUM(?favNums) AS ?favNum)
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"]
@@ -1641,16 +1720,16 @@
                        "results"
                        {"bindings"
                         [{"favNum"
-                          {"value"    "38",
-                           "type"     "literal",
+                          {"value" "38",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNum"
-                          {"value"    "151",
-                           "type"     "literal",
+                          {"value" "151",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNum"
-                          {"value"    "23",
-                           "type"     "literal",
+                          {"value" "23",
+                           "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "CONSTRUCT query works"
@@ -1664,23 +1743,23 @@
                           { ?x foaf:firstname ?gname } UNION  { ?x foaf:givenname   ?gname } .
                           { ?x foaf:surname   ?fname } UNION  { ?x foaf:family_name ?fname } .
                         }"]
-               (is (= {"@context" {"foaf"  "http://xmlns.com/foaf/0.1/",
+               (is (= {"@context" {"foaf" "http://xmlns.com/foaf/0.1/",
                                    "vcard" "http://www.w3.org/2001/vcard-rdf/3.0#"}
                        "@graph"
-                       [{"@id"              "ex:alice",
-                         "vcard:givenName"  ["Alice"],
+                       [{"@id" "ex:alice",
+                         "vcard:givenName" ["Alice"],
                          "vcard:familyName" ["Hacker"]}
-                        {"@id"              "ex:bob",
-                         "vcard:givenName"  ["Bob"],
+                        {"@id" "ex:bob",
+                         "vcard:givenName" ["Bob"],
                          "vcard:familyName" ["Hacker"]}]}
                       @(fluree/query db query {:format :sparql})))))
            (testing "CONSTRUCT WHERE"
              (let [query "PREFIX foaf:    <http://xmlns.com/foaf/0.1/>
                         PREFIX vcard:   <http://www.w3.org/2001/vcard-rdf/3.0#>
                         CONSTRUCT WHERE { ?x foaf:firstname ?fname }"]
-               (is (= {"@context" {"foaf"  "http://xmlns.com/foaf/0.1/",
+               (is (= {"@context" {"foaf" "http://xmlns.com/foaf/0.1/",
                                    "vcard" "http://www.w3.org/2001/vcard-rdf/3.0#"}
-                       "@graph"   [{"@id" "ex:bob", "foaf:firstname" ["Bob"]}]}
+                       "@graph" [{"@id" "ex:bob", "foaf:firstname" ["Bob"]}]}
                       @(fluree/query db query {:format :sparql})))))
            ;; non-deterministic output
            #_(testing "CONSTRUCT with blank nodes"
@@ -1694,21 +1773,21 @@
                           { ?x foaf:firstname ?gname } UNION  { ?x foaf:givenname   ?gname } .
                           { ?x foaf:surname   ?fname } UNION  { ?x foaf:family_name ?fname } .
                         }"]
-                 (is (= {"@context" {"foaf"  "http://xmlns.com/foaf/0.1/",
+                 (is (= {"@context" {"foaf" "http://xmlns.com/foaf/0.1/",
                                      "vcard" "http://www.w3.org/2001/vcard-rdf/3.0#"}
                          "@graph"
-                         [{"@id"              "_:v1",
-                           "vcard:givenName"  ["Bob"],
+                         [{"@id" "_:v1",
+                           "vcard:givenName" ["Bob"],
                            "vcard:familyName" ["Hacker"]}
-                          {"@id"              "_:v2",
-                           "vcard:givenName"  ["Alice"],
+                          {"@id" "_:v2",
+                           "vcard:givenName" ["Alice"],
                            "vcard:familyName" ["Hacker"]}
                           {"@id" "ex:alice", "vcard:N" [{"@id" "_:v2"}]}
                           {"@id" "ex:bob", "vcard:N" [{"@id" "_:v1"}]}]}
                         @(fluree/query db query {:format :sparql}))))))
 
          (testing "ORDER BY ASC query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?handle
                           WHERE {?person person:handle ?handle.}
                           ORDER BY ASC(?handle)"]
@@ -1725,7 +1804,7 @@
                          {"handle" {"value" "jdoe", "type" "literal"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "ORDER BY DESC query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT ?handle
                           WHERE {?person person:handle ?handle.}
                           ORDER BY DESC(?handle)"]
@@ -1750,7 +1829,7 @@
            (testing "BASE IRI gets prefixed onto relative IRIs"
              (let [book-db @(fluree/stage db {"@context" [test-utils/default-str-context
                                                           {"person" "http://example.org/Person#"}]
-                                              "insert"   book-data})
+                                              "insert" book-data})
                    query   "BASE <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book <title> ?title.}"
@@ -1761,7 +1840,7 @@
            (testing "PREFIX declarations go into the context"
              (let [book-db @(fluree/stage db {"@context" [test-utils/default-str-context
                                                           {"person" "http://example.org/Person#"}]
-                                              "insert"   book-data})
+                                              "insert" book-data})
                    query   "PREFIX book: <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book book:title ?title.}"
@@ -1771,7 +1850,7 @@
                       results)))))
 
          (testing "fn w/ langtag string arg query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (CONCAT(?fullName, \"'s handle is \"@en, ?handle) AS ?hfn)
                             WHERE {?person person:handle ?handle.
                                    ?person person:fullName ?fullName.}"]
@@ -1782,7 +1861,7 @@
                     @(fluree/query db query {:format :sparql})))))
 
          (testing "VALUES query works"
-           (let [query "PREFIX person: <http://example.org/Person#>
+           (let [query   "PREFIX person: <http://example.org/Person#>
                             SELECT ?handle
                             WHERE {VALUES ?handle { \"jdoe\" }
                                   ?person person:handle ?handle.}"]

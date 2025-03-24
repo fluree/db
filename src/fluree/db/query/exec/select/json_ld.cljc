@@ -18,7 +18,7 @@
              lang   (where/get-lang o-match)]
          (if (datatype/inferable-iri? dt-iri)
            v
-           (cond-> {(compact const/iri-value) o-match}
+           (cond-> {(compact const/iri-value) v}
              lang       (assoc (compact const/iri-language) lang)
              (not lang) (assoc (compact const/iri-type) (compact dt-iri)))))))])
 

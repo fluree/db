@@ -3,6 +3,7 @@
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.fql.syntax :as syntax]
+            [fluree.db.query.sparql :as sparql]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]))
 
@@ -16,13 +17,21 @@
         (update :identity #(or % (:did opts)))
         (dissoc :did))))
 
+(defn track-fuel?
+  [parsed-opts]
+  (or (:max-fuel parsed-opts)
+      (:meta parsed-opts)))
+
 (defn stage
   [db txn opts]
   (go-try
-    (let [txn-context (or (ctx-util/txn-context txn)
+    (let [txn*        (if (sparql/sparql-format? opts)
+                        (sparql/->fql txn)
+                        txn)
+          txn-context (or (ctx-util/txn-context txn*)
                           (:context opts))
-          parsed-opts (parse-opts txn opts txn-context)
-          parsed-txn  (q-parse/parse-txn txn txn-context)]
+          parsed-opts (parse-opts txn* opts txn-context)
+          parsed-txn  (q-parse/parse-txn txn* txn-context)]
       (<? (connection/stage-triples db parsed-txn parsed-opts)))))
 
 (defn extract-ledger-id
@@ -37,13 +46,17 @@
    (transact! conn txn nil))
   ([conn txn override-opts]
    (go-try
-     (let [context     (or (ctx-util/txn-context txn)
+     (let [txn*           (if (sparql/sparql-format? override-opts)
+                            (sparql/->fql txn)
+                            txn)
+           override-opts* (assoc override-opts :format :fql)
+           context        (or (ctx-util/txn-context txn*)
                            ;; parent context might come from a Verifiable
                            ;; Credential's context
-                           (:context override-opts))
-           ledger-id   (extract-ledger-id txn)
-           triples     (q-parse/parse-txn txn context)
-           parsed-opts (parse-opts txn override-opts context)]
+                              (:context override-opts*))
+           ledger-id      (extract-ledger-id txn*)
+           triples        (q-parse/parse-txn txn* context)
+           parsed-opts    (parse-opts txn override-opts* context)]
        (<? (connection/transact! conn ledger-id triples parsed-opts))))))
 
 (defn credential-transact!

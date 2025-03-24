@@ -32,7 +32,8 @@
             (conj acc [idx frequency])
             acc))
         [])
-       (sort-by first)))
+       (sort-by first)
+       vec))
 
 (defn update-avg-len
   [avg-length item-count doc-len]
@@ -155,7 +156,7 @@
 
   item-count will be 'nil' for an initialization query as we process results lazily
   and therefore the status-update won't be able to report % complete."
-  [{:keys [stemmer stopwords] :as bm25} latest-index item-count items-ch status-update]
+  [{:keys [stemmer stopwords] :as bm25} latest-index items-count items-ch status-update]
   (async/go
     (loop [i     0
            index latest-index]
@@ -168,7 +169,7 @@
                        (retract-item index id))]
           ;; supply status for every 100 items for timeout reporting, etc.
           (when (zero? (mod i 100))
-            (status-update [i item-count]))
+            (status-update [i items-count]))
           (recur (inc i) index*))
         (do
           (status-update [i i]) ;; 100% done - item-count can be nil for initialized query so use 'i' for both tuples

@@ -1,15 +1,26 @@
 (ns fluree.db.virtual-graph.bm25.stopwords
-  (:require [clojure.string :as str]))
+  (:require [clojure.java.io :as io]
+            [clojure.set :as set]
+            [clojure.string :as str]))
 
 (set! *warn-on-reflection* true)
 
-;; TODO - need to add new stopword language support... right now everything is english
-(defn initialize
-  "Returns a fn that will return truthy if the word is a stopword"
+(defn lang-filename
   [lang]
-  (let [filename (str "resources/stopwords/" (str/lower-case lang) ".txt")
-        data     (slurp filename)
-        tokens (set
-                (str/split data #"[\n\r\s]+"))]
-    (fn [word]
-      (tokens word))))
+  (-> lang str/lower-case (str ".txt")))
+
+(defn resource-path
+  [filename]
+  (str (io/file "stopwords" filename)))
+
+(defn read-lang
+  [lang]
+  (-> lang lang-filename resource-path io/resource slurp (str/split #"[\n\r\s]+") set))
+
+(defn initialize
+  "Returns the default set of stop words for `lang` combined with the extra stop
+  words `extras`, if present."
+  ([lang]
+   (initialize lang #{}))
+  ([lang extras]
+   (-> lang read-lang (set/union extras))))

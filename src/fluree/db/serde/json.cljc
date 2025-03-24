@@ -6,7 +6,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.serde.protocol :as serdeproto]
+            [fluree.db.serde.protocol :as serde]
             [fluree.db.util.core :as util])
   #?(:clj (:import (java.time.format DateTimeFormatter))))
 #?(:clj (set! *warn-on-reflection* true))
@@ -48,16 +48,17 @@
       (update :first deserialize-flake-bound)
       (update :rhs deserialize-flake-bound)))
 
-(defn keyword->int
+(defn parse-int
   [k]
   (-> k name util/str->int))
 
 (defn numerize-keys
   "Convert the keys of the provided map `m` to integers. Assumes that the keys are
-  keywordized integers and will throw an exception otherwise."
+  either stringified or keywordized integers and will throw an exception
+  otherwise."
   [m]
   (reduce-kv (fn [numerized k v]
-               (let [int-k (keyword->int k)]
+               (let [int-k (parse-int k)]
                  (assoc numerized int-k v)))
              {} m))
 
@@ -153,7 +154,7 @@
    "garbage" (vec garbage)})
 
 (defrecord Serializer []
-  serdeproto/StorageSerializer
+  serde/StorageSerializer
   (-serialize-db-root [_ db-root]
     (reduce-kv
      (fn [acc k v]
@@ -180,7 +181,17 @@
   (-serialize-garbage [_ garbage-map]
     (serialize-garbage garbage-map))
   (-deserialize-garbage [_ garbage]
-    (deserialize-garbage garbage)))
+    (deserialize-garbage garbage))
+
+  serde/BM25Serializer
+  (-serialize-bm25 [_ bm25]
+   ;; output as JSON, no additional parsing of keys/vals needed
+    bm25)
+  (-deserialize-bm25 [_ bm25]
+    (-> bm25
+        util/keywordize-keys
+        (update :namespace-codes numerize-keys)
+        (update :index-state util/keywordize-keys))))
 
 (defn json-serde
   "Returns a JSON serializer / deserializer"

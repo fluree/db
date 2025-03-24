@@ -64,3 +64,7 @@
   [sparql]
   (let [parsed (parse sparql)]
     (sparql.translator/translate parsed)))
+
+(defn sparql-format?
+  [opts]
+  (= :sparql (:format opts)))
