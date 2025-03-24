@@ -1,6 +1,5 @@
 (ns fluree.db.flake.transact
   (:require [clojure.core.async :as async :refer [go]]
-            [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.fuel :as fuel]
@@ -81,7 +80,7 @@
                      result
                      [@db-vol result]))))))
 
-(defn new-virtual-graph
+(defn create-virtual-graphs
   "Creates a new virtual graph. If the virtual graph is invalid, an
   exception will be thrown and the transaction will not complete."
   [db add new-vgs]
@@ -93,17 +92,6 @@
         ;; TODO - VG - ensure alias is not being used, throw if so
         (recur r (assoc-in db* [:vg alias] vg-record)))
       db)))
-
-(defn check-virtual-graph
-  [db add rem]
-  ;; TODO - VG - should also check for retractions to "delete" virtual graph
-  ;; TODO - VG - check flakes if user updated existing virtual graph
-  (let [new-vgs  (keep #(when (= (flake/o %) const/$fluree:VirtualGraph)
-                          (flake/s %)) add)
-        has-vgs? (not-empty (:vg db))]
-    (cond-> db
-      (seq new-vgs) (new-virtual-graph add (set new-vgs))
-      has-vgs? (vg/update-vgs add rem))))
 
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
@@ -120,7 +108,7 @@
                            (commit-data/update-novelty add remove)
                            (commit-data/add-tt-id)
                            (vocab/hydrate-schema add)
-                           (check-virtual-graph add remove))]
+                           (vg/check-virtual-graph add remove))]
       {:add       add
        :remove    remove
        :db-after  db-after

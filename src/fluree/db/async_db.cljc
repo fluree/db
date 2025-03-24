@@ -74,9 +74,10 @@
             (>! error-ch e))))
       match-ch))
 
-  (-activate-alias [db alias']
-    (when (= alias alias')
-      db))
+  (-activate-alias [_ alias']
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (where/-activate-alias db alias')))))
 
   (-aliases [_]
     [alias])

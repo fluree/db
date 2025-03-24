@@ -3,7 +3,8 @@
                 [[cheshire.core :as cjson]
                  [cheshire.generate :refer [add-encoder encode-seq remove-encoder]]
                  [cheshire.parse :as cparse]
-                 [fluree.db.util.log :as log]]
+                 [fluree.db.util.log :as log]
+                 [fluree.db.flake :as flake]]
                 :cljs
                 [[fluree.db.util.core :as util]
                  [goog.object :as gobject]])
