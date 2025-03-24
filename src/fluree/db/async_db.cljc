@@ -23,7 +23,7 @@
 
 (defrecord AsyncDB [alias branch commit t db-chan]
   dbproto/IFlureeDb
-  (-query [this query-map]
+  (-query [_ query-map]
     (go-try
       (let [db (<? db-chan)]
         (<? (dbproto/-query db query-map)))))
@@ -74,9 +74,10 @@
             (>! error-ch e))))
       match-ch))
 
-  (-activate-alias [db alias']
-    (when (= alias alias')
-      db))
+  (-activate-alias [_ alias']
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (where/-activate-alias db alias')))))
 
   (-aliases [_]
     [alias])

@@ -257,7 +257,8 @@
   (-> db
       (assoc :t t)
       (commit-data/update-novelty flakes)
-      (vocab/hydrate-schema flakes)))
+      (vocab/hydrate-schema flakes)
+      (vg/check-virtual-graph flakes nil)))
 
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates respective
@@ -314,10 +315,11 @@
     (match/match-class db fuel-tracker solution class-mch error-ch))
 
   (-activate-alias [db alias']
-    (cond
-      (= alias alias')              db
-      (flat-rank/flatrank-alias? alias') (flat-rank/index-graph db alias')
-      (where/virtual-graph? alias') (vg/load-virtual-graph db alias')))
+    (go-try
+      (cond
+        (= alias alias') db
+        (flat-rank/flatrank-alias? alias') (flat-rank/index-graph db alias')
+        (where/virtual-graph? alias') (vg/load-virtual-graph db alias'))))
 
   (-aliases [_]
     [alias])

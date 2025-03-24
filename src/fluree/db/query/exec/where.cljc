@@ -5,6 +5,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.flake.index :as index]
+            [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.datatype :as datatype]
@@ -629,14 +630,20 @@
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
-  (try*
-    (if-let [graph (-activate-alias ds alias)]
-      (match-clause graph fuel-tracker solution clause error-ch)
-      nil-channel)
-    (catch* e (async/offer! error-ch (ex-info (str "Error activating alias: " alias
-                                                   " due to exception: " (ex-message e))
-                                              {:status 400
-                                               :error  :db/invalid-query} e)))))
+  (let [res-ch (async/chan)]
+    (go
+      (try*
+        (when-let [graph (<? (-activate-alias ds alias))]
+          (-> (match-clause graph fuel-tracker solution clause error-ch)
+              (async/pipe res-ch)))
+        (catch* e
+                (log/error e "Error activating alias" alias)
+          (>! error-ch (ex-info (str "Error activating alias: " alias
+                                     " due to exception: " (ex-message e))
+                                {:status 400, :error :db/invalid-query}
+                                e))
+          (async/close! res-ch))))
+    res-ch))
 
 (defmethod match-pattern :exists
   [ds fuel-tracker solution pattern error-ch]
