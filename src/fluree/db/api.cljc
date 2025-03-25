@@ -22,8 +22,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(declare query)
-
 (defn promise-wrap
   "Wraps an async channel that will contain a response in a promise."
   [port]
