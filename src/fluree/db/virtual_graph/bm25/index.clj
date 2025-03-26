@@ -225,11 +225,9 @@
     (async/pipeline-async 1 items-ch #(async/onto-chan! %2 %1) query-result)
     (bm25-upsert* bm25 db nil items-ch)))
 
-(defrecord BM25-VirtualGraph
-           [stemmer stopwords k1 b index-state initialized genesis-t t
-            alias query parsed-query property-deps
-   ;; following taken from db - needs to be kept up to date with new db updates
-            db-alias namespaces namespace-codes]
+(defrecord BM25-VirtualGraph [id stemmer stopwords k1 b index-state initialized genesis-t t
+                              alias query parsed-query property-deps 
+                              db-alias namespaces namespace-codes] ;; these items taken from db - is kept up to date with new db updates
 
   iri/IRICodec
   (encode-iri [_ iri]

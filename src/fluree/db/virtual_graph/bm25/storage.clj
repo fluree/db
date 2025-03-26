@@ -90,6 +90,7 @@
   (-> vg
       (select-keys [:k1 :b :index-state :initialized :genesis-t :t :alias :db-alias
                     :query :namespace-codes :property-deps :type :lang :id :vg-name])
+      (update :id iri/serialize-sid)
       (update :index-state state-data)
       (update :type (partial mapv iri/serialize-sid))
       (update :property-deps (partial map iri/serialize-sid))))
@@ -113,6 +114,7 @@
         (assoc :property-deps property-deps)
         (assoc :stemmer (stemmer/initialize lang))
         (assoc :stopwords (stopwords/initialize lang))
+        (update :id iri/deserialize-sid)
         (update :type (partial mapv iri/deserialize-sid))
         (update :index-state reify-state)
         (update :b coerce-double)

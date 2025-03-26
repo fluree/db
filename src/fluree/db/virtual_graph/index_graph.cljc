@@ -32,7 +32,8 @@
                             :error  :db/invalid-index}))))
 
        :else acc))
-   {:type    []
+   {:id      (flake/s (first index-flakes))
+    :type    []
     :vg-name nil
     :query   nil}
    index-flakes))
@@ -40,11 +41,8 @@
 (defn add-vg-id
   "Adds the full virtual graph IRI to the index options map"
   [{:keys [vg-name] :as idx-opts} db-alias]
-  (let [vg-alias (str "##" vg-name)
-        vg-id    (str db-alias vg-alias)]
-    (assoc idx-opts
-           :id vg-id
-           :alias vg-alias)))
+  (let [vg-alias (str "##" vg-name)]
+    (assoc idx-opts :alias vg-alias)))
 
 #?(:clj
    (defn create
