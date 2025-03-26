@@ -45,12 +45,11 @@
 (defn read-commit-jsonld
   [storage commit-address]
   (go-try
-    (let [commit-data   (<? (storage/read-json storage commit-address))
-          addr-key-path (if (contains? commit-data "credentialSubject")
-                          ["credentialSubject" "address"]
-                          ["address"])]
+    (when-let [commit-data (<? (storage/read-json storage commit-address))]
       (log/trace "read-commit at:" commit-address "data:" commit-data)
-      (when commit-data
+      (let [addr-key-path (if (contains? commit-data "credentialSubject")
+                            ["credentialSubject" "address"]
+                            ["address"])]
         (-> commit-data
             (assoc-in addr-key-path commit-address)
             json-ld/expand

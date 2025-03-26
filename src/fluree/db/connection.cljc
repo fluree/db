@@ -110,22 +110,16 @@
   (get-in @state [:ledger ledger-alias]))
 
 (defn notify-commit
-  [conn commit-map]
-  (go-try
-    (let [expanded-commit (json-ld/expand commit-map)
-          ledger-alias    (get-first-value expanded-commit const/iri-alias)]
-      (if ledger-alias
-        (if-let [ledger-c (cached-ledger conn ledger-alias)]
-          (<? (ledger/notify (<? ledger-c) expanded-commit))
-          (log/debug "No cached ledger found for commit: " commit-map))
-        (log/warn "Notify called with a data that does not have a ledger alias."
-                  "Are you sure it is a commit?: " commit-map)))))
-
-(defn notify-address
   [{:keys [commit-catalog] :as conn} address]
   (go-try
-    (let [commit-map (<? (commit-storage/read-commit-jsonld commit-catalog address))]
-      (<? (notify-commit conn commit-map)))))
+    (let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))
+          ledger-alias    (get-first-value expanded-commit const/iri-alias)]
+      (if ledger-alias
+        (if-let [ledger (cached-ledger conn ledger-alias)]
+          (<? (ledger/notify (<? ledger) expanded-commit))
+          (log/debug "No cached ledger found for commit: " expanded-commit))
+        (log/warn "Notify called with a data that does not have a ledger alias."
+                  "Are you sure it is a commit?: " expanded-commit)))))
 
 (defn publishers
   [{:keys [primary-publisher secondary-publishers] :as _conn}]

@@ -198,20 +198,17 @@
        (<! (connection/ledger-exists? conn address))))))
 
 (defn notify
-  "Notifies the connection with a new commit map (parsed JSON commit with string keys).
+  "Notifies the connection of a new commit stored at address `commit-address`.
 
-  If the connection knows of the ledger, and is currently maintaining
-  an in-memory version of the ledger, will attempt to update the db if the commit
-  is for the next 't' value. If a commit is for a past 't' value, noop.
-  If commit is for a future 't' value, will drop in-memory ledger for reload upon next request."
-  [conn commit-map]
+  If the connection knows of the ledger, and is currently maintaining an
+  in-memory version of the ledger, will attempt to update the db if the commit
+  is for the next 't' value. If a commit is for a past 't' value, noop. If
+  commit is for a future 't' value, will drop in-memory ledger for reload upon
+  next request."
+  [conn commit-address]
   (validate-connection conn)
   (promise-wrap
-   (if (map? commit-map)
-     (notify-commit conn commit-map)
-     (go
-       (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
-                {:status 400 :error :db/invalid-commit-map})))))
+   (notify-commit conn commit-address)))
 
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"
