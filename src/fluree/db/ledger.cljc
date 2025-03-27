@@ -102,7 +102,7 @@
                                  (get-first const/iri-data)
                                  (get-first-value const/iri-address))
               commit-storage (-> ledger :conn :store)
-              db-data-jsonld (<? (commit-storage/read-commit-jsonld commit-storage db-address))
+              db-data-jsonld (<? (commit-storage/read-verified-commit commit-storage db-address))
               updated-db     (<? (transact/-merge-commit current-db commit-jsonld db-data-jsonld))]
           (update-commit! ledger branch updated-db))
 
