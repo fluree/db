@@ -331,8 +331,7 @@
     (let [[cached? ledger-chan] (register-ledger conn ledger-alias)]
       (if cached?
         (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
-                        {:status 400
-                         :error  :db/ledger-exists}))
+                        {:status 409, :error :db/ledger-exists}))
         (let [addr          (<? (primary-address conn ledger-alias))
               publish-addrs (<? (publishing-addresses conn ledger-alias))
               pubs          (publishers conn)
