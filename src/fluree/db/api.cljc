@@ -253,10 +253,14 @@
     (transact-api/credential-transact! conn txn opts))))
 
 (defn create-with-txn
-  [conn txn]
-  (validate-connection conn)
-  (promise-wrap
-   (transact-api/create-with-txn conn txn)))
+  ([conn txn]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/create-with-txn conn txn)))
+  ([conn txn opts]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/create-with-txn conn txn opts))))
 
 (defn status
   "Returns current status of ledger branch."
