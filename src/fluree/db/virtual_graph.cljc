@@ -20,7 +20,7 @@
 
 (defn storage-path
   [vg-type db-alias vg-alias]
-  (str/join "/" [db-alias (name vg-type) vg-alias]))
+  (str/join "/" [db-alias "index" (name vg-type) vg-alias]))
 
 (defmulti read-vg
   (fn [_index-catalog storage-meta]
