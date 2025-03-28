@@ -20,17 +20,20 @@
       ;; default branch
       (get branches branch))))
 
+(defn available-branches
+  [{:keys [state] :as _ledger}]
+  (-> @state :branches keys))
+
 ;; TODO - no time travel, only latest db on a branch thus far
 (defn current-db
   ([ledger]
    (current-db ledger nil))
   ([ledger branch]
-   (let [branch-meta (get-branch-meta ledger branch)]
-     ;; if branch is nil, will return default
-     (when-not branch-meta
-       (throw (ex-info (str "Invalid branch: " branch ".")
-                       {:status 400, :error :db/invalid-branch})))
-     (branch/current-db branch-meta))))
+   (if-let [branch-meta (get-branch-meta ledger branch)]
+     (branch/current-db branch-meta) ; if branch is nil, will return default
+     (throw (ex-info (str "Invalid branch: " branch " is not one of:"
+                          (available-branches ledger))
+                     {:status 400, :error :db/invalid-branch})))))
 
 (defn update-commit!
   "Updates both latest db and commit db. If latest registered index is
