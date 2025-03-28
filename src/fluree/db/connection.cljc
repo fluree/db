@@ -114,8 +114,9 @@
   (go-try
     (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
       (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
-        (if-let [ledger (<? (cached-ledger conn ledger-alias))]
-          (<? (ledger/notify ledger expanded-commit))
+        (if-let [ledger-ch (cached-ledger conn ledger-alias)]
+          (let [ledger (<? ledger-ch)]
+            (<? (ledger/notify ledger expanded-commit)))
           (log/debug "No cached ledger found for commit: " expanded-commit))
         (log/warn "Notify called with a data that does not have a ledger alias."
                   "Are you sure it is a commit?: " expanded-commit))
