@@ -1,7 +1,7 @@
 (ns fluree.db.flake.flake-db
   (:refer-clojure :exclude [load vswap!])
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
-            [clojure.core.async :as async :refer [go <! >! close!]]
+            [clojure.core.async :as async :refer [<! >! go go-loop]]
             [clojure.set :refer [map-invert]]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
@@ -33,7 +33,7 @@
             [fluree.db.time-travel :refer [TimeTravel]]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-first-value]]
+            [fluree.db.util.core :as util :refer [try* catch* get-first get-first-value]]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph.flat-rank :as flat-rank]
             [fluree.db.virtual-graph.index-graph :as vg])
@@ -447,32 +447,56 @@
      :namespace-codes iri/default-namespace-codes
      :schema          (vocab/base-schema)}))
 
-(defn add-commit-data
-  [commit-storage commits-ch]
+(defn read-commit-data
+  [commit-storage commit-jsonld db-address error-ch]
+  (go
+    (try*
+      (let [commit-data (<? (commit-storage/read-data-jsonld commit-storage db-address))]
+        [commit-jsonld commit-data])
+      (catch* e
+        (log/error e "Error reading commit data")
+        (>! error-ch e)))))
+
+(defn with-commit-data
+  [commit-storage error-ch commits-ch]
   (let [to (async/chan)
-        af (fn [commit-tuple res-ch]
+        af (fn [[commit-jsonld _commit-proof] ch]
              (go
-               (let [[commit-jsonld _commit-proof] commit-tuple
-                     db-address       (-> commit-jsonld
-                                          (get-first const/iri-data)
-                                          (get-first-value const/iri-address))
-                     db-data-jsonld   (<? (commit-storage/read-data-jsonld commit-storage db-address))]
-                 (>! res-ch [commit-jsonld db-data-jsonld])
-                 (close! res-ch))))]
+               (let [db-address (-> commit-jsonld
+                                    (get-first const/iri-data)
+                                    (get-first-value const/iri-address))]
+                 (-> commit-storage
+                     (read-commit-data commit-jsonld db-address error-ch)
+                     (async/pipe ch)))))]
     (async/pipeline-async 2 to af commits-ch)
     to))
 
+(defn merge-novelty-commit
+  [db error-ch [commit-jsonld db-data-jsonld]]
+  (go
+    (try*
+      (<? (transact/-merge-commit db commit-jsonld db-data-jsonld))
+      (catch* e
+        (log/error e "Error merging commit")
+        (>! error-ch e)))))
+
+(defn merge-novelty-commits
+  [indexed-db error-ch commit-pair-ch]
+  (go-loop [db indexed-db]
+    (if-let [commit-pair (<! commit-pair-ch)]
+      (recur (<! (merge-novelty-commit db error-ch commit-pair)))
+      db)))
+
 (defn load-novelty
   [commit-storage indexed-db index-t commit-jsonld]
-  (let [commits-ch    (commit-storage/trace-commits commit-storage commit-jsonld (inc index-t))
-        commits+data-ch (add-commit-data commit-storage commits-ch)]
-    (go
-      (loop [[commit-jsonld db-data-jsonld] (<! commits+data-ch)
-             db indexed-db]
-        (if db-data-jsonld
-          (let [new-db (<? (transact/-merge-commit db commit-jsonld db-data-jsonld))]
-            (recur (<! commits+data-ch) new-db))
-          db)))))
+  (go
+    (let [error-ch (async/chan)
+          db-ch    (->> (commit-storage/trace-commits commit-storage commit-jsonld (inc index-t))
+                        (with-commit-data commit-storage error-ch)
+                        (merge-novelty-commits indexed-db error-ch))]
+      (async/alt!
+        error-ch ([e] e)
+        db-ch    ([db] db)))))
 
 (defn add-reindex-thresholds
   "Adds reindexing thresholds to the root map.
