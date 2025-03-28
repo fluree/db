@@ -103,7 +103,7 @@
    (go-try
      (let [ledger-address       (<? (connection/primary-address conn ledger-alias))
            last-commit-addr     (<? (connection/lookup-commit conn ledger-address))
-           last-verified-commit (<? (commit-storage/read-commit-jsonld store last-commit-addr))
+           last-verified-commit (<? (commit-storage/read-verified-commit store last-commit-addr))
            last-commit          (first last-verified-commit)
            version              (get-first-value last-commit const/iri-v)]
        (if (and (= version commit-data/commit-version) (not force))

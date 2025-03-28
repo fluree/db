@@ -42,19 +42,24 @@
           (assoc "f:address" address)
           json-ld/expand))))
 
-(defn read-commit-jsonld
+(defn read-verified-commit
   [storage commit-address]
   (go-try
-    (let [commit-data   (<? (storage/read-json storage commit-address))
-          addr-key-path (if (contains? commit-data "credentialSubject")
-                          ["credentialSubject" "address"]
-                          ["address"])]
+    (when-let [commit-data (<? (storage/read-json storage commit-address))]
       (log/trace "read-commit at:" commit-address "data:" commit-data)
-      (when commit-data
+      (let [addr-key-path (if (contains? commit-data "credentialSubject")
+                            ["credentialSubject" "address"]
+                            ["address"])]
         (-> commit-data
             (assoc-in addr-key-path commit-address)
             json-ld/expand
             verify-commit)))))
+
+(defn read-commit-jsonld
+  [storage commit-address]
+  (go-try
+    (when-let [[commit _proof] (<? (read-verified-commit storage commit-address))]
+      commit)))
 
 (defn get-commit-t
   [commit]
@@ -108,7 +113,7 @@
 
             (if (= from-t commit-t)
               (async/onto-chan! resp-ch commit-tuples*)
-              (let [verified-commit (<! (read-commit-jsonld storage prev-commit-addr))]
+              (let [verified-commit (<! (read-verified-commit storage prev-commit-addr))]
                 (if (util/exception? verified-commit)
                   (do (async/>! resp-ch verified-commit)
                       (async/close! resp-ch))

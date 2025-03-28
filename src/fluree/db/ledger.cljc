@@ -20,17 +20,20 @@
       ;; default branch
       (get branches branch))))
 
+(defn available-branches
+  [{:keys [state] :as _ledger}]
+  (-> @state :branches keys))
+
 ;; TODO - no time travel, only latest db on a branch thus far
 (defn current-db
   ([ledger]
    (current-db ledger nil))
   ([ledger branch]
-   (let [branch-meta (get-branch-meta ledger branch)]
-     ;; if branch is nil, will return default
-     (when-not branch-meta
-       (throw (ex-info (str "Invalid branch: " branch ".")
-                       {:status 400 :error :db/invalid-branch})))
-     (branch/current-db branch-meta))))
+   (if-let [branch-meta (get-branch-meta ledger branch)]
+     (branch/current-db branch-meta) ; if branch is nil, will return default
+     (throw (ex-info (str "Invalid branch: " branch " is not one of:"
+                          (available-branches ledger))
+                     {:status 400, :error :db/invalid-branch})))))
 
 (defn update-commit!
   "Updates both latest db and commit db. If latest registered index is
@@ -46,7 +49,7 @@
      (when-not branch-meta
        (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
                             "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
-                       {:status 400 :error :db/invalid-branch})))
+                       {:status 400, :error :db/invalid-branch})))
      (-> branch-meta
          (branch/update-commit! db index-files-ch)
          branch/current-db))))
@@ -82,28 +85,24 @@
   If commit successful, returns successfully updated db."
   [ledger expanded-commit]
   (go-try
-    (let [[commit-jsonld _proof] (commit-storage/verify-commit expanded-commit)
-
-          branch     (-> expanded-commit
-                         (get-first-value const/iri-branch)
-                         keyword)
-          commit-t   (-> expanded-commit
-                         (get-first const/iri-data)
-                         (get-first-value const/iri-fluree-t))
-          current-db (current-db ledger branch)
-          current-t  (:t current-db)]
+    (let [branch    (get-first-value expanded-commit const/iri-branch)
+          commit-t  (-> expanded-commit
+                        (get-first const/iri-data)
+                        (get-first-value const/iri-fluree-t))
+          db        (current-db ledger branch)
+          current-t (:t db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
                  "where current cached db t value is:" current-t)
       ;; note, index updates will have same t value as current one, so still need to check if t = current-t
       (cond
 
         (= commit-t (flake/next-t current-t))
-        (let [db-address     (-> commit-jsonld
+        (let [db-address     (-> expanded-commit
                                  (get-first const/iri-data)
                                  (get-first-value const/iri-address))
               commit-storage (-> ledger :conn :store)
-              db-data-jsonld (<? (commit-storage/read-commit-jsonld commit-storage db-address))
-              updated-db     (<? (transact/-merge-commit current-db commit-jsonld db-data-jsonld))]
+              db-data-jsonld (<? (commit-storage/read-verified-commit commit-storage db-address))
+              updated-db     (<? (transact/-merge-commit db expanded-commit db-data-jsonld))]
           (update-commit! ledger branch updated-db))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
@@ -116,14 +115,16 @@
 
         (= commit-t current-t)
         (do
-          (log/info "Received commit update for ledger: " (:alias ledger) " at t value: " commit-t
-                    " however we already have this commit so not applying: " current-t)
+          (log/info "Received commit update for ledger: " (:alias ledger)
+                    " at t value: " commit-t " however we already have this commit so not applying: "
+                    current-t)
           false)
 
         (flake/t-before? commit-t current-t)
         (do
-          (log/info "Received commit update for ledger: " (:alias ledger) " at t value: " commit-t
-                    " however, latest t is more current: " current-t)
+          (log/info "Received commit update for ledger: " (:alias ledger)
+                    " at t value: " commit-t " however, latest t is more current: "
+                    current-t)
           false)))))
 
 (defrecord Ledger [conn id address alias did state cache commit-catalog
