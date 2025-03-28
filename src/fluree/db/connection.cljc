@@ -112,14 +112,14 @@
 (defn notify-commit
   [{:keys [commit-catalog] :as conn} address]
   (go-try
-    (let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))
-          ledger-alias    (get-first-value expanded-commit const/iri-alias)]
-      (if ledger-alias
+    (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
+      (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
         (if-let [ledger (<? (cached-ledger conn ledger-alias))]
           (<? (ledger/notify ledger expanded-commit))
           (log/debug "No cached ledger found for commit: " expanded-commit))
         (log/warn "Notify called with a data that does not have a ledger alias."
-                  "Are you sure it is a commit?: " expanded-commit)))))
+                  "Are you sure it is a commit?: " expanded-commit))
+      (log/warn "No commit found for address:" address))))
 
 (defn publishers
   [{:keys [primary-publisher secondary-publishers] :as _conn}]
