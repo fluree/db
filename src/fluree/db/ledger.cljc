@@ -82,12 +82,12 @@
   If commit successful, returns successfully updated db."
   [ledger expanded-commit]
   (go-try
-    (let [branch     (get-first-value expanded-commit const/iri-branch)
-          commit-t   (-> expanded-commit
-                         (get-first const/iri-data)
-                         (get-first-value const/iri-fluree-t))
-          current-db (current-db ledger branch)
-          current-t  (:t current-db)]
+    (let [branch    (get-first-value expanded-commit const/iri-branch)
+          commit-t  (-> expanded-commit
+                        (get-first const/iri-data)
+                        (get-first-value const/iri-fluree-t))
+          db        (current-db ledger branch)
+          current-t (:t db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
                  "where current cached db t value is:" current-t)
       ;; note, index updates will have same t value as current one, so still need to check if t = current-t
@@ -99,7 +99,7 @@
                                  (get-first-value const/iri-address))
               commit-storage (-> ledger :conn :store)
               db-data-jsonld (<? (commit-storage/read-verified-commit commit-storage db-address))
-              updated-db     (<? (transact/-merge-commit current-db expanded-commit db-data-jsonld))]
+              updated-db     (<? (transact/-merge-commit db expanded-commit db-data-jsonld))]
           (update-commit! ledger branch updated-db))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
