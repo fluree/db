@@ -179,8 +179,9 @@
     (loop [[[vg-alias storage-meta] & r] vg-address-map
            vg-map         {}]
       (if vg-alias
-        (let [vg (<? (vg/read-vg index-catalog storage-meta))]
-          (recur r (assoc vg-map (:alias vg) vg)))
+        (let [vg          (<? (vg/read-vg index-catalog storage-meta))
+              named-graph (vg/named-graph-alias vg)]
+          (recur r (assoc vg-map named-graph vg)))
         vg-map))))
 
 (defn read-db-root

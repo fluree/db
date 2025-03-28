@@ -226,7 +226,7 @@
     (bm25-upsert* bm25 db nil items-ch)))
 
 (defrecord BM25-VirtualGraph [id stemmer stopwords k1 b index-state initialized genesis-t t
-                              alias query parsed-query property-deps 
+                              vg-name query parsed-query property-deps 
                               db-alias namespaces namespace-codes] ;; these items taken from db - is kept up to date with new db updates
 
   iri/IRICodec

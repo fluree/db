@@ -88,7 +88,7 @@
 (defn vg-data
   [vg]
   (-> vg
-      (select-keys [:k1 :b :index-state :initialized :genesis-t :t :alias :db-alias
+      (select-keys [:k1 :b :index-state :initialized :genesis-t :t :db-alias
                     :query :namespace-codes :property-deps :type :lang :id :vg-name])
       (update :id iri/serialize-sid)
       (update :index-state state-data)
@@ -109,11 +109,11 @@
         query-props  (parse/get-query-props parsed-query)
         property-deps (get-property-sids namespaces query-props)]
     (-> vg-data
-        (assoc :parsed-query parsed-query)
-        (assoc :namespaces namespaces)
-        (assoc :property-deps property-deps)
-        (assoc :stemmer (stemmer/initialize lang))
-        (assoc :stopwords (stopwords/initialize lang))
+        (assoc :parsed-query parsed-query
+               :namespaces namespaces
+               :property-deps property-deps
+               :stemmer (stemmer/initialize lang)
+               :stopwords (stopwords/initialize lang))
         (update :id iri/deserialize-sid)
         (update :type (partial mapv iri/deserialize-sid))
         (update :index-state reify-state)
@@ -121,11 +121,11 @@
         (update :k1 coerce-double))))
 
 (defmethod vg/write-vg :bm25
-  [{:keys [storage serializer] :as _index-catalog} {:keys [alias db-alias] :as vg}]
+  [{:keys [storage serializer] :as _index-catalog} {:keys [vg-name db-alias] :as vg}]
   (go-try
     (let [data            (vg-data vg)
           serialized-data (serde/-serialize-bm25 serializer data)
-          path            (vg/storage-path :bm25 db-alias (vg/trim-alias-ref alias))
+          path            (vg/storage-path :bm25 db-alias vg-name)
           write-res       (<? (storage/content-write-json storage path serialized-data))]
       (assoc write-res :type "bm25"))))
 

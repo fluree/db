@@ -38,21 +38,14 @@
     :query   nil}
    index-flakes))
 
-(defn add-vg-id
-  "Adds the full virtual graph IRI to the index options map"
-  [{:keys [vg-name] :as idx-opts} db-alias]
-  (let [vg-alias (str "##" vg-name)]
-    (assoc idx-opts :alias vg-alias)))
-
 #?(:clj
    (defn create
-     [{:keys [alias t] :as db} vg-flakes]
+     [{:keys [t] :as db} vg-flakes]
      (let [db-vol (volatile! db) ;; needed to potentially add new namespace codes based on query IRIs
 
-           {:keys [type alias] :as vg-opts}
+           {:keys [type] :as vg-opts}
            (-> (idx-flakes->opts vg-flakes)
                (vg-parse/parse-document-query db-vol)
-               (add-vg-id alias)
                (assoc :genesis-t t))
 
            db* @db-vol
@@ -64,8 +57,8 @@
                  :else (throw (ex-info "Unrecognized virtual graph creation attempted."
                                        {:status 400
                                         :error  :db/invalid-index})))
-           initialized-vg (vg/initialize vg db*)]
-       [db* alias initialized-vg]))
+           vg* (vg/initialize vg db*)]
+       [db* vg*]))
 
    :cljs
    (defn create
@@ -93,9 +86,9 @@
   ;; at least currently, updates to vg are async
   ;; and happen in background.
   (let [vg* (reduce-kv
-             (fn [vg* vg-alias vg-impl]
-               (log/debug "Virtual Graph update started for: " vg-alias)
-               (assoc vg* vg-alias (vg/upsert vg-impl db add remove)))
+             (fn [vg* named-graph vg-impl]
+               (log/debug "Virtual Graph update started for: " named-graph)
+               (assoc vg* named-graph (vg/upsert vg-impl db add remove)))
              {} vg)]
     (assoc db :vg vg*)))
 
@@ -106,10 +99,11 @@
   (loop [[new-vg & r] new-vgs
          db db]
     (if new-vg
-      (let [vg-flakes (filter #(= (flake/s %) new-vg) add)
-            [db* alias vg-record] (create db vg-flakes)]
+      (let [vg-flakes   (filter #(= (flake/s %) new-vg) add)
+            [db* vg]    (create db vg-flakes)
+            named-graph (vg/named-graph-alias vg)]
         ;; TODO - VG - ensure alias is not being used, throw if so
-        (recur r (assoc-in db* [:vg alias] vg-record)))
+        (recur r (assoc-in db* [:vg named-graph] vg)))
       db)))
 
 (defn has-vgs?

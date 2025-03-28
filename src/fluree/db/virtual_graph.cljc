@@ -34,3 +34,10 @@
   (if (str/starts-with? vg-alias "##")
     (subs vg-alias 2)
     vg-alias))
+
+(defn named-graph-alias
+  "Returns the virtual graph's named graph alias
+   
+   We currently use the syntax '##<vg-name>' for a named graph alias."
+  [{:keys [vg-name] :as _vg}]
+  (str "##" vg-name))
