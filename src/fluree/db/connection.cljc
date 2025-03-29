@@ -316,7 +316,7 @@
 
 (defn parse-ledger-options
   [conn {:keys [did branch indexing]
-         :or   {branch :main}}]
+         :or   {branch commit-data/default-branch}}]
   (let [did*           (parse-identity conn did)
         ledger-default (-> conn :defaults :indexing)
         indexing*      (merge ledger-default indexing)]
@@ -630,7 +630,7 @@
         (<? (transact/stage policy-db identity parsed-txn parsed-opts))))))
 
 (defn transact-ledger!
-  [_conn ledger triples {:keys [branch] :as parsed-opts, :or {branch :main}}]
+  [_conn ledger triples {:keys [branch] :as parsed-opts, :or {branch commit-data/default-branch}}]
   (log/info "transacting ledger:" parsed-opts)
   (go-try
     (let [db       (ledger/current-db ledger branch)

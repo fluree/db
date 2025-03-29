@@ -4,6 +4,7 @@
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.branch :as branch]
+            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
@@ -57,7 +58,7 @@
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
   ([ledger]
-   (status ledger "main"))
+   (status ledger commit-data/default-branch))
   ([{:keys [address alias] :as ledger} requested-branch]
    (let [branch-data (get-branch-meta ledger requested-branch)
          current-db  (branch/current-db branch-data)

@@ -116,7 +116,7 @@
                all-commit-tuples (<? (commit-storage/trace-commits store last-commit 1))
                first-commit      (ffirst all-commit-tuples)
                branch            (or (keyword (get-first-value first-commit const/iri-branch))
-                                     :main)
+                                     commit-data/default-branch)
                ledger            (<? (ledger/create conn {:alias    ledger-alias
                                                           :did      nil
                                                           :branch   branch
