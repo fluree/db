@@ -81,20 +81,21 @@
   in-memory on the conn.
 
   Returns a two-tuple of
-  [not-cached? promise-chan]
+  [cached? promise-chan]
 
-  where not-cached? is true if a new promise-chan was created, false if an
-  existing promise-chan was found.
+  where `cached?` is true if an existing promise-chan was found, false if a new
+  promise-chan was created.
 
-  promise-chan is the new promise channel that must have the final ledger `put!` into it
-  assuming success? is true, otherwise it will return the existing found promise-chan when
-  success? is false"
+  `promise-chan` is a promise channel that must have the final ledger `put!`
+  into it assuming `success?` is true, otherwise it will return the existing
+  found promise-chan when `success?` is false"
   [{:keys [state] :as _conn} ledger-alias]
   (let [new-p-chan (async/promise-chan)
-        new-state  (swap! state update-in [:ledger ledger-alias]
-                          (fn [existing]
-                            (or existing new-p-chan)))
-        p-chan     (get-in new-state [:ledger ledger-alias])
+        p-chan     (-> state
+                       (swap! update-in [:ledger ledger-alias]
+                              (fn [existing]
+                                (or existing new-p-chan)))
+                       (get-in [:ledger ledger-alias]))
         cached?    (not= p-chan new-p-chan)]
     (log/debug "Registering ledger: " ledger-alias " cached? " cached?)
     [cached? p-chan]))
@@ -325,8 +326,7 @@
      :indexing indexing*}))
 
 (defn create-ledger
-  [{:keys [commit-catalog index-catalog] :as conn}
-   ledger-alias opts]
+  [{:keys [commit-catalog index-catalog] :as conn} ledger-alias opts]
   (go-try
     (let [[cached? ledger-chan] (register-ledger conn ledger-alias)]
       (if cached?
