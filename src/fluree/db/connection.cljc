@@ -368,7 +368,7 @@
                      "with commit:" commit)
           (let [commit*      (json-ld/expand commit)
                 ledger-alias (commit->ledger-alias conn address commit*)
-                branch       (keyword (get-first-value commit const/iri-branch))
+                branch       (get-first-value commit const/iri-branch)
 
                 {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
 
