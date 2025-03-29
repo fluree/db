@@ -12,6 +12,9 @@
 
 (def commit-version 1)
 
+(def default-branch
+  "main")
+
 (comment
   ;; commit map - this map is what gets recorded in a few places:
   ;; - in a 'commit' file: (translated to JSON-LD, and optionally wrapped in a Verifiable Credential)
@@ -270,7 +273,7 @@
                                  :v      0
                                  :branch (if branch
                                            (util/keyword->str branch)
-                                           "main")
+                                           default-branch)
                                  :data   {:t      0
                                           :flakes 0
                                           :size   0}
