@@ -1,4 +1,4 @@
-(ns fluree.db.json-ld.branch
+(ns fluree.db.branch
   (:require [clojure.core.async :as async :refer [go <! go-loop]]
             [fluree.db.async-db :as async-db]
             [fluree.db.dbproto :as dbproto]

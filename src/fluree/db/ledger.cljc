@@ -3,7 +3,7 @@
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.json-ld.branch :as branch]
+            [fluree.db.branch :as branch]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
