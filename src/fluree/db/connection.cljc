@@ -366,15 +366,15 @@
     (if-let [commit (<? (lookup-commit conn address))]
       (do (log/debug "Attempting to load from address:" address
                      "with commit:" commit)
-          (let [commit*      (json-ld/expand commit)
-                ledger-alias (commit->ledger-alias conn address commit*)
-                branch       (get-first-value commit const/iri-branch)
+          (let [expanded-commit (json-ld/expand commit)
+                ledger-alias    (commit->ledger-alias conn address expanded-commit)
+                branch          (get-first-value expanded-commit const/iri-branch)
 
                 {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
 
                 pubs   (publishers conn)
                 ledger (ledger/instantiate conn ledger-alias address branch commit-catalog
-                                           index-catalog pubs indexing did commit*)]
+                                           index-catalog pubs indexing did expanded-commit)]
             (subscribe-ledger conn ledger-alias)
             (async/put! ledger-chan ledger)
             ledger))
