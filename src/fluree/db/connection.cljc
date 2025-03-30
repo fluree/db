@@ -592,11 +592,6 @@
    (go-try
      (:db (<? (apply-stage! ledger staged-db opts))))))
 
-(defn track?
-  [parsed-opts]
-  (or (:max-fuel parsed-opts)
-      (:meta parsed-opts)))
-
 (defn stage-triples
   "Stages a new transaction that is already parsed into the
    internal Fluree triples format."
@@ -607,7 +602,7 @@
                       (let [parsed-context (:context parsed-opts)]
                         (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
                       db)]
-      (if (track? parsed-opts)
+      (if (fuel/track? parsed-opts)
         (let [start-time   #?(:clj (System/nanoTime)
                               :cljs (util/current-time-millis))
               fuel-tracker (fuel/tracker (:max-fuel parsed-opts))]
@@ -638,7 +633,7 @@
           ;; whereas stage API takes a did IRI and unparsed context.
           ;; Dissoc them until deciding at a later point if they can carry through.
           cmt-opts (dissoc parsed-opts :context :identity)]
-      (if (track? parsed-opts)
+      (if (fuel/track? parsed-opts)
         (assoc staged :result (<? (commit! ledger (:result staged) cmt-opts)))
         (<? (commit! ledger staged cmt-opts))))))
 

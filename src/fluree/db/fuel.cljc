@@ -17,6 +17,11 @@
             (+ total @ctr))
           0 @(:counters trkr)))
 
+(defn track?
+  [opts]
+  (or (:max-fuel opts)
+      (:meta opts)))
+
 (defn track
   [trkr error-ch]
   (fn [rf]

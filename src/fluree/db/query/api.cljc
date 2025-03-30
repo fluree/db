@@ -77,11 +77,6 @@
                                     time-travel-db)]
        (assoc-in reasoned-db [:policy :cache] (atom {}))))))
 
-(defn track-fuel?
-  [sanitized-query]
-  (or (-> sanitized-query :opts :max-fuel)
-      (-> sanitized-query :opts :meta)))
-
 (defn track-query
   [ds max-fuel query]
   (go-try
@@ -118,9 +113,9 @@
            ds*      (if (dataset? ds)
                       ds
                       (<? (restrict-db ds query*)))
-           query**  (update query* :opts dissoc :meta :max-fuel ::track-fuel?)
+           query**  (update query* :opts dissoc :meta :max-fuel)
            max-fuel (:max-fuel opts)]
-       (if (track-fuel? query*)
+       (if (fuel/track? opts)
          (<? (track-query ds* max-fuel query**))
          (<? (fql/query ds* query**)))))))
 
@@ -257,9 +252,9 @@
       (if (or (seq default-aliases)
               (seq named-aliases))
         (let [ds            (<? (load-dataset conn default-aliases named-aliases sanitized-query))
-              trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel ::track-fuel?)
+              trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel)
               max-fuel      (:max-fuel opts)]
-          (if (track-fuel? sanitized-query)
+          (if (fuel/track? opts)
             (<? (track-query ds max-fuel trimmed-query))
             (<? (fql/query ds trimmed-query))))
         (throw (ex-info "Missing ledger specification in connection query"
