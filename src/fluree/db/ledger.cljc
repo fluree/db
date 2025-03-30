@@ -1,9 +1,9 @@
 (ns fluree.db.ledger
   (:require [clojure.string :as str]
+            [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.branch :as branch]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
