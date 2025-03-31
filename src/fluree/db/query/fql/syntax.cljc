@@ -289,7 +289,7 @@
 (defn coerce-txn-opts
   [opts]
   (try*
-    (coerce-txn-opts* opts)
+    (some-> opts coerce-txn-opts*)
     (catch* e
       (-> e
           humanize-error

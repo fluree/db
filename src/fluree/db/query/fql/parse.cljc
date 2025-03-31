@@ -11,6 +11,7 @@
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.query.sparql.translator :as sparql.translator]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.parse :as util.parse]
@@ -850,32 +851,36 @@
                       e)))))
 
 (defn parse-txn
-  [txn context]
-  (let [[vars values] (-> (get-named txn "values")
-                          (parse-values context))
-        where         (-> (get-named txn "where")
-                          (parse-where vars context))
-        bound-vars    (-> where where/bound-variables (into vars))
-        delete        (when-let [dlt (get-named txn "delete")]
-                        (-> dlt
-                            (json-ld/expand context)
-                            util/get-graph
-                            util/sequential
-                            (parse-triples bound-vars context)))
-        insert        (when-let [ins (get-named txn "insert")]
-                        (-> ins
-                            (json-ld/expand context)
-                            util/get-graph
-                            util/sequential
-                            (parse-triples bound-vars context)))
-        annotation    (util/get-first-value txn const/iri-annotation)]
-    (when (and (empty? insert) (empty? delete))
-      (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
-                      {:status 400 :error :db/invalid-transaction})))
-    (cond-> {}
-      context      (assoc :context context)
-      where        (assoc :where where)
-      annotation   (assoc :annotation annotation)
-      (seq values) (assoc :values values)
-      (seq delete) (assoc :delete delete)
-      (seq insert) (assoc :insert insert))))
+  ([txn]
+   (parse-txn txn {}))
+  ([txn override-opts]
+   (let [context       (or (ctx-util/txn-context txn)
+                           (:context override-opts))
+         [vars values] (-> (get-named txn "values")
+                           (parse-values context))
+         where         (-> (get-named txn "where")
+                           (parse-where vars context))
+         bound-vars    (-> where where/bound-variables (into vars))
+         delete        (when-let [dlt (get-named txn "delete")]
+                         (-> dlt
+                             (json-ld/expand context)
+                             util/get-graph
+                             util/sequential
+                             (parse-triples bound-vars context)))
+         insert        (when-let [ins (get-named txn "insert")]
+                         (-> ins
+                             (json-ld/expand context)
+                             util/get-graph
+                             util/sequential
+                             (parse-triples bound-vars context)))
+         annotation    (util/get-first-value txn const/iri-annotation)]
+     (when (and (empty? insert) (empty? delete))
+       (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
+                       {:status 400 :error :db/invalid-transaction})))
+     (cond-> {}
+       context      (assoc :context context)
+       where        (assoc :where where)
+       annotation   (assoc :annotation annotation)
+       (seq values) (assoc :values values)
+       (seq delete) (assoc :delete delete)
+       (seq insert) (assoc :insert insert)))))

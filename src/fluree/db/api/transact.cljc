@@ -23,10 +23,10 @@
     (let [txn*        (if (sparql/sparql-format? opts)
                         (sparql/->fql txn)
                         txn)
+          parsed-txn  (q-parse/parse-txn txn*)
           txn-context (or (ctx-util/txn-context txn*)
                           (:context opts))
-          parsed-opts (parse-opts txn* opts txn-context)
-          parsed-txn  (q-parse/parse-txn txn* txn-context)]
+          parsed-opts (parse-opts txn* opts txn-context)]
       (<? (connection/stage-triples db parsed-txn parsed-opts)))))
 
 (defn extract-ledger-id
@@ -45,14 +45,14 @@
                             (sparql/->fql txn)
                             txn)
            override-opts* (assoc override-opts :format :fql)
-           context        (or (ctx-util/txn-context txn*)
-                           ;; parent context might come from a Verifiable
-                           ;; Credential's context
-                              (:context override-opts*))
            ledger-id      (extract-ledger-id txn*)
-           triples        (q-parse/parse-txn txn* context)
+           parsed-txn     (q-parse/parse-txn txn* override-opts*)
+           context        (or (ctx-util/txn-context txn*)
+                             ;; parent context might come from a Verifiable
+                             ;; Credential's context
+                              (:context override-opts*))
            parsed-opts    (parse-opts txn override-opts* context)]
-       (<? (connection/transact! conn ledger-id triples parsed-opts))))))
+       (<? (connection/transact! conn ledger-id parsed-txn parsed-opts))))))
 
 (defn credential-transact!
   "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.
@@ -81,14 +81,14 @@
        (if (<? (connection/ledger-exists? conn address))
          (throw (ex-info (str "Ledger " ledger-id " already exists")
                          {:status 409 :error :db/ledger-exists}))
-         (let [ledger  (<? (connection/create-ledger conn ledger-id parsed-opts))
-               triples (q-parse/parse-txn txn txn-context)
+         (let [ledger     (<? (connection/create-ledger conn ledger-id parsed-opts))
+               parsed-txn (q-parse/parse-txn txn override-opts)
 
-              ;; commit API takes a did-map and parsed context as opts
-              ;; whereas stage API takes a did IRI and unparsed context.
-              ;; Dissoc them until deciding at a later point if they can carry through.
+               ;; commit API takes a did-map and parsed context as opts
+               ;; whereas stage API takes a did IRI and unparsed context.
+               ;; Dissoc them until deciding at a later point if they can carry through.
                cmt-opts (dissoc parsed-opts :context :did)]
-           (<? (connection/transact-ledger! conn ledger triples cmt-opts))))))))
+           (<? (connection/transact-ledger! conn ledger parsed-txn cmt-opts))))))))
 
 (defn credential-create-with-txn!
   [conn txn]

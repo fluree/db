@@ -61,12 +61,12 @@
 (defn rule-graph
   "Puts rule in a specific graph format"
   [rule]
-  (let [context         (some-> (get rule "@context")
-                                json-ld/parse-context)
+  (let [context         (get rule "@context")
         where           (get rule "where")
         insert          (get rule "insert")
-        rule-parsed     (q-parse/parse-txn {:where  where
-                                            :insert insert} context)
+        rule-parsed     (q-parse/parse-txn {:context context
+                                            :where   where
+                                            :insert  insert})
         where-patterns  (extract-patterns (::exec-where/patterns (:where rule-parsed)))
         insert-patterns (extract-patterns (:insert rule-parsed))]
     {:deps        where-patterns
