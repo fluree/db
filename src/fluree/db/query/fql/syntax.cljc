@@ -140,6 +140,7 @@
                          [:author {:optional true} ::identity]
                          [:policy-values {:optional true} :any]]
     ::commit-opts       [:map
+                         [:meta {:optional true} :boolean]
                          [:identity {:optional true} ::identity]
                          [:context {:optional true} ::context]
                          [:raw-txn {:optional true} :any]
