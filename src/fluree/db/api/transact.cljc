@@ -17,12 +17,16 @@
         (update :identity #(or % (:did opts)))
         (dissoc :did))))
 
+(defn format-txn
+  [txn override-opts]
+  (if (sparql/sparql-format? override-opts)
+    (sparql/->fql txn)
+    txn))
+
 (defn stage
   [db txn opts]
   (go-try
-    (let [txn*        (if (sparql/sparql-format? opts)
-                        (sparql/->fql txn)
-                        txn)
+    (let [txn*        (format-txn txn opts)
           parsed-txn  (q-parse/parse-txn txn*)
           txn-context (or (ctx-util/txn-context txn*)
                           (:context opts))
@@ -41,15 +45,13 @@
    (transact! conn txn nil))
   ([conn txn override-opts]
    (go-try
-     (let [txn*           (if (sparql/sparql-format? override-opts)
-                            (sparql/->fql txn)
-                            txn)
+     (let [txn*           (format-txn txn override-opts)
            override-opts* (assoc override-opts :format :fql)
            ledger-id      (extract-ledger-id txn*)
            parsed-txn     (q-parse/parse-txn txn* override-opts*)
            context        (or (ctx-util/txn-context txn*)
-                             ;; parent context might come from a Verifiable
-                             ;; Credential's context
+                              ;; parent context might come from a Verifiable
+                              ;; Credential's context
                               (:context override-opts*))
            parsed-opts    (parse-opts txn override-opts* context)]
        (<? (connection/transact! conn ledger-id parsed-txn parsed-opts))))))
