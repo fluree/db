@@ -709,9 +709,12 @@
     q))
 
 (defn get-named
-  [jsonld nme]
-  (or (get jsonld nme)
-      (get jsonld (keyword nme))))
+  "Get the value from the map `m` associated with the key with name `nme`. This
+  key could be a string, keyword, or symbol."
+  [m nme]
+  (or (get m nme)
+      (get m (keyword nme))
+      (get m (symbol nme))))
 
 (defn parse-analytical-query
   ([q] (parse-analytical-query q nil))
