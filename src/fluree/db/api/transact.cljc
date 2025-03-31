@@ -45,13 +45,8 @@
      (let [txn*           (format-txn txn override-opts)
            override-opts* (assoc override-opts :format :fql)
            ledger-id      (extract-ledger-id txn*)
-           parsed-txn     (q-parse/parse-txn txn* override-opts*)
-           context        (or (ctx-util/txn-context txn*)
-                              ;; parent context might come from a Verifiable
-                              ;; Credential's context
-                              (:context override-opts*))
-           parsed-opts    (parse-opts txn override-opts* context)]
-       (<? (connection/transact! conn ledger-id parsed-txn parsed-opts))))))
+           parsed-txn     (q-parse/parse-txn txn* override-opts*)]
+       (<? (connection/transact! conn ledger-id parsed-txn))))))
 
 (defn credential-transact!
   "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.
@@ -62,7 +57,8 @@
     (let [{txn* :subject identity :did} (<? (cred/verify txn))
           parent-context (when (map? txn) ;; parent-context only relevant for verifiable credential
                            (ctx-util/txn-context txn))]
-      (<? (transact! conn txn* (assoc opts :raw-txn txn
+      (<? (transact! conn txn* (assoc opts
+                                      :raw-txn txn
                                       :identity identity
                                       :context parent-context))))))
 
@@ -81,13 +77,13 @@
          (throw (ex-info (str "Ledger " ledger-id " already exists")
                          {:status 409 :error :db/ledger-exists}))
          (let [ledger     (<? (connection/create-ledger conn ledger-id parsed-opts))
-               parsed-txn (q-parse/parse-txn txn override-opts)
-
                ;; commit API takes a did-map and parsed context as opts
                ;; whereas stage API takes a did IRI and unparsed context.
                ;; Dissoc them until deciding at a later point if they can carry through.
-               cmt-opts (dissoc parsed-opts :context :did)]
-           (<? (connection/transact-ledger! conn ledger parsed-txn cmt-opts))))))))
+               parsed-txn (-> txn
+                              (q-parse/parse-txn override-opts)
+                              (update :opts dissoc :context :did))]
+           (<? (connection/transact-ledger! conn ledger parsed-txn))))))))
 
 (defn credential-create-with-txn!
   [conn txn]

@@ -625,10 +625,13 @@
         (<? (transact/stage policy-db identity parsed-txn parsed-opts))))))
 
 (defn transact-ledger!
-  [_conn ledger parsed-txn {:keys [branch] :as parsed-opts, :or {branch commit-data/default-branch}}]
-  (log/info "transacting ledger:" parsed-opts)
+  [_conn ledger parsed-txn]
   (go-try
-    (let [db       (ledger/current-db ledger branch)
+    (let [{:keys [branch] :as parsed-opts,
+           :or   {branch commit-data/default-branch}}
+          (:opts parsed-txn)
+
+          db       (ledger/current-db ledger branch)
           staged   (<? (stage-triples db parsed-txn))
           ;; commit API takes a did-map and parsed context as opts
           ;; whereas stage API takes a did IRI and unparsed context.
@@ -639,11 +642,10 @@
         (<? (commit! ledger staged cmt-opts))))))
 
 (defn transact!
-  [conn ledger-id triples parsed-opts]
-  (log/info "transacting:" parsed-opts)
+  [conn ledger-id parsed-txn]
   (go-try
     (let [ledger (<? (load-ledger conn ledger-id))]
-      (<? (transact-ledger! conn ledger triples parsed-opts)))))
+      (<? (transact-ledger! conn ledger parsed-txn)))))
 
 (defn replicate-index-node
   [conn address data]
