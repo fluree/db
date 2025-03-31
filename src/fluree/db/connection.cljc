@@ -7,7 +7,7 @@
             [fluree.db.constants :as const]
             [fluree.db.did :as did]
             [fluree.db.flake.flake-db :as flake-db]
-            [fluree.db.fuel :as fuel]
+            [fluree.db.report.fuel :as fuel]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.credential :as credential]
             [fluree.db.json-ld.iri :as iri]

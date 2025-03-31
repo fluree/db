@@ -1,5 +1,5 @@
 (ns fluree.db.reasoner
-  (:require [fluree.db.fuel :as fuel]
+  (:require [fluree.db.report.fuel :as fuel]
             [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))

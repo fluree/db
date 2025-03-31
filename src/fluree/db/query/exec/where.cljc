@@ -6,7 +6,7 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
             [fluree.db.flake.index :as index]
-            [fluree.db.fuel :as fuel]
+            [fluree.db.report.fuel :as fuel]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<?]]

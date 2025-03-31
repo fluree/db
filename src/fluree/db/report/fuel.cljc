@@ -1,4 +1,4 @@
-(ns fluree.db.fuel
+(ns fluree.db.report.fuel
   (:require [clojure.core.async :as async :refer [put!]]
             [fluree.db.util.log :as log]))
 
@@ -18,9 +18,10 @@
           0 @(:counters trkr)))
 
 (defn track?
-  [opts]
-  (or (:max-fuel opts)
-      (:meta opts)))
+  [{:keys [max-fuel meta] :as _opts}]
+  (or max-fuel
+      (true? meta)
+      (:fuel meta)))
 
 (defn track
   [trkr error-ch]

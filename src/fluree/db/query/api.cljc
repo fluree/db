@@ -4,7 +4,7 @@
   (:require [clojure.string :as str]
             [fluree.db.connection :as connection]
             [fluree.db.dataset :as dataset :refer [dataset?]]
-            [fluree.db.fuel :as fuel]
+            [fluree.db.report.fuel :as fuel]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.policy.rules :as policy.rules]
             [fluree.db.ledger :as ledger]

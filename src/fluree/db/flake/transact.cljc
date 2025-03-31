@@ -2,7 +2,7 @@
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.flake :as flake]
             [fluree.db.flake.index.novelty :as novelty]
-            [fluree.db.fuel :as fuel]
+            [fluree.db.report.fuel :as fuel]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.modify :as policy.modify]
