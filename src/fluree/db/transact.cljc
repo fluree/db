@@ -27,7 +27,7 @@
 
 (defn expand-annotation
   [parsed-txn parsed-opts context]
-  (some-> (or (:annotation parsed-txn) (:annotation parsed-opts))
+  (some-> (:annotation parsed-opts)
           (json-ld/expand context)
           util/sequential))
 

@@ -850,6 +850,15 @@
                       (or (ex-data e) {})
                       e)))))
 
+(defn parse-txn-opts
+  [{:keys [did] :as txn-opts} override-opts txn-context]
+  (let [opts (merge (syntax/coerce-txn-opts txn-opts)
+                    (syntax/coerce-txn-opts override-opts))]
+    (-> opts
+        (assoc :context txn-context)
+        (update :identity #(or % did))
+        (dissoc :did))))
+
 (defn parse-txn
   ([txn]
    (parse-txn txn {}))
@@ -873,7 +882,9 @@
                              util/get-graph
                              util/sequential
                              (parse-triples bound-vars context)))
-         annotation    (util/get-first-value txn const/iri-annotation)]
+         annotation    (util/get-first-value txn const/iri-annotation)
+         opts          (-> (get-named txn "opts")
+                           (parse-txn-opts override-opts context))]
      (when (and (empty? insert) (empty? delete))
        (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
                        {:status 400 :error :db/invalid-transaction})))
@@ -883,4 +894,5 @@
        annotation   (assoc :annotation annotation)
        (seq values) (assoc :values values)
        (seq delete) (assoc :delete delete)
-       (seq insert) (assoc :insert insert)))))
+       (seq insert) (assoc :insert insert)
+       (seq opts)   (assoc :opts opts)))))

@@ -595,13 +595,14 @@
 (defn stage-triples
   "Stages a new transaction that is already parsed into the
    internal Fluree triples format."
-  [db parsed-txn parsed-opts]
+  [db parsed-txn]
   (go-try
-    (let [identity  (:identity parsed-opts)
-          policy-db (if (policy/policy-enforced-opts? parsed-opts)
-                      (let [parsed-context (:context parsed-opts)]
-                        (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
-                      db)]
+    (let [parsed-opts (:opts parsed-txn)
+          identity    (:identity parsed-opts)
+          policy-db   (if (policy/policy-enforced-opts? parsed-opts)
+                        (let [parsed-context (:context parsed-opts)]
+                          (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
+                        db)]
       (if (fuel/track? parsed-opts)
         (let [start-time   #?(:clj (System/nanoTime)
                               :cljs (util/current-time-millis))
@@ -624,11 +625,11 @@
         (<? (transact/stage policy-db identity parsed-txn parsed-opts))))))
 
 (defn transact-ledger!
-  [_conn ledger triples {:keys [branch] :as parsed-opts, :or {branch commit-data/default-branch}}]
+  [_conn ledger parsed-txn {:keys [branch] :as parsed-opts, :or {branch commit-data/default-branch}}]
   (log/info "transacting ledger:" parsed-opts)
   (go-try
     (let [db       (ledger/current-db ledger branch)
-          staged   (<? (stage-triples db triples parsed-opts))
+          staged   (<? (stage-triples db parsed-txn))
           ;; commit API takes a did-map and parsed context as opts
           ;; whereas stage API takes a did IRI and unparsed context.
           ;; Dissoc them until deciding at a later point if they can carry through.

@@ -24,14 +24,11 @@
     txn))
 
 (defn stage
-  [db txn opts]
+  [db txn override-opts]
   (go-try
-    (let [txn*        (format-txn txn opts)
-          parsed-txn  (q-parse/parse-txn txn*)
-          txn-context (or (ctx-util/txn-context txn*)
-                          (:context opts))
-          parsed-opts (parse-opts txn* opts txn-context)]
-      (<? (connection/stage-triples db parsed-txn parsed-opts)))))
+    (let [txn*       (format-txn txn override-opts)
+          parsed-txn (q-parse/parse-txn txn* override-opts)]
+      (<? (connection/stage-triples db parsed-txn)))))
 
 (defn extract-ledger-id
   "Extracts ledger-id from expanded json-ld transaction"
