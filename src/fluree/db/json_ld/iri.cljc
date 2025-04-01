@@ -172,7 +172,7 @@
         (map default-namespaces)
         commit-namespaces))
 
-(def f-idx-code 
+(def f-idx-code
   (get default-namespaces f-idx-ns))
 
 (defn decompose-by-char
@@ -299,7 +299,7 @@
         suf (nano-id 8)]
     (str/join "-" [blank-node-prefix now suf])))
 
-(defn f-idx-ns? 
+(defn f-idx-ns?
   "Returns truthy if the given iri is in the fluree index namespace."
   [^SID sid]
   (= f-idx-code (get-namespace sid)))

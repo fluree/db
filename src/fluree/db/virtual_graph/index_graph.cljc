@@ -4,11 +4,11 @@
                       [fluree.db.virtual-graph.parse :as vg-parse]])
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            [fluree.db.virtual-graph :as vg]
-            [fluree.db.json-ld.iri :as iri]))
+            [fluree.db.virtual-graph :as vg]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -43,7 +43,7 @@
     :query       nil}
    index-flakes))
 
-(defn throw-if-defined 
+(defn throw-if-defined
   "Ensures a new virtual graph does not reuse an existing virtual
    graph alias, or create a new virtual graph using an existing vg IRI"
   [{:keys [vg] :as db} named-graph vg-sid]
@@ -51,8 +51,8 @@
     (throw (ex-info (str "Virtual graph alias: " named-graph " already exists in db.")
                     {:status 400
                      :error  :db/invalid-index})))
-  
-  (when (some #(= vg-sid (:id %))(vals vg))
+
+  (when (some #(= vg-sid (:id %)) (vals vg))
     (throw (ex-info (str "Virtual graph IRI already exists in db: " (iri/decode-sid db vg-sid))
                     {:status 400
                      :error  :db/invalid-index}))))
@@ -98,7 +98,7 @@
   [{:keys [t] :as db} {:keys [vg-name] :as _vg-opts} vg-flakes]
   (let [named-graph (vg/named-graph-str vg-name)]
     (if (remove-vg? vg-flakes)
-        (update db :vg dissoc named-graph)
+      (update db :vg dissoc named-graph)
       (throw (ex-info "Virtual graph update not supported."
                       {:status 400
                        :error  :db/invalid-index})))))
