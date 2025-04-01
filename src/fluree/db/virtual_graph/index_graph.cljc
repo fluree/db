@@ -95,7 +95,7 @@
         vg-flakes))
 
 (defn modify
-  [{:keys [t] :as db} {:keys [vg-name] :as _vg-opts} vg-flakes]
+  [db {:keys [vg-name] :as _vg-opts} vg-flakes]
   (let [named-graph (vg/named-graph-str vg-name)]
     (if (remove-vg? vg-flakes)
       (update db :vg dissoc named-graph)

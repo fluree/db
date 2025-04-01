@@ -80,19 +80,6 @@
                      result
                      [@db-vol result]))))))
 
-(defn create-virtual-graphs
-  "Creates a new virtual graph. If the virtual graph is invalid, an
-  exception will be thrown and the transaction will not complete."
-  [db add new-vgs]
-  (loop [[new-vg & r] new-vgs
-         db db]
-    (if new-vg
-      (let [vg-flakes (filter #(= (flake/s %) new-vg) add)
-            [db* alias vg-record] (vg/create db vg-flakes)]
-        ;; TODO - VG - ensure alias is not being used, throw if so
-        (recur r (assoc-in db* [:vg alias] vg-record)))
-      db)))
-
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
