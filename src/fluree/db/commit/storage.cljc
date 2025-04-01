@@ -1,5 +1,5 @@
 (ns fluree.db.commit.storage
-  (:require [clojure.core.async :as async :refer [go <! chan]]
+  (:require [clojure.core.async :as async :refer [>! chan go]]
             [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.commit-data :as commit-data]
@@ -96,7 +96,7 @@
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
   First commit will be t value of `from-t` and increment from there."
-  [storage latest-commit from-t]
+  [storage latest-commit from-t error-ch]
   (let [resp-ch (chan)]
     (go
       (try*
@@ -113,13 +113,15 @@
 
             (if (= from-t commit-t)
               (async/onto-chan! resp-ch commit-tuples*)
-              (let [verified-commit (<! (read-verified-commit storage prev-commit-addr))]
-                (if (util/exception? verified-commit)
-                  (do (async/>! resp-ch verified-commit)
-                      (async/close! resp-ch))
-                  (recur verified-commit commit-t commit-tuples*))))))
-        (catch* e (async/>! resp-ch e)
-                (async/close! resp-ch))))
+              (let [verified-commit (try*
+                                      (<? (read-verified-commit storage prev-commit-addr))
+                                      (catch* e
+                                        (log/error e "Error tracing commits")
+                                        (>! error-ch e)))]
+                (recur verified-commit commit-t commit-tuples*)))))
+        (catch* e
+          (>! resp-ch e)
+          (async/close! resp-ch))))
     resp-ch))
 
 (defn write-jsonld
