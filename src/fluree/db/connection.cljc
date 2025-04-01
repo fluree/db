@@ -20,7 +20,7 @@
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
-            [fluree.db.util.core :as util :refer [get-first-value try* catch*]]
+            [fluree.db.util.core :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
@@ -117,9 +117,13 @@
     (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
       (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
         (if-let [ledger-ch (cached-ledger conn ledger-alias)]
-          (let [ledger              (<? ledger-ch)
-                notification-status (<? (ledger/notify ledger expanded-commit))]
-            (case notification-status
+          (let [db-address    (-> expanded-commit
+                                  (get-first const/iri-data)
+                                  (get-first-value const/iri-address))
+                expanded-data (<? (commit-storage/read-commit-jsonld commit-catalog db-address))
+                ledger        (<? ledger-ch)
+                status        (<? (ledger/notify ledger expanded-commit expanded-data))]
+            (case status
               (::ledger/current ::ledger/newer ::ledger/updated)
               (do (log/debug "Ledger" ledger-alias "is up to date")
                   true)
