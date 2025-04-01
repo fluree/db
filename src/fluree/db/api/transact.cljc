@@ -26,10 +26,10 @@
    (transact! conn txn nil))
   ([conn txn override-opts]
    (go-try
-     (let [override-opts* (assoc override-opts :format :fql)
-           {:keys [ledger-id] :as parsed-txn}
-           (-> (format-txn txn override-opts)
-               (parse/parse-ledger-txn override-opts*))]
+     (let [{:keys [ledger-id] :as parsed-txn}
+           (-> txn
+               (format-txn override-opts)
+               (parse/parse-ledger-txn override-opts))]
        (<? (connection/transact! conn ledger-id parsed-txn))))))
 
 (defn credential-transact!
@@ -56,6 +56,7 @@
            ;; Dissoc them until deciding at a later point if they can carry through.
            {:keys [ledger-id] :as parsed-txn}
            (-> txn
+               (format-txn override-opts)
                (parse/parse-ledger-txn override-opts)
                (update :opts dissoc :context :did))
            ledger-opts (-> parsed-txn :opts syntax/coerce-ledger-opts)
