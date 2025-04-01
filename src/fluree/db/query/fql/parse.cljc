@@ -851,9 +851,9 @@
                       e)))))
 
 (defn parse-txn-opts
-  [{:keys [did] :as txn-opts} override-opts txn-context]
-  (let [opts (merge (syntax/coerce-txn-opts txn-opts)
-                    (syntax/coerce-txn-opts override-opts))]
+  [txn-opts override-opts txn-context]
+  (let [{:keys [did] :as opts} (merge (syntax/coerce-txn-opts txn-opts)
+                                      (syntax/coerce-txn-opts override-opts))]
     (-> opts
         (assoc :context txn-context)
         (update :identity #(or % did))
