@@ -73,12 +73,6 @@
       :flakes  flakes
       :commit  commit})))
 
-(defn close-ledger
-  "Shuts down ledger and resources."
-  [{:keys [cache state] :as _ledger}]
-  (reset! state {:closed? true})
-  (reset! cache {}))
-
 (defn notify
   "Returns false if provided commit update did not result in an update to the ledger because
   the provided commit was not the next expected commit.
@@ -104,37 +98,36 @@
               commit-storage (-> ledger :conn :store)
               db-data-jsonld (<? (commit-storage/read-verified-commit commit-storage db-address))
               updated-db     (<? (transact/-merge-commit db expanded-commit db-data-jsonld))]
-          (update-commit! ledger branch updated-db))
+          (update-commit! ledger branch updated-db)
+          ::updated)
 
         ;; missing some updates, dump in-memory ledger forcing a reload
         (flake/t-after? commit-t (flake/next-t current-t))
         (do
           (log/warn "Received commit update that is more than 1 ahead of current ledger state. "
                     "Will dump in-memory ledger and force a reload: " (:alias ledger))
-          (close-ledger ledger)
-          false)
+          ::stale)
 
         (= commit-t current-t)
         (do
           (log/info "Received commit update for ledger: " (:alias ledger)
                     " at t value: " commit-t " however we already have this commit so not applying: "
                     current-t)
-          false)
+          ::current)
 
         (flake/t-before? commit-t current-t)
         (do
           (log/info "Received commit update for ledger: " (:alias ledger)
                     " at t value: " commit-t " however, latest t is more current: "
                     current-t)
-          false)))))
+          ::newer)))))
 
 (defrecord Ledger [conn id address alias did state cache commit-catalog
                    index-catalog reasoner])
 
 (defn initial-state
   [branches current-branch]
-  {:closed?  false
-   :branches branches
+  {:branches branches
    :branch   current-branch
    :graphs   {}})
 
@@ -145,16 +138,16 @@
    indexing-opts did latest-commit]
   (let [branches {branch (branch/state-map ledger-alias branch commit-catalog index-catalog
                                            publishers latest-commit indexing-opts)}]
-    (map->Ledger {:conn                 conn
-                  :id                   (random-uuid)
-                  :did                  did
-                  :state                (atom (initial-state branches branch))
-                  :alias                ledger-alias
-                  :address              ledger-address
-                  :commit-catalog       commit-catalog
-                  :index-catalog        index-catalog
-                  :cache                (atom {})
-                  :reasoner             #{}})))
+    (map->Ledger {:conn           conn
+                  :id             (random-uuid)
+                  :did            did
+                  :state          (atom (initial-state branches branch))
+                  :alias          ledger-alias
+                  :address        ledger-address
+                  :commit-catalog commit-catalog
+                  :index-catalog  index-catalog
+                  :cache          (atom {})
+                  :reasoner       #{}})))
 
 (defn normalize-alias
   "For a ledger alias, removes any preceding '/' or '#' if exists."

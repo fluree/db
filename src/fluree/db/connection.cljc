@@ -103,7 +103,8 @@
 (defn release-ledger
   "Opposite of register-ledger. Removes reference to a ledger from conn"
   [{:keys [state] :as _conn} ledger-alias]
-  (swap! state update :ledger dissoc ledger-alias))
+  (swap! state update :ledger dissoc ledger-alias)
+  nil)
 
 (defn cached-ledger
   "Returns a cached ledger from the connection if it is cached, else nil"
@@ -116,8 +117,16 @@
     (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
       (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
         (if-let [ledger-ch (cached-ledger conn ledger-alias)]
-          (let [ledger (<? ledger-ch)]
-            (<? (ledger/notify ledger expanded-commit)))
+          (let [ledger              (<? ledger-ch)
+                notification-status (<? (ledger/notify ledger expanded-commit))]
+            (case notification-status
+              (::ledger/current ::ledger/newer ::ledger/updated)
+              (do (log/debug "Ledger" ledger-alias "is up to date")
+                  true)
+
+              ::ledger/stale
+              (do (log/debug "Dropping state for stale ledger:" ledger-alias)
+                  (release-ledger conn ledger-alias))))
           (log/debug "No cached ledger found for commit: " expanded-commit))
         (log/warn "Notify called with a data that does not have a ledger alias."
                   "Are you sure it is a commit?: " expanded-commit))
