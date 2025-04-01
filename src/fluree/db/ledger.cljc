@@ -109,8 +109,8 @@
         ;; missing some updates, dump in-memory ledger forcing a reload
         (flake/t-after? commit-t (flake/next-t current-t))
         (do
-          (log/debug "Received commit update that is more than 1 ahead of current ledger state. "
-                     "Will dump in-memory ledger and force a reload: " (:alias ledger))
+          (log/warn "Received commit update that is more than 1 ahead of current ledger state. "
+                    "Will dump in-memory ledger and force a reload: " (:alias ledger))
           (close-ledger ledger)
           false)
 
