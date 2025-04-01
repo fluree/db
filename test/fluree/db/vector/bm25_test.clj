@@ -413,7 +413,69 @@
 
           (is (util/exception? ex-db))
           (is (= "BM25 index query must not contain wildcard '*' in subgraph selector"
-                 (ex-message ex-db))))))))
+                 (ex-message ex-db)))))
+
+      (testing " cannot update/overwrite an existing virtual graph"
+        (let [db     @(fluree/stage
+                       (fluree/db ledger)
+                       {"insert"
+                        {"@context"       {"f"    "https://ns.flur.ee/ledger#"
+                                           "fvg"  "https://ns.flur.ee/virtualgraph#"
+                                           "fidx" "https://ns.flur.ee/index#"
+                                           "ex"   "http://example.org/"},
+                         "@id"            "ex:articleSearch"
+                         "@type"          ["f:VirtualGraph" "fidx:BM25"]
+                         "f:virtualGraph" "articleSearch"
+                         "f:query"        {"@type"  "@json"
+                                           "@value" {"@context"  {"ex" "http://example.org/ns/"}
+                                                     "where"     [{"@id"       "?x"
+                                                                   "ex:author" "?author"}]
+                                                               ;; a 'selectOne' wil get converted to a 'select' internally
+                                                     "selectOne" {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})]
+
+          (testing " new vg with same IRI as existing vg should error"
+            (let [same-id @(fluree/stage
+                            db
+                            {"insert"
+                             {"@context"       {"f"    "https://ns.flur.ee/ledger#"
+                                                "fvg"  "https://ns.flur.ee/virtualgraph#"
+                                                "fidx" "https://ns.flur.ee/index#"
+                                                "ex"   "http://example.org/"},
+                              "@id"            "ex:articleSearch" ;; <<-- NOTE same IRI as prior VG
+                              "@type"          ["f:VirtualGraph" "fidx:BM25"]
+                              "f:virtualGraph" "someOtherVGName" ;; <<-- NOTE different vg alias name as prior VG
+                              "f:query"        {"@type"  "@json"
+                                                "@value" {"@context"  {"ex" "http://example.org/ns/"}
+                                                          "where"     [{"@id"       "?x"
+                                                                        "ex:author" "?author"}]
+                                                                                   ;; a 'selectOne' wil get converted to a 'select' internally
+                                                          "selectOne" {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})]
+
+              (is (util/exception? same-id))
+              (is (= "Virtual graph IRI already exists in db: http://example.org/articleSearch"
+                     (ex-message same-id)))))
+
+          (testing " new vg with same alias should error"
+            (let [same-alias @(fluree/stage
+                               db
+                               {"insert"
+                                {"@context"       {"f"    "https://ns.flur.ee/ledger#"
+                                                   "fvg"  "https://ns.flur.ee/virtualgraph#"
+                                                   "fidx" "https://ns.flur.ee/index#"
+                                                   "ex"   "http://example.org/"},
+                                 "@id"            "ex:articleSearch" ;; <<-- NOTE different IRI as prior VG
+                                 "@type"          ["f:VirtualGraph" "fidx:BM25"]
+                                 "f:virtualGraph" "articleSearch" ;; <<-- NOTE same vg alias name as prior VG
+                                 "f:query"        {"@type"  "@json"
+                                                   "@value" {"@context"  {"ex" "http://example.org/ns/"}
+                                                             "where"     [{"@id"       "?x"
+                                                                           "ex:author" "?author"}]
+                                                                                   ;; a 'selectOne' wil get converted to a 'select' internally
+                                                             "selectOne" {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})]
+
+              (is (util/exception? same-alias))
+              (is (= "Virtual graph alias: ##articleSearch already exists in db."
+                     (ex-message same-alias))))))))))
 
 (deftest ^:integration bm25-search-persist
   (with-tmp-dir storage-path
