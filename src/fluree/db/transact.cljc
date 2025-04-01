@@ -26,7 +26,7 @@
        not-empty))
 
 (defn expand-annotation
-  [parsed-txn parsed-opts context]
+  [_parsed-txn parsed-opts context]
   (some-> (:annotation parsed-opts)
           (json-ld/expand context)
           util/sequential))

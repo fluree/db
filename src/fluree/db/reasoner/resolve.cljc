@@ -8,8 +8,7 @@
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]))
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

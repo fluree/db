@@ -2,7 +2,6 @@
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.flake :as flake]
             [fluree.db.flake.index.novelty :as novelty]
-            [fluree.db.report.fuel :as fuel]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.modify :as policy.modify]
@@ -10,6 +9,7 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.report.fuel :as fuel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.virtual-graph.index-graph :as vg]))
