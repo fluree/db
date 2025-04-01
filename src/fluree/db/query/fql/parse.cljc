@@ -859,11 +859,12 @@
         (update :identity #(or % did))
         (dissoc :did))))
 
-(defn parse-txn
+(defn parse-stage-txn
   ([txn]
-   (parse-txn txn {}))
+   (parse-stage-txn txn {}))
   ([txn override-opts]
-   (let [context       (or (ctx-util/txn-context txn)
+   (let [ledger-id     (get-named txn "ledger")
+         context       (or (ctx-util/txn-context txn)
                            (:context override-opts))
          [vars values] (-> (get-named txn "values")
                            (parse-values context))
@@ -889,6 +890,7 @@
        (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
                        {:status 400 :error :db/invalid-transaction})))
      (cond-> {}
+       ledger-id    (assoc :ledger-id ledger-id)
        context      (assoc :context context)
        where        (assoc :where where)
        annotation   (assoc :annotation annotation)
@@ -896,3 +898,14 @@
        (seq delete) (assoc :delete delete)
        (seq insert) (assoc :insert insert)
        (seq opts)   (assoc :opts opts)))))
+
+(defn parse-ledger-txn
+  ([txn]
+   (parse-ledger-txn txn {}))
+  ([txn override-opts]
+   (if-let [ledger-id (get-named txn "ledger")]
+     (-> txn
+         (parse-stage-txn override-opts)
+         (assoc :ledger-id ledger-id))
+     (throw (ex-info "Invalid transaction, missing required key: ledger."
+                     {:status 400, :error :db/invalid-transaction})))))

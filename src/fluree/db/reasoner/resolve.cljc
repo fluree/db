@@ -6,7 +6,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as exec-where]
             [fluree.db.query.fql :as fql]
-            [fluree.db.query.fql.parse :as q-parse]
+            [fluree.db.query.fql.parse :as parse]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]))
 
@@ -63,9 +63,9 @@
   (let [context         (get rule "@context")
         where           (get rule "where")
         insert          (get rule "insert")
-        rule-parsed     (q-parse/parse-txn {:context context
-                                            :where   where
-                                            :insert  insert})
+        rule-parsed     (parse/parse-stage-txn {:context context
+                                                :where   where
+                                                :insert  insert})
         where-patterns  (extract-patterns (::exec-where/patterns (:where rule-parsed)))
         insert-patterns (extract-patterns (:insert rule-parsed))]
     {:deps        where-patterns

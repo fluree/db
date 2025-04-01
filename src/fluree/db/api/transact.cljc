@@ -16,26 +16,20 @@
 (defn stage
   [db txn override-opts]
   (go-try
-    (let [txn*       (format-txn txn override-opts)
-          parsed-txn (parse/parse-txn txn* override-opts)]
+    (let [parsed-txn (-> txn
+                         (format-txn override-opts)
+                         (parse/parse-stage-txn override-opts))]
       (<? (connection/stage-triples db parsed-txn)))))
-
-(defn extract-ledger-id
-  "Extracts ledger-id from expanded json-ld transaction"
-  [txn]
-  (or (parse/get-named txn "ledger")
-      (throw (ex-info "Invalid transaction, missing required key: ledger."
-                      {:status 400 :error :db/invalid-transaction}))))
 
 (defn transact!
   ([conn txn]
    (transact! conn txn nil))
   ([conn txn override-opts]
    (go-try
-     (let [txn*           (format-txn txn override-opts)
-           override-opts* (assoc override-opts :format :fql)
-           ledger-id      (extract-ledger-id txn*)
-           parsed-txn     (parse/parse-txn txn* override-opts*)]
+     (let [override-opts* (assoc override-opts :format :fql)
+           {:keys [ledger-id] :as parsed-txn}
+           (-> (format-txn txn override-opts)
+               (parse/parse-ledger-txn override-opts*))]
        (<? (connection/transact! conn ledger-id parsed-txn))))))
 
 (defn credential-transact!
@@ -51,18 +45,19 @@
                                       :raw-txn txn
                                       :identity identity
                                       :context parent-context))))))
+
 (defn create-with-txn
   ([conn txn]
    (create-with-txn conn txn nil))
   ([conn txn override-opts]
    (go-try
-     (let [ledger-id   (extract-ledger-id txn)
-           ;; commit API takes a did-map and parsed context as opts
+     (let [;; commit API takes a did-map and parsed context as opts
            ;; whereas stage API takes a did IRI and unparsed context.
            ;; Dissoc them until deciding at a later point if they can carry through.
-           parsed-txn  (-> txn
-                           (parse/parse-txn override-opts)
-                           (update :opts dissoc :context :did))
+           {:keys [ledger-id] :as parsed-txn}
+           (-> txn
+               (parse/parse-ledger-txn override-opts)
+               (update :opts dissoc :context :did))
            ledger-opts (-> parsed-txn :opts syntax/coerce-ledger-opts)
            ledger      (<? (connection/create-ledger conn ledger-id ledger-opts))]
        (<? (connection/transact-ledger! conn ledger parsed-txn))))))
