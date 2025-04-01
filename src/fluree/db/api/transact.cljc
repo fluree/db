@@ -56,20 +56,16 @@
    (create-with-txn conn txn nil))
   ([conn txn override-opts]
    (go-try
-     (let [ledger-id (extract-ledger-id txn)
-           address   (<? (connection/primary-address conn ledger-id))]
-       (if (<? (connection/ledger-exists? conn address))
-         (throw (ex-info (str "Ledger " ledger-id " already exists")
-                         {:status 409 :error :db/ledger-exists}))
-         (let [;; commit API takes a did-map and parsed context as opts
-               ;; whereas stage API takes a did IRI and unparsed context.
-               ;; Dissoc them until deciding at a later point if they can carry through.
-               parsed-txn  (-> txn
-                               (parse/parse-txn override-opts)
-                               (update :opts dissoc :context :did))
-               ledger-opts (-> parsed-txn :opts syntax/coerce-ledger-opts)
-               ledger      (<? (connection/create-ledger conn ledger-id ledger-opts))]
-           (<? (connection/transact-ledger! conn ledger parsed-txn))))))))
+     (let [ledger-id   (extract-ledger-id txn)
+           ;; commit API takes a did-map and parsed context as opts
+           ;; whereas stage API takes a did IRI and unparsed context.
+           ;; Dissoc them until deciding at a later point if they can carry through.
+           parsed-txn  (-> txn
+                           (parse/parse-txn override-opts)
+                           (update :opts dissoc :context :did))
+           ledger-opts (-> parsed-txn :opts syntax/coerce-ledger-opts)
+           ledger      (<? (connection/create-ledger conn ledger-id ledger-opts))]
+       (<? (connection/transact-ledger! conn ledger parsed-txn))))))
 
 (defn credential-create-with-txn!
   [conn txn]

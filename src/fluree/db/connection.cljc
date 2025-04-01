@@ -325,29 +325,35 @@
      :branch   branch
      :indexing indexing*}))
 
+(defn throw-ledger-exists
+  [ledger-alias]
+  (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
+                  {:status 409, :error :db/ledger-exists})))
+
 (defn create-ledger
   [{:keys [commit-catalog index-catalog] :as conn} ledger-alias opts]
   (go-try
-    (let [[cached? ledger-chan] (register-ledger conn ledger-alias)]
-      (if cached?
-        (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
-                        {:status 409, :error :db/ledger-exists}))
-        (let [addr          (<? (primary-address conn ledger-alias))
-              publish-addrs (<? (publishing-addresses conn ledger-alias))
-              pubs          (publishers conn)
-              ledger-opts   (parse-ledger-options conn opts)
-              ledger        (<! (ledger/create {:conn              conn
-                                                :alias             ledger-alias
-                                                :address           addr
-                                                :publish-addresses publish-addrs
-                                                :commit-catalog    commit-catalog
-                                                :index-catalog     index-catalog
-                                                :publishers        pubs}
-                                               ledger-opts))]
-          (when (util/exception? ledger)
-            (release-ledger conn ledger-alias))
-          (async/put! ledger-chan ledger)
-          ledger)))))
+    (if (<? (ledger-exists? conn ledger-alias))
+      (throw-ledger-exists ledger-alias)
+      (let [[cached? ledger-chan] (register-ledger conn ledger-alias)]
+        (if  cached?
+          (throw-ledger-exists ledger-alias)
+          (let [addr          (<? (primary-address conn ledger-alias))
+                publish-addrs (<? (publishing-addresses conn ledger-alias))
+                pubs          (publishers conn)
+                ledger-opts   (parse-ledger-options conn opts)
+                ledger        (<! (ledger/create {:conn              conn
+                                                  :alias             ledger-alias
+                                                  :address           addr
+                                                  :publish-addresses publish-addrs
+                                                  :commit-catalog    commit-catalog
+                                                  :index-catalog     index-catalog
+                                                  :publishers        pubs}
+                                                 ledger-opts))]
+            (when (util/exception? ledger)
+              (release-ledger conn ledger-alias))
+            (async/put! ledger-chan ledger)
+            ledger))))))
 
 (defn commit->ledger-alias
   "Returns ledger alias from commit map, if present. If not present
