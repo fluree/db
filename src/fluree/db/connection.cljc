@@ -359,6 +359,12 @@
            (some (fn [ns]
                    (nameservice/alias ns db-alias))))))
 
+(defn throw-missing-branch
+  [address ledger-alias]
+  (throw (ex-info (str "No committed branches exist for ledger: " ledger-alias
+                       " at address: " address)
+                  {:status 400, :error :db/missing-branch})))
+
 (defn load-ledger*
   [{:keys [commit-catalog index-catalog] :as conn}
    ledger-chan address]
@@ -368,7 +374,9 @@
                      "with commit:" commit)
           (let [expanded-commit (json-ld/expand commit)
                 ledger-alias    (commit->ledger-alias conn address expanded-commit)
-                branch          (get-first-value expanded-commit const/iri-branch)
+                branch          (-> expanded-commit
+                                    (get-first-value const/iri-branch)
+                                    (or (throw-missing-branch address ledger-alias)))
 
                 {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
 
