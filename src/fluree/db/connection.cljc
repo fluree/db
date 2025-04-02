@@ -20,7 +20,7 @@
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
-            [fluree.db.util.core :as util :refer [get-first-value try* catch*]]
+            [fluree.db.util.core :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
@@ -103,7 +103,8 @@
 (defn release-ledger
   "Opposite of register-ledger. Removes reference to a ledger from conn"
   [{:keys [state] :as _conn} ledger-alias]
-  (swap! state update :ledger dissoc ledger-alias))
+  (swap! state update :ledger dissoc ledger-alias)
+  nil)
 
 (defn cached-ledger
   "Returns a cached ledger from the connection if it is cached, else nil"
@@ -116,8 +117,20 @@
     (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
       (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
         (if-let [ledger-ch (cached-ledger conn ledger-alias)]
-          (let [ledger (<? ledger-ch)]
-            (<? (ledger/notify ledger expanded-commit)))
+          (let [db-address    (-> expanded-commit
+                                  (get-first const/iri-data)
+                                  (get-first-value const/iri-address))
+                expanded-data (<? (commit-storage/read-commit-jsonld commit-catalog db-address))
+                ledger        (<? ledger-ch)
+                status        (<? (ledger/notify ledger expanded-commit expanded-data))]
+            (case status
+              (::ledger/current ::ledger/newer ::ledger/updated)
+              (do (log/debug "Ledger" ledger-alias "is up to date")
+                  true)
+
+              ::ledger/stale
+              (do (log/debug "Dropping state for stale ledger:" ledger-alias)
+                  (release-ledger conn ledger-alias))))
           (log/debug "No cached ledger found for commit: " expanded-commit))
         (log/warn "Notify called with a data that does not have a ledger alias."
                   "Are you sure it is a commit?: " expanded-commit))
@@ -364,6 +377,12 @@
            (some (fn [ns]
                    (nameservice/alias ns db-alias))))))
 
+(defn throw-missing-branch
+  [address ledger-alias]
+  (throw (ex-info (str "No committed branches exist for ledger: " ledger-alias
+                       " at address: " address)
+                  {:status 400, :error :db/missing-branch})))
+
 (defn load-ledger*
   [{:keys [commit-catalog index-catalog] :as conn}
    ledger-chan address]
@@ -373,7 +392,9 @@
                      "with commit:" commit)
           (let [expanded-commit (json-ld/expand commit)
                 ledger-alias    (commit->ledger-alias conn address expanded-commit)
-                branch          (get-first-value expanded-commit const/iri-branch)
+                branch          (-> expanded-commit
+                                    (get-first-value const/iri-branch)
+                                    (or (throw-missing-branch address ledger-alias)))
 
                 {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
 

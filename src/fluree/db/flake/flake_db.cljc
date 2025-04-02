@@ -491,7 +491,7 @@
   [commit-storage indexed-db index-t commit-jsonld]
   (go
     (let [error-ch (async/chan)
-          db-ch    (->> (commit-storage/trace-commits commit-storage commit-jsonld (inc index-t))
+          db-ch    (->> (commit-storage/trace-commits commit-storage commit-jsonld (inc index-t) error-ch)
                         (with-commit-data commit-storage error-ch)
                         (merge-novelty-commits indexed-db error-ch))]
       (async/alt!
