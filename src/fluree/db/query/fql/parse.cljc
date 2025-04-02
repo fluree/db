@@ -863,8 +863,7 @@
   ([txn]
    (parse-stage-txn txn {}))
   ([txn override-opts]
-   (let [ledger-id     (get-named txn "ledger")
-         context       (or (ctx-util/txn-context txn)
+   (let [context       (or (ctx-util/txn-context txn)
                            (:context override-opts))
          [vars values] (-> (get-named txn "values")
                            (parse-values context))
@@ -890,7 +889,6 @@
        (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
                        {:status 400 :error :db/invalid-transaction})))
      (cond-> {}
-       ledger-id    (assoc :ledger-id ledger-id)
        context      (assoc :context context)
        where        (assoc :where where)
        annotation   (assoc :annotation annotation)
