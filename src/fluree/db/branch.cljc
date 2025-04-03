@@ -202,7 +202,3 @@
   "Returns current db from branch data"
   [{:keys [state] :as _branch-map}]
   (:current-db @state))
-
-(defn current-commit
-  [{:keys [state] :as _branch-map}]
-  (:commit @state))
