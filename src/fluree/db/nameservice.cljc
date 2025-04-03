@@ -62,11 +62,6 @@
               (get % "commit"))
            (get record "branches")))))
 
-(defn commit-address-from-record
-  [record branch]
-  (let [commit-data (commit-from-record record branch)]
-    (get commit-data "address")))
-
 (defn address-path
   [address]
   (storage/get-local-path address))
