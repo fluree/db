@@ -42,7 +42,7 @@
 (defn printer-map
   "Returns map of important data for print writer"
   [conn]
-  {:id (:id conn)})
+  (select-keys conn [:id]))
 
 (defrecord Connection [id state parallelism commit-catalog index-catalog primary-publisher
                        secondary-publishers remote-systems serializer cache defaults])
