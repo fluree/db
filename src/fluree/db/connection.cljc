@@ -34,11 +34,10 @@
                                :branch   {}}}
    :subscriptions {}})
 
-(defn blank-state
-  "Returns top-level state for connection"
-  []
-  (atom {:ledger        {}
-         :subscriptions {}}))
+(def blank-state
+  "Initial connection state"
+  {:ledger        {}
+   :subscriptions {}})
 
 (defn printer-map
   "Returns map of important data for print writer"
@@ -72,7 +71,7 @@
            primary-publisher secondary-publishers remote-systems defaults]
     :or   {serializer (json-serde)} :as _opts}]
   (let [id    (random-uuid)
-        state (blank-state)]
+        state (atom blank-state)]
     (->Connection id state parallelism commit-catalog index-catalog primary-publisher
                   secondary-publishers remote-systems serializer cache defaults)))
 
