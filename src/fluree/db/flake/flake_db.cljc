@@ -283,6 +283,8 @@
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))
+      (log/debug "Updating db" (str/join "@" [(:alias db) (:t db)])
+                 "to t:" t-new "with new commit:" commit-metadata)
       (-> db*
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))

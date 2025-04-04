@@ -118,21 +118,22 @@
       (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
         (if-let [ledger-ch (cached-ledger conn ledger-alias)]
           (let [commit-id        (commit-data/hash->commit-id hash)
-                expanded-commit* (assoc expanded-commit :id commit-id)
-                db-address       (-> expanded-commit*
-                                     (get-first const/iri-data)
-                                     (get-first-value const/iri-address))
-                expanded-data    (<? (commit-storage/read-commit-jsonld commit-catalog db-address))
-                ledger           (<? ledger-ch)
-                status           (<? (ledger/notify ledger expanded-commit* expanded-data))]
-            (case status
-              (::ledger/current ::ledger/newer ::ledger/updated)
-              (do (log/debug "Ledger" ledger-alias "is up to date")
-                  true)
+                expanded-commit* (assoc expanded-commit :id commit-id)]
+            (log/debug "Notification received for ledger" ledger-alias "of new commit:" expanded-commit*)
+            (let [db-address    (-> expanded-commit*
+                                    (get-first const/iri-data)
+                                    (get-first-value const/iri-address))
+                  expanded-data (<? (commit-storage/read-commit-jsonld commit-catalog db-address))
+                  ledger        (<? ledger-ch)
+                  status        (<? (ledger/notify ledger expanded-commit* expanded-data))]
+              (case status
+                (::ledger/current ::ledger/newer ::ledger/updated)
+                (do (log/debug "Ledger" ledger-alias "is up to date")
+                    true)
 
-              ::ledger/stale
-              (do (log/debug "Dropping state for stale ledger:" ledger-alias)
-                  (release-ledger conn ledger-alias))))
+                ::ledger/stale
+                (do (log/debug "Dropping state for stale ledger:" ledger-alias)
+                    (release-ledger conn ledger-alias)))))
           (log/debug "No cached ledger found for commit: " expanded-commit))
         (log/warn "Notify called with a data that does not have a ledger alias."
                   "Are you sure it is a commit?: " expanded-commit))
