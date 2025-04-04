@@ -110,18 +110,21 @@
   [{:keys [state] :as _conn} ledger-alias]
   (get-in @state [:ledger ledger-alias]))
 
+;; TODO: Verify hash
 (defn notify-commit
-  [{:keys [commit-catalog] :as conn} address]
+  [{:keys [commit-catalog] :as conn} address hash]
   (go-try
     (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
       (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
         (if-let [ledger-ch (cached-ledger conn ledger-alias)]
-          (let [db-address    (-> expanded-commit
-                                  (get-first const/iri-data)
-                                  (get-first-value const/iri-address))
-                expanded-data (<? (commit-storage/read-commit-jsonld commit-catalog db-address))
-                ledger        (<? ledger-ch)
-                status        (<? (ledger/notify ledger expanded-commit expanded-data))]
+          (let [commit-id        (commit-data/hash->commit-id hash)
+                expanded-commit* (assoc expanded-commit :id commit-id)
+                db-address       (-> expanded-commit*
+                                     (get-first const/iri-data)
+                                     (get-first-value const/iri-address))
+                expanded-data    (<? (commit-storage/read-commit-jsonld commit-catalog db-address))
+                ledger           (<? ledger-ch)
+                status           (<? (ledger/notify ledger expanded-commit* expanded-data))]
             (case status
               (::ledger/current ::ledger/newer ::ledger/updated)
               (do (log/debug "Ledger" ledger-alias "is up to date")
@@ -302,10 +305,10 @@
         (go-loop []
           (when-let [msg (<! sub-ch)]
             (log/info "Subscribed ledger:" ledger-alias "received subscription message:" msg)
-            (let [action (get msg "action")
-                  data   (get msg "data")]
+            (let [action (get msg "action")]
               (if (= "new-commit" action)
-                (notify-commit conn data)
+                (let [{:keys [address hash]} (get msg "data")]
+                  (notify-commit conn address hash))
                 (log/info "New subscrition message with action: " action "received, ignored.")))
             (recur)))
         :subscribed))))
@@ -476,15 +479,15 @@
   [commit-storage alias {:keys [did private]} commit]
   (go-try
     (let [commit-jsonld (commit-data/->json-ld commit)
-
           signed-commit (if did
                           (<? (credential/generate commit-jsonld private (:id did)))
                           commit-jsonld)
           commit-res    (<? (commit-storage/write-jsonld commit-storage alias signed-commit))
 
-          [commit* commit-jsonld*] (-> [commit commit-jsonld]
-                                       (update-commit-id (:hash commit-res))
-                                       (update-commit-address (:address commit-res)))]
+          [commit* commit-jsonld*]
+          (-> [commit commit-jsonld]
+              (update-commit-id (:hash commit-res))
+              (update-commit-address (:address commit-res)))]
       {:commit-map    commit*
        :commit-jsonld commit-jsonld*
        :write-result  commit-res})))

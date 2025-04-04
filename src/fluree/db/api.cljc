@@ -205,10 +205,10 @@
   is for the next 't' value. If a commit is for a past 't' value, noop. If
   commit is for a future 't' value, will drop in-memory ledger for reload upon
   next request."
-  [conn commit-address]
+  [conn commit-address commit-hash]
   (validate-connection conn)
   (promise-wrap
-   (notify-commit conn commit-address)))
+   (notify-commit conn commit-address commit-hash)))
 
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"

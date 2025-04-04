@@ -156,14 +156,14 @@
   template, except for some defaults (like rdf:type) which are not in our
   internal commit map, but are part of json-ld."
   [{:keys [previous data ns index issuer] :as commit-map}]
-  (let [commit-map*    (assoc commit-map
-                              :previous (merge-template previous json-ld-prev-commit-template)
-                              :data (data-map->json-ld data)
-                              :issuer (merge-template issuer json-ld-issuer-template)
-                              :ns (mapv #(merge-template % json-ld-ns-template) ns)
-                              :index (-> index
-                                         (update :data data-map->json-ld) ; index has an embedded db map
-                                         (merge-template json-ld-index-template)))]
+  (let [commit-map* (assoc commit-map
+                           :previous (merge-template previous json-ld-prev-commit-template)
+                           :data (data-map->json-ld data)
+                           :issuer (merge-template issuer json-ld-issuer-template)
+                           :ns (mapv #(merge-template % json-ld-ns-template) ns)
+                           :index (-> index
+                                      (update :data data-map->json-ld) ; index has an embedded db map
+                                      (merge-template json-ld-index-template)))]
     (merge-template commit-map* json-ld-base-template)))
 
 (defn parse-db-data
