@@ -12,6 +12,9 @@
 
 (def commit-version 1)
 
+(def default-branch
+  "main")
+
 (comment
   ;; commit map - this map is what gets recorded in a few places:
   ;; - in a 'commit' file: (translated to JSON-LD, and optionally wrapped in a Verifiable Credential)
@@ -153,14 +156,14 @@
   template, except for some defaults (like rdf:type) which are not in our
   internal commit map, but are part of json-ld."
   [{:keys [previous data ns index issuer] :as commit-map}]
-  (let [commit-map*    (assoc commit-map
-                              :previous (merge-template previous json-ld-prev-commit-template)
-                              :data (data-map->json-ld data)
-                              :issuer (merge-template issuer json-ld-issuer-template)
-                              :ns (mapv #(merge-template % json-ld-ns-template) ns)
-                              :index (-> index
-                                         (update :data data-map->json-ld) ; index has an embedded db map
-                                         (merge-template json-ld-index-template)))]
+  (let [commit-map* (assoc commit-map
+                           :previous (merge-template previous json-ld-prev-commit-template)
+                           :data (data-map->json-ld data)
+                           :issuer (merge-template issuer json-ld-issuer-template)
+                           :ns (mapv #(merge-template % json-ld-ns-template) ns)
+                           :index (-> index
+                                      (update :data data-map->json-ld) ; index has an embedded db map
+                                      (merge-template json-ld-index-template)))]
     (merge-template commit-map* json-ld-base-template)))
 
 (defn parse-db-data
@@ -235,12 +238,6 @@
        true
        (update-index-roots index-roots)))))
 
-(defn update-commit-id
-  "Once a commit id is known (by hashing json-ld version of commit), update
-  the id prior to writing the commit to disk"
-  [commit commit-id]
-  (assoc commit :id commit-id))
-
 (defn hash->commit-id
   [hsh]
   (str "fluree:commit:sha256:b" hsh))
@@ -270,7 +267,7 @@
                                  :v      0
                                  :branch (if branch
                                            (util/keyword->str branch)
-                                           "main")
+                                           default-branch)
                                  :data   {:t      0
                                           :flakes 0
                                           :size   0}

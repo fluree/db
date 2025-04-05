@@ -103,7 +103,7 @@
    (go-try
      (let [ledger-address       (<? (connection/primary-address conn ledger-alias))
            last-commit-addr     (<? (connection/lookup-commit conn ledger-address))
-           last-verified-commit (<? (commit-storage/read-commit-jsonld store last-commit-addr))
+           last-verified-commit (<? (commit-storage/read-verified-commit store last-commit-addr))
            last-commit          (first last-verified-commit)
            version              (get-first-value last-commit const/iri-v)]
        (if (and (= version commit-data/commit-version) (not force))
@@ -113,10 +113,11 @@
                                      (update-keys {const/iri-t :t const/iri-size :size const/iri-flakes :flakes})
                                      (select-keys [:t :size :flakes])
                                      (update-vals (comp :value first)))
-               all-commit-tuples (<? (commit-storage/trace-commits store last-commit 1))
+               error-ch          (async/chan)
+               all-commit-tuples (<? (commit-storage/trace-commits store last-commit 1 error-ch))
                first-commit      (ffirst all-commit-tuples)
                branch            (or (keyword (get-first-value first-commit const/iri-branch))
-                                     :main)
+                                     commit-data/default-branch)
                ledger            (<? (ledger/create conn {:alias    ledger-alias
                                                           :did      nil
                                                           :branch   branch

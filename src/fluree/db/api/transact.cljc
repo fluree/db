@@ -17,11 +17,6 @@
         (update :identity #(or % (:did opts)))
         (dissoc :did))))
 
-(defn track-fuel?
-  [parsed-opts]
-  (or (:max-fuel parsed-opts)
-      (:meta parsed-opts)))
-
 (defn stage
   [db txn opts]
   (go-try

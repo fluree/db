@@ -180,7 +180,7 @@
   (log/warn "DEPRECATED function `notify` superseded by `fluree.db.api/notify`")
   (promise-wrap
    (if (map? commit-map)
-     (notify-commit conn commit-map)
+     (notify-commit conn commit-map nil)
      (go
        (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
                 {:status 400 :error :db/invalid-commit-map})))))
