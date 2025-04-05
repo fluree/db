@@ -34,14 +34,6 @@
       [credential-subject commit-data])
     [commit-data nil]))
 
-(defn read-data-jsonld
-  [storage address]
-  (go-try
-    (let [jsonld (<? (storage/read-json storage address))]
-      (-> jsonld
-          (assoc "f:address" address)
-          json-ld/expand))))
-
 (defn read-verified-commit
   [storage commit-address]
   (go-try
@@ -56,10 +48,19 @@
             verify-commit)))))
 
 (defn read-commit-jsonld
-  [storage commit-address]
+  [storage commit-address commit-hash]
   (go-try
     (when-let [[commit _proof] (<? (read-verified-commit storage commit-address))]
-      commit)))
+      (let [commit-id (commit-data/hash->commit-id commit-hash)]
+        (assoc commit :id commit-id)))))
+
+(defn read-data-jsonld
+  [storage address]
+  (go-try
+    (let [jsonld (<? (storage/read-json storage address))]
+      (-> jsonld
+          (assoc "f:address" address)
+          json-ld/expand))))
 
 (defn get-commit-t
   [commit]
