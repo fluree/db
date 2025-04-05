@@ -110,7 +110,6 @@
   [{:keys [state] :as _conn} ledger-alias]
   (get-in @state [:ledger ledger-alias]))
 
-;; TODO: Verify hash
 (defn notify-commit
   [{:keys [commit-catalog] :as conn} address hash]
   (go-try

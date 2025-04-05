@@ -47,6 +47,7 @@
             json-ld/expand
             verify-commit)))))
 
+;; TODO: Verify hash
 (defn read-commit-jsonld
   [storage commit-address commit-hash]
   (go-try
