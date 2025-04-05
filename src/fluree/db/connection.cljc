@@ -117,14 +117,14 @@
     (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address hash))]
       (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
         (if-let [ledger-ch (cached-ledger conn ledger-alias)]
-          (do (log/debug "Notification received for ledger" ledger-alias "of new commit:" expanded-commit)
-              (let [db-address    (-> expanded-commit
+          (do (log/debug "Notification received for ledger" ledger-alias
+                         "of new commit:" expanded-commit)
+              (let [ledger        (<? ledger-ch)
+                    db-address    (-> expanded-commit
                                       (get-first const/iri-data)
                                       (get-first-value const/iri-address))
-                    expanded-data (<? (commit-storage/read-data-jsonld commit-catalog db-address))
-                    ledger        (<? ledger-ch)
-                    status        (<? (ledger/notify ledger expanded-commit expanded-data))]
-                (case status
+                    expanded-data (<? (commit-storage/read-data-jsonld commit-catalog db-address))]
+                (case (<? (ledger/notify ledger expanded-commit expanded-data))
                   (::ledger/current ::ledger/newer ::ledger/updated)
                   (do (log/debug "Ledger" ledger-alias "is up to date")
                       true)
