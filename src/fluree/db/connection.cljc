@@ -432,8 +432,7 @@
                 (recur r))
             (do (release-ledger conn alias)
                 (let [ex (ex-info (str "Load for " alias " failed due to failed address lookup.")
-                                  {:status 404 :error :db/unknown-address}
-                                  addr)]
+                                  {:status 404, :error :db/unknown-address})]
                   (async/put! ledger-chan ex)
                   (throw ex)))))))))
 
