@@ -238,12 +238,6 @@
        true
        (update-index-roots index-roots)))))
 
-(defn update-commit-id
-  "Once a commit id is known (by hashing json-ld version of commit), update
-  the id prior to writing the commit to disk"
-  [commit commit-id]
-  (assoc commit :id commit-id))
-
 (defn hash->commit-id
   [hsh]
   (str "fluree:commit:sha256:b" hsh))
