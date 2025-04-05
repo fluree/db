@@ -473,7 +473,7 @@
   [[commit-map commit-jsonld] commit-hash]
   (let [commit-id (commit-data/hash->commit-id commit-hash)]
     [(assoc commit-map :id commit-id)
-     (assoc commit-jsonld "@id" commit-id)]))
+     (assoc commit-jsonld "id" commit-id)]))
 
 (defn write-commit
   [commit-storage alias {:keys [did private]} commit]
