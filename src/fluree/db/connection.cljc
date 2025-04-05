@@ -34,16 +34,15 @@
                                :branch   {}}}
    :subscriptions {}})
 
-(defn blank-state
-  "Returns top-level state for connection"
-  []
-  (atom {:ledger        {}
-         :subscriptions {}}))
+(def blank-state
+  "Initial connection state"
+  {:ledger        {}
+   :subscriptions {}})
 
 (defn printer-map
   "Returns map of important data for print writer"
   [conn]
-  {:id (:id conn)})
+  (select-keys conn [:id]))
 
 (defrecord Connection [id state parallelism commit-catalog index-catalog primary-publisher
                        secondary-publishers remote-systems serializer cache defaults])
@@ -72,7 +71,7 @@
            primary-publisher secondary-publishers remote-systems defaults]
     :or   {serializer (json-serde)} :as _opts}]
   (let [id    (random-uuid)
-        state (blank-state)]
+        state (atom blank-state)]
     (->Connection id state parallelism commit-catalog index-catalog primary-publisher
                   secondary-publishers remote-systems serializer cache defaults)))
 
@@ -111,26 +110,30 @@
   [{:keys [state] :as _conn} ledger-alias]
   (get-in @state [:ledger ledger-alias]))
 
+;; TODO: Verify hash
 (defn notify-commit
-  [{:keys [commit-catalog] :as conn} address]
+  [{:keys [commit-catalog] :as conn} address hash]
   (go-try
     (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
       (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
         (if-let [ledger-ch (cached-ledger conn ledger-alias)]
-          (let [db-address    (-> expanded-commit
-                                  (get-first const/iri-data)
-                                  (get-first-value const/iri-address))
-                expanded-data (<? (commit-storage/read-commit-jsonld commit-catalog db-address))
-                ledger        (<? ledger-ch)
-                status        (<? (ledger/notify ledger expanded-commit expanded-data))]
-            (case status
-              (::ledger/current ::ledger/newer ::ledger/updated)
-              (do (log/debug "Ledger" ledger-alias "is up to date")
-                  true)
+          (let [commit-id        (commit-data/hash->commit-id hash)
+                expanded-commit* (assoc expanded-commit :id commit-id)]
+            (log/debug "Notification received for ledger" ledger-alias "of new commit:" expanded-commit*)
+            (let [db-address    (-> expanded-commit*
+                                    (get-first const/iri-data)
+                                    (get-first-value const/iri-address))
+                  expanded-data (<? (commit-storage/read-commit-jsonld commit-catalog db-address))
+                  ledger        (<? ledger-ch)
+                  status        (<? (ledger/notify ledger expanded-commit* expanded-data))]
+              (case status
+                (::ledger/current ::ledger/newer ::ledger/updated)
+                (do (log/debug "Ledger" ledger-alias "is up to date")
+                    true)
 
-              ::ledger/stale
-              (do (log/debug "Dropping state for stale ledger:" ledger-alias)
-                  (release-ledger conn ledger-alias))))
+                ::ledger/stale
+                (do (log/debug "Dropping state for stale ledger:" ledger-alias)
+                    (release-ledger conn ledger-alias)))))
           (log/debug "No cached ledger found for commit: " expanded-commit))
         (log/warn "Notify called with a data that does not have a ledger alias."
                   "Are you sure it is a commit?: " expanded-commit))
@@ -303,10 +306,10 @@
         (go-loop []
           (when-let [msg (<! sub-ch)]
             (log/info "Subscribed ledger:" ledger-alias "received subscription message:" msg)
-            (let [action (get msg "action")
-                  data   (get msg "data")]
+            (let [action (get msg "action")]
               (if (= "new-commit" action)
-                (notify-commit conn data)
+                (let [{:keys [address hash]} (get msg "data")]
+                  (notify-commit conn address hash))
                 (log/info "New subscrition message with action: " action "received, ignored.")))
             (recur)))
         :subscribed))))
@@ -434,8 +437,7 @@
                 (recur r))
             (do (release-ledger conn alias)
                 (let [ex (ex-info (str "Load for " alias " failed due to failed address lookup.")
-                                  {:status 404 :error :db/unknown-address}
-                                  addr)]
+                                  {:status 404, :error :db/unknown-address})]
                   (async/put! ledger-chan ex)
                   (throw ex)))))))))
 
@@ -478,21 +480,21 @@
   [[commit-map commit-jsonld] commit-hash]
   (let [commit-id (commit-data/hash->commit-id commit-hash)]
     [(assoc commit-map :id commit-id)
-     (assoc commit-jsonld "@id" commit-id)]))
+     (assoc commit-jsonld "id" commit-id)]))
 
 (defn write-commit
   [commit-storage alias {:keys [did private]} commit]
   (go-try
     (let [commit-jsonld (commit-data/->json-ld commit)
-
           signed-commit (if did
                           (<? (credential/generate commit-jsonld private (:id did)))
                           commit-jsonld)
           commit-res    (<? (commit-storage/write-jsonld commit-storage alias signed-commit))
 
-          [commit* commit-jsonld*] (-> [commit commit-jsonld]
-                                       (update-commit-id (:hash commit-res))
-                                       (update-commit-address (:address commit-res)))]
+          [commit* commit-jsonld*]
+          (-> [commit commit-jsonld]
+              (update-commit-id (:hash commit-res))
+              (update-commit-address (:address commit-res)))]
       {:commit-map    commit*
        :commit-jsonld commit-jsonld*
        :write-result  commit-res})))

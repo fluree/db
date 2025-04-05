@@ -43,10 +43,10 @@
   (-> commit-map commit-data/->json-ld json-ld/expand))
 
 (defn load-db
-  [alias branch commit-catalog index-catalog commit]
-  (let [commit-jsonld (commit-map->commit-jsonld commit)]
+  [alias branch commit-catalog index-catalog commit-map]
+  (let [commit-jsonld (commit-map->commit-jsonld commit-map)]
     (async-db/load alias branch commit-catalog index-catalog
-                   commit-jsonld nil)))
+                   commit-jsonld commit-map nil)))
 
 (defn update-index-async
   "Returns an updated async-db with the index changes.
@@ -143,9 +143,9 @@
   ([ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld]
    (state-map ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld nil))
   ([ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld indexing-opts]
-   (let [initial-db (async-db/load ledger-alias branch-name commit-catalog index-catalog
-                                   commit-jsonld indexing-opts)
-         commit-map (commit-data/jsonld->clj commit-jsonld)
+   (let [commit-map (commit-data/jsonld->clj commit-jsonld)
+         initial-db (async-db/load ledger-alias branch-name commit-catalog index-catalog
+                                   commit-jsonld commit-map indexing-opts)
          state      (atom {:commit     commit-map
                            :current-db initial-db})
          idx-q      (index-queue ledger-alias branch-name publishers state)]
@@ -202,7 +202,3 @@
   "Returns current db from branch data"
   [{:keys [state] :as _branch-map}]
   (:current-db @state))
-
-(defn current-commit
-  [{:keys [state] :as _branch-map}]
-  (:commit @state))

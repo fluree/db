@@ -30,8 +30,8 @@
   ([ledger]
    (current-db ledger nil))
   ([ledger branch]
-   (if-let [branch-meta (get-branch-meta ledger branch)]
-     (branch/current-db branch-meta) ; if branch is nil, will return default
+   (if-let [branch-meta (get-branch-meta ledger branch)] ; if branch is nil, will return default
+     (branch/current-db branch-meta)
      (throw (ex-info (str "Invalid branch: " branch " is not one of:"
                           (available-branches ledger))
                      {:status 400, :error :db/invalid-branch})))))

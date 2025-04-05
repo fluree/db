@@ -50,23 +50,6 @@
     (let [addr (<? (publishing-address nsv ledger-alias))]
       (boolean (<? (lookup nsv addr))))))
 
-(defn commit-from-record
-  ([record]
-   (commit-from-record record nil))
-  ([record branch]
-   (log/info "Fetching commit from record:" record)
-   (let [branch-iri (if branch
-                      (str (get record "@id") "(" branch ")")
-                      (get record "defaultBranch"))]
-     (some #(when (= (get % "@id") branch-iri)
-              (get % "commit"))
-           (get record "branches")))))
-
-(defn commit-address-from-record
-  [record branch]
-  (let [commit-data (commit-from-record record branch)]
-    (get commit-data "address")))
-
 (defn address-path
   [address]
   (storage/get-local-path address))

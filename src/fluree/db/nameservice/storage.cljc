@@ -4,7 +4,8 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.json :as json]))
+            [fluree.db.util.json :as json]
+            [fluree.db.util.log :as log]))
 
 (defn local-filename
   [ledger-alias]
@@ -30,6 +31,18 @@
                        "address" address
                        "commit"  commit-jsonld}]}))
 
+(defn get-commit
+  ([record]
+   (get-commit record nil))
+  ([record branch]
+   (log/info "Fetching commit from record:" record)
+   (let [branch-iri (if branch
+                      (str (get record "@id") "(" branch ")")
+                      (get record "defaultBranch"))]
+     (some #(when (= (get % "@id") branch-iri)
+              (get % "commit"))
+           (get record "branches")))))
+
 (defrecord StorageNameService [store]
   nameservice/Publisher
   (publish [_ commit-jsonld]
@@ -50,7 +63,7 @@
             filename                (local-filename alias)]
         (when-let [record-bytes (<? (storage/read-bytes store filename))]
           (let [record (json/parse record-bytes false)]
-            (nameservice/commit-from-record record))))))
+            (get-commit record))))))
 
   (alias [_ ledger-address]
     ;; TODO: need to validate that the branch doesn't have a slash?

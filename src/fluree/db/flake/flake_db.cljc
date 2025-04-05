@@ -3,6 +3,7 @@
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [<! >! go go-loop]]
             [clojure.set :refer [map-invert]]
+            [clojure.string :as str]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
@@ -283,6 +284,8 @@
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))
+      (log/debug "Updating db" (str/join "@" [(:alias db) (:t db)])
+                 "to t:" t-new "with new commit:" commit-metadata)
       (-> db*
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))

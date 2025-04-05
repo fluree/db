@@ -3,7 +3,7 @@
             [clojure.core.async :as async :refer [go <!]]
             [clojure.walk :refer [postwalk]]
             [fluree.db.api.transact :as transact-api]
-            [fluree.db.connection :as connection :refer [notify-commit]]
+            [fluree.db.connection :as connection :refer [connection? notify-commit]]
             [fluree.db.connection.config :as config]
             [fluree.db.connection.system :as system]
             [fluree.db.json-ld.credential :as cred]
@@ -45,7 +45,7 @@
 (defn- validate-connection
   "Throws exception if x is not a valid connection"
   [x]
-  (when-not (connection/connection? x)
+  (when-not (connection? x)
     (throw (ex-info "Unable to create new ledger, connection is not valid. fluree/connect returns a promise, did you deref it?"
                     {:status 400 :error :db/invalid-connection}))))
 
@@ -205,10 +205,10 @@
   is for the next 't' value. If a commit is for a past 't' value, noop. If
   commit is for a future 't' value, will drop in-memory ledger for reload upon
   next request."
-  [conn commit-address]
+  [conn commit-address commit-hash]
   (validate-connection conn)
   (promise-wrap
-   (notify-commit conn commit-address)))
+   (notify-commit conn commit-address commit-hash)))
 
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"
