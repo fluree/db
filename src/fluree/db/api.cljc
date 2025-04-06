@@ -217,13 +217,6 @@
    (promise-wrap
     (transact-api/stage db json-ld opts))))
 
-(defn apply-stage!
-  ([ledger staged-db]
-   (apply-stage! ledger staged-db {}))
-  ([ledger staged-db opts]
-   (promise-wrap
-    (connection/apply-stage! ledger staged-db opts))))
-
 (defn commit!
   "Commits a staged database to the ledger with all changes since the last commit
   aggregated together.
