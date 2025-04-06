@@ -3,7 +3,7 @@
             [clojure.core.async :as async :refer [go <!]]
             [clojure.walk :refer [postwalk]]
             [fluree.db.api.transact :as transact-api]
-            [fluree.db.connection :as connection :refer [connection? notify-commit]]
+            [fluree.db.connection :as connection :refer [connection?]]
             [fluree.db.connection.config :as config]
             [fluree.db.connection.system :as system]
             [fluree.db.json-ld.credential :as cred]
@@ -208,7 +208,7 @@
   [conn commit-address commit-hash]
   (validate-connection conn)
   (promise-wrap
-   (notify-commit conn commit-address commit-hash)))
+   (connection/notify conn commit-address commit-hash)))
 
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"

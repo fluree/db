@@ -110,7 +110,7 @@
   [{:keys [state] :as _conn} ledger-alias]
   (get-in @state [:ledger ledger-alias]))
 
-(defn notify-commit
+(defn notify
   [{:keys [commit-catalog] :as conn} address hash]
   (go-try
     (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address hash))]
@@ -306,7 +306,7 @@
             (let [action (get msg "action")]
               (if (= "new-commit" action)
                 (let [{:keys [address hash]} (get msg "data")]
-                  (notify-commit conn address hash))
+                  (notify conn address hash))
                 (log/info "New subscrition message with action: " action "received, ignored.")))
             (recur)))
         :subscribed))))
