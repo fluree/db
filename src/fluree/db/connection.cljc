@@ -405,8 +405,8 @@
             (subscribe-ledger conn ledger-alias)
             (async/put! ledger-chan ledger)
             ledger))
-      (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
-                      {:status 400 :error :db/invalid-db})))))
+      (throw (ex-info (str "Unable to load. No record of ledger at address: " address " exists.")
+                      {:status 404, :error :db/unkown-address})))))
 
 (defn load-ledger-address
   [conn address]
@@ -435,7 +435,7 @@
                 (recur r))
             (do (release-ledger conn alias)
                 (let [ex (ex-info (str "Load for " alias " failed due to failed address lookup.")
-                                  {:status 404, :error :db/unknown-address})]
+                                  {:status 404, :error :db/unkown-ledger})]
                   (async/put! ledger-chan ex)
                   (throw ex)))))))))
 
@@ -665,10 +665,25 @@
         (assoc staged :result (<? (commit! ledger (:result staged) cmt-opts)))
         (<? (commit! ledger staged cmt-opts))))))
 
+(defn not-found?
+  [e]
+  (-> e ex-data :status (= 404)))
+
+(defn load-transacting-ledger
+  [conn ledger-id]
+  (go-try
+    (try* (<? (load-ledger conn ledger-id))
+          (catch* e
+            (if (not-found? e)
+              (throw (ex-info (str "Ledger " ledger-id " does not exist")
+                              {:status 409 :error :db/ledger-not-exists}
+                              e))
+              (throw e))))))
+
 (defn transact!
   [conn ledger-id parsed-txn]
   (go-try
-    (let [ledger (<? (load-ledger conn ledger-id))]
+    (let [ledger (<? (load-transacting-ledger conn ledger-id))]
       (<? (transact-ledger! conn ledger parsed-txn)))))
 
 (defn replicate-index-node
