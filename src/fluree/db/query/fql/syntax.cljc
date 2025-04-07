@@ -113,13 +113,16 @@
     ::role              :any
     ::identity          :any
     ::format            [:enum :sparql :fql]
+    ::meta              [:orn
+                         [:all :boolean]
+                         [:specific [:map-of :keyword :boolean]]]
     ::opts              [:map
                          [:max-fuel {:optional true} ::max-fuel]
                          [:identity {:optional true} ::identity]
                          [:policy {:optional true} :any]
                          [:policy-class {:optional true} :any]
                          [:policy-values {:optional true} :any]
-                         [:meta {:optional true} :boolean]
+                         [:meta {:optional true} ::meta]
                          [:format {:optional true} ::format]
                          [:output {:optional true} [:enum :sparql :fql]]
                          ;; deprecated
@@ -130,7 +133,7 @@
                          [:default-allow? {:optional true} ::default-allow?]
                          [:parse-json {:optional true} ::parse-json]]
     ::stage-opts        [:map
-                         [:meta {:optional true} :boolean]
+                         [:meta {:optional true} ::meta]
                          [:max-fuel {:optional true} ::max-fuel]
                          [:identity {:optional true} ::identity]
                          [:format {:optional true} ::format]
@@ -140,7 +143,7 @@
                          [:author {:optional true} ::identity]
                          [:policy-values {:optional true} :any]]
     ::commit-opts       [:map
-                         [:meta {:optional true} :boolean]
+                         [:meta {:optional true} ::meta]
                          [:identity {:optional true} ::identity]
                          [:context {:optional true} ::context]
                          [:raw-txn {:optional true} :any]
