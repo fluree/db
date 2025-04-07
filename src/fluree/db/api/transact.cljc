@@ -26,11 +26,10 @@
    (transact! conn txn nil))
   ([conn txn override-opts]
    (go-try
-     (let [{:keys [ledger-id] :as parsed-txn}
-           (-> txn
-               (format-txn override-opts)
-               (parse/parse-ledger-txn override-opts))]
-       (<? (connection/transact! conn ledger-id parsed-txn))))))
+     (let [parsed-txn (-> txn
+                          (format-txn override-opts)
+                          (parse/parse-ledger-txn override-opts))]
+       (<? (connection/transact! conn parsed-txn))))))
 
 (defn credential-transact!
   "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.

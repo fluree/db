@@ -681,7 +681,7 @@
               (throw e))))))
 
 (defn transact!
-  [conn ledger-id parsed-txn]
+  [conn {:keys [ledger-id] :as parsed-txn}]
   (go-try
     (let [ledger (<? (load-transacting-ledger conn ledger-id))]
       (<? (transact-ledger! conn ledger parsed-txn)))))
