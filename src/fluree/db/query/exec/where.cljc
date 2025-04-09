@@ -8,7 +8,7 @@
             [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.range :as query-range]
-            [fluree.db.report.fuel :as fuel]
+            [fluree.db.track.fuel :as fuel]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]

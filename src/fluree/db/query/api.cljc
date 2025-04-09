@@ -12,7 +12,7 @@
             [fluree.db.query.history :as history]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.reasoner :as reasoner]
-            [fluree.db.report.fuel :as fuel]
+            [fluree.db.track.fuel :as fuel]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]

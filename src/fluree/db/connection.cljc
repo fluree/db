@@ -14,8 +14,8 @@
             [fluree.db.json-ld.policy.rules :as policy.rules]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.report :refer [report-file?]]
-            [fluree.db.report.fuel :as fuel]
+            [fluree.db.track :as track]
+            [fluree.db.track.fuel :as fuel]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
             [fluree.db.transact :as transact]
@@ -620,7 +620,7 @@
   ([ledger staged-db opts]
    (go-try
      (let [commit-result (<? (apply-stage! ledger staged-db opts))]
-       (if (report-file? opts)
+       (if (track/track-file? opts)
          commit-result
          (:db commit-result))))))
 

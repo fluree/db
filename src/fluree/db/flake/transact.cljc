@@ -9,7 +9,7 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.report.fuel :as fuel]
+            [fluree.db.track.fuel :as fuel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.virtual-graph.index-graph :as vg]))

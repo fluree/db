@@ -5,7 +5,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.range :as query-range]
-            [fluree.db.report.fuel :as fuel]
+            [fluree.db.track.fuel :as fuel]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]))
 

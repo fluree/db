@@ -1,4 +1,4 @@
-(ns fluree.db.report.fuel
+(ns fluree.db.track.fuel
   (:require [clojure.core.async :as async :refer [put!]]
             [fluree.db.util.log :as log]))
 
