@@ -103,6 +103,7 @@
 
              IAssociative
              (-assoc [this k v] (assoc-flake this k v))
+             (-contains-key? [_ k] (boolean (#{:s :p :o :dt :t :op :m} k)))
 
              IMeta
              (-meta [_this] -clj-meta)
