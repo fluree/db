@@ -23,6 +23,7 @@
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
             [fluree.db.json-ld.policy.rules :as policy-rules]
+            [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
@@ -560,9 +561,10 @@
                          (<? (vocab/load-schema indexed-db (:preds root-map)))
                          indexed-db)
            index-t     (:t indexed-db*)]
-       (if (= commit-t index-t)
-         indexed-db*
-         (<? (load-novelty commit-catalog indexed-db* index-t commit-jsonld)))))))
+       (<? (shacl/hydrate-shape-cache!
+            (if (= commit-t index-t)
+              indexed-db*
+              (<? (load-novelty commit-catalog indexed-db* index-t commit-jsonld)))))))))
 
 (defn get-s-iri
   "Returns a compact IRI from a subject id (sid)."

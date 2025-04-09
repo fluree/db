@@ -1152,12 +1152,18 @@
   (let [p-ns (property-ns-code flake)]
     (= p-ns shacl-ns-code)))
 
-(defn extract-shapes
+(defn hydrate-shape-cache!
   [db]
   (go-try
     (let [new-shapes (<? (rebuild-shapes db))]
-      (reset-shape-cache! db new-shapes) ;; TODO - there is really no reason this needs to be an atom any longer
-      (vals new-shapes))))
+      (reset-shape-cache! db new-shapes)
+      db)))
+
+(defn extract-shapes
+  [db]
+  (go-try
+    (let [db* (<? (hydrate-shape-cache! db))]
+      (-> db* :schema :shapes deref vals))))
 
 (defn validate!
   "Will throw an exception if any of the modified subjects fails to conform to a shape that targets it.
