@@ -268,8 +268,8 @@
 (defn db
   "Retrieves latest db, or optionally a db at a moment in time
   and/or permissioned to a specific identity."
-  ([ledger]
-   (ledger/current-db ledger)))
+  [ledger]
+  (ledger/current-db ledger))
 
 (defn wrap-policy
   "Restricts the provided db with the provided json-ld

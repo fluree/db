@@ -27,6 +27,10 @@
     (go-try
       (let [db (<? db-chan)]
         (<? (dbproto/-query db query-map)))))
+  (-class-ids [_ subject]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (dbproto/-class-ids db subject)))))
   (-index-update [_ commit-index]
     (let [commit* (assoc commit :index commit-index)
           updated-db (->async-db alias branch commit* t)]
