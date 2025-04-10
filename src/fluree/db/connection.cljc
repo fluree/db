@@ -447,19 +447,19 @@
 
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
 
-(defn write-transaction
-  [storage ledger-alias txn]
+(defn save-transaction!
+  [{:keys [commit-catalog] :as _conn} ledger-alias txn]
   (let [path (str/join "/" [ledger-alias "txn"])]
-    (storage/content-write-json storage path txn)))
+    (storage/content-write-json commit-catalog path txn)))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
 ;; TODO - however this is really a concern of "commit", not staging and I don't think the db should be handling any of it
 (defn write-transaction!
-  [storage ledger-alias staged]
+  [conn ledger-alias staged]
   (go-try
     (let [{:keys [txn author annotation]} staged]
       (if txn
-        (let [{txn-id :address} (<? (write-transaction storage ledger-alias txn))]
+        (let [{txn-id :address} (<? (save-transaction! conn ledger-alias txn))]
           {:txn-id     txn-id
            :author     author
            :annotation annotation})
@@ -579,7 +579,7 @@
            (flake-db/db->jsonld staged-db commit-data-opts)
 
            {:keys [txn-id author annotation]}
-           (<? (write-transaction! commit-catalog ledger-alias staged-txn))
+           (<? (write-transaction! conn ledger-alias staged-txn))
 
            data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
            db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file

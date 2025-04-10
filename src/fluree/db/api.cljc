@@ -224,6 +224,11 @@
    (promise-wrap
     (connection/apply-stage! ledger staged-db opts))))
 
+(defn save-txn!
+  [conn ledger-alias txn]
+  (promise-wrap
+   (connection/save-transaction! conn ledger-alias txn)))
+
 (defn commit!
   "Commits a staged database to the ledger with all changes since the last commit
   aggregated together.
