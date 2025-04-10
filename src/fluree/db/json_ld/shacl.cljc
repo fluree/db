@@ -1113,7 +1113,8 @@
 (defn reset-shape-cache!
   "resets the shape cache with new shapes."
   [db new-shapes]
-  (reset! (-> db :schema :shapes) new-shapes))
+  (reset! (-> db :schema :shapes) new-shapes)
+  db)
 
 (defn cached-shapes
   "Shapes stored as map, keyed to the shacl rule's SID"
@@ -1156,8 +1157,7 @@
   [db]
   (go-try
     (let [new-shapes (<? (rebuild-shapes db))]
-      (reset-shape-cache! db new-shapes)
-      db)))
+      (reset-shape-cache! db new-shapes))))
 
 (defn extract-shapes
   [db]

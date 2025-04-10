@@ -560,11 +560,11 @@
            indexed-db* (if (nil? (:schema root-map)) ;; needed for legacy (v0) root index map
                          (<? (vocab/load-schema indexed-db (:preds root-map)))
                          indexed-db)
-           index-t     (:t indexed-db*)]
-       (<? (shacl/hydrate-shape-cache!
-            (if (= commit-t index-t)
-              indexed-db*
-              (<? (load-novelty commit-catalog indexed-db* index-t commit-jsonld)))))))))
+           index-t     (:t indexed-db*)
+           loaded-db   (if (= commit-t index-t)
+                         indexed-db*
+                         (<? (load-novelty commit-catalog indexed-db* index-t commit-jsonld)))]
+       (<? (shacl/hydrate-shape-cache! loaded-db))))))
 
 (defn get-s-iri
   "Returns a compact IRI from a subject id (sid)."
