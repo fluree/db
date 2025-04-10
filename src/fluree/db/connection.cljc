@@ -612,7 +612,7 @@
 
        (-> write-result
            (select-keys [:address :hash :size])
-           (assoc :t t, :db db*))))))
+           (assoc :ledger-id ledger-alias, :t t, :db db*))))))
 
 (defn commit!
   ([ledger staged-db]
