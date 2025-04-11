@@ -224,6 +224,12 @@
    (promise-wrap
     (connection/apply-stage! ledger staged-db opts))))
 
+(defn format-txn
+  "Reformats the transaction `txn` as JSON-QL if it is formatted as SPARQL,
+  returning it unchanged otherwise."
+  [txn override-opts]
+  (transact-api/format-txn txn override-opts))
+
 (defn save-txn!
   [conn ledger-alias txn]
   (promise-wrap
