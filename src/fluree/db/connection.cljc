@@ -447,10 +447,14 @@
 
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
 
-(defn save-transaction!
+(defn save-txn!
   [{:keys [commit-catalog] :as _conn} ledger-alias txn]
   (let [path (str/join "/" [ledger-alias "txn"])]
     (storage/content-write-json commit-catalog path txn)))
+
+(defn resolve-txn
+  [{:keys [commit-catalog] :as _conn} address]
+  (storage/read-json commit-catalog address))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
 ;; TODO - however this is really a concern of "commit", not staging and I don't think the db should be handling any of it
@@ -459,7 +463,7 @@
   (go-try
     (let [{:keys [txn author annotation]} staged]
       (if txn
-        (let [{txn-id :address} (<? (save-transaction! conn ledger-alias txn))]
+        (let [{txn-id :address} (<? (save-txn! conn ledger-alias txn))]
           {:txn-id     txn-id
            :author     author
            :annotation annotation})
