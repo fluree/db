@@ -11,6 +11,7 @@
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.query.sparql.translator :as sparql.translator]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.parse :as util.parse]
@@ -709,9 +710,12 @@
     q))
 
 (defn get-named
-  [jsonld nme]
-  (or (get jsonld nme)
-      (get jsonld (keyword nme))))
+  "Get the value from the map `m` associated with the key with name `nme`. This
+  key could be a string, keyword, or symbol."
+  [m nme]
+  (or (get m nme)
+      (get m (keyword nme))
+      (get m (symbol nme))))
 
 (defn parse-analytical-query
   ([q] (parse-analytical-query q nil))
@@ -846,33 +850,60 @@
                       (or (ex-data e) {})
                       e)))))
 
-(defn parse-txn
-  [txn context]
-  (let [[vars values] (-> (get-named txn "values")
-                          (parse-values context))
-        where         (-> (get-named txn "where")
-                          (parse-where vars context))
-        bound-vars    (-> where where/bound-variables (into vars))
-        delete        (when-let [dlt (get-named txn "delete")]
-                        (-> dlt
-                            (json-ld/expand context)
-                            util/get-graph
-                            util/sequential
-                            (parse-triples bound-vars context)))
-        insert        (when-let [ins (get-named txn "insert")]
-                        (-> ins
-                            (json-ld/expand context)
-                            util/get-graph
-                            util/sequential
-                            (parse-triples bound-vars context)))
-        annotation    (util/get-first-value txn const/iri-annotation)]
-    (when (and (empty? insert) (empty? delete))
-      (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
-                      {:status 400 :error :db/invalid-transaction})))
-    (cond-> {}
-      context      (assoc :context context)
-      where        (assoc :where where)
-      annotation   (assoc :annotation annotation)
-      (seq values) (assoc :values values)
-      (seq delete) (assoc :delete delete)
-      (seq insert) (assoc :insert insert))))
+(defn parse-txn-opts
+  [txn-opts override-opts txn-context]
+  (let [{:keys [did] :as opts} (merge (syntax/coerce-txn-opts txn-opts)
+                                      (syntax/coerce-txn-opts override-opts))]
+    (-> opts
+        (assoc :context txn-context)
+        (update :identity #(or % did))
+        (dissoc :did))))
+
+(defn parse-stage-txn
+  ([txn]
+   (parse-stage-txn txn {}))
+  ([txn override-opts]
+   (let [context       (or (ctx-util/txn-context txn)
+                           (:context override-opts))
+         [vars values] (-> (get-named txn "values")
+                           (parse-values context))
+         where         (-> (get-named txn "where")
+                           (parse-where vars context))
+         bound-vars    (-> where where/bound-variables (into vars))
+         delete        (when-let [dlt (get-named txn "delete")]
+                         (-> dlt
+                             (json-ld/expand context)
+                             util/get-graph
+                             util/sequential
+                             (parse-triples bound-vars context)))
+         insert        (when-let [ins (get-named txn "insert")]
+                         (-> ins
+                             (json-ld/expand context)
+                             util/get-graph
+                             util/sequential
+                             (parse-triples bound-vars context)))
+         annotation    (util/get-first-value txn const/iri-annotation)
+         opts          (-> (get-named txn "opts")
+                           (parse-txn-opts override-opts context))]
+     (when (and (empty? insert) (empty? delete))
+       (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
+                       {:status 400 :error :db/invalid-transaction})))
+     (cond-> {}
+       context      (assoc :context context)
+       where        (assoc :where where)
+       annotation   (assoc :annotation annotation)
+       (seq values) (assoc :values values)
+       (seq delete) (assoc :delete delete)
+       (seq insert) (assoc :insert insert)
+       (seq opts)   (assoc :opts opts)))))
+
+(defn parse-ledger-txn
+  ([txn]
+   (parse-ledger-txn txn {}))
+  ([txn override-opts]
+   (if-let [ledger-id (get-named txn "ledger")]
+     (-> txn
+         (parse-stage-txn override-opts)
+         (assoc :ledger-id ledger-id))
+     (throw (ex-info "Invalid transaction, missing required key: ledger."
+                     {:status 400, :error :db/invalid-transaction})))))

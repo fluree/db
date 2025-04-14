@@ -3,7 +3,7 @@
             [clojure.core.async :as async :refer [go <!]]
             [clojure.walk :refer [postwalk]]
             [fluree.db.api.transact :as transact-api]
-            [fluree.db.connection :as connection :refer [connection? notify-commit]]
+            [fluree.db.connection :as connection :refer [connection?]]
             [fluree.db.connection.config :as config]
             [fluree.db.connection.system :as system]
             [fluree.db.json-ld.credential :as cred]
@@ -208,7 +208,7 @@
   [conn commit-address commit-hash]
   (validate-connection conn)
   (promise-wrap
-   (notify-commit conn commit-address commit-hash)))
+   (connection/notify conn commit-address commit-hash)))
 
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"
@@ -223,6 +223,12 @@
   ([ledger staged-db opts]
    (promise-wrap
     (connection/apply-stage! ledger staged-db opts))))
+
+(defn format-txn
+  "Reformats the transaction `txn` as JSON-QL if it is formatted as SPARQL,
+  returning it unchanged otherwise."
+  [txn override-opts]
+  (transact-api/format-txn txn override-opts))
 
 (defn commit!
   "Commits a staged database to the ledger with all changes since the last commit
@@ -253,10 +259,14 @@
     (transact-api/credential-transact! conn txn opts))))
 
 (defn create-with-txn
-  [conn txn]
-  (validate-connection conn)
-  (promise-wrap
-   (transact-api/create-with-txn conn txn)))
+  ([conn txn]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/create-with-txn conn txn)))
+  ([conn txn opts]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/create-with-txn conn txn opts))))
 
 (defn status
   "Returns current status of ledger branch."

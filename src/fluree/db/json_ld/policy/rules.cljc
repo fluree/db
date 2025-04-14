@@ -160,7 +160,11 @@
 
 (defn enforcement-report
   [db]
-  (some-> db :policy :trace (update-vals (fn [p-report] (update-vals p-report deref)))))
+  (some-> db
+          :policy
+          :trace
+          (update-vals (fn [p-report]
+                         (update-vals p-report deref)))))
 
 (defn build-wrapper
   [db]

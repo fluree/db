@@ -7,7 +7,6 @@
             [fluree.db.constants :as const]
             [fluree.db.did :as did]
             [fluree.db.flake.flake-db :as flake-db]
-            [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.credential :as credential]
             [fluree.db.json-ld.iri :as iri]
@@ -17,6 +16,8 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
+            [fluree.db.track :as track]
+            [fluree.db.track.fuel :as fuel]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
@@ -110,7 +111,7 @@
   [{:keys [state] :as _conn} ledger-alias]
   (get-in @state [:ledger ledger-alias]))
 
-(defn notify-commit
+(defn notify
   [{:keys [commit-catalog] :as conn} address hash]
   (go-try
     (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address hash))]
@@ -306,7 +307,7 @@
             (let [action (get msg "action")]
               (if (= "new-commit" action)
                 (let [{:keys [address hash]} (get msg "data")]
-                  (notify-commit conn address hash))
+                  (notify conn address hash))
                 (log/info "New subscrition message with action: " action "received, ignored.")))
             (recur)))
         :subscribed))))
@@ -338,30 +339,35 @@
      :branch   branch
      :indexing indexing*}))
 
+(defn throw-ledger-exists
+  [ledger-alias]
+  (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
+                  {:status 409, :error :db/ledger-exists})))
+
 (defn create-ledger
   [{:keys [commit-catalog index-catalog] :as conn} ledger-alias opts]
   (go-try
-    (let [[cached? ledger-chan] (register-ledger conn ledger-alias)]
-      (if cached?
-        (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
-                        {:status 400
-                         :error  :db/ledger-exists}))
-        (let [addr          (<? (primary-address conn ledger-alias))
-              publish-addrs (<? (publishing-addresses conn ledger-alias))
-              pubs          (publishers conn)
-              ledger-opts   (parse-ledger-options conn opts)
-              ledger        (<! (ledger/create {:conn              conn
-                                                :alias             ledger-alias
-                                                :address           addr
-                                                :publish-addresses publish-addrs
-                                                :commit-catalog    commit-catalog
-                                                :index-catalog     index-catalog
-                                                :publishers        pubs}
-                                               ledger-opts))]
-          (when (util/exception? ledger)
-            (release-ledger conn ledger-alias))
-          (async/put! ledger-chan ledger)
-          ledger)))))
+    (if (<? (ledger-exists? conn ledger-alias))
+      (throw-ledger-exists ledger-alias)
+      (let [[cached? ledger-chan] (register-ledger conn ledger-alias)]
+        (if  cached?
+          (throw-ledger-exists ledger-alias)
+          (let [addr          (<? (primary-address conn ledger-alias))
+                publish-addrs (<? (publishing-addresses conn ledger-alias))
+                pubs          (publishers conn)
+                ledger-opts   (parse-ledger-options conn opts)
+                ledger        (<! (ledger/create {:conn              conn
+                                                  :alias             ledger-alias
+                                                  :address           addr
+                                                  :publish-addresses publish-addrs
+                                                  :commit-catalog    commit-catalog
+                                                  :index-catalog     index-catalog
+                                                  :publishers        pubs}
+                                                 ledger-opts))]
+            (when (util/exception? ledger)
+              (release-ledger conn ledger-alias))
+            (async/put! ledger-chan ledger)
+            ledger))))))
 
 (defn commit->ledger-alias
   "Returns ledger alias from commit map, if present. If not present
@@ -399,8 +405,8 @@
             (subscribe-ledger conn ledger-alias)
             (async/put! ledger-chan ledger)
             ledger))
-      (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
-                      {:status 400 :error :db/invalid-db})))))
+      (throw (ex-info (str "Unable to load. No record of ledger at address: " address " exists.")
+                      {:status 404, :error :db/unkown-address})))))
 
 (defn load-ledger-address
   [conn address]
@@ -429,7 +435,7 @@
                 (recur r))
             (do (release-ledger conn alias)
                 (let [ex (ex-info (str "Load for " alias " failed due to failed address lookup.")
-                                  {:status 404, :error :db/unknown-address})]
+                                  {:status 404, :error :db/unkown-ledger})]
                   (async/put! ledger-chan ex)
                   (throw ex)))))))))
 
@@ -441,20 +447,26 @@
 
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
 
-(defn write-transaction
-  [storage ledger-alias txn]
+(defn save-txn!
+  [{:keys [commit-catalog] :as _conn} ledger-alias txn]
   (let [path (str/join "/" [ledger-alias "txn"])]
-    (storage/content-write-json storage path txn)))
+    (storage/content-write-json commit-catalog path txn)))
+
+(defn resolve-txn
+  [{:keys [commit-catalog] :as _conn} address]
+  (storage/read-json commit-catalog address))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
 ;; TODO - however this is really a concern of "commit", not staging and I don't think the db should be handling any of it
 (defn write-transaction!
-  [storage ledger-alias staged]
+  [conn ledger-alias staged]
   (go-try
-    (let [[txn author-did annotation] staged]
+    (let [{:keys [txn author annotation]} staged]
       (if txn
-        (let [{txn-id :address} (<? (write-transaction storage ledger-alias txn))]
-          [txn-id author-did annotation])
+        (let [{txn-id :address} (<? (save-txn! conn ledger-alias txn))]
+          {:txn-id     txn-id
+           :author     author
+           :annotation annotation})
         staged))))
 
 (defn update-commit-address
@@ -552,81 +564,82 @@
       parse-data-helpers))
 
 (defn apply-stage!
-  [{:keys [conn] ledger-alias :alias, :as ledger}
-   {:keys [branch t stats commit] :as staged-db}
-   opts]
-  (go-try
-    (let [{:keys [commit-catalog]} conn
-
-          {:keys [tag time message did private commit-data-opts index-files-ch]
-           :or   {time (util/current-time-iso)}}
-          (parse-commit-opts ledger opts)
-
-          {:keys [db-jsonld staged-txn]}
-          (flake-db/db->jsonld staged-db commit-data-opts)
-
-          [txn-id author annotation]
-          (<? (write-transaction! commit-catalog ledger-alias staged-txn))
-
-          data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
-          db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
-          dbid              (commit-data/hash->db-id (:hash data-write-result))
-          keypair           {:did did, :private private}
-
-          new-commit (commit-data/new-db-commit-map {:old-commit commit
-                                                     :issuer     did
-                                                     :message    message
-                                                     :tag        tag
-                                                     :dbid       dbid
-                                                     :t          t
-                                                     :time       time
-                                                     :db-address db-address
-                                                     :author     author
-                                                     :annotation annotation
-                                                     :txn-id     txn-id
-                                                     :flakes     (:flakes stats)
-                                                     :size       (:size stats)})
-
-          {:keys [commit-map commit-jsonld write-result]}
-          (<? (write-commit commit-catalog ledger-alias keypair new-commit))
-
-          db  (formalize-commit staged-db commit-map)
-          db* (ledger/update-commit! ledger branch db index-files-ch)]
-
-      (log/debug "Committing t" t "at" time)
-
-      (<? (publish-commit conn commit-jsonld))
-
-      (-> write-result
-          (select-keys [:address :hash :size])
-          (assoc :t t, :db db*)))))
-
-(defn commit!
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
+  ([ledger db]
+   (apply-stage! ledger db {}))
+  ([{:keys [conn] ledger-alias :alias, :as ledger}
+    {:keys [branch t stats commit] :as staged-db}
+    opts]
+   (go-try
+     (let [{:keys [commit-catalog]} conn
+
+           {:keys [tag time message did private commit-data-opts index-files-ch]
+            :or   {time (util/current-time-iso)}}
+           (parse-commit-opts ledger opts)
+
+           {:keys [db-jsonld staged-txn]}
+           (flake-db/db->jsonld staged-db commit-data-opts)
+
+           {:keys [txn-id author annotation]}
+           (<? (write-transaction! conn ledger-alias staged-txn))
+
+           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
+           db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
+           dbid              (commit-data/hash->db-id (:hash data-write-result))
+           keypair           {:did did, :private private}
+
+           new-commit (commit-data/new-db-commit-map {:old-commit commit
+                                                      :issuer     did
+                                                      :message    message
+                                                      :tag        tag
+                                                      :dbid       dbid
+                                                      :t          t
+                                                      :time       time
+                                                      :db-address db-address
+                                                      :author     author
+                                                      :annotation annotation
+                                                      :txn-id     txn-id
+                                                      :flakes     (:flakes stats)
+                                                      :size       (:size stats)})
+
+           {:keys [commit-map commit-jsonld write-result]}
+           (<? (write-commit commit-catalog ledger-alias keypair new-commit))
+
+           db  (formalize-commit staged-db commit-map)
+           db* (ledger/update-commit! ledger branch db index-files-ch)]
+
+       (log/debug "Committing t" t "at" time)
+
+       (<? (publish-commit conn commit-jsonld))
+
+       (-> write-result
+           (select-keys [:address :hash :size])
+           (assoc :ledger-id ledger-alias, :t t, :db db*))))))
+
+(defn commit!
   ([ledger staged-db]
-   (commit! ledger staged-db nil))
+   (commit! ledger staged-db {}))
   ([ledger staged-db opts]
    (go-try
-     (:db (<? (apply-stage! ledger staged-db opts))))))
-
-(defn track?
-  [parsed-opts]
-  (or (:max-fuel parsed-opts)
-      (:meta parsed-opts)))
+     (let [commit-result (<? (apply-stage! ledger staged-db opts))]
+       (if (track/track-file? opts)
+         commit-result
+         (:db commit-result))))))
 
 (defn stage-triples
   "Stages a new transaction that is already parsed into the
    internal Fluree triples format."
-  [db parsed-txn parsed-opts]
+  [db parsed-txn]
   (go-try
-    (let [identity  (:identity parsed-opts)
-          policy-db (if (policy/policy-enforced-opts? parsed-opts)
-                      (let [parsed-context (:context parsed-opts)]
-                        (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
-                      db)]
-      (if (track? parsed-opts)
+    (let [parsed-opts (:opts parsed-txn)
+          identity    (:identity parsed-opts)
+          policy-db   (if (policy/policy-enforced-opts? parsed-opts)
+                        (let [parsed-context (:context parsed-opts)]
+                          (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
+                        db)]
+      (if (fuel/track? parsed-opts)
         (let [start-time   #?(:clj (System/nanoTime)
                               :cljs (util/current-time-millis))
               fuel-tracker (fuel/tracker (:max-fuel parsed-opts))]
@@ -648,25 +661,42 @@
         (<? (transact/stage policy-db identity parsed-txn parsed-opts))))))
 
 (defn transact-ledger!
-  [_conn ledger triples {:keys [branch] :as parsed-opts, :or {branch commit-data/default-branch}}]
-  (log/info "transacting ledger:" parsed-opts)
+  [_conn ledger parsed-txn]
   (go-try
-    (let [db       (ledger/current-db ledger branch)
-          staged   (<? (stage-triples db triples parsed-opts))
+    (let [{:keys [branch] :as parsed-opts,
+           :or   {branch commit-data/default-branch}}
+          (:opts parsed-txn)
+
+          db       (ledger/current-db ledger branch)
+          staged   (<? (stage-triples db parsed-txn))
           ;; commit API takes a did-map and parsed context as opts
           ;; whereas stage API takes a did IRI and unparsed context.
           ;; Dissoc them until deciding at a later point if they can carry through.
           cmt-opts (dissoc parsed-opts :context :identity)]
-      (if (track? parsed-opts)
+      (if (fuel/track? parsed-opts)
         (assoc staged :result (<? (commit! ledger (:result staged) cmt-opts)))
         (<? (commit! ledger staged cmt-opts))))))
 
-(defn transact!
-  [conn ledger-id triples parsed-opts]
-  (log/info "transacting:" parsed-opts)
+(defn not-found?
+  [e]
+  (-> e ex-data :status (= 404)))
+
+(defn load-transacting-ledger
+  [conn ledger-id]
   (go-try
-    (let [ledger (<? (load-ledger conn ledger-id))]
-      (<? (transact-ledger! conn ledger triples parsed-opts)))))
+    (try* (<? (load-ledger conn ledger-id))
+          (catch* e
+            (if (not-found? e)
+              (throw (ex-info (str "Ledger " ledger-id " does not exist")
+                              {:status 409 :error :db/ledger-not-exists}
+                              e))
+              (throw e))))))
+
+(defn transact!
+  [conn {:keys [ledger-id] :as parsed-txn}]
+  (go-try
+    (let [ledger (<? (load-transacting-ledger conn ledger-id))]
+      (<? (transact-ledger! conn ledger parsed-txn)))))
 
 (defn replicate-index-node
   [conn address data]

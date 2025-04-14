@@ -3,7 +3,7 @@
    :superseded-by "fluree.db"}
   (:require [clojure.core.async :as async :refer [go <!]]
             [fluree.db.api.transact :as transact-api]
-            [fluree.db.connection :as connection :refer [notify-commit]]
+            [fluree.db.connection :as connection]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
@@ -180,7 +180,7 @@
   (log/warn "DEPRECATED function `notify` superseded by `fluree.db.api/notify`")
   (promise-wrap
    (if (map? commit-map)
-     (notify-commit conn commit-map nil)
+     (connection/notify conn commit-map nil)
      (go
        (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
                 {:status 400 :error :db/invalid-commit-map})))))

@@ -6,10 +6,9 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as exec-where]
             [fluree.db.query.fql :as fql]
-            [fluree.db.query.fql.parse :as q-parse]
+            [fluree.db.query.fql.parse :as parse]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]))
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -61,12 +60,12 @@
 (defn rule-graph
   "Puts rule in a specific graph format"
   [rule]
-  (let [context         (some-> (get rule "@context")
-                                json-ld/parse-context)
+  (let [context         (get rule "@context")
         where           (get rule "where")
         insert          (get rule "insert")
-        rule-parsed     (q-parse/parse-txn {:where  where
-                                            :insert insert} context)
+        rule-parsed     (parse/parse-stage-txn {:context context
+                                                :where   where
+                                                :insert  insert})
         where-patterns  (extract-patterns (::exec-where/patterns (:where rule-parsed)))
         insert-patterns (extract-patterns (:insert rule-parsed))]
     {:deps        where-patterns
