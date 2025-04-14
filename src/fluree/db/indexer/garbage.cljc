@@ -20,10 +20,9 @@
            :index (:address prev-index))))
 
 (defn trace-idx-roots
-  [index-catalog commit]
+  [index-catalog index-address]
   (go-try
-    (loop [next-idx-root (<! (storage/read-db-root index-catalog
-                                                   (-> commit :index :address)))
+    (loop [next-idx-root (<! (storage/read-db-root index-catalog index-address))
            garbage       []]
       (if (or (nil? next-idx-root) ;; no more idx-roots
               (util/exception? next-idx-root)) ;; if idx-root already deleted, will be exception
@@ -80,21 +79,11 @@
           (recur (rest to-clean*))
           to-clean*)))))
 
-(defn clean-garbage
-  "Cleans up garbage data for old indexes, but retains
-  the most recent `max-indexes` indexes.
-
-  Note that any db's held as a variable will rely on the index-root
-  from when they were pulled from the ledger via (fluree/db <ledger>).
-  If these db vars are held over time, you might want to adjust this
-  setting such that old index-roots are not garbage collected during that
-  expected timeframe. The frequency of new indexes being created is
-  dependent on the frequency and size of updates that is ledger-specific
-  against the ledger's 'reindex-min-bytes' setting."
-  [{:keys [index-catalog commit] :as _db} max-indexes]
+(defn clean-garbage*
+  [index-catalog index-address max-indexes]
   (go
     (if (nat-int? max-indexes)
-      (let [all-garbage (<! (trace-idx-roots index-catalog commit))
+      (let [all-garbage (<! (trace-idx-roots index-catalog index-address))
             to-clean    (if (util/exception? all-garbage)
                           (log/error all-garbage "Garbage collection error, unable to trace index roots with error:" (ex-message all-garbage))
                           (->> all-garbage ;; garbage will be in order of newest to oldest
@@ -116,3 +105,18 @@
       ;; Unexpected setting. In async chan, don't throw.
       (log/error (str "Garbage collection: Setting for max-old-indexes should be >=0, instead received: " max-indexes
                       "Unable to garbage collect.")))))
+
+(defn clean-garbage
+  "Cleans up garbage data for old indexes, but retains
+  the most recent `max-indexes` indexes.
+
+  Note that any db's held as a variable will rely on the index-root
+  from when they were pulled from the ledger via (fluree/db <ledger>).
+  If these db vars are held over time, you might want to adjust this
+  setting such that old index-roots are not garbage collected during that
+  expected timeframe. The frequency of new indexes being created is
+  dependent on the frequency and size of updates that is ledger-specific
+  against the ledger's 'reindex-min-bytes' setting."
+  [{:keys [index-catalog commit] :as _db} max-indexes]
+  (let [index-address (-> commit :index :address)]
+    (clean-garbage* index-catalog index-address max-indexes)))
