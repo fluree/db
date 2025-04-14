@@ -17,7 +17,7 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld])
-  (:refer-clojure :exclude [merge load range exists? update]))
+  (:refer-clojure :exclude [merge load range exists? update drop]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -183,6 +183,12 @@
   (promise-wrap
    (connection/load-ledger conn alias-or-address)))
 
+(defn drop
+  ([conn ledger-alias-or-address] (drop conn ledger-alias-or-address nil))
+  ([conn ledger-alias-or-address opts]
+   (promise-wrap
+     (connection/drop-ledger conn ledger-alias-or-address opts))))
+
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
   otherwise."
@@ -216,7 +222,7 @@
 
    The 'opts' key is a map with the following key options:
     - `:context` - (optional) and externally provided context that will be used
-                   for document expansition, the @context in the json-ld will be 
+                   for document expansition, the @context in the json-ld will be
                    ignored if present.
 
    The data is expected to be in JSON-LD format, and will be expanded before
