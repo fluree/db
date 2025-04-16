@@ -39,7 +39,7 @@
   Note: does not check here for unrestricted-view? as that should
   happen upstream. Assumes this is a policy-wrapped db if it ever
   hits this fn."
-  [{:keys [policy] :as db} flake]
+  [{:keys [policy] :as db} fuel-tracker flake]
   (go-try
     (let [pid      (flake/p flake)
           sid      (flake/s flake)
@@ -50,9 +50,8 @@
                                  (<? (class-policies db sid))))
                            (enforce/policies-for-flake db flake false))]
       (if-some [required-policies (not-empty (filter :required? policies))]
-        ;; TODO: figure out how to get a fuel-tracker here
-        (<? (enforce/policies-allow? db nil false sid required-policies))
-        (<? (enforce/policies-allow? db nil false sid policies))))))
+        (<? (enforce/policies-allow? db fuel-tracker false sid required-policies))
+        (<? (enforce/policies-allow? db fuel-tracker false sid policies))))))
 
 (defn allow-iri?
   "Returns async channel with truthy value if iri is visible for query results"
@@ -62,7 +61,8 @@
     (try*
       (let [sid      (iri/encode-iri db iri)
             id-flake (flake/create sid const/$id nil nil nil nil nil)]
-        (allow-flake? db id-flake))
+        ;; TODO: track fuel
+        (allow-flake? db nil id-flake))
       (catch* e
         (log/error e "Unexpected exception in allow-iri? checking permission for iri: " iri)
         (go (ex-info (str "Unexpected exception in allow-iri? checking permission for iri: " iri

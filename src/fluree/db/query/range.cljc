@@ -105,10 +105,10 @@
     e*))
 
 (defn authorize-flake
-  [db error-ch flake]
+  [db fuel-tracker error-ch flake]
   (go
     (try* (if (or (schema-util/is-schema-flake? db flake)
-                  (<? (policy/allow-flake? db flake)))
+                  (<? (policy/allow-flake? db fuel-tracker flake)))
             flake
             ::unauthorized)
           (catch* e
@@ -118,9 +118,9 @@
   "Authorize each flake in the supplied `flakes` collection asynchronously,
   returning a collection containing only allowed flakes according to the
   policy of the supplied `db`."
-  [db error-ch flakes]
+  [db fuel-tracker error-ch flakes]
   (->> flakes
-       (map (partial authorize-flake db error-ch))
+       (map (partial authorize-flake db fuel-tracker error-ch))
        (async/map (fn [& fs]
                     (into [] (remove unauthorized?) fs)))))
 
@@ -130,11 +130,11 @@
      containing only the schema flakes and the flakes validated by
      allow-flake? function for the database `db`
      from the `flake-slices` channel"
-     [db error-ch flake-slices]
+     [db fuel-tracker error-ch flake-slices]
      (if (policy/unrestricted? db)
        flake-slices
        (let [auth-fn (fn [flakes ch]
-                       (-> (authorize-flakes db error-ch flakes)
+                       (-> (authorize-flakes db fuel-tracker error-ch flakes)
                            (async/pipe ch)))
              out-ch  (chan)]
          (async/pipeline-async 2 out-ch auth-fn flake-slices)
@@ -145,7 +145,7 @@
      "Returns the unfiltered channel `flake-slices`.
 
      Note: this bypasses all permissions in CLJS for now!"
-     [_ _ flake-slices]
+     [_ _ _ flake-slices]
      flake-slices))
 
 (defn resolve-flake-slices
@@ -162,7 +162,7 @@
          resolver  (index/index-catalog->t-range-resolver index-catalog novelty-t novelty to-t)
          query-xf  (extract-query-flakes opts)]
      (->> (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)
-          (filter-authorized db error-ch)))))
+          (filter-authorized db fuel-tracker error-ch)))))
 
 (defn filter-subject-page
   "Returns a transducer to filter a stream of flakes to only contain flakes from
@@ -254,7 +254,8 @@
      (go-try
        (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake
                                               in-range? 1 query-xf error-ch)
-                             (filter-authorized db error-ch)
+                             ;; TODO: track fuel
+                             (filter-authorized db nil error-ch)
                              (into-page limit offset flake-limit))]
          (async/alt!
            error-ch ([e]
