@@ -501,7 +501,7 @@
                      :start-flake start-flake
                      :end-flake   end-flake
                      :flake-xf    flake-xf}]
-    (query-range/resolve-flake-slices db idx error-ch opts)))
+    (query-range/resolve-flake-slices db fuel-tracker idx error-ch opts)))
 
 (defn compute-sid
   [s-mch db]

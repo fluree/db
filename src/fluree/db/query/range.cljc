@@ -152,15 +152,17 @@
   "Returns a channel that will contain a stream of chunked flake collections that
   contain the flakes between `start-flake` and `end-flake` and are within the
   transaction range starting at `from-t` and ending at `to-t`."
-  [{:keys [index-catalog] :as db} idx error-ch
-   {:keys [to-t start-flake end-flake] :as opts}]
-  (let [root      (get db idx)
-        novelty   (get-in db [:novelty idx])
-        novelty-t (get-in db [:novelty :t])
-        resolver  (index/index-catalog->t-range-resolver index-catalog novelty-t novelty to-t)
-        query-xf  (extract-query-flakes opts)]
-    (->> (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)
-         (filter-authorized db error-ch))))
+  ([db idx error-ch opts]
+   (resolve-flake-slices db nil idx error-ch opts))
+  ([{:keys [index-catalog] :as db} fuel-tracker idx error-ch
+    {:keys [to-t start-flake end-flake] :as opts}]
+   (let [root      (get db idx)
+         novelty   (get-in db [:novelty idx])
+         novelty-t (get-in db [:novelty :t])
+         resolver  (index/index-catalog->t-range-resolver index-catalog novelty-t novelty to-t)
+         query-xf  (extract-query-flakes opts)]
+     (->> (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)
+          (filter-authorized db error-ch)))))
 
 (defn filter-subject-page
   "Returns a transducer to filter a stream of flakes to only contain flakes from
