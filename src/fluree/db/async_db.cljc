@@ -23,10 +23,10 @@
 
 (defrecord AsyncDB [alias branch commit t db-chan]
   dbproto/IFlureeDb
-  (-query [_ query-map]
+  (-query [_ fuel-tracker query-map]
     (go-try
       (let [db (<? db-chan)]
-        (<? (dbproto/-query db query-map)))))
+        (<? (dbproto/-query db fuel-tracker query-map)))))
   (-class-ids [_ subject]
     (go-try
       (let [db (<? db-chan)]

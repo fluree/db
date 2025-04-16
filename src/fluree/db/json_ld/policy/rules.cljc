@@ -89,7 +89,7 @@
                                     sid-xf  (map #(json-ld/expand-iri % context))
                                     target-q (cond-> (assoc target-expr "select" "?$target")
                                                policy-values (policy/inject-where-pattern ["values" policy-values]))]
-                                (-> (dbproto/-query db target-q)
+                                (-> (dbproto/-query db nil target-q)
                                     (async/pipe (async/chan 2 (comp cat sid-xf)))
                                     (async/pipe ch)))
                               ;; non-maps are literals

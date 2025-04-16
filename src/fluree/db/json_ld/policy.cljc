@@ -52,10 +52,10 @@
                          util/sequential
                          (mapv (fn [c] {"@value" c
                                         "@type"  const/iri-id})))
-          policies  (<! (dbproto/-query db {"select" {"?policy" ["*"]}
-                                            "where"  [{"@id"   "?policy"
-                                                       "@type" "?classes"}]
-                                            "values" ["?classes" c-values]}))
+          policies  (<! (dbproto/-query db nil {"select" {"?policy" ["*"]}
+                                                "where"  [{"@id"   "?policy"
+                                                           "@type" "?classes"}]
+                                                "values" ["?classes" c-values]}))
           policies* (if (util/exception? policies)
                       policies
                       (policy-from-query policies))]
@@ -89,11 +89,11 @@
   that identity, queries for those classes and calls `wrap-policy`"
   [db identity policy-values]
   (go
-    (let [policies  (<! (dbproto/-query db {"select" {"?policy" ["*"]}
-                                            "where"  [{"@id"                 identity
-                                                       const/iri-policyClass "?classes"}
-                                                      {"@id"   "?policy"
-                                                       "@type" "?classes"}]}))
+    (let [policies  (<! (dbproto/-query db nil {"select" {"?policy" ["*"]}
+                                                "where"  [{"@id"                 identity
+                                                           const/iri-policyClass "?classes"}
+                                                          {"@id"   "?policy"
+                                                           "@type" "?classes"}]}))
           policies* (if (util/exception? policies)
                       policies
                       (policy-from-query policies))

@@ -87,7 +87,7 @@
                  allowed-counter :allowed} (get tracer (:id policy))
 
                 query   (policy-query db sid policy)
-                result  (seq (<? (dbproto/-query (root db) query)))]
+                result  (seq (<? (dbproto/-query (root db) nil query)))]
             (swap! exec-counter inc)
             (if result
               (do (swap! allowed-counter inc)
