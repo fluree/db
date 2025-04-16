@@ -289,7 +289,7 @@
   ([db policy policy-values]
    (promise-wrap
     (let [policy* (json-ld/expand policy)]
-      (policy/wrap-policy db policy* policy-values)))))
+      (policy/wrap-policy db nil policy* policy-values)))))
 
 (defn wrap-class-policy
   "Restricts the provided db with policies in the db
@@ -298,7 +298,7 @@
    (wrap-class-policy db policy-classes nil))
   ([db policy-classes policy-values]
    (promise-wrap
-    (policy/wrap-class-policy db policy-classes policy-values))))
+    (policy/wrap-class-policy db nil policy-classes policy-values))))
 
 (defn wrap-identity-policy
   "For provided identity, locates specific property f:policyClass on
@@ -311,7 +311,7 @@
    (wrap-identity-policy db identity nil))
   ([db identity policy-values]
    (promise-wrap
-    (policy/wrap-identity-policy db identity policy-values))))
+    (policy/wrap-identity-policy db nil identity policy-values))))
 
 (defn dataset
   "Creates a composed dataset from multiple resolved graph databases.
@@ -361,7 +361,7 @@
                                               (cred/verify-jws cred-query)
                                               (<? (cred/verify cred-query)))]
         (log/debug "Credential query with identity: " identity " and query: " query)
-        (let [policy-db (<? (policy/wrap-identity-policy ds identity values-map))]
+        (let [policy-db (<? (policy/wrap-identity-policy ds nil identity values-map))]
           (<? (query-api/query policy-db query opts))))))))
 
 (defn query-connection
@@ -400,13 +400,13 @@
             {:keys [policy identity policy-class policy-values]} opts
             policy-db (cond
                         identity
-                        (<? (policy/wrap-identity-policy latest-db identity policy-values))
+                        (<? (policy/wrap-identity-policy latest-db nil identity policy-values))
 
                         policy
-                        (<? (policy/wrap-policy latest-db (json-ld/expand policy context) policy-values))
+                        (<? (policy/wrap-policy latest-db nil (json-ld/expand policy context) policy-values))
 
                         policy-class
-                        (<? (policy/wrap-class-policy latest-db (json-ld/expand policy-class context) policy-values))
+                        (<? (policy/wrap-class-policy latest-db nil (json-ld/expand policy-class context) policy-values))
 
                         :else
                         latest-db)]
@@ -430,7 +430,7 @@
           (and query identity)
           (let [{:keys [opts] :as sanitized-query} (query-api/sanitize-query-options query (assoc override-opts :identity identity))
                 {:keys [identity policy-values]} opts
-                policy-db (<? (policy/wrap-identity-policy latest-db identity policy-values))]
+                policy-db (<? (policy/wrap-identity-policy latest-db nil identity policy-values))]
             (<? (query-api/history policy-db sanitized-query)))
 
           identity

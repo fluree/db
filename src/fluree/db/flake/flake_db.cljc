@@ -389,8 +389,8 @@
     (history/query-commits db context from-t to-t include error-ch))
 
   policy/Restrictable
-  (wrap-policy [db policy policy-values]
-    (policy-rules/wrap-policy db policy policy-values))
+  (wrap-policy [db fuel-tracker policy policy-values]
+    (policy-rules/wrap-policy db fuel-tracker policy policy-values))
   (root [db]
     (policy/root-db db))
 

@@ -78,7 +78,7 @@
   (map? target-expr))
 
 (defn parse-targets
-  [db policy-values target-exprs]
+  [db fuel-tracker policy-values target-exprs]
   (let [in-ch  (async/to-chan! target-exprs)
         out-ch (async/chan 2 (map (fn [iri] (iri/iri->sid iri (:namespaces db)))))]
     (async/pipeline-async 2
@@ -89,7 +89,7 @@
                                     sid-xf  (map #(json-ld/expand-iri % context))
                                     target-q (cond-> (assoc target-expr "select" "?$target")
                                                policy-values (policy/inject-where-pattern ["values" policy-values]))]
-                                (-> (dbproto/-query db nil target-q)
+                                (-> (dbproto/-query db fuel-tracker target-q)
                                     (async/pipe (async/chan 2 (comp cat sid-xf)))
                                     (async/pipe ch)))
                               ;; non-maps are literals
@@ -102,16 +102,16 @@
   (not-empty (mapv #(or (util/get-id %) (util/get-value %)) targets)))
 
 (defn parse-policy
-  [db policy-values policy-doc]
+  [db fuel-tracker policy-values policy-doc]
   (go-try
     (let [id (util/get-id policy-doc) ;; @id name of policy-doc
 
           target-subject      (unwrap (get policy-doc const/iri-targetSubject))
           subject-targets-ch  (when target-subject
-                                (parse-targets db policy-values target-subject))
+                                (parse-targets db fuel-tracker policy-values target-subject))
           target-property     (unwrap (get policy-doc const/iri-targetProperty))
           property-targets-ch (when target-property
-                                (parse-targets db policy-values target-property))
+                                (parse-targets db fuel-tracker policy-values target-property))
 
           on-property (when-let [p-iris (util/get-all-ids policy-doc const/iri-onProperty)]
                         (set p-iris))
@@ -191,19 +191,19 @@
         wrapper*))))
 
 (defn parse-policies
-  [db policy-values policy-docs]
+  [db fuel-tracker policy-values policy-docs]
   (let [policy-ch     (async/chan)
         policy-doc-ch (async/to-chan! policy-docs)]
     (async/pipeline-async 2
                           policy-ch
                           (fn [policy-doc ch]
-                            (-> (parse-policy db policy-values policy-doc)
+                            (-> (parse-policy db fuel-tracker policy-values policy-doc)
                                 (async/pipe ch)))
                           policy-doc-ch)
     (async/reduce (build-wrapper db) {:trace {}} policy-ch)))
 
 (defn wrap-policy
-  [db policy-rules policy-values]
+  [db fuel-tracker policy-rules policy-values]
   (go-try
-    (let [wrapper (<? (parse-policies db policy-values (util/sequential policy-rules)))]
+    (let [wrapper (<? (parse-policies db fuel-tracker policy-values (util/sequential policy-rules)))]
       (assoc db :policy (assoc wrapper :cache (atom {}) :policy-values policy-values)))))

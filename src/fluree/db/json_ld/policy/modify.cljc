@@ -11,8 +11,8 @@
   [db-after policy-values {:keys [target-subject target-property] :as policy}]
   (go-try
     (cond-> policy
-      target-subject  (update :s-targets into (<? (policy.rules/parse-targets db-after policy-values target-subject)))
-      target-property (update :p-targets into (<? (policy.rules/parse-targets db-after policy-values target-subject))))))
+      target-subject  (update :s-targets into (<? (policy.rules/parse-targets db-after nil policy-values target-subject)))
+      target-property (update :p-targets into (<? (policy.rules/parse-targets db-after nil policy-values target-subject))))))
 
 (defn refresh-modify-policies
   "Update targets to include newly created targets."

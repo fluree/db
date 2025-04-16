@@ -311,7 +311,7 @@
   ([db policy values-map]
    (log/warn "DEPRECATED function `wrap-policy` superseded by `fluree.db.api/wrap-policy`")
    (promise-wrap
-    (policy/wrap-policy db policy values-map))))
+    (policy/wrap-policy db nil policy values-map))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/wrap-identity-policy"}
@@ -421,8 +421,8 @@
    (promise-wrap
     (let [latest-db (ledger/current-db ledger)
           policy-db (if identity
-                      (<? (policy/wrap-identity-policy latest-db identity values-map))
-                      (<? (policy/wrap-policy latest-db policy values-map)))]
+                      (<? (policy/wrap-identity-policy latest-db nil identity values-map))
+                      (<? (policy/wrap-policy latest-db nil policy values-map)))]
       (query-api/history policy-db query)))))
 
 (defn ^{:deprecated    "3.0"
