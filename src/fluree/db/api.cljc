@@ -398,6 +398,7 @@
             context   (context/extract query)
             {:keys [opts] :as sanitized-query} (query-api/sanitize-query-options query override-opts)
             {:keys [policy identity policy-class policy-values]} opts
+            ;; TODO: add fuel tracking for history queries
             policy-db (cond
                         identity
                         (<? (policy/wrap-identity-policy latest-db nil identity policy-values))

@@ -327,7 +327,7 @@
   ([db identity values-map]
    (log/warn "DEPRECATED function `wrap-identity-policy` superseded by `fluree.db.api/wrap-identity-policy`")
    (promise-wrap
-    (policy/wrap-identity-policy db identity values-map))))
+    (policy/wrap-identity-policy db nil identity values-map))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/dataset"}
@@ -385,7 +385,7 @@
         (log/debug "Credential query with identity: " identity " and query: " query)
         (cond
           (and query identity)
-          (let [policy-db (<? (policy/wrap-identity-policy ds identity values-map))]
+          (let [policy-db (<? (policy/wrap-identity-policy ds nil identity values-map))]
             (<? (query-api/query policy-db query opts)))
 
           identity
@@ -444,7 +444,7 @@
         (log/debug "Credential history query with identity: " identity " and query: " query)
         (cond
           (and query identity)
-          (let [policy-db (<? (policy/wrap-identity-policy latest-db identity values-map))]
+          (let [policy-db (<? (policy/wrap-identity-policy latest-db nil identity values-map))]
             (<? (query-api/history policy-db query)))
 
           identity

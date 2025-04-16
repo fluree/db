@@ -25,6 +25,7 @@
 (defn class-policies
   [{:keys [policy] :as db} sid]
   (go-try
+    ;; TODO: track fuel for class id lookups
     (let [class-sids (<? (dbproto/-class-ids db sid))]
       (swap! (:cache policy) assoc sid class-sids)
       (enforce/policies-for-classes policy false class-sids))))
@@ -49,8 +50,9 @@
                                  (<? (class-policies db sid))))
                            (enforce/policies-for-flake db flake false))]
       (if-some [required-policies (not-empty (filter :required? policies))]
-        (<? (enforce/policies-allow? db false sid required-policies))
-        (<? (enforce/policies-allow? db false sid policies))))))
+        ;; TODO: figure out how to get a fuel-tracker here
+        (<? (enforce/policies-allow? db nil false sid required-policies))
+        (<? (enforce/policies-allow? db nil false sid policies))))))
 
 (defn allow-iri?
   "Returns async channel with truthy value if iri is visible for query results"

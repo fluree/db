@@ -116,10 +116,10 @@
        :context   context})))
 
 (defn validate-db-update
-  [{:keys [db-after add context] :as staged-map}]
+  [fuel-tracker {:keys [db-after add context] :as staged-map}]
   (go-try
     (<? (shacl/validate! (policy/root db-after) add context))
-    (let [allowed-db (<? (policy.modify/allowed? staged-map))]
+    (let [allowed-db (<? (policy.modify/allowed? fuel-tracker staged-map))]
       allowed-db)))
 
 (defn stage
@@ -138,4 +138,4 @@
                                  :annotation annotation)
           [db** new-flakes] (<? (generate-flakes db fuel-tracker parsed-txn tx-state))
           staged-map (<? (final-db db** new-flakes tx-state))]
-      (<? (validate-db-update staged-map)))))
+      (<? (validate-db-update fuel-tracker staged-map)))))

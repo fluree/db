@@ -77,7 +77,7 @@
 (defn policies-allow?
   "Once narrowed to a specific set of policies, execute and return
   appropriate policy response."
-  [db modify? sid policies-to-eval]
+  [db fuel-tracker modify? sid policies-to-eval]
   (let [tracer (-> db :policy :trace)]
     (go-try
       (loop [[policy & r] policies-to-eval]
@@ -87,7 +87,7 @@
                  allowed-counter :allowed} (get tracer (:id policy))
 
                 query   (policy-query db sid policy)
-                result  (seq (<? (dbproto/-query (root db) nil query)))]
+                result  (seq (<? (dbproto/-query (root db) fuel-tracker query)))]
             (swap! exec-counter inc)
             (if result
               (do (swap! allowed-counter inc)
