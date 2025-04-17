@@ -221,10 +221,12 @@
            when :chan is supplied.
   :flake-limit - max number of flakes to return"
   ([db idx test match opts]
+   (time-range db nil idx test match opts))
+  ([db fuel-tracker idx test match opts]
    (let [[start-test start-match end-test end-match]
          (expand-range-interval idx test match)]
-     (time-range db idx start-test start-match end-test end-match opts)))
-  ([{:keys [t index-catalog] :as db} idx start-test start-match end-test end-match opts]
+     (time-range db fuel-tracker idx start-test start-match end-test end-match opts)))
+  ([{:keys [t index-catalog] :as db} fuel-tracker idx start-test start-match end-test end-match opts]
    (let [{:keys [limit offset flake-limit from-t to-t]
           :or   {from-t t, to-t t}}
          opts
@@ -254,8 +256,7 @@
      (go-try
        (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake
                                               in-range? 1 query-xf error-ch)
-                             ;; TODO: track fuel
-                             (filter-authorized db nil error-ch)
+                             (filter-authorized db fuel-tracker error-ch)
                              (into-page limit offset flake-limit))]
          (async/alt!
            error-ch ([e]
