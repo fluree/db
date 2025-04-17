@@ -127,6 +127,15 @@
   (and (string? x)
        (re-matches #"(^[A-Za-z0-9-_]*\.[A-Za-z0-9-_]*\.[A-Za-z0-9-_]*$)" x)))
 
+(defn signed-credential?
+  [x]
+  (some? (get-in x ["proof" "jws"])))
+
+(defn signed?
+  [command]
+  (or (jws? command)
+      (signed-credential? command)))
+
 (defn verify
   "Verifies a signed query/transaction. Returns keys:
   {:subject <original tx/cmd> :did <did>}
