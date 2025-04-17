@@ -23,14 +23,14 @@
 
 (defrecord AsyncDB [alias branch commit t db-chan]
   dbproto/IFlureeDb
-  (-query [_ query-map]
+  (-query [_ fuel-tracker query-map]
     (go-try
       (let [db (<? db-chan)]
-        (<? (dbproto/-query db query-map)))))
-  (-class-ids [_ subject]
+        (<? (dbproto/-query db fuel-tracker query-map)))))
+  (-class-ids [_ fuel-tracker subject]
     (go-try
       (let [db (<? db-chan)]
-        (<? (dbproto/-class-ids db subject)))))
+        (<? (dbproto/-class-ids db fuel-tracker subject)))))
   (-index-update [_ commit-index]
     (let [commit* (assoc commit :index commit-index)
           updated-db (->async-db alias branch commit* t)]
@@ -116,10 +116,10 @@
             (>! error-ch e))))
       prop-ch))
 
-  (-iri-visible? [_ iri]
+  (-iri-visible? [_ fuel-tracker iri]
     (go-try
       (let [db (<? db-chan)]
-        (<? (subject/-iri-visible? db iri)))))
+        (<? (subject/-iri-visible? db fuel-tracker iri)))))
 
   transact/Transactable
   (-stage-txn [_ fuel-tracker context identity author annotation raw-txn parsed-txn]
@@ -160,18 +160,18 @@
       db-at-t))
 
   history/AuditLog
-  (-history [_ context from-t to-t commit-details? include error-ch history-q]
+  (-history [_ fuel-tracker context from-t to-t commit-details? include error-ch history-q]
     (go-try
       (let [db (<? db-chan)]
-        (<? (history/-history db context from-t to-t commit-details? include error-ch history-q)))))
+        (<? (history/-history db fuel-tracker context from-t to-t commit-details? include error-ch history-q)))))
 
-  (-commits [_ context from-t to-t include error-ch]
+  (-commits [_ fuel-tracker context from-t to-t include error-ch]
     (let [commit-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (history/-commits context from-t to-t include error-ch)
+                (history/-commits context fuel-tracker from-t to-t include error-ch)
                 (async/pipe commit-ch)))
           (catch* e
             (log/error e "Error loading database for commit range")
@@ -183,6 +183,10 @@
     (go-try
       (let [db (<? db-chan)]
         (<? (policy/wrap-policy db policy policy-values)))))
+  (wrap-policy [_ fuel-tracker policy policy-values]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (policy/wrap-policy db fuel-tracker policy policy-values)))))
   (root [_]
     (let [root-ch (async/promise-chan)
           root-db (->AsyncDB alias branch commit t root-ch)]

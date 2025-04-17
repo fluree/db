@@ -296,8 +296,8 @@
                     namespaces namespace-codes max-namespace-code
                     reindex-min-bytes reindex-max-bytes max-old-indexes]
   dbproto/IFlureeDb
-  (-query [this query-map] (fql/query this query-map))
-  (-class-ids [this subject] (match/class-ids this subject))
+  (-query [this fuel-tracker query-map] (fql/query this fuel-tracker query-map))
+  (-class-ids [this fuel-tracker subject] (match/class-ids this fuel-tracker subject))
   (-index-update [db commit-index] (index-update db commit-index))
 
   iri/IRICodec
@@ -342,8 +342,8 @@
   (-reverse-property [db iri reverse-spec context compact-fn cache fuel-tracker error-ch]
     (jld-format/reverse-property db iri reverse-spec context compact-fn cache fuel-tracker error-ch))
 
-  (-iri-visible? [db iri]
-    (qpolicy/allow-iri? db iri))
+  (-iri-visible? [db fuel-tracker iri]
+    (qpolicy/allow-iri? db fuel-tracker iri))
 
   indexer/Indexable
   (index [db changes-ch]
@@ -363,6 +363,7 @@
             flakes         (-> db
                                policy/root
                                (query-range/index-range
+                                nil    ;; TODO: track fuel
                                 :post
                                 > [const/$_commit:time start]
                                 < [const/$_commit:time end])
@@ -383,14 +384,16 @@
     (assoc db :t t))
 
   AuditLog
-  (-history [db context from-t to-t commit-details? include error-ch history-q]
-    (history/query-history db context from-t to-t commit-details? include error-ch history-q))
-  (-commits [db context from-t to-t include error-ch]
-    (history/query-commits db context from-t to-t include error-ch))
+  (-history [db fuel-tracker context from-t to-t commit-details? include error-ch history-q]
+    (history/query-history db fuel-tracker context from-t to-t commit-details? include error-ch history-q))
+  (-commits [db fuel-tracker context from-t to-t include error-ch]
+    (history/query-commits db fuel-tracker context from-t to-t include error-ch))
 
   policy/Restrictable
   (wrap-policy [db policy policy-values]
     (policy-rules/wrap-policy db policy policy-values))
+  (wrap-policy [db fuel-tracker policy policy-values]
+    (policy-rules/wrap-policy db fuel-tracker policy policy-values))
   (root [db]
     (policy/root-db db))
 

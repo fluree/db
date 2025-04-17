@@ -46,6 +46,7 @@
             ;; For now, pulling all matching values from full index once hitting
             ;; the actual vector index, we'll only need to pull matches out of
             ;; novelty (if that)
+            ;; TODO: track fuel
             vectors   (<? (query-range/index-range db :post = [pid] score-opt))]
         (->> vectors
              (sort sort-fn)

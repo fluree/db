@@ -14,7 +14,6 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.util.context :as context]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld])
@@ -298,7 +297,7 @@
    (wrap-class-policy db policy-classes nil))
   ([db policy-classes policy-values]
    (promise-wrap
-    (policy/wrap-class-policy db policy-classes policy-values))))
+    (policy/wrap-class-policy db nil policy-classes policy-values))))
 
 (defn wrap-identity-policy
   "For provided identity, locates specific property f:policyClass on
@@ -311,7 +310,7 @@
    (wrap-identity-policy db identity nil))
   ([db identity policy-values]
    (promise-wrap
-    (policy/wrap-identity-policy db identity policy-values))))
+    (policy/wrap-identity-policy db nil identity policy-values))))
 
 (defn dataset
   "Creates a composed dataset from multiple resolved graph databases.
@@ -361,7 +360,7 @@
                                               (cred/verify-jws cred-query)
                                               (<? (cred/verify cred-query)))]
         (log/debug "Credential query with identity: " identity " and query: " query)
-        (let [policy-db (<? (policy/wrap-identity-policy ds identity values-map))]
+        (let [policy-db (<? (policy/wrap-identity-policy ds nil identity values-map))]
           (<? (query-api/query policy-db query opts))))))))
 
 (defn query-connection
@@ -389,28 +388,10 @@
   "Return the change history over a specified time range. Optionally include the commit
   that produced the changes."
   ([ledger query]
-   (promise-wrap
-    (query-api/history (ledger/current-db ledger) query)))
+   (history ledger query nil))
   ([ledger query override-opts]
    (promise-wrap
-    (go-try
-      (let [latest-db (ledger/current-db ledger)
-            context   (context/extract query)
-            {:keys [opts] :as sanitized-query} (query-api/sanitize-query-options query override-opts)
-            {:keys [policy identity policy-class policy-values]} opts
-            policy-db (cond
-                        identity
-                        (<? (policy/wrap-identity-policy latest-db identity policy-values))
-
-                        policy
-                        (<? (policy/wrap-policy latest-db (json-ld/expand policy context) policy-values))
-
-                        policy-class
-                        (<? (policy/wrap-class-policy latest-db (json-ld/expand policy-class context) policy-values))
-
-                        :else
-                        latest-db)]
-        (<? (query-api/history policy-db sanitized-query)))))))
+    (query-api/history ledger query override-opts))))
 
 (defn credential-history
   "Issues a policy-enforced history query to the specified ledger as a
@@ -423,23 +404,8 @@
   ([ledger cred-query override-opts]
    (promise-wrap
     (go-try
-      (let [latest-db (ledger/current-db ledger)
-            {query :subject, identity :did} (<? (cred/verify cred-query))]
-        (log/debug "Credential history query with identity: " identity " and query: " query)
-        (cond
-          (and query identity)
-          (let [{:keys [opts] :as sanitized-query} (query-api/sanitize-query-options query (assoc override-opts :identity identity))
-                {:keys [identity policy-values]} opts
-                policy-db (<? (policy/wrap-identity-policy latest-db identity policy-values))]
-            (<? (query-api/history policy-db sanitized-query)))
-
-          identity
-          (throw (ex-info "Query not present in credential"
-                          {:status 400 :error :db/invalid-credential}))
-
-          :else
-          (throw (ex-info "Invalid credential"
-                          {:status 400 :error :db/invalid-credential}))))))))
+      (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
+        (<? (query-api/history ledger query (assoc override-opts :identity identity))))))))
 
 (defn range
   "Performs a range scan against the specified index using test functions
