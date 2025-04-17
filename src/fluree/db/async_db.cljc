@@ -179,6 +179,10 @@
       commit-ch))
 
   policy/Restrictable
+  (wrap-policy [_ policy policy-values]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (policy/wrap-policy db policy policy-values)))))
   (wrap-policy [_ fuel-tracker policy policy-values]
     (go-try
       (let [db (<? db-chan)]

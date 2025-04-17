@@ -11,7 +11,9 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defprotocol Restrictable
-  (wrap-policy [db fuel-tracker policy-rules policy-values])
+  (wrap-policy
+    [db policy-rules policy-values]
+    [db fuel-tracker policy-rules policy-values])
   (root [db]))
 
 (def root-policy-map

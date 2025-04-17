@@ -203,7 +203,9 @@
     (async/reduce (build-wrapper db) {:trace {}} policy-ch)))
 
 (defn wrap-policy
-  [db fuel-tracker policy-rules policy-values]
-  (go-try
-    (let [wrapper (<? (parse-policies db fuel-tracker policy-values (util/sequential policy-rules)))]
-      (assoc db :policy (assoc wrapper :cache (atom {}) :policy-values policy-values)))))
+  ([db policy-rules policy-values]
+   (wrap-policy db nil policy-rules policy-values))
+  ([db fuel-tracker policy-rules policy-values]
+   (go-try
+     (let [wrapper (<? (parse-policies db fuel-tracker policy-values (util/sequential policy-rules)))]
+       (assoc db :policy (assoc wrapper :cache (atom {}) :policy-values policy-values))))))

@@ -288,7 +288,7 @@
   ([db policy policy-values]
    (promise-wrap
     (let [policy* (json-ld/expand policy)]
-      (policy/wrap-policy db nil policy* policy-values)))))
+      (policy/wrap-policy db policy* policy-values)))))
 
 (defn wrap-class-policy
   "Restricts the provided db with policies in the db
