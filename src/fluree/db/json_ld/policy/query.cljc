@@ -23,10 +23,9 @@
     (enforce/policies-for-classes policy false classes)))
 
 (defn class-policies
-  [{:keys [policy] :as db} sid]
+  [{:keys [policy] :as db} fuel-tracker sid]
   (go-try
-    ;; TODO: track fuel for class id lookups
-    (let [class-sids (<? (dbproto/-class-ids db nil sid))]
+    (let [class-sids (<? (dbproto/-class-ids db fuel-tracker sid))]
       (swap! (:cache policy) assoc sid class-sids)
       (enforce/policies-for-classes policy false class-sids))))
 
@@ -47,7 +46,7 @@
                            (or (cached-class-policies policy sid)
                                (when (-> policy :view :class not-empty)
                                  ;; only do range scan if we have /any/ class policies
-                                 (<? (class-policies db sid))))
+                                 (<? (class-policies db fuel-tracker sid))))
                            (enforce/policies-for-flake db flake false))]
       (if-some [required-policies (not-empty (filter :required? policies))]
         (<? (enforce/policies-allow? db fuel-tracker false sid required-policies))

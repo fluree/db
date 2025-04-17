@@ -35,10 +35,9 @@
 
 ;; TODO - get parent classes
 (defn subject-class-policies
-  [db-after policy class-policy-cache sid]
+  [db-after fuel-tracker policy class-policy-cache sid]
   (go-try
-    ;; TODO: track fuel for class lookups
-    (let [classes (<? (dbproto/-class-ids db-after nil sid))
+    (let [classes  (<? (dbproto/-class-ids db-after fuel-tracker sid))
           policies (or (enforce/policies-for-classes classes policy true)
                        [])]
       (swap! class-policy-cache assoc sid policies)
@@ -64,7 +63,7 @@
                   policies (concat (enforce/policies-for-property policy true pid)
                                    (when class-policies?
                                      (or (get @class-policy-cache sid)
-                                         (<? (subject-class-policies db-after policy class-policy-cache sid))))
+                                         (<? (subject-class-policies db-after fuel-tracker policy class-policy-cache sid))))
                                    (enforce/policies-for-flake db-after flake true))]
               ;; policies-allow? will throw if access forbidden
               (if-some [required-policies (not-empty (filter :required? policies))]

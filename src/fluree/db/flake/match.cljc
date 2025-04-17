@@ -13,10 +13,10 @@
 
 (defn class-ids
   "Returns list of class-ids for given subject-id"
-  [db subject-id]
+  [db fuel-tracker subject-id]
   (go-try
     (let [root (policy/root db)]
-      (<? (query-range/index-range root :spot = [subject-id const/$rdf:type]
+      (<? (query-range/index-range root fuel-tracker :spot = [subject-id const/$rdf:type]
                                    {:flake-xf (map flake/o)})))))
 
 (defn subclasses

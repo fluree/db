@@ -191,8 +191,8 @@
 (defn index-range*
   "Return a channel that will eventually hold a sorted vector of the range of
   flakes from `db` that meet the criteria specified in the `opts` map."
-  [db error-ch {:keys [idx limit offset flake-limit] :as opts}]
-  (->> (resolve-flake-slices db idx error-ch opts)
+  [db fuel-tracker error-ch {:keys [idx limit offset flake-limit] :as opts}]
+  (->> (resolve-flake-slices db fuel-tracker idx error-ch opts)
        (into-page limit offset flake-limit)))
 
 (defn expand-range-interval
@@ -275,15 +275,16 @@
   :xform - xform applied to each result individually. This is not used when :chan is supplied.
   :limit - max number of flakes to return"
   ([db idx] (index-range db idx {}))
-  ([db idx opts] (index-range db idx >= (min-match idx) <= (max-match idx) opts))
-  ([db idx test match] (index-range db idx test match {}))
-  ([db idx test match opts]
+  ([db idx opts] (index-range db nil idx >= (min-match idx) <= (max-match idx) opts))
+  ([db idx test match] (index-range db nil idx test match {}))
+  ([db idx test match opts] (index-range db nil idx test match opts))
+  ([db fuel-tracker idx test match opts]
    (let [[start-test start-match end-test end-match]
          (expand-range-interval idx test match)]
-     (index-range db idx start-test start-match end-test end-match opts)))
-  ([db idx start-test start-match end-test end-match]
-   (index-range db idx start-test start-match end-test end-match {}))
-  ([{:keys [t] :as db} idx start-test start-match end-test end-match opts]
+     (index-range db fuel-tracker idx start-test start-match end-test end-match opts)))
+  ([db fuel-tracker idx start-test start-match end-test end-match]
+   (index-range db fuel-tracker idx start-test start-match end-test end-match {}))
+  ([{:keys [t] :as db} fuel-tracker idx start-test start-match end-test end-match opts]
    (let [[s1 p1 o1 t1 op1 m1]
          (match->flake-parts db idx start-match)
 
@@ -307,6 +308,7 @@
              end-flake   (resolve-match-flake end-test s2* p2 o2 t2 op2 m2)
              error-ch    (chan)
              range-ch    (index-range* db
+                                       fuel-tracker
                                        error-ch
                                        (assoc opts
                                               :idx idx

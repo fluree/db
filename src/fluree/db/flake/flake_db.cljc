@@ -363,6 +363,7 @@
             flakes         (-> db
                                policy/root
                                (query-range/index-range
+                                nil    ;; TODO: track fuel
                                 :post
                                 > [const/$_commit:time start]
                                 < [const/$_commit:time end])
