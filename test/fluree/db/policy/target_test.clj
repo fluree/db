@@ -307,7 +307,7 @@
                         "http://a.co/wishlistItemViewPolicy"   {:executed 3, :allowed 3},
                         "http://a.co/availableModifyPolicy"    {:executed 2, :allowed 0}}
                        (:policy result)))
-                (is (= 4
+                (is (= 6
                        (:fuel result)))))))
         (testing "non-owners item available status"
           (let [policy-db  @(fluree/wrap-policy db2 {"@graph" [wishlist-create wishlist-modify wishlist-view
@@ -335,7 +335,7 @@
                         "http://a.co/wishlistItemViewPolicy"   {:executed 3, :allowed 3},
                         "http://a.co/availableModifyPolicy"    {:executed 2, :allowed 2}}
                        (:policy result)))
-                (is (= 4
+                (is (= 6
                        (:fuel result)))))))))))
 
 (deftest policy-class-test
