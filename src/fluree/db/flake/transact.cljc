@@ -118,6 +118,7 @@
 (defn validate-db-update
   [fuel-tracker {:keys [db-after add context] :as staged-map}]
   (go-try
+    ;; TODO: track fuel
     (<? (shacl/validate! (policy/root db-after) add context))
     (let [allowed-db (<? (policy.modify/allowed? fuel-tracker staged-map))]
       allowed-db)))

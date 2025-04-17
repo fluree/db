@@ -56,6 +56,7 @@
                                     (<? (load-aliased-rule-dbs conn rule-sources)))
            policy-db              (if (perm/policy-enforced-opts? opts)
                                     (let [parsed-context (context/extract sanitized-query)]
+                                      ;; TODO: track fuel
                                       (<? (perm/policy-enforce-db db parsed-context opts)))
                                     db)
            time-travel-db         (-> (if t
@@ -104,6 +105,7 @@
           context   (context/extract query*)
           latest-db (ledger/current-db ledger)
           policy-db (if (perm/policy-enforced-opts? opts)
+                      ;; TODO: track fuel
                       (<? (perm/policy-enforce-db latest-db context opts))
                       latest-db)
           max-fuel  (:max-fuel opts)]
