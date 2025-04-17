@@ -10,7 +10,7 @@
 (defprotocol SubjectFormatter
   (-forward-properties [db iri select-spec context compact-fn cache fuel-tracker error-ch])
   (-reverse-property [db iri reverse-spec context compact-fn cache fuel-tracker error-ch])
-  (-iri-visible? [db iri]))
+  (-iri-visible? [db fuel-tracker iri]))
 
 (defn subject-formatter?
   [x]
@@ -30,7 +30,8 @@
              node* (if (or (nil? select-spec)
                            wildcard?
                            (contains? select-spec const/iri-id))
-                     (if (<? (-iri-visible? ds iri))
+                     ;; TODO: track fuel
+                     (if (<? (-iri-visible? ds nil iri))
                        (let [;; TODO: we generate id-key here every time, this
                              ;; should be done in the :spec once beforehand and
                              ;; used from there

@@ -116,10 +116,10 @@
             (>! error-ch e))))
       prop-ch))
 
-  (-iri-visible? [_ iri]
+  (-iri-visible? [_ fuel-tracker iri]
     (go-try
       (let [db (<? db-chan)]
-        (<? (subject/-iri-visible? db iri)))))
+        (<? (subject/-iri-visible? db fuel-tracker iri)))))
 
   transact/Transactable
   (-stage-txn [_ fuel-tracker context identity author annotation raw-txn parsed-txn]

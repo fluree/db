@@ -342,7 +342,7 @@
   (-reverse-property [db iri reverse-spec context compact-fn cache fuel-tracker error-ch]
     (jld-format/reverse-property db iri reverse-spec context compact-fn cache fuel-tracker error-ch))
 
-  (-iri-visible? [db iri]
+  (-iri-visible? [db fuel-tracker iri]
     (qpolicy/allow-iri? db iri))
 
   indexer/Indexable
