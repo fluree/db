@@ -633,16 +633,16 @@
    internal Fluree triples format."
   [db parsed-txn]
   (go-try
-    (let [parsed-opts (:opts parsed-txn)
-          identity    (:identity parsed-opts)
-          policy-db   (if (policy/policy-enforced-opts? parsed-opts)
-                        (let [parsed-context (:context parsed-opts)]
-                          (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
-                        db)]
+    (let [parsed-opts    (:opts parsed-txn)
+          parsed-context (:context parsed-opts)
+          identity       (:identity parsed-opts)]
       (if (fuel/track? parsed-opts)
         (let [start-time   #?(:clj (System/nanoTime)
                               :cljs (util/current-time-millis))
-              fuel-tracker (fuel/tracker (:max-fuel parsed-opts))]
+              fuel-tracker (fuel/tracker (:max-fuel parsed-opts))
+              policy-db    (if (policy/policy-enforced-opts? parsed-opts)
+                             (<? (policy/policy-enforce-db db fuel-tracker parsed-context parsed-opts))
+                             db)]
           (try*
             (let [result        (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))
                   policy-report (policy.rules/enforcement-report result)]
@@ -658,7 +658,10 @@
                                          :fuel (fuel/tally fuel-tracker)}
                                   policy-report (assoc :policy policy-report)))
                               e)))))
-        (<? (transact/stage policy-db identity parsed-txn parsed-opts))))))
+        (let [policy-db (if (policy/policy-enforced-opts? parsed-opts)
+                          (<? (policy/policy-enforce-db db parsed-context parsed-opts))
+                          db)]
+          (<? (transact/stage policy-db identity parsed-txn parsed-opts)))))))
 
 (defn transact-ledger!
   [_conn ledger parsed-txn]
