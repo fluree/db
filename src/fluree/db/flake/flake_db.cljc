@@ -384,10 +384,10 @@
     (assoc db :t t))
 
   AuditLog
-  (-history [db context from-t to-t commit-details? include error-ch history-q]
-    (history/query-history db context from-t to-t commit-details? include error-ch history-q))
-  (-commits [db context from-t to-t include error-ch]
-    (history/query-commits db context from-t to-t include error-ch))
+  (-history [db fuel-tracker context from-t to-t commit-details? include error-ch history-q]
+    (history/query-history db fuel-tracker context from-t to-t commit-details? include error-ch history-q))
+  (-commits [db fuel-tracker context from-t to-t include error-ch]
+    (history/query-commits db fuel-tracker context from-t to-t include error-ch))
 
   policy/Restrictable
   (wrap-policy [db fuel-tracker policy policy-values]

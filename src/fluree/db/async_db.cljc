@@ -160,18 +160,18 @@
       db-at-t))
 
   history/AuditLog
-  (-history [_ context from-t to-t commit-details? include error-ch history-q]
+  (-history [_ fuel-tracker context from-t to-t commit-details? include error-ch history-q]
     (go-try
       (let [db (<? db-chan)]
-        (<? (history/-history db context from-t to-t commit-details? include error-ch history-q)))))
+        (<? (history/-history db fuel-tracker context from-t to-t commit-details? include error-ch history-q)))))
 
-  (-commits [_ context from-t to-t include error-ch]
+  (-commits [_ fuel-tracker context from-t to-t include error-ch]
     (let [commit-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (history/-commits context from-t to-t include error-ch)
+                (history/-commits context fuel-tracker from-t to-t include error-ch)
                 (async/pipe commit-ch)))
           (catch* e
             (log/error e "Error loading database for commit range")
