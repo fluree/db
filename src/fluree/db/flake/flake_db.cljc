@@ -297,7 +297,7 @@
                     reindex-min-bytes reindex-max-bytes max-old-indexes]
   dbproto/IFlureeDb
   (-query [this fuel-tracker query-map] (fql/query this fuel-tracker query-map))
-  (-class-ids [this subject] (match/class-ids this subject))
+  (-class-ids [this fuel-tracker subject] (match/class-ids this fuel-tracker subject))
   (-index-update [db commit-index] (index-update db commit-index))
 
   iri/IRICodec

@@ -26,7 +26,7 @@
   [{:keys [policy] :as db} sid]
   (go-try
     ;; TODO: track fuel for class id lookups
-    (let [class-sids (<? (dbproto/-class-ids db sid))]
+    (let [class-sids (<? (dbproto/-class-ids db nil sid))]
       (swap! (:cache policy) assoc sid class-sids)
       (enforce/policies-for-classes policy false class-sids))))
 

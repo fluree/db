@@ -38,7 +38,7 @@
   [db-after policy class-policy-cache sid]
   (go-try
     ;; TODO: track fuel for class lookups
-    (let [classes (<? (dbproto/-class-ids db-after sid))
+    (let [classes (<? (dbproto/-class-ids db-after nil sid))
           policies (or (enforce/policies-for-classes classes policy true)
                        [])]
       (swap! class-policy-cache assoc sid policies)
