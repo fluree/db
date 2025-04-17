@@ -19,9 +19,9 @@
 (declare format-subject)
 
 (defn append-id
-  ([ds iri compact-fn error-ch]
-   (append-id ds iri nil compact-fn error-ch nil))
-  ([ds iri {:keys [wildcard?] :as select-spec} compact-fn error-ch node-ch]
+  ([ds fuel-tracker iri compact-fn error-ch]
+   (append-id ds fuel-tracker iri nil compact-fn error-ch nil))
+  ([ds fuel-tracker iri {:keys [wildcard?] :as select-spec} compact-fn error-ch node-ch]
    (go
      (try*
        (let [node  (if (nil? node-ch)
@@ -30,8 +30,7 @@
              node* (if (or (nil? select-spec)
                            wildcard?
                            (contains? select-spec const/iri-id))
-                     ;; TODO: track fuel
-                     (if (<? (-iri-visible? ds nil iri))
+                     (if (<? (-iri-visible? ds fuel-tracker iri))
                        (let [;; TODO: we generate id-key here every time, this
                              ;; should be done in the :spec once beforehand and
                              ;; used from there
@@ -70,7 +69,7 @@
                       fuel-tracker error-ch)
 
       :else
-      (append-id ds o-iri compact-fn error-ch))))
+      (append-id ds fuel-tracker o-iri compact-fn error-ch))))
 
 (defn resolve-reference
   [ds cache context compact-fn select-spec current-depth fuel-tracker error-ch v]
@@ -128,4 +127,4 @@
                       forward-ch)]
      (->> subject-ch
           (resolve-references ds cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-          (append-id ds iri select-spec compact-fn error-ch)))))
+          (append-id ds fuel-tracker iri select-spec compact-fn error-ch)))))

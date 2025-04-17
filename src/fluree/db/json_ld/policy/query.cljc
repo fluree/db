@@ -54,14 +54,13 @@
 
 (defn allow-iri?
   "Returns async channel with truthy value if iri is visible for query results"
-  [db iri]
+  [db fuel-tracker iri]
   (if (unrestricted? db)
     (go true)
     (try*
       (let [sid      (iri/encode-iri db iri)
             id-flake (flake/create sid const/$id nil nil nil nil nil)]
-        ;; TODO: track fuel
-        (allow-flake? db nil id-flake))
+        (allow-flake? db fuel-tracker id-flake))
       (catch* e
         (log/error e "Unexpected exception in allow-iri? checking permission for iri: " iri)
         (go (ex-info (str "Unexpected exception in allow-iri? checking permission for iri: " iri
