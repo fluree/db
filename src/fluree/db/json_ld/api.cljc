@@ -413,17 +413,11 @@
   "Return the change history over a specified time range. Optionally include the commit
   that produced the changes."
   ([ledger query]
-   (let [latest-db (ledger/current-db ledger)
-         res-chan  (query-api/history latest-db query)]
-     (promise-wrap res-chan)))
-  ([ledger query {:keys [policy identity values-map] :as _opts}]
+   (history ledger query {}))
+  ([ledger query override-opts]
    (log/warn "DEPRECATED function `history` superseded by `fluree.db.api/history`")
    (promise-wrap
-    (let [latest-db (ledger/current-db ledger)
-          policy-db (if identity
-                      (<? (policy/wrap-identity-policy latest-db nil identity values-map))
-                      (<? (policy/wrap-policy latest-db nil policy values-map)))]
-      (query-api/history policy-db query)))))
+    (query-api/history ledger query override-opts))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/credential-history"}
@@ -435,25 +429,13 @@
   signing identity, which is then used by `wrap-identity-policy` to extract
   the policy classes and apply the policies to the query."
   ([ledger cred-query] (credential-history ledger cred-query {}))
-  ([ledger cred-query {:keys [values-map] :as opts}]
+  ([ledger cred-query override-opts]
    (log/warn "DEPRECATED function `credential-history` superseded by `fluree.db.api/credential-history`")
    (promise-wrap
     (go-try
-      (let [latest-db                       (ledger/current-db ledger)
-            {query :subject, identity :did} (<? (cred/verify cred-query))]
+      (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
         (log/debug "Credential history query with identity: " identity " and query: " query)
-        (cond
-          (and query identity)
-          (let [policy-db (<? (policy/wrap-identity-policy latest-db nil identity values-map))]
-            (<? (query-api/history policy-db query)))
-
-          identity
-          (throw (ex-info "Query not present in credential"
-                          {:status 400 :error :db/invalid-credential}))
-
-          :else
-          (throw (ex-info "Invalid credential"
-                          {:status 400 :error :db/invalid-credential}))))))))
+        (<? (query-api/history ledger query override-opts)))))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/range"}

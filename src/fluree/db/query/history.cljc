@@ -28,19 +28,21 @@
   (-commits [db fuel-tracker context from-t to-t include error-ch]))
 
 (defn query
-  [db context q]
-  (go-try
-    (let [{:keys [history t commit-details] :as parsed-query}
-          (parse/parse-history-query q)
-          ;; from and to are positive ints, need to convert to negative or fill in default values
-          [from-t to-t] (<? (find-t-endpoints db t))
-          error-ch      (async/chan)
-          include       (not-empty (select-keys parsed-query [:commit :data :txn]))
-          result-ch     (if history
-                          ;; TODO: track fuel
-                          (-history db nil context from-t to-t commit-details include error-ch history)
-                          (-commits db nil context from-t to-t include error-ch))]
-      (when commit-details
-        (log/warn "DEPRECATED history option `commit-details` superseded by options `commit`, `data`, and `txn`."))
-      (async/alt! result-ch ([result] result)
-                  error-ch  ([e] e)))))
+  ([db context q]
+   (query db nil context q))
+  ([db fuel-tracker context q]
+   (go-try
+     (let [{:keys [history t commit-details] :as parsed-query}
+           (parse/parse-history-query q)
+
+           ;; from and to are positive ints, need to convert to negative or fill in default values
+           [from-t to-t] (<? (find-t-endpoints db t))
+           error-ch      (async/chan)
+           include       (not-empty (select-keys parsed-query [:commit :data :txn]))
+           result-ch     (if history
+                           (-history db fuel-tracker context from-t to-t commit-details include error-ch history)
+                           (-commits db fuel-tracker context from-t to-t include error-ch))]
+       (when commit-details
+         (log/warn "DEPRECATED history option `commit-details` superseded by options `commit`, `data`, and `txn`."))
+       (async/alt! result-ch ([result] result)
+                   error-ch  ([e] e))))))
