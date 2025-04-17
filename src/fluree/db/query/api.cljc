@@ -52,7 +52,7 @@
   ([db {:keys [t opts] :as sanitized-query} conn]
    (go-try
      (let [{:keys [reasoner-methods rule-sources]} opts
-           processed-rule-sources (when rule-sources
+           processed-rule-sources (when (and rule-sources conn)
                                     (<? (load-aliased-rule-dbs conn rule-sources)))
            policy-db              (if (perm/policy-enforced-opts? opts)
                                     (let [parsed-context (context/extract sanitized-query)]
