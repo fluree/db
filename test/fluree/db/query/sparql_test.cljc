@@ -893,6 +893,8 @@
                        "ex:fbueller a ex:Person; person:handle \"dankeshön\"; person:fullName \"Ferris Bueller\"."
                        "ex:alice foaf:givenname \"Alice\"; foaf:family_name \"Hacker\"."
                        "ex:bob foaf:firstname \"Bob\"; foaf:surname \"Hacker\"."
+                       "ex:carol ex:catchphrase \"Heyyyy\"@en."
+                       "ex:carol ex:catchphrase \"¡Eyyyy!\"@es."
                        "}"])]
     #?(:cljs
        (async done
@@ -1848,6 +1850,17 @@
                (is (= [["book:1" "For Whom the Bell Tolls"]
                        ["book:2" "The Hitchhiker's Guide to the Galaxy"]]
                       results)))))
+
+         (testing "langstrings are returned annotated"
+           (let [query "SELECT ?catchphrase WHERE {<ex:carol> <ex:catchphrase> ?catchphrase}"]
+             (is (= {"head" {"vars" ["catchphrase"]},
+                     "results"
+                     {"bindings"
+                      [{"catchphrase"
+                        {"value" "Heyyyy", "type" "literal", "xml:lang" "en"}}
+                       {"catchphrase"
+                        {"value" "¡Eyyyy!", "type" "literal", "xml:lang" "es"}}]}}
+                    @(fluree/query db query {:format :sparql :output :sparql})))))
 
          (testing "fn w/ langtag string arg query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
