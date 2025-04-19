@@ -2719,6 +2719,42 @@ WORLD!")
 Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape ex:pshape3 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint."
              (ex-message invalid-hand))))))
 
+(deftest fuel-test
+  (let [conn    @(fluree/connect-memory)
+        ledger  @(fluree/create conn "shape-constaints")
+        db0     (fluree/db ledger)
+        context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
+
+        ;; sh:node constraint needs to query the db, requiring fuel for validation
+        db1            @(fluree/stage db0 {"@context" context
+                                           "insert"   [{"id"          "ex:AddressShape"
+                                                        "type"        "sh:NodeShape"
+                                                        "sh:property" [{"id"          "ex:pshape1"
+                                                                        "sh:path"     {"id" "ex:postalCode"}
+                                                                        "sh:maxCount" 1}]}
+                                                       {"id"             "ex:PersonShape"
+                                                        "type"           "sh:NodeShape"
+                                                        "sh:targetClass" {"id" "ex:Person"}
+                                                        "sh:property"    [{"id"          "ex:pshape2"
+                                                                           "sh:path"     {"id" "ex:address"}
+                                                                           "sh:node"     {"id" "ex:AddressShape"}
+                                                                           "sh:minCount" 1}]}]})
+        valid-person   @(fluree/stage db1 {"@context" context
+                                           "insert"   {"id"         "ex:Bob"
+                                                       "type"       "ex:Person"
+                                                       "ex:address" {"ex:postalCode" "12345"}}
+                                           "opts"     {"meta" true}})
+        invalid-person @(fluree/stage db1 {"@context" context
+                                           "insert"   {"id"         "ex:Reto"
+                                                       "type"       "ex:Person"
+                                                       "ex:address" {"id"            "ex:1"
+                                                                     "ex:postalCode" ["12345" "45678"]}}
+                                           "opts"     {"meta" true}})]
+    (is (= 3
+           (:fuel valid-person)))
+    (is (= 4
+           (:fuel (ex-data invalid-person))))))
+
 (deftest ^:integration post-processing-validation
   (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "post-processing")
