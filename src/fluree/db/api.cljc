@@ -409,7 +409,7 @@
     (query-range/index-range db index test match)))
   ([db index start-test start-match end-test end-match]
    (promise-wrap
-    (query-range/index-range db index start-test start-match end-test end-match))))
+    (query-range/index-range db nil index start-test start-match end-test end-match))))
 
 (defn slice
   "Like range, but returns all flakes that match the supplied flake parts."

@@ -449,7 +449,7 @@
   ([db index start-test start-match end-test end-match]
    (log/warn "DEPRECATED function `range` superseded by `fluree.db.api/range`")
    (promise-wrap
-    (query-range/index-range db index start-test start-match end-test end-match))))
+    (query-range/index-range db nil index start-test start-match end-test end-match))))
 
 (defn ^{:deprecated    "3.0"
         :superseded-by "fluree.db/slice"}
