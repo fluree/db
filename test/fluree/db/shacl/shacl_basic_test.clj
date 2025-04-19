@@ -2719,6 +2719,80 @@ WORLD!")
 Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape ex:pshape3 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint."
              (ex-message invalid-hand))))))
 
+(deftest fuel-test
+  (let [conn   @(fluree/connect-memory)
+        ledger @(fluree/create conn "shape-constraints")
+        db0    (fluree/db ledger)
+
+        context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
+        ;; sh:qualifiedValueShape requires building shapes during validation
+        db1     @(fluree/stage db0 {"@context" context
+                                    "insert"
+                                    [{"id"      "ex:Digit"
+                                      "ex:name" "Toe"}
+                                     {"id"             "ex:HandShape"
+                                      "type"           "sh:NodeShape"
+                                      "sh:targetClass" {"id" "ex:Hand"}
+                                      "sh:property"
+                                      [{"id"          "ex:pshape1"
+                                        "sh:path"     {"id" "ex:digit"}
+                                        "sh:maxCount" 5}
+                                       {"id"                              "ex:pshape2"
+                                        "sh:path"                         {"id" "ex:digit"}
+                                        "sh:qualifiedValueShape"          {"id"          "ex:thumbshape"
+                                                                           "sh:path"     {"id" "ex:name"}
+                                                                           "sh:hasValue" "Thumb"}
+                                        "sh:qualifiedMinCount"            1
+                                        "sh:qualifiedMaxCount"            1
+                                        "sh:qualifiedValueShapesDisjoint" true}
+                                       {"id"                              "ex:pshape3"
+                                        "sh:path"                         {"id" "ex:digit"}
+                                        "sh:qualifiedValueShape"          {"id"          "ex:fingershape"
+                                                                           "sh:path"     {"id" "ex:name"}
+                                                                           "sh:hasValue" "Finger"}
+                                        "sh:qualifiedMinCount"            4
+                                        "sh:qualifiedMaxCount"            4
+                                        "sh:qualifiedValueShapesDisjoint" true}]}]})
+
+        valid-hand   @(fluree/stage db1 {"@context" context
+                                         "insert"   {"id"       "ex:ValidHand"
+                                                     "type"     "ex:Hand"
+                                                     "ex:digit" [{"id" "ex:thumb" "ex:name" "Thumb"}
+                                                                 {"id" "ex:finger1" "ex:name" "Finger"}
+                                                                 {"id" "ex:finger2" "ex:name" "Finger"}
+                                                                 {"id" "ex:finger3" "ex:name" "Finger"}
+                                                                 {"id" "ex:finger4" "ex:name" "Finger"}]}
+                                         "opts"     {"meta" true}})
+        invalid-hand @(fluree/stage db1 {"@context" context
+                                         "insert"   {"id"       "ex:InvalidHand"
+                                                     "type"     "ex:Hand"
+                                                     "ex:digit" [{"id" "ex:thumb" "ex:name" "Thumb"}
+                                                                 {"id" "ex:finger1" "ex:name" "Finger"}
+                                                                 {"id" "ex:finger2" "ex:name" "Finger"}
+                                                                 {"id" "ex:finger3" "ex:name" "Finger"}
+                                                                 {"id"      "ex:finger4andthumb"
+                                                                  "ex:name" ["Finger" "Thumb"]}]}
+                                         "opts"     {"meta" true}})]
+
+    (is (= 11
+           (:fuel valid-hand)))
+
+    (is (= [{"id" "ex:ValidHand",
+             "type" "ex:Hand",
+             "ex:digit"
+             [{"ex:name" "Finger"}
+              {"ex:name" "Finger"}
+              {"ex:name" "Finger"}
+              {"ex:name" "Finger"}
+              {"ex:name" "Thumb"}]}]
+             @(fluree/query (:result valid-hand) {"@context" context
+                                                  "select" {"ex:ValidHand" ["*" {"ex:digit" ["ex:name"]}]}})))
+    (is (= 12
+           (:fuel (ex-data invalid-hand))))
+    (is (= "Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape ex:pshape2 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:fingershape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint.
+Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValueShape of shape ex:pshape3 - value ex:finger4andthumb conformed to a sibling qualified value shape [\"ex:thumbshape\"] in violation of the sh:qualifiedValueShapesDisjoint constraint."
+           (ex-message invalid-hand)))))
+
 (deftest ^:integration post-processing-validation
   (let [conn    @(fluree/connect-memory)
         ledger  @(fluree/create conn "post-processing")
