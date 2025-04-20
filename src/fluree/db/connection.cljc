@@ -16,7 +16,7 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
-            [fluree.db.track :as track]
+            [fluree.db.track :as track :refer [track?]]
             [fluree.db.track.fuel :as fuel]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
@@ -624,7 +624,7 @@
   ([ledger staged-db opts]
    (go-try
      (let [commit-result (<? (apply-stage! ledger staged-db opts))]
-       (if (track/track-file? opts)
+       (if (track? opts)
          commit-result
          (:db commit-result))))))
 
@@ -639,17 +639,19 @@
                         (let [parsed-context (:context parsed-opts)]
                           (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
                         db)]
-      (if (fuel/track? parsed-opts)
+      (if (track? parsed-opts)
         (let [start-time   #?(:clj (System/nanoTime)
                               :cljs (util/current-time-millis))
-              fuel-tracker (fuel/tracker (:max-fuel parsed-opts))]
+              track-fuel?  (track/track-fuel? parsed-opts)
+              fuel-tracker (when track-fuel?
+                             (fuel/tracker (:max-fuel parsed-opts)))]
           (try*
             (let [result        (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))
                   policy-report (policy.rules/enforcement-report result)]
               (cond-> {:status 200
                        :result result
-                       :time   (util/response-time-formatted start-time)
-                       :fuel   (fuel/tally fuel-tracker)}
+                       :time   (util/response-time-formatted start-time)}
+                track-fuel?   (assoc :fuel (fuel/tally fuel-tracker))
                 policy-report (assoc :policy policy-report)))
             (catch* e
               (throw (ex-info (ex-message e)
@@ -673,7 +675,7 @@
           ;; whereas stage API takes a did IRI and unparsed context.
           ;; Dissoc them until deciding at a later point if they can carry through.
           cmt-opts (dissoc parsed-opts :context :identity)]
-      (if (fuel/track? parsed-opts)
+      (if (track? parsed-opts)
         (assoc staged :result (<? (commit! ledger (:result staged) cmt-opts)))
         (<? (commit! ledger staged cmt-opts))))))
 
