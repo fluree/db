@@ -702,7 +702,7 @@
                                                                {:ex "http://example.org/ns/"}]
                                                    "insert"   test-utils/people}
                                               {:meta true})
-                   db          (:result response)
+                   db          (:db response)
                    flake-total (- (-> db :stats :flakes)
                                   (-> db0 :stats :flakes))]
 

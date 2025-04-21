@@ -640,10 +640,10 @@
               fuel-tracker (when track-fuel?
                              (fuel/tracker (:max-fuel parsed-opts)))]
           (try*
-            (let [result        (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))
-                  policy-report (policy.rules/enforcement-report result)]
+            (let [staged-db     (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))
+                  policy-report (policy.rules/enforcement-report staged-db)]
               (cond-> {:status 200
-                       :result result
+                       :db     staged-db
                        :time   (util/response-time-formatted start-time)}
                 track-fuel?   (assoc :fuel (fuel/tally fuel-tracker))
                 policy-report (assoc :policy policy-report)))
@@ -670,7 +670,8 @@
           ;; Dissoc them until deciding at a later point if they can carry through.
           cmt-opts (dissoc parsed-opts :context :identity)]
       (if (track? parsed-opts)
-        (let [commit-result (<? (commit! ledger (:result staged) cmt-opts))]
+        (let [staged-db     (:db staged)
+              commit-result (<? (commit! ledger staged-db cmt-opts))]
           (merge staged commit-result))
         (<? (commit! ledger staged cmt-opts))))))
 
