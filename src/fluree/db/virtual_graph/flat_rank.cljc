@@ -5,6 +5,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
+            [fluree.db.track.fuel :as fuel]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log]
@@ -35,19 +36,21 @@
     (format-result f score)))
 
 (defn search
-  [db score-fn sort-fn solution error-ch out-ch]
+  [db fuel-tracker score-fn sort-fn solution error-ch out-ch]
   (go
     (try*
       (let [{::vg-parse/keys [property target limit] :as search-params} (vg-parse/get-search-params solution)
 
             pid       (iri/encode-iri db property)
-            score-opt {:flake-xf (comp (map (partial score-flake score-fn target))
-                                       (remove nil?))}
+            score-xf  (comp (map (partial score-flake score-fn target))
+                            (remove nil?))
+            flake-xf  (->> [score-xf (when fuel-tracker (fuel/track fuel-tracker error-ch))]
+                           (remove nil?)
+                           (apply comp))
             ;; For now, pulling all matching values from full index once hitting
             ;; the actual vector index, we'll only need to pull matches out of
             ;; novelty (if that)
-            ;; TODO: track fuel
-            vectors   (<? (query-range/index-range db :post = [pid] score-opt))]
+            vectors   (<? (query-range/index-range db fuel-tracker :post = [pid] {:flake-xf flake-xf}))]
         (->> vectors
              (sort sort-fn)
              (vg-parse/limit-results limit)
@@ -62,8 +65,8 @@
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (vg-parse/match-search-triple solution triple))
 
-  (-finalize [_ _ error-ch solution-ch]
-    (vg-parse/finalize (partial search db dot-product reverse-result-sort) error-ch solution-ch))
+  (-finalize [_ fuel-tracker error-ch solution-ch]
+    (vg-parse/finalize (partial search db fuel-tracker dot-product reverse-result-sort) error-ch solution-ch))
 
   (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
@@ -86,8 +89,8 @@
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (vg-parse/match-search-triple solution triple))
 
-  (-finalize [_ _ error-ch solution-ch]
-    (vg-parse/finalize (partial search db cosine-similarity reverse-result-sort) error-ch solution-ch))
+  (-finalize [_ fuel-tracker error-ch solution-ch]
+    (vg-parse/finalize (partial search db fuel-tracker cosine-similarity reverse-result-sort) error-ch solution-ch))
 
   (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
@@ -110,8 +113,8 @@
   (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (vg-parse/match-search-triple solution triple))
 
-  (-finalize [_ _ error-ch solution-ch]
-    (vg-parse/finalize (partial search db euclidian-distance result-sort) error-ch solution-ch))
+  (-finalize [_ fuel-tracker error-ch solution-ch]
+    (vg-parse/finalize (partial search db fuel-tracker euclidian-distance result-sort) error-ch solution-ch))
 
   (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
