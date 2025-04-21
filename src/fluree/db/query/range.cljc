@@ -5,6 +5,7 @@
             [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy.query :as policy]
+            [fluree.db.track.fuel :as fuel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
@@ -308,6 +309,11 @@
                            (iri/encode-iri db s2))
              end-flake   (resolve-match-flake end-test s2* p2 o2 t2 op2 m2)
              error-ch    (chan)
+             track-fuel  (when fuel-tracker
+                           (fuel/track fuel-tracker error-ch))
+             flake-xf*   (->> [(:flake-xf opts) track-fuel]
+                              (remove nil?)
+                              (apply comp))
              range-ch    (index-range* db
                                        fuel-tracker
                                        error-ch
@@ -317,7 +323,8 @@
                                               :start-test start-test
                                               :start-flake start-flake
                                               :end-test end-test
-                                              :end-flake end-flake))]
+                                              :end-flake end-flake
+                                              :flake-xf flake-xf*))]
          (async/alt!
            error-ch ([e]
                      (throw e))

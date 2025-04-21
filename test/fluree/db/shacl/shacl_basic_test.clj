@@ -2750,9 +2750,9 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                                                        "ex:address" {"id"            "ex:1"
                                                                      "ex:postalCode" ["12345" "45678"]}}
                                            "opts"     {"meta" true}})]
-    (is (= 3
+    (is (= 9
            (:fuel valid-person)))
-    (is (= 4
+    (is (= 13
            (:fuel (ex-data invalid-person))))))
 
 (deftest ^:integration post-processing-validation
