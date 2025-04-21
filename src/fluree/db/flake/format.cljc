@@ -114,7 +114,7 @@
         subj-xf                 (comp cat
                                       (format-subject-xf db cache context compact-fn
                                                          select-spec))]
-    (->> (query-range/resolve-flake-slices db :spot error-ch range-opts)
+    (->> (query-range/resolve-flake-slices db fuel-tracker :spot error-ch range-opts)
          (async/transduce subj-xf (completing conj) {}))))
 
 (defn reverse-property
@@ -134,7 +134,7 @@
                                   (map (partial format-reference db reverse-spec))
                                   (comp (map (partial cache-sid->iri db cache compact-fn))
                                         (map :as)))]
-    (->> (query-range/resolve-flake-slices db :opst error-ch range-opts)
+    (->> (query-range/resolve-flake-slices db fuel-tracker :opst error-ch range-opts)
          (async/transduce (comp cat sid-xf)
                           (completing conj
                                       (fn [result]
@@ -157,5 +157,5 @@
                           (go subject-attrs))]
       (->> subject-ch
            (subject/resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-           (subject/append-id db s-iri select-spec compact-fn error-ch)))
+           (subject/append-id db fuel-tracker s-iri select-spec compact-fn error-ch)))
     (go)))

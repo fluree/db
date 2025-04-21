@@ -8,15 +8,15 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn refresh-policy
-  [db-after policy-values {:keys [target-subject target-property] :as policy}]
+  [db-after fuel-tracker policy-values {:keys [target-subject target-property] :as policy}]
   (go-try
     (cond-> policy
-      target-subject  (update :s-targets into (<? (policy.rules/parse-targets db-after policy-values target-subject)))
-      target-property (update :p-targets into (<? (policy.rules/parse-targets db-after policy-values target-subject))))))
+      target-subject  (update :s-targets into (<? (policy.rules/parse-targets db-after fuel-tracker policy-values target-subject)))
+      target-property (update :p-targets into (<? (policy.rules/parse-targets db-after fuel-tracker policy-values target-subject))))))
 
 (defn refresh-modify-policies
   "Update targets to include newly created targets."
-  [db-after]
+  [db-after fuel-tracker]
   (go-try
     (let [policy-values (-> db-after :policy :policy-values)]
       (loop [[policy & r] (-> db-after :policy :modify :default)
@@ -24,7 +24,7 @@
         (if policy
           (let [{:keys [target-subject target-property]} policy]
             (if (or target-subject target-property)
-              (let [policy* (<? (refresh-policy db-after policy-values policy))]
+              (let [policy* (<? (refresh-policy db-after fuel-tracker policy-values policy))]
                 (recur r (conj refreshed policy*)))
               (recur r (conj refreshed policy))))
           (assoc-in db-after [:policy :modify :default] refreshed))))))
@@ -35,9 +35,9 @@
 
 ;; TODO - get parent classes
 (defn subject-class-policies
-  [db-after policy class-policy-cache sid]
+  [db-after fuel-tracker policy class-policy-cache sid]
   (go-try
-    (let [classes (<? (dbproto/-class-ids db-after sid))
+    (let [classes  (<? (dbproto/-class-ids db-after fuel-tracker sid))
           policies (or (enforce/policies-for-classes classes policy true)
                        [])]
       (swap! class-policy-cache assoc sid policies)
@@ -49,9 +49,9 @@
 
   If encounters a policy error, will throw with policy error
   message (if available)."
-  [{:keys [db-after add]}]
+  [fuel-tracker {:keys [db-after add]}]
   (go-try
-    (let [{:keys [policy]} (<? (refresh-modify-policies db-after))
+    (let [{:keys [policy]} (<? (refresh-modify-policies db-after fuel-tracker))
           class-policies? (has-class-policies? policy)
           class-policy-cache (atom {})]
       (if (enforce/unrestricted-modify? policy)
@@ -63,12 +63,12 @@
                   policies (concat (enforce/policies-for-property policy true pid)
                                    (when class-policies?
                                      (or (get @class-policy-cache sid)
-                                         (<? (subject-class-policies db-after policy class-policy-cache sid))))
+                                         (<? (subject-class-policies db-after fuel-tracker policy class-policy-cache sid))))
                                    (enforce/policies-for-flake db-after flake true))]
               ;; policies-allow? will throw if access forbidden
               (if-some [required-policies (not-empty (filter :required? policies))]
-                (<? (enforce/policies-allow? db-after true sid required-policies))
-                (<? (enforce/policies-allow? db-after true sid policies)))
+                (<? (enforce/policies-allow? db-after fuel-tracker true sid required-policies))
+                (<? (enforce/policies-allow? db-after fuel-tracker true sid policies)))
               (recur r))
             ;; no more flakes, all passed so return final db
             db-after))))))

@@ -992,3 +992,37 @@
                                           "ledger"   "novelty/test"
                                           "insert"   [{"@id"      "ex:1",
                                                        "ex:crawl" "It is a period of civil war."}]})))))))
+
+#?(:clj
+   (deftest policy-loading-test
+     (with-tmp-dir storage-path
+       (let [conn1 @(fluree/connect-file {:storage-path storage-path})
+             conn2 @(fluree/connect-file {:storage-path storage-path})
+             _db   @(fluree/create-with-txn conn1 {"ledger" "user/ledger",
+                                                   "insert" {"@id"      "freddy",
+                                                             "@type"    "Yeti",
+                                                             "name"     "Freddy",
+                                                             "age"      4,
+                                                             "verified" true},
+                                                   "opts"
+                                                   {"policy" {"@type"                            ["https://ns.flur.ee/ledger#AccessPolicy"],
+                                                              "https://ns.flur.ee/ledger#action" {"@id" "https://ns.flur.ee/ledger#modify"},
+                                                              "https://ns.flur.ee/ledger#query"  {"@type"  "@json",
+                                                                                                  "@value" {}}}}})
+             q     {"from"   "user/ledger",
+                    "where"  [{"@id" "?s", "age" "?age"}],
+                    "select" {"?s" ["*"]}}]
+         (testing "opts policy is not applied to query on original connection"
+           (is (= [{"age"      4,
+                    "name"     "Freddy",
+                    "verified" true,
+                    "@type"    "Yeti",
+                    "@id"      "freddy"}]
+                  @(fluree/query-connection conn1 q))))
+         (testing "opts policy is not applied to query on fresh connection"
+           (is (= [{"age"      4,
+                    "name"     "Freddy",
+                    "verified" true,
+                    "@type"    "Yeti",
+                    "@id"      "freddy"}]
+                  @(fluree/query-connection conn2 q))))))))

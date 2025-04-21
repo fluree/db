@@ -164,7 +164,7 @@
                   "http://a.co/wishlistItemViewPolicy"   {:executed 0, :allowed 0},
                   "http://a.co/availableModifyPolicy"    {:executed 0, :allowed 0}}
                  (:policy txn-result)))
-          (is (= 3
+          (is (= 5
                  (:fuel txn-result)))
           (is (= ["a:burt-wish1"]
                  (:result result)))
@@ -235,7 +235,7 @@
                     "http://a.co/wishlistItemViewPolicy"   {:executed 0, :allowed 0},
                     "http://a.co/availableModifyPolicy"    {:executed 0, :allowed 0}}
                    (:policy txn-result)))
-            (is (= 4
+            (is (= 11
                    (:fuel txn-result)))
             (is (= [{"a:title"       "helicopter"
                      "a:description" "flying car, basically"
@@ -289,7 +289,7 @@
                       "http://a.co/wishlistItemViewPolicy"   {:executed 0, :allowed 0},
                       "http://a.co/availableModifyPolicy"    {:executed 1, :allowed 0}}
                      (:policy (ex-data unauthorized))))
-              (is (= 1
+              (is (= 3
                      (:fuel (ex-data unauthorized)))))
             (testing "cannot be viewed by owner"
               (let [result @(fluree/query policy-db {"@context" {"a" "http://a.co/"}
@@ -307,7 +307,7 @@
                         "http://a.co/wishlistItemViewPolicy"   {:executed 3, :allowed 3},
                         "http://a.co/availableModifyPolicy"    {:executed 2, :allowed 0}}
                        (:policy result)))
-                (is (= 4
+                (is (= 6
                        (:fuel result)))))))
         (testing "non-owners item available status"
           (let [policy-db  @(fluree/wrap-policy db2 {"@graph" [wishlist-create wishlist-modify wishlist-view
@@ -335,7 +335,7 @@
                         "http://a.co/wishlistItemViewPolicy"   {:executed 3, :allowed 3},
                         "http://a.co/availableModifyPolicy"    {:executed 2, :allowed 2}}
                        (:policy result)))
-                (is (= 4
+                (is (= 6
                        (:fuel result)))))))))))
 
 (deftest policy-class-test

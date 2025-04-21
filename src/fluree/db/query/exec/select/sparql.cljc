@@ -16,10 +16,12 @@
 
 (defmethod display :default
   [match _compact]
-  (let [v  (where/get-value match)
-        dt (where/get-datatype-iri match)]
+  (let [v    (where/get-value match)
+        dt   (where/get-datatype-iri match)
+        lang (where/get-lang match)]
     (cond-> {"value" (str v) "type" "literal"}
-      (and v (not= const/iri-string dt)) (assoc "datatype" dt))))
+      (and v lang)                                                 (assoc "xml:lang" lang)
+      (and v (not (#{const/iri-string const/iri-lang-string} dt))) (assoc "datatype" dt))))
 
 (defmethod display const/iri-rdf-json
   [match _compact]

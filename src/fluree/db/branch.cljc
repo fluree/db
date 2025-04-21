@@ -4,6 +4,7 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.json-ld.policy :as policy]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
@@ -193,7 +194,7 @@
   't' should be the same (if just updating an index) or after the db's 't' value."
   [{:keys [state index-queue] :as branch-map} new-db index-files-ch]
   (let [updated-db (-> state
-                       (swap! update-commit new-db)
+                       (swap! update-commit (policy/root-db new-db))
                        :current-db)]
     (enqueue-index! index-queue updated-db index-files-ch)
     branch-map))

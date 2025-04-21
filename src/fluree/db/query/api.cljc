@@ -21,14 +21,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn history
-  "Return a summary of the changes over time, optionally with the full commit
-  details included."
-  [db query]
-  (go-try
-    (let [context (context/extract query)]
-      (<? (history/query db context query)))))
-
 (defn sanitize-query-options
   [query override-opts]
   (update query :opts (fn [{:keys [max-fuel] :as opts}]
@@ -60,10 +52,11 @@
   ([db {:keys [t opts] :as sanitized-query} conn]
    (go-try
      (let [{:keys [reasoner-methods rule-sources]} opts
-           processed-rule-sources (when rule-sources
+           processed-rule-sources (when (and rule-sources conn)
                                     (<? (load-aliased-rule-dbs conn rule-sources)))
            policy-db              (if (perm/policy-enforced-opts? opts)
                                     (let [parsed-context (context/extract sanitized-query)]
+                                      ;; TODO: track fuel
                                       (<? (perm/policy-enforce-db db parsed-context opts)))
                                     db)
            time-travel-db         (-> (if t
@@ -78,12 +71,16 @@
        (assoc-in reasoned-db [:policy :cache] (atom {}))))))
 
 (defn track-query
-  [ds max-fuel query]
+  "Track fuel usage in query. `query-fn` is a function that takes one argument, the
+  fuel-tracker, and returns the query results:
+
+  query-fn [fuel-tracker] => result`"
+  [ds max-fuel query-fn]
   (go-try
     (let [start        #?(:clj (System/nanoTime)
                           :cljs (util/current-time-millis))
           fuel-tracker (fuel/tracker max-fuel)]
-      (try* (let [result (<? (fql/query ds fuel-tracker query))
+      (try* (let [result (<? (query-fn fuel-tracker))
                   policy-report (when-not (dataset? ds)
                                   (policy.rules/enforcement-report ds))]
               (cond-> {:status 200
@@ -97,6 +94,24 @@
                                :time   (util/response-time-formatted start)
                                :fuel   (fuel/tally fuel-tracker)}
                               e)))))))
+
+(defn history
+  "Return a summary of the changes over time, optionally with the full commit
+  details included."
+  [ledger query override-opts]
+  (go-try
+    (let [{:keys [opts] :as query*} (sanitize-query-options query override-opts)
+
+          context   (context/extract query*)
+          latest-db (ledger/current-db ledger)
+          policy-db (if (perm/policy-enforced-opts? opts)
+                      ;; TODO: track fuel
+                      (<? (perm/policy-enforce-db latest-db context opts))
+                      latest-db)
+          max-fuel  (:max-fuel opts)]
+      (if (fuel/track? opts)
+        (<? (track-query policy-db max-fuel (fn [fuel-tracker] (history/query policy-db fuel-tracker context query*))))
+        (<? (history/query policy-db context query*))))))
 
 (defn query-fql
   "Execute a query against a database source. Returns core async channel
@@ -116,13 +131,13 @@
            query**  (update query* :opts dissoc :meta :max-fuel)
            max-fuel (:max-fuel opts)]
        (if (fuel/track? opts)
-         (<? (track-query ds* max-fuel query**))
+         (<? (track-query ds* max-fuel (fn [fuel-tracker] (fql/query ds* fuel-tracker query**))))
          (<? (fql/query ds* query**)))))))
 
 (defn query-sparql
   [db query override-opts]
   (go-try
-    (let [fql     (sparql/->fql query)]
+    (let [fql (sparql/->fql query)]
       (<? (query-fql db fql override-opts)))))
 
 (defn query
@@ -255,7 +270,7 @@
               trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel)
               max-fuel      (:max-fuel opts)]
           (if (fuel/track? opts)
-            (<? (track-query ds max-fuel trimmed-query))
+            (<? (track-query ds max-fuel (fn [fuel-tracker] (fql/query ds fuel-tracker trimmed-query))))
             (<? (fql/query ds trimmed-query))))
         (throw (ex-info "Missing ledger specification in connection query"
                         {:status 400, :error :db/invalid-query}))))))

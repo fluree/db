@@ -119,11 +119,11 @@
                     []
                     prop-ch)))
 
-  (-iri-visible? [ds iri]
+  (-iri-visible? [ds fuel-tracker iri]
     (go-try
       (some? (loop [[db & r] (all ds)]
                (if db
-                 (if (<? (subject/-iri-visible? db iri))
+                 (if (<? (subject/-iri-visible? db fuel-tracker iri))
                    db
                    (recur r))
                  nil))))))
