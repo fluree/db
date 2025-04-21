@@ -563,12 +563,12 @@
       (->> (parse-keypair ledger))
       parse-data-helpers))
 
-(defn apply-stage!
+(defn commit!
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
   ([ledger db]
-   (apply-stage! ledger db {}))
+   (commit! ledger db {}))
   ([{:keys [conn] ledger-alias :alias, :as ledger}
     {:keys [branch t stats commit] :as staged-db}
     opts]
@@ -614,19 +614,13 @@
 
        (<? (publish-commit conn commit-jsonld))
 
-       (-> write-result
-           (select-keys [:address :hash :size])
-           (assoc :ledger-id ledger-alias, :t t, :db db*))))))
-
-(defn commit!
-  ([ledger staged-db]
-   (commit! ledger staged-db {}))
-  ([ledger staged-db opts]
-   (go-try
-     (let [commit-result (<? (apply-stage! ledger staged-db opts))]
        (if (track? opts)
-         commit-result
-         (:db commit-result))))))
+         (-> write-result
+             (select-keys [:address :hash :size])
+             (assoc :ledger-id ledger-alias
+                    :t t
+                    :db db*))
+         db*)))))
 
 (defn stage-triples
   "Stages a new transaction that is already parsed into the
