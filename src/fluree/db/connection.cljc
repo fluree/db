@@ -650,8 +650,8 @@
             (catch* e
               (throw (ex-info (ex-message e)
                               (let [policy-report (policy.rules/enforcement-report policy-db)]
-                                (cond-> {:time (util/response-time-formatted start-time)
-                                         :fuel (fuel/tally fuel-tracker)}
+                                (cond-> {:time (util/response-time-formatted start-time)}
+                                  track-fuel?   (assoc :fuel (fuel/tally fuel-tracker))
                                   policy-report (assoc :policy policy-report)))
                               e)))))
         (<? (transact/stage policy-db identity parsed-txn parsed-opts))))))
