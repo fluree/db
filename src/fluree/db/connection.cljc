@@ -670,7 +670,8 @@
           ;; Dissoc them until deciding at a later point if they can carry through.
           cmt-opts (dissoc parsed-opts :context :identity)]
       (if (track? parsed-opts)
-        (assoc staged :result (<? (commit! ledger (:result staged) cmt-opts)))
+        (let [commit-result (<? (commit! ledger (:result staged) cmt-opts))]
+          (merge staged commit-result))
         (<? (commit! ledger staged cmt-opts))))))
 
 (defn not-found?

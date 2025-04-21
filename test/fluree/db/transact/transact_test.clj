@@ -361,8 +361,8 @@
                               :id         :ex/alice
                               :quux/corge "grault"}]}
             committed  @(fluree/transact! conn txn {:meta true})]
-        (is (= [:fuel :result :status :time]
-               (sort (keys committed))))))
+        (is (= #{:address :db :fuel :hash :ledger-id :result :size :status :t :time}
+               (set (keys committed))))))
 
     (testing "Throws on invalid txn"
       (let [txn {"@context" ["" {:quux "http://quux.com/"}]
