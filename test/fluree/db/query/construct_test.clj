@@ -103,6 +103,16 @@
                                  "construct" [{"@id" "?s" "json" "?config"}
                                               {"@id" "?s" "name" "?name"}
                                               {"@id" "?s" "date" "?date"}]}))))
+    (testing "@type values are unwrapped"
+      (is (= {"@context" {"person" "http://example.org/Person#", "ex" "http://example.org/"}
+              "@graph" [{"@id" "ex:bbob", "@type" ["ex:Person"]}
+                        {"@id" "ex:fbueller", "@type" ["ex:Person"]}
+                        {"@id" "ex:jbob", "@type" ["ex:Person"]}
+                        {"@id" "ex:jdoe", "@type" ["ex:Person"]}]}
+             @(fluree/query db1 {"@context" context
+                                 "where" [{"@id" "?s" "@type" "?o"}]
+                                 "construct" [{"@id" "?s" "@type" "?o"}]}))))
+
     #_(testing "bnode template"
         (is (= {"@context" {"person" "http://example.org/Person#", "ex" "http://example.org/"}
                 "@graph"
