@@ -8,17 +8,17 @@
   [{:keys [max-fuel meta] :as opts}]
   (or max-fuel
       (track-all? opts)
-      (:fuel meta)))
+      (-> meta :fuel true?)))
 
 (defn track-file?
   [{:keys [meta] :as opts}]
   (or (track-all? opts)
-      (:file meta)))
+      (-> meta :file true?)))
 
 (defn track-policy?
   [{:keys [meta] :as opts}]
   (or (track-all? opts)
-      (:policy meta)))
+      (-> meta :policy true?)))
 
 (defn track?
   [opts]
