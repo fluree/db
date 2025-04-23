@@ -150,7 +150,7 @@
                                                      "a:name"    "Burt's Birthday"
                                                      "a:summary" "My birthday wishlist"}}
                                                    "opts"     {"meta" true}})
-              authorized (:result txn-result)
+              authorized (:db txn-result)
               result     @(fluree/query authorized {"@context" {"a" "http://a.co/"}
                                                     "where"    [{"@id" (:id burt) "a:wishlist" "?wishlist"}]
                                                     "select"   "?wishlist"
@@ -222,7 +222,7 @@
                                                                 "a:description" "flying car, basically"
                                                                 "a:rank"        1}}
                                                      "opts"     {"meta" true}})
-                authorized (:result txn-result)
+                authorized (:db txn-result)
                 result     @(fluree/query authorized {"@context" {"a" "http://a.co/"}
                                                       "select"   {"a:burt-wish1-1" ["*"]}
                                                       "opts"     {"meta" true}})]

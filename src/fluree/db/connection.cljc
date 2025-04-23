@@ -563,12 +563,12 @@
       (->> (parse-keypair ledger))
       parse-data-helpers))
 
-(defn apply-stage!
+(defn commit!
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
   ([ledger db]
-   (apply-stage! ledger db {}))
+   (commit! ledger db {}))
   ([{:keys [conn] ledger-alias :alias, :as ledger}
     {:keys [branch t stats commit] :as staged-db}
     opts]
@@ -614,19 +614,13 @@
 
        (<? (publish-commit conn commit-jsonld))
 
-       (-> write-result
-           (select-keys [:address :hash :size])
-           (assoc :ledger-id ledger-alias, :t t, :db db*))))))
-
-(defn commit!
-  ([ledger staged-db]
-   (commit! ledger staged-db {}))
-  ([ledger staged-db opts]
-   (go-try
-     (let [commit-result (<? (apply-stage! ledger staged-db opts))]
-       (if (track/track-file? opts)
-         commit-result
-         (:db commit-result))))))
+       (if (track/track? opts)
+         (-> write-result
+             (select-keys [:address :hash :size])
+             (assoc :ledger-id ledger-alias
+                    :t t
+                    :db db*))
+         db*)))))
 
 (defn stage-triples
   "Stages a new transaction that is already parsed into the
@@ -636,27 +630,30 @@
     (let [parsed-opts    (:opts parsed-txn)
           parsed-context (:context parsed-opts)
           identity       (:identity parsed-opts)]
-      (if (fuel/track? parsed-opts)
+      (if (track/track? parsed-opts)
         (let [start-time   #?(:clj (System/nanoTime)
                               :cljs (util/current-time-millis))
-              fuel-tracker (fuel/tracker (:max-fuel parsed-opts))
+              track-fuel?  (track/track-fuel? parsed-opts)
+              fuel-tracker (when track-fuel?
+                             (fuel/tracker (:max-fuel parsed-opts)))
               policy-db    (if (policy/policy-enforced-opts? parsed-opts)
                              (<? (policy/policy-enforce-db db fuel-tracker parsed-context parsed-opts))
                              db)]
           (try*
-            (let [result        (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))
-                  policy-report (policy.rules/enforcement-report result)]
+            (let [staged-db     (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))
+                  policy-report (policy.rules/enforcement-report staged-db)]
               (cond-> {:status 200
-                       :result result
-                       :time   (util/response-time-formatted start-time)
-                       :fuel   (fuel/tally fuel-tracker)}
+                       :db     staged-db
+                       :time   (util/response-time-formatted start-time)}
+                track-fuel?   (assoc :fuel (fuel/tally fuel-tracker))
                 policy-report (assoc :policy policy-report)))
             (catch* e
               (throw (ex-info (ex-message e)
                               (let [policy-report (policy.rules/enforcement-report policy-db)]
-                                (cond-> {:time (util/response-time-formatted start-time)
-                                         :fuel (fuel/tally fuel-tracker)}
-                                  policy-report (assoc :policy policy-report)))
+                                (cond-> (ex-data e)
+                                  track-fuel?   (assoc :fuel (fuel/tally fuel-tracker))
+                                  policy-report (assoc :policy policy-report)
+                                  true          (assoc :time (util/response-time-formatted start-time))))
                               e)))))
         (let [policy-db (if (policy/policy-enforced-opts? parsed-opts)
                           (<? (policy/policy-enforce-db db parsed-context parsed-opts))
@@ -676,8 +673,10 @@
           ;; whereas stage API takes a did IRI and unparsed context.
           ;; Dissoc them until deciding at a later point if they can carry through.
           cmt-opts (dissoc parsed-opts :context :identity)]
-      (if (fuel/track? parsed-opts)
-        (assoc staged :result (<? (commit! ledger (:result staged) cmt-opts)))
+      (if (track/track? parsed-opts)
+        (let [staged-db     (:db staged)
+              commit-result (<? (commit! ledger staged-db cmt-opts))]
+          (merge staged commit-result))
         (<? (commit! ledger staged cmt-opts))))))
 
 (defn not-found?
