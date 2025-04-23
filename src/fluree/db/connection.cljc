@@ -630,7 +630,7 @@
     (let [parsed-opts    (:opts parsed-txn)
           parsed-context (:context parsed-opts)
           identity       (:identity parsed-opts)]
-      (if (track? parsed-opts)
+      (if (track/track? parsed-opts)
         (let [start-time   #?(:clj (System/nanoTime)
                               :cljs (util/current-time-millis))
               track-fuel?  (track/track-fuel? parsed-opts)
@@ -673,7 +673,7 @@
           ;; whereas stage API takes a did IRI and unparsed context.
           ;; Dissoc them until deciding at a later point if they can carry through.
           cmt-opts (dissoc parsed-opts :context :identity)]
-      (if (track? parsed-opts)
+      (if (track/track? parsed-opts)
         (let [staged-db     (:db staged)
               commit-result (<? (commit! ledger staged-db cmt-opts))]
           (merge staged commit-result))
