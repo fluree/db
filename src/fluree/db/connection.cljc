@@ -16,7 +16,7 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
-            [fluree.db.track :as track :refer [track?]]
+            [fluree.db.track :as track]
             [fluree.db.track.fuel :as fuel]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
@@ -614,7 +614,7 @@
 
        (<? (publish-commit conn commit-jsonld))
 
-       (if (track? opts)
+       (if (track/track? opts)
          (-> write-result
              (select-keys [:address :hash :size])
              (assoc :ledger-id ledger-alias
