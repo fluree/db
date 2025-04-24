@@ -5,14 +5,17 @@
             [fluree.db.validation :as v]))
 
 (defn json-ld-object
-  [compact bnodes o-match]
+  [compact bnodes p o-match]
   [(if (where/unmatched? o-match)
      (let [var (where/get-variable o-match)]
        ;; unbound non-bnode variable is an optional match.
        (when (v/bnode-variable? var)
          {(compact const/iri-id) (str var bnodes)}))
      (if-let [iri (where/get-iri o-match)]
-       {(compact const/iri-id) (compact iri)}
+       ;; don't wrap @type values
+       (if (= p const/iri-type)
+         (compact iri)
+         {(compact const/iri-id) (compact iri)})
        (let [v      (where/get-value o-match)
              dt-iri (where/get-datatype-iri o-match)
              lang   (where/get-lang o-match)]
@@ -21,6 +24,13 @@
            (cond-> {(compact const/iri-value) v}
              lang       (assoc (compact const/iri-language) lang)
              (not lang) (assoc (compact const/iri-type) (compact dt-iri)))))))])
+
+(defn json-ld-predicate
+  [p-match]
+  (let [p (where/get-iri p-match)]
+    (if (= p const/iri-rdf-type)
+      const/iri-type
+      p)))
 
 (defn json-ld-subject
   [compact bnodes s-match]
@@ -35,7 +45,10 @@
 (defn json-ld-node
   [compact bnodes s-matches]
   (reduce (fn [node [_ p o]]
-            (assoc node (compact (where/get-iri p)) (json-ld-object compact bnodes o)))
+            ;; There may be no p or o matches, e. from an :id pattern
+            (if-let [pred (json-ld-predicate p)]
+              (assoc node (compact pred) (json-ld-object compact bnodes pred o))
+              node))
           (json-ld-subject compact bnodes (ffirst s-matches))
           s-matches))
 

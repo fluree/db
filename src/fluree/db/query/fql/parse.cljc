@@ -553,12 +553,26 @@
         syntax/coerce-where
         (parse-where-clause vars context))))
 
+(defn unwrap-tuple-patterns
+  "Construct accepts ::v/node-map patterns, which can produce :tuple patterns, :class
+  patterns, or :id patterns. We only need the pattern components as a template for
+  construct, the :id and :class patterns are for optimized query execution, so this
+  function unwraps :id and :class patterns and only returns the underlying components."
+  [patterns]
+  (mapv (fn [[pattern-type component :as pattern]]
+          (case pattern-type
+            :class component
+            :id    [component]
+            pattern))
+        patterns))
+
 (defn parse-construct
   [q context]
   (when-let [construct (:construct q)]
     (-> construct
         syntax/coerce-where
         (parse-where-clause nil context)
+        unwrap-tuple-patterns
         select/construct-selector)))
 
 (defn parse-select-as-fn
