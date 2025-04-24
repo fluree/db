@@ -45,8 +45,10 @@
 (defn json-ld-node
   [compact bnodes s-matches]
   (reduce (fn [node [_ p o]]
-            (let [pred (json-ld-predicate p)]
-              (assoc node (compact pred) (json-ld-object compact bnodes pred o))))
+            ;; There may be no p or o matches, e. from an :id pattern
+            (if-let [pred (json-ld-predicate p)]
+              (assoc node (compact pred) (json-ld-object compact bnodes pred o))
+              node))
           (json-ld-subject compact bnodes (ffirst s-matches))
           s-matches))
 

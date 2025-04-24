@@ -112,6 +112,26 @@
              @(fluree/query db1 {"@context" context
                                  "where" [{"@id" "?s" "@type" "?o"}]
                                  "construct" [{"@id" "?s" "@type" "?o"}]}))))
+    (testing ":class patterns are constructed correctly"
+      (is (= {"@context" {"person" "http://example.org/Person#", "ex" "http://example.org/"}
+              "@graph" [{"@id" "ex:bbob", "@type" ["ex:Human"]}
+                        {"@id" "ex:fbueller", "@type" ["ex:Human"]}
+                        {"@id" "ex:jbob", "@type" ["ex:Human"]}
+                        {"@id" "ex:jdoe", "@type" ["ex:Human"]}]}
+             @(fluree/query db1 {"@context" context
+                                 "where" [{"@id" "?s" "@type" "ex:Person"}]
+                                 ;; :class pattern in construct clause
+                                 "construct" [{"@id" "?s" "@type" "ex:Human"}]}))))
+    (testing ":id patterns are constructed correctly"
+      (is (= {"@context" {"person" "http://example.org/Person#", "ex" "http://example.org/"}
+              "@graph" [{"@id" "ex:bbob"}
+                        {"@id" "ex:fbueller"}
+                        {"@id" "ex:jbob"}
+                        {"@id" "ex:jdoe"}]}
+             @(fluree/query db1 {"@context" context
+                                 "where" [{"@id" "?s" "@type" "ex:Person"}]
+                                 ;; :id pattern in construct clause
+                                 "construct" [{"@id" "?s"}]}))))
 
     #_(testing "bnode template"
         (is (= {"@context" {"person" "http://example.org/Person#", "ex" "http://example.org/"}
