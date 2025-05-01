@@ -610,7 +610,12 @@
 (defmethod parse-term :PathElt
   [[_ primary mod]]
   (if mod
-    (str "<" (parse-term primary) (parse-term mod) ">")
+    (let [term  (parse-term primary)
+          term* (if ((set (flatten primary)) :IRIREF)
+                  ;; expanded IRIs need to be wrapped in angle brackets in a transitive path
+                  (str "<" term ">")
+                  term)]
+      (str "<" term* (parse-term mod) ">"))
     (parse-term primary)))
 
 (defmethod parse-term :PathSequence
