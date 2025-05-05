@@ -336,7 +336,9 @@
   ([ds q]
    (query ds q {}))
   ([ds q opts]
-   (promise-wrap (query-api/query ds q opts))))
+   (if (util/exception? ds)
+     (throw ds)
+     (promise-wrap (query-api/query ds q opts)))))
 
 (defn credential-query
   "Issues a policy-enforced query to the specified dataset/db as a verifiable
