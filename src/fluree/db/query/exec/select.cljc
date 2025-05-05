@@ -125,7 +125,7 @@
       (go (->> (mapv #(where/assign-matched-values % solution) patterns)
                ;; partition by s-match
                (partition-by first)
-               (mapv (partial select.json-ld/json-ld-node compact bnodes)))))))
+               (keep (partial select.json-ld/format-node compact bnodes)))))))
 
 (defn construct-selector
   [patterns]

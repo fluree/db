@@ -122,16 +122,25 @@
                                  "where" [{"@id" "?s" "@type" "ex:Person"}]
                                  ;; :class pattern in construct clause
                                  "construct" [{"@id" "?s" "@type" "ex:Human"}]}))))
-    (testing ":id patterns are constructed correctly"
+    (testing ":id patterns cannot produce valid triples"
       (is (= {"@context" {"person" "http://example.org/Person#", "ex" "http://example.org/"}
-              "@graph" [{"@id" "ex:bbob"}
-                        {"@id" "ex:fbueller"}
-                        {"@id" "ex:jbob"}
-                        {"@id" "ex:jdoe"}]}
+              "@graph" []}
              @(fluree/query db1 {"@context" context
                                  "where" [{"@id" "?s" "@type" "ex:Person"}]
                                  ;; :id pattern in construct clause
                                  "construct" [{"@id" "?s"}]}))))
+    (testing "unbound vars are not included"
+      (is (= {"@context" {"person" "http://example.org/Person#", "ex" "http://example.org/"}
+              "@graph" [{"@id" "ex:alice", "ex:name" ["Alice"]}
+                        {"@id" "ex:bbob", "@type" ["ex:Person"]}
+                        {"@id" "ex:fbueller" "@type" ["ex:Person"]}
+                        {"@id" "ex:jbob" "@type" ["ex:Person"]}
+                        {"@id" "ex:jdoe" "@type" ["ex:Person"]}]}
+             @(fluree/query db1 {"@context" context
+                                 "where" [{"@id" "?s" "?p" "?o"}
+                                          ["optional" {"@id" "?s" "@type" "?type"}]
+                                          ["optional" {"@id" "?s" "foaf:givenname" "?name"}]]
+                                 "construct" [{"@id" "?s"  "ex:name" "?name" "@type" "?type"}]}))))
 
     #_(testing "bnode template"
         (is (= {"@context" {"person" "http://example.org/Person#", "ex" "http://example.org/"}
