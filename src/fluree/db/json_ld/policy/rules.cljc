@@ -4,10 +4,9 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.util.async :refer [go-try <?]]
+            [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]))
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
