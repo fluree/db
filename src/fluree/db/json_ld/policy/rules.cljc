@@ -5,8 +5,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.util.async :refer [<?]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.core :as util :refer [try* catch*]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -123,10 +122,15 @@
                           (set classes))
 
             src-query (util/get-first-value policy-doc const/iri-query)
-            query     (if (map? src-query)
+            query     (cond 
+                        (map? src-query)
                         (assoc src-query "select" "?$this" "limit" 1)
-                        (throw (ex-info (str "Invalid policy, unable to extract query from f:query. "
-                                             "Did you forget @context?. Parsed restriction: " policy-doc)
+                        
+                        (nil? src-query) 
+                        nil 
+                        
+                        :else 
+                        (throw (ex-info (str "Invalid policy query. Query must be a map, instead got: " src-query)
                                         {:status 400
                                          :error  :db/invalid-policy})))
             actions   (set (util/get-all-ids policy-doc const/iri-action))
@@ -137,8 +141,17 @@
 
             subject-targets  (when subject-targets-ch (<? subject-targets-ch))
             property-targets (when property-targets-ch (<? property-targets-ch))]
-        (log/warn "subject-targets: " subject-targets
-                  " property-targets: " property-targets)
+        
+        (when (and (nil? query)
+                   (nil? target-subject) 
+                   (nil? target-property)
+                   (nil? on-property)
+                   (nil? on-class))
+          (throw (ex-info (str "Invalid policy, unable to extract a target subject, property, or on-property."
+                               "Did you forget @context?. Parsed restriction: " policy-doc)
+                          {:status 400
+                           :error  :db/invalid-policy})))
+        
         (if (or view? modify?)
           (cond-> {:id          id
                    :on-property on-property

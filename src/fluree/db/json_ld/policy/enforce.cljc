@@ -60,9 +60,8 @@
                  policy)))))
 
 (defn policy-query
-  [db sid policy]
+  [db sid query]
   (let [policy-values (-> db :policy :policy-values)
-        query         (:query policy)
         this-val      (iri/decode-sid db sid)
         values        (-> (util.parse/normalize-values policy-values)
                           (policy/inject-value-binding "?$this" {"@value" this-val "@type" const/iri-id}))]
@@ -73,6 +72,8 @@
   (ex-info (or (some :ex-message policies)
                "Policy enforcement prevents modification.")
            {:status 403 :error :db/policy-exception}))
+
+(def ^:const deny-query-result false)
 
 (defn policies-allow?
   "Once narrowed to a specific set of policies, execute and return
@@ -86,8 +87,11 @@
           (let [{exec-counter :executed
                  allowed-counter :allowed} (get tracer (:id policy))
 
-                query   (policy-query db sid policy)
-                result  (seq (<? (dbproto/-query (root db) fuel-tracker query)))]
+                query   (when-let [query (:query policy)]
+                          (policy-query db sid query))
+                result  (if query 
+                          (seq (<? (dbproto/-query (root db) fuel-tracker query)))
+                          deny-query-result)]
             (swap! exec-counter inc)
             (if result
               (do (swap! allowed-counter inc)
