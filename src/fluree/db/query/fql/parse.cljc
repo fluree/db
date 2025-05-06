@@ -286,7 +286,7 @@
         ;; id map
         (where/match-iri mch (json-ld/expand-iri iri context))
         ;; literal value
-        (where/match-value mch static-value)))))
+        (where/match-value mch static-value (datatype/infer-iri static-value))))))
 
 (defn parse-bind-expression
   [var-name expression context]
