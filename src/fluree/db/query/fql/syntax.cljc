@@ -22,6 +22,10 @@
   [x]
   (boolean (#{'desc "desc" :desc} x)))
 
+(defn function?
+  [x]
+  (m/validate ::v/function x {:registry v/registry}))
+
 (defn one-select-key-present?
   [q]
   (log/trace "one-select-key-present? q:" q)

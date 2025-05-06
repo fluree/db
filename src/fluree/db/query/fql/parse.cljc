@@ -271,6 +271,29 @@
         f    (eval/compile code context false)]
     (where/->var-filter var-name f)))
 
+(defn parse-static-bind
+  [var-name static-value context]
+  (let [mch (where/unmatched-var var-name)
+        v   (get static-value const/iri-value)]
+    (if (some? v)
+      ;; value map
+      (if-let [dt (get static-value const/iri-type)]
+        (where/match-value mch v (json-ld/expand-iri dt context))
+        (if-let [lang (get static-value const/iri-language)]
+          (where/match-lang mch v lang)
+          (where/match-value mch v)))
+      (if-let [iri (get static-value const/iri-id)]
+        ;; id map
+        (where/match-iri mch (json-ld/expand-iri iri context))
+        ;; literal value
+        (where/match-value mch static-value)))))
+
+(defn parse-bind-expression
+  [var-name expression context]
+  (if (syntax/function? expression)
+    (parse-bind-function var-name expression context)
+    (parse-static-bind var-name expression context)))
+
 (defn parse-subject-iri
   [x context]
   (-> x
@@ -292,9 +315,9 @@
   (into {}
         (comp (partition-all 2)
               (map (fn [[k v]]
-                     (let [var (parse-var-name k)
-                           f   (parse-bind-function var v context)]
-                       [var f]))))
+                     (let [var     (parse-var-name k)
+                           binding (parse-bind-expression var v context)]
+                       [var binding]))))
         binds))
 
 (defn higher-order-pattern?
