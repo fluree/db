@@ -122,14 +122,14 @@
                           (set classes))
 
             src-query (util/get-first-value policy-doc const/iri-query)
-            query     (cond 
+            query     (cond
                         (map? src-query)
                         (assoc src-query "select" "?$this" "limit" 1)
-                        
-                        (nil? src-query) 
-                        nil 
-                        
-                        :else 
+
+                        (nil? src-query)
+                        nil
+
+                        :else
                         (throw (ex-info (str "Invalid policy query. Query must be a map, instead got: " src-query)
                                         {:status 400
                                          :error  :db/invalid-policy})))
@@ -141,9 +141,9 @@
 
             subject-targets  (when subject-targets-ch (<? subject-targets-ch))
             property-targets (when property-targets-ch (<? property-targets-ch))]
-        
+
         (when (and (nil? query)
-                   (nil? target-subject) 
+                   (nil? target-subject)
                    (nil? target-property)
                    (nil? on-property)
                    (nil? on-class))
@@ -151,7 +151,7 @@
                                "Did you forget @context?. Parsed restriction: " policy-doc)
                           {:status 400
                            :error  :db/invalid-policy})))
-        
+
         (if (or view? modify?)
           (cond-> {:id          id
                    :on-property on-property

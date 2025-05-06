@@ -89,7 +89,7 @@
 
                 query   (when-let [query (:query policy)]
                           (policy-query db sid query))
-                result  (if query 
+                result  (if query
                           (seq (<? (dbproto/-query (root db) fuel-tracker query)))
                           deny-query-result)]
             (swap! exec-counter inc)
