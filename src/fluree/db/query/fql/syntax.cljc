@@ -40,6 +40,7 @@
    [:where {:optional true} ::where]
    [:t {:optional true} ::t]
    [:context {:optional true} ::context]
+   [:selection-context {:optional true} ::context]
    [:order-by {:optional true} ::order-by]
    [:group-by {:optional true} ::group-by]
    [:having {:optional true} ::function]
