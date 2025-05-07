@@ -7,6 +7,10 @@
             [malli.error :as me]
             [malli.util :as mu]))
 
+(defn json-ld-keyword?
+  [x]
+  (and (string? x) (= \@ (first x))))
+
 (defn decode-json-ld-keyword
   [v]
   (if (string? v)
@@ -271,7 +275,7 @@
                             [:double :double]
                             [:iri ::iri]
                             ;; id/value map
-                            [:map-of ::json-ld-keyword [:ref ::literal]]]
+                            [:map [:map-of [:fn json-ld-keyword?] [:ref ::literal]]]]
     ::function             [:orn
                             [:string-fn [:and :string [:re #"^\(.+\)$"]]]
                             [:list-fn [:and list? [:cat :symbol [:* any?]]]]
