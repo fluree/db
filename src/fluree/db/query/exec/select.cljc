@@ -10,6 +10,7 @@
             [fluree.db.query.exec.select.json-ld :as select.json-ld]
             [fluree.db.query.exec.select.sparql :as select.sparql]
             [fluree.db.query.exec.select.subject :as subject]
+            [fluree.db.query.exec.select.literal :as literal]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
@@ -98,17 +99,23 @@
       :sparql (with-meta selector {`format-value (select.sparql/format-as-selector-value bind-var)})
       (with-meta selector {`format-value (select.fql/format-as-selector-value bind-var)}))))
 
+(defn get-subject-iri
+  [solution subj]
+  (if (where/variable? subj)
+    (-> solution
+        (get subj)
+        where/get-iri)
+    subj))
+
 (defrecord SubgraphSelector [subj selection depth spec]
   ValueSelector
   (format-value
     [_ ds iri-cache context compact fuel-tracker error-ch solution]
-    (when-let [iri (if (where/variable? subj)
-                     (-> solution
-                         (get subj)
-                         where/get-iri)
-                     subj)]
+    (if-let [iri (get-subject-iri solution subj)]
       (subject/format-subject ds iri context compact spec iri-cache
-                              fuel-tracker error-ch))))
+                              fuel-tracker error-ch)
+      (let [match (get solution subj)]
+        (go (literal/format-literal match compact spec iri-cache))))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied
@@ -123,8 +130,7 @@
   (format-value [_ _ _ _ compact _ _ solution]
     (let [bnodes (swap! bnodes inc)]
       (go (->> (mapv #(where/assign-matched-values % solution) patterns)
-               ;; partition by s-match
-               (partition-by first)
+               (partition-by first) ; partition by s-match
                (keep (partial select.json-ld/format-node compact bnodes)))))))
 
 (defn construct-selector
