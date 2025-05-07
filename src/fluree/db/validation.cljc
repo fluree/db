@@ -7,6 +7,10 @@
             [malli.error :as me]
             [malli.util :as mu]))
 
+(defn json-ld-keyword?
+  [x]
+  (and (string? x) (= \@ (first x))))
+
 (defn decode-json-ld-keyword
   [v]
   (if (string? v)
@@ -264,6 +268,14 @@
                             variable?]
     ::val                  [:fn value?]
     ::subject              ::iri
+    ::literal              [:orn {:error/message "Invalid literal"}
+                            [:string :string]
+                            [:boolean :boolean]
+                            [:int :int]
+                            [:double :double]
+                            [:iri ::iri]
+                            ;; id/value map
+                            [:map [:map-of [:fn json-ld-keyword?] [:ref ::literal]]]]
     ::function             [:orn
                             [:string-fn [:and :string [:re #"^\(.+\)$"]]]
                             [:list-fn [:and list? [:cat :symbol [:* any?]]]]
@@ -283,7 +295,7 @@
                             [:schema [:ref ::where]]]
     ::bind                 [:+ {:error/message "bind values must be mappings from variables to functions"}
                             [:catn [:var ::var]
-                             [:binding ::function]]]
+                             [:binding [:or ::function ::literal]]]]
     ::where-op             [:and
                             :keyword
                             [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind, values, exists, not-exists, minus"}

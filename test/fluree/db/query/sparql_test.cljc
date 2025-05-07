@@ -202,17 +202,31 @@
              where))))
   (testing "transitive property path"
     (testing "one-or-more"
-      (let [query "SELECT ?uri ?broader
-                 WHERE {?uri (<http://www.w3.org/2004/02/skos/core#broader>)+ ?broader.}"]
+      (testing "compact IRI"
+        (let [query "SELECT ?uri ?broader
+                     WHERE {?uri skos:broader+ ?broader.}"]
 
-        (is (= [{"@id" "?uri", "<http://www.w3.org/2004/02/skos/core#broader+>" "?broader"}]
-               (:where (sparql/->fql query))))))
+          (is (= [{"@id" "?uri", "<skos:broader+>" "?broader"}]
+                 (:where (sparql/->fql query))))))
+      (testing "expanded IRI"
+        (let [query "SELECT ?uri ?broader
+                     WHERE {?uri (<http://www.w3.org/2004/02/skos/core#broader>)+ ?broader.}"]
+
+          (is (= [{"@id" "?uri", "<<http://www.w3.org/2004/02/skos/core#broader>+>" "?broader"}]
+                 (:where (sparql/->fql query)))))))
     (testing "zero-or-more"
-      (let [query "SELECT ?uri ?broader
+      (testing "compact IRI"
+        (let [query "SELECT ?uri ?broader
+                 WHERE {?uri (skos:broader)* ?broader.}"]
+
+          (is (= [{"@id" "?uri", "<skos:broader*>" "?broader"}]
+                 (:where (sparql/->fql query))))))
+      (testing "expanded IRI"
+        (let [query "SELECT ?uri ?broader
                  WHERE {?uri (<http://www.w3.org/2004/02/skos/core#broader>)* ?broader.}"]
 
-        (is (= [{"@id" "?uri", "<http://www.w3.org/2004/02/skos/core#broader*>" "?broader"}]
-               (:where (sparql/->fql query)))))))
+          (is (= [{"@id" "?uri", "<<http://www.w3.org/2004/02/skos/core#broader>*>" "?broader"}]
+                 (:where (sparql/->fql query))))))))
   (testing "UNION"
     (let [query "SELECT ?person ?age
                  WHERE {?person person:age 70 .
@@ -421,13 +435,63 @@
                (select-keys (sparql/->fql query) [:where :values]))
             "where pattern: single var, multiple values"))))
   (testing "BIND"
-    (let [query "SELECT ?person ?handle
+    (testing "static values"
+      (testing "string"
+        (let [query "SELECT ?person ?handle
                  WHERE {BIND (\"dsanchez\" AS ?handle)
                         ?person person:handle ?handle.}"
-          {:keys [where]} (sparql/->fql query)]
-      (is (= [[:bind "?handle" "dsanchez"]
-              {"@id" "?person", "person:handle" "?handle"}]
-             where)))
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?handle" "dsanchez"]
+                  {"@id" "?person", "person:handle" "?handle"}]
+                 where))))
+      (testing "langstring"
+        (let [query "SELECT ?person ?bound
+                 WHERE {BIND (\"dsanchez\"@en AS ?bound)
+                        ?person person:handle ?bound.}"
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?bound" {"@value" "dsanchez", "@language" "en"}]
+                  {"@id" "?person", "person:handle" "?bound"}]
+                 where))))
+      (testing "boolean"
+        (let [query "SELECT ?person ?bound
+                 WHERE {BIND (true AS ?bound)
+                        ?person person:handle ?bound.}"
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?bound" true]
+                  {"@id" "?person", "person:handle" "?bound"}]
+                 where))))
+      (testing "integer"
+        (let [query "SELECT ?person ?bound
+                 WHERE {BIND (1 AS ?bound)
+                        ?person person:handle ?bound.}"
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?bound" 1]
+                  {"@id" "?person", "person:handle" "?bound"}]
+                 where))))
+      (testing "float"
+        (let [query "SELECT ?person ?bound
+                 WHERE {BIND (1.0 AS ?bound)
+                        ?person person:handle ?bound.}"
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?bound" 1.0]
+                  {"@id" "?person", "person:handle" "?bound"}]
+                 where))))
+      (testing "IRI"
+        (let [query "SELECT ?person ?bound
+                 WHERE {BIND (<ex:foo> AS ?bound)
+                        ?person person:handle ?bound.}"
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?bound" {"@id" "ex:foo"}]
+                  {"@id" "?person", "person:handle" "?bound"}]
+                 where))))
+      (testing "compact IRI"
+        (let [query "SELECT ?person ?bound
+                 WHERE {BIND (ex:foo AS ?bound)
+                        ?person person:handle ?bound.}"
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?bound" {"@id" "ex:foo"}]
+                  {"@id" "?person", "person:handle" "?bound"}]
+                 where)))))
     (let [query "SELECT ?person ?prefix ?foofix ?num1
                  WHERE {BIND (SUBSTR(?handle, 4) AS ?prefix)
                         BIND (REPLACE(?prefix, \"abc\", \"FOO\") AS ?foofix)

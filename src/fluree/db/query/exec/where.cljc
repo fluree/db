@@ -585,6 +585,18 @@
   ([value dt-iri lang]
    (->TypedValue (when (some? value) (datatype/coerce value dt-iri)) dt-iri lang)))
 
+(defn mch->typed-val
+  [{::keys [val iri datatype-iri meta]}]
+  (->typed-val (or iri val) (if iri const/iri-id datatype-iri) (:lang meta)))
+
+(defn typed-val->mch
+  [mch {v :value dt :datatype-iri lang :lang}]
+  (if (= dt const/iri-id)
+    (match-iri mch v)
+    (if lang
+      (match-lang mch v lang)
+      (match-value mch v dt))))
+
 (defmethod match-pattern :filter
   [_ds _fuel-tracker solution pattern error-ch]
   (go
@@ -780,18 +792,14 @@
     (-> (match-clause db fuel-tracker solution clause error-ch)
         (async/pipe opt-ch))))
 
-(defn bind-function-result
-  [solution var-name result]
-  (let [{v :value dt :datatype-iri} result
-        mch (if (= dt const/iri-id)
-              (-> var-name unmatched-var (match-iri v))
-              (-> var-name unmatched-var (match-value v dt)))]
-    (if-let [current (get solution var-name)]
-      (when (and (= (get-binding mch) (get-binding current))
-                 (= (get-datatype-iri mch) (get-datatype-iri current))
-                 (= (get-lang mch) (get-lang current)))
-        solution)
-      (assoc solution var-name mch))))
+(defn update-solution-binding
+  [solution var-name mch]
+  (if-let [current (get solution var-name)]
+    (when (and (= (get-binding mch) (get-binding current))
+               (= (get-datatype-iri mch) (get-datatype-iri current))
+               (= (get-lang mch) (get-lang current)))
+      solution)
+    (assoc solution var-name mch)))
 
 (defmethod match-pattern :bind
   [_db _fuel-tracker solution pattern error-ch]
@@ -801,8 +809,13 @@
                               (let [f        (::fn b)
                                     var-name (::var b)]
                                 (try*
-                                  (let [result (f soln)]
-                                    (or (bind-function-result soln var-name result)
+                                  (if f
+                                    (let [result (f soln)
+                                          result-mch (typed-val->mch (unmatched-var var-name) result)]
+                                      (or (update-solution-binding soln var-name result-mch)
+                                          (assoc soln ::invalidated true)))
+                                    ;; static binding
+                                    (or (update-solution-binding soln var-name b)
                                         (assoc soln ::invalidated true)))
                                   (catch* e (update soln ::errors conj e)))))
                             solution binds)]

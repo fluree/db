@@ -493,7 +493,13 @@
   [[_ & bindings]]
   ;; bindings come in as val, var; need to be reversed to var, val.
   (into [:bind] (->> bindings
-                     (mapv parse-term)
+                     (mapv (fn [term]
+                             (let [terms (into #{} (flatten term))
+                                   parsed (parse-term term)]
+                               (if (and (terms :iriOrFunction) (not= \( (first parsed)))
+                                 ;; static iri
+                                 {const/iri-id parsed}
+                                 (parse-term term)))))
                      (partition-all 2)
                      (mapcat reverse))))
 
@@ -610,7 +616,12 @@
 (defmethod parse-term :PathElt
   [[_ primary mod]]
   (if mod
-    (str "<" (parse-term primary) (parse-term mod) ">")
+    (let [term  (parse-term primary)
+          term* (if ((set (flatten primary)) :IRIREF)
+                  ;; expanded IRIs need to be wrapped in angle brackets in a transitive path
+                  (str "<" term ">")
+                  term)]
+      (str "<" term* (parse-term mod) ">"))
     (parse-term primary)))
 
 (defmethod parse-term :PathSequence
