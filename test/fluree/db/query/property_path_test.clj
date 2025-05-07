@@ -45,7 +45,7 @@
           (testing "transitive"
             (testing "without cycle"
               (is (= ["ex:b" "ex:c" "ex:d" "ex:e"]
-                     @(fluree/query db1 {"where" [{"@id" "ex:a" "<ex:knows+>" "?who"}]
+                     @(fluree/query db1 {"where" [{"@id" "ex:a" "<<ex:knows>+>" "?who"}]
                                          "select" "?who"}))))
             (testing "with cycle"
               (let [db2 @(fluree/stage db1 {"insert" {"@id" "ex:e" "ex:knows" {"@id" "ex:a"}}})]

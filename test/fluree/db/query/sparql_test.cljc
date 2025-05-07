@@ -202,17 +202,31 @@
              where))))
   (testing "transitive property path"
     (testing "one-or-more"
-      (let [query "SELECT ?uri ?broader
-                 WHERE {?uri (<http://www.w3.org/2004/02/skos/core#broader>)+ ?broader.}"]
+      (testing "compact IRI"
+        (let [query "SELECT ?uri ?broader
+                     WHERE {?uri skos:broader+ ?broader.}"]
 
-        (is (= [{"@id" "?uri", "<http://www.w3.org/2004/02/skos/core#broader+>" "?broader"}]
-               (:where (sparql/->fql query))))))
+          (is (= [{"@id" "?uri", "<skos:broader+>" "?broader"}]
+                 (:where (sparql/->fql query))))))
+      (testing "expanded IRI"
+        (let [query "SELECT ?uri ?broader
+                     WHERE {?uri (<http://www.w3.org/2004/02/skos/core#broader>)+ ?broader.}"]
+
+          (is (= [{"@id" "?uri", "<<http://www.w3.org/2004/02/skos/core#broader>+>" "?broader"}]
+                 (:where (sparql/->fql query)))))))
     (testing "zero-or-more"
-      (let [query "SELECT ?uri ?broader
+      (testing "compact IRI"
+        (let [query "SELECT ?uri ?broader
+                 WHERE {?uri (skos:broader)* ?broader.}"]
+
+          (is (= [{"@id" "?uri", "<skos:broader*>" "?broader"}]
+                 (:where (sparql/->fql query))))))
+      (testing "expanded IRI"
+        (let [query "SELECT ?uri ?broader
                  WHERE {?uri (<http://www.w3.org/2004/02/skos/core#broader>)* ?broader.}"]
 
-        (is (= [{"@id" "?uri", "<http://www.w3.org/2004/02/skos/core#broader*>" "?broader"}]
-               (:where (sparql/->fql query)))))))
+          (is (= [{"@id" "?uri", "<<http://www.w3.org/2004/02/skos/core#broader>*>" "?broader"}]
+                 (:where (sparql/->fql query))))))))
   (testing "UNION"
     (let [query "SELECT ?person ?age
                  WHERE {?person person:age 70 .
