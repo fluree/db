@@ -391,3 +391,51 @@
                                                                "ex:capitol" "?capitol"}]
                                                      "values" ["?type" [{"@value" "usa:state" "@type" "@id"}]]}}}
                                         "policyValues" ["?capitol" ["Madison"]]}}))))))
+
+(deftest ^:integration property-policy-nil-query
+  (testing "Restrict properties based on policy"
+    (let [conn            (test-utils/create-conn)
+          ledger          @(fluree/create conn "policy/property-policy-nil-query")
+          db              @(fluree/stage
+                            (fluree/db ledger)
+                            {"@context" {"ex"     "http://example.org/ns/"
+                                         "schema" "http://schema.org/"
+                                         "f"      "https://ns.flur.ee/ledger#"}
+                             "insert"   [{"@id"              "ex:alice",
+                                          "@type"            "ex:User",
+                                          "schema:name"      "Alice"
+                                          "schema:ssn"       "111-11-1111"}
+                                         {"@id"              "ex:john",
+                                          "@type"            "ex:User",
+                                          "schema:name"      "John"
+                                          "schema:ssn"       "888-88-8888"}]})
+
+          policy          {"@context" {"ex"     "http://example.org/ns/"
+                                       "schema" "http://schema.org/"
+                                       "f"      "https://ns.flur.ee/ledger#"}
+                           "@graph"   [{"@id"      "ex:defaultAllowView"
+                                        "@type"    ["f:AccessPolicy"]
+                                        "f:action" {"@id" "f:view"}
+                                        "f:query"  {"@type"  "@json"
+                                                    "@value" {}}}
+                                       {"@id"       "ex:restrictAllSSNs"
+                                        "@type"     ["f:AccessPolicy"]
+                                        "f:required" true
+                                        "f:targetProperty" [{"@id" "schema:ssn"}]
+                                        "f:action"  {"@id" "f:view"}}]}
+          policy-db  @(fluree/wrap-policy db policy)]
+
+      (testing "and values binding has user with policy relationship"
+        (is (= [{"@id" "ex:alice",
+                 "@type" "ex:User",
+                 "schema:name" "Alice"}
+                {"@id" "ex:john",
+                 "@type" "ex:User",
+                 "schema:name" "John"}]
+               @(fluree/query
+                 policy-db
+                 {"@context" {"ex"     "http://example.org/ns/"
+                              "schema" "http://schema.org/"}
+                  "select"   {"?s" ["*"]}
+                  "where"    {"@id"   "?s"
+                              "@type" "ex:User"}})))))))
