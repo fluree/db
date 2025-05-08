@@ -523,7 +523,9 @@
                 commit-ch     (drop-commit-artifacts conn latest-commit)]
             (<? index-ch)
             (<? commit-ch)
-            (recur r)))))))
+            (recur r))))
+      (log/debug "Dropped ledger" alias-or-address)
+      :dropped)))
 
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
 
