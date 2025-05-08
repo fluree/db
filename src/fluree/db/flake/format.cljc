@@ -59,12 +59,15 @@
 (defn format-object
   [db spec f]
   (let [obj (flake/o f)
-        dt (flake/dt f)]
+        dt  (flake/dt f)]
     (if (= const/$id dt)
       (format-reference db spec obj)
-      (if (= const/$rdf:json dt)
-        (json/parse obj false)
-        obj))))
+      (let [value  (if (= const/$rdf:json dt)
+                     (json/parse obj false)
+                     obj)
+            dt-iri (iri/decode-sid db dt)
+            lang   (-> f flake/m :lang)]
+        (subject/encode-literal value dt-iri lang spec)))))
 
 (defn wildcard-spec
   [db cache compact-fn iri]
@@ -156,6 +159,6 @@
                             (async/reduce conj subject-attrs reverse-ch))
                           (go subject-attrs))]
       (->> subject-ch
-           (subject/resolve-references db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
+           (subject/resolve-properties db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
            (subject/append-id db fuel-tracker s-iri select-spec compact-fn error-ch)))
     (go)))

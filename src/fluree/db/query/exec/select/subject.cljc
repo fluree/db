@@ -1,6 +1,7 @@
 (ns fluree.db.query.exec.select.subject
   (:require [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.constants :as const]
+            [fluree.db.query.exec.select.literal :as literal]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]))
@@ -53,6 +54,17 @@
   [v]
   (some? (::reference v)))
 
+(defn encode-literal
+  [value datatype language spec]
+  {::literal {:value    value
+              :datatype datatype
+              :language language
+              :spec     spec}})
+
+(defn literal?
+  [v]
+  (some? (::literal v)))
+
 (defn display-reference
   [ds o-iri spec select-spec cache context compact-fn current-depth fuel-tracker error-ch]
   (let [max-depth (:depth select-spec)
@@ -77,7 +89,7 @@
     (display-reference ds iri spec select-spec cache context compact-fn current-depth
                        fuel-tracker error-ch)))
 
-(defn resolve-references
+(defn resolve-properties
   [ds cache context compact-fn select-spec current-depth fuel-tracker error-ch attr-ch]
   (go (when-let [attrs (<! attr-ch)]
         (loop [[[prop v] & r] attrs
@@ -87,15 +99,25 @@
                        (loop [[value & r]     v
                               resolved-values []]
                          (if value
-                           (if (reference? value)
+                           (cond
+                             (reference? value)
                              (if-let [resolved (<! (resolve-reference ds cache context compact-fn select-spec current-depth fuel-tracker error-ch value))]
                                (recur r (conj resolved-values resolved))
                                (recur r resolved-values))
-                             (recur r (conj resolved-values value)))
+
+                             (literal? value)
+                             (recur r (conj resolved-values (-> value ::literal :value)))
+
+                             :else value)
                            (not-empty resolved-values)))
-                       (if (reference? v)
+                       (cond
+                         (reference? v)
                          (<! (resolve-reference ds cache context compact-fn select-spec current-depth fuel-tracker error-ch v))
-                         v))]
+
+                         (literal? v)
+                         (-> v ::literal :value)
+
+                         :else v))]
               (if (some? v')
                 (recur r (assoc resolved-attrs prop v'))
                 (recur r resolved-attrs)))
@@ -126,5 +148,5 @@
                              (async/reduce merge {})))
                       forward-ch)]
      (->> subject-ch
-          (resolve-references ds cache context compact-fn select-spec current-depth fuel-tracker error-ch)
+          (resolve-properties ds cache context compact-fn select-spec current-depth fuel-tracker error-ch)
           (append-id ds fuel-tracker iri select-spec compact-fn error-ch)))))
