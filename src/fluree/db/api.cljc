@@ -184,10 +184,9 @@
    (connection/load-ledger conn alias-or-address)))
 
 (defn drop
-  ([conn ledger-alias-or-address] (drop conn ledger-alias-or-address nil))
-  ([conn ledger-alias-or-address opts]
-   (promise-wrap
-     (connection/drop-ledger conn ledger-alias-or-address opts))))
+  [conn ledger-alias]
+  (promise-wrap
+   (connection/drop-ledger conn ledger-alias)))
 
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false

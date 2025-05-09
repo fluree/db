@@ -1046,13 +1046,13 @@
              tx1    {"insert" [{"@id" "ex:foo" "ex:num1" (range 1000)}]}
              tx2    {"insert" [{"@id" "ex:foo" "ex:num2" (range 1000)}]}
              tx3    {"insert" [{"@id" "ex:foo" "ex:num3" (range 1000)}]}
-             db1    (->> @(fluree/stage db0 tx1 {:raw-txn tx1})
+             _db1   (->> @(fluree/stage db0 tx1 {:raw-txn tx1})
                          (fluree/commit! ledger)
                          deref)
-             db2    (->> @(fluree/stage (fluree/db ledger) tx2 {:raw-txn tx2})
+             _db2   (->> @(fluree/stage (fluree/db ledger) tx2 {:raw-txn tx2})
                          (fluree/commit! ledger)
                          deref)
-             db3    (->> @(fluree/stage (fluree/db ledger) tx3 {:raw-txn tx3})
+             _db3   (->> @(fluree/stage (fluree/db ledger) tx3 {:raw-txn tx3})
                          (fluree/commit! ledger)
                          deref)
              tx-count 3]

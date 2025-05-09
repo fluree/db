@@ -447,7 +447,7 @@
     (load-ledger-alias conn alias-or-address)))
 
 (defn drop-commit-artifacts
-  [{:keys [commit-catalog] :as conn} latest-commit]
+  [{:keys [commit-catalog] :as _conn} latest-commit]
   (let [error-ch  (async/chan)
         commit-ch (commit-storage/trace-commits commit-catalog latest-commit 0 error-ch)]
     (go-loop []
@@ -457,7 +457,7 @@
               data-address        (-> (util/get-first commit const/iri-data)
                                       (util/get-first-value const/iri-address))]
           (log/debug "Dropping commit" (-> (util/get-first commit const/iri-data)
-                                          (util/get-first-value const/iri-fluree-t)))
+                                           (util/get-first-value const/iri-fluree-t)))
           (when data-address
             (log/debug "Deleting data" data-address)
             (storage/delete commit-catalog data-address))
@@ -474,7 +474,7 @@
   [storage node-address]
   (go-try
     (loop [[address & r] [node-address]
-           addresses     (list )]
+           addresses     (list)]
       (if address
         (if-let [children (->> (:children (<? (storage/read-json storage address true)))
                                (mapv :id))]
@@ -488,8 +488,7 @@
 (defn drop-index-artifacts
   [{:keys [index-catalog] :as _conn} latest-commit]
   (go-try
-    (let [
-          storage       (:storage index-catalog)
+    (let [storage       (:storage index-catalog)
           index-address (some-> (util/get-first latest-commit const/iri-index)
                                 (util/get-first-value const/iri-address))]
       (when index-address
@@ -509,7 +508,7 @@
           (<? (storage/delete storage index-address)))))))
 
 (defn drop-ledger
-  [{:keys [commit-catalog index-catalog] :as conn} alias opts]
+  [conn alias]
   (go-try
     (let [alias (if (fluree-address? alias)
                   (nameservice/address-path alias)

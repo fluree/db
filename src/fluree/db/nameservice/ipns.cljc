@@ -58,7 +58,7 @@
   nameservice/Publisher
   (publish [_ commit-jsonld]
     (ipfs/push! ipfs-endpoint commit-jsonld))
-  (retract [_ ledger-alias]
+  (retract [_ _ledger-alias]
     (ipfs/write ipfs-endpoint "null"))
   (publishing-address [_ ledger-alias]
     (ipns-address ipfs-endpoint ipns-key ledger-alias))
