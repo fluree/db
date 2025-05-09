@@ -157,5 +157,5 @@
                           (go subject-attrs))]
       (->> subject-ch
            (subject/resolve-properties db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-           (subject/append-id db fuel-tracker s-iri select-spec compact-fn cache error-ch)))
+           (subject/append-id db fuel-tracker s-iri select-spec compact-fn error-ch)))
     (go)))
