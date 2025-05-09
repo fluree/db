@@ -1,7 +1,6 @@
 (ns fluree.db.query.exec.select.subject
   (:require [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.constants :as const]
-            [fluree.db.query.exec.select.literal :as literal]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]))
@@ -10,7 +9,7 @@
 
 (defprotocol SubjectFormatter
   (-forward-properties [db iri select-spec context compact-fn cache fuel-tracker error-ch])
-  (-reverse-property [db iri reverse-spec context compact-fn cache fuel-tracker error-ch])
+  (-reverse-property [db iri reverse-spec context fuel-tracker error-ch])
   (-iri-visible? [db fuel-tracker iri]))
 
 (defn subject-formatter?
@@ -124,13 +123,13 @@
             resolved-attrs)))))
 
 (defn format-reverse-properties
-  [ds iri reverse-map context compact-fn cache fuel-tracker error-ch]
+  [ds iri reverse-map context fuel-tracker error-ch]
   (let [out-ch (async/chan 32)]
     (async/pipeline-async 32
                           out-ch
                           (fn [reverse-spec ch]
                             (-> ds
-                                (-reverse-property iri reverse-spec context compact-fn cache fuel-tracker error-ch)
+                                (-reverse-property iri reverse-spec context fuel-tracker error-ch)
                                 (async/pipe ch)))
                           (async/to-chan! (vals reverse-map)))
 
@@ -142,7 +141,7 @@
   ([ds iri context compact-fn {:keys [reverse] :as select-spec} cache current-depth fuel-tracker error-ch]
    (let [forward-ch (-forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)
          subject-ch (if reverse
-                      (let [reverse-ch (format-reverse-properties ds iri reverse context compact-fn cache fuel-tracker error-ch)]
+                      (let [reverse-ch (format-reverse-properties ds iri reverse context fuel-tracker error-ch)]
                         (->> [forward-ch reverse-ch]
                              async/merge
                              (async/reduce merge {})))
