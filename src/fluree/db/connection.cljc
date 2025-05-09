@@ -513,7 +513,7 @@
     (let [alias (if (fluree-address? alias)
                   (nameservice/address-path alias)
                   alias)]
-      (loop [[publisher & r] (all-nameservices conn)]
+      (loop [[publisher & r] (publishers conn)]
         (when publisher
           (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
                 _             (log/debug "Dropping ledger" ledger-addr)
