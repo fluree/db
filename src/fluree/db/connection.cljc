@@ -508,22 +508,24 @@
           (<? (storage/delete storage index-address)))))))
 
 (defn drop-ledger
-  [{:keys [commit-catalog index-catalog] :as conn} alias-or-address opts]
+  [{:keys [commit-catalog index-catalog] :as conn} alias opts]
   (go-try
-    (let [alias (if (fluree-address? alias-or-address)
-                  (nameservice/address-path alias-or-address)
-                  alias-or-address)]
-      (loop [[ledger-addr & r] (<? (current-addresses conn alias))]
-        (when ledger-addr
-          (log/debug "Dropping ledger" ledger-addr)
-          (let [latest-commit (-> (<? (lookup-commit conn ledger-addr))
+    (let [alias (if (fluree-address? alias)
+                  (nameservice/address-path alias)
+                  alias)]
+      (loop [[publisher & r] (all-nameservices conn)]
+        (when publisher
+          (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
+                _             (log/debug "Dropping ledger" ledger-addr)
+                latest-commit (-> (<? (nameservice/lookup publisher ledger-addr))
                                   json-ld/expand)
                 index-ch      (drop-index-artifacts conn latest-commit)
                 commit-ch     (drop-commit-artifacts conn latest-commit)]
             (<? index-ch)
             (<? commit-ch)
+            (<? (nameservice/retract publisher alias))
             (recur r))))
-      (log/debug "Dropped ledger" alias-or-address)
+      (log/debug "Dropped ledger" alias)
       :dropped)))
 
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
