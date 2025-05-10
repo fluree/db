@@ -45,3 +45,10 @@
                     prop-value (get-vprop-value match prop compact-fn)]
                 (assoc node prop-key prop-value)))
             initial-node props)))
+
+(defn literal-match
+  [value datatype language]
+  (let [mch where/unmatched]
+    (if language
+      (where/match-lang mch value language)
+      (where/match-value mch value datatype))))
