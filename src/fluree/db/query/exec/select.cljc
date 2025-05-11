@@ -114,8 +114,12 @@
     (if-let [iri (get-subject-iri solution subj)]
       (subject/format-subject ds iri context compact spec iri-cache
                               fuel-tracker error-ch)
-      (let [match (get solution subj)]
-        (go (literal/format-literal match compact spec iri-cache))))))
+      (go
+        (let [match    (get solution subj)
+              value    (where/get-value match)
+              datatype (where/get-datatype-iri match)
+              language (where/get-lang match)]
+          (literal/format-literal value datatype language compact spec iri-cache))))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied

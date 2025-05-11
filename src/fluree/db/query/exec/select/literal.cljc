@@ -36,19 +36,20 @@
             {} virtual-properties)
     {}))
 
-(defn format-literal
-  [match compact-fn select-spec cache]
-  (let [initial-node (initial-value-node match compact-fn select-spec cache)
-        props        (remove keyword? (keys select-spec))]
-    (reduce (fn [node prop]
-              (let [prop-key   (get-compact-vprop cache compact-fn prop)
-                    prop-value (get-vprop-value match prop compact-fn)]
-                (assoc node prop-key prop-value)))
-            initial-node props)))
-
 (defn literal-match
   [value datatype language]
   (let [mch where/unmatched]
     (if language
       (where/match-lang mch value language)
       (where/match-value mch value datatype))))
+
+(defn format-literal
+  [value datatype language compact-fn select-spec cache]
+  (let [match        (literal-match value datatype language)
+        initial-node (initial-value-node match compact-fn select-spec cache)
+        props        (remove keyword? (keys select-spec))]
+    (reduce (fn [node prop]
+              (let [prop-key   (get-compact-vprop cache compact-fn prop)
+                    prop-value (get-vprop-value match prop compact-fn)]
+                (assoc node prop-key prop-value)))
+            initial-node props)))

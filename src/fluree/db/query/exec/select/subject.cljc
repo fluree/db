@@ -89,25 +89,24 @@
     (display-reference ds iri spec select-spec cache context compact-fn current-depth
                        fuel-tracker error-ch)))
 
-(defn resolve-literal
-  [cache compact-fn select-spec current-depth encoded-literal]
+(defn display-literal
+  [value datatype language spec select-spec cache compact-fn current-depth]
   (let [max-depth (:depth select-spec)
-        {:keys [value datatype language spec]}
-        (::literal encoded-literal)
         subselect (:spec spec)]
     (cond
       subselect
-      (-> value
-          (literal/literal-match datatype language)
-          (literal/format-literal compact-fn subselect cache))
+      (literal/format-literal value datatype language compact-fn subselect cache)
 
       (< current-depth max-depth)
-      (-> value
-          (literal/literal-match datatype language)
-          (literal/format-literal compact-fn select-spec cache))
+      (literal/format-literal value datatype language compact-fn select-spec cache)
 
       :else
       value)))
+
+(defn resolve-literal
+  [cache compact-fn select-spec current-depth v]
+  (let [{:keys [value datatype language spec]} (::literal v)]
+    (display-literal value datatype language spec select-spec cache compact-fn current-depth)))
 
 (defn resolve-properties
   [ds cache context compact-fn select-spec current-depth fuel-tracker error-ch attr-ch]
