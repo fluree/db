@@ -93,11 +93,20 @@
   [cache compact-fn select-spec current-depth encoded-literal]
   (let [max-depth (:depth select-spec)
         {:keys [value datatype language spec]}
-        (::literal encoded-literal)]
-    (if (< current-depth max-depth)
+        (::literal encoded-literal)
+        subselect (:spec spec)]
+    (cond
+      subselect
+      (-> value
+          (literal/literal-match datatype language)
+          (literal/format-literal compact-fn subselect cache))
+
+      (< current-depth max-depth)
       (-> value
           (literal/literal-match datatype language)
           (literal/format-literal compact-fn select-spec cache))
+
+      :else
       value)))
 
 (defn resolve-properties
