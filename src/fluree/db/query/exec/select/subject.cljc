@@ -4,7 +4,8 @@
             [fluree.db.query.exec.select.literal :as literal]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.datatype :as datatype]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -47,8 +48,8 @@
 
 (defn encode-reference
   [iri spec]
-  {::reference {:iri  iri
-                :spec spec}})
+  {::reference {::iri  iri
+                ::spec spec}})
 
 (defn reference?
   [v]
@@ -56,10 +57,8 @@
 
 (defn encode-literal
   [value datatype language spec]
-  {::literal {:value    value
-              :datatype datatype
-              :language language
-              :spec     spec}})
+  (let [attr-map (literal/attribute-map value datatype language)]
+    {::literal (assoc attr-map ::spec spec)}))
 
 (defn literal?
   [v]
@@ -85,28 +84,28 @@
 
 (defn resolve-reference
   [ds cache context compact-fn select-spec current-depth fuel-tracker error-ch v]
-  (let [{:keys [iri spec]} (::reference v)]
+  (let [{::keys [iri spec]} (::reference v)]
     (display-reference ds iri spec select-spec cache context compact-fn current-depth
                        fuel-tracker error-ch)))
 
 (defn display-literal
-  [value datatype language spec select-spec cache compact-fn current-depth]
+  [attrs spec select-spec cache compact-fn current-depth]
   (let [max-depth (:depth select-spec)
         subselect (:spec spec)]
     (cond
       subselect
-      (literal/format-literal value datatype language compact-fn subselect cache)
+      (literal/format-literal attrs compact-fn subselect cache)
 
       (< current-depth max-depth)
-      (literal/format-literal value datatype language compact-fn select-spec cache)
+      (literal/format-literal attrs compact-fn select-spec cache)
 
       :else
-      value)))
+      (literal/get-value attrs))))
 
 (defn resolve-literal
   [cache compact-fn select-spec current-depth v]
-  (let [{:keys [value datatype language spec]} (::literal v)]
-    (display-literal value datatype language spec select-spec cache compact-fn current-depth)))
+  (let [{::keys [spec] :as attrs} (::literal v)]
+    (display-literal attrs spec select-spec cache compact-fn current-depth)))
 
 (defn resolve-properties
   [ds cache context compact-fn select-spec current-depth fuel-tracker error-ch attr-ch]

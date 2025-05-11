@@ -119,7 +119,8 @@
               value    (where/get-value match)
               datatype (where/get-datatype-iri match)
               language (where/get-lang match)]
-          (literal/format-literal value datatype language compact spec iri-cache))))))
+          (literal/format-literal value datatype language compact spec
+                                  iri-cache))))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied

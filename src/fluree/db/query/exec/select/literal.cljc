@@ -1,16 +1,15 @@
-(ns fluree.db.query.exec.select.literal
-  (:require [fluree.db.query.exec.where :as where]))
+(ns fluree.db.query.exec.select.literal)
 
 (def virtual-properties
   #{"@value" "@type" "@language"})
 
 (defn get-vprop-value
-  [match vprop compact-fn]
+  [{::keys [value datatype language]} vprop compact-fn]
   (when (contains? virtual-properties vprop)
     (case vprop
-      "@value"    (where/get-value match)
-      "@type"     (-> match where/get-datatype-iri compact-fn)
-      "@language" (where/get-lang match))))
+      "@value"    value
+      "@type"     (compact-fn datatype)
+      "@language" language)))
 
 (defn ensure-compact-vprop
   [cache-value vprop compact-fn]
@@ -26,30 +25,35 @@
       :as))
 
 (defn initial-value-node
-  [match compact-fn {:keys [wildcard?] :as _select-spec} cache]
+  [attrs compact-fn {:keys [wildcard?] :as _select-spec} cache]
   (if wildcard?
     (reduce (fn [node vprop]
-              (if-let [vprop-value (get-vprop-value match vprop compact-fn)]
+              (if-let [vprop-value (get-vprop-value attrs vprop compact-fn)]
                 (let [compact-vprop (get-compact-vprop cache compact-fn vprop)]
                   (assoc node compact-vprop vprop-value))
                 node))
             {} virtual-properties)
     {}))
 
-(defn literal-match
+(defn attribute-map
   [value datatype language]
-  (let [mch where/unmatched]
-    (if language
-      (where/match-lang mch value language)
-      (where/match-value mch value datatype))))
+  {::value    value
+   ::datatype datatype
+   ::language language})
+
+(defn get-value
+  [attrs]
+  (::value attrs))
 
 (defn format-literal
-  [value datatype language compact-fn select-spec cache]
-  (let [match        (literal-match value datatype language)
-        initial-node (initial-value-node match compact-fn select-spec cache)
-        props        (remove keyword? (keys select-spec))]
-    (reduce (fn [node prop]
-              (let [prop-key   (get-compact-vprop cache compact-fn prop)
-                    prop-value (get-vprop-value match prop compact-fn)]
-                (assoc node prop-key prop-value)))
-            initial-node props)))
+  ([value datatype language compact-fn select-spec cache]
+   (let [attrs (attribute-map value datatype language)]
+     (format-literal attrs compact-fn select-spec cache)))
+  ([attrs compact-fn select-spec cache]
+   (let [initial-node (initial-value-node attrs compact-fn select-spec cache)
+         props        (remove keyword? (keys select-spec))]
+     (reduce (fn [node prop]
+               (let [prop-key   (get-compact-vprop cache compact-fn prop)
+                     prop-value (get-vprop-value attrs prop compact-fn)]
+                 (assoc node prop-key prop-value)))
+             initial-node props))))
