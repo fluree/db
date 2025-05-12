@@ -69,14 +69,6 @@
             lang   (-> f flake/m :lang)]
         (subject/encode-literal value dt-iri lang spec)))))
 
-(defn wildcard-spec
-  [db cache compact-fn iri]
-  (or (get @cache iri)
-      (when-let [spec (get-in db [:schema :pred iri])]
-        (let [spec* (assoc spec :as (compact-fn (:iri spec)))]
-          (vswap! cache assoc iri spec*)
-          spec*))))
-
 (defn format-property
   [db cache context compact-fn {:keys [wildcard?] :as select-spec} p-flakes]
   (let [ff  (first p-flakes)
@@ -84,8 +76,7 @@
         iri (iri/decode-sid db pid)]
     (when-let [spec (or (get select-spec iri)
                         (when wildcard?
-                          (or (wildcard-spec db cache compact-fn iri)
-                              (cache-sid->iri db cache compact-fn pid))))]
+                          (cache-sid->iri db cache compact-fn pid)))]
       (let [p-iri (:as spec)
             v     (if (rdf-type? pid)
                     (type-value db cache compact-fn p-flakes)
