@@ -74,14 +74,11 @@
             (is (= {:id                               :wiki/Q836821,
                     :type                             :schema/Movie,
                     :schema/name                      {:value            "The Hitchhiker's Guide to the Galaxy",
-                                                       :type             :xsd/string,
-                                                       :schema/isBasedOn nil},
+                                                       :type             :xsd/string},
                     :schema/disambiguatingDescription {:value            "2005 British-American comic science fiction film directed by Garth Jennings"
-                                                       :type             :xsd/string
-                                                       :schema/isBasedOn nil},
+                                                       :type             :xsd/string},
                     :schema/titleEIDR                 {:value            "10.5240/B752-5B47-DBBE-E5D4-5A3F-N"
-                                                       :type             :xsd/string
-                                                       :schema/isBasedOn nil},
+                                                       :type             :xsd/string},
                     :schema/isBasedOn                 {:id            :wiki/Q3107329,
                                                        :type          :schema/Book,
                                                        :schema/name   {:value            "The Hitchhiker's Guide to the Galaxy",
