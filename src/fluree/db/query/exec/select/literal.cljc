@@ -51,7 +51,8 @@
    (let [attrs (attribute-map value datatype language)]
      (format-literal attrs compact-fn select-spec cache)))
   ([attrs compact-fn select-spec cache]
-   (into {}
-         (comp (map (partial format-vprop attrs compact-fn select-spec cache))
-               (remove nil?))
-         virtual-properties)))
+   (->> virtual-properties
+        (map (partial format-vprop attrs compact-fn select-spec cache))
+        (remove nil?)
+        (into {})
+        not-empty)))
