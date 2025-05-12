@@ -88,7 +88,33 @@
                                                        :schema/author {:id          :wiki/Q42,
                                                                        :type        :schema/Person,
                                                                        :schema/name "Douglas Adams"}}}
-                   query-res))))))))
+                   query-res)))))
+      (testing "expanding literal nodes"
+        (testing "with wildcard"
+          (let [q {:context context
+                   :selectOne {:wiki/Q836821 [:* {:schema/name [:*]}]}}]
+            (is (= {:type             :schema/Movie,
+                    :schema/disambiguatingDescription
+                    "2005 British-American comic science fiction film directed by Garth Jennings",
+                    :schema/isBasedOn {:id :wiki/Q3107329},
+                    :schema/name
+                    {:value "The Hitchhiker's Guide to the Galaxy", :type :xsd/string},
+                    :schema/titleEIDR "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
+                    :id               :wiki/Q836821}
+                   @(fluree/query db q))
+                "returns all defined virtual properties")))
+        (testing "with specific virtual properties"
+          (let [q {:context   context
+                   :selectOne {:wiki/Q836821 [:* {:schema/name [:type]}]}}]
+            (is (= {:type             :schema/Movie,
+                    :schema/disambiguatingDescription
+                    "2005 British-American comic science fiction film directed by Garth Jennings",
+                    :schema/isBasedOn {:id :wiki/Q3107329},
+                    :schema/name      {:type :xsd/string},
+                    :schema/titleEIDR "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
+                    :id               :wiki/Q836821}
+                   @(fluree/query db q))
+                "returns only the virtual properties queried for")))))))
 
 (deftest ^:integration json-ld-rdf-type-query
   (testing "json-ld rdf type queries"
