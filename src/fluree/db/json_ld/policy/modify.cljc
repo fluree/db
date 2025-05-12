@@ -1,31 +1,37 @@
 (ns fluree.db.json-ld.policy.modify
-  (:require [fluree.db.dbproto :as dbproto]
+  (:require [clojure.core.async :as async]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.policy.enforce :as enforce]
             [fluree.db.json-ld.policy.rules :as policy.rules]
-            [fluree.db.util.async :refer [<? go-try]]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn refresh-policy
-  [db-after fuel-tracker policy-values {:keys [target-subject target-property] :as policy}]
+  [db-after fuel-tracker error-ch policy-values {:keys [target-subject target-property] :as policy}]
   (go-try
     (cond-> policy
-      target-subject  (update :s-targets into (<? (policy.rules/parse-targets db-after fuel-tracker policy-values target-subject)))
-      target-property (update :p-targets into (<? (policy.rules/parse-targets db-after fuel-tracker policy-values target-subject))))))
+      target-subject  (update :s-targets into (<? (policy.rules/parse-targets db-after fuel-tracker error-ch policy-values target-subject)))
+      target-property (update :p-targets into (<? (policy.rules/parse-targets db-after fuel-tracker error-ch policy-values target-subject))))))
 
 (defn refresh-modify-policies
   "Update targets to include newly created targets."
   [db-after fuel-tracker]
   (go-try
-    (let [policy-values (-> db-after :policy :policy-values)]
+    (let [error-ch (async/chan)
+          policy-values (-> db-after :policy :policy-values)]
       (loop [[policy & r] (-> db-after :policy :modify :default)
              refreshed []]
         (if policy
           (let [{:keys [target-subject target-property]} policy]
             (if (or target-subject target-property)
-              (let [policy* (<? (refresh-policy db-after fuel-tracker policy-values policy))]
-                (recur r (conj refreshed policy*)))
+              (let [[policy* _] (async/alts! [error-ch
+                                              (refresh-policy db-after fuel-tracker error-ch policy-values policy)])]
+                (if (util/exception? policy*)
+                  (throw policy*)
+                  (recur r (conj refreshed policy*))))
               (recur r (conj refreshed policy))))
           (assoc-in db-after [:policy :modify :default] refreshed))))))
 

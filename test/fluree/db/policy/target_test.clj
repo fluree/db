@@ -1,6 +1,7 @@
 (ns fluree.db.policy.target-test
   (:require [clojure.test :as t :refer [deftest testing is]]
-            [fluree.db.api :as fluree]))
+            [fluree.db.api :as fluree]
+            [fluree.db.util.core :as util]))
 
 (def burt
   {:id    "did:fluree:TfE2Frz2qkMjnCNJM5yPv7B8gq5Xhk5bqkm"
@@ -484,3 +485,31 @@
                                      "select"   {"?s" ["*"]}
                                      "opts"     {"policy" [default-policy classification-policy]}}))
               "only data with classification < 1 should be visible when using opts.policy"))))))
+
+(deftest ^:integration target-policy-exception
+  (testing "Invalid policy target queries throw exceptions"
+    (let [conn   @(fluree/connect-memory)
+          ledger @(fluree/create conn "policy/target-policy-exception")
+          db0    (fluree/db ledger)
+          db1    @(fluree/stage db0 {"@context" {"a" "http://a.co/"}
+                                     "insert"
+                                     [{"@id"    (:id arnold)
+                                       "a:name" "Arnold"}
+                                      {"@id"    (:id burt)
+                                       "a:name" "Burt"}
+                                      {"@id"    (:id charles)
+                                       "a:name" "Chuck"}]})
+          bad-policy [{"@context" {"ex" "http://example.org/ns/"
+                                   "f"  "https://ns.flur.ee/ledger#"}
+                       "@id"             "ex:badSubjectPolicy"
+                       "@type"           ["f:AccessPolicy"]
+                       "f:targetSubject" {"@type"  "@json"
+                                          "@value" {"blah" {[] []}}}
+                       "f:action"        [{"@id" "f:view"}, {"@id" "f:modify"}]
+                       "f:query"         {"@type"  "@json"
+                                          "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                    "where"    [{"@id" "?$this" "ex:classification" "?c"}
+                                                                ["filter", "(< ?c 1)"]]}}}]
+          bad-db @(fluree/wrap-policy db1 bad-policy)]
+
+      (is (util/exception? bad-db)))))
