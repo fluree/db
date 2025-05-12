@@ -3,14 +3,6 @@
 (def virtual-properties
   #{"@value" "@type" "@language"})
 
-(defn get-vprop-value
-  [{::keys [value datatype language]} vprop compact-fn]
-  (when (contains? virtual-properties vprop)
-    (case vprop
-      "@value"    value
-      "@type"     (compact-fn datatype)
-      "@language" language)))
-
 (defn ensure-compact-iri
   [cache-value iri compact-fn]
   (if (contains? cache-value iri)
@@ -34,6 +26,14 @@
   [attrs]
   (::value attrs))
 
+(defn get-vprop-object
+  [{::keys [value datatype language]} vprop compact-fn cache]
+  (when (contains? virtual-properties vprop)
+    (case vprop
+      "@value"    value
+      "@type"     (get-compact-iri cache compact-fn datatype)
+      "@language" language)))
+
 (defn format-vprop
   [attrs compact-fn {:keys [wildcard?] :as select-spec} cache vprop]
   (when-let [k (or (some-> select-spec
@@ -41,7 +41,7 @@
                            :as)
                    (and wildcard?
                         (get-compact-iri cache compact-fn vprop)))]
-    (when-let [v (get-vprop-value attrs vprop compact-fn)]
+    (when-let [v (get-vprop-object attrs vprop compact-fn cache)]
       [k v])))
 
 (defn format-literal
