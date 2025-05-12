@@ -36,15 +36,13 @@
 
 (defn format-vprop
   [attrs compact-fn {:keys [wildcard?] :as select-spec} cache vprop]
-  (if-let [k (some-> select-spec
-                     (get vprop)
-                     :as)]
-    (let [v (get-vprop-value attrs vprop compact-fn)]
-      [k v])
-    (when wildcard?
-      (let [k (get-compact-iri cache compact-fn vprop)]
-        (when-let [v (get-vprop-value attrs vprop compact-fn)]
-          [k v])))))
+  (when-let [k (or (some-> select-spec
+                           (get vprop)
+                           :as)
+                   (and wildcard?
+                        (get-compact-iri cache compact-fn vprop)))]
+    (when-let [v (get-vprop-value attrs vprop compact-fn)]
+      [k v])))
 
 (defn format-literal
   ([value datatype language compact-fn select-spec cache]
