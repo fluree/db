@@ -133,7 +133,7 @@
              (vg-parse/limit-results limit)
              (vg-parse/process-sparse-results bm25 solution search-params)
              (async/onto-chan! out-ch)))
-      (catch* e 
+      (catch* e
         (>! error-ch e)))))
 
 (defn bm25-upsert*
