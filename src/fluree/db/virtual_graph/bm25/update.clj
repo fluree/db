@@ -46,30 +46,36 @@
 (defn- extract-text
   "Takes an item and returns full concatenated text"
   [item]
-  (->> (dissoc item "@id")
-       vals
-       (reduce
-        (fn [all-text sentence]
-          (cond
+  (try
+    (->> (dissoc item "@id")
+         vals
+         (reduce
+          (fn [all-text sentence]
+            (cond
             ;; nested map is a referred node
-            (map? sentence)
-            (str all-text " " (extract-text sentence))
+              (map? sentence)
+              (str all-text " " (extract-text sentence))
 
             ;; multiple items, can be anything
-            (sequential? sentence)
-            (apply str/join
-                   (cons all-text (map #(if (map? %)
-                                          (extract-text %)
-                                          %) sentence)) " ")
+              (sequential? sentence)
+              (str/join " "
+                        (cons all-text (map #(if (map? %)
+                                               (extract-text %)
+                                               %) sentence)))
 
-            (nil? sentence)
-            all-text
+              (nil? sentence)
+              all-text
 
-            :else ;; string, or stringify other data types
-            (str all-text " " sentence))
-          (if (sequential? sentence)
-            (apply str all-text " " sentence)
-            (str all-text " " sentence))))))
+              :else ;; string, or stringify other data types
+              (str all-text " " sentence))
+            (if (sequential? sentence)
+              (apply str all-text " " sentence)
+              (str all-text " " sentence)))))
+    (catch Exception e
+      (let [msg (str "Error extracting text for BM25 from item: " item
+                     " - " (ex-message e))]
+        (throw (ex-info msg {:status 400
+                             :error "db/bm25-bad-index"}))))))
 
 (defn retract-terms-docs
   "Returns updated terms map with doc-id for sparce vec removed"
