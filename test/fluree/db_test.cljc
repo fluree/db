@@ -1031,76 +1031,105 @@
 #?(:clj
    (deftest drop-test
      (with-tmp-dir storage-path
-       (let [conn   @(fluree/connect-file {:storage-path storage-path})
-             alias  "destined-for-drop"
-             ledger @(fluree/create conn alias {:reindex-min-bytes 100 :max-old-indexes 3})
-             db0    (-> (fluree/db ledger)
-                        ;; wrap with a policy so we are storing txns
-                        (fluree/wrap-policy {"@context" {"ex" "http://example.org/ns/" "f" "https://ns.flur.ee/ledger#"}
-                                             "@id" "ex:defaultAllowViewModify"
-                                             "@type" ["f:AccessPolicy"]
-                                             "f:action" [{"@id" "f:view"},
-                                                         {"@id" "f:modify"}]
-                                             "f:query" {"@type" "@json" "@value" {}}})
-                        deref)
-             tx1    {"insert" [{"@id" "ex:foo" "ex:num1" (range 1000)}]}
-             tx2    {"insert" [{"@id" "ex:foo" "ex:num2" (range 1000)}]}
-             tx3    {"insert" [{"@id" "ex:foo" "ex:num3" (range 1000)}]}
-             _db1   (->> @(fluree/stage db0 tx1 {:raw-txn tx1})
-                         (fluree/commit! ledger)
-                         deref)
-             _db2   (->> @(fluree/stage (fluree/db ledger) tx2 {:raw-txn tx2})
-                         (fluree/commit! ledger)
-                         deref)
-             _db3   (->> @(fluree/stage (fluree/db ledger) tx3 {:raw-txn tx3})
-                         (fluree/commit! ledger)
-                         deref)
+       (let [primary-path   (str storage-path "/primary")
+             secondary-path (str storage-path "/secondary")
+
+             conn     @(fluree/connect {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
+                                                    "@vocab" "https://ns.flur.ee/system#"}
+                                        "@id"      "file"
+                                        "@graph"   [{"@id" "primaryStorage"
+                                                     "@type" "Storage"
+                                                     "filePath" primary-path}
+                                                    {"@id" "secondaryStorage"
+                                                     "@type" "Storage"
+                                                     "filePath" secondary-path}
+                                                    {"@id" "connection"
+                                                     "@type" "Connection"
+                                                     "parallelism" 4
+                                                     "cacheMaxMb" 1000
+                                                     "commitStorage" {"@id" "primaryStorage"}
+                                                     "indexStorage" {"@id" "primaryStorage"}
+                                                     "primaryPublisher" {"@type" "Publisher"
+                                                                         "storage" {"@id" "primaryStorage"}}
+                                                     ;; secondary publisher on other storage
+                                                     "secondaryPublishers" {"@type" "Publisher"
+                                                                            "storage" {"@id" "secondaryStorage"}}}]})
+             alias    "destined-for-drop"
+             ledger   @(fluree/create conn alias {:reindex-min-bytes 100 :max-old-indexes 3})
+             db0      (-> (fluree/db ledger)
+                          ;; wrap with a policy so we are storing txns
+                          (fluree/wrap-policy {"@context" {"ex" "http://example.org/ns/" "f" "https://ns.flur.ee/ledger#"}
+                                               "@id"      "ex:defaultAllowViewModify"
+                                               "@type"    ["f:AccessPolicy"]
+                                               "f:action" [{"@id" "f:view"},
+                                                           {"@id" "f:modify"}]
+                                               "f:query"  {"@type" "@json" "@value" {}}})
+                          deref)
+             tx1      {"insert" [{"@id" "ex:foo" "ex:num1" (range 1000)}]}
+             tx2      {"insert" [{"@id" "ex:foo" "ex:num2" (range 1000)}]}
+             tx3      {"insert" [{"@id" "ex:foo" "ex:num3" (range 1000)}]}
+             _db1     (->> @(fluree/stage db0 tx1 {:raw-txn tx1})
+                           (fluree/commit! ledger)
+                           deref)
+             _db2     (->> @(fluree/stage (fluree/db ledger) tx2 {:raw-txn tx2})
+                           (fluree/commit! ledger)
+                           deref)
+             _db3     (->> @(fluree/stage (fluree/db ledger) tx3 {:raw-txn tx3})
+                           (fluree/commit! ledger)
+                           deref)
              tx-count 3]
          ;; wait for everything to be written
          (Thread/sleep 1000)
          (testing "before drop"
            (is (= ["destined-for-drop" "destined-for-drop.json"]
-                  (sort (async/<!! (fs/list-files storage-path)))))
+                  (sort (async/<!! (fs/list-files primary-path)))))
+           (is (= ["destined-for-drop.json"]
+                  (async/<!! (fs/list-files secondary-path))))
            (is (= ["commit" "index" "txn"]
-                  (sort (async/<!! (fs/list-files (str storage-path "/" alias))))))
+                  (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
            ;; only store txns when signed
            (is (= tx-count
-                  (count (async/<!! (fs/list-files (str storage-path "/" alias "/txn"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/txn"))))))
            ;; initial create call generates an initial commit, each commit has two files
            (is (= (* 2 (inc tx-count))
-                  (count (async/<!! (fs/list-files (str storage-path "/" alias "/commit"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/commit"))))))
            (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
-                  (sort (async/<!! (fs/list-files (str storage-path "/" alias "/index"))))))
+                  (sort (async/<!! (fs/list-files (str primary-path "/" alias "/index"))))))
            ;; one new index root per tx
            (is (= tx-count
-                  (count (async/<!! (fs/list-files (str storage-path "/" alias "/index/root"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/root"))))))
            ;; one garbage file for each obsolete index root
            (is (= (dec tx-count)
-                  (count (async/<!! (fs/list-files (str storage-path "/" alias "/index/garbage"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/garbage"))))))
            (is (= 6
-                  (count (async/<!! (fs/list-files (str storage-path "/" alias "/index/spot"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/spot"))))))
            (is (= 6
-                  (count (async/<!! (fs/list-files (str storage-path "/" alias "/index/post"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/post"))))))
            (is (= 6
-                  (count (async/<!! (fs/list-files (str storage-path "/" alias "/index/tspo"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/tspo"))))))
            (is (= 6
-                  (count (async/<!! (fs/list-files (str storage-path "/" alias "/index/opst")))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/opst")))))))
          (testing "drop"
            (is (= :dropped
                   @(fluree/drop conn alias))))
+         ;; wait for deletion
+         (Thread/sleep 1000)
          (testing "after drop"
            ;; directories are not removed
            (is (= ["destined-for-drop"]
-                  (async/<!! (fs/list-files storage-path))))
+                  (async/<!! (fs/list-files primary-path))))
+           (is (= []
+                  (async/<!! (fs/list-files secondary-path))))
            (is (= ["commit" "index" "txn"]
-                  (sort (async/<!! (fs/list-files (str storage-path "/" alias))))))
+                  (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
            (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
-                  (sort (async/<!! (fs/list-files (str storage-path "/" alias "/index"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str storage-path "/" alias "/txn"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str storage-path "/" alias "/commit"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str storage-path "/" alias "/index/root"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str storage-path "/" alias "/index/garbage"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str storage-path "/" alias "/index/spot"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str storage-path "/" alias "/index/post"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str storage-path "/" alias "/index/tspo"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str storage-path "/" alias "/index/opst")))))))))))
+                  (sort (async/<!! (fs/list-files (str primary-path "/" alias "/index"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/txn"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/commit"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/root"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/root"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/garbage"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/spot"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/post"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/tspo"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/opst")))))))))))
