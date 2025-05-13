@@ -891,17 +891,19 @@
           err (try (sparql/->fql query)
                    (catch #?(:clj  clojure.lang.ExceptionInfo
                              :cljs :default) e e))]
-      (is (= (str/join "\n" ["Improperly formatted SPARQL query:"
-                             "Parse error at line 2, column 25:"
-                             "                 WHERE  ?person person:fullName \"jdoe\""
-                             "                        ^"
-                             "Expected:"
-                             "{"
-                             ""
-                             ""
-                             "Note: Fluree does not support all SPARQL features."
-                             "See here for more information:"
-                             "https://next.developers.flur.ee/docs/reference/errorcodes#query-sparql-improper"])
+      (is (= #?(:clj (str/join "\n" ["Improperly formatted SPARQL query:"
+                                     "Parse error at line 2, column 25:"
+                                     "                 WHERE  ?person person:fullName \"jdoe\""
+                                     "                        ^"
+                                     "Expected:"
+                                     "{"
+                                     ""
+                                     ""
+                                     "Note: Fluree does not support all SPARQL features."
+                                     "See here for more information:"
+                                     "https://next.developers.flur.ee/docs/reference/errorcodes#query-sparql-improper"])
+                :cljs
+                "Improperly formatted SPARQL query:\nParse error at line 2, column 25:\n                 WHERE  ?person person:fullName \"jdoe\"\n                        ^\nExpected:\n\"{\"\n\n\nNote: Fluree does not support all SPARQL features.\nSee here for more information:\nhttps://next.developers.flur.ee/docs/reference/errorcodes#query-sparql-improper")
              (ex-message err)))
       (is (= {:status 400
               :error :db/invalid-query}
