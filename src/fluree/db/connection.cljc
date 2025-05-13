@@ -482,7 +482,8 @@
 
         (doseq [address addresses]
           (log/debug "Dropping node" address)
-          (storage/delete storage address))))))
+          (storage/delete storage address))))
+    :nodes-dropped))
 
 (defn drop-index-artifacts
   [{:keys [index-catalog] :as _conn} latest-commit]
@@ -504,7 +505,8 @@
           (<? post-ch)
           (<? tspo-ch)
           (<? opst-ch)
-          (<? (storage/delete storage index-address)))))))
+          (<? (storage/delete storage index-address))))
+      :index-dropped)))
 
 (defn drop-ledger
   [conn alias]
@@ -515,16 +517,14 @@
       (loop [[publisher & r] (publishers conn)]
         (when publisher
           (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
-                _             (log/debug "Dropping ledger" ledger-addr)
                 latest-commit (-> (<? (nameservice/lookup publisher ledger-addr))
-                                  json-ld/expand)
-                index-ch      (drop-index-artifacts conn latest-commit)
-                commit-ch     (drop-commit-artifacts conn latest-commit)]
-            (<? index-ch)
-            (<? commit-ch)
+                                  json-ld/expand)]
+            (log/warn "Dropping ledger" ledger-addr)
+            (drop-index-artifacts conn latest-commit)
+            (drop-commit-artifacts conn latest-commit)
             (<? (nameservice/retract publisher alias))
             (recur r))))
-      (log/debug "Dropped ledger" alias)
+      (log/warn "Dropped ledger" alias)
       :dropped)))
 
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
