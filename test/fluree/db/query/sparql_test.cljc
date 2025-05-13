@@ -1459,6 +1459,22 @@
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
+         (testing "GROUP_CONCAT aggregate fn query works"
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (GROUP_CONCAT(?favNums; separator=\", \") AS ?nums)
+                          WHERE {?person person:favNums ?favNums.}
+                          GROUP BY ?person"]
+             (testing "output :fql"
+               (is (= [["0, 3, 5, 6, 7, 8, 9"] ["3, 7, 42, 99"] ["23"]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["nums"]},
+                       "results"
+                       {"bindings"
+                        [{"nums" {"value" "0, 3, 5, 6, 7, 8, 9", "type" "literal"}}
+                         {"nums" {"value" "3, 7, 42, 99", "type" "literal"}}
+                         {"nums" {"value" "23", "type" "literal"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "aggregate fn w/ GROUP BY ... HAVING query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (AVG(?favNums) AS ?avgFav)
