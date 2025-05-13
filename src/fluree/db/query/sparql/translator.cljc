@@ -37,13 +37,18 @@
   [[_ & var]]
   (str "?" (str/join var)))
 
+(defmethod parse-term :Separator
+  [[_ & separator-chars]]
+  (apply str separator-chars))
+
 (def supported-aggregate-functions
   {"MAX"       "max"
    "MIN"       "min"
    "SAMPLE"    "sample1"
    "COUNT"     "count"
    "SUM"       "sum"
-   "AVG"       "avg"})
+   "AVG"       "avg"
+   "GROUP_CONCAT" "groupconcat"})
 
 (defmethod parse-term :Aggregate
   ;; Aggregate ::= 'COUNT' WS <'('> WS 'DISTINCT'? WS ( '*' | Expression ) WS <')'> WS
@@ -65,8 +70,8 @@
 
                   :else
                   f)
-          body (if distinct? (second body) (first body))]
-      (str "(" f " " (parse-term body) ")"))
+          [mset scalarvals] (if distinct? (rest body) body)]
+      (str "(" f " " (parse-term mset) (when scalarvals (str " " (literal-quote (parse-term scalarvals)))) ")"))
     (throw (ex-info (str "Unsupported aggregate function: " func)
                     {:status 400 :error :db/invalid-query}))))
 

@@ -75,8 +75,15 @@
             {:keys [select]} (sparql/->fql query)]
         (is (= ["?fullName" "(as (sum ?favNums) ?sum)"]
                select))))
-    ;;TODO: not yet supported
-    #_(testing "GROUP_CONCAT")))
+    (testing "GROUP_CONCAT"
+      (let [query "SELECT ?author (GROUP_CONCAT(?title; separator=\", \") AS ?books)
+                   WHERE {
+                     ?book dc:creator ?author .
+                     ?book dc:title ?title .
+                   }
+                   GROUP BY ?author"]
+        (is (= ["?author" "(as (groupconcat ?title \", \") ?books)"]
+               (:select (sparql/->fql query))))))))
 
 (deftest parse-construct
   (testing "basic construct"
