@@ -174,6 +174,14 @@
       (is (= [{"@id" "?person", "@type" {"@id" "schema:Person"}}]
              where)
           "a as an alias for @type")))
+  (testing "anonymous blank nodes"
+    (let [query "SELECT ?x
+                 WHERE { ?x ex:friend [ a ex:Person ; ex:name ?name ] . }"]
+      (is (= {:context {},
+              :select ["?x"],
+              :where [{"@id" "?x", "ex:friend" {"@id" "_:b1"}}
+                      {"@id" "_:b1", "@type" "ex:Person", "ex:name" "?name"}]}
+             (sparql/->fql query)))))
   (testing "multi clause"
     (let [query "SELECT ?person ?nums
                  WHERE {?person person:handle \"jdoe\".

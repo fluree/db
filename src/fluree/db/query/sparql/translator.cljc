@@ -3,6 +3,12 @@
             [clojure.string :as str]
             [fluree.db.constants :as const]))
 
+(def bnode-counter (atom 0))
+
+(defn new-bnode!
+  []
+  (str "_:b" (swap! bnode-counter inc)))
+
 (defn rule?
   [x]
   (and (sequential? x)
@@ -645,16 +651,21 @@
   ;; <VarOrTerm> ::= Var | GraphTerm WS
   ;; TriplesNode ::= Collection | BlankNodePropertyList
   ;; Collection ::=  '(' GraphNode+ ')'
-  ;; BlankNodePropertyList ::= '[' PropertyListNotEmpty ']'
   [[_ & path]]
   (mapv parse-term path))
+
+(defmethod parse-term :BlankNodePropertyListPath
+  ;; BlankNodePropertyListPath ::= <'['> PropertyListPathNotEmpty <']'>
+  [[_ plist]]
+  (->> (partition-all 2 (parse-term plist))
+       (mapv (fn [[p o]] (if (= p const/iri-type) [p (get o const/iri-id)] [p o])))
+       (into {const/iri-id (new-bnode!)})))
 
 (defmethod parse-term :ObjectPath
   ;; ObjectPath ::= GraphNodePath
   ;; <GraphNodePath> ::= VarOrTerm | TriplesNodePath
-  ;; TriplesNodePath  ::=  CollectionPath WS | BlankNodePropertyListPath WS
+  ;; <TriplesNodePath>  ::=  CollectionPath WS | BlankNodePropertyListPath WS
   ;; CollectionPath ::= '(' GraphNodePath+ ')'
-  ;; BlankNodePropertyListPath ::= '[' PropertyListPathNotEmpty ']'
   [[_ & objs]]
   (mapv (fn [[tag :as obj]]
           (if (= tag :iri)
@@ -684,7 +695,11 @@
   [[_ subject properties]]
   (let [s (parse-term subject)]
     (->> (partition-all 2 (parse-term properties))
-         (mapv (fn [[p o]] {"@id" s p o})))))
+         (reduce (fn [triples [p o]]
+                   (into triples (if (and (get o const/iri-id) (> (count o) 1))
+                                   ;; unpack nested object into a separate triple with ref
+                                   [{"@id" s p (select-keys o [const/iri-id])} o]
+                                   [{"@id" s p o}]))) []))))
 
 (defmethod parse-term :TriplesBlock
   ;; TriplesBlock ::= WS TriplesSameSubjectPath WS ( <'.'> TriplesBlock? WS )?
@@ -950,6 +965,7 @@
 
 (defn translate
   [parsed]
+  (reset! bnode-counter 0)
   (reduce (fn [fql rule] (into fql (parse-rule rule)))
           {}
           parsed))
