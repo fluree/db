@@ -653,8 +653,8 @@
                       reasoner flake.reasoner/non-reasoned-flakes)]
     (log/trace "generate-commit flakes:" flakes)
     (loop [[s-flakes & r] (partition-by flake/s flakes)
-           assert  []
-           retract []]
+           assert  (transient [])
+           retract (transient [])]
       (if s-flakes
         (let [sid   (flake/s (first s-flakes))
               s-iri (get-s-iri db sid compact-fn)
@@ -676,12 +676,12 @@
                                   (-> (subject-block retract-flakes db compact-fn)
                                       (assoc id-key s-iri)))]
                   [(cond-> assert
-                     s-assert (conj s-assert))
+                     s-assert (conj! s-assert))
                    (cond-> retract
-                     s-retract (conj s-retract))]))]
+                     s-retract (conj! s-retract))]))]
           (recur r assert* retract*))
-        {:assert   assert
-         :retract  retract
+        {:assert   (persistent! assert)
+         :retract  (persistent! retract)
          :flakes   flakes}))))
 
 (defn new-namespaces
