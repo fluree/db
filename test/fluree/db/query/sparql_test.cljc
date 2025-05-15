@@ -109,6 +109,19 @@
               {"@id" "_:v", "vcard:givenName" "?gname"}
               {"@id" "_:v", "vcard:familyName" "?fname"}]
              (:construct (sparql/->fql query))))))
+  (testing "templates with anon bnodes"
+    (let [query "CONSTRUCT {[ a ?x ]}
+                 WHERE { ?x a ?foo . }"]
+      (is (= {:context {},
+              :construct [{"@id" "_:b1" "@type" "?x"}],
+              :where [{"@id" "?x", "@type" "?foo"}]}
+             (sparql/->fql query))))
+    (let [query "CONSTRUCT {[] a ?x}
+                 WHERE { ?x a ?foo . }"]
+      (is (= {:context {},
+              :construct [{"@id" "_:b1" "@type" "?x"}],
+              :where [{"@id" "?x", "@type" "?foo"}]}
+             (sparql/->fql query)))))
   (testing "CONSTRUCT WHERE"
     (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
                  CONSTRUCT WHERE { ?x foaf:name ?name }"]

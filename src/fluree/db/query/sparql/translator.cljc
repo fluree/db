@@ -37,6 +37,10 @@
     "false" false
     "true" true))
 
+(defmethod parse-term :ANON
+  [_]
+  (new-bnode!))
+
 (defmethod parse-term :Var
   ;; Var ::= VAR1 WS | VAR2 WS
   ;; [:Var "n" "u" "m" "s"]
@@ -416,20 +420,34 @@
   ;; <Verb> ::= VarOrIri | Type
   [[_ verb objects]]
   (let [p (parse-term verb)]
-    (mapv #(vector p (if (= const/iri-type p)
+    (mapv #(vector p (if (and (= const/iri-type p)
+                              (not= \? (first %)))
                        (get % const/iri-id)
-                       %)) (parse-term objects))))
+                       %))
+          (parse-term objects))))
 
 (defmethod parse-term :PropertyListNotEmpty
   ;; PropertyListNotEmpty ::= PropertyObjectList ( <';'>  WS ( PropertyObjectList )? )*
   [[_ & properties]]
   (mapcat parse-term properties))
 
-(defmethod parse-term :TriplesSameSubject
-  ;; TriplesSameSubject ::= VarOrTerm PropertyListNotEmpty | TriplesNode PropertyList
+(defmethod parse-term :PropertyList
+  ;; PropertyList ::= PropertyListNotEmpty?
+  [[_ plist]]
+  (if plist
+    (parse-term plist)
+    []))
+
+(defmethod parse-term :TriplesSameSubject1
+  ;; TriplesSameSubject1 ::= VarOrTerm PropertyListNotEmpty
   [[_ subject properties]]
   (let [s (parse-term subject)]
     (mapv (fn [[p o]] {"@id" s p o}) (parse-term properties))))
+
+(defmethod parse-term :TriplesSameSubject2
+  ;; TriplesSameSubject1 ::= TriplesNode PropertyList
+  [[_ node plist]]
+  [(into (parse-term node) (parse-term plist))])
 
 (defmethod parse-rule :ConstructTemplate
   ;; ConstructTemplate   ::=   <'{'> WS ConstructTriples? WS <'}'> WS
@@ -649,10 +667,15 @@
   ;; Object ::= GraphNode
   ;; <GraphNode> ::= VarOrTerm | TriplesNode
   ;; <VarOrTerm> ::= Var | GraphTerm WS
-  ;; TriplesNode ::= Collection | BlankNodePropertyList
+  ;; <TriplesNode> ::= Collection | BlankNodePropertyList
   ;; Collection ::=  '(' GraphNode+ ')'
   [[_ & path]]
   (mapv parse-term path))
+
+(defmethod parse-term :BlankNodePropertyList
+  ;; BlankNodePropertyList ::= <'['> PropertyListNotEmpty <']'>
+  [[_ plist]]
+  (into {const/iri-id (new-bnode!)} (parse-term plist)))
 
 (defmethod parse-term :BlankNodePropertyListPath
   ;; BlankNodePropertyListPath ::= <'['> PropertyListPathNotEmpty <']'>
