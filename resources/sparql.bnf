@@ -202,13 +202,14 @@ SubstringExpression   ::=   <'SUBSTR'> <'('> Expression <','> Expression ( <','>
 StrReplaceExpression    ::=   <'REPLACE'> <'('> Expression <','> Expression <','> Expression ( <','> Expression )? <')'>
 ExistsFunc    ::=   <'EXISTS'> GroupGraphPattern
 NotExistsFunc   ::=   <'NOT'> WS <'EXISTS'> GroupGraphPattern
+Separator ::= ( <';'> WS <('SEPARATOR' | 'separator')> WS <'='> String )
 Aggregate   ::=     'COUNT' WS <'('> WS 'DISTINCT'? WS ( '*' | Expression ) WS <')'> WS
 | 'SUM' WS <'('> WS 'DISTINCT'? Expression <')'>
 | 'MIN' <'('>  WS 'DISTINCT'? Expression <')'>
 | 'MAX' <'('>  WS 'DISTINCT'? Expression <')'>
 | 'AVG' <'('>  WS 'DISTINCT'? Expression <')'>
 | 'SAMPLE' <'('>  WS 'DISTINCT'? Expression? Expression <')'>
-| 'GROUP_CONCAT' <'('> WS 'DISTINCT'? Expression ( <';'> WS 'SEPARATOR' WS <'='> WS String WS )? <')'>
+| 'GROUP_CONCAT' <'('> WS 'DISTINCT'? Expression Separator? <')'>
 iriOrFunction	  ::=  	iri ArgList?
 RDFLiteral	  ::=  	String WS ( LANGTAG | ( '^^' iri ) )? WS
 NumericLiteral	  ::=  	NumericLiteralUnsigned WS | NumericLiteralPositive WS | NumericLiteralNegative WS

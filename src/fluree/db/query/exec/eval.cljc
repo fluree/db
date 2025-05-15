@@ -84,7 +84,18 @@
   [coll]
   (where/->typed-val (count coll)))
 
-(def groupconcat clojure.core/concat)
+(defn groupconcat
+  "GroupConcat is a set function which performs a string concatenation across the values
+  of an expression with a group. The order of the strings is not specified. The
+  separator character used in the concatenation may be given with the scalar argument
+  SEPARATOR.
+
+  If the separator scalar argument is absent from GROUP_CONCAT then it is taken to be
+  the space character, unicode codepoint U+0020."
+  ([coll]
+   (groupconcat coll (where/->typed-val " ")))
+  ([coll separator]
+   (where/->typed-val (str/join (:value separator) (mapv :value coll)))))
 
 (defn sample
   [{n :value} coll]
