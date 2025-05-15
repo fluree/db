@@ -377,7 +377,7 @@
                      ;; translate back to string
                     (sparql.translator/parse-term)
                      ;; separate recursion modifier
-                    (split-at (dec (count path-expr)))
+                    (#(split-at (dec (count %)) %))
                      ;; turn back into strings
                     (map (partial apply str)))
         recur-mod   ({"+" :one+ "*" :zero+} mod)]
