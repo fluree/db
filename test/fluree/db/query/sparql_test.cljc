@@ -937,14 +937,27 @@
 (deftest parsing-error
   (testing "invalid query throws expected error"
     (let [query "SELECT ?person
-                 WHERE  ?person person:fullName \"jdoe\""]
+                 WHERE  ?person person:fullName \"jdoe\""
+          err (try (sparql/->fql query)
+                   (catch #?(:clj  clojure.lang.ExceptionInfo
+                             :cljs :default) e e))]
+      (is (= #?(:clj (str/join "\n" ["Improperly formatted SPARQL query:"
+                                     "Parse error at line 2, column 25:"
+                                     "                 WHERE  ?person person:fullName \"jdoe\""
+                                     "                        ^"
+                                     "Expected:"
+                                     "{"
+                                     ""
+                                     ""
+                                     "Note: Fluree does not support all SPARQL features."
+                                     "See here for more information:"
+                                     "https://next.developers.flur.ee/docs/reference/errorcodes#query-sparql-improper"])
+                :cljs
+                "Improperly formatted SPARQL query:\nParse error at line 2, column 25:\n                 WHERE  ?person person:fullName \"jdoe\"\n                        ^\nExpected:\n\"{\"\n\n\nNote: Fluree does not support all SPARQL features.\nSee here for more information:\nhttps://next.developers.flur.ee/docs/reference/errorcodes#query-sparql-improper")
+             (ex-message err)))
       (is (= {:status 400
-              :error  :db/invalid-query}
-             (try
-               (sparql/->fql query)
-               "should throw 400, :db/invalid-query"
-               (catch #?(:clj  clojure.lang.ExceptionInfo
-                         :cljs :default) e (ex-data e))))))))
+              :error :db/invalid-query}
+             (ex-data err))))))
 
 (deftest ^:integration query-test
   (let [txn (str/join "\n"
