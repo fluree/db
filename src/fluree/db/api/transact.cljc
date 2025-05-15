@@ -57,7 +57,15 @@
            (-> txn
                (format-txn override-opts)
                (parse/parse-ledger-txn override-opts)
-               (update :opts dissoc :context :did))
+               (update :opts dissoc :context :did :identity)) ; Using an
+                                                              ; identity option
+                                                              ; with an empty
+                                                              ; ledger will
+                                                              ; always fail
+                                                              ; policy checks
+                                                              ; because there
+                                                              ; are no policies
+                                                              ; to check.
            ledger-opts (-> parsed-txn :opts syntax/coerce-ledger-opts)
            ledger      (<? (connection/create-ledger conn ledger-id ledger-opts))]
        (<? (connection/transact-ledger! conn ledger parsed-txn))))))
