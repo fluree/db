@@ -788,10 +788,6 @@
     :else
     x))
 
-(defn mch->typed-val
-  [{::where/keys [val iri datatype-iri meta]}]
-  (where/->typed-val (or iri val) (if iri const/iri-id datatype-iri) (:lang meta)))
-
 (defn bind-variables
   [soln-sym var-syms ctx]
   (into `[~context-var ~ctx]
@@ -799,8 +795,8 @@
                   `[mch# (get ~soln-sym (quote ~var))
                     ;; convert match to TypedValue
                     ~var (if (= ::group/grouping (where/get-datatype-iri mch#))
-                           (mapv mch->typed-val (where/get-binding mch#))
-                           (mch->typed-val mch#))]))
+                           (mapv where/mch->typed-val (where/get-binding mch#))
+                           (where/mch->typed-val mch#))]))
         var-syms))
 
 (defn compile*

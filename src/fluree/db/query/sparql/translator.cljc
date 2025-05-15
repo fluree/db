@@ -493,7 +493,13 @@
   [[_ & bindings]]
   ;; bindings come in as val, var; need to be reversed to var, val.
   (into [:bind] (->> bindings
-                     (mapv parse-term)
+                     (mapv (fn [term]
+                             (let [terms (into #{} (flatten term))
+                                   parsed (parse-term term)]
+                               (if (and (terms :iriOrFunction) (not= \( (first parsed)))
+                                 ;; static iri
+                                 {const/iri-id parsed}
+                                 (parse-term term)))))
                      (partition-all 2)
                      (mapcat reverse))))
 

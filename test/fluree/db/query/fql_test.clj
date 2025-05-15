@@ -304,6 +304,47 @@
                 ["L" "Liam" false]]
                res))))
 
+    (testing "with static binds"
+      (let [q   {:context  [test-utils/default-context
+                            {:ex "http://example.org/ns/"}]
+                 :construct '[{:id ?s
+                               :ex/firstLetter ?firstLetterOfName
+                               :ex/const ?const
+                               :ex/greeting ?langstring
+                               :ex/date     ?date}]
+                 :where    '[{:id ?s
+                              :schema/age  ?age
+                              :schema/name ?name}
+                             [:bind
+                              ?firstLetterOfName (subStr ?name 1 1)
+                              ?const             "const"
+                              ?langstring        {"@value" "hola" "@language" "es"}
+                              ?bool              false
+                              ?date              {"@value" "2020-01-10" "@type" "ex:mydate"}]]
+                 :order-by '?name}
+            res (-> @(fluree/query db q) (get "@graph"))]
+        (is (= [{:id :ex/alice,
+                 :ex/firstLetter ["A"],
+                 :ex/const ["const"],
+                 :ex/greeting [{"@value" "hola", "@language" "es"}],
+                 :ex/date [{"@value" "2020-01-10", :type "ex:mydate"}]}
+                {:id :ex/brian,
+                 :ex/firstLetter ["B"],
+                 :ex/const ["const"],
+                 :ex/greeting [{"@value" "hola", "@language" "es"}],
+                 :ex/date [{"@value" "2020-01-10", :type "ex:mydate"}]}
+                {:id :ex/cam,
+                 :ex/firstLetter ["C"],
+                 :ex/const ["const"],
+                 :ex/greeting [{"@value" "hola", "@language" "es"}],
+                 :ex/date [{"@value" "2020-01-10", :type "ex:mydate"}]}
+                {:id :ex/liam,
+                 :ex/firstLetter ["L"],
+                 :ex/const ["const"],
+                 :ex/greeting [{"@value" "hola", "@language" "es"}],
+                 :ex/date [{"@value" "2020-01-10", :type "ex:mydate"}]}]
+               res))))
+
     (testing "with invalid aggregate fn"
       (let [q {:context  [test-utils/default-context
                           {:ex "http://example.org/ns/"}]
