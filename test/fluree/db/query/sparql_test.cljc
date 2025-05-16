@@ -75,8 +75,15 @@
             {:keys [select]} (sparql/->fql query)]
         (is (= ["?fullName" "(as (sum ?favNums) ?sum)"]
                select))))
-    ;;TODO: not yet supported
-    #_(testing "GROUP_CONCAT")))
+    (testing "GROUP_CONCAT"
+      (let [query "SELECT ?author (GROUP_CONCAT(?title; separator=\", \") AS ?books)
+                   WHERE {
+                     ?book dc:creator ?author .
+                     ?book dc:title ?title .
+                   }
+                   GROUP BY ?author"]
+        (is (= ["?author" "(as (groupconcat ?title \", \") ?books)"]
+               (:select (sparql/->fql query))))))))
 
 (deftest parse-construct
   (testing "basic construct"
@@ -202,17 +209,31 @@
              where))))
   (testing "transitive property path"
     (testing "one-or-more"
-      (let [query "SELECT ?uri ?broader
-                 WHERE {?uri (<http://www.w3.org/2004/02/skos/core#broader>)+ ?broader.}"]
+      (testing "compact IRI"
+        (let [query "SELECT ?uri ?broader
+                     WHERE {?uri skos:broader+ ?broader.}"]
 
-        (is (= [{"@id" "?uri", "<http://www.w3.org/2004/02/skos/core#broader+>" "?broader"}]
-               (:where (sparql/->fql query))))))
+          (is (= [{"@id" "?uri", "<skos:broader+>" "?broader"}]
+                 (:where (sparql/->fql query))))))
+      (testing "expanded IRI"
+        (let [query "SELECT ?uri ?broader
+                     WHERE {?uri (<http://www.w3.org/2004/02/skos/core#broader>)+ ?broader.}"]
+
+          (is (= [{"@id" "?uri", "<<http://www.w3.org/2004/02/skos/core#broader>+>" "?broader"}]
+                 (:where (sparql/->fql query)))))))
     (testing "zero-or-more"
-      (let [query "SELECT ?uri ?broader
+      (testing "compact IRI"
+        (let [query "SELECT ?uri ?broader
+                 WHERE {?uri (skos:broader)* ?broader.}"]
+
+          (is (= [{"@id" "?uri", "<skos:broader*>" "?broader"}]
+                 (:where (sparql/->fql query))))))
+      (testing "expanded IRI"
+        (let [query "SELECT ?uri ?broader
                  WHERE {?uri (<http://www.w3.org/2004/02/skos/core#broader>)* ?broader.}"]
 
-        (is (= [{"@id" "?uri", "<http://www.w3.org/2004/02/skos/core#broader*>" "?broader"}]
-               (:where (sparql/->fql query)))))))
+          (is (= [{"@id" "?uri", "<<http://www.w3.org/2004/02/skos/core#broader>*>" "?broader"}]
+                 (:where (sparql/->fql query))))))))
   (testing "UNION"
     (let [query "SELECT ?person ?age
                  WHERE {?person person:age 70 .
@@ -421,13 +442,63 @@
                (select-keys (sparql/->fql query) [:where :values]))
             "where pattern: single var, multiple values"))))
   (testing "BIND"
-    (let [query "SELECT ?person ?handle
+    (testing "static values"
+      (testing "string"
+        (let [query "SELECT ?person ?handle
                  WHERE {BIND (\"dsanchez\" AS ?handle)
                         ?person person:handle ?handle.}"
-          {:keys [where]} (sparql/->fql query)]
-      (is (= [[:bind "?handle" "dsanchez"]
-              {"@id" "?person", "person:handle" "?handle"}]
-             where)))
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?handle" "dsanchez"]
+                  {"@id" "?person", "person:handle" "?handle"}]
+                 where))))
+      (testing "langstring"
+        (let [query "SELECT ?person ?bound
+                 WHERE {BIND (\"dsanchez\"@en AS ?bound)
+                        ?person person:handle ?bound.}"
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?bound" {"@value" "dsanchez", "@language" "en"}]
+                  {"@id" "?person", "person:handle" "?bound"}]
+                 where))))
+      (testing "boolean"
+        (let [query "SELECT ?person ?bound
+                 WHERE {BIND (true AS ?bound)
+                        ?person person:handle ?bound.}"
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?bound" true]
+                  {"@id" "?person", "person:handle" "?bound"}]
+                 where))))
+      (testing "integer"
+        (let [query "SELECT ?person ?bound
+                 WHERE {BIND (1 AS ?bound)
+                        ?person person:handle ?bound.}"
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?bound" 1]
+                  {"@id" "?person", "person:handle" "?bound"}]
+                 where))))
+      (testing "float"
+        (let [query "SELECT ?person ?bound
+                 WHERE {BIND (1.0 AS ?bound)
+                        ?person person:handle ?bound.}"
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?bound" 1.0]
+                  {"@id" "?person", "person:handle" "?bound"}]
+                 where))))
+      (testing "IRI"
+        (let [query "SELECT ?person ?bound
+                 WHERE {BIND (<ex:foo> AS ?bound)
+                        ?person person:handle ?bound.}"
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?bound" {"@id" "ex:foo"}]
+                  {"@id" "?person", "person:handle" "?bound"}]
+                 where))))
+      (testing "compact IRI"
+        (let [query "SELECT ?person ?bound
+                 WHERE {BIND (ex:foo AS ?bound)
+                        ?person person:handle ?bound.}"
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?bound" {"@id" "ex:foo"}]
+                  {"@id" "?person", "person:handle" "?bound"}]
+                 where)))))
     (let [query "SELECT ?person ?prefix ?foofix ?num1
                  WHERE {BIND (SUBSTR(?handle, 4) AS ?prefix)
                         BIND (REPLACE(?prefix, \"abc\", \"FOO\") AS ?foofix)
@@ -873,14 +944,27 @@
 (deftest parsing-error
   (testing "invalid query throws expected error"
     (let [query "SELECT ?person
-                 WHERE  ?person person:fullName \"jdoe\""]
+                 WHERE  ?person person:fullName \"jdoe\""
+          err (try (sparql/->fql query)
+                   (catch #?(:clj  clojure.lang.ExceptionInfo
+                             :cljs :default) e e))]
+      (is (= #?(:clj (str/join "\n" ["Improperly formatted SPARQL query:"
+                                     "Parse error at line 2, column 25:"
+                                     "                 WHERE  ?person person:fullName \"jdoe\""
+                                     "                        ^"
+                                     "Expected:"
+                                     "{"
+                                     ""
+                                     ""
+                                     "Note: Fluree does not support all SPARQL features."
+                                     "See here for more information:"
+                                     "https://next.developers.flur.ee/docs/reference/errorcodes#query-sparql-improper"])
+                :cljs
+                "Improperly formatted SPARQL query:\nParse error at line 2, column 25:\n                 WHERE  ?person person:fullName \"jdoe\"\n                        ^\nExpected:\n\"{\"\n\n\nNote: Fluree does not support all SPARQL features.\nSee here for more information:\nhttps://next.developers.flur.ee/docs/reference/errorcodes#query-sparql-improper")
+             (ex-message err)))
       (is (= {:status 400
-              :error  :db/invalid-query}
-             (try
-               (sparql/->fql query)
-               "should throw 400, :db/invalid-query"
-               (catch #?(:clj  clojure.lang.ExceptionInfo
-                         :cljs :default) e (ex-data e))))))))
+              :error :db/invalid-query}
+             (ex-data err))))))
 
 (deftest ^:integration query-test
   (let [txn (str/join "\n"
@@ -1424,6 +1508,22 @@
                           {"value" "23",
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
+         (testing "GROUP_CONCAT aggregate fn query works"
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (GROUP_CONCAT(?favNums; separator=\", \") AS ?nums)
+                          WHERE {?person person:favNums ?favNums.}
+                          GROUP BY ?person"]
+             (testing "output :fql"
+               (is (= [["0, 3, 5, 6, 7, 8, 9"] ["3, 7, 42, 99"] ["23"]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["nums"]},
+                       "results"
+                       {"bindings"
+                        [{"nums" {"value" "0, 3, 5, 6, 7, 8, 9", "type" "literal"}}
+                         {"nums" {"value" "3, 7, 42, 99", "type" "literal"}}
+                         {"nums" {"value" "23", "type" "literal"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "aggregate fn w/ GROUP BY ... HAVING query works"
            (let [query   "PREFIX person: <http://example.org/Person#>

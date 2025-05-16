@@ -82,4 +82,23 @@
         (is (= [[8]]
                @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
                                   :where ['{:id ?s :ex/favNums ?favNums}]
-                                  :select ['(count ?favNums)]})))))))
+                                  :select ['(count ?favNums)]}))))
+      (testing "using groupconcat"
+        (testing "without explicit separator"
+          (is (= [[:ex/cam "5 10"]
+                  [:ex/brian "7"]
+                  [:ex/alice "9 42 76"]
+                  [:ex/liam "11 42"]]
+                 @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
+                                    :where ['{:id ?s :ex/favNums ?favNums}]
+                                    :group-by '?s
+                                    :select ['?s '(groupconcat ?favNums)]}))))
+        (testing "with explicit separator"
+          (is (= [[:ex/cam "5, 10"]
+                  [:ex/brian "7"]
+                  [:ex/alice "9, 42, 76"]
+                  [:ex/liam "11, 42"]]
+                 @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
+                                    :where ['{:id ?s :ex/favNums ?favNums}]
+                                    :group-by '?s
+                                    :select ['?s '(groupconcat ?favNums ", ")]}))))))))

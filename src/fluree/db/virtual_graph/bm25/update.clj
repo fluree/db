@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.db.json-ld.iri :as iri]
+            [fluree.db.util.log :as log]
             [fluree.db.virtual-graph.bm25.stemmer :as stm]))
 
 (set! *warn-on-reflection* true)
@@ -10,7 +11,9 @@
 
 (defn- split-text
   [text]
-  (str/split (str/lower-case text) SPACE_PATTERN))
+  (if (= "" text)
+    []
+    (str/split (str/lower-case text) SPACE_PATTERN)))
 
 (defn parse-sentence
   [sentence stemmer stopwords]
@@ -46,30 +49,39 @@
 (defn- extract-text
   "Takes an item and returns full concatenated text"
   [item]
-  (->> (dissoc item "@id")
-       vals
-       (reduce
-        (fn [all-text sentence]
-          (cond
+  (try
+    (->> (dissoc item "@id")
+         vals
+         (reduce
+          (fn [all-text sentence]
+            (cond
+              (string? sentence)
+              (str all-text " " sentence)
+
             ;; nested map is a referred node
-            (map? sentence)
-            (str all-text " " (extract-text sentence))
+              (map? sentence)
+              (str all-text " " (extract-text sentence))
 
             ;; multiple items, can be anything
-            (sequential? sentence)
-            (apply str/join
-                   (cons all-text (map #(if (map? %)
-                                          (extract-text %)
-                                          %) sentence)) " ")
+              (sequential? sentence)
+              (str/join " "
+                        (cons all-text (map #(if (map? %)
+                                               (extract-text %)
+                                               %) sentence)))
 
-            (nil? sentence)
-            all-text
+              (nil? sentence)
+              all-text
 
-            :else ;; string, or stringify other data types
-            (str all-text " " sentence))
-          (if (sequential? sentence)
-            (apply str all-text " " sentence)
-            (str all-text " " sentence))))))
+              :else ;; stringify other data types
+              (str all-text " " sentence))
+            (if (sequential? sentence)
+              (apply str all-text " " sentence)
+              (str all-text " " sentence)))))
+    (catch Exception e
+      (let [msg (str "Error extracting text for BM25 from item: " item
+                     " - " (ex-message e))]
+        (throw (ex-info msg {:status 400
+                             :error "db/bm25-bad-index"}))))))
 
 (defn retract-terms-docs
   "Returns updated terms map with doc-id for sparce vec removed"
@@ -135,21 +147,26 @@
 
 (defn index-item
   "Returns updated bm25 index map after adding item to it"
-  [index stemmer stopwords id item]
-  (let [{:keys [avg-length item-count terms dimensions vectors]} index
-        item-terms     (-> (extract-text item)
-                           (parse-sentence stemmer stopwords))
-        doc-len        (count item-terms)
-        [avg-length* item-count*] (update-avg-len avg-length item-count doc-len)
-        term-freq      (frequencies item-terms)
-        terms-distinct (keys term-freq)
-        [terms* dimensions*] (update-terms terms dimensions id terms-distinct)
-        item-vec       (vectorize-item terms* term-freq)]
-    (assoc index :terms terms*
-           :dimensions dimensions*
-           :avg-length avg-length*
-           :item-count item-count*
-           :vectors (assoc vectors id item-vec))))
+  [{:keys [avg-length item-count terms dimensions vectors] :as index} stemmer stopwords id item]
+  (try
+    (let [item-terms     (-> (extract-text item)
+                             (parse-sentence stemmer stopwords))
+          doc-len        (count item-terms)]
+      (if (pos? doc-len) ;; empty strings will have no indexing data
+        (let [[avg-length* item-count*] (update-avg-len avg-length item-count doc-len)
+              term-freq      (frequencies item-terms)
+              terms-distinct (keys term-freq)
+              [terms* dimensions*] (update-terms terms dimensions id terms-distinct)
+              item-vec       (vectorize-item terms* term-freq)]
+          (assoc index :terms terms*
+                 :dimensions dimensions*
+                 :avg-length avg-length*
+                 :item-count item-count*
+                 :vectors (assoc vectors id item-vec)))
+        index))
+    (catch Exception e
+      (log/warn "Cannot full-text (BM25) index item: " item " - " (ex-message e) ". Ignoring item.")
+      index)))
 
 (defn upsert-items
   "Asserts items into the bm25 index, returns updated state.

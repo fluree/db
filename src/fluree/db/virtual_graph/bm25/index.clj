@@ -102,6 +102,10 @@
   (go
     (try*
       (let [{::vg-parse/keys [target limit timeout] :as search-params} (vg-parse/get-search-params solution)
+            _ (when-not target
+                (throw (ex-info "No search target for virtual graph. Did you forget @context in your query?"
+                                {:status 400 :error
+                                 :db/invalid-query})))
             {:keys [pending-ch index]} @index-state
 
             ;; TODO - check for "sync" options and don't wait for pending-ch if sync is false
@@ -130,7 +134,6 @@
              (vg-parse/process-sparse-results bm25 solution search-params)
              (async/onto-chan! out-ch)))
       (catch* e
-        (log/error e "Error ranking vectors")
         (>! error-ch e)))))
 
 (defn bm25-upsert*

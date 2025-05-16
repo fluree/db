@@ -37,13 +37,18 @@
   [[_ & var]]
   (str "?" (str/join var)))
 
+(defmethod parse-term :Separator
+  [[_ & separator-chars]]
+  (apply str separator-chars))
+
 (def supported-aggregate-functions
   {"MAX"       "max"
    "MIN"       "min"
    "SAMPLE"    "sample1"
    "COUNT"     "count"
    "SUM"       "sum"
-   "AVG"       "avg"})
+   "AVG"       "avg"
+   "GROUP_CONCAT" "groupconcat"})
 
 (defmethod parse-term :Aggregate
   ;; Aggregate ::= 'COUNT' WS <'('> WS 'DISTINCT'? WS ( '*' | Expression ) WS <')'> WS
@@ -65,8 +70,8 @@
 
                   :else
                   f)
-          body (if distinct? (second body) (first body))]
-      (str "(" f " " (parse-term body) ")"))
+          [mset scalarvals] (if distinct? (rest body) body)]
+      (str "(" f " " (parse-term mset) (when scalarvals (str " " (literal-quote (parse-term scalarvals)))) ")"))
     (throw (ex-info (str "Unsupported aggregate function: " func)
                     {:status 400 :error :db/invalid-query}))))
 
@@ -493,7 +498,13 @@
   [[_ & bindings]]
   ;; bindings come in as val, var; need to be reversed to var, val.
   (into [:bind] (->> bindings
-                     (mapv parse-term)
+                     (mapv (fn [term]
+                             (let [terms (into #{} (flatten term))
+                                   parsed (parse-term term)]
+                               (if (and (terms :iriOrFunction) (not= \( (first parsed)))
+                                 ;; static iri
+                                 {const/iri-id parsed}
+                                 (parse-term term)))))
                      (partition-all 2)
                      (mapcat reverse))))
 
@@ -610,7 +621,12 @@
 (defmethod parse-term :PathElt
   [[_ primary mod]]
   (if mod
-    (str "<" (parse-term primary) (parse-term mod) ">")
+    (let [term  (parse-term primary)
+          term* (if ((set (flatten primary)) :IRIREF)
+                  ;; expanded IRIs need to be wrapped in angle brackets in a transitive path
+                  (str "<" term ">")
+                  term)]
+      (str "<" term* (parse-term mod) ">"))
     (parse-term primary)))
 
 (defmethod parse-term :PathSequence
