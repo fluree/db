@@ -1,6 +1,7 @@
 (ns fluree.db.query.exec.select.subject
   (:require [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.constants :as const]
+            [fluree.db.query.exec.select.literal :as literal]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]))
@@ -9,7 +10,7 @@
 
 (defprotocol SubjectFormatter
   (-forward-properties [db iri select-spec context compact-fn cache fuel-tracker error-ch])
-  (-reverse-property [db iri reverse-spec context compact-fn cache fuel-tracker error-ch])
+  (-reverse-property [db iri reverse-spec context fuel-tracker error-ch])
   (-iri-visible? [db fuel-tracker iri]))
 
 (defn subject-formatter?
@@ -46,12 +47,21 @@
 
 (defn encode-reference
   [iri spec]
-  {::reference {:iri  iri
-                :spec spec}})
+  {::reference {::iri  iri
+                ::spec spec}})
 
 (defn reference?
   [v]
   (some? (::reference v)))
+
+(defn encode-literal
+  [value datatype language spec]
+  (let [attr-map (literal/attribute-map value datatype language)]
+    {::literal (assoc attr-map ::spec spec)}))
+
+(defn literal?
+  [v]
+  (some? (::literal v)))
 
 (defn display-reference
   [ds o-iri spec select-spec cache context compact-fn current-depth fuel-tracker error-ch]
@@ -73,11 +83,30 @@
 
 (defn resolve-reference
   [ds cache context compact-fn select-spec current-depth fuel-tracker error-ch v]
-  (let [{:keys [iri spec]} (::reference v)]
+  (let [{::keys [iri spec]} (::reference v)]
     (display-reference ds iri spec select-spec cache context compact-fn current-depth
                        fuel-tracker error-ch)))
 
-(defn resolve-references
+(defn display-literal
+  [attrs spec select-spec cache compact-fn current-depth]
+  (let [max-depth (:depth select-spec)
+        subselect (:spec spec)]
+    (cond
+      subselect
+      (literal/format-literal attrs compact-fn subselect cache)
+
+      (< current-depth max-depth)
+      (literal/format-literal attrs compact-fn select-spec cache)
+
+      :else
+      (literal/get-value attrs))))
+
+(defn resolve-literal
+  [cache compact-fn select-spec current-depth v]
+  (let [{::keys [spec] :as attrs} (::literal v)]
+    (display-literal attrs spec select-spec cache compact-fn current-depth)))
+
+(defn resolve-properties
   [ds cache context compact-fn select-spec current-depth fuel-tracker error-ch attr-ch]
   (go (when-let [attrs (<! attr-ch)]
         (loop [[[prop v] & r] attrs
@@ -87,28 +116,38 @@
                        (loop [[value & r]     v
                               resolved-values []]
                          (if value
-                           (if (reference? value)
+                           (cond
+                             (reference? value)
                              (if-let [resolved (<! (resolve-reference ds cache context compact-fn select-spec current-depth fuel-tracker error-ch value))]
                                (recur r (conj resolved-values resolved))
                                (recur r resolved-values))
-                             (recur r (conj resolved-values value)))
+
+                             (literal? value)
+                             (recur r (conj resolved-values (resolve-literal cache compact-fn select-spec current-depth value)))
+
+                             :else value)
                            (not-empty resolved-values)))
-                       (if (reference? v)
+                       (cond
+                         (reference? v)
                          (<! (resolve-reference ds cache context compact-fn select-spec current-depth fuel-tracker error-ch v))
-                         v))]
+
+                         (literal? v)
+                         (resolve-literal cache compact-fn select-spec current-depth v)
+
+                         :else v))]
               (if (some? v')
                 (recur r (assoc resolved-attrs prop v'))
                 (recur r resolved-attrs)))
             resolved-attrs)))))
 
 (defn format-reverse-properties
-  [ds iri reverse-map context compact-fn cache fuel-tracker error-ch]
+  [ds iri reverse-map context fuel-tracker error-ch]
   (let [out-ch (async/chan 32)]
     (async/pipeline-async 32
                           out-ch
                           (fn [reverse-spec ch]
                             (-> ds
-                                (-reverse-property iri reverse-spec context compact-fn cache fuel-tracker error-ch)
+                                (-reverse-property iri reverse-spec context fuel-tracker error-ch)
                                 (async/pipe ch)))
                           (async/to-chan! (vals reverse-map)))
 
@@ -120,11 +159,11 @@
   ([ds iri context compact-fn {:keys [reverse] :as select-spec} cache current-depth fuel-tracker error-ch]
    (let [forward-ch (-forward-properties ds iri select-spec context compact-fn cache fuel-tracker error-ch)
          subject-ch (if reverse
-                      (let [reverse-ch (format-reverse-properties ds iri reverse context compact-fn cache fuel-tracker error-ch)]
+                      (let [reverse-ch (format-reverse-properties ds iri reverse context fuel-tracker error-ch)]
                         (->> [forward-ch reverse-ch]
                              async/merge
                              (async/reduce merge {})))
                       forward-ch)]
      (->> subject-ch
-          (resolve-references ds cache context compact-fn select-spec current-depth fuel-tracker error-ch)
+          (resolve-properties ds cache context compact-fn select-spec current-depth fuel-tracker error-ch)
           (append-id ds fuel-tracker iri select-spec compact-fn error-ch)))))

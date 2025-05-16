@@ -946,10 +946,10 @@
       (is (= [{"f:data" {"f:t" 1}}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
                "f:data"   {"f:t" 2},
-               "f:txn"    "fluree:memory://bmpe6riaeyz6i54k2mjwwp6sn7tanw6jkighv4arnkoexqungnet"}
+               "f:txn"    "fluree:memory://byfkd5sj5lwq3aaxgbqkwoteakwjqqjrrvsrbhl7eirp3aizykj3"}
               {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
                "f:data"   {"f:t" 3},
-               "f:txn"    "fluree:memory://ueaysvwnt36afj5kf5hsju2xbai556cn7sn4exwu4pmsjglg5ql"}]
+               "f:txn"    "fluree:memory://bsb5zixq25bktdvwtzbquwgvjii6cv4mi7mu3zbpu562oa77y5nq"}]
              (->> @(fluree/history ledger {:context        context
                                            :commit-details true
                                            :t              {:from 1 :to :latest}})
