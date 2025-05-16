@@ -631,8 +631,10 @@
           parsed-context (:context parsed-opts)
           identity       (:identity parsed-opts)]
       (if (track/track? parsed-opts)
-        (let [start-time   #?(:clj (System/nanoTime)
-                              :cljs (util/current-time-millis))
+        (let [track-time?  (track/track-time? parsed-opts)
+              start-time   (when track-time?
+                             #?(:clj (System/nanoTime)
+                                :cljs (util/current-time-millis)))
               track-fuel?  (track/track-fuel? parsed-opts)
               fuel-tracker (when track-fuel?
                              (fuel/tracker (:max-fuel parsed-opts)))
@@ -643,17 +645,17 @@
             (let [staged-db     (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))
                   policy-report (policy.rules/enforcement-report staged-db)]
               (cond-> {:status 200
-                       :db     staged-db
-                       :time   (util/response-time-formatted start-time)}
+                       :db     staged-db}
+                track-time?   (assoc :time (util/response-time-formatted start-time))
                 track-fuel?   (assoc :fuel (fuel/tally fuel-tracker))
                 policy-report (assoc :policy policy-report)))
             (catch* e
               (throw (ex-info (ex-message e)
                               (let [policy-report (policy.rules/enforcement-report policy-db)]
                                 (cond-> (ex-data e)
+                                  track-time?   (assoc :time (util/response-time-formatted start-time))
                                   track-fuel?   (assoc :fuel (fuel/tally fuel-tracker))
-                                  policy-report (assoc :policy policy-report)
-                                  true          (assoc :time (util/response-time-formatted start-time))))
+                                  policy-report (assoc :policy policy-report)))
                               e)))))
         (let [policy-db (if (policy/policy-enforced-opts? parsed-opts)
                           (<? (policy/policy-enforce-db db parsed-context parsed-opts))
