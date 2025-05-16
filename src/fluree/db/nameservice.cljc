@@ -20,6 +20,8 @@
 (defprotocol Publisher
   (publish [publisher commit-jsonld]
     "Publishes new commit.")
+  (retract [publisher ledger-alias]
+    "Remove the nameservice record for the ledger.")
   (publishing-address [publisher ledger-alias]
     "Returns full publisher address/iri which will get published in commit. If
     'private', return `nil`."))
