@@ -137,22 +137,31 @@
                 "returns ordered results")))))))
 
 (deftest ^:integration select-distinct-test
-  (testing "Distinct queries"
-    (let [conn   (test-utils/create-conn)
-          people (test-utils/load-people conn)
-          db     (fluree/db people)
-          q      {:context         [test-utils/default-context
-                                    {:ex "http://example.org/ns/"}]
-                  :select-distinct '[?name ?email]
-                  :where           '{:schema/name  ?name
-                                     :schema/email ?email
-                                     :ex/favNums   ?favNum}
-                  :order-by        '?favNum}]
-      (is (= [["Cam" "cam@example.org"]
+  (let [conn   (test-utils/create-conn)
+        people (test-utils/load-people conn)
+        db     (fluree/db people)]
+    (testing "distinct results"
+      (is (= [["Alice" "alice@example.org"]
               ["Brian" "brian@example.org"]
-              ["Alice" "alice@example.org"]
+              ["Cam" "cam@example.org"]
               ["Liam" "liam@example.org"]]
-             @(fluree/query db q))
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select-distinct '[?name ?email]
+                                :where '{:schema/name ?name
+                                         :schema/email ?email
+                                         :ex/favNums ?favNum}}))
+          "return results without repeated entries"))
+    (testing "distinct results with limit and offset"
+      (is (= [["Brian" "brian@example.org"]
+              ["Cam" "cam@example.org"]]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select-distinct '[?name ?email]
+                                :where '{:schema/name ?name
+                                         :schema/email ?email
+                                         :ex/favNums ?favNum}
+                                :limit 2 :offset 1}))
           "return results without repeated entries"))))
 
 (deftest ^:integration select-one-test
