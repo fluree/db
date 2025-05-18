@@ -48,6 +48,8 @@
         rule-results))))
 
 (defn restrict-db
+  ([db sanitized-query]
+   (restrict-db db nil sanitized-query))
   ([db fuel-tracker sanitized-query]
    (restrict-db db fuel-tracker sanitized-query nil))
   ([db fuel-tracker {:keys [t opts] :as sanitized-query} conn]
