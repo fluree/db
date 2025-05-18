@@ -614,7 +614,7 @@
 
        (<? (publish-commit conn commit-jsonld))
 
-       (if (track/track? opts)
+       (if (track/track-txn? opts)
          (-> write-result
              (select-keys [:address :hash :size])
              (assoc :ledger-id ledger-alias
@@ -630,7 +630,7 @@
     (let [parsed-opts    (:opts parsed-txn)
           parsed-context (:context parsed-opts)
           identity       (:identity parsed-opts)]
-      (if (track/track? parsed-opts)
+      (if (track/track-txn? parsed-opts)
         (let [track-time?  (track/track-time? parsed-opts)
               start-time   (when track-time?
                              #?(:clj (System/nanoTime)
@@ -675,7 +675,7 @@
           ;; whereas stage API takes a did IRI and unparsed context.
           ;; Dissoc them until deciding at a later point if they can carry through.
           cmt-opts (dissoc parsed-opts :context :identity)]
-      (if (track/track? parsed-opts)
+      (if (track/track-txn? parsed-opts)
         (let [staged-db     (:db staged)
               commit-result (<? (commit! ledger staged-db cmt-opts))]
           (merge staged commit-result))

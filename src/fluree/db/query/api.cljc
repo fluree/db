@@ -14,6 +14,7 @@
             [fluree.db.reasoner :as reasoner]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.track.fuel :as fuel]
+            [fluree.db.track :as track]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
             [fluree.db.util.core :as util :refer [try* catch*]]
@@ -98,14 +99,14 @@
   (go-try
     (let [{:keys [opts] :as query*} (sanitize-query-options query override-opts)
 
-          fuel-tracker (when (fuel/track? opts)
+          fuel-tracker (when (track/track-query? opts)
                          (fuel/tracker (:max-fuel opts)))
           context      (context/extract query*)
           latest-db    (ledger/current-db ledger)
           policy-db    (if (perm/policy-enforced-opts? opts)
                          (<? (perm/policy-enforce-db latest-db fuel-tracker context opts))
                          latest-db)]
-      (if (fuel/track? opts)
+      (if (track/track-query? opts)
         (<? (track-execution policy-db fuel-tracker #(history/query policy-db fuel-tracker context query*)))
         (<? (history/query policy-db context query*))))))
 
@@ -119,7 +120,7 @@
                                          syntax/coerce-query
                                          (sanitize-query-options override-opts))
 
-           fuel-tracker (when (fuel/track? opts)
+           fuel-tracker (when (track/track-query? opts)
                           (fuel/tracker (:max-fuel opts)))
 
            ;; TODO - remove restrict-db from here, restriction should happen
@@ -128,7 +129,7 @@
                       ds
                       (<? (restrict-db ds fuel-tracker query*)))
            query**  (update query* :opts dissoc :meta :max-fuel)]
-       (if (fuel/track? opts)
+       (if (track/track-query? opts)
          (<? (track-execution ds* fuel-tracker #(fql/query ds* fuel-tracker query**)))
          (<? (fql/query ds* query**)))))))
 
@@ -259,7 +260,7 @@
                                                  syntax/coerce-query
                                                  (sanitize-query-options override-opts))
 
-          fuel-tracker    (when (fuel/track? opts)
+          fuel-tracker    (when (track/track-query? opts)
                             (fuel/tracker (:max-fuel opts)))
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
@@ -267,7 +268,7 @@
               (seq named-aliases))
         (let [ds            (<? (load-dataset conn fuel-tracker default-aliases named-aliases sanitized-query))
               trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel)]
-          (if (fuel/track? opts)
+          (if (track/track-query? opts)
             (<? (track-execution ds fuel-tracker #(fql/query ds fuel-tracker trimmed-query)))
             (<? (fql/query ds trimmed-query))))
         (throw (ex-info "Missing ledger specification in connection query"

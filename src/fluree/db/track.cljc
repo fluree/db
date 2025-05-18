@@ -25,8 +25,15 @@
   (or (track-all? opts)
       (-> meta :policy true?)))
 
-(defn track?
+(defn track-query?
   [opts]
-  (or (track-fuel? opts)
+  (or (track-time? opts)
+      (track-fuel? opts)
+      (track-policy? opts)))
+
+(defn track-txn?
+  [opts]
+  (or (track-time? opts)
+      (track-fuel? opts)
       (track-file? opts)
       (track-policy? opts)))
