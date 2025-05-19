@@ -35,6 +35,14 @@
     (async/take limit solution-ch)
     solution-ch))
 
+(defn paginate
+  "Returns a channel that contains a page-worth of results, according to `:offset` and
+  `:limit`."
+  [q solution-ch]
+  (->> solution-ch
+       (drop-offset q)
+       (take-limit q)))
+
 (defn collect-results
   "Returns a channel that will eventually contain the stream of results from the
   `result-ch` channel collected into a single vector, but handles the special cases.
@@ -69,8 +77,7 @@
   [ds fuel-tracker q error-ch]
   (->> (execute* ds fuel-tracker q error-ch)
        (select/format ds q fuel-tracker error-ch)
-       (drop-offset q)
-       (take-limit q)
+       (paginate q)
        (collect-results q)))
 
 ;; TODO: refactor namespace heirarchy so this isn't necessary
@@ -81,8 +88,7 @@
   (fn [ds fuel-tracker error-ch]
     (->> (execute* ds fuel-tracker subquery error-ch)
          (select/subquery-format ds subquery fuel-tracker error-ch)
-         (drop-offset subquery)
-         (take-limit subquery))))
+         (paginate subquery))))
 
 (defn prep-subqueries
   "Takes a query and returns a query with all subqueries within replaced by a subquery
