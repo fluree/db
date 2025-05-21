@@ -13,6 +13,7 @@
             [fluree.db.query.sparql :as sparql]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.time-travel :as time-travel]
+            [fluree.db.track :as track]
             [fluree.db.track.fuel :as fuel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
@@ -47,6 +48,8 @@
         rule-results))))
 
 (defn restrict-db
+  ([db sanitized-query]
+   (restrict-db db nil sanitized-query))
   ([db fuel-tracker sanitized-query]
    (restrict-db db fuel-tracker sanitized-query nil))
   ([db fuel-tracker {:keys [t opts] :as sanitized-query} conn]
@@ -72,23 +75,24 @@
 (defn track-execution
   "Track fuel usage in query. `exec-fn` is a thunk that when called with no arguments
   returns a result or throws an exception."
-  [ds fuel-tracker exec-fn]
+  [ds fuel-tracker opts exec-fn]
   (go-try
-    (let [start        #?(:clj (System/nanoTime)
-                          :cljs (util/current-time-millis))]
-      (try* (let [result (<? (exec-fn))
+    (let [start #?(:clj (System/nanoTime)
+                   :cljs (util/current-time-millis))]
+      (try* (let [result        (<? (exec-fn))
                   policy-report (when-not (dataset? ds)
                                   (policy.rules/enforcement-report ds))]
-              (cond-> {:status 200
+              (cond-> {:status 200,
                        :result result
-                       :time   (util/response-time-formatted start)
-                       :fuel   (fuel/tally fuel-tracker)}
-                policy-report (assoc :policy policy-report)))
+                       :time   (util/response-time-formatted start)}
+                (track/track-fuel? opts) (assoc :fuel (fuel/tally fuel-tracker))
+                policy-report            (assoc :policy policy-report)))
             (catch* e
               (throw (ex-info "Error executing query"
-                              {:status (-> e ex-data :status)
-                               :time   (util/response-time-formatted start)
-                               :fuel   (fuel/tally fuel-tracker)}
+                              (cond-> {:status (-> e ex-data :status)
+                                       :time   (util/response-time-formatted start)}
+                                (track/track-fuel? opts)
+                                (assoc :fuel (fuel/tally fuel-tracker)))
                               e)))))))
 
 (defn history
@@ -98,15 +102,15 @@
   (go-try
     (let [{:keys [opts] :as query*} (sanitize-query-options query override-opts)
 
-          fuel-tracker (when (fuel/track? opts)
+          fuel-tracker (when (track/track-query? opts)
                          (fuel/tracker (:max-fuel opts)))
           context      (context/extract query*)
           latest-db    (ledger/current-db ledger)
           policy-db    (if (perm/policy-enforced-opts? opts)
                          (<? (perm/policy-enforce-db latest-db fuel-tracker context opts))
                          latest-db)]
-      (if (fuel/track? opts)
-        (<? (track-execution policy-db fuel-tracker #(history/query policy-db fuel-tracker context query*)))
+      (if (track/track-query? opts)
+        (<? (track-execution policy-db fuel-tracker opts #(history/query policy-db fuel-tracker context query*)))
         (<? (history/query policy-db context query*))))))
 
 (defn query-fql
@@ -119,7 +123,7 @@
                                          syntax/coerce-query
                                          (sanitize-query-options override-opts))
 
-           fuel-tracker (when (fuel/track? opts)
+           fuel-tracker (when (track/track-query? opts)
                           (fuel/tracker (:max-fuel opts)))
 
            ;; TODO - remove restrict-db from here, restriction should happen
@@ -128,8 +132,8 @@
                       ds
                       (<? (restrict-db ds fuel-tracker query*)))
            query**  (update query* :opts dissoc :meta :max-fuel)]
-       (if (fuel/track? opts)
-         (<? (track-execution ds* fuel-tracker #(fql/query ds* fuel-tracker query**)))
+       (if (track/track-query? opts)
+         (<? (track-execution ds* fuel-tracker opts #(fql/query ds* fuel-tracker query**)))
          (<? (fql/query ds* query**)))))))
 
 (defn query-sparql
@@ -259,7 +263,7 @@
                                                  syntax/coerce-query
                                                  (sanitize-query-options override-opts))
 
-          fuel-tracker    (when (fuel/track? opts)
+          fuel-tracker    (when (track/track-fuel? opts)
                             (fuel/tracker (:max-fuel opts)))
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
@@ -267,8 +271,8 @@
               (seq named-aliases))
         (let [ds            (<? (load-dataset conn fuel-tracker default-aliases named-aliases sanitized-query))
               trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel)]
-          (if (fuel/track? opts)
-            (<? (track-execution ds fuel-tracker #(fql/query ds fuel-tracker trimmed-query)))
+          (if (track/track-query? opts)
+            (<? (track-execution ds fuel-tracker opts #(fql/query ds fuel-tracker trimmed-query)))
             (<? (fql/query ds trimmed-query))))
         (throw (ex-info "Missing ledger specification in connection query"
                         {:status 400, :error :db/invalid-query}))))))
