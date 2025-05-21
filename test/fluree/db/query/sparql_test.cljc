@@ -109,6 +109,19 @@
               {"@id" "_:v", "vcard:givenName" "?gname"}
               {"@id" "_:v", "vcard:familyName" "?fname"}]
              (:construct (sparql/->fql query))))))
+  (testing "templates with anon bnodes"
+    (let [query "CONSTRUCT {[ a ?x ]}
+                 WHERE { ?x a ?foo . }"]
+      (is (= {:context {},
+              :construct [{"@id" "_:b1" "@type" "?x"}],
+              :where [{"@id" "?x", "@type" "?foo"}]}
+             (sparql/->fql query))))
+    (let [query "CONSTRUCT {[] a ?x}
+                 WHERE { ?x a ?foo . }"]
+      (is (= {:context {},
+              :construct [{"@id" "_:b1" "@type" "?x"}],
+              :where [{"@id" "?x", "@type" "?foo"}]}
+             (sparql/->fql query)))))
   (testing "CONSTRUCT WHERE"
     (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
                  CONSTRUCT WHERE { ?x foaf:name ?name }"]
@@ -174,6 +187,14 @@
       (is (= [{"@id" "?person", "@type" {"@id" "schema:Person"}}]
              where)
           "a as an alias for @type")))
+  (testing "anonymous blank nodes"
+    (let [query "SELECT ?x
+                 WHERE { ?x ex:friend [ a ex:Person ; ex:name ?name ] . }"]
+      (is (= {:context {},
+              :select ["?x"],
+              :where [{"@id" "?x", "ex:friend" {"@id" "_:b1"}}
+                      {"@id" "_:b1", "@type" "ex:Person", "ex:name" "?name"}]}
+             (sparql/->fql query)))))
   (testing "multi clause"
     (let [query "SELECT ?person ?nums
                  WHERE {?person person:handle \"jdoe\".
