@@ -13,10 +13,10 @@
 
 (defn class-ids
   "Returns list of class-ids for given subject-id"
-  [db fuel-tracker subject-id]
+  [db tracker subject-id]
   (go-try
     (let [root (policy/root db)]
-      (<? (query-range/index-range root fuel-tracker :spot = [subject-id const/$rdf:type]
+      (<? (query-range/index-range root tracker :spot = [subject-id const/$rdf:type]
                                    {:flake-xf (map flake/o)})))))
 
 (defn subclasses
@@ -24,7 +24,7 @@
   (get @(:subclasses schema) class))
 
 (defn match-id
-  [db fuel-tracker solution s-mch error-ch]
+  [db tracker solution s-mch error-ch]
   (let [matched-ch (async/chan 2 (comp cat
                                        (partition-by flake/s)
                                        (map first)
@@ -37,7 +37,7 @@
         s-mch*     (where/assign-matched-component s-mch solution)]
     (if-let [s (where/compute-sid s-mch* db)]
       (-> db
-          (where/resolve-flake-range fuel-tracker error-ch [s])
+          (where/resolve-flake-range tracker error-ch [s])
           (async/pipe matched-ch))
       (async/close! matched-ch))
     matched-ch))
@@ -52,7 +52,7 @@
   (mapv #(if (where/get-variable %) :? :v) triple))
 
 (defmulti resolve-transitive
-  (fn [_db _fuel-tracker _solution triple _error-ch]
+  (fn [_db _tracker _solution triple _error-ch]
     (var-pattern triple)))
 
 (defmethod resolve-transitive :default
@@ -65,7 +65,7 @@
   (-> soln (get var) where/get-iri))
 
 (defmethod resolve-transitive [:? :v :v]
-  [db fuel-tracker solution [s p o] error-ch]
+  [db tracker solution [s p o] error-ch]
   (let [tag          (where/get-transitive-property p)
         p*           (where/remove-transitivity p)
         s-var        (where/get-variable s)
@@ -77,7 +77,7 @@
       (loop [[soln & to-visit] [initial-soln]
              visited-iris      (if (= :zero+ tag) #{(where/get-iri o)} #{})]
         (if soln
-          (let [step-solns (<! (async/into [] (where/match-clause db fuel-tracker solution [[s p* (get soln s-var)]] error-ch)))
+          (let [step-solns (<! (async/into [] (where/match-clause db tracker solution [[s p* (get soln s-var)]] error-ch)))
                 remove-visited-xf (remove (comp visited-iris (partial get-match-iri s-var)))
                 visited-step      (sequence remove-visited-xf step-solns)]
             (<! (async/onto-chan! out-ch visited-step false))
@@ -87,7 +87,7 @@
     out-ch))
 
 (defmethod resolve-transitive [:v :v :?]
-  [db fuel-tracker solution [s p o] error-ch]
+  [db tracker solution [s p o] error-ch]
   (let [tag          (where/get-transitive-property p)
         p*           (where/remove-transitivity p)
         o-var        (where/get-variable o)
@@ -99,7 +99,7 @@
       (loop [[soln & to-visit] [initial-soln]
              visited-iris      (if (= :zero+ tag) #{(where/get-iri s)} #{})]
         (if soln
-          (let [step-solns (<! (async/into [] (where/match-clause db fuel-tracker solution [[(get soln o-var) p* o]] error-ch)))
+          (let [step-solns (<! (async/into [] (where/match-clause db tracker solution [[(get soln o-var) p* o]] error-ch)))
                 remove-visited-xf (remove (comp visited-iris get-o-iri))
                 visited-step      (sequence remove-visited-xf step-solns)]
             (<! (async/onto-chan! out-ch visited-step false))
@@ -160,8 +160,8 @@
         (async/to-chan! result)))))
 
 (defmethod resolve-transitive [:? :v :?]
-  [db fuel-tracker solution [s p o] error-ch]
-  (let [step-ch (async/into #{} (where/match-clause db fuel-tracker solution [[s (where/remove-transitivity p) o]] error-ch))
+  [db tracker solution [s p o] error-ch]
+  (let [step-ch (async/into #{} (where/match-clause db tracker solution [[s (where/remove-transitivity p) o]] error-ch))
         soln-ch (async/chan)]
     (async/pipeline-async 2
                           soln-ch
@@ -172,7 +172,7 @@
     soln-ch))
 
 (defn match-triple
-  [db fuel-tracker solution tuple error-ch]
+  [db tracker solution tuple error-ch]
   (let [out-ch     (async/chan 2)
         db-alias   (:alias db)
         triple     (where/assign-matched-values tuple solution)]
@@ -185,16 +185,16 @@
                                   (fn [prop ch]
                                     (let [p* (where/match-sid p db-alias prop)]
                                       (-> db
-                                          (where/resolve-flake-range fuel-tracker error-ch [s p* o])
+                                          (where/resolve-flake-range tracker error-ch [s p* o])
                                           (async/pipe (async/chan 2 (match-flakes-xf db solution tuple)))
                                           (async/pipe ch))))
                                   prop-ch))
 
           (if (where/get-transitive-property p)
-            (-> (resolve-transitive db fuel-tracker solution [s p o] error-ch)
+            (-> (resolve-transitive db tracker solution [s p o] error-ch)
                 (async/pipe out-ch))
             (-> db
-                (where/resolve-flake-range fuel-tracker error-ch [s p o])
+                (where/resolve-flake-range tracker error-ch [s p o])
                 (async/pipe (async/chan 2 (match-flakes-xf db solution tuple)))
                 (async/pipe out-ch)))))
       (async/close! out-ch))
@@ -225,7 +225,7 @@
          (rf result))))))
 
 (defn match-class
-  [db fuel-tracker solution triple error-ch]
+  [db tracker solution triple error-ch]
   (let [matched-ch (async/chan 2 (comp cat
                                        (with-distinct-subjects)
                                        (map (fn [flake]
@@ -244,7 +244,7 @@
         (async/pipeline-async 2
                               matched-ch
                               (fn [class-obj ch]
-                                (-> (where/resolve-flake-range db fuel-tracker error-ch [s p class-obj])
+                                (-> (where/resolve-flake-range db tracker error-ch [s p class-obj])
                                     (async/pipe ch)))
                               class-ch))
       (async/close! matched-ch))

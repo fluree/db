@@ -13,7 +13,7 @@
 (defprotocol Restrictable
   (wrap-policy
     [db policy-rules policy-values]
-    [db fuel-tracker policy-rules policy-values])
+    [db tracker policy-rules policy-values])
   (root [db]))
 
 (def root-policy-map
@@ -48,13 +48,13 @@
 (defn wrap-class-policy
   "Given one or more policy classes, queries for policies
   containing those classes and calls `wrap-policy`"
-  [db fuel-tracker classes policy-values]
+  [db tracker classes policy-values]
   (go
     (let [c-values  (->> classes ;; for passing in classes as query `values`
                          util/sequential
                          (mapv (fn [c] {"@value" c
                                         "@type"  const/iri-id})))
-          policies  (<! (dbproto/-query db fuel-tracker {"select" {"?policy" ["*"]}
+          policies  (<! (dbproto/-query db tracker {"select" {"?policy" ["*"]}
                                                          "where"  [{"@id"   "?policy"
                                                                     "@type" "?classes"}]
                                                          "values" ["?classes" c-values]}))
@@ -68,7 +68,7 @@
                       " with error: " (ex-message policies*))
                  {:status 400 :error :db/policy-exception}
                  policies*)
-        (<! (wrap-policy db fuel-tracker (json-ld/expand policies*) policy-values))))))
+        (<! (wrap-policy db tracker (json-ld/expand policies*) policy-values))))))
 
 (defn inject-value-binding
   "Inject the given var and value into a normalized values clause."
@@ -89,9 +89,9 @@
   "Given an identity (@id) that exists in the db which contains a
   property `f:policyClass` listing policy classes associated with
   that identity, queries for those classes and calls `wrap-policy`"
-  [db fuel-tracker identity policy-values]
+  [db tracker identity policy-values]
   (go
-    (let [policies  (<! (dbproto/-query db fuel-tracker {"select" {"?policy" ["*"]}
+    (let [policies  (<! (dbproto/-query db tracker {"select" {"?policy" ["*"]}
                                                          "where"  [{"@id"                 identity
                                                                     const/iri-policyClass "?classes"}
                                                                    {"@id"   "?policy"
@@ -107,7 +107,7 @@
                       " with error: " (ex-message policies*))
                  {:status 400 :error :db/policy-exception}
                  policies*)
-        (<! (wrap-policy db fuel-tracker (json-ld/expand policies*) policy-values*))))))
+        (<! (wrap-policy db tracker (json-ld/expand policies*) policy-values*))))))
 
 (defn policy-enforced-opts?
   "Tests 'options' for a query or transaction to see if the options request
@@ -121,19 +121,19 @@
   "Policy enforces a db based on the query/transaction options"
   ([db parsed-context opts]
    (policy-enforce-db db nil parsed-context opts))
-  ([db fuel-tracker parsed-context opts]
+  ([db tracker parsed-context opts]
    (go-try
      (let [{:keys [identity policy-class policy policy-values]} opts
            policy-values* (util.parse/normalize-values policy-values)]
        (cond
 
          identity
-         (<? (wrap-identity-policy db fuel-tracker identity policy-values*))
+         (<? (wrap-identity-policy db tracker identity policy-values*))
 
          policy-class
          (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policy-class))]
-           (<? (wrap-class-policy db fuel-tracker classes policy-values*)))
+           (<? (wrap-class-policy db tracker classes policy-values*)))
 
          policy
          (let [expanded-policy (json-ld/expand policy parsed-context)]
-           (<? (wrap-policy db fuel-tracker expanded-policy policy-values*))))))))
+           (<? (wrap-policy db tracker expanded-policy policy-values*))))))))
