@@ -37,3 +37,10 @@
       (track-fuel? opts)
       (track-file? opts)
       (track-policy? opts)))
+
+(defn tracker
+  "Creates a new fuel tracker w/ optional fuel limit (0 means unlimited)."
+  ([] (tracker 0))
+  ([limit]
+   {:limit    limit
+    :counters (atom [])}))

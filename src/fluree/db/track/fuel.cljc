@@ -4,24 +4,11 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn tracker
-  "Creates a new fuel tracker w/ optional fuel limit (0 means unlimited)."
-  ([] (tracker nil))
-  ([limit]
-   {:limit    (or limit 0)
-    :counters (atom [])}))
-
 (defn tally
   [trkr]
   (reduce (fn [total ctr]
             (+ total @ctr))
           0 @(:counters trkr)))
-
-(defn track?
-  [{:keys [max-fuel meta] :as _opts}]
-  (or max-fuel
-      (true? meta)
-      (:fuel meta)))
 
 (defn track
   [trkr error-ch]
