@@ -103,7 +103,7 @@
     (let [{:keys [opts] :as query*} (sanitize-query-options query override-opts)
 
           tracker (when (track/track-query? opts)
-                         (track/tracker (:max-fuel opts)))
+                    (track/tracker {:fuel {:limit (:max-fuel opts)}}))
           context      (context/extract query*)
           latest-db    (ledger/current-db ledger)
           policy-db    (if (perm/policy-enforced-opts? opts)
@@ -124,7 +124,7 @@
                                          (sanitize-query-options override-opts))
 
            tracker (when (track/track-query? opts)
-                          (track/tracker (:max-fuel opts)))
+                     (track/tracker {:fuel {:limit (:max-fuel opts)}}))
 
            ;; TODO - remove restrict-db from here, restriction should happen
            ;;      - upstream if needed
@@ -264,7 +264,7 @@
                                                  (sanitize-query-options override-opts))
 
           tracker    (when (track/track-fuel? opts)
-                            (track/tracker (:max-fuel opts)))
+                       (track/tracker {:fuel {:limit (:max-fuel opts)}}))
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
       (if (or (seq default-aliases)

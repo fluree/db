@@ -40,7 +40,9 @@
 
 (defn tracker
   "Creates a new fuel tracker w/ optional fuel limit (0 means unlimited)."
-  ([] (tracker 0))
-  ([limit]
-   {:limit    limit
-    :counters (atom [])}))
+  ([]
+   (tracker {:fuel {:limit 0}}))
+  ([{:keys [fuel]}]
+   (let [{:keys [limit]} fuel]
+     {:limit    limit
+      :counters (atom [])})))

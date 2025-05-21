@@ -637,7 +637,7 @@
                                 :cljs (util/current-time-millis)))
               track-fuel?  (track/track-fuel? parsed-opts)
               tracker (when track-fuel?
-                             (track/tracker (:max-fuel parsed-opts)))
+                        (track/tracker {:fuel {:limit (:max-fuel parsed-opts)}}))
               policy-db    (if (policy/policy-enforced-opts? parsed-opts)
                              (<? (policy/policy-enforce-db db tracker parsed-context parsed-opts))
                              db)]
