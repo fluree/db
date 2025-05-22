@@ -77,22 +77,21 @@
   returns a result or throws an exception."
   [ds tracker opts exec-fn]
   (go-try
-    (let [start #?(:clj (System/nanoTime)
-                   :cljs (util/current-time-millis))]
-      (try* (let [result        (<? (exec-fn))
-                  policy-report (when-not (dataset? ds)
-                                  (policy.rules/enforcement-report ds))]
-              (cond-> {:status 200,
-                       :result result
-                       :time   (util/response-time-formatted start)}
-                (track/track-fuel? opts) (assoc :fuel (-> tracker track/tally :fuel))
-                policy-report            (assoc :policy policy-report)))
-            (catch* e
+    (try* (let [result        (<? (exec-fn))
+                policy-report (when-not (dataset? ds)
+                                (policy.rules/enforcement-report ds))
+                tally         (track/tally tracker)]
+            (cond-> {:status 200,
+                     :result result}
+              (track/track-time? opts) (assoc :time (:time tally))
+              (track/track-fuel? opts) (assoc :fuel (:fuel tally))
+              policy-report            (assoc :policy policy-report)))
+          (catch* e
+            (let [tally (track/tally tracker)]
               (throw (ex-info "Error executing query"
-                              (cond-> {:status (-> e ex-data :status)
-                                       :time   (util/response-time-formatted start)}
-                                (track/track-fuel? opts)
-                                (assoc :fuel (-> tracker track/tally :fuel)))
+                              (cond-> {:status (-> e ex-data :status)}
+                                (track/track-time? opts) (assoc :time (:time tally))
+                                (track/track-fuel? opts) (assoc :fuel (:fuel tally)))
                               e)))))))
 
 (defn history
@@ -102,13 +101,13 @@
   (go-try
     (let [{:keys [opts] :as query*} (sanitize-query-options query override-opts)
 
-          tracker (when (track/track-query? opts)
-                    (track/init {:fuel {:limit (:max-fuel opts)}}))
-          context      (context/extract query*)
-          latest-db    (ledger/current-db ledger)
-          policy-db    (if (perm/policy-enforced-opts? opts)
-                         (<? (perm/policy-enforce-db latest-db tracker context opts))
-                         latest-db)]
+          tracker   (when (track/track-query? opts)
+                      (track/init {:fuel {:limit (:max-fuel opts)}}))
+          context   (context/extract query*)
+          latest-db (ledger/current-db ledger)
+          policy-db (if (perm/policy-enforced-opts? opts)
+                      (<? (perm/policy-enforce-db latest-db tracker context opts))
+                      latest-db)]
       (if (track/track-query? opts)
         (<? (track-execution policy-db tracker opts #(history/query policy-db tracker context query*)))
         (<? (history/query policy-db context query*))))))

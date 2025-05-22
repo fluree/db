@@ -631,9 +631,6 @@
           identity       (:identity parsed-opts)]
       (if (track/track-txn? parsed-opts)
         (let [track-time?  (track/track-time? parsed-opts)
-              start-time   (when track-time?
-                             #?(:clj (System/nanoTime)
-                                :cljs (util/current-time-millis)))
               track-fuel?  (track/track-fuel? parsed-opts)
               tracker (when track-fuel?
                         (track/init {:fuel {:limit (:max-fuel parsed-opts)}}))
@@ -642,18 +639,20 @@
                              db)]
           (try*
             (let [staged-db     (<? (transact/stage policy-db tracker identity parsed-txn parsed-opts))
-                  policy-report (policy.rules/enforcement-report staged-db)]
+                  policy-report (policy.rules/enforcement-report staged-db)
+                  tally         (track/tally tracker)]
               (cond-> {:status 200
                        :db     staged-db}
-                track-time?   (assoc :time (util/response-time-formatted start-time))
-                track-fuel?   (assoc :fuel (-> tracker track/tally :fuel))
+                track-time?   (assoc :time (:time tally))
+                track-fuel?   (assoc :fuel (:fuel tally))
                 policy-report (assoc :policy policy-report)))
             (catch* e
               (throw (ex-info (ex-message e)
-                              (let [policy-report (policy.rules/enforcement-report policy-db)]
+                              (let [policy-report (policy.rules/enforcement-report policy-db)
+                                    tally         (track/tally tracker)]
                                 (cond-> (ex-data e)
-                                  track-time?   (assoc :time (util/response-time-formatted start-time))
-                                  track-fuel?   (assoc :fuel (-> tracker track/tally :fuel))
+                                  track-time?   (assoc :time (:time tally))
+                                  track-fuel?   (assoc :fuel (:fuel tally))
                                   policy-report (assoc :policy policy-report)))
                               e)))))
         (let [policy-db (if (policy/policy-enforced-opts? parsed-opts)

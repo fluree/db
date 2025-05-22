@@ -1,5 +1,6 @@
 (ns fluree.db.track
-  (:require [fluree.db.track.fuel :as fuel]))
+  (:require [fluree.db.track.fuel :as fuel]
+            [fluree.db.track.time :as time]))
 
 (defn track-all?
   [{:keys [meta] :as _opts}]
@@ -44,8 +45,11 @@
   ([]
    (init {:fuel {:limit 0}}))
   ([{:keys [fuel]}]
-   {:fuel (fuel/init fuel)}))
+   {:time (time/init)
+    :fuel (fuel/init fuel)}))
 
 (defn tally
   [trkr]
-  (update trkr :fuel fuel/tally))
+  (-> trkr
+      (update :time time/tally)
+      (update :fuel fuel/tally)))
