@@ -520,19 +520,31 @@
           (is (= [[:bind "?bound" {"@id" "ex:foo"}]
                   {"@id" "?person", "person:handle" "?bound"}]
                  where)))))
-    (let [query "SELECT ?person ?prefix ?foofix ?num1
+    (testing "math"
+      (testing "without whitespace"
+        (let [query "SELECT ?person ?prefix ?foofix ?num1
                  WHERE {BIND (SUBSTR(?handle, 4) AS ?prefix)
                         BIND (REPLACE(?prefix, \"abc\", \"FOO\") AS ?foofix)
                         BIND (?age*4*3/-2*(-4/2) AS ?num1)
                         ?person person:handle ?handle.
                         ?person person:age ?age}"
-          {:keys [where]} (sparql/->fql query)]
-      (is (= [[:bind "?prefix" "(subStr ?handle 4)"]
-              [:bind "?foofix" "(replace ?prefix \"abc\" \"FOO\")"]
-              [:bind "?num1" "(* (/ (* (* ?age 4) 3) -2) (/ -4 2))"]
-              {"@id" "?person", "person:handle" "?handle"}
-              {"@id" "?person", "person:age" "?age"}]
-             where)))
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?prefix" "(subStr ?handle 4)"]
+                  [:bind "?foofix" "(replace ?prefix \"abc\" \"FOO\")"]
+                  [:bind "?num1" "(* (/ (* (* ?age 4) 3) -2) (/ -4 2))"]
+                  {"@id" "?person", "person:handle" "?handle"}
+                  {"@id" "?person", "person:age" "?age"}]
+                 where))))
+      (testing "with whitespace"
+        (let [query "SELECT ?person ?prefix ?foofix ?num1
+                 WHERE {BIND (?age * 4 * 3 / -2 * (-4 / 2) AS ?num1)
+                        ?person person:handle ?handle.
+                        ?person person:age ?age}"
+              {:keys [where]} (sparql/->fql query)]
+          (is (= [[:bind "?num1" "(* (/ (* (* ?age 4) 3) -2) (/ -4 2))"]
+                  {"@id" "?person", "person:handle" "?handle"}
+                  {"@id" "?person", "person:age" "?age"}]
+                 where)))))
     (testing "function calls"
       (let [query "SELECT ?finger
                  WHERE {?person ex:thumb ?thumb.
