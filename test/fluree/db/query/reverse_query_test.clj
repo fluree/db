@@ -6,38 +6,38 @@
 
 (deftest ^:integration context-reverse-test
   (testing "Test that the @reverse context values pulls select values back correctly."
-    (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/reverse")
-          context          [test-utils/default-context {:ex "http://example.org/ns/"}]
-          db     @(fluree/stage
-                   (fluree/db ledger)
-                   {"@context" context
-                    "insert"
-                    [{:id           :ex/brian
-                      :type         :ex/User
-                      :schema/name  "Brian"
-                      :ex/friend    [:ex/alice]}
-                     {:id           :ex/alice
-                      :type         :ex/User
-                      :schema/name  "Alice"}
-                     {:id           :ex/cam
-                      :type         :ex/User
-                      :schema/name  "Cam"
-                      :ex/friend    [:ex/brian :ex/alice]}]})]
+    (let [conn    (test-utils/create-conn)
+          ledger  @(fluree/create conn "query/reverse")
+          context [test-utils/default-context {:ex "http://example.org/ns/"}]
+          db      @(fluree/stage
+                    (fluree/db ledger)
+                    {"@context" context
+                     "insert"
+                     [{:id          :ex/brian
+                       :type        :ex/User
+                       :schema/name "Brian"
+                       :ex/friend   [:ex/alice]}
+                      {:id          :ex/alice
+                       :type        :ex/User
+                       :schema/name "Alice"}
+                      {:id          :ex/cam
+                       :type        :ex/User
+                       :schema/name "Cam"
+                       :ex/friend   [:ex/brian :ex/alice]}]})]
 
       (is (= {:schema/name "Brian"
-              :friended    :ex/cam}
+              :friended    {:id :ex/cam}}
              @(fluree/query db {:context   [context {:friended {:reverse :ex/friend}}]
                                 :selectOne {:ex/brian [:schema/name :friended]}})))
 
       (is (= {:schema/name "Brian"
-              :friended    [:ex/cam]}
+              :friended    [{:id :ex/cam}]}
              @(fluree/query db {:context   [context {:friended {:container :set
-                                                                :reverse :ex/friend}}]
+                                                                :reverse   :ex/friend}}]
                                 :selectOne {:ex/brian [:schema/name :friended]}})))
 
       (is (= {:schema/name "Alice"
-              :friended    [:ex/brian :ex/cam]}
+              :friended    [{:id :ex/brian} {:id :ex/cam}]}
              @(fluree/query db {:context   [context {:friended {:reverse :ex/friend}}]
                                 :selectOne {:ex/alice [:schema/name :friended]}})))
 

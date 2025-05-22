@@ -10,6 +10,7 @@
 (def default-context
   {:id     "@id"
    :type   "@type"
+   :value  "@value"
    :graph  "@graph"
    :xsd    "http://www.w3.org/2001/XMLSchema#"
    :rdf    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -23,6 +24,7 @@
 (def default-str-context
   {"id"     "@id"
    "type"   "@type"
+   "value"  "@value"
    "graph"  "@graph"
    "foaf"   "http://xmlns.com/foaf/0.1/"
    "owl"    "http://www.w3.org/2002/07/owl#"
