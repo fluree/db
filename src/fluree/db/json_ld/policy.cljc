@@ -55,9 +55,9 @@
                          (mapv (fn [c] {"@value" c
                                         "@type"  const/iri-id})))
           policies  (<! (dbproto/-query db tracker {"select" {"?policy" ["*"]}
-                                                         "where"  [{"@id"   "?policy"
-                                                                    "@type" "?classes"}]
-                                                         "values" ["?classes" c-values]}))
+                                                    "where"  [{"@id"   "?policy"
+                                                               "@type" "?classes"}]
+                                                    "values" ["?classes" c-values]}))
           policies* (if (util/exception? policies)
                       policies
                       (policy-from-query policies))]
@@ -92,10 +92,10 @@
   [db tracker identity policy-values]
   (go
     (let [policies  (<! (dbproto/-query db tracker {"select" {"?policy" ["*"]}
-                                                         "where"  [{"@id"                 identity
-                                                                    const/iri-policyClass "?classes"}
-                                                                   {"@id"   "?policy"
-                                                                    "@type" "?classes"}]}))
+                                                    "where"  [{"@id"                 identity
+                                                               const/iri-policyClass "?classes"}
+                                                              {"@id"   "?policy"
+                                                               "@type" "?classes"}]}))
           policies* (if (util/exception? policies)
                       policies
                       (policy-from-query policies))

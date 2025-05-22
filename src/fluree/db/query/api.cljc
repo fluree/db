@@ -14,7 +14,6 @@
             [fluree.db.reasoner :as reasoner]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.track :as track]
-            [fluree.db.track.fuel :as fuel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
             [fluree.db.util.core :as util :refer [try* catch*]]
