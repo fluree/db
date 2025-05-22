@@ -17,7 +17,7 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld])
-  (:refer-clojure :exclude [merge load range exists?]))
+  (:refer-clojure :exclude [merge load range exists? drop]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -182,6 +182,11 @@
   (validate-connection conn)
   (promise-wrap
    (connection/load-ledger conn alias-or-address)))
+
+(defn drop
+  [conn ledger-alias]
+  (promise-wrap
+   (connection/drop-ledger conn ledger-alias)))
 
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
