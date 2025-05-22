@@ -5,24 +5,24 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn tally
-  [trkr]
+  [fuel-tracker]
   (reduce (fn [total ctr]
             (+ total @ctr))
-          0 @(:counters trkr)))
+          0 @(:counters fuel-tracker)))
 
 (defn track
-  [trkr error-ch]
+  [{:keys [fuel] :as _trkr} error-ch]
   (fn [rf]
     (let [counter (volatile! 0)]
-      (swap! (:counters trkr) conj counter)
+      (swap! (:counters fuel) conj counter)
       (fn
         ([]
          (rf))
 
         ([result next]
          (vswap! counter inc)
-         (when-let [limit (:limit trkr)]
-           (let [tly (tally trkr)]
+         (when-let [limit (:limit fuel)]
+           (let [tly (tally fuel)]
              (when (< 0 limit tly)
                (log/error "Fuel limit of" limit "exceeded:" tly)
                (put! error-ch

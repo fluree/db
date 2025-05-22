@@ -1,4 +1,5 @@
-(ns fluree.db.track)
+(ns fluree.db.track
+  (:require [fluree.db.track.fuel :as fuel]))
 
 (defn track-all?
   [{:keys [meta] :as _opts}]
@@ -44,5 +45,9 @@
    (tracker {:fuel {:limit 0}}))
   ([{:keys [fuel]}]
    (let [{:keys [limit]} fuel]
-     {:limit    limit
-      :counters (atom [])})))
+     {:fuel {:limit    limit
+             :counters (atom [])}})))
+
+(defn tally
+  [trkr]
+  (update trkr :fuel fuel/tally))

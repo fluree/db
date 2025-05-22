@@ -647,14 +647,14 @@
               (cond-> {:status 200
                        :db     staged-db}
                 track-time?   (assoc :time (util/response-time-formatted start-time))
-                track-fuel?   (assoc :fuel (fuel/tally tracker))
+                track-fuel?   (assoc :fuel (-> tracker track/tally :fuel))
                 policy-report (assoc :policy policy-report)))
             (catch* e
               (throw (ex-info (ex-message e)
                               (let [policy-report (policy.rules/enforcement-report policy-db)]
                                 (cond-> (ex-data e)
                                   track-time?   (assoc :time (util/response-time-formatted start-time))
-                                  track-fuel?   (assoc :fuel (fuel/tally tracker))
+                                  track-fuel?   (assoc :fuel (-> tracker track/tally :fuel))
                                   policy-report (assoc :policy policy-report)))
                               e)))))
         (let [policy-db (if (policy/policy-enforced-opts? parsed-opts)

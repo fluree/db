@@ -85,14 +85,14 @@
               (cond-> {:status 200,
                        :result result
                        :time   (util/response-time-formatted start)}
-                (track/track-fuel? opts) (assoc :fuel (fuel/tally tracker))
+                (track/track-fuel? opts) (assoc :fuel (-> tracker track/tally :fuel))
                 policy-report            (assoc :policy policy-report)))
             (catch* e
               (throw (ex-info "Error executing query"
                               (cond-> {:status (-> e ex-data :status)
                                        :time   (util/response-time-formatted start)}
                                 (track/track-fuel? opts)
-                                (assoc :fuel (fuel/tally tracker)))
+                                (assoc :fuel (-> tracker track/tally :fuel)))
                               e)))))))
 
 (defn history
