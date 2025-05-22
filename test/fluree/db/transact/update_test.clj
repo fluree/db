@@ -479,15 +479,21 @@
                                                    ["bind"
                                                     "?bound" "(bound ?text)"
                                                     "?in" "(in (strLen ?text) [(+ 6 1) 8 9])"
-                                                    "?not-in" "(not (in (strLen ?text) [(+ 6 1) 8 9]))"]]
+                                                    "?not-in" "(not (in (strLen ?text) [(+ 6 1) 8 9]))"
+                                                    "?or" "(or false false false (= 0 (- (- 10 3) 7)))"
+                                                    "?and" "(and true true true (+ (- 10 3) 7))"]]
                                        "insert"   {"id"        "?s",
                                                    "ex:bound"  "?bound"
                                                    "ex:in"     "?in"
-                                                   "ex:not-in" "?not-in"}
+                                                   "ex:not-in" "?not-in"
+                                                   "ex:logical-or" "?or"
+                                                   "ex:logical-and" "?and"}
                                        "values"   ["?s" [{"@value" "ex:functional-fns" "@type" "@id"}]]}))]
         (is (= {"ex:bound"  true
                 "ex:in"     true
-                "ex:not-in" false}
+                "ex:not-in" false
+                "ex:logical-or" true
+                "ex:logical-and" 14}
                @(fluree/query @updated {"@context"  [test-utils/default-str-context
                                                      {"ex" "http://example.com/"}]
                                         "selectOne" {"ex:functional-fns" ["ex:bound"
