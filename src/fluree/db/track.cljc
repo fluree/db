@@ -39,14 +39,12 @@
       (track-file? opts)
       (track-policy? opts)))
 
-(defn tracker
+(defn init
   "Creates a new fuel tracker w/ optional fuel limit (0 means unlimited)."
   ([]
-   (tracker {:fuel {:limit 0}}))
+   (init {:fuel {:limit 0}}))
   ([{:keys [fuel]}]
-   (let [{:keys [limit]} fuel]
-     {:fuel {:limit    limit
-             :counters (atom [])}})))
+   {:fuel (fuel/init fuel)}))
 
 (defn tally
   [trkr]

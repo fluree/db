@@ -12,7 +12,7 @@
   [db methods rule-sources {:keys [max-fuel reasoner-max]
                             :or   {reasoner-max 10} :as _opts}]
   (let [methods*        (set (util/sequential methods))
-        tracker    (track/tracker {:fuel {:limit max-fuel}})]
+        tracker    (track/init {:fuel {:limit max-fuel}})]
     (-reason db methods* rule-sources tracker reasoner-max)))
 
 (defn reasoned-facts

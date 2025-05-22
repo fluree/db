@@ -17,7 +17,6 @@
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
             [fluree.db.track :as track]
-            [fluree.db.track.fuel :as fuel]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
@@ -637,7 +636,7 @@
                                 :cljs (util/current-time-millis)))
               track-fuel?  (track/track-fuel? parsed-opts)
               tracker (when track-fuel?
-                        (track/tracker {:fuel {:limit (:max-fuel parsed-opts)}}))
+                        (track/init {:fuel {:limit (:max-fuel parsed-opts)}}))
               policy-db    (if (policy/policy-enforced-opts? parsed-opts)
                              (<? (policy/policy-enforce-db db tracker parsed-context parsed-opts))
                              db)]

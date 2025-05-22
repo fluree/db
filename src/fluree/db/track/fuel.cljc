@@ -31,3 +31,8 @@
 
         ([result]
          (rf result))))))
+
+(defn init
+  [{:keys [limit]}]
+  {:limit    limit
+   :counters (atom [])})
