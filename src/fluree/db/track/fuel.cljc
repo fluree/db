@@ -4,11 +4,16 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn init
+  [{:keys [limit]}]
+  {:limit    limit
+   :counters (atom [])})
+
 (defn tally
-  [fuel-tracker]
+  [{:keys [counters]}]
   (reduce (fn [total ctr]
             (+ total @ctr))
-          0 @(:counters fuel-tracker)))
+          0 @counters))
 
 (defn track
   [{:keys [fuel] :as _trkr} error-ch]
@@ -31,8 +36,3 @@
 
         ([result]
          (rf result))))))
-
-(defn init
-  [{:keys [limit]}]
-  {:limit    limit
-   :counters (atom [])})
