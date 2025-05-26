@@ -633,7 +633,7 @@
         (let [track-time?  (track/track-time? parsed-opts)
               track-fuel?  (track/track-fuel? parsed-opts)
               tracker (when track-fuel?
-                        (track/init {:fuel {:limit (:max-fuel parsed-opts)}}))
+                        (track/init (select-keys parsed-opts [:max-fuel])))
               policy-db    (if (policy/policy-enforced-opts? parsed-opts)
                              (<? (policy/policy-enforce-db db tracker parsed-context parsed-opts))
                              db)]

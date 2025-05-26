@@ -5,8 +5,8 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn init
-  [{:keys [limit]}]
-  {:limit    limit
+  [max-fuel]
+  {:limit    (or max-fuel 0)
    :counters (atom [])})
 
 (defn tally
