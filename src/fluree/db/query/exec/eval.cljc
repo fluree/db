@@ -146,16 +146,16 @@
   ([] (where/->typed-val true))
   ([x] x)
   ([x & next]
-   `(let [and# (:value ~x)]
-      (where/->typed-val (if and# (and (:value ~@next)) and#)))))
+   `(let [and# ~x]
+      (if (:value and#) (-and ~@next) ~x))))
 
 (defmacro -or
   "Equivalent to or"
   ([] (where/->typed-val nil))
   ([x] x)
   ([x & next]
-   `(let [or# (:value ~x)]
-      (where/->typed-val (if or# or# (or (:value ~@next)))))))
+   `(let [or# ~x]
+      (if (:value or#) ~x (-or ~@next)))))
 
 (defn strStarts
   [{s :value} {substr :value}]
