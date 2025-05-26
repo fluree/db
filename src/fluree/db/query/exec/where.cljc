@@ -8,7 +8,7 @@
             [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.range :as query-range]
-            [fluree.db.track.fuel :as fuel]
+            [fluree.db.track :as track]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
@@ -477,7 +477,7 @@
         start-flake (flake/create s p o* o-dt nil nil util/min-integer)
         end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
         track-fuel  (when tracker
-                      (fuel/track tracker error-ch))
+                      (track/track-fuel! tracker error-ch))
         subj-filter (when s-fn
                       (filter (fn [f]
                                 (-> unmatched

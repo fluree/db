@@ -48,6 +48,11 @@
    {:time (time/init)
     :fuel (fuel/init fuel)}))
 
+(defn track-fuel!
+  [{:keys [fuel] :as _trkr} error-ch]
+  (fuel/track! fuel error-ch))
+
+
 (defn tally
   [trkr]
   (-> trkr

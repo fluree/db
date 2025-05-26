@@ -9,7 +9,7 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.track.fuel :as fuel]
+            [fluree.db.track :as track]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.virtual-graph.index-graph :as vg]))
@@ -60,7 +60,7 @@
   (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)
         error-xf (halt-when util/exception?)
         flake-xf (if tracker
-                   (let [track-fuel (fuel/track tracker error-ch)]
+                   (let [track-fuel (track/track-fuel! tracker error-ch)]
                      (comp error-xf track-fuel))
                    error-xf)]
     (async/transduce flake-xf (completing conj) flakeset flake-ch)))

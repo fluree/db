@@ -5,7 +5,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.range :as query-range]
-            [fluree.db.track.fuel :as fuel]
+            [fluree.db.track :as track]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]))
 
@@ -106,7 +106,7 @@
   (let [sid                     (iri/encode-iri db iri)
         [start-flake end-flake] (flake-bounds db :spot [sid])
         flake-xf                (when tracker
-                                  (comp (fuel/track tracker error-ch)))
+                                  (comp (track/track-fuel! tracker error-ch)))
         range-opts              {:to-t        t
                                  :start-flake start-flake
                                  :end-flake   end-flake
@@ -123,7 +123,7 @@
         pid                     (iri/encode-iri db p-iri)
         [start-flake end-flake] (flake-bounds db :opst [oid pid])
         flake-xf                (if tracker
-                                  (comp (fuel/track tracker error-ch)
+                                  (comp (track/track-fuel! tracker error-ch)
                                         (map flake/s))
                                   (map flake/s))
         range-opts              {:to-t        t

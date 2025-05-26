@@ -5,7 +5,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
-            [fluree.db.track.fuel :as fuel]
+            [fluree.db.track :as track]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log]
@@ -44,7 +44,7 @@
             pid       (iri/encode-iri db property)
             score-xf  (comp (map (partial score-flake score-fn target))
                             (remove nil?))
-            flake-xf  (->> [score-xf (when tracker (fuel/track tracker error-ch))]
+            flake-xf  (->> [score-xf (when tracker (track/track-fuel! tracker error-ch))]
                            (remove nil?)
                            (apply comp))
             ;; For now, pulling all matching values from full index once hitting

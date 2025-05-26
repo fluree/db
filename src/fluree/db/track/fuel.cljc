@@ -15,8 +15,8 @@
             (+ total @ctr))
           0 @counters))
 
-(defn track
-  [{:keys [fuel] :as _trkr} error-ch]
+(defn track!
+  [fuel error-ch]
   (fn [rf]
     (let [counter (volatile! 0)]
       (swap! (:counters fuel) conj counter)
