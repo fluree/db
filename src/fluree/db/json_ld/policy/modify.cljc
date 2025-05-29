@@ -37,14 +37,14 @@
 
 (defn has-class-policies?
   [policy]
-  (boolean (enforce/class-policy-map policy true)))
+  (boolean (-> policy enforce/modify-class-policy-map not-empty)))
 
 ;; TODO - get parent classes
 (defn subject-class-policies
   [db-after tracker policy class-policy-cache sid]
   (go-try
     (let [classes  (<? (dbproto/-class-ids db-after tracker sid))
-          policies (or (enforce/policies-for-classes classes policy true)
+          policies (or (enforce/modify-policies-for-classes classes policy)
                        [])]
       (swap! class-policy-cache assoc sid policies)
       policies)))

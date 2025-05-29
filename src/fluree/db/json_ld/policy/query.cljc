@@ -20,14 +20,14 @@
 (defn cached-class-policies
   [policy sid]
   (when-let [classes (get @(:cache policy) sid)]
-    (enforce/policies-for-classes policy false classes)))
+    (enforce/view-policies-for-classes policy classes)))
 
 (defn class-policies
   [{:keys [policy] :as db} tracker sid]
   (go-try
     (let [class-sids (<? (dbproto/-class-ids db tracker sid))]
       (swap! (:cache policy) assoc sid class-sids)
-      (enforce/policies-for-classes policy false class-sids))))
+      (enforce/view-policies-for-classes policy class-sids))))
 
 (defn allow-flake?
   "Returns one of:

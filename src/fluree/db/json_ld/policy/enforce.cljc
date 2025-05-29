@@ -16,12 +16,13 @@
   [policy]
   (true? (get-in policy [:view :root?])))
 
-(defn class-policy-map
-  "Returns class policy map"
-  [policy modify?]
-  (if modify?
-    (get-in policy [:modify :class])
-    (get-in policy [:view :class])))
+(defn view-class-policy-map
+  [policy]
+  (get-in policy [:view :class]))
+
+(defn modify-class-policy-map
+  [policy]
+  (get-in policy [:modify :class]))
 
 (defn modify-property-policy-map
   [policy]
@@ -31,10 +32,14 @@
   [policy]
   (get-in policy [:view :property]))
 
-(defn policies-for-classes
-  "Returns sequence of policies that apply to the provided classes."
-  [policy modify? classes]
-  (let [class-policies (class-policy-map policy modify?)]
+(defn view-policies-for-classes
+  [policy classes]
+  (let [class-policies (view-class-policy-map policy)]
+    (seq (apply concat (keep #(get class-policies %) classes)))))
+
+(defn modify-policies-for-classes
+  [policy classes]
+  (let [class-policies (modify-class-policy-map policy)]
     (seq (apply concat (keep #(get class-policies %) classes)))))
 
 (defn modify-policies-for-property
