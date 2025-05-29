@@ -832,7 +832,25 @@
       (is (= ["?e"]
              groupBy))
       (is (= "(> (sum ?favNums) 1000)"
-             having))))
+             having)))
+    (let [query "SELECT (COUNT(DISTINCT ?account) AS ?count)
+                 WHERE {
+                   SELECT ?account
+                   WHERE {
+                     ?record abc:account ?account .
+                   }
+                   GROUP BY ?account
+                   HAVING (COUNT(?record) > 1)
+                 }"]
+      (is (= {:context {},
+              :select ["(as (count-distinct ?account) ?count)"],
+              :where
+              [[:query
+                {:select ["?account"],
+                 :where [{"@id" "?record", "abc:account" "?account"}],
+                 :groupBy ["?account"],
+                 :having "(> (count ?record) 1)"}]]}
+             (sparql/->fql query)))))
   (testing "multiple GROUP BY"
     (let [query "SELECT ?handle
                  WHERE {?person person:handle ?handle.}
