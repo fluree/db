@@ -52,21 +52,31 @@
   (let [prop-policies (view-property-policy-map policy-map)]
     (get prop-policies property)))
 
-(defn default-policies
-  "Returns default policies if they exist else nil"
-  [policy-map modify?]
-  (if modify?
-    (get-in policy-map [:modify :default])
-    (get-in policy-map [:view :default])))
+(defn default-view-policies
+  [policy-map]
+  (get-in policy-map [:view :default]))
 
-(defn policies-for-flake
-  [{:keys [policy] :as _db} [s p _o :as _flake] modify?]
-  (->> (default-policies policy modify?)
-       (keep (fn [{:keys [s-targets p-targets default?] :as policy}]
-               (when (or (and (or (nil? s-targets) (contains? s-targets s))
-                              (or (nil? p-targets) (contains? p-targets p)))
-                         default?)
-                 policy)))))
+(defn default-modify-policies
+  [policy-map]
+  (get-in policy-map [:modify :default]))
+
+(defn applies-to-flake?
+  [{:keys [s-targets p-targets default?] :as _policy} [s p _o :as _flake]]
+  (or (and (or (nil? s-targets) (contains? s-targets s))
+           (or (nil? p-targets) (contains? p-targets p)))
+      default?))
+
+(defn view-policies-for-flake
+  [{:keys [policy] :as _db} flake]
+  (filter (fn [policy]
+            (applies-to-flake? policy flake))
+          (default-view-policies policy)))
+
+(defn modify-policies-for-flake
+  [{:keys [policy] :as _db} flake]
+  (filter (fn [policy]
+            (applies-to-flake? policy flake))
+          (default-modify-policies policy)))
 
 (defn policy-query
   [db sid query]

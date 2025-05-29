@@ -47,7 +47,7 @@
                                (when (-> policy :view :class not-empty)
                                  ;; only do range scan if we have /any/ class policies
                                  (<? (class-policies db tracker sid))))
-                           (enforce/policies-for-flake db flake false))]
+                           (enforce/view-policies-for-flake db flake))]
       (if-some [required-policies (not-empty (filter :required? policies))]
         (<? (enforce/policies-allow? db tracker false sid required-policies))
         (<? (enforce/policies-allow? db tracker false sid policies))))))

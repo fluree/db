@@ -70,7 +70,7 @@
                                    (when class-policies?
                                      (or (get @class-policy-cache sid)
                                          (<? (subject-class-policies db-after tracker policy class-policy-cache sid))))
-                                   (enforce/policies-for-flake db-after flake true))]
+                                   (enforce/modify-policies-for-flake db-after flake))]
               ;; policies-allow? will throw if access forbidden
               (if-some [required-policies (not-empty (filter :required? policies))]
                 (<? (enforce/policies-allow? db-after tracker true sid required-policies))
