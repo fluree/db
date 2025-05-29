@@ -640,18 +640,13 @@
             (let [staged-db     (<? (transact/stage policy-db tracker identity parsed-txn parsed-opts))
                   policy-report (policy.rules/enforcement-report staged-db)
                   tally         (track/tally tracker)]
-              (cond-> {:status 200
-                       :db     staged-db}
-                track-time?   (assoc :time (:time tally))
-                track-fuel?   (assoc :fuel (:fuel tally))
+              (cond-> (assoc tally :status 200, :db staged-db)
                 policy-report (assoc :policy policy-report)))
             (catch* e
               (throw (ex-info (ex-message e)
                               (let [policy-report (policy.rules/enforcement-report policy-db)
                                     tally         (track/tally tracker)]
-                                (cond-> (ex-data e)
-                                  track-time?   (assoc :time (:time tally))
-                                  track-fuel?   (assoc :fuel (:fuel tally))
+                                (cond-> (merge (ex-data e) tally)
                                   policy-report (assoc :policy policy-report)))
                               e)))))
         (let [policy-db (if (policy/policy-enforced-opts? parsed-opts)

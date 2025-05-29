@@ -74,23 +74,20 @@
 (defn track-execution
   "Track fuel usage in query. `exec-fn` is a thunk that when called with no arguments
   returns a result or throws an exception."
-  [ds tracker opts exec-fn]
+  [ds tracker exec-fn]
   (go-try
     (try* (let [result        (<? (exec-fn))
                 policy-report (when-not (dataset? ds)
                                 (policy.rules/enforcement-report ds))
                 tally         (track/tally tracker)]
-            (cond-> {:status 200,
-                     :result result}
-              (track/track-time? opts) (assoc :time (:time tally))
-              (track/track-fuel? opts) (assoc :fuel (:fuel tally))
-              policy-report            (assoc :policy policy-report)))
+            (cond-> (assoc tally :status 200, :result result)
+              policy-report (assoc :policy policy-report)))
           (catch* e
-            (let [tally (track/tally tracker)]
+            (let [data (-> tracker
+                           track/tally
+                           (assoc :status (-> e ex-data :status)))]
               (throw (ex-info "Error executing query"
-                              (cond-> {:status (-> e ex-data :status)}
-                                (track/track-time? opts) (assoc :time (:time tally))
-                                (track/track-fuel? opts) (assoc :fuel (:fuel tally)))
+                              data
                               e)))))))
 
 (defn history
@@ -107,7 +104,7 @@
                       (<? (perm/policy-enforce-db latest-db tracker context opts))
                       latest-db)]
       (if (track/track-query? opts)
-        (<? (track-execution policy-db tracker opts #(history/query policy-db tracker context query*)))
+        (<? (track-execution policy-db tracker #(history/query policy-db tracker context query*)))
         (<? (history/query policy-db context query*))))))
 
 (defn query-fql
@@ -129,7 +126,7 @@
                       (<? (restrict-db ds tracker query*)))
            query**  (update query* :opts dissoc :meta :max-fuel)]
        (if (track/track-query? opts)
-         (<? (track-execution ds* tracker opts #(fql/query ds* tracker query**)))
+         (<? (track-execution ds* tracker #(fql/query ds* tracker query**)))
          (<? (fql/query ds* query**)))))))
 
 (defn query-sparql
@@ -267,7 +264,7 @@
         (let [ds            (<? (load-dataset conn tracker default-aliases named-aliases sanitized-query))
               trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel)]
           (if (track/track-query? opts)
-            (<? (track-execution ds tracker opts #(fql/query ds tracker trimmed-query)))
+            (<? (track-execution ds tracker #(fql/query ds tracker trimmed-query)))
             (<? (fql/query ds trimmed-query))))
         (throw (ex-info "Missing ledger specification in connection query"
                         {:status 400, :error :db/invalid-query}))))))
