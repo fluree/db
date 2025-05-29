@@ -66,7 +66,7 @@
           (if flake
             (let [sid      (flake/s flake)
                   pid      (flake/p flake)
-                  policies (concat (enforce/policies-for-property policy true pid)
+                  policies (concat (enforce/modify-policies-for-property policy pid)
                                    (when class-policies?
                                      (or (get @class-policy-cache sid)
                                          (<? (subject-class-policies db-after tracker policy class-policy-cache sid))))

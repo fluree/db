@@ -42,7 +42,7 @@
   (go-try
     (let [pid      (flake/p flake)
           sid      (flake/s flake)
-          policies (concat (enforce/policies-for-property policy false pid)
+          policies (concat (enforce/view-policies-for-property policy pid)
                            (or (cached-class-policies policy sid)
                                (when (-> policy :view :class not-empty)
                                  ;; only do range scan if we have /any/ class policies
