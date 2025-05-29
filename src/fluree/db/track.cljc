@@ -54,7 +54,7 @@
   "Creates a new fuel tracker w/ optional fuel limit (0 means unlimited)."
   ([]
    (init {}))
-  ([{:keys [max-fuel policy]}]
+  ([{:keys [max-fuel]}]
    (-> {}
        init-time
        (init-fuel max-fuel))))
