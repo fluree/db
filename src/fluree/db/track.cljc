@@ -43,12 +43,12 @@
       (track-policy? opts)))
 
 (defn init-time
-  [trkr]
-  (assoc trkr :time (time/init)))
+  [tracker]
+  (assoc tracker :time (time/init)))
 
 (defn init-fuel
-  [trkr max-fuel]
-  (assoc trkr :fuel (fuel/init max-fuel)))
+  [tracker max-fuel]
+  (assoc tracker :fuel (fuel/init max-fuel)))
 
 (defn init
   "Creates a new fuel tracker w/ optional fuel limit (0 means unlimited)."
@@ -60,12 +60,12 @@
        (init-fuel max-fuel))))
 
 (defn track-fuel!
-  [{:keys [fuel] :as _trkr} error-ch]
-  (fuel/track! fuel error-ch))
-
+  [tracker error-ch]
+  (when-let [fuel-tracker (:fuel tracker)]
+    (fuel/track! fuel-tracker error-ch)))
 
 (defn tally
-  [trkr]
-  (-> trkr
-      (update :time time/tally)
-      (update :fuel fuel/tally)))
+  [tracker]
+  (cond-> tracker
+    (contains? tracker :time) (update :time time/tally)
+    (contains? tracker :fuel) (update :fuel fuel/tally)))

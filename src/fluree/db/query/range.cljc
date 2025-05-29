@@ -309,8 +309,7 @@
                            (iri/encode-iri db s2))
              end-flake   (resolve-match-flake end-test s2* p2 o2 t2 op2 m2)
              error-ch    (chan)
-             track-fuel  (when tracker
-                           (track/track-fuel! tracker error-ch))
+             track-fuel  (track/track-fuel! tracker error-ch)
              flake-xf*   (->> [(:flake-xf opts) track-fuel]
                               (remove nil?)
                               (apply comp))

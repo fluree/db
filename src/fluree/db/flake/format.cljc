@@ -105,12 +105,11 @@
   [{:keys [t] :as db} iri select-spec context compact-fn cache tracker error-ch]
   (let [sid                     (iri/encode-iri db iri)
         [start-flake end-flake] (flake-bounds db :spot [sid])
-        flake-xf                (when tracker
-                                  (comp (track/track-fuel! tracker error-ch)))
-        range-opts              {:to-t        t
-                                 :start-flake start-flake
-                                 :end-flake   end-flake
-                                 :flake-xf    flake-xf}
+        flake-xf                (track/track-fuel! tracker error-ch)
+        range-opts              (cond-> {:to-t        t
+                                         :start-flake start-flake
+                                         :end-flake   end-flake}
+                                  flake-xf (assoc :flake-xf flake-xf))
         subj-xf                 (comp cat
                                       (format-subject-xf db cache context compact-fn
                                                          select-spec))]
@@ -122,8 +121,8 @@
   (let [oid                     (iri/encode-iri db o-iri)
         pid                     (iri/encode-iri db p-iri)
         [start-flake end-flake] (flake-bounds db :opst [oid pid])
-        flake-xf                (if tracker
-                                  (comp (track/track-fuel! tracker error-ch)
+        flake-xf                (if-let [track-fuel (track/track-fuel! tracker error-ch)]
+                                  (comp track-fuel
                                         (map flake/s))
                                   (map flake/s))
         range-opts              {:to-t        t

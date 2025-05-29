@@ -476,8 +476,7 @@
         [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
         start-flake (flake/create s p o* o-dt nil nil util/min-integer)
         end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
-        track-fuel  (when tracker
-                      (track/track-fuel! tracker error-ch))
+        track-fuel  (track/track-fuel! tracker error-ch)
         subj-filter (when s-fn
                       (filter (fn [f]
                                 (-> unmatched

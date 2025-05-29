@@ -59,9 +59,8 @@
   [tracker error-ch flake-ch]
   (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)
         error-xf (halt-when util/exception?)
-        flake-xf (if tracker
-                   (let [track-fuel (track/track-fuel! tracker error-ch)]
-                     (comp error-xf track-fuel))
+        flake-xf (if-let [track-fuel (track/track-fuel! tracker error-ch)]
+                   (comp error-xf track-fuel)
                    error-xf)]
     (async/transduce flake-xf (completing conj) flakeset flake-ch)))
 
