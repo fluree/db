@@ -71,10 +71,10 @@
                                      (or (get @class-policy-cache sid)
                                          (<? (subject-class-policies db-after tracker policy class-policy-cache sid))))
                                    (enforce/modify-policies-for-flake db-after flake))]
-              ;; policies-allow? will throw if access forbidden
+              ;; policies-allow-modification? will throw if access forbidden
               (if-some [required-policies (not-empty (filter :required? policies))]
-                (<? (enforce/policies-allow? db-after tracker true sid required-policies))
-                (<? (enforce/policies-allow? db-after tracker true sid policies)))
+                (<? (enforce/policies-allow-modification? db-after tracker sid required-policies))
+                (<? (enforce/policies-allow-modification? db-after tracker sid policies)))
               (recur r))
             ;; no more flakes, all passed so return final db
             db-after))))))

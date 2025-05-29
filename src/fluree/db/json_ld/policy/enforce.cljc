@@ -86,21 +86,15 @@
                           (policy/inject-value-binding "?$this" {"@value" this-val "@type" const/iri-id}))]
     (policy/inject-where-pattern query ["values" values])))
 
-(defn modify-exception
-  [policies]
-  (ex-info (or (some :ex-message policies)
-               "Policy enforcement prevents modification.")
-           {:status 403 :error :db/policy-exception}))
-
 (def ^:const deny-query-result false)
 
-(defn policies-allow?
+(defn- policies-allow?
   "Once narrowed to a specific set of policies, execute and return
   appropriate policy response."
-  [db tracker modify? sid policies-to-eval]
+  [db tracker sid policies]
   (let [tracer (-> db :policy :trace)]
     (go-try
-      (loop [[policy & r] policies-to-eval]
+      (loop [[policy & r] policies]
         ;; return first truthy response, else false
         (if policy
           (let [{exec-counter :executed
@@ -117,6 +111,15 @@
                   true)
               (recur r)))
           ;; no more policies left to evaluate - all returned false
-          (if modify?
-            (modify-exception policies-to-eval)
-            false))))))
+          false)))))
+
+(defn policies-allow-viewing?
+  [db tracker sid policies]
+  (policies-allow? db tracker sid policies))
+
+(defn policies-allow-modification?
+  [db tracker sid policies]
+  (go-try (or (<? (policies-allow? db tracker sid policies))
+              (ex-info (or (some :ex-message policies)
+                           "Policy enforcement prevents modification.")
+                       {:status 403 :error :db/policy-exception}))))

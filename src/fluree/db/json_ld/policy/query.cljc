@@ -49,8 +49,8 @@
                                  (<? (class-policies db tracker sid))))
                            (enforce/view-policies-for-flake db flake))]
       (if-some [required-policies (not-empty (filter :required? policies))]
-        (<? (enforce/policies-allow? db tracker false sid required-policies))
-        (<? (enforce/policies-allow? db tracker false sid policies))))))
+        (<? (enforce/policies-allow-viewing? db tracker sid required-policies))
+        (<? (enforce/policies-allow-viewing? db tracker sid policies))))))
 
 (defn allow-iri?
   "Returns async channel with truthy value if iri is visible for query results"
