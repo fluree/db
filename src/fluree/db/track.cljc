@@ -54,10 +54,10 @@
   "Creates a new fuel tracker w/ optional fuel limit (0 means unlimited)."
   ([]
    (init {}))
-  ([{:keys [max-fuel]}]
-   (-> {}
-       init-time
-       (init-fuel max-fuel))))
+  ([{:keys [max-fuel] :as opts}]
+   (cond-> {}
+     (track-time? opts) init-time
+     (track-fuel? opts) (init-fuel max-fuel))))
 
 (defn track-fuel!
   [tracker error-ch]

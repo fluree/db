@@ -630,13 +630,12 @@
           parsed-context (:context parsed-opts)
           identity       (:identity parsed-opts)]
       (if (track/track-txn? parsed-opts)
-        (let [track-time?  (track/track-time? parsed-opts)
-              track-fuel?  (track/track-fuel? parsed-opts)
-              tracker (when track-fuel?
-                        (track/init (select-keys parsed-opts [:max-fuel])))
-              policy-db    (if (policy/policy-enforced-opts? parsed-opts)
-                             (<? (policy/policy-enforce-db db tracker parsed-context parsed-opts))
-                             db)]
+        (let [track-time? (track/track-time? parsed-opts)
+              track-fuel? (track/track-fuel? parsed-opts)
+              tracker     (track/init parsed-opts)
+              policy-db   (if (policy/policy-enforced-opts? parsed-opts)
+                            (<? (policy/policy-enforce-db db tracker parsed-context parsed-opts))
+                            db)]
           (try*
             (let [staged-db     (<? (transact/stage policy-db tracker identity parsed-txn parsed-opts))
                   policy-report (policy.rules/enforcement-report staged-db)
