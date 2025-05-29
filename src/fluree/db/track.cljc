@@ -2,6 +2,8 @@
   (:require [fluree.db.track.fuel :as fuel]
             [fluree.db.track.time :as time]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn track-all?
   [{:keys [meta] :as _opts}]
   (true? meta))
