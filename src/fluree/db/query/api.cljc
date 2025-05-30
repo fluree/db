@@ -14,7 +14,6 @@
             [fluree.db.reasoner :as reasoner]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.track :as track]
-            [fluree.db.track.fuel :as fuel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
             [fluree.db.util.core :as util :refer [try* catch*]]
@@ -50,16 +49,16 @@
 (defn restrict-db
   ([db sanitized-query]
    (restrict-db db nil sanitized-query))
-  ([db fuel-tracker sanitized-query]
-   (restrict-db db fuel-tracker sanitized-query nil))
-  ([db fuel-tracker {:keys [t opts] :as sanitized-query} conn]
+  ([db tracker sanitized-query]
+   (restrict-db db tracker sanitized-query nil))
+  ([db tracker {:keys [t opts] :as sanitized-query} conn]
    (go-try
      (let [{:keys [reasoner-methods rule-sources]} opts
            processed-rule-sources (when (and rule-sources conn)
                                     (<? (load-aliased-rule-dbs conn rule-sources)))
            policy-db              (if (perm/policy-enforced-opts? opts)
                                     (let [parsed-context (context/extract sanitized-query)]
-                                      (<? (perm/policy-enforce-db db fuel-tracker parsed-context opts)))
+                                      (<? (perm/policy-enforce-db db tracker parsed-context opts)))
                                     db)
            time-travel-db         (-> (if t
                                         (<? (time-travel/as-of policy-db t))
@@ -75,24 +74,20 @@
 (defn track-execution
   "Track fuel usage in query. `exec-fn` is a thunk that when called with no arguments
   returns a result or throws an exception."
-  [ds fuel-tracker opts exec-fn]
+  [ds tracker exec-fn]
   (go-try
-    (let [start #?(:clj (System/nanoTime)
-                   :cljs (util/current-time-millis))]
-      (try* (let [result        (<? (exec-fn))
-                  policy-report (when-not (dataset? ds)
-                                  (policy.rules/enforcement-report ds))]
-              (cond-> {:status 200,
-                       :result result
-                       :time   (util/response-time-formatted start)}
-                (track/track-fuel? opts) (assoc :fuel (fuel/tally fuel-tracker))
-                policy-report            (assoc :policy policy-report)))
-            (catch* e
+    (try* (let [result        (<? (exec-fn))
+                policy-report (when-not (dataset? ds)
+                                (policy.rules/enforcement-report ds))
+                tally         (track/tally tracker)]
+            (cond-> (assoc tally :status 200, :result result)
+              policy-report (assoc :policy policy-report)))
+          (catch* e
+            (let [data (-> tracker
+                           track/tally
+                           (assoc :status (-> e ex-data :status)))]
               (throw (ex-info "Error executing query"
-                              (cond-> {:status (-> e ex-data :status)
-                                       :time   (util/response-time-formatted start)}
-                                (track/track-fuel? opts)
-                                (assoc :fuel (fuel/tally fuel-tracker)))
+                              data
                               e)))))))
 
 (defn history
@@ -102,15 +97,14 @@
   (go-try
     (let [{:keys [opts] :as query*} (sanitize-query-options query override-opts)
 
-          fuel-tracker (when (track/track-query? opts)
-                         (fuel/tracker (:max-fuel opts)))
-          context      (context/extract query*)
-          latest-db    (ledger/current-db ledger)
-          policy-db    (if (perm/policy-enforced-opts? opts)
-                         (<? (perm/policy-enforce-db latest-db fuel-tracker context opts))
-                         latest-db)]
+          tracker   (track/init opts)
+          context   (context/extract query*)
+          latest-db (ledger/current-db ledger)
+          policy-db (if (perm/policy-enforced-opts? opts)
+                      (<? (perm/policy-enforce-db latest-db tracker context opts))
+                      latest-db)]
       (if (track/track-query? opts)
-        (<? (track-execution policy-db fuel-tracker opts #(history/query policy-db fuel-tracker context query*)))
+        (<? (track-execution policy-db tracker #(history/query policy-db tracker context query*)))
         (<? (history/query policy-db context query*))))))
 
 (defn query-fql
@@ -123,17 +117,16 @@
                                          syntax/coerce-query
                                          (sanitize-query-options override-opts))
 
-           fuel-tracker (when (track/track-query? opts)
-                          (fuel/tracker (:max-fuel opts)))
+           tracker (track/init opts)
 
            ;; TODO - remove restrict-db from here, restriction should happen
            ;;      - upstream if needed
            ds*      (if (dataset? ds)
                       ds
-                      (<? (restrict-db ds fuel-tracker query*)))
+                      (<? (restrict-db ds tracker query*)))
            query**  (update query* :opts dissoc :meta :max-fuel)]
        (if (track/track-query? opts)
-         (<? (track-execution ds* fuel-tracker opts #(fql/query ds* fuel-tracker query**)))
+         (<? (track-execution ds* tracker #(fql/query ds* tracker query**)))
          (<? (fql/query ds* query**)))))))
 
 (defn query-sparql
@@ -201,7 +194,7 @@
       [alias nil])))
 
 (defn load-alias
-  [conn fuel-tracker alias {:keys [t] :as sanitized-query}]
+  [conn tracker alias {:keys [t] :as sanitized-query}]
   (go-try
     (try*
       (let [[alias explicit-t] (extract-query-string-t alias)
@@ -209,14 +202,14 @@
             db           (ledger/current-db ledger)
             t*           (or explicit-t t)
             query*       (assoc sanitized-query :t t*)]
-        (<? (restrict-db db fuel-tracker query* conn)))
+        (<? (restrict-db db tracker query* conn)))
       (catch* e
         (throw (contextualize-ledger-400-error
                 (str "Error loading ledger " alias ": ")
                 e))))))
 
 (defn load-aliases
-  [conn fuel-tracker aliases sanitized-query]
+  [conn tracker aliases sanitized-query]
   (when (some? (:t sanitized-query))
     (try*
       (util/str->epoch-ms (:t sanitized-query))
@@ -231,7 +224,7 @@
            db-map      {}]
       (if alias
        ;; TODO: allow restricting federated dataset components individually by t
-        (let [db      (<? (load-alias conn fuel-tracker alias sanitized-query))
+        (let [db      (<? (load-alias conn tracker alias sanitized-query))
               db-map* (assoc db-map alias db)]
           (recur r db-map*))
         db-map))))
@@ -245,15 +238,15 @@
     (dataset/combine named-graphs default-coll)))
 
 (defn load-dataset
-  [conn fuel-tracker defaults named sanitized-query]
+  [conn tracker defaults named sanitized-query]
   (go-try
     (if (and (= (count defaults) 1)
              (empty? named))
       (let [alias (first defaults)]
         ;; return an unwrapped db if the data set consists of one ledger
-        (<? (load-alias conn fuel-tracker alias sanitized-query)))
+        (<? (load-alias conn tracker alias sanitized-query)))
       (let [all-aliases (->> defaults (concat named) distinct)
-            db-map      (<? (load-aliases conn fuel-tracker all-aliases sanitized-query))]
+            db-map      (<? (load-aliases conn tracker all-aliases sanitized-query))]
         (dataset db-map defaults)))))
 
 (defn query-connection-fql
@@ -263,16 +256,15 @@
                                                  syntax/coerce-query
                                                  (sanitize-query-options override-opts))
 
-          fuel-tracker    (when (track/track-fuel? opts)
-                            (fuel/tracker (:max-fuel opts)))
+          tracker         (track/init opts)
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
-        (let [ds            (<? (load-dataset conn fuel-tracker default-aliases named-aliases sanitized-query))
+        (let [ds            (<? (load-dataset conn tracker default-aliases named-aliases sanitized-query))
               trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel)]
           (if (track/track-query? opts)
-            (<? (track-execution ds fuel-tracker opts #(fql/query ds fuel-tracker trimmed-query)))
+            (<? (track-execution ds tracker #(fql/query ds tracker trimmed-query)))
             (<? (fql/query ds trimmed-query))))
         (throw (ex-info "Missing ledger specification in connection query"
                         {:status 400, :error :db/invalid-query}))))))

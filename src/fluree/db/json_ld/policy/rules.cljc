@@ -77,7 +77,7 @@
   (map? target-expr))
 
 (defn parse-targets
-  [db fuel-tracker error-ch policy-values target-exprs]
+  [db tracker error-ch policy-values target-exprs]
   (let [in-ch  (async/to-chan! target-exprs)
         out-ch (async/chan 2 (map (fn [iri] (iri/iri->sid iri (:namespaces db)))))]
     (async/pipeline-async 2
@@ -90,7 +90,7 @@
                                                                 "select" "?$target"
                                                                 :selection-context {}) ;; don't compact selection results
                                                    policy-values (policy/inject-where-pattern ["values" policy-values]))]
-                                    (->> (<? (dbproto/-query db fuel-tracker target-q))
+                                    (->> (<? (dbproto/-query db tracker target-q))
                                          (async/onto-chan! ch)))
                                  ;; non-maps are literals
                                   (async/onto-chan! ch [target-expr]))
@@ -104,17 +104,17 @@
   (not-empty (mapv #(or (util/get-id %) (util/get-value %)) targets)))
 
 (defn parse-policy
-  [db fuel-tracker error-ch policy-values policy-doc]
+  [db tracker error-ch policy-values policy-doc]
   (async/go
     (try*
       (let [id (util/get-id policy-doc) ;; @id name of policy-doc
 
             target-subject      (unwrap (get policy-doc const/iri-targetSubject))
             subject-targets-ch  (when target-subject
-                                  (parse-targets db fuel-tracker error-ch policy-values target-subject))
+                                  (parse-targets db tracker error-ch policy-values target-subject))
             target-property     (unwrap (get policy-doc const/iri-targetProperty))
             property-targets-ch (when target-property
-                                  (parse-targets db fuel-tracker error-ch policy-values target-property))
+                                  (parse-targets db tracker error-ch policy-values target-property))
 
             on-property (when-let [p-iris (util/get-all-ids policy-doc const/iri-onProperty)]
                           (set p-iris))
@@ -212,7 +212,7 @@
         wrapper*))))
 
 (defn parse-policies
-  [db fuel-tracker error-ch policy-values policy-docs]
+  [db tracker error-ch policy-values policy-docs]
   (let [policy-ch     (async/chan)]
     ;; parse policies and put them on the policy-ch, output to error-ch in case of error
     (->> policy-docs
@@ -220,7 +220,7 @@
          (async/pipeline-async 2
                                policy-ch
                                (fn [policy-doc ch]
-                                 (-> (parse-policy db fuel-tracker error-ch policy-values policy-doc)
+                                 (-> (parse-policy db tracker error-ch policy-values policy-doc)
                                      (async/pipe ch)))))
 
     ;; build policy wrapper attached to db containing parsed policies
@@ -229,11 +229,11 @@
 (defn wrap-policy
   ([db policy-rules policy-values]
    (wrap-policy db nil policy-rules policy-values))
-  ([db fuel-tracker policy-rules policy-values]
+  ([db tracker policy-rules policy-values]
    (async/go
      (let [error-ch (async/chan)
            [wrapper _] (async/alts! [error-ch
-                                     (parse-policies db fuel-tracker error-ch policy-values (util/sequential policy-rules))])]
+                                     (parse-policies db tracker error-ch policy-values (util/sequential policy-rules))])]
        (if (util/exception? wrapper)
          wrapper
          (assoc db :policy (assoc wrapper :cache (atom {}), :policy-values policy-values)))))))

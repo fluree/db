@@ -5,7 +5,7 @@
             [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy.query :as policy]
-            [fluree.db.track.fuel :as fuel]
+            [fluree.db.track :as track]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
@@ -106,10 +106,10 @@
     e*))
 
 (defn authorize-flake
-  [db fuel-tracker error-ch flake]
+  [db tracker error-ch flake]
   (go
     (try* (if (or (schema-util/is-schema-flake? db flake)
-                  (<? (policy/allow-flake? db fuel-tracker flake)))
+                  (<? (policy/allow-flake? db tracker flake)))
             flake
             ::unauthorized)
           (catch* e
@@ -119,9 +119,9 @@
   "Authorize each flake in the supplied `flakes` collection asynchronously,
   returning a collection containing only allowed flakes according to the
   policy of the supplied `db`."
-  [db fuel-tracker error-ch flakes]
+  [db tracker error-ch flakes]
   (->> flakes
-       (map (partial authorize-flake db fuel-tracker error-ch))
+       (map (partial authorize-flake db tracker error-ch))
        (async/map (fn [& fs]
                     (into [] (remove unauthorized?) fs)))))
 
@@ -131,11 +131,11 @@
      containing only the schema flakes and the flakes validated by
      allow-flake? function for the database `db`
      from the `flake-slices` channel"
-     [db fuel-tracker error-ch flake-slices]
+     [db tracker error-ch flake-slices]
      (if (policy/unrestricted? db)
        flake-slices
        (let [auth-fn (fn [flakes ch]
-                       (-> (authorize-flakes db fuel-tracker error-ch flakes)
+                       (-> (authorize-flakes db tracker error-ch flakes)
                            (async/pipe ch)))
              out-ch  (chan)]
          (async/pipeline-async 2 out-ch auth-fn flake-slices)
@@ -155,7 +155,7 @@
   transaction range starting at `from-t` and ending at `to-t`."
   ([db idx error-ch opts]
    (resolve-flake-slices db nil idx error-ch opts))
-  ([{:keys [index-catalog] :as db} fuel-tracker idx error-ch
+  ([{:keys [index-catalog] :as db} tracker idx error-ch
     {:keys [to-t start-flake end-flake] :as opts}]
    (let [root      (get db idx)
          novelty   (get-in db [:novelty idx])
@@ -163,7 +163,7 @@
          resolver  (index/index-catalog->t-range-resolver index-catalog novelty-t novelty to-t)
          query-xf  (extract-query-flakes opts)]
      (->> (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)
-          (filter-authorized db fuel-tracker error-ch)))))
+          (filter-authorized db tracker error-ch)))))
 
 (defn filter-subject-page
   "Returns a transducer to filter a stream of flakes to only contain flakes from
@@ -192,8 +192,8 @@
 (defn index-range*
   "Return a channel that will eventually hold a sorted vector of the range of
   flakes from `db` that meet the criteria specified in the `opts` map."
-  [db fuel-tracker error-ch {:keys [idx limit offset flake-limit] :as opts}]
-  (->> (resolve-flake-slices db fuel-tracker idx error-ch opts)
+  [db tracker error-ch {:keys [idx limit offset flake-limit] :as opts}]
+  (->> (resolve-flake-slices db tracker idx error-ch opts)
        (into-page limit offset flake-limit)))
 
 (defn expand-range-interval
@@ -223,11 +223,11 @@
   :flake-limit - max number of flakes to return"
   ([db idx test match opts]
    (time-range db nil idx test match opts))
-  ([db fuel-tracker idx test match opts]
+  ([db tracker idx test match opts]
    (let [[start-test start-match end-test end-match]
          (expand-range-interval idx test match)]
-     (time-range db fuel-tracker idx start-test start-match end-test end-match opts)))
-  ([{:keys [t index-catalog] :as db} fuel-tracker idx start-test start-match end-test end-match opts]
+     (time-range db tracker idx start-test start-match end-test end-match opts)))
+  ([{:keys [t index-catalog] :as db} tracker idx start-test start-match end-test end-match opts]
    (let [{:keys [limit offset flake-limit from-t to-t]
           :or   {from-t t, to-t t}}
          opts
@@ -257,7 +257,7 @@
      (go-try
        (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake
                                               in-range? 1 query-xf error-ch)
-                             (filter-authorized db fuel-tracker error-ch)
+                             (filter-authorized db tracker error-ch)
                              (into-page limit offset flake-limit))]
          (async/alt!
            error-ch ([e]
@@ -280,13 +280,13 @@
   ([db idx opts] (index-range db nil idx >= (min-match idx) <= (max-match idx) opts))
   ([db idx test match] (index-range db nil idx test match {}))
   ([db idx test match opts] (index-range db nil idx test match opts))
-  ([db fuel-tracker idx test match opts]
+  ([db tracker idx test match opts]
    (let [[start-test start-match end-test end-match]
          (expand-range-interval idx test match)]
-     (index-range db fuel-tracker idx start-test start-match end-test end-match opts)))
-  ([db fuel-tracker idx start-test start-match end-test end-match]
-   (index-range db fuel-tracker idx start-test start-match end-test end-match {}))
-  ([{:keys [t] :as db} fuel-tracker idx start-test start-match end-test end-match opts]
+     (index-range db tracker idx start-test start-match end-test end-match opts)))
+  ([db tracker idx start-test start-match end-test end-match]
+   (index-range db tracker idx start-test start-match end-test end-match {}))
+  ([{:keys [t] :as db} tracker idx start-test start-match end-test end-match opts]
    (let [[s1 p1 o1 t1 op1 m1]
          (match->flake-parts db idx start-match)
 
@@ -309,13 +309,12 @@
                            (iri/encode-iri db s2))
              end-flake   (resolve-match-flake end-test s2* p2 o2 t2 op2 m2)
              error-ch    (chan)
-             track-fuel  (when fuel-tracker
-                           (fuel/track fuel-tracker error-ch))
+             track-fuel  (track/track-fuel! tracker error-ch)
              flake-xf*   (->> [(:flake-xf opts) track-fuel]
                               (remove nil?)
                               (apply comp))
              range-ch    (index-range* db
-                                       fuel-tracker
+                                       tracker
                                        error-ch
                                        (assoc opts
                                               :idx idx

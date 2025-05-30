@@ -23,14 +23,14 @@
 
 (defrecord AsyncDB [alias branch commit t db-chan]
   dbproto/IFlureeDb
-  (-query [_ fuel-tracker query-map]
+  (-query [_ tracker query-map]
     (go-try
       (let [db (<? db-chan)]
-        (<? (dbproto/-query db fuel-tracker query-map)))))
-  (-class-ids [_ fuel-tracker subject]
+        (<? (dbproto/-query db tracker query-map)))))
+  (-class-ids [_ tracker subject]
     (go-try
       (let [db (<? db-chan)]
-        (<? (dbproto/-class-ids db fuel-tracker subject)))))
+        (<? (dbproto/-class-ids db tracker subject)))))
   (-index-update [_ commit-index]
     (let [commit* (assoc commit :index commit-index)
           updated-db (->async-db alias branch commit* t)]
@@ -39,39 +39,39 @@
           (deliver! updated-db (dbproto/-index-update db commit-index))))
       updated-db))
   where/Matcher
-  (-match-id [_ fuel-tracker solution s-match error-ch]
+  (-match-id [_ tracker solution s-match error-ch]
     (let [match-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (where/-match-id fuel-tracker solution s-match error-ch)
+                (where/-match-id tracker solution s-match error-ch)
                 (async/pipe match-ch)))
           (catch* e
             (log/error e "Error loading database")
             (>! error-ch e))))
       match-ch))
 
-  (-match-triple [_ fuel-tracker solution triple error-ch]
+  (-match-triple [_ tracker solution triple error-ch]
     (let [match-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (where/-match-triple fuel-tracker solution triple error-ch)
+                (where/-match-triple tracker solution triple error-ch)
                 (async/pipe match-ch)))
           (catch* e
             (log/error e "Error loading database")
             (>! error-ch e))))
       match-ch))
 
-  (-match-class [_ fuel-tracker solution triple error-ch]
+  (-match-class [_ tracker solution triple error-ch]
     (let [match-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (where/-match-class fuel-tracker solution triple error-ch)
+                (where/-match-class tracker solution triple error-ch)
                 (async/pipe match-ch)))
           (catch* e
             (log/error e "Error loading database")
@@ -90,42 +90,42 @@
     solution-ch)
 
   subject/SubjectFormatter
-  (-forward-properties [_ iri select-spec context compact-fn cache fuel-tracker error-ch]
+  (-forward-properties [_ iri select-spec context compact-fn cache tracker error-ch]
     (let [prop-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (subject/-forward-properties iri select-spec context compact-fn cache fuel-tracker error-ch)
+                (subject/-forward-properties iri select-spec context compact-fn cache tracker error-ch)
                 (async/pipe prop-ch)))
           (catch* e
             (log/error e "Error loading database")
             (>! error-ch e))))
       prop-ch))
 
-  (-reverse-property [_ iri reverse-spec context compact-fn cache fuel-tracker error-ch]
+  (-reverse-property [_ iri reverse-spec context compact-fn cache tracker error-ch]
     (let [prop-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (subject/-reverse-property iri reverse-spec context compact-fn cache fuel-tracker error-ch)
+                (subject/-reverse-property iri reverse-spec context compact-fn cache tracker error-ch)
                 (async/pipe prop-ch)))
           (catch* e
             (log/error e "Error loading database")
             (>! error-ch e))))
       prop-ch))
 
-  (-iri-visible? [_ fuel-tracker iri]
+  (-iri-visible? [_ tracker iri]
     (go-try
       (let [db (<? db-chan)]
-        (<? (subject/-iri-visible? db fuel-tracker iri)))))
+        (<? (subject/-iri-visible? db tracker iri)))))
 
   transact/Transactable
-  (-stage-txn [_ fuel-tracker context identity author annotation raw-txn parsed-txn]
+  (-stage-txn [_ tracker context identity author annotation raw-txn parsed-txn]
     (go-try
       (let [db (<? db-chan)]
-        (<? (transact/-stage-txn db fuel-tracker context identity author annotation raw-txn parsed-txn)))))
+        (<? (transact/-stage-txn db tracker context identity author annotation raw-txn parsed-txn)))))
   (-merge-commit [_ commit-jsonld commit-data-jsonld]
     (go-try
       (let [db (<? db-chan)]
@@ -160,18 +160,18 @@
       db-at-t))
 
   history/AuditLog
-  (-history [_ fuel-tracker context from-t to-t commit-details? include error-ch history-q]
+  (-history [_ tracker context from-t to-t commit-details? include error-ch history-q]
     (go-try
       (let [db (<? db-chan)]
-        (<? (history/-history db fuel-tracker context from-t to-t commit-details? include error-ch history-q)))))
+        (<? (history/-history db tracker context from-t to-t commit-details? include error-ch history-q)))))
 
-  (-commits [_ fuel-tracker context from-t to-t include error-ch]
+  (-commits [_ tracker context from-t to-t include error-ch]
     (let [commit-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (history/-commits context fuel-tracker from-t to-t include error-ch)
+                (history/-commits context tracker from-t to-t include error-ch)
                 (async/pipe commit-ch)))
           (catch* e
             (log/error e "Error loading database for commit range")
@@ -183,10 +183,10 @@
     (go-try
       (let [db (<? db-chan)]
         (<? (policy/wrap-policy db policy policy-values)))))
-  (wrap-policy [_ fuel-tracker policy policy-values]
+  (wrap-policy [_ tracker policy policy-values]
     (go-try
       (let [db (<? db-chan)]
-        (<? (policy/wrap-policy db fuel-tracker policy policy-values)))))
+        (<? (policy/wrap-policy db tracker policy policy-values)))))
   (root [_]
     (let [root-ch (async/promise-chan)
           root-db (->AsyncDB alias branch commit t root-ch)]

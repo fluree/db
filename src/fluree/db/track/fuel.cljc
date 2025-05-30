@@ -4,38 +4,36 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn tracker
-  "Creates a new fuel tracker w/ optional fuel limit (0 means unlimited)."
-  ([] (tracker nil))
-  ([limit]
-   {:limit    (or limit 0)
-    :counters (atom [])}))
+(defn init
+  [max-fuel]
+  (atom {:limit    (or max-fuel 0)
+         :counters []}))
 
 (defn tally
-  [trkr]
-  (reduce (fn [total ctr]
-            (+ total @ctr))
-          0 @(:counters trkr)))
+  [fuel]
+  (let [{:keys [counters]} @fuel]
+    (reduce (fn [total ctr]
+              (+ total @ctr))
+            0 counters)))
 
-(defn track?
-  [{:keys [max-fuel meta] :as _opts}]
-  (or max-fuel
-      (true? meta)
-      (:fuel meta)))
+(defn with-counter
+  [fuel-state counter]
+  (update fuel-state :counters conj counter))
 
-(defn track
-  [trkr error-ch]
+(defn track!
+  [fuel error-ch]
   (fn [rf]
-    (let [counter (volatile! 0)]
-      (swap! (:counters trkr) conj counter)
+    (let [limit   (:limit @fuel)
+          counter (volatile! 0)]
+      (swap! fuel with-counter counter)
       (fn
         ([]
          (rf))
 
         ([result next]
          (vswap! counter inc)
-         (when-let [limit (:limit trkr)]
-           (let [tly (tally trkr)]
+         (when limit
+           (let [tly (tally fuel)]
              (when (< 0 limit tly)
                (log/error "Fuel limit of" limit "exceeded:" tly)
                (put! error-ch
