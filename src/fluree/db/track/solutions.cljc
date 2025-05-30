@@ -21,4 +21,4 @@
 
 (defn tally
   [explain]
-  (deref explain))
+  (update-keys @explain (fn [pattern] (:orig (meta pattern)))))
