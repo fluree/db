@@ -62,13 +62,11 @@
 
 (defn init
   "Creates a new fuel tracker w/ optional fuel limit (0 means unlimited)."
-  ([]
-   (init {}))
-  ([{:keys [max-fuel] :as opts}]
-   (cond-> {}
-     (track-time? opts) init-time
-     (track-fuel? opts) (init-fuel max-fuel)
-     (track-solutions? opts) init-explain)))
+  [{:keys [max-fuel] :as opts}]
+  (cond-> {}
+    (track-time? opts) init-time
+    (track-fuel? opts) (init-fuel max-fuel)
+    (track-solutions? opts) init-explain))
 
 (defn pattern-in!
   [tracker pattern]
