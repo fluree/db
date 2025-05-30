@@ -331,6 +331,12 @@
   ([named-graphs default-graphs]
    (query-api/dataset named-graphs default-graphs)))
 
+(defn explain
+  ([ds q]
+   (explain ds q {}))
+  ([ds q opts]
+   (promise-wrap (query-api/explain ds q opts))))
+
 (defn query
   "Queries a dataset or single db and returns a promise with the results."
   ([ds q]
