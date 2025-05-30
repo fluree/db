@@ -72,13 +72,13 @@
 
 (defn pattern-in!
   [tracker pattern]
-  (when-let [solution-tracker (:solutions tracker)]
-    (solutions/pattern-in! pattern)))
+  (when-let [solution-tracker (:explain tracker)]
+    (solutions/pattern-in! solution-tracker pattern)))
 
 (defn pattern-out!
   [tracker pattern]
-  (when-let [solution-tracker (:solutions tracker)]
-    (solutions/pattern-out! pattern)))
+  (when-let [solution-tracker (:explain tracker)]
+    (solutions/pattern-out! solution-tracker pattern)))
 
 (defn track-fuel!
   [tracker error-ch]
@@ -90,4 +90,4 @@
   (cond-> tracker
     (contains? tracker :time) (update :time time/tally)
     (contains? tracker :fuel) (update :fuel fuel/tally)
-    (contains? tracker :solutions) (update :solutions solutions/tally)))
+    (contains? tracker :explain) (update :explain solutions/tally)))
