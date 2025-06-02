@@ -587,10 +587,10 @@
   construct, the :id and :class patterns are for optimized query execution, so this
   function unwraps :id and :class patterns and only returns the underlying components."
   [patterns]
-  (mapv (fn [[pattern-type component :as pattern]]
+  (mapv (fn [{:keys [pattern-type data] :as pattern}]
           (case pattern-type
-            :class component
-            :id    [component]
+            :class data
+            :id    [data]
             pattern))
         patterns))
 

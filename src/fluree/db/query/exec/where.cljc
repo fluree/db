@@ -199,11 +199,12 @@
   [graph-alias]
   (str/starts-with? graph-alias "##"))
 
+(defrecord Pattern [pattern-type data])
+
 (defn ->pattern
   "Build a new non-tuple match pattern of type `typ`."
   [typ data]
-  #?(:clj  (MapEntry/create typ data)
-     :cljs (MapEntry. typ data nil)))
+  (->Pattern typ data))
 
 (defn ->iri-ref
   [x]
@@ -305,14 +306,14 @@
 
 (defn pattern-type
   [pattern]
-  (if (map-entry? pattern)
-    (key pattern)
+  (if (instance? Pattern pattern)
+    (:pattern-type pattern)
     :tuple))
 
 (defn pattern-data
   [pattern]
-  (if (map-entry? pattern)
-    (val pattern)
+  (if (instance? Pattern pattern)
+    (:data pattern)
     pattern))
 
 (defmulti match-pattern
@@ -629,8 +630,7 @@
 
 (defn subquery?
   [pattern]
-  (and (sequential? pattern)
-       (= :query (first pattern))))
+  (= :query (pattern-type pattern)))
 
 (defn match-clause
   "Returns a channel that will eventually contain all match solutions in the
