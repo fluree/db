@@ -632,11 +632,11 @@
   underlying components."
   [patterns]
   (->> patterns
-       (mapcat (fn [[pattern-type component :as pattern]]
+       (mapcat (fn [{:keys [pattern-type data] :as pattern}]
                  (case pattern-type
-                   :class         [component]
-                   :property-join component
-                   :id            [[component]]
+                   :class         [data]
+                   :property-join data
+                   :id            [[data]]
                    [pattern])))
        vec))
 
