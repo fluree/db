@@ -40,14 +40,16 @@
   [opts]
   (or (track-time? opts)
       (track-fuel? opts)
-      (track-policy? opts)))
+      (track-policy? opts)
+      (track-solutions? opts)))
 
 (defn track-txn?
   [opts]
   (or (track-time? opts)
       (track-fuel? opts)
       (track-file? opts)
-      (track-policy? opts)))
+      (track-policy? opts)
+      (track-solutions? opts)))
 
 (defn init-time
   [tracker]
