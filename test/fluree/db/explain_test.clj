@@ -39,4 +39,17 @@
                                                        {"@id" "?s" "ex:foo" "?str"}
                                                        {"@id" "?s" "ex:bar" "?str"}]
                                                       ["filter" "(> 50 ?num)"]]
-                                             "select" ["?s" "?ref1" "?str"]})))))))
+                                             "select" ["?s" "?ref1" "?str"]})))))
+    (testing "result mapping"
+      (testing "multiple patterns in a single where pattern"
+        (is (= {{"@id" "?s", "ex:bar" "?bar", "ex:num" "?num"} {:in 16, :out 48}}
+               (:explain @(fluree/explain db1 {"where" [{"@id" "?s"
+                                                         "ex:bar" "?bar"
+                                                         "ex:num" "?num"}]
+                                               "select" ["?s" "?bar" "?num"]})))))
+      (testing "vs breaking them into their own patterns"
+        (is (= {{"@id" "?s", "ex:bar" "?bar"} {:in 1, :out 16},
+                {"@id" "?s", "ex:num" "?num"} {:in 16, :out 48}}
+               (:explain @(fluree/explain db1 {"where" [{"@id" "?s" "ex:bar" "?bar"}
+                                                        {"@id" "?s" "ex:num" "?num"}]
+                                               "select" ["?s" "?bar" "?num"]}))))))))
