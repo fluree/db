@@ -10,14 +10,14 @@
 (defn pattern-in!
   [explain pattern]
   (swap! explain update pattern
-         (fn [[in out]]
+         (fn [{:keys [in out]}]
            (if (nil? in)
-             [1 0] ; initialize pattern counters
-             [(inc in) out]))))
+             {:in 1 :out 0} ; initialize pattern counters
+             {:in (inc in) :out out}))))
 
 (defn pattern-out!
   [explain pattern]
-  (swap! explain update pattern (fn [[in out]] [in (inc out)])))
+  (swap! explain update pattern (fn [{:keys [in out]}] {:in in :out (inc out)})))
 
 (defn tally
   [explain]
