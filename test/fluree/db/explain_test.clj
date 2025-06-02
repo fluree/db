@@ -24,18 +24,19 @@
                                                         "ex:bar" "bar"
                                                         "ex:num" [i (inc i) (dec i)])))
                                          (range 1 100 3))})]
-    (is (= {[:filter "(> 50 ?num)"] {:in 96 :out 48},
-            [:optional {"@id" "?s", "ex:ref1" "?ref1"}] {:in 48 :out 48},
-            [:union {"@id" "?s", "ex:foo" "?str"} {"@id" "?s", "ex:bar" "?str"}] {:in 48 :out 96},
-            {"@id" "?s", "ex:bar" "?str"} {:in 48 :out 48},
-            {"@id" "?s", "ex:foo" "?str"} {:in 48 :out 48},
-            {"@id" "?s", "ex:num" "?num"} {:in 1 :out 48},
-            {"@id" "?s", "ex:ref1" "?ref1"} {:in 48 :out 0}}
-           (:explain @(fluree/explain db1 {"where" [{"@id" "?s" "ex:num" "?num"}
-                                                    ["optional"
-                                                     {"@id" "?s" "ex:ref1" "?ref1"}]
-                                                    ["union"
-                                                     {"@id" "?s" "ex:foo" "?str"}
-                                                     {"@id" "?s" "ex:bar" "?str"}]
-                                                    ["filter" "(> 50 ?num)"]]
-                                           "select" ["?s" "?ref1" "?str"]}))))))
+    (testing "query with triple and non-triple patterns"
+      (is (= {[:filter "(> 50 ?num)"] {:in 96 :out 48},
+              [:optional {"@id" "?s", "ex:ref1" "?ref1"}] {:in 48 :out 48},
+              [:union {"@id" "?s", "ex:foo" "?str"} {"@id" "?s", "ex:bar" "?str"}] {:in 48 :out 96},
+              {"@id" "?s", "ex:bar" "?str"} {:in 48 :out 48},
+              {"@id" "?s", "ex:foo" "?str"} {:in 48 :out 48},
+              {"@id" "?s", "ex:num" "?num"} {:in 1 :out 48},
+              {"@id" "?s", "ex:ref1" "?ref1"} {:in 48 :out 0}}
+             (:explain @(fluree/explain db1 {"where" [{"@id" "?s" "ex:num" "?num"}
+                                                      ["optional"
+                                                       {"@id" "?s" "ex:ref1" "?ref1"}]
+                                                      ["union"
+                                                       {"@id" "?s" "ex:foo" "?str"}
+                                                       {"@id" "?s" "ex:bar" "?str"}]
+                                                      ["filter" "(> 50 ?num)"]]
+                                             "select" ["?s" "?ref1" "?str"]})))))))
