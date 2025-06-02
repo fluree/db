@@ -12,8 +12,7 @@
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.json-ld :as json-ld])
-  #?(:clj (:import (clojure.lang MapEntry))))
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
