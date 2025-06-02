@@ -14,8 +14,8 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.xhttp :as xhttp]
-            [fluree.json-ld :as json-ld])
-  #?(:clj (:import (clojure.lang MapEntry))))
+            [fluree.json-ld :as json-ld]))
+
 
 #?(:clj (set! *warn-on-reflection* true))
 

@@ -21,8 +21,8 @@
                                                                (assoc "ex:ref2" (gen-subj (+ 2000 i))
                                                                       "ex:ref3" {"@id" (str "ex:" i)})))
                                              (even? i) (assoc
-                                                         "ex:bar" "bar"
-                                                         "ex:num" [i (inc i) (dec i)])))
+                                                        "ex:bar" "bar"
+                                                        "ex:num" [i (inc i) (dec i)])))
                                          (range 1 100 3))})]
     (is (= {[:filter "(> 50 ?num)"] {:in 96 :out 48},
             [:optional {"@id" "?s", "ex:ref1" "?ref1"}] {:in 48 :out 48},
