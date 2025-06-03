@@ -163,14 +163,14 @@
 (defn load-people
   [conn]
   (#?(:clj do, :cljs go)
-    (let [ledger-p (fluree/create conn "test/people")
-          ledger   #?(:clj @ledger-p :cljs (<p! ledger-p))
-          staged-p (fluree/stage (fluree/db ledger) {"@context" [default-context
-                                                                 {:ex "http://example.org/ns/"}]
-                                                     "insert" people})
-          staged   #?(:clj @staged-p, :cljs (<p! staged-p))
-          commit-p (fluree/commit! ledger staged {:message "Adding people"
-                                                  :push? true})]
+   (let [ledger-p (fluree/create conn "test/people")
+         ledger   #?(:clj @ledger-p :cljs (<p! ledger-p))
+         staged-p (fluree/stage (fluree/db ledger) {:context [default-context
+                                                              {:ex "http://example.org/ns/"}]
+                                                    :insert  people})
+         staged   #?(:clj @staged-p, :cljs (<p! staged-p))
+         commit-p (fluree/commit! ledger staged {:message "Adding people"
+                                                 :push?   true})]
       #?(:clj @commit-p, :cljs (<p! commit-p))
       ledger)))
 
