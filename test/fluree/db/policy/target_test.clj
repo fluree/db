@@ -169,8 +169,8 @@
                  (:fuel txn-result)))
           (is (= ["a:burt-wish1"]
                  (:result result)))
-          (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 1, :allowed 1},
-                  "http://a.co/wishlistModifyPolicy"     {:executed 2, :allowed 2},
+          (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 0, :allowed 0},
+                  "http://a.co/wishlistModifyPolicy"     {:executed 0, :allowed 0},
                   "http://a.co/wishlistViewPolicy"       {:executed 1, :allowed 1},
                   "http://a.co/wishlistItemCreatePolicy" {:executed 0, :allowed 0},
                   "http://a.co/wishlistItemModifyPolicy" {:executed 0, :allowed 0},
@@ -243,10 +243,10 @@
                      "a:rank"        1}]
                    (:result result)))
             (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 0, :allowed 0},
-                    "http://a.co/wishlistModifyPolicy"     {:executed 1, :allowed 1},
+                    "http://a.co/wishlistModifyPolicy"     {:executed 0, :allowed 0},
                     "http://a.co/wishlistViewPolicy"       {:executed 0, :allowed 0},
                     "http://a.co/wishlistItemCreatePolicy" {:executed 0, :allowed 0},
-                    "http://a.co/wishlistItemModifyPolicy" {:executed 3, :allowed 3},
+                    "http://a.co/wishlistItemModifyPolicy" {:executed 0, :allowed 0},
                     "http://a.co/wishlistItemViewPolicy"   {:executed 3, :allowed 3},
                     "http://a.co/availableModifyPolicy"    {:executed 0, :allowed 0}}
                    (:policy result)))
@@ -306,7 +306,7 @@
                         "http://a.co/wishlistItemCreatePolicy" {:executed 0, :allowed 0},
                         "http://a.co/wishlistItemModifyPolicy" {:executed 0, :allowed 0},
                         "http://a.co/wishlistItemViewPolicy"   {:executed 3, :allowed 3},
-                        "http://a.co/availableModifyPolicy"    {:executed 2, :allowed 0}}
+                        "http://a.co/availableModifyPolicy"    {:executed 1, :allowed 0}}
                        (:policy result)))
                 (is (= 6
                        (:fuel result)))))))
@@ -334,7 +334,7 @@
                         "http://a.co/wishlistItemCreatePolicy" {:executed 0, :allowed 0},
                         "http://a.co/wishlistItemModifyPolicy" {:executed 0, :allowed 0},
                         "http://a.co/wishlistItemViewPolicy"   {:executed 3, :allowed 3},
-                        "http://a.co/availableModifyPolicy"    {:executed 2, :allowed 2}}
+                        "http://a.co/availableModifyPolicy"    {:executed 1, :allowed 1}}
                        (:policy result)))
                 (is (= 6
                        (:fuel result)))))))))))
