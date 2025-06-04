@@ -361,7 +361,7 @@
                               :id         :ex/alice
                               :quux/corge "grault"}]}
             committed  @(fluree/transact! conn txn {:meta true})]
-        (is (= #{:address :db :fuel :hash :ledger-id :size :status :t :time}
+        (is (= #{:address :db :fuel :hash :ledger-id :size :status :t :time :policy}
                (set (keys committed))))))
 
     (testing "Throws on invalid txn"
