@@ -11,7 +11,6 @@
             [fluree.db.json-ld.credential :as credential]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.json-ld.policy.rules :as policy.rules]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.serde.json :refer [json-serde]]
@@ -640,10 +639,10 @@
                   tally     (track/tally tracker)]
               (assoc tally :status 200, :db staged-db))
             (catch* e
-                    (throw (ex-info (ex-message e)
-                                    (let [tally (track/tally tracker)]
-                                      (merge (ex-data e) tally))
-                                    e)))))
+              (throw (ex-info (ex-message e)
+                              (let [tally (track/tally tracker)]
+                                (merge (ex-data e) tally))
+                              e)))))
         (let [policy-db (if (policy/policy-enforced-opts? parsed-opts)
                           (<? (policy/policy-enforce-db db parsed-context parsed-opts))
                           db)]
