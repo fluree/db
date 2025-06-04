@@ -1,6 +1,6 @@
 (ns fluree.db.track.solutions
   (:require [fluree.db.constants :as const]
-            [fluree.db.query.exec.where :as where]
+            [fluree.db.query.exec.where :as-alias where]
             [fluree.json-ld :as json-ld]))
 
 (defn init
@@ -48,8 +48,8 @@
   (let [[_ p _] pattern
         id-key (reduce-kv (fn [_ k v] (when (= (json-ld/expand-iri k context) const/iri-id)
                                         (reduced k))) nil orig)
-        orig-p (or (where/get-variable p)
-                   (-> (where/get-iri p)
+        orig-p (or (::where/var p)
+                   (-> (::where/iri p)
                        (json-ld/compact context)))]
     (select-keys orig [id-key orig-p])))
 
