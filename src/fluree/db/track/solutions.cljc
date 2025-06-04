@@ -46,7 +46,7 @@
     [{:id ?s :ex/bar ?bar} <counters>] ]"
   [pattern context orig]
   (let [[_ p _] pattern
-        id-key (reduce-kv (fn [_ k v] (when (= (json-ld/expand-iri k context) const/iri-id)
+        id-key (reduce-kv (fn [_ k _] (when (= (json-ld/expand-iri k context) const/iri-id)
                                         (reduced k))) nil orig)
         orig-p (or (::where/var p)
                    (-> (::where/iri p)
@@ -64,8 +64,7 @@
 (defn tally
   "Format the explanation as a vector of [<pattern> <counters>] tuples in execution order."
   [tracker]
-  (let [{:keys [patterns context] :as explain} @tracker
-        parsed-context (json-ld/parse-context context)]
+  (let [{:keys [patterns] :as explain} @tracker]
     (reduce (fn [explanation pattern]
               (conj explanation [(display-pattern pattern) (get explain pattern)]))
             []
