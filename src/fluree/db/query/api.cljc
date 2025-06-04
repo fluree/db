@@ -5,7 +5,6 @@
             [fluree.db.connection :as connection]
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.json-ld.policy.rules :as policy.rules]
             [fluree.db.ledger :as ledger]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.syntax :as syntax]
@@ -76,12 +75,10 @@
   returns a result or throws an exception."
   [ds tracker exec-fn]
   (go-try
+    (track/register-policies! tracker ds)
     (try* (let [result        (<? (exec-fn))
-                policy-report (when-not (dataset? ds)
-                                (policy.rules/enforcement-report ds))
                 tally         (track/tally tracker)]
-            (cond-> (assoc tally :status 200, :result result)
-              policy-report (assoc :policy policy-report)))
+            (assoc tally :status 200, :result result))
           (catch* e
             (let [data (-> tracker
                            track/tally
