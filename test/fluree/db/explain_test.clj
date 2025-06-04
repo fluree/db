@@ -48,21 +48,25 @@
       (testing "multi-triple node pattern"
         (testing "with string context"
           (is (= [[{"@id" "?s", "ex:bar" "?bar"} {:in 1, :out 16}]
-                  [{"@id" "?s", "ex:num" "?num"} {:in 16, :out 48}]]
+                  [{"@id" "?s", "ex:num" "?num"} {:in 16, :out 48}]
+                  [{"@id" "?s", "?p" "?o"} {:in 48, :out 288}]]
                  (:explain @(fluree/explain db1 {"@context" {"ex" "http://example.com/"}
                                                  ;; single node pattern
                                                  "where" [{"@id" "?s"
                                                            "ex:bar" "?bar"
-                                                           "ex:num" "?num"}]
+                                                           "ex:num" "?num"
+                                                           "?p" "?o"}]
                                                  "select" ["?s" "?bar" "?num"]})))))
         (testing "with keyword context"
           (is (= [[{:id "?s", :ex/bar "?bar"} {:in 1, :out 16}]
-                  [{:id "?s", :ex/num "?num"} {:in 16, :out 48}]]
+                  [{:id "?s", :ex/num "?num"} {:in 16, :out 48}]
+                  [{:id "?s", '?p '?o} {:in 48, :out 288}]]
                  (:explain @(fluree/explain db1 {:context {:id "@id" :ex "http://example.com/"}
                                                  ;; single node pattern
                                                  :where [{:id "?s"
                                                           :ex/bar "?bar"
-                                                          :ex/num "?num"}]
+                                                          :ex/num "?num"
+                                                          '?p '?o}]
                                                  :select ["?s" "?bar" "?num"]}))))))
       (testing "single-triple per node pattern"
         (is (= [[{"@id" "?s", "ex:bar" "?bar"} {:in 1, :out 16}] ,
