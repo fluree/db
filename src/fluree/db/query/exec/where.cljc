@@ -212,6 +212,10 @@
 
 (defrecord Pattern [pattern-type data])
 
+(defn pattern?
+  [x]
+  (instance? Pattern x))
+
 (defn ->pattern
   "Build a new non-tuple match pattern of type `typ`."
   [typ data]
@@ -317,13 +321,13 @@
 
 (defn pattern-type
   [pattern]
-  (if (instance? Pattern pattern)
+  (if (pattern? pattern)
     (:pattern-type pattern)
     :tuple))
 
 (defn pattern-data
   [pattern]
-  (if (instance? Pattern pattern)
+  (if (pattern? pattern)
     (:data pattern)
     pattern))
 
