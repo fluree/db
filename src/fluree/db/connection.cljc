@@ -89,6 +89,7 @@
   into it assuming `success?` is true, otherwise it will return the existing
   found promise-chan when `success?` is false"
   [{:keys [state] :as _conn} ledger-alias]
+  (log/debug "Registering ledger: " ledger-alias)
   (let [new-p-chan (async/promise-chan)
         p-chan     (-> state
                        (swap! update-in [:ledger ledger-alias]
@@ -96,7 +97,7 @@
                                 (or existing new-p-chan)))
                        (get-in [:ledger ledger-alias]))
         cached?    (not= p-chan new-p-chan)]
-    (log/debug "Registering ledger: " ledger-alias " cached? " cached?)
+    (log/debug "Ledger: " ledger-alias " registered. cached? " cached?)
     [cached? p-chan]))
 
 (defn release-ledger
