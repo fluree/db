@@ -46,12 +46,16 @@
     [{:id ?s :ex/bar ?bar} <counters>] ]"
   [pattern context orig]
   (let [[_ p _] pattern
-        id-key (reduce-kv (fn [_ k _] (when (= (json-ld/expand-iri k context) const/iri-id)
-                                        (reduced k))) nil orig)
-        orig-p (or (::where/var p)
-                   (-> (::where/iri p)
-                       (json-ld/compact context)))]
-    (select-keys orig [id-key orig-p])))
+        id-key  (reduce-kv (fn [_ k _] (when (= (json-ld/expand-iri k context) const/iri-id)
+                                         (reduced k))) nil orig)
+
+        p-sym-var  (::where/var p)
+        p-str-var  (str p-sym-var)
+        orig-p-iri (some-> (::where/iri p)
+                           (json-ld/compact context))]
+    ;; p-sym-var, p-str-var, orig-p-iri are mutually exclusive keys, only one will be present
+    ;; we cannot know whether the original var is a symbol or a str, so we just try both
+    (select-keys orig [id-key p-sym-var p-str-var orig-p-iri])))
 
 (defn display-pattern
   "Replace parsed patterns with the user's original syntax."
