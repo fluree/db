@@ -313,7 +313,7 @@
 (defn parse-pattern-with-orig
   "Wrap each parsed pattern with its source so we can map it back for explain queries."
   [pattern vars context]
-  (map #(with-meta % {:orig pattern}) (parse-pattern pattern vars context)))
+  (map #(with-meta % {:orig pattern :context context}) (parse-pattern pattern vars context)))
 
 (defn parse-bind-map
   [binds context]
