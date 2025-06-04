@@ -24,11 +24,11 @@
   [tracker pattern]
   (swap! tracker update-in [pattern :out] inc))
 
-(defn multi-pattern-node?
+(defn multi-triple-node-pattern?
   "When a 'node' pattern has more than two entries and gets parsed to multiple triple patterns."
   [orig]
-  (and (map? orig) ; triple pattern
-       (> (count orig) 2))) ; more than two entries
+  (and (map? orig) ; node pattern
+       (> (count orig) 2))) ; more than two entries => more than one triple pattern
 
 (defn display-triple-pattern
   "Users can express a series of triple patterns in a single 'node' pattern.
@@ -61,7 +61,7 @@
   "Replace parsed patterns with the user's original syntax."
   [pattern]
   (let [{:keys [orig context]} (meta pattern)]
-    (if (multi-pattern-node? orig)
+    (if (multi-triple-node-pattern? orig)
       (display-triple-pattern pattern context orig)
       orig)))
 
