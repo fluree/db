@@ -76,12 +76,10 @@
   returns a result or throws an exception."
   [ds tracker exec-fn]
   (go-try
+    (track/register-policies! tracker ds)
     (try* (let [result        (<? (exec-fn))
-                policy-report (when-not (dataset? ds)
-                                (policy.rules/enforcement-report ds))
                 tally         (track/tally tracker)]
-            (cond-> (assoc tally :status 200, :result result)
-              policy-report (assoc :policy policy-report)))
+            (assoc tally :status 200, :result result))
           (catch* e
             (let [data (-> tracker
                            track/tally
