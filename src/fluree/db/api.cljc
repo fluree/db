@@ -209,7 +209,7 @@
   (promise-wrap
    (connection/notify conn commit-address commit-hash)))
 
-(defn insert 
+(defn insert
   "Inserts a new set of data into the database if valid (does not commit).
    Multiple inserts and updates can be staged together and will be merged into a single
    transaction when committed.
@@ -240,7 +240,6 @@
   "Renamed to `update`, prefer that API instead."
   ([db json-ld] (update db json-ld nil))
   ([db json-ld opts] (update db json-ld opts)))
-
 
 (defn format-txn
   "Reformats the transaction `txn` as JSON-QL if it is formatted as SPARQL,
