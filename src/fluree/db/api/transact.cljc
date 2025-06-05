@@ -13,6 +13,12 @@
     (sparql/->fql txn)
     txn))
 
+(defn insert
+  [db txn override-opts]
+  (go-try
+    (let [parsed-triples (parse/jld->parsed-triples txn nil (:context override-opts))]
+      (<? (connection/stage-triples db {:insert parsed-triples})))))
+
 (defn stage
   [db txn override-opts]
   (go-try
