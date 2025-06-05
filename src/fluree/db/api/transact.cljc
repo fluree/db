@@ -16,10 +16,8 @@
 (defn insert
   [db txn override-opts]
   (go-try
-    (let [context    (or (ctx-util/txn-context txn)
-                         (:context override-opts))
-          parsed-txn {:insert (parse/jld->parsed-triples txn nil context)}]
-      (<? (connection/stage-triples db parsed-txn)))))
+    (let [parsed-triples (parse/jld->parsed-triples txn nil (:context override-opts))]
+      (<? (connection/stage-triples db {:insert parsed-triples})))))
 
 (defn stage
   [db txn override-opts]

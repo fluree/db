@@ -898,13 +898,17 @@
 
 (defn jld->parsed-triples
   "Parses a JSON-LD document into a sequence of update triples. The document
-   should be expanded and contain a @graph key."
-  [txn bound-vars context]
-  (-> txn
-      (json-ld/expand context)
+   will be expanded using the context inside the txn merged with the 
+   provided parsed-context, if not nil.
+   
+   If bound-vars is non-nil, it will replace any variables in the document
+   assuming it is a valid variable placement, otherwise it will throw."
+  [jld bound-vars parsed-context]
+  (-> jld
+      (json-ld/expand parsed-context)
       util/get-graph
       util/sequential
-      (parse-triples bound-vars context)))
+      (parse-triples bound-vars parsed-context)))
 
 (defn parse-stage-txn
   ([txn]
