@@ -64,19 +64,19 @@
         (async/into [] result-ch)))
 
 (defn execute*
-  ([ds tracker q error-ch]
-   (execute* ds tracker q error-ch nil))
-  ([ds tracker q error-ch initial-soln]
-   (->> (where/search ds q tracker error-ch initial-soln)
+  ([ds fuel-tracker q error-ch]
+   (execute* ds fuel-tracker q error-ch nil))
+  ([ds fuel-tracker q error-ch initial-soln]
+   (->> (where/search ds q fuel-tracker error-ch initial-soln)
         (group/combine q)
         (having/filter q error-ch)
         (select/modify q)
         (order/arrange q))))
 
 (defn execute
-  [ds tracker q error-ch]
-  (->> (execute* ds tracker q error-ch)
-       (select/format ds q tracker error-ch)
+  [ds fuel-tracker q error-ch]
+  (->> (execute* ds fuel-tracker q error-ch)
+       (select/format ds q fuel-tracker error-ch)
        (paginate q)
        (collect-results q)))
 
@@ -85,9 +85,9 @@
   "Closes over a subquery to allow processing the whole query pipeline from within the
   search."
   [subquery]
-  (fn [ds tracker error-ch]
-    (->> (execute* ds tracker subquery error-ch)
-         (select/subquery-format ds subquery tracker error-ch)
+  (fn [ds fuel-tracker error-ch]
+    (->> (execute* ds fuel-tracker subquery error-ch)
+         (select/subquery-format ds subquery fuel-tracker error-ch)
          (paginate subquery))))
 
 (defn prep-subqueries
@@ -107,11 +107,11 @@
   exception if there was an error."
   ([ds q]
    (query ds nil q))
-  ([ds tracker q]
+  ([ds fuel-tracker q]
    (go
      (let [error-ch  (async/chan)
            prepped-q (prep-subqueries q)
-           result-ch (execute ds tracker prepped-q error-ch)]
+           result-ch (execute ds fuel-tracker prepped-q error-ch)]
        (async/alt!
          error-ch ([e] e)
          result-ch ([result] result))))))

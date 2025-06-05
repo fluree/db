@@ -247,16 +247,16 @@
     (bm25-initialize this source-db))
 
   where/Matcher
-  (-match-triple [_ _tracker solution triple _error-ch]
+  (-match-triple [_ _fuel-tracker solution triple _error-ch]
     (vg-parse/match-search-triple solution triple))
 
-  (-finalize [this _tracker error-ch solution-ch]
+  (-finalize [this _fuel-tracker error-ch solution-ch]
     (vg-parse/finalize (partial search this) error-ch solution-ch))
 
-  (-match-id [_ _tracker _solution _s-mch _error-ch]
+  (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
 
-  (-match-class [_ _tracker _solution _s-mch _error-ch]
+  (-match-class [_ _fuel-tracker _solution _s-mch _error-ch]
     where/nil-channel)
 
   ;; activate-alias should not be called on an index VG, return empty chan

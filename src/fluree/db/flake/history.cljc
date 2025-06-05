@@ -17,17 +17,17 @@
 (defn s-flakes->json-ld
   "Build a subject map out a set of flakes with the same subject.
   {:id :ex/foo :ex/x 1 :ex/y 2}"
-  [db tracker cache context compact error-ch s-flakes]
+  [db fuel-tracker cache context compact error-ch s-flakes]
   (jld-format/format-subject-flakes db cache context compact
                                     {:wildcard? true, :depth 0}
-                                    0 tracker error-ch s-flakes))
+                                    0 fuel-tracker error-ch s-flakes))
 
 (defn t-flakes->json-ld
   "Build a collection of subject maps out of a set of flakes with the same t.
 
   [{:id :ex/foo :ex/x 1 :ex/y 2}...]
   "
-  [db tracker context compact cache error-ch t-flakes]
+  [db fuel-tracker context compact cache error-ch t-flakes]
   (let [s-flakes-ch (->> t-flakes
                          (group-by flake/s)
                          (vals)
@@ -39,7 +39,7 @@
      s-out-ch
      (fn [assert-flakes ch]
        (-> db
-           (s-flakes->json-ld tracker cache context compact error-ch assert-flakes)
+           (s-flakes->json-ld fuel-tracker cache context compact error-ch assert-flakes)
            (async/pipe ch)))
      s-flakes-ch)
     s-out-ch))
@@ -50,7 +50,7 @@
 
   [{:id :ex/foo :f/assert [{},,,} :f/retract [{},,,]]}]
   "
-  [db tracker context error-ch flakes]
+  [db fuel-tracker context error-ch flakes]
   (let [cache       (volatile! {})
 
         compact     (json-ld/compact-fn context)
@@ -78,12 +78,12 @@
                      t        (flake/t (first t-flakes))
 
                      asserts  (->> assert-flakes
-                                   (t-flakes->json-ld db tracker context compact cache error-ch)
+                                   (t-flakes->json-ld db fuel-tracker context compact cache error-ch)
                                    (async/into [])
                                    <!)
 
                      retracts (->> retract-flakes
-                                   (t-flakes->json-ld db tracker context compact cache error-ch)
+                                   (t-flakes->json-ld db fuel-tracker context compact cache error-ch)
                                    (async/into [])
                                    <!)]
                  {t-key       t
@@ -159,7 +159,7 @@
 
 (defn commit-t-flakes->json-ld
   "Build a commit maps given a set of all flakes with the same t."
-  [{:keys [commit-catalog] :as db} tracker context {:keys [commit data txn] :as include} compact cache error-ch t-flakes]
+  [{:keys [commit-catalog] :as db} fuel-tracker context {:keys [commit data txn] :as include} compact cache error-ch t-flakes]
   (go
     (try*
       (let [{commit-wrapper-flakes :commit-wrapper
@@ -189,23 +189,23 @@
 
             commit-wrapper-chan (jld-format/format-subject-flakes db cache context compact
                                                                   {:wildcard? true, :depth 0}
-                                                                  0 tracker error-ch commit-wrapper-flakes)
+                                                                  0 fuel-tracker error-ch commit-wrapper-flakes)
 
             commit-meta-chan    (jld-format/format-subject-flakes db cache context compact
                                                                   {:wildcard? true, :depth 0}
-                                                                  0 tracker error-ch commit-meta-flakes)
+                                                                  0 fuel-tracker error-ch commit-meta-flakes)
 
             commit-wrapper      (<! commit-wrapper-chan)
             commit-meta         (<! commit-meta-chan)
             asserts             (->> assert-flakes
-                                     (t-flakes->json-ld db tracker context compact cache error-ch)
+                                     (t-flakes->json-ld db fuel-tracker context compact cache error-ch)
                                      (async/into [])
                                      <!)
             retracts            (->> retract-flakes
-                                     (t-flakes->json-ld db tracker context compact cache error-ch)
+                                     (t-flakes->json-ld db fuel-tracker context compact cache error-ch)
                                      (async/into [])
                                      <!)
-            annotation          (<? (t-flakes->json-ld db tracker context compact cache error-ch annotation-flakes))
+            annotation          (<? (t-flakes->json-ld db fuel-tracker context compact cache error-ch annotation-flakes))
 
             assert-key          (json-ld/compact const/iri-assert compact)
             retract-key         (json-ld/compact const/iri-retract compact)
@@ -238,7 +238,7 @@
 
 (defn commit-flakes->json-ld
   "Create a collection of commit maps."
-  [db tracker context include error-ch flake-slice-ch]
+  [db fuel-tracker context include error-ch flake-slice-ch]
   (let [cache       (volatile! {})
         compact     (json-ld/compact-fn context)
 
@@ -250,7 +250,7 @@
      2
      out-ch
      (fn [t-flakes ch]
-       (-> (commit-t-flakes->json-ld db tracker context include compact cache error-ch
+       (-> (commit-t-flakes->json-ld db fuel-tracker context include compact cache error-ch
                                      t-flakes)
            (async/pipe ch)))
      t-flakes-ch)
@@ -278,7 +278,7 @@
   "Adds commit-details to history results from the history-results-ch.
   Chunks together history results with consecutive `t`s to reduce `time-range`
   calls. "
-  [db tracker context include error-ch history-results-ch]
+  [db fuel-tracker context include error-ch history-results-ch]
   (let [t-key      (json-ld/compact const/iri-fluree-t context)
         out-ch     (async/chan 2 cat)
         chunked-ch (async/chan 2 (with-consecutive-ts t-key))]
@@ -292,11 +292,11 @@
           (let [to-t                       (-> chunk peek (get t-key))
                 from-t                     (-> chunk (nth 0) (get t-key))
                 flake-slices-ch            (query-range/time-range
-                                            db tracker :tspo = []
+                                            db fuel-tracker :tspo = []
                                             {:from-t from-t, :to-t to-t})
                 consecutive-commit-details (<! (->> flake-slices-ch
                                                     (commit-flakes->json-ld
-                                                     db tracker context include error-ch)
+                                                     db fuel-tracker context include error-ch)
                                                     (async/into [])))]
             (map into chunk consecutive-commit-details)))
         ch))
@@ -304,18 +304,18 @@
     out-ch))
 
 (defn query-history
-  [db tracker context from-t to-t commit-details? include error-ch history-q]
+  [db fuel-tracker context from-t to-t commit-details? include error-ch history-q]
   (go-try
     (let [[pattern idx]  (<? (history-pattern db context history-q))
-          flake-slice-ch (query-range/time-range db tracker idx = pattern {:from-t from-t :to-t to-t})
+          flake-slice-ch (query-range/time-range db fuel-tracker idx = pattern {:from-t from-t :to-t to-t})
           flakes         (async/<! (async/reduce into [] flake-slice-ch))
-          result-ch      (cond->> (history-flakes->json-ld db tracker context error-ch flakes)
-                           (or commit-details? include) (add-commit-details db tracker context include error-ch)
+          result-ch      (cond->> (history-flakes->json-ld db fuel-tracker context error-ch flakes)
+                           (or commit-details? include) (add-commit-details db fuel-tracker context include error-ch)
                            true            (async/into []))]
       (<! result-ch))))
 
 (defn query-commits
-  [db tracker context from-t to-t include error-ch]
-  (let [flake-slice-ch    (query-range/time-range db tracker :tspo = [] {:from-t from-t :to-t to-t})
-        commit-results-ch (commit-flakes->json-ld db tracker context include error-ch flake-slice-ch)]
+  [db fuel-tracker context from-t to-t include error-ch]
+  (let [flake-slice-ch    (query-range/time-range db fuel-tracker :tspo = [] {:from-t from-t :to-t to-t})
+        commit-results-ch (commit-flakes->json-ld db fuel-tracker context include error-ch flake-slice-ch)]
     (async/into [] commit-results-ch)))

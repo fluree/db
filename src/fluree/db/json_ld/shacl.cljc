@@ -97,11 +97,11 @@
   "Recursively build a shape by traversing the ref flakes and constructing nodes out of
   them. This function will halt but not error if a cycle is detected. It is also not
   stack safe."
-  ([db tracker shape-sid]
-   (build-shape-node db tracker shape-sid #{shape-sid} 0))
-  ([db tracker shape-sid built-nodes depth]
+  ([db fuel-tracker shape-sid]
+   (build-shape-node db fuel-tracker shape-sid #{shape-sid} 0))
+  ([db fuel-tracker shape-sid built-nodes depth]
    (go-try
-     (let [flakes (<? (query-range/index-range db tracker :spot = [shape-sid] {}))]
+     (let [flakes (<? (query-range/index-range db fuel-tracker :spot = [shape-sid] {}))]
        (if (seq flakes)
          (loop [[f & r] (sort-by (comp :i flake/m) flakes)
                 node {const/$id shape-sid}]
@@ -113,7 +113,7 @@
                                           (>= depth 10))
                                     ;; cycle or depth limit reached (depth limit is currently arbitrary)
                                     ref
-                                    (<? (build-shape-node db tracker ref (conj built-nodes ref) (inc depth)))))
+                                    (<? (build-shape-node db fuel-tracker ref (conj built-nodes ref) (inc depth)))))
                                 (flake/o f))))
              node))
          shape-sid)))))
@@ -121,12 +121,12 @@
 (defn build-shape
   "Build the shape of the given sid. Use a cached value if it exists. The cache is reset
   in `vocab/hydrate-schema` if any shapes are modified."
-  [db tracker shape-sid]
+  [db fuel-tracker shape-sid]
   (go-try
     (let [shapes-cache (-> db :schema :shapes)]
       (if-let [shape (get @shapes-cache shape-sid)]
         shape
-        (let [shape (<? (build-shape-node db tracker shape-sid))]
+        (let [shape (<? (build-shape-node db fuel-tracker shape-sid))]
           (swap! shapes-cache assoc shape-sid shape)
           shape)))))
 
@@ -134,7 +134,7 @@
 (defn build-sibling-shapes
   "Construct the sibling shapes of a shape with a sh:qualifiedValueShape. Siblings are
   other qualified value shape constraints in the same property constraint."
-  [db tracker shape]
+  [db fuel-tracker shape]
   (go-try
     (let [{shape-id const/$id
            [q-disjoint?] const/sh_qualifiedValueShapesDisjoint
@@ -142,15 +142,15 @@
           shape]
       (if q-disjoint?
         (let [parent-shape-id
-              (first (<? (query-range/index-range db tracker :opst = [[shape-id const/$id] const/sh_property]
+              (first (<? (query-range/index-range db fuel-tracker :opst = [[shape-id const/$id] const/sh_property]
                                                   {:flake-xf (map flake/s)})))
               sibling-sids
-              (<? (query-range/index-range db tracker :spot = [parent-shape-id const/sh_property]
+              (<? (query-range/index-range db fuel-tracker :spot = [parent-shape-id const/sh_property]
                                            {:flake-xf (map flake/o)}))]
           (loop [[sib-sid & r] sibling-sids
                  sib-q-shapes []]
             (if sib-sid
-              (recur r (conj sib-q-shapes (<? (build-shape db tracker sib-sid))))
+              (recur r (conj sib-q-shapes (<? (build-shape db fuel-tracker sib-sid))))
               (->> sib-q-shapes
                    ;; only keep the qualified value shape of the sibling shape
                    (keep #(first (get % const/sh_qualifiedValueShape)))
@@ -196,40 +196,40 @@
   [(flake/o flake) (flake/dt flake) (:lang (flake/m flake))])
 
 (defn resolve-predicate-path
-  [data-db tracker focus-node pred-path]
-  (query-range/index-range data-db tracker :spot = [focus-node pred-path] {:flake-xf (map object-node)}))
+  [data-db fuel-tracker focus-node pred-path]
+  (query-range/index-range data-db fuel-tracker :spot = [focus-node pred-path] {:flake-xf (map object-node)}))
 
 (defn resolve-inverse-path
-  [data-db tracker focus-node inverse-path]
-  (query-range/index-range data-db tracker :opst = [focus-node inverse-path] {:flake-xf (map subject-node)}))
+  [data-db fuel-tracker focus-node inverse-path]
+  (query-range/index-range data-db fuel-tracker :opst = [focus-node inverse-path] {:flake-xf (map subject-node)}))
 
 (defn resolve-alternative-path
-  [data-db tracker focus-node alternative-path]
+  [data-db fuel-tracker focus-node alternative-path]
   (go-try
     (loop [[pid & r] alternative-path
            value-nodes    []]
       (if pid
-        (let [value-nodes* (<? (query-range/index-range data-db tracker :spot = [focus-node pid]
+        (let [value-nodes* (<? (query-range/index-range data-db fuel-tracker :spot = [focus-node pid]
                                                         {:flake-xf (map object-node)}))]
           (recur r (into value-nodes value-nodes*)))
         value-nodes))))
 
 (defn resolve-segment
   "Return the value nodes corresponding to the path segment from the focus-node."
-  [data-db tracker focus-node segment]
+  [data-db fuel-tracker focus-node segment]
   (go-try
     (if (iri/sid? segment)
-      (<? (resolve-predicate-path data-db tracker focus-node segment))
+      (<? (resolve-predicate-path data-db fuel-tracker focus-node segment))
       (let [{[inverse-path]   const/sh_inversePath
              alternative-path const/sh_alternativePath}
             segment]
-        (cond inverse-path     (<? (resolve-inverse-path data-db tracker focus-node inverse-path))
-              alternative-path (<? (resolve-alternative-path data-db tracker focus-node alternative-path))
+        (cond inverse-path     (<? (resolve-inverse-path data-db fuel-tracker focus-node inverse-path))
+              alternative-path (<? (resolve-alternative-path data-db fuel-tracker focus-node alternative-path))
               :else            (throw (ex-info "Unsupported property path segment." {:segment segment})))))))
 
 (defn resolve-value-nodes
   "Return the value nodes resolved via the path from the focus node."
-  [data-db tracker focus-node path]
+  [data-db fuel-tracker focus-node path]
   (go-try
     (loop [[segment & segments] path
            focus-nodes [focus-node]
@@ -238,7 +238,7 @@
         (let [vns (loop [[[sid :as f-node] & r] focus-nodes
                          v-nodes []]
                     (if f-node
-                      (recur r (conj v-nodes (<? (resolve-segment data-db tracker sid segment))))
+                      (recur r (conj v-nodes (<? (resolve-segment data-db fuel-tracker sid segment))))
                       v-nodes))]
           (recur segments
                  (apply concat vns)
@@ -247,10 +247,10 @@
 
 (defn validate-property-shape
   "Returns a sequence of validation results if conforming fails, otherwise nil."
-  [{:keys [data-db tracker] :as v-ctx} shape focus-node]
+  [{:keys [data-db fuel-tracker] :as v-ctx} shape focus-node]
   (go-try
     (let [{path const/sh_path} shape]
-      (loop [[value-nodes & r] (<? (resolve-value-nodes data-db tracker focus-node path))
+      (loop [[value-nodes & r] (<? (resolve-value-nodes data-db fuel-tracker focus-node path))
              results           []]
         (if value-nodes
           (if-let [results* (<? (validate-constraints v-ctx shape focus-node value-nodes))]
@@ -302,11 +302,11 @@
 (defn target-objects-of-focus-nodes
   "Returns the objects of any targeted predicate, plus the subject if it is referred to by
   the targeted predicate."
-  [db tracker shape s-flakes]
+  [db fuel-tracker shape s-flakes]
   (go-try
     (let [target-pids    (into #{} (map unpack-id) (get shape const/sh_targetObjectsOf))
           sid            (some-> s-flakes first flake/s)
-          referring-pids (not-empty (<? (query-range/index-range db tracker :opst = [[sid const/$id]]
+          referring-pids (not-empty (<? (query-range/index-range db fuel-tracker :opst = [[sid const/$id]]
                                                                  {:flake-xf (comp
                                                                              (map flake/p)
                                                                              (filter target-pids))})))
@@ -318,7 +318,7 @@
 (defn resolve-focus-nodes
   "Evaluate the target declarations of a NodeShape to see if the provided s-flakes contain
   any focus nodes for the shape. Returns a sequence of focus nodes if targets are present."
-  [data-db tracker shape s-flakes]
+  [data-db fuel-tracker shape s-flakes]
   (go-try
     (let [sid (some-> s-flakes first flake/s)]
       (cond (or (target-node-target? shape s-flakes)
@@ -328,23 +328,23 @@
             [(sid-node sid)]
 
             (target-objects-of-target? shape)
-            (<? (target-objects-of-focus-nodes data-db tracker shape s-flakes))
+            (<? (target-objects-of-focus-nodes data-db fuel-tracker shape s-flakes))
 
             :else ;; no target declaration, no focus nodes
             []))))
 
 (defn validate-node-shape
   "Validate the focus nodes that are targeted by the target declaration, or the provided nodes."
-  ([{:keys [data-db tracker] :as v-ctx} shape s-flakes]
+  ([{:keys [data-db fuel-tracker] :as v-ctx} shape s-flakes]
    (go-try
-     (loop [[[s _dt :as focus-node] & r] (<? (resolve-focus-nodes data-db tracker shape s-flakes))
+     (loop [[[s _dt :as focus-node] & r] (<? (resolve-focus-nodes data-db fuel-tracker shape s-flakes))
             results          []]
        (if focus-node
          (let [value-nodes (cond (some-> s-flakes first flake/s (= s))
                                  (mapv object-node s-flakes)
 
                                  (iri/sid? s)
-                                 (<? (query-range/index-range data-db tracker :spot = [s]
+                                 (<? (query-range/index-range data-db fuel-tracker :spot = [s]
                                                               {:flake-xf (map object-node)}))
 
                                  :else ;; focus node is value node (targetObjectsOf)
@@ -380,7 +380,7 @@
 
 ;; value type constraints
 (defmethod validate-constraint const/sh_class
-  [{:keys [display data-db tracker] :as v-ctx} shape constraint focus-node value-nodes]
+  [{:keys [display data-db fuel-tracker] :as v-ctx} shape constraint focus-node value-nodes]
   (go-try
     (let [{expect constraint} shape
 
@@ -391,7 +391,7 @@
              results []]
         (if o
           (let [classes (if (iri/sid? o)
-                          (->> (<? (query-range/index-range data-db tracker :spot = [o const/$rdf:type]
+                          (->> (<? (query-range/index-range data-db fuel-tracker :spot = [o const/$rdf:type]
                                                             {:flake-xf (map flake/o)}))
                                (into #{}))
                           #{})
@@ -656,12 +656,12 @@
 
 ;; property pair constraints
 (defmethod validate-constraint const/sh_equals
-  [{:keys [display data-db tracker] :as v-ctx} shape constraint focus-node value-nodes]
+  [{:keys [display data-db fuel-tracker] :as v-ctx} shape constraint focus-node value-nodes]
   (go-try
     (let [{expect constraint} shape
 
           [equals]       expect
-          equals-flakes  (<? (query-range/index-range data-db tracker :spot = [(first focus-node) equals] {}))
+          equals-flakes  (<? (query-range/index-range data-db fuel-tracker :spot = [(first focus-node) equals] {}))
           equals-objects (into #{} (map flake/o) equals-flakes)
           focus-objects  (into #{} (map first) value-nodes)]
       (when (not= equals-objects focus-objects)
@@ -677,12 +677,12 @@
                                         (display equals) " values " (str/join ", " (sort expect-vals))))))])))))
 
 (defmethod validate-constraint const/sh_disjoint
-  [{:keys [data-db display tracker] :as v-ctx} shape constraint focus-node value-nodes]
+  [{:keys [data-db display fuel-tracker] :as v-ctx} shape constraint focus-node value-nodes]
   (go-try
     (let [{expect constraint} shape
 
           [disjoint]       expect
-          disjoint-flakes  (<? (query-range/index-range data-db tracker :spot = [(first focus-node) disjoint] {}))
+          disjoint-flakes  (<? (query-range/index-range data-db fuel-tracker :spot = [(first focus-node) disjoint] {}))
           disjoint-objects (into #{} (map flake/o) disjoint-flakes)
           focus-objects    (into #{} (map first) value-nodes)]
       (when (not-empty (set/intersection focus-objects disjoint-objects))
@@ -698,12 +698,12 @@
                                         (display disjoint) " values " (str/join ", " (sort expect-vals))))))])))))
 
 (defmethod validate-constraint const/sh_lessThan
-  [{:keys [data-db display tracker] :as v-ctx} shape constraint focus-node value-nodes]
+  [{:keys [data-db display fuel-tracker] :as v-ctx} shape constraint focus-node value-nodes]
   (go-try
     (let [{expect constraint} shape
 
           [less-than]       expect
-          less-than-flakes  (<? (query-range/index-range data-db tracker :spot = [(first focus-node) less-than] {}))
+          less-than-flakes  (<? (query-range/index-range data-db fuel-tracker :spot = [(first focus-node) less-than] {}))
           less-than-objects (into #{} (map flake/o) less-than-flakes)
           focus-objects     (into #{} (map first) value-nodes)
 
@@ -728,12 +728,12 @@
                                          " values " (str/join ", " (sort expect-vals)))))]))))
 
 (defmethod validate-constraint const/sh_lessThanOrEquals
-  [{:keys [data-db display tracker] :as v-ctx} shape constraint focus-node value-nodes]
+  [{:keys [data-db display fuel-tracker] :as v-ctx} shape constraint focus-node value-nodes]
   (go-try
     (let [{expect constraint} shape
 
           [less-than]       expect
-          less-than-flakes  (<? (query-range/index-range data-db tracker :spot = [(first focus-node) less-than] {}))
+          less-than-flakes  (<? (query-range/index-range data-db fuel-tracker :spot = [(first focus-node) less-than] {}))
           less-than-objects (into #{} (map flake/o) less-than-flakes)
           focus-objects     (into #{} (map first) value-nodes)
 
@@ -851,7 +851,7 @@
 
 ;; shape-based constraints
 (defmethod validate-constraint const/sh_node
-  [{:keys [display data-db tracker] :as v-ctx} shape constraint focus-node value-nodes]
+  [{:keys [display data-db fuel-tracker] :as v-ctx} shape constraint focus-node value-nodes]
   (go-try
     (let [{expect constraint} shape
 
@@ -868,7 +868,7 @@
                            (loop [[node-shape & r] expect
                                   results []]
                              (if node-shape
-                               (let [value-nodes (<? (query-range/index-range data-db tracker :spot = [v]
+                               (let [value-nodes (<? (query-range/index-range data-db fuel-tracker :spot = [v]
                                                                               {:flake-xf (map object-node)}))]
                                  (if (<? (validate-node-shape v-ctx node-shape value-node value-nodes))
                                    (recur r (conj results (assoc result
@@ -898,7 +898,7 @@
         (not-empty results)))))
 
 (defmethod validate-constraint const/sh_qualifiedValueShape
-  [{:keys [display data-db tracker] :as v-ctx} shape constraint focus-node value-nodes]
+  [{:keys [display data-db fuel-tracker] :as v-ctx} shape constraint focus-node value-nodes]
   (go-try
     (let [{expect constraint
            [q-disjoint?] const/sh_qualifiedValueShapesDisjoint
@@ -920,7 +920,7 @@
           ;; build up conforming sids
           (let [focus-node* (if (iri/sid? v) value-node focus-node)
                 value-nodes* (if (iri/sid? v)
-                               (<? (query-range/index-range data-db tracker :spot = [v] {:flake-xf (map object-node)}))
+                               (<? (query-range/index-range data-db fuel-tracker :spot = [v] {:flake-xf (map object-node)}))
                                value-nodes)
                 result (if (property-shape? q-shape)
                          (<? (validate-property-shape v-ctx q-shape focus-node*))
@@ -931,7 +931,7 @@
 
           (if q-disjoint?
             ;; disjoint requires subjects that conform to this q-shape cannot conform to any of the sibling q-shapes
-            (let [sibling-q-shapes (<? (build-sibling-shapes data-db tracker shape))]
+            (let [sibling-q-shapes (<? (build-sibling-shapes data-db fuel-tracker shape))]
               (loop [[conforming-sid & r] conforming
                      non-disjoint-conformers #{}]
                 (if conforming-sid
@@ -939,7 +939,7 @@
                          (loop [[sib-q-shape & r] sibling-q-shapes
                                 non-disjoint-conformers* []]
                            (if sib-q-shape
-                             (let [value-nodes (<? (query-range/index-range data-db tracker :spot = [conforming-sid]
+                             (let [value-nodes (<? (query-range/index-range data-db fuel-tracker :spot = [conforming-sid]
                                                                             {:flake-xf (map object-node)}))
                                    q-result (if (property-shape? sib-q-shape)
                                               (<? (validate-property-shape v-ctx sib-q-shape (sid-node conforming-sid)))
@@ -989,13 +989,13 @@
 
 ;; other constraints
 (defmethod validate-constraint const/sh_closed
-  [{:keys [data-db display tracker] :as v-ctx} shape constraint focus-node _value-nodes]
+  [{:keys [data-db display fuel-tracker] :as v-ctx} shape constraint focus-node _value-nodes]
   (go-try
     (let [{ignored    const/sh_ignoredProperties
            properties const/sh_property}
           shape
 
-          s-flakes    (<? (query-range/index-range data-db tracker :spot = [(first focus-node)] {}))
+          s-flakes    (<? (query-range/index-range data-db fuel-tracker :spot = [(first focus-node)] {}))
           constrained (into #{} (map #(-> % (get const/sh_path) first) properties))
           allowed     (into constrained ignored)
           present     (into #{} (map flake/p) s-flakes)
@@ -1081,8 +1081,8 @@
 
 (defn all-node-shape-ids
   "Returns the sids of all subjects with an @type of sh:NodeShape."
-  [db tracker]
-  (query-range/index-range db tracker :post = [const/$rdf:type [const/sh_NodeShape const/$id]]
+  [db fuel-tracker]
+  (query-range/index-range db fuel-tracker :post = [const/$rdf:type [const/sh_NodeShape const/$id]]
                            {:flake-xf (map flake/s)}))
 
 (defn make-display
@@ -1099,13 +1099,13 @@
   "Returns a seq of s-flakes for each modified subject.
 
   Note: SHACL validation needs to happen on the data state in db-after"
-  [data-db tracker flakes]
+  [data-db fuel-tracker flakes]
   (go-try
     (loop [[s-flakes & r] (partition-by flake/s flakes)
            all-s-flakes []]
       (if s-flakes
         (let [sid        (some-> s-flakes first flake/s)
-              sid-flakes (set (<? (query-range/index-range data-db tracker :spot = [sid] {})))]
+              sid-flakes (set (<? (query-range/index-range data-db fuel-tracker :spot = [sid] {})))]
           (recur r (conj all-s-flakes sid-flakes)))
         all-s-flakes))))
 
@@ -1126,13 +1126,13 @@
   (get shape const/sh_deactivated))
 
 (defn rebuild-shapes
-  [db tracker]
+  [db fuel-tracker]
   (go-try
     ;; TODO, can parallelize build-shape-node
-    (loop [[shape-sid & r] (<? (all-node-shape-ids db tracker))
+    (loop [[shape-sid & r] (<? (all-node-shape-ids db fuel-tracker))
            shapes {}]
       (if shape-sid
-        (let [shape (<? (build-shape-node db tracker shape-sid))]
+        (let [shape (<? (build-shape-node db fuel-tracker shape-sid))]
           (if (shape-deactivated? shape)
             (recur r shapes)
             (recur r (assoc shapes shape-sid shape))))
@@ -1156,31 +1156,31 @@
 (defn hydrate-shape-cache!
   ([db]
    (hydrate-shape-cache! db nil))
-  ([db tracker]
+  ([db fuel-tracker]
    (go-try
-     (let [new-shapes (<? (rebuild-shapes db tracker))]
+     (let [new-shapes (<? (rebuild-shapes db fuel-tracker))]
        (reset-shape-cache! db new-shapes)))))
 
 (defn extract-shapes
-  [db tracker]
+  [db fuel-tracker]
   (go-try
-    (let [db* (<? (hydrate-shape-cache! db tracker))]
+    (let [db* (<? (hydrate-shape-cache! db fuel-tracker))]
       (-> db* :schema :shapes deref vals))))
 
 (defn validate!
   "Will throw an exception if any of the modified subjects fails to conform to a shape that targets it.
 
   `modified-subjects` is a sequence of s-flakes of modified subjects."
-  [data-db tracker new-flakes context]
+  [data-db fuel-tracker new-flakes context]
   (go-try
     (let [shapes (if (some modified-shape? new-flakes)
-                   (<? (extract-shapes data-db tracker))
+                   (<? (extract-shapes data-db fuel-tracker))
                    (cached-shapes data-db))]
       (if (empty? shapes)
         :valid
-        (let [modified-subjects (<? (modified-subjects data-db tracker new-flakes))
+        (let [modified-subjects (<? (modified-subjects data-db fuel-tracker new-flakes))
               v-ctx {:display  (make-display data-db context)
-                     :tracker tracker
+                     :fuel-tracker fuel-tracker
                      :context  context
                      :data-db  data-db}]
           (loop [[shape & r] shapes]

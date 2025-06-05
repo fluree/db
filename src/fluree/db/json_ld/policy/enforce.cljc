@@ -16,67 +16,48 @@
   [policy]
   (true? (get-in policy [:view :root?])))
 
-(defn view-class-policy-map
-  [policy]
-  (get-in policy [:view :class]))
+(defn class-policy-map
+  "Returns class policy map"
+  [policy modify?]
+  (if modify?
+    (get-in policy [:modify :class])
+    (get-in policy [:view :class])))
 
-(defn modify-class-policy-map
-  [policy]
-  (get-in policy [:modify :class]))
+(defn property-policy-map
+  "Returns property policy map"
+  [policy modify?]
+  (if modify?
+    (get-in policy [:modify :property])
+    (get-in policy [:view :property])))
 
-(defn modify-property-policy-map
-  [policy]
-  (get-in policy [:modify :property]))
-
-(defn view-property-policy-map
-  [policy]
-  (get-in policy [:view :property]))
-
-(defn view-policies-for-classes
-  [policy classes]
-  (let [class-policies (view-class-policy-map policy)]
+(defn policies-for-classes
+  "Returns sequence of policies that apply to the provided classes."
+  [policy modify? classes]
+  (let [class-policies (class-policy-map policy modify?)]
     (seq (apply concat (keep #(get class-policies %) classes)))))
 
-(defn modify-policies-for-classes
-  [policy classes]
-  (let [class-policies (modify-class-policy-map policy)]
-    (seq (apply concat (keep #(get class-policies %) classes)))))
-
-(defn modify-policies-for-property
-  [policy-map property]
-  (let [prop-policies (modify-property-policy-map policy-map)]
+(defn policies-for-property
+  "Returns policy properties if they exist for the provided property
+  else nil"
+  [policy-map modify? property]
+  (let [prop-policies (property-policy-map policy-map modify?)]
     (get prop-policies property)))
 
-(defn view-policies-for-property
-  [policy-map property]
-  (let [prop-policies (view-property-policy-map policy-map)]
-    (get prop-policies property)))
+(defn default-policies
+  "Returns default policies if they exist else nil"
+  [policy-map modify?]
+  (if modify?
+    (get-in policy-map [:modify :default])
+    (get-in policy-map [:view :default])))
 
-(defn default-view-policies
-  [policy-map]
-  (get-in policy-map [:view :default]))
-
-(defn default-modify-policies
-  [policy-map]
-  (get-in policy-map [:modify :default]))
-
-(defn applies-to-flake?
-  [{:keys [s-targets p-targets default?] :as _policy} [s p _o :as _flake]]
-  (or (and (or (nil? s-targets) (contains? s-targets s))
-           (or (nil? p-targets) (contains? p-targets p)))
-      default?))
-
-(defn view-policies-for-flake
-  [{:keys [policy] :as _db} flake]
-  (filter (fn [policy]
-            (applies-to-flake? policy flake))
-          (default-view-policies policy)))
-
-(defn modify-policies-for-flake
-  [{:keys [policy] :as _db} flake]
-  (filter (fn [policy]
-            (applies-to-flake? policy flake))
-          (default-modify-policies policy)))
+(defn policies-for-flake
+  [{:keys [policy] :as _db} [s p _o :as _flake] modify?]
+  (->> (default-policies policy modify?)
+       (keep (fn [{:keys [s-targets p-targets default?] :as policy}]
+               (when (or (and (or (nil? s-targets) (contains? s-targets s))
+                              (or (nil? p-targets) (contains? p-targets p)))
+                         default?)
+                 policy)))))
 
 (defn policy-query
   [db sid query]
@@ -86,15 +67,21 @@
                           (policy/inject-value-binding "?$this" {"@value" this-val "@type" const/iri-id}))]
     (policy/inject-where-pattern query ["values" values])))
 
+(defn modify-exception
+  [policies]
+  (ex-info (or (some :ex-message policies)
+               "Policy enforcement prevents modification.")
+           {:status 403 :error :db/policy-exception}))
+
 (def ^:const deny-query-result false)
 
-(defn- policies-allow?
+(defn policies-allow?
   "Once narrowed to a specific set of policies, execute and return
   appropriate policy response."
-  [db tracker sid policies]
+  [db fuel-tracker modify? sid policies-to-eval]
   (let [tracer (-> db :policy :trace)]
     (go-try
-      (loop [[policy & r] policies]
+      (loop [[policy & r] policies-to-eval]
         ;; return first truthy response, else false
         (if policy
           (let [{exec-counter :executed
@@ -103,7 +90,7 @@
                 query   (when-let [query (:query policy)]
                           (policy-query db sid query))
                 result  (if query
-                          (seq (<? (dbproto/-query (root db) tracker query)))
+                          (seq (<? (dbproto/-query (root db) fuel-tracker query)))
                           deny-query-result)]
             (swap! exec-counter inc)
             (if result
@@ -111,15 +98,6 @@
                   true)
               (recur r)))
           ;; no more policies left to evaluate - all returned false
-          false)))))
-
-(defn policies-allow-viewing?
-  [db tracker sid policies]
-  (policies-allow? db tracker sid policies))
-
-(defn policies-allow-modification?
-  [db tracker sid policies]
-  (go-try (or (<? (policies-allow? db tracker sid policies))
-              (ex-info (or (some :ex-message policies)
-                           "Policy enforcement prevents modification.")
-                       {:status 403 :error :db/policy-exception}))))
+          (if modify?
+            (modify-exception policies-to-eval)
+            false))))))

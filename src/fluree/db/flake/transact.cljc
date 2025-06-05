@@ -9,7 +9,7 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.track :as track]
+            [fluree.db.track.fuel :as fuel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.virtual-graph.index-graph :as vg]))
@@ -56,22 +56,23 @@
      :reasoned      reasoned-from-iri}))
 
 (defn into-flakeset
-  [tracker error-ch flake-ch]
+  [fuel-tracker error-ch flake-ch]
   (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)
         error-xf (halt-when util/exception?)
-        flake-xf (if-let [track-fuel (track/track-fuel! tracker error-ch)]
-                   (comp error-xf track-fuel)
+        flake-xf (if fuel-tracker
+                   (let [track-fuel (fuel/track fuel-tracker error-ch)]
+                     (comp error-xf track-fuel))
                    error-xf)]
     (async/transduce flake-xf (completing conj) flakeset flake-ch)))
 
 (defn generate-flakes
-  [db tracker parsed-txn tx-state]
+  [db fuel-tracker parsed-txn tx-state]
   (go
     (let [error-ch  (async/chan)
           db-vol    (volatile! db)
-          update-ch (->> (where/search db parsed-txn tracker error-ch)
-                         (update/modify db-vol parsed-txn tx-state tracker error-ch)
-                         (into-flakeset tracker error-ch))]
+          update-ch (->> (where/search db parsed-txn fuel-tracker error-ch)
+                         (update/modify db-vol parsed-txn tx-state fuel-tracker error-ch)
+                         (into-flakeset fuel-tracker error-ch))]
       (async/alt!
         error-ch ([e] e)
         update-ch ([result]
@@ -115,14 +116,14 @@
        :context   context})))
 
 (defn validate-db-update
-  [tracker {:keys [db-after add context] :as staged-map}]
+  [fuel-tracker {:keys [db-after add context] :as staged-map}]
   (go-try
-    (<? (shacl/validate! (policy/root db-after) tracker add context))
-    (let [allowed-db (<? (policy.modify/allowed? tracker staged-map))]
+    (<? (shacl/validate! (policy/root db-after) fuel-tracker add context))
+    (let [allowed-db (<? (policy.modify/allowed? fuel-tracker staged-map))]
       allowed-db)))
 
 (defn stage
-  [db tracker context identity author annotation raw-txn parsed-txn]
+  [db fuel-tracker context identity author annotation raw-txn parsed-txn]
   (go-try
     (when (novelty/max-novelty? db)
       (throw (ex-info "Maximum novelty exceeded, no transactions will be processed until indexing has completed."
@@ -135,6 +136,6 @@
                                  :txn raw-txn
                                  :author (or author identity)
                                  :annotation annotation)
-          [db** new-flakes] (<? (generate-flakes db tracker parsed-txn tx-state))
+          [db** new-flakes] (<? (generate-flakes db fuel-tracker parsed-txn tx-state))
           staged-map (<? (final-db db** new-flakes tx-state))]
-      (<? (validate-db-update tracker staged-map)))))
+      (<? (validate-db-update fuel-tracker staged-map)))))

@@ -296,8 +296,8 @@
                     namespaces namespace-codes max-namespace-code
                     reindex-min-bytes reindex-max-bytes max-old-indexes]
   dbproto/IFlureeDb
-  (-query [this tracker query-map] (fql/query this tracker query-map))
-  (-class-ids [this tracker subject] (match/class-ids this tracker subject))
+  (-query [this fuel-tracker query-map] (fql/query this fuel-tracker query-map))
+  (-class-ids [this fuel-tracker subject] (match/class-ids this fuel-tracker subject))
   (-index-update [db commit-index] (index-update db commit-index))
 
   iri/IRICodec
@@ -307,14 +307,14 @@
     (iri/sid->iri sid namespace-codes))
 
   where/Matcher
-  (-match-id [db tracker solution s-mch error-ch]
-    (match/match-id db tracker solution s-mch error-ch))
+  (-match-id [db fuel-tracker solution s-mch error-ch]
+    (match/match-id db fuel-tracker solution s-mch error-ch))
 
-  (-match-triple [db tracker solution triple-mch error-ch]
-    (match/match-triple db tracker solution triple-mch error-ch))
+  (-match-triple [db fuel-tracker solution triple-mch error-ch]
+    (match/match-triple db fuel-tracker solution triple-mch error-ch))
 
-  (-match-class [db tracker solution class-mch error-ch]
-    (match/match-class db tracker solution class-mch error-ch))
+  (-match-class [db fuel-tracker solution class-mch error-ch]
+    (match/match-class db fuel-tracker solution class-mch error-ch))
 
   (-activate-alias [db alias']
     (go-try
@@ -330,20 +330,20 @@
     solution-ch)
 
   transact/Transactable
-  (-stage-txn [db tracker context identity author annotation raw-txn parsed-txn]
-    (flake.transact/stage db tracker context identity author annotation raw-txn parsed-txn))
+  (-stage-txn [db fuel-tracker context identity author annotation raw-txn parsed-txn]
+    (flake.transact/stage db fuel-tracker context identity author annotation raw-txn parsed-txn))
   (-merge-commit [db commit-jsonld commit-data-jsonld]
     (merge-commit db commit-jsonld commit-data-jsonld))
 
   subject/SubjectFormatter
-  (-forward-properties [db iri spec context compact-fn cache tracker error-ch]
-    (jld-format/forward-properties db iri spec context compact-fn cache tracker error-ch))
+  (-forward-properties [db iri spec context compact-fn cache fuel-tracker error-ch]
+    (jld-format/forward-properties db iri spec context compact-fn cache fuel-tracker error-ch))
 
-  (-reverse-property [db iri reverse-spec context compact-fn cache tracker error-ch]
-    (jld-format/reverse-property db iri reverse-spec context compact-fn cache tracker error-ch))
+  (-reverse-property [db iri reverse-spec context compact-fn cache fuel-tracker error-ch]
+    (jld-format/reverse-property db iri reverse-spec context compact-fn cache fuel-tracker error-ch))
 
-  (-iri-visible? [db tracker iri]
-    (qpolicy/allow-iri? db tracker iri))
+  (-iri-visible? [db fuel-tracker iri]
+    (qpolicy/allow-iri? db fuel-tracker iri))
 
   indexer/Indexable
   (index [db changes-ch]
@@ -384,22 +384,22 @@
     (assoc db :t t))
 
   AuditLog
-  (-history [db tracker context from-t to-t commit-details? include error-ch history-q]
-    (history/query-history db tracker context from-t to-t commit-details? include error-ch history-q))
-  (-commits [db tracker context from-t to-t include error-ch]
-    (history/query-commits db tracker context from-t to-t include error-ch))
+  (-history [db fuel-tracker context from-t to-t commit-details? include error-ch history-q]
+    (history/query-history db fuel-tracker context from-t to-t commit-details? include error-ch history-q))
+  (-commits [db fuel-tracker context from-t to-t include error-ch]
+    (history/query-commits db fuel-tracker context from-t to-t include error-ch))
 
   policy/Restrictable
   (wrap-policy [db policy policy-values]
     (policy-rules/wrap-policy db policy policy-values))
-  (wrap-policy [db tracker policy policy-values]
-    (policy-rules/wrap-policy db tracker policy policy-values))
+  (wrap-policy [db fuel-tracker policy policy-values]
+    (policy-rules/wrap-policy db fuel-tracker policy policy-values))
   (root [db]
     (policy/root-db db))
 
   reasoner/Reasoner
-  (-reason [db methods rule-sources tracker reasoner-max]
-    (flake.reasoner/reason db methods rule-sources tracker reasoner-max))
+  (-reason [db methods rule-sources fuel-tracker reasoner-max]
+    (flake.reasoner/reason db methods rule-sources fuel-tracker reasoner-max))
   (-reasoned-facts [db]
     (flake.reasoner/reasoned-facts db)))
 

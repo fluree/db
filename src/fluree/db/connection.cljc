@@ -17,6 +17,7 @@
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
             [fluree.db.track :as track]
+            [fluree.db.track.fuel :as fuel]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
@@ -630,21 +631,30 @@
           parsed-context (:context parsed-opts)
           identity       (:identity parsed-opts)]
       (if (track/track-txn? parsed-opts)
-        (let [tracker     (track/init parsed-opts)
-              policy-db   (if (policy/policy-enforced-opts? parsed-opts)
-                            (<? (policy/policy-enforce-db db tracker parsed-context parsed-opts))
-                            db)]
+        (let [track-time?  (track/track-time? parsed-opts)
+              start-time   (when track-time?
+                             #?(:clj (System/nanoTime)
+                                :cljs (util/current-time-millis)))
+              track-fuel?  (track/track-fuel? parsed-opts)
+              fuel-tracker (when track-fuel?
+                             (fuel/tracker (:max-fuel parsed-opts)))
+              policy-db    (if (policy/policy-enforced-opts? parsed-opts)
+                             (<? (policy/policy-enforce-db db fuel-tracker parsed-context parsed-opts))
+                             db)]
           (try*
-            (let [staged-db     (<? (transact/stage policy-db tracker identity parsed-txn parsed-opts))
-                  policy-report (policy.rules/enforcement-report staged-db)
-                  tally         (track/tally tracker)]
-              (cond-> (assoc tally :status 200, :db staged-db)
+            (let [staged-db     (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))
+                  policy-report (policy.rules/enforcement-report staged-db)]
+              (cond-> {:status 200
+                       :db     staged-db}
+                track-time?   (assoc :time (util/response-time-formatted start-time))
+                track-fuel?   (assoc :fuel (fuel/tally fuel-tracker))
                 policy-report (assoc :policy policy-report)))
             (catch* e
               (throw (ex-info (ex-message e)
-                              (let [policy-report (policy.rules/enforcement-report policy-db)
-                                    tally         (track/tally tracker)]
-                                (cond-> (merge (ex-data e) tally)
+                              (let [policy-report (policy.rules/enforcement-report policy-db)]
+                                (cond-> (ex-data e)
+                                  track-time?   (assoc :time (util/response-time-formatted start-time))
+                                  track-fuel?   (assoc :fuel (fuel/tally fuel-tracker))
                                   policy-report (assoc :policy policy-report)))
                               e)))))
         (let [policy-db (if (policy/policy-enforced-opts? parsed-opts)

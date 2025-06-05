@@ -58,14 +58,14 @@
 
 (defn format-variable-selector-value
   [var]
-  (fn [_ _db _iri-cache _context compact _tracker error-ch solution]
+  (fn [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
     (go (try* {(var-name var) (-> solution (get var) (display compact))}
               (catch* e
                 (log/error e "Error formatting variable:" var)
                 (>! error-ch e))))))
 
 (defn format-wildcard-selector-value
-  [_ _db _iri-cache _context compact _tracker error-ch solution]
+  [_ _db _iri-cache _context compact _fuel-tracker error-ch solution]
   (go
     (try*
       (loop [[var & vars] (sort (remove nil? (keys solution))) ; implicit grouping can introduce nil keys in solution

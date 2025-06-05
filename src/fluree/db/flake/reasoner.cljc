@@ -52,22 +52,22 @@
 
 (defn reasoner-insert
   "When triples from rules require explicit inserts, returns flakes."
-  [db tracker rule-id insert-smt]
+  [db fuel-tracker rule-id insert-smt]
   (go-try
     (let [tx-state (-> (flake.transact/->tx-state :db db, :reasoned-from-iri rule-id)
                        (assoc :stage-update? true))
-          [db* new-flakes] (<? (flake.transact/generate-flakes db tracker insert-smt tx-state))]
+          [db* new-flakes] (<? (flake.transact/generate-flakes db fuel-tracker insert-smt tx-state))]
       (<? (flake.transact/final-db db* new-flakes tx-state)))))
 
 (defn reasoner-stage
-  [db tracker rule-id full-rule]
+  [db fuel-tracker rule-id full-rule]
   (go-try
     (let [tx-state   (flake.transact/->tx-state :db db, :reasoned-from-iri rule-id)
           parsed-txn (:rule-parsed full-rule)]
       (when-not (:where parsed-txn)
         (throw (ex-info (str "Unable to execute reasoner rule transaction due to format error: " (:rule full-rule))
                         {:status 400 :error :db/invalid-transaction})))
-      (<? (flake.transact/generate-flakes db tracker parsed-txn tx-state)))))
+      (<? (flake.transact/generate-flakes db fuel-tracker parsed-txn tx-state)))))
 
 (defn filter-same-as-trans
   "Note - this remove 'self' from sameAs transitive
@@ -86,9 +86,9 @@
     new-flakes))
 
 (defn execute-reasoner-rule
-  [db rule-id reasoning-rules tracker tx-state]
+  [db rule-id reasoning-rules fuel-tracker tx-state]
   (go-try
-    (let [[db reasoner-flakes] (<? (reasoner-stage db tracker rule-id (get reasoning-rules rule-id)))
+    (let [[db reasoner-flakes] (<? (reasoner-stage db fuel-tracker rule-id (get reasoning-rules rule-id)))
           tx-state*        (assoc tx-state :stage-update? true)
           reasoner-flakes* (filter-same-as-trans rule-id reasoner-flakes)]
       (log/debug "reasoner flakes: " rule-id reasoner-flakes*)
@@ -97,7 +97,7 @@
 
 (defn execute-reasoner
   "Executes the reasoner on the staged db-after and returns the updated db-after."
-  [db reasoning-rules tracker reasoner-max tx-state]
+  [db reasoning-rules fuel-tracker reasoner-max tx-state]
   (go-try
     (let [rule-schedule (schedule reasoning-rules)]
       (log/debug "reasoning schedule: " rule-schedule)
@@ -109,7 +109,7 @@
                                 :reasoned-flakes []
                                 :total-flakes    0}]
           (if rule-id
-            (let [{:keys [db-after add]} (<? (execute-reasoner-rule reasoned-db rule-id reasoning-rules tracker tx-state))]
+            (let [{:keys [db-after add]} (<? (execute-reasoner-rule reasoned-db rule-id reasoning-rules fuel-tracker tx-state))]
               (log/debug "executed reasoning rule: " rule-id)
               (log/trace "reasoning rule: " rule-id "produced flakes:" add)
               (recur r
@@ -244,14 +244,14 @@
 (defn process-inserts
   "Processes any raw inserts that originate from the reasoning
   graph (e.g. owl:sameAs statements)"
-  [db tracker inserts]
+  [db fuel-tracker inserts]
   (go-try
     (let [by-rule (inserts-by-rule inserts)]
       (loop [[[rule-id insert] & r] by-rule
              db* db]
         (if rule-id
           (let [{db**   :db-after
-                 flakes :add} (<? (reasoner-insert db* tracker rule-id insert))]
+                 flakes :add} (<? (reasoner-insert db* fuel-tracker rule-id insert))]
             (log/debug "Rule Flake insert:" rule-id "flakes:" flakes)
             (recur r db**))
           db*)))))
@@ -264,7 +264,7 @@
          (filter #(< 1 (val %))))))
 
 (defn reason
-  [db methods rule-sources tracker reasoner-max]
+  [db methods rule-sources fuel-tracker reasoner-max]
   (go-try
     (let [db*                 (update db :reasoner #(into methods %))
           tx-state            (flake.transact/->tx-state :db db*)
@@ -279,12 +279,12 @@
                                   resolve/rules->graph
                                   add-rule-dependencies)
           db**                (if-let [inserts* @inserts]
-                                (<? (process-inserts db* tracker inserts*))
+                                (<? (process-inserts db* fuel-tracker inserts*))
                                 db*)]
       (log/trace "Reasoner - parsed rules: " reasoning-rules)
       (if (empty? reasoning-rules)
         db**
-        (<? (execute-reasoner db** reasoning-rules tracker reasoner-max tx-state))))))
+        (<? (execute-reasoner db** reasoning-rules fuel-tracker reasoner-max tx-state))))))
 
 (defn reasoned-flake->fact
   [db f]
