@@ -4,7 +4,7 @@
             [fluree.db.test-utils :as test-utils]))
 
 (deftest ^:integration insert-data
-  (testing "Inserting data into a ledger using EDN"
+  (testing "Inserting data into a ledger"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "tx/insert")
           db     @(fluree/insert
