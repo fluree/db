@@ -896,6 +896,16 @@
         (update :identity #(or % did))
         (dissoc :did))))
 
+(defn jld->parsed-triples
+  "Parses a JSON-LD document into a sequence of update triples. The document
+   should be expanded and contain a @graph key."
+  [txn bound-vars context]
+  (-> txn
+      (json-ld/expand context)
+      util/get-graph
+      util/sequential
+      (parse-triples bound-vars context)))
+
 (defn parse-stage-txn
   ([txn]
    (parse-stage-txn txn {}))
@@ -908,17 +918,9 @@
                            (parse-where vars context))
          bound-vars    (-> where where/bound-variables (into vars))
          delete        (when-let [dlt (get-named txn "delete")]
-                         (-> dlt
-                             (json-ld/expand context)
-                             util/get-graph
-                             util/sequential
-                             (parse-triples bound-vars context)))
+                         (jld->parsed-triples dlt bound-vars context))
          insert        (when-let [ins (get-named txn "insert")]
-                         (-> ins
-                             (json-ld/expand context)
-                             util/get-graph
-                             util/sequential
-                             (parse-triples bound-vars context)))
+                         (jld->parsed-triples ins bound-vars context))
          annotation    (util/get-first-value txn const/iri-annotation)
          opts          (-> (get-named txn "opts")
                            (parse-txn-opts override-opts context))]
