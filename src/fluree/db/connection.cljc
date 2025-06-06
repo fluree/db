@@ -510,22 +510,24 @@
 
 (defn drop-ledger
   [conn alias]
-  (go-try
-    (let [alias (if (fluree-address? alias)
-                  (nameservice/address-path alias)
-                  alias)]
-      (loop [[publisher & r] (publishers conn)]
-        (when publisher
-          (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
-                latest-commit (-> (<? (nameservice/lookup publisher ledger-addr))
-                                  json-ld/expand)]
-            (log/warn "Dropping ledger" ledger-addr)
-            (drop-index-artifacts conn latest-commit)
-            (drop-commit-artifacts conn latest-commit)
-            (<? (nameservice/retract publisher alias))
-            (recur r))))
-      (log/warn "Dropped ledger" alias)
-      :dropped)))
+  (go
+    (try*
+      (let [alias (if (fluree-address? alias)
+                    (nameservice/address-path alias)
+                    alias)]
+        (loop [[publisher & r] (publishers conn)]
+          (when publisher
+            (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
+                  latest-commit (-> (<? (nameservice/lookup publisher ledger-addr))
+                                    json-ld/expand)]
+              (log/warn "Dropping ledger" ledger-addr)
+              (drop-index-artifacts conn latest-commit)
+              (drop-commit-artifacts conn latest-commit)
+              (<? (nameservice/retract publisher alias))
+              (recur r))))
+        (log/warn "Dropped ledger" alias)
+        :dropped)
+      (catch* e (log/debug e "Failed to complete ledger deletion")))))
 
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
 
