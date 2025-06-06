@@ -7,6 +7,7 @@
             [fluree.db.constants :as const]
             [fluree.db.did :as did]
             [fluree.db.flake.flake-db :as flake-db]
+            [fluree.db.indexer.garbage :as garbage]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.credential :as credential]
             [fluree.db.json-ld.iri :as iri]
@@ -443,6 +444,90 @@
   (if (fluree-address? alias-or-address)
     (load-ledger-address conn alias-or-address)
     (load-ledger-alias conn alias-or-address)))
+
+(defn drop-commit-artifacts
+  [{:keys [commit-catalog] :as _conn} latest-commit]
+  (let [error-ch  (async/chan)
+        commit-ch (commit-storage/trace-commits commit-catalog latest-commit 0 error-ch)]
+    (go-loop []
+      (when-let [[commit _] (<! commit-ch)]
+        (let [txn-address         (util/get-first-value commit const/iri-txn)
+              commit-address      (util/get-first-value commit const/iri-address)
+              data-address        (-> (util/get-first commit const/iri-data)
+                                      (util/get-first-value const/iri-address))]
+          (log/debug "Dropping commit" (-> (util/get-first commit const/iri-data)
+                                           (util/get-first-value const/iri-fluree-t)))
+          (when data-address
+            (log/debug "Deleting data" data-address)
+            (storage/delete commit-catalog data-address))
+          (when commit-address
+            (log/debug "Deleting commit" commit-address)
+            (storage/delete commit-catalog commit-address))
+          (when txn-address
+            (log/debug "Deleting txn" txn-address)
+            (storage/delete commit-catalog txn-address))
+          (recur))))))
+
+(defn drop-index-nodes
+  "Build up a list of node addresses in leaf->root order, then delete them."
+  [storage node-address]
+  (go-try
+    (loop [[address & r] [node-address]
+           addresses     (list)]
+      (if address
+        (if-let [children (->> (:children (<? (storage/read-json storage address true)))
+                               (mapv :id))]
+          (recur (into r children) (conj addresses address))
+          (recur r (conj addresses address)))
+
+        (doseq [address addresses]
+          (log/debug "Dropping node" address)
+          (storage/delete storage address))))
+    :nodes-dropped))
+
+(defn drop-index-artifacts
+  [{:keys [index-catalog] :as _conn} latest-commit]
+  (go-try
+    (let [storage       (:storage index-catalog)
+          index-address (some-> (util/get-first latest-commit const/iri-index)
+                                (util/get-first-value const/iri-address))]
+      (when index-address
+        (log/debug "Dropping index" index-address)
+        (let [{:keys [spot opst post tspo]} (<? (storage/read-json storage index-address true))
+
+              garbage-ch (garbage/clean-garbage* index-catalog index-address 0)
+              spot-ch    (drop-index-nodes storage (:id spot))
+              post-ch    (drop-index-nodes storage (:id post))
+              tspo-ch    (drop-index-nodes storage (:id tspo))
+              opst-ch    (drop-index-nodes storage (:id opst))]
+          (<? garbage-ch)
+          (<? spot-ch)
+          (<? post-ch)
+          (<? tspo-ch)
+          (<? opst-ch)
+          (<? (storage/delete storage index-address))))
+      :index-dropped)))
+
+(defn drop-ledger
+  [conn alias]
+  (go
+    (try*
+      (let [alias (if (fluree-address? alias)
+                    (nameservice/address-path alias)
+                    alias)]
+        (loop [[publisher & r] (publishers conn)]
+          (when publisher
+            (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
+                  latest-commit (-> (<? (nameservice/lookup publisher ledger-addr))
+                                    json-ld/expand)]
+              (log/warn "Dropping ledger" ledger-addr)
+              (drop-index-artifacts conn latest-commit)
+              (drop-commit-artifacts conn latest-commit)
+              (<? (nameservice/retract publisher alias))
+              (recur r))))
+        (log/warn "Dropped ledger" alias)
+        :dropped)
+      (catch* e (log/debug e "Failed to complete ledger deletion")))))
 
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
 
