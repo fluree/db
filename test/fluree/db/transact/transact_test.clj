@@ -245,7 +245,7 @@
             _       (assert (not (util/exception? db0)))
             db1     @(fluree/commit! ledger db0)
             _       (assert (not (util/exception? db1)))
-            db2     @(fluree/stage db0 {"@context" [test-utils/default-str-context
+            db2     @(fluree/stage db1 {"@context" [test-utils/default-str-context
                                                     {"ex"        "https://example.com/"
                                                      "ex:rating" {"@type" "xsd:float"}}]
                                         "insert"   movies})
