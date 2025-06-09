@@ -134,17 +134,17 @@
 
      (defonce original-run dispatch/run)
 
-     ;; if OpenTelemetry is on classpath than propagate otel context
-     ;; otherwise no-op
-     (try
-       (let [context-class (Class/forName "io.opentelemetry.context.Context")
-             current-method (.getMethod context-class "current" (into-array Class []))
-             wrap-method (.getMethod context-class "wrap" (into-array Class [Runnable]))]
-         (defn wrap-otel ^Runnable [^Runnable r]
-           (let [current-context (.invoke current-method nil (into-array Object []))]
-             (.invoke wrap-method current-context (into-array Object [r])))))
-       (catch ClassNotFoundException _
-         (defn wrap-otel ^Runnable [^Runnable r] r)))
+     ;; if OpenTelemetry is on classpath than propagate otel context otherwise no-op
+     (def wrap-otel
+       (try
+         (let [context-class (Class/forName "io.opentelemetry.context.Context")
+               current-method (.getMethod context-class "current" (into-array Class []))
+               wrap-method (.getMethod context-class "wrap" (into-array Class [Runnable]))]
+           (fn wrap-otel ^Runnable [^Runnable r]
+             (let [current-context (.invoke current-method nil (into-array Object []))]
+               (.invoke wrap-method current-context (into-array Object [r])))))
+         (catch ClassNotFoundException _
+           (fn wrap-otel ^Runnable [^Runnable r] r))))
 
      (defn wrapped-runable ^Runnable [^Runnable r] (wrap-otel (wrap-mdc r)))
      (defn patched-run
