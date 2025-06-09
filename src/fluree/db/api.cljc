@@ -17,7 +17,7 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld])
-  (:refer-clojure :exclude [merge load range exists?]))
+  (:refer-clojure :exclude [merge load range exists? update drop]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -183,18 +183,23 @@
   (promise-wrap
    (connection/load-ledger conn alias-or-address)))
 
+(defn drop
+  [conn ledger-alias]
+  (promise-wrap
+   (connection/drop-ledger conn ledger-alias)))
+
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
   otherwise."
   [conn ledger-alias-or-address]
   (validate-connection conn)
   (promise-wrap
-   (go-try
+   (go
      (let [address (if (address? ledger-alias-or-address)
                      ledger-alias-or-address
-                     (<? (alias->address conn ledger-alias-or-address)))]
+                     (<! (alias->address conn ledger-alias-or-address)))]
        (log/debug "exists? - ledger address:" address)
-       (<? (connection/ledger-exists? conn address))))))
+       (<! (connection/ledger-exists? conn address))))))
 
 (defn notify
   "Notifies the connection of a new commit stored at address `commit-address`.
@@ -209,12 +214,37 @@
   (promise-wrap
    (connection/notify conn commit-address commit-hash)))
 
-(defn stage
-  "Performs a transaction and queues change if valid (does not commit)"
-  ([db json-ld] (stage db json-ld nil))
+(defn insert
+  "Inserts a new set of data into the database if valid (does not commit).
+   Multiple inserts and updates can be staged together and will be merged into a single
+   transaction when committed.
+
+   The 'opts' key is a map with the following key options:
+    - `:context` - (optional) and externally provided context that will be used
+                   for document expansition, the @context in the json-ld will be
+                   ignored if present.
+
+   The data is expected to be in JSON-LD format, and will be expanded before
+   being inserted into the database."
+  ([db json-ld] (insert db json-ld nil))
+  ([db json-ld opts]
+   (promise-wrap
+    (transact-api/insert db json-ld opts))))
+
+(defn update
+  "Performs an update and queues change if valid (does not commit).
+   Multiple updates can be staged together and will be merged into a single
+   transaction when committed."
+  ([db json-ld] (update db json-ld nil))
   ([db json-ld opts]
    (promise-wrap
     (transact-api/stage db json-ld opts))))
+
+;; TODO - deprecate `stage` in favor of `update` eventually
+(defn stage
+  "Renamed to `update`, prefer that API instead."
+  ([db json-ld] (update db json-ld nil))
+  ([db json-ld opts] (update db json-ld opts)))
 
 (defn format-txn
   "Reformats the transaction `txn` as JSON-QL if it is formatted as SPARQL,
@@ -336,7 +366,9 @@
   ([ds q]
    (query ds q {}))
   ([ds q opts]
-   (promise-wrap (query-api/query ds q opts))))
+   (if (util/exception? ds)
+     (throw ds)
+     (promise-wrap (query-api/query ds q opts)))))
 
 (defn credential-query
   "Issues a policy-enforced query to the specified dataset/db as a verifiable
