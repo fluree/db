@@ -7,11 +7,11 @@
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.transact :as transact]
+            [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.history :as history]
-            [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.time-travel :as time-travel]
+            [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log])
@@ -23,10 +23,14 @@
 
 (defrecord AsyncDB [alias branch commit t db-chan]
   dbproto/IFlureeDb
-  (-query [this query-map]
+  (-query [_ fuel-tracker query-map]
     (go-try
       (let [db (<? db-chan)]
-        (<? (dbproto/-query db query-map)))))
+        (<? (dbproto/-query db fuel-tracker query-map)))))
+  (-class-ids [_ fuel-tracker subject]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (dbproto/-class-ids db fuel-tracker subject)))))
   (-index-update [_ commit-index]
     (let [commit* (assoc commit :index commit-index)
           updated-db (->async-db alias branch commit* t)]
@@ -74,9 +78,10 @@
             (>! error-ch e))))
       match-ch))
 
-  (-activate-alias [db alias']
-    (when (= alias alias')
-      db))
+  (-activate-alias [_ alias']
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (where/-activate-alias db alias')))))
 
   (-aliases [_]
     [alias])
@@ -111,10 +116,10 @@
             (>! error-ch e))))
       prop-ch))
 
-  (-iri-visible? [_ iri]
+  (-iri-visible? [_ fuel-tracker iri]
     (go-try
       (let [db (<? db-chan)]
-        (<? (subject/-iri-visible? db iri)))))
+        (<? (subject/-iri-visible? db fuel-tracker iri)))))
 
   transact/Transactable
   (-stage-txn [_ fuel-tracker context identity author annotation raw-txn parsed-txn]
@@ -155,18 +160,18 @@
       db-at-t))
 
   history/AuditLog
-  (-history [_ context from-t to-t commit-details? include error-ch history-q]
+  (-history [_ fuel-tracker context from-t to-t commit-details? include error-ch history-q]
     (go-try
       (let [db (<? db-chan)]
-        (<? (history/-history db context from-t to-t commit-details? include error-ch history-q)))))
+        (<? (history/-history db fuel-tracker context from-t to-t commit-details? include error-ch history-q)))))
 
-  (-commits [_ context from-t to-t include error-ch]
+  (-commits [_ fuel-tracker context from-t to-t include error-ch]
     (let [commit-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (history/-commits context from-t to-t include error-ch)
+                (history/-commits context fuel-tracker from-t to-t include error-ch)
                 (async/pipe commit-ch)))
           (catch* e
             (log/error e "Error loading database for commit range")
@@ -176,8 +181,12 @@
   policy/Restrictable
   (wrap-policy [_ policy policy-values]
     (go-try
-     (let [db (<? db-chan)]
-       (<? (policy/wrap-policy db policy policy-values)))))
+      (let [db (<? db-chan)]
+        (<? (policy/wrap-policy db policy policy-values)))))
+  (wrap-policy [_ fuel-tracker policy policy-values]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (policy/wrap-policy db fuel-tracker policy policy-values)))))
   (root [_]
     (let [root-ch (async/promise-chan)
           root-db (->AsyncDB alias branch commit t root-ch)]
@@ -236,12 +245,14 @@
   (->AsyncDB ledger-alias branch commit-map t (async/promise-chan)))
 
 (defn load
-  [ledger-alias branch commit-catalog index-catalog commit-jsonld indexing-opts]
-  (let [commit-map (commit-data/jsonld->clj commit-jsonld)
-        t          (-> commit-map :data :t)
-        async-db   (->async-db ledger-alias branch commit-map t)]
-    (go
-      (let [db (<! (flake-db/load ledger-alias commit-catalog index-catalog branch
-                                  [commit-jsonld commit-map] indexing-opts))]
-        (deliver! async-db db)))
-    async-db))
+  ([ledger-alias branch commit-catalog index-catalog commit-jsonld indexing-opts]
+   (let [commit-map (commit-data/jsonld->clj commit-jsonld)]
+     (load ledger-alias branch commit-catalog index-catalog commit-jsonld commit-map indexing-opts)))
+  ([ledger-alias branch commit-catalog index-catalog commit-jsonld commit-map indexing-opts]
+   (let [t        (-> commit-map :data :t)
+         async-db (->async-db ledger-alias branch commit-map t)]
+     (go
+       (let [db (<! (flake-db/load ledger-alias commit-catalog index-catalog branch
+                                   [commit-jsonld commit-map] indexing-opts))]
+         (deliver! async-db db)))
+     async-db)))

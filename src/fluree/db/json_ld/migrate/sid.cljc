@@ -2,18 +2,18 @@
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.db.async-db :as async-db]
+            [fluree.db.commit.storage :as commit-storage]
+            [fluree.db.connection :as connection]
             [fluree.db.constants :as const]
             [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.ledger :as ledger]
-            [fluree.db.connection :as connection]
             [fluree.db.query.exec.update :as update]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-id get-first-id get-first-value]]
-            [fluree.db.util.log :as log]
-            [fluree.db.commit.storage :as commit-storage]))
+            [fluree.db.util.core :as util :refer [get-first get-id get-first-value]]
+            [fluree.db.util.log :as log]))
 
 (defrecord NamespaceMapping [mapping]
   iri/IRICodec
@@ -77,9 +77,9 @@
 
 (defn migrate-commits
   "Reduce over each commmit and integrate its data into the ledger's db."
-  [ledger branch tuples-chans]
+  [ledger _branch tuples-chans]
   (go-try
-    (loop [[[commit-tuple ch] & r] tuples-chans
+    (loop [[[commit-tuple _ch] & r] tuples-chans
            db (let [current-db (ledger/current-db ledger)]
                 (if (async-db/db? current-db)
                   (<? (async-db/deref-async current-db))
@@ -103,7 +103,7 @@
    (go-try
      (let [ledger-address       (<? (connection/primary-address conn ledger-alias))
            last-commit-addr     (<? (connection/lookup-commit conn ledger-address))
-           last-verified-commit (<? (commit-storage/read-commit-jsonld store last-commit-addr))
+           last-verified-commit (<? (commit-storage/read-verified-commit store last-commit-addr))
            last-commit          (first last-verified-commit)
            version              (get-first-value last-commit const/iri-v)]
        (if (and (= version commit-data/commit-version) (not force))
@@ -113,10 +113,11 @@
                                      (update-keys {const/iri-t :t const/iri-size :size const/iri-flakes :flakes})
                                      (select-keys [:t :size :flakes])
                                      (update-vals (comp :value first)))
-               all-commit-tuples (<? (commit-storage/trace-commits store last-commit 1))
+               error-ch          (async/chan)
+               all-commit-tuples (<? (commit-storage/trace-commits store last-commit 1 error-ch))
                first-commit      (ffirst all-commit-tuples)
                branch            (or (keyword (get-first-value first-commit const/iri-branch))
-                                     :main)
+                                     commit-data/default-branch)
                ledger            (<? (ledger/create conn {:alias    ledger-alias
                                                           :did      nil
                                                           :branch   branch

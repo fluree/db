@@ -1,9 +1,9 @@
 (ns fluree.db.commit.storage
-  (:require [clojure.string :as str]
-            [clojure.core.async :as async :refer [go <! chan]]
+  (:require [clojure.core.async :as async :refer [>! chan go]]
+            [clojure.string :as str]
             [fluree.db.constants :as const]
-            [fluree.db.storage :as storage]
             [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-first-id
                                                   get-first-value try* catch*]]
@@ -17,7 +17,7 @@
   "Run proof validation, if exists.
   Return actual commit data. In the case of a VerifiableCredential this is
   the `credentialSubject`."
-  [proof]
+  [_proof]
   ;; TODO - returning true for now
   true)
 
@@ -34,27 +34,36 @@
       [credential-subject commit-data])
     [commit-data nil]))
 
-(defn read-data-jsonld
-  [storage address]
-  (go-try
-    (let [jsonld (<? (storage/read-json storage address)) ]
-      (-> jsonld
-          (assoc "f:address" address)
-          json-ld/expand))))
-
-(defn read-commit-jsonld
+(defn read-verified-commit
   [storage commit-address]
   (go-try
-    (let [commit-data   (<? (storage/read-json storage commit-address))
-          addr-key-path (if (contains? commit-data "credentialSubject")
-                          ["credentialSubject" "address"]
-                          ["address"])]
+    (when-let [commit-data (<? (storage/read-json storage commit-address))]
       (log/trace "read-commit at:" commit-address "data:" commit-data)
-      (when commit-data
+      (let [addr-key-path (if (contains? commit-data "credentialSubject")
+                            ["credentialSubject" "address"]
+                            ["address"])]
         (-> commit-data
             (assoc-in addr-key-path commit-address)
             json-ld/expand
             verify-commit)))))
+
+;; TODO: Verify hash
+(defn read-commit-jsonld
+  [storage commit-address commit-hash]
+  (go-try
+    (when-let [[commit _proof] (<? (read-verified-commit storage commit-address))]
+      (let [commit-id (commit-data/hash->commit-id commit-hash)]
+        (assoc commit
+               :id commit-id
+               const/iri-address commit-address)))))
+
+(defn read-data-jsonld
+  [storage address]
+  (go-try
+    (let [jsonld (<? (storage/read-json storage address))]
+      (-> jsonld
+          (assoc "f:address" address)
+          json-ld/expand))))
 
 (defn get-commit-t
   [commit]
@@ -91,30 +100,32 @@
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
   First commit will be t value of `from-t` and increment from there."
-  [storage latest-commit from-t]
+  [storage latest-commit from-t error-ch]
   (let [resp-ch (chan)]
     (go
-     (try*
-      (loop [[commit proof] (verify-commit latest-commit)
-             last-t        nil
-             commit-tuples (list)] ;; note 'conj' will put at beginning of list (smallest 't' first)
-        (let [prev-commit-addr (-> commit
-                                   (get-first const/iri-previous)
-                                   (get-first-value const/iri-address))
-              commit-t         (get-commit-t commit)
-              commit-tuples*   (conj commit-tuples [commit proof])]
+      (try*
+        (loop [[commit proof] (verify-commit latest-commit)
+               last-t        nil
+               commit-tuples (list)] ;; note 'conj' will put at beginning of list (smallest 't' first)
+          (let [prev-commit-addr (-> commit
+                                     (get-first const/iri-previous)
+                                     (get-first-value const/iri-address))
+                commit-t         (get-commit-t commit)
+                commit-tuples*   (conj commit-tuples [commit proof])]
 
-          (validate-commit commit last-t)
+            (validate-commit commit last-t)
 
-          (if (= from-t commit-t)
-            (async/onto-chan! resp-ch commit-tuples*)
-            (let [verified-commit (<! (read-commit-jsonld storage prev-commit-addr))]
-              (if (util/exception? verified-commit)
-                (do (async/>! resp-ch verified-commit)
-                    (async/close! resp-ch))
-                (recur verified-commit commit-t commit-tuples*))))))
-      (catch* e (async/>! resp-ch e)
-        (async/close! resp-ch))))
+            (if (= from-t commit-t)
+              (async/onto-chan! resp-ch commit-tuples*)
+              (let [verified-commit (try*
+                                      (<? (read-verified-commit storage prev-commit-addr))
+                                      (catch* e
+                                        (log/error e "Error tracing commits")
+                                        (>! error-ch e)))]
+                (recur verified-commit commit-t commit-tuples*)))))
+        (catch* e
+          (>! resp-ch e)
+          (async/close! resp-ch))))
     resp-ch))
 
 (defn write-jsonld

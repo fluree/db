@@ -1,8 +1,8 @@
 (ns fluree.db.query.history.parse
-  (:require [fluree.db.query.fql.syntax :as syntax]
-            [fluree.db.validation :as v]
-            [fluree.db.datatype :as datatype]
+  (:require [fluree.db.datatype :as datatype]
+            [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.validation :as v]
             [malli.core :as m]))
 
 (defn history-query-schema

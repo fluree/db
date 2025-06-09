@@ -1,8 +1,8 @@
 (ns fluree.db.transact
-  (:require [fluree.db.util.async :refer [<? go-try]]
+  (:require [fluree.db.constants :as const]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.constants :as const]))
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -21,27 +21,34 @@
                                     (fn [v]
                                       ;; remove value objects unless they have type @id
                                       (and
-                                        (some? (:value v))
-                                        (not= (:type v) const/iri-id)))))))
+                                       (some? (:value v))
+                                       (not= (:type v) const/iri-id)))))))
        not-empty))
+
+(defn expand-annotation
+  [_parsed-txn parsed-opts context]
+  (some-> (:annotation parsed-opts)
+          (json-ld/expand context)
+          util/sequential))
+
+(defn validate-annotation
+  [[annotation :as expanded]]
+  (when-let [specified-id (:id annotation)]
+    (throw (ex-info "Commit annotation cannot specify a subject identifier."
+                    {:status 400, :error :db/invalid-annotation :id specified-id})))
+  (when (> (count expanded) 1)
+    (throw (ex-info "Commit annotation must only have a single subject."
+                    {:status 400, :error :db/invalid-annotation})))
+  (when (nested-nodes? annotation)
+    (throw (ex-info "Commit annotation cannot reference other subjects."
+                    {:status 400, :error :db/invalid-annotation})))
+  expanded)
 
 (defn extract-annotation
   [context parsed-txn parsed-opts]
-  (let [[annotation :as expanded]
-        (some-> (or (:annotation parsed-txn) (:annotation parsed-opts))
-                (json-ld/expand context)
-                util/sequential)]
-    (when-let [specified-id (:id annotation)]
-      (throw (ex-info "Commit annotation cannot specify a subject identifier."
-                      {:status 400, :error :db/invalid-annotation :id specified-id})))
-    (when (> (count expanded) 1)
-      (throw (ex-info "Commit annotation must only have a single subject."
-                      {:status 400, :error :db/invalid-annotation})))
-    (when (nested-nodes? annotation)
-      (throw (ex-info "Commit annotation cannot reference other subjects."
-                      {:status 400, :error :db/invalid-annotation})))
-    ;; everything is good
-    expanded))
+  (-> parsed-txn
+      (expand-annotation parsed-opts context)
+      validate-annotation))
 
 (defn stage
   ([db identity txn parsed-opts]

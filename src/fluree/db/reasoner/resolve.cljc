@@ -3,73 +3,69 @@
   (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as exec-where]
-            [fluree.db.util.core :as util]
-            [fluree.json-ld :as json-ld]
             [fluree.db.query.fql :as fql]
+            [fluree.db.query.fql.parse :as parse]
+            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-
-
 
 (defn result-summary
   "Generates a result summary appropriate for 'schedule' function.
 
   Input is the original rule set, and a list/set of newly generated
   flakes from the last rules run."
-  [rules post-flakes]
+  [_rules _post-flakes]
   :TODO)
 
 (defn extract-pattern
   [triple-pattern]
   (mapv
-    (fn [individual]
-      (if (contains? individual ::exec-where/var)
-        nil
-        (::exec-where/iri individual)))
-    triple-pattern))
+   (fn [individual]
+     (if (contains? individual ::exec-where/var)
+       nil
+       (::exec-where/iri individual)))
+   triple-pattern))
 
 (defn extract-patterns
   [where-patterns]
   (reduce
-    (fn [acc pattern]
-      (case (first pattern)
-        :class (conj acc (extract-pattern (second pattern)))
-        :union (reduce
-                 (fn [acc* union-pattern]
-                   (into acc*
-                         (extract-patterns (::exec-where/patterns union-pattern))))
-                 acc
-                 (second pattern))
-        :optional (into acc (extract-patterns (::exec-where/patterns pattern)))
-        :bind acc ;; bind can only use patterns/vars already established, nothing to add
+   (fn [acc pattern]
+     (case (first pattern)
+       :class (conj acc (extract-pattern (second pattern)))
+       :union (reduce
+               (fn [acc* union-pattern]
+                 (into acc*
+                       (extract-patterns (::exec-where/patterns union-pattern))))
+               acc
+               (second pattern))
+       :optional (into acc (extract-patterns (::exec-where/patterns pattern)))
+       :bind acc ;; bind can only use patterns/vars already established, nothing to add
         ;; else
-        (conj acc (extract-pattern pattern))))
-    #{}
-    where-patterns))
+       (conj acc (extract-pattern pattern))))
+   #{}
+   where-patterns))
 
 (defn flake-tests
   "Generates 'test' flakes to test if any patterns in this rule match
   newly generate flakes (based on post index sorting)"
   [patterns]
   (mapv
-    (fn [[s p o]]
-      (flake/create s p o nil nil nil nil))
-    patterns))
+   (fn [[s p o]]
+     (flake/create s p o nil nil nil nil))
+   patterns))
 
 (defn rule-graph
   "Puts rule in a specific graph format"
   [rule]
-  (let [context         (some-> (get rule "@context")
-                                json-ld/parse-context)
+  (let [context         (get rule "@context")
         where           (get rule "where")
         insert          (get rule "insert")
-        rule-parsed     (q-parse/parse-txn {:where  where
-                                            :insert insert} context)
+        rule-parsed     (parse/parse-stage-txn {:context context
+                                                :where   where
+                                                :insert  insert})
         where-patterns  (extract-patterns (::exec-where/patterns (:where rule-parsed)))
         insert-patterns (extract-patterns (:insert rule-parsed))]
     {:deps        where-patterns
@@ -89,10 +85,10 @@
   to determine if any of the patterns used by this rule had a match."
   [rules]
   (reduce
-    (fn [acc [rule-id rule]]
-      (assoc acc rule-id (rule-graph rule)))
-    {}
-    rules))
+   (fn [acc [rule-id rule]]
+     (assoc acc rule-id (rule-graph rule)))
+   {}
+   rules))
 
 (defn extract-owl2rl-from-db
   [db]

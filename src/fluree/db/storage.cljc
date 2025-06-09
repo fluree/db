@@ -1,12 +1,11 @@
 (ns fluree.db.storage
   (:refer-clojure :exclude [read list exists?])
   (:require [clojure.core.async :as async]
-            [clojure.string :as str]
             [clojure.pprint :as pprint]
+            [clojure.string :as str]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
-            [fluree.db.util.json :as json]
-            [fluree.json-ld :as json-ld])
+            [fluree.db.util.json :as json])
   #?(:clj (:import (java.io Writer))))
 
 (defn hashable?
@@ -138,7 +137,7 @@
 
 #?(:clj
    (defmethod print-method Catalog [^Catalog clg, ^Writer w]
-     (.write w (str "#fluree/Catalog "))
+     (.write w "#fluree/Catalog ")
      (binding [*out* w]
        (pr (display-catalog clg))))
    :cljs

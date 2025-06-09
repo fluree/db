@@ -1,13 +1,11 @@
 (ns fluree.db.json-ld.policy.rules
-  (:require [clojure.core.async :as async :refer [<! go]]
+  (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.reasoner.util :refer [parse-rules-graph]]
-            [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -34,11 +32,11 @@
   [restriction policy]
   (cond-> policy
 
-          (view-restriction? restriction)
-          (update-in [:view :default] util/conjv restriction)
+    (view-restriction? restriction)
+    (update-in [:view :default] util/conjv restriction)
 
-          (modify-restriction? restriction)
-          (update-in [:modify :default] util/conjv restriction)))
+    (modify-restriction? restriction)
+    (update-in [:modify :default] util/conjv restriction)))
 
 (defn add-class-restriction
   [restriction-map db policy-map]
@@ -48,11 +46,11 @@
        (let [restriction-map* (assoc restriction-map :cid cid)]
          (cond-> policy
 
-                 (view-restriction? restriction-map*)
-                 (update-in [:view :class cid] util/conjv restriction-map*)
+           (view-restriction? restriction-map*)
+           (update-in [:view :class cid] util/conjv restriction-map*)
 
-                 (modify-restriction? restriction-map*)
-                 (update-in [:modify :class cid] util/conjv restriction-map*))))
+           (modify-restriction? restriction-map*)
+           (update-in [:modify :class cid] util/conjv restriction-map*))))
      policy-map
      cids)))
 
@@ -63,14 +61,14 @@
      (fn [policy property]
        (let [pid              (if (iri/sid? property) property (iri/encode-iri db property))
              restriction-map* (assoc restriction-map :pid pid
-                                                     :cids cids)]
+                                     :cids cids)]
          (cond-> policy
 
-                 (view-restriction? restriction-map*)
-                 (update-in [:view :property pid] util/conjv restriction-map*)
+           (view-restriction? restriction-map*)
+           (update-in [:view :property pid] util/conjv restriction-map*)
 
-                 (modify-restriction? restriction-map*)
-                 (update-in [:modify :property pid] util/conjv restriction-map*))))
+           (modify-restriction? restriction-map*)
+           (update-in [:modify :property pid] util/conjv restriction-map*))))
      policy-map
      (:on-property restriction-map))))
 
@@ -80,7 +78,7 @@
   (map? target-expr))
 
 (defn parse-targets
-  [db policy-values target-exprs]
+  [db fuel-tracker policy-values target-exprs]
   (let [in-ch  (async/to-chan! target-exprs)
         out-ch (async/chan 2 (map (fn [iri] (iri/iri->sid iri (:namespaces db)))))]
     (async/pipeline-async 2
@@ -91,7 +89,7 @@
                                     sid-xf  (map #(json-ld/expand-iri % context))
                                     target-q (cond-> (assoc target-expr "select" "?$target")
                                                policy-values (policy/inject-where-pattern ["values" policy-values]))]
-                                (-> (dbproto/-query db target-q)
+                                (-> (dbproto/-query db fuel-tracker target-q)
                                     (async/pipe (async/chan 2 (comp cat sid-xf)))
                                     (async/pipe ch)))
                               ;; non-maps are literals
@@ -104,16 +102,16 @@
   (not-empty (mapv #(or (util/get-id %) (util/get-value %)) targets)))
 
 (defn parse-policy
-  [db policy-values policy-doc]
+  [db fuel-tracker policy-values policy-doc]
   (go-try
     (let [id (util/get-id policy-doc) ;; @id name of policy-doc
 
           target-subject      (unwrap (get policy-doc const/iri-targetSubject))
           subject-targets-ch  (when target-subject
-                                (parse-targets db policy-values target-subject))
+                                (parse-targets db fuel-tracker policy-values target-subject))
           target-property     (unwrap (get policy-doc const/iri-targetProperty))
           property-targets-ch (when target-property
-                                (parse-targets db policy-values target-property))
+                                (parse-targets db fuel-tracker policy-values target-property))
 
           on-property (when-let [p-iris (util/get-all-ids policy-doc const/iri-onProperty)]
                         (set p-iris))
@@ -162,7 +160,11 @@
 
 (defn enforcement-report
   [db]
-  (some-> db :policy :trace (update-vals (fn [p-report] (update-vals p-report deref)))))
+  (some-> db
+          :policy
+          :trace
+          (update-vals (fn [p-report]
+                         (update-vals p-report deref)))))
 
 (defn build-wrapper
   [db]
@@ -189,19 +191,21 @@
         wrapper*))))
 
 (defn parse-policies
-  [db policy-values policy-docs]
+  [db fuel-tracker policy-values policy-docs]
   (let [policy-ch     (async/chan)
         policy-doc-ch (async/to-chan! policy-docs)]
     (async/pipeline-async 2
                           policy-ch
                           (fn [policy-doc ch]
-                            (-> (parse-policy db policy-values policy-doc)
+                            (-> (parse-policy db fuel-tracker policy-values policy-doc)
                                 (async/pipe ch)))
                           policy-doc-ch)
     (async/reduce (build-wrapper db) {:trace {}} policy-ch)))
 
 (defn wrap-policy
-  [db policy-rules policy-values]
-  (go-try
-    (let [wrapper (<? (parse-policies db policy-values (util/sequential policy-rules)))]
-      (assoc db :policy (assoc wrapper :cache (atom {}) :policy-values policy-values)))))
+  ([db policy-rules policy-values]
+   (wrap-policy db nil policy-rules policy-values))
+  ([db fuel-tracker policy-rules policy-values]
+   (go-try
+     (let [wrapper (<? (parse-policies db fuel-tracker policy-values (util/sequential policy-rules)))]
+       (assoc db :policy (assoc wrapper :cache (atom {}) :policy-values policy-values))))))

@@ -1,20 +1,18 @@
 (ns fluree.db.flake.transact
   (:require [clojure.core.async :as async :refer [go]]
-            [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.flake.index.novelty :as novelty]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.json-ld.policy :as policy]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.fuel :as fuel]
-            [fluree.db.json-ld.shacl :as shacl]
-            [fluree.db.json-ld.policy.modify :as policy.modify]
-            [fluree.db.query.exec.update :as update]
             [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.json-ld.policy :as policy]
+            [fluree.db.json-ld.policy.modify :as policy.modify]
+            [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.virtual-graph.index-graph :as vg]
-            [fluree.db.util.log :as log]))
+            [fluree.db.query.exec.update :as update]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.track.fuel :as fuel]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util]
+            [fluree.db.virtual-graph.index-graph :as vg]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -82,7 +80,7 @@
                      result
                      [@db-vol result]))))))
 
-(defn new-virtual-graph
+(defn create-virtual-graphs
   "Creates a new virtual graph. If the virtual graph is invalid, an
   exception will be thrown and the transaction will not complete."
   [db add new-vgs]
@@ -95,18 +93,6 @@
         (recur r (assoc-in db* [:vg alias] vg-record)))
       db)))
 
-(defn check-virtual-graph
-  [db add rem]
-  ;; TODO - VG - should also check for retractions to "delete" virtual graph
-  ;; TODO - VG - check flakes if user updated existing virtual graph
-  (let [new-vgs  (keep #(when (= (flake/o %) const/$fluree:VirtualGraph)
-                          (flake/s %)) add)
-        has-vgs? (not-empty (:vg db))]
-    (cond-> db
-            (seq new-vgs) (new-virtual-graph add (set new-vgs))
-            has-vgs? (vg/update-vgs add rem))))
-
-
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
@@ -117,12 +103,12 @@
                          [new-flakes nil])
           db-after     (-> db
                            (assoc :t t
-                                  :staged [txn author annotation]
+                                  :staged {:txn txn, :author author, :annotation annotation}
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
                            (commit-data/add-tt-id)
                            (vocab/hydrate-schema add)
-                           (check-virtual-graph add remove))]
+                           (vg/check-virtual-graph add remove))]
       {:add       add
        :remove    remove
        :db-after  db-after
@@ -130,10 +116,10 @@
        :context   context})))
 
 (defn validate-db-update
-  [{:keys [db-after add context] :as staged-map}]
+  [fuel-tracker {:keys [db-after add context] :as staged-map}]
   (go-try
-    (<? (shacl/validate! (policy/root db-after) add context))
-    (let [allowed-db (<? (policy.modify/allowed? staged-map))]
+    (<? (shacl/validate! (policy/root db-after) fuel-tracker add context))
+    (let [allowed-db (<? (policy.modify/allowed? fuel-tracker staged-map))]
       allowed-db)))
 
 (defn stage
@@ -152,4 +138,4 @@
                                  :annotation annotation)
           [db** new-flakes] (<? (generate-flakes db fuel-tracker parsed-txn tx-state))
           staged-map (<? (final-db db** new-flakes tx-state))]
-      (<? (validate-db-update staged-map)))))
+      (<? (validate-db-update fuel-tracker staged-map)))))

@@ -337,6 +337,10 @@
   [[_ iri]]
   (subs iri 1 (-> iri count dec)))
 
+(defmethod parse-term :BLANK_NODE_LABEL
+  [[_ & bnode-chars]]
+  (str/join bnode-chars))
+
 (defmethod parse-rule :PrefixDecl
   ;; PrefixDecl ::= <'PREFIX'> WS PNAME_NS WS IRIREF
   ;; [:PrefixDecl "e" "x" ":" [:IRIREF "<http://example.com/>"]]
@@ -380,7 +384,7 @@
       (if term
         ;; either multiple terms or a single wildcard
         (cond (rule? term)
-              (let [[tag & body] term]
+              (let [[tag & _body] term]
                 (if (= tag :Var)
                   (recur r (conj result (parse-term term)))
                   ;; :Expression
@@ -395,6 +399,38 @@
               (= "*" term)
               (recur nil term))
         [[select-key result]]))))
+
+(defmethod parse-term :PropertyObjectList
+  ;; PropertyObjectList ::= Verb ObjectList
+  ;; <Verb> ::= VarOrIri | Type
+  [[_ verb objects]]
+  (let [p (parse-term verb)]
+    (mapv #(vector p (if (= const/iri-type p)
+                       (get % const/iri-id)
+                       %)) (parse-term objects))))
+
+(defmethod parse-term :PropertyListNotEmpty
+  ;; PropertyListNotEmpty ::= PropertyObjectList ( <';'>  WS ( PropertyObjectList )? )*
+  [[_ & properties]]
+  (mapcat parse-term properties))
+
+(defmethod parse-term :TriplesSameSubject
+  ;; TriplesSameSubject ::= VarOrTerm PropertyListNotEmpty | TriplesNode PropertyList
+  [[_ subject properties]]
+  (let [s (parse-term subject)]
+    (mapv (fn [[p o]] {"@id" s p o}) (parse-term properties))))
+
+(defmethod parse-rule :ConstructTemplate
+  ;; ConstructTemplate   ::=   <'{'> WS ConstructTriples? WS <'}'> WS
+  ;; <ConstructTriples>    ::=   TriplesSameSubject ( WS <'.'> WS ConstructTriples? )?
+  [[_ & construct-triples]]
+  [[:construct (vec (mapcat parse-term construct-triples))]])
+
+(defmethod parse-rule :ConstructWhereTemplate
+  ;; ConstructWhereTemplate ::= <'{'> WS TriplesTemplate? <'}'>
+  [[_ & construct-triples]]
+  (let [triples (vec (mapcat parse-term construct-triples))]
+    [[:construct triples] [:where triples]]))
 
 (defmethod parse-term :DefaultGraphClause
   ;; DefaultGraphClause ::= SourceSelector
@@ -547,11 +583,15 @@
   [[_ iri]]
   (parse-term iri))
 
+(defmethod parse-term :Type
+  [_]
+  const/iri-type)
+
 (defmethod parse-term :PathPrimary
   ;; PathPrimary    ::=   iri | Type | '!' PathNegatedPropertySet | '(' Path ')'
   ;; PathNegatedPropertySet   ::=   PathOneInPropertySet | '(' ( PathOneInPropertySet ( '|' PathOneInPropertySet )* )? ')'
   ;; PathOneInPropertySet   ::=   iri | Type | '^' ( iri | Type )
-  ;; <Type> ::= (WS 'a' WS)
+  ;; Type ::= (WS <'a'> WS)
   [[_ el]]
   (cond (rule? el) (parse-term el)
         (= el "a") const/iri-type
@@ -560,16 +600,23 @@
                         {:status 400 :error :db/invalid-query}))))
 
 (defmethod parse-term :PathMod
-  ;; PathMod ::= '?' | '*' | ('+' INTEGER?) WS
+  ;; PathMod ::= '?' WS | '*' WS | ('+' INTEGER?) WS
   [[_ mod degree]]
-  ;; TODO: this does nothing in FQL
-  (str mod degree))
+  (if degree
+    (throw (ex-info "Depth modifiers on transitive path elements are not supported."
+                    {:status 400 :error :db/invalid-query}))
+    (str mod degree)))
+
+(defmethod parse-term :PathElt
+  [[_ primary mod]]
+  (if mod
+    (str "<" (parse-term primary) (parse-term mod) ">")
+    (parse-term primary)))
 
 (defmethod parse-term :PathSequence
   ;; PathSequence ::= PathEltOrInverse ( <'/'> PathEltOrInverse )*
-  ;; TODO: it may be a mistake to hide the '^'
-  ;; <PathEltOrInverse> ::= PathElt | <'^'> PathElt
-  ;; <PathElt> ::= PathPrimary PathMod?
+  ;; <PathEltOrInverse> ::= PathElt | '^' PathElt
+  ;; PathElt ::= PathPrimary PathMod?
   [[_ & elements]]
   (apply str (mapv parse-term elements)))
 
@@ -589,7 +636,7 @@
   ;; TriplesNode ::= Collection | BlankNodePropertyList
   ;; Collection ::=  '(' GraphNode+ ')'
   ;; BlankNodePropertyList ::= '[' PropertyListNotEmpty ']'
-  [[_ & path :as obj-path]]
+  [[_ & path]]
   (mapv parse-term path))
 
 (defmethod parse-term :ObjectPath
@@ -631,7 +678,7 @@
 
 (defmethod parse-term :TriplesBlock
   ;; TriplesBlock ::= WS TriplesSameSubjectPath WS ( <'.'> TriplesBlock? WS )?
-  [[_ subject-path triples-block :as r]]
+  [[_ subject-path triples-block]]
   (cond-> (parse-term subject-path)
     triples-block (concat (parse-term triples-block))))
 
@@ -695,7 +742,7 @@
   [[:limit (read-string limit)]])
 
 (defmethod parse-term :ExplicitOrderCondition
-  ;; ExplicitOrderCondition ::= ( 'ASC' | 'DESC' ) WS BrackettedExpression
+  ;; ExplicitOrderCondition ::= ( 'ASC' | 'DESC' | 'asc' | 'desc' ) WS BrackettedExpression
   [[_ order expr]]
   (list (str/lower-case order) (parse-term expr)))
 
@@ -712,7 +759,7 @@
 
 (defmethod parse-term :GroupCondition
   ;; GroupCondition ::= BuiltInCall | FunctionCall | <'('> Expression ( WS 'AS' WS Var )? <')'> | Var
-  [[_ expr as var :as condition]]
+  [[_ expr as var]]
   (if (= as [:As])
     (str "(as " (parse-term expr) " " (parse-term var) ")")
     (parse-term expr)))
@@ -744,6 +791,144 @@
   (reduce (fn [entries rule] (into entries (parse-rule rule)))
           []
           select-query))
+
+(defmethod parse-rule :ConstructWhereQuery
+  ;; ConstructWhereQuery ::= DatasetClause <'WHERE'> WS ConstructWhereTemplate SolutionModifier
+  [[_ & construct-query]]
+  (reduce (fn [entries rule] (into entries (parse-rule rule)))
+          []
+          construct-query))
+
+(defmethod parse-rule :ConstructQuery
+  ;; ConstructQuery   ::= WS <'CONSTRUCT'> WS ( ConstructTemplate DatasetClause WhereClause SolutionModifier | ConstructWhereQuery )
+  [[_ & construct-query]]
+  (reduce (fn [entries rule] (into entries (parse-rule rule)))
+          []
+          construct-query))
+
+(defmethod parse-rule :ModifyWhere
+  ;; ModifyWhere ::= <'WHERE'> GroupGraphPattern
+  [[_ group-pattern]]
+  [[:where (vec (parse-term group-pattern))]])
+
+(defmethod parse-term :QuadsNotTriples
+  ;; QuadsNotTriples ::= <'GRAPH'> WS VarOrIri <'{'> WS TriplesTemplate? <'}'> WS
+  [[_ graph-iri & triples]]
+  ;; This is how we would translate it if we supported it in FQL
+  [(into [:graph (parse-term graph-iri)] (mapv parse-term triples))])
+
+(defmethod parse-term :Quads
+  ;; <Quads> ::= TriplesTemplate? ( QuadsNotTriples '.'? TriplesTemplate? )*
+  [[_ & quads]]
+  (vec (mapcat parse-term quads)))
+
+(defmethod parse-rule :DeleteWhere
+  ;; DeleteWhere ::= <'DELETE WHERE'> WS QuadPattern
+  [[_ quad-pattern]]
+  (let [pattern (parse-term quad-pattern)]
+    [[:where pattern]
+     [:delete pattern]]))
+
+(defmethod parse-rule :DeleteData
+  ;; DeleteClause ::= <'DELETE DATA'> WS QuadData
+  ;; <QuadData> ::= <'{'> WS Quads <'}'> WS
+  [[_ quad-pattern]]
+  (let [{graph-patterns true
+         default-patterns false}
+        (->> (parse-term quad-pattern)
+             (group-by (comp (partial = :graph) first)))]
+    (cond (>= (count graph-patterns) 2)
+          (throw (ex-info "Multiple GRAPH declarations not supported in DELETE DATA."
+                          {:status 400 :error :db/invalid-update}))
+          (= (count graph-patterns) 1)
+          (let [[[_ graph-iri data]] graph-patterns]
+            [[:ledger graph-iri] [:insert data]])
+          :else
+          [[:delete default-patterns]])))
+
+(defmethod parse-rule :DeleteClause
+  ;; DeleteClause ::= <'DELETE'> WS QuadPattern
+  ;; <QuadPattern> ::= <'{'> WS Quads <'}'> WS
+  [[_ quad-pattern]]
+  (let [quad-data (parse-term quad-pattern)]
+    (when (not-empty (filter (comp (partial = :graph) first) quad-data))
+      (throw (ex-info "GRAPH not supported in DELETE. Use WITH or USING instead."
+                      {:status 400 :error :db/invalid-update})))
+    [[:delete quad-data]]))
+
+(defmethod parse-rule :InsertData
+  ;; InsertClause ::= <'INSERT DATA'> WS QuadData
+  ;; <QuadData> ::= <'{'> WS Quads <'}'> WS
+  [[_ quad-pattern]]
+  (let [{graph-patterns true
+         default-patterns false}
+        (->> (parse-term quad-pattern)
+             (group-by (comp (partial = :graph) first)))]
+    (cond (>= (count graph-patterns) 2)
+          (throw (ex-info "Multiple GRAPH declarations not supported in INSERT DATA."
+                          {:status 400 :error :db/invalid-update}))
+          (= (count graph-patterns) 1)
+          (let [[[_ graph-iri data]] graph-patterns]
+            [[:ledger graph-iri] [:insert data]])
+          :else
+          [[:insert default-patterns]])))
+
+(defmethod parse-rule :InsertClause
+  ;; InsertClause ::= <'INSERT'> WS QuadPattern
+  ;; <QuadPattern> ::= <'{'> WS Quads <'}'> WS
+  [[_ quad-pattern]]
+  (let [quad-data (parse-term quad-pattern)]
+    (when (not-empty (filter (comp (partial = :graph) first) quad-data))
+      (throw (ex-info "GRAPH not supported in INSERT. Use WITH or USING instead."
+                      {:status 400 :error :db/invalid-update})))
+    [[:insert quad-data]]))
+
+(defmethod parse-rule :ModifyClause
+  ;; ModifyClause ::= ( DeleteClause InsertClause? | InsertClause )
+  [[_ & clauses]]
+  (mapcat parse-rule clauses))
+
+(defmethod parse-rule :UsingNamed
+  ;; UsingNamed ::= <'USING NAMED'> WS iri
+  [[_ _iri]]
+  (throw (ex-info "USING NAMED is not supported in SPARQL Update."
+                  {:status 400 :error :db/invalid-update})))
+
+(defmethod parse-rule :UsingDefault
+  ;; UsingDefault ::= <'USING'> WS iri
+  [[_ iri]]
+  [[:ledger (parse-term iri)]])
+
+(defmethod parse-rule :UsingClause
+  ;; UsingClause ::= (UsingDefault | UsingNamed)*
+  [[_ & using-clauses]]
+  (cond (zero? (count using-clauses))
+        []
+
+        (= 1 (count using-clauses))
+        (parse-rule (first using-clauses))
+
+        :else
+        (throw (ex-info "More than one USING clause is not supported in SPARQL Update."
+                        {:status 400 :error :db/invalid-update}))))
+
+(defmethod parse-rule :ModifyWith
+  ;; ModifyWith ::= <'WITH'> WS iri ModifyClause UsingClause* ModifyWhere
+  [[_ iri & clauses]]
+  (into [[:ledger (parse-term iri)]]
+        (mapcat parse-rule clauses)))
+
+(defmethod parse-rule :Modify
+  ;; Modify ::= ModifyClause UsingClause* ModifyWhere
+  [[_ & clauses]]
+  (mapcat parse-rule clauses))
+
+(defmethod parse-rule :Update
+  ;; Update ::= Prologue ( Update1 ( ';' Update )? )?
+  [[_ & update-op]]
+  (reduce (fn [entries rule] (into entries (parse-rule rule)))
+          []
+          update-op))
 
 (defmethod parse-rule :PrettyPrint
   [_]

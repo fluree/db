@@ -1,6 +1,6 @@
 (ns fluree.db.reasoner
-  (:require [fluree.db.util.core :as util]
-            [fluree.db.fuel :as fuel]))
+  (:require [fluree.db.track.fuel :as fuel]
+            [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -14,7 +14,6 @@
   (let [methods*        (set (util/sequential methods))
         fuel-tracker    (fuel/tracker max-fuel)]
     (-reason db methods* rule-sources fuel-tracker reasoner-max)))
-
 
 (defn reasoned-facts
   ([db]

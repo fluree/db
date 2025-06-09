@@ -1,29 +1,34 @@
 (ns fluree.db.query.exec.eval
   (:refer-clojure :exclude [compile rand concat replace max min
                             #?(:clj ratio?) #?@(:cljs [uuid -count divide])])
-  (:require [fluree.db.query.exec.group :as group]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.vector.scoring :as score]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.json-ld.iri :as iri]
+  (:require [clojure.math :as math]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :as walk :refer [postwalk]]
-            [fluree.db.datatype :as datatype]
             [fluree.crypto :as crypto]
             [fluree.db.constants :as const]
-            [clojure.math :as math])
+            [fluree.db.datatype :as datatype]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.exec.group :as group]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log]
+            [fluree.db.vector.scoring :as score]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.time LocalDateTime OffsetDateTime LocalDate OffsetTime LocalTime
                               ZoneId ZoneOffset))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn ratio?
-  [x]
-  #?(:clj  (clojure.core/ratio? x)
-     :cljs false)) ; ClojureScript doesn't support ratios
+#?(:clj
+   (defn ratio?
+     [x]
+     (clojure.core/ratio? x))
+
+   :cljs  ; ClojureScript doesn't support ratios)
+   (defn ratio?
+     [_]
+     false))
 
 (defn sum
   [coll]
@@ -35,9 +40,9 @@
         res (/ (reduce + coll)
                (count coll))]
     (where/->typed-val
-      (if (ratio? res)
-        (double res)
-        res))))
+     (if (ratio? res)
+       (double res)
+       res))))
 
 (defn median
   [coll]
@@ -49,9 +54,9 @@
                 (-> (+ (nth terms (dec med)))
                     (/ 2)))]
     (where/->typed-val
-      (if (ratio? res)
-        (double res)
-        res))))
+     (if (ratio? res)
+       (double res)
+       res))))
 
 (defn variance
   [coll]
@@ -61,19 +66,19 @@
                     (* delta delta)))
         res  (/ (:value sum) (count coll))]
     (where/->typed-val
-      (if (ratio? res)
-        (double res)
-        res))))
+     (if (ratio? res)
+       (double res)
+       res))))
 
 (defn stddev
   [coll]
   (where/->typed-val
-    (Math/sqrt (:value (variance coll)))))
+   (Math/sqrt (:value (variance coll)))))
 
 (defn count-distinct
   [coll]
   (where/->typed-val
-    (count (distinct coll))))
+   (count (distinct coll))))
 
 (defn -count
   [coll]
@@ -177,17 +182,17 @@
   [{s :value} {substr :value}]
   (let [[before :as split] (str/split s (re-pattern substr))]
     (where/->typed-val
-      (if (> (count split) 1)
-        before
-        ""))))
+     (if (> (count split) 1)
+       before
+       ""))))
 
 (defn strAfter
   [{s :value} {substr :value}]
   (let [split (str/split s (re-pattern substr))]
     (where/->typed-val
-      (if (> (count split) 1)
-        (last split)
-        ""))))
+     (if (> (count split) 1)
+       (last split)
+       ""))))
 
 (defn concat
   [& strs]
@@ -257,29 +262,46 @@
   #{const/iri-xsd-dateTime
     const/iri-xsd-date})
 
+#?(:clj (defmulti ->offset-date-time
+          #(when-let [t (#{OffsetDateTime LocalDateTime LocalDate} (type %))]
+             t)))
+#?(:clj (defmethod ->offset-date-time OffsetDateTime
+          [^OffsetDateTime datetime]
+          datetime))
+#?(:clj (defmethod ->offset-date-time LocalDateTime
+          [^LocalDateTime datetime]
+          (.atOffset datetime ZoneOffset/UTC)))
+#?(:clj (defmethod ->offset-date-time LocalDate
+          [^LocalDate date]
+          (.atOffset (.atStartOfDay date) ZoneOffset/UTC)))
+#?(:clj (defmethod ->offset-date-time :default
+          [x]
+          (throw (ex-info "Cannot convert value to OffsetDateTime."
+                          {:value  x
+                           :status 400
+                           :error  :db/invalid-fn-call}))))
 
-#?(:clj (defmulti ->offset-date-time #(when-let [t (#{OffsetDateTime LocalDateTime LocalDate} (type %))] t)))
-#?(:clj (defmethod ->offset-date-time OffsetDateTime [^OffsetDateTime datetime] datetime))
-#?(:clj (defmethod ->offset-date-time LocalDateTime [^LocalDateTime datetime] (.atOffset datetime (ZoneOffset/UTC))))
-#?(:clj (defmethod ->offset-date-time LocalDate [^LocalDate date] (.atOffset (.atStartOfDay date) (ZoneOffset/UTC))))
-#?(:clj (defmethod ->offset-date-time :default [x] (throw (ex-info "Cannot convert value to OffsetDateTime."
-                                                                   {:value x
-                                                                    :status 400
-                                                                    :error :db/invalid-fn-call}))))
-
-#?(:clj (defmulti ->offset-time #(when-let [t (#{OffsetTime LocalTime} (type %))] t)))
-#?(:clj (defmethod ->offset-time OffsetTime [^OffsetTime time] time))
-#?(:clj (defmethod ->offset-time LocalTime [^LocalTime time] (.atOffset time (ZoneOffset/UTC))))
-#?(:clj (defmethod ->offset-time :default [x] (throw (ex-info "Cannot convert value to OffsetTime."
-                                                              {:value x
-                                                               :status 400
-                                                               :error :db/invalid-fn-call}))))
+#?(:clj (defmulti ->offset-time
+          #(when-let [t (#{OffsetTime LocalTime} (type %))]
+             t)))
+#?(:clj (defmethod ->offset-time OffsetTime
+          [^OffsetTime time]
+          time))
+#?(:clj (defmethod ->offset-time LocalTime
+          [^LocalTime time]
+          (.atOffset time ZoneOffset/UTC)))
+#?(:clj (defmethod ->offset-time :default
+          [x]
+          (throw (ex-info "Cannot convert value to OffsetTime."
+                          {:value  x
+                           :status 400
+                           :error  :db/invalid-fn-call}))))
 
 (defn compare*
   [{val-a :value dt-a :datatype-iri}
    {val-b :value dt-b :datatype-iri}]
-  (let [dt-a  (or dt-a (datatype/infer-iri val-a))
-        dt-b  (or dt-b (datatype/infer-iri val-b))]
+  (let [dt-a (or dt-a (datatype/infer-iri val-a))
+        dt-b (or dt-b (datatype/infer-iri val-b))]
     (cond
       ;; can compare across types
       (or (and (contains? comparable-numeric-datatypes dt-a)
@@ -306,8 +328,10 @@
                        :error  :db/invalid-query})))))
 
 (defn typed-equal
-  ([x]  (where/->typed-val true))
-  ([x y] (where/->typed-val (zero? (compare* x y))))
+  ([_]
+   (where/->typed-val true))
+  ([x y]
+   (where/->typed-val (zero? (compare* x y))))
   ([x y & more]
    (reduce (fn [result [a b]]
              (if (:value result)
@@ -317,7 +341,8 @@
            (partition 2 1 (into [y] more)))))
 
 (defn typed-not-equal
-  ([x]  (where/->typed-val false))
+  ([_]
+   (where/->typed-val false))
   ([x y] (where/->typed-val (not (zero? (compare* x y)))))
   ([x y & more]
    (reduce (fn [result [a b]]
@@ -334,8 +359,8 @@
 (defn less-than-or-equal
   [a b]
   (where/->typed-val
-    (or (= a b)
-        (neg? (compare* a b)))))
+   (or (= a b)
+       (neg? (compare* a b)))))
 
 (defn greater-than
   [a b]
@@ -344,8 +369,8 @@
 (defn greater-than-or-equal
   [a b]
   (where/->typed-val
-    (or (= a b)
-        (pos? (compare* a b)))))
+   (or (= a b)
+       (pos? (compare* a b)))))
 
 (defn max
   [coll]
@@ -378,85 +403,85 @@
 (defn now
   []
   (where/->typed-val
-    #?(:clj (OffsetDateTime/now (ZoneId/of "UTC"))
-       :cljs (js/Date.))
-    const/iri-xsd-dateTime))
+   #?(:clj (OffsetDateTime/now (ZoneId/of "UTC"))
+      :cljs (js/Date.))
+   const/iri-xsd-dateTime))
 
 ;; TODO - date functions below all look incorrect for CLJS - should (string? datetime) be (map? datetime)?
 (defn year
   [x]
   (where/->typed-val
-    #?(:clj  (.getYear ^OffsetDateTime (->offset-date-time (:value x)))
-       :cljs (.getFullYear (if (string? (:value x))
-                             (datatype/coerce (:value x) (:datatype-iri x))
-                             x)))))
+   #?(:clj  (.getYear ^OffsetDateTime (->offset-date-time (:value x)))
+      :cljs (.getFullYear (if (string? (:value x))
+                            (datatype/coerce (:value x) (:datatype-iri x))
+                            x)))))
 
 (defn month
   [x]
   (where/->typed-val
-    #?(:clj  (.getMonthValue ^OffsetDateTime (->offset-date-time (:value x)))
-       :cljs (.getMonth (if (string? (:value x))
-                          (datatype/coerce (:value x) (:datatype-iri x))
-                          x)))))
+   #?(:clj  (.getMonthValue ^OffsetDateTime (->offset-date-time (:value x)))
+      :cljs (.getMonth (if (string? (:value x))
+                         (datatype/coerce (:value x) (:datatype-iri x))
+                         x)))))
 
 (defn day
   [x]
   (where/->typed-val
-    #?(:clj  (.getDayOfMonth ^OffsetDateTime (->offset-date-time (:value x)))
-       :cljs (.getDate (if (string? (:value x))
-                          (datatype/coerce (:value x) (:datatype-iri x))
-                          x)))))
+   #?(:clj  (.getDayOfMonth ^OffsetDateTime (->offset-date-time (:value x)))
+      :cljs (.getDate (if (string? (:value x))
+                        (datatype/coerce (:value x) (:datatype-iri x))
+                        x)))))
 
 (defn hours
   [x]
   (where/->typed-val
-    #?(:clj
-       (condp contains? (:datatype-iri x)
-         #{const/iri-xsd-dateTime const/iri-xsd-date}
-         (.getHour ^OffsetDateTime (->offset-date-time (:value x)))
-         #{const/iri-xsd-time}
-         (.getHour ^OffsetTime (->offset-time (:value x))))
-       :cljs
-       (.getHours (if (string? (:value x))
-                    (datatype/coerce (:value x) (:datatype-iri x))
-                    x)))))
+   #?(:clj
+      (condp contains? (:datatype-iri x)
+        #{const/iri-xsd-dateTime const/iri-xsd-date}
+        (.getHour ^OffsetDateTime (->offset-date-time (:value x)))
+        #{const/iri-xsd-time}
+        (.getHour ^OffsetTime (->offset-time (:value x))))
+      :cljs
+      (.getHours (if (string? (:value x))
+                   (datatype/coerce (:value x) (:datatype-iri x))
+                   x)))))
 
 (defn minutes
   [x]
   (where/->typed-val
-    #?(:clj  (condp contains? (:datatype-iri x)
-               #{const/iri-xsd-dateTime const/iri-xsd-date}
-               (.getMinute ^OffsetDateTime (->offset-date-time (:value x)))
-               #{const/iri-xsd-time}
-               (.getMinute ^OffsetTime (->offset-time (:value x))))
-       :cljs (.getMinutes (if (string? (:value x))
-                            (datatype/coerce (:value x) (:datatype-iri x))
-                            x)))))
+   #?(:clj  (condp contains? (:datatype-iri x)
+              #{const/iri-xsd-dateTime const/iri-xsd-date}
+              (.getMinute ^OffsetDateTime (->offset-date-time (:value x)))
+              #{const/iri-xsd-time}
+              (.getMinute ^OffsetTime (->offset-time (:value x))))
+      :cljs (.getMinutes (if (string? (:value x))
+                           (datatype/coerce (:value x) (:datatype-iri x))
+                           x)))))
 
 (defn seconds
   [x]
   (where/->typed-val
-    #?(:clj (condp contains? (:datatype-iri x)
-              #{const/iri-xsd-dateTime const/iri-xsd-date}
-              (.getSecond ^OffsetDateTime (->offset-date-time (:value x)))
-              #{const/iri-xsd-time}
-              (.getSecond ^OffsetTime (->offset-time (:value x))))
-       :cljs (.getSeconds (if (string? (:value x))
-                            (datatype/coerce (:value x) (:datatype-iri x))
-                            x)))))
+   #?(:clj (condp contains? (:datatype-iri x)
+             #{const/iri-xsd-dateTime const/iri-xsd-date}
+             (.getSecond ^OffsetDateTime (->offset-date-time (:value x)))
+             #{const/iri-xsd-time}
+             (.getSecond ^OffsetTime (->offset-time (:value x))))
+      :cljs (.getSeconds (if (string? (:value x))
+                           (datatype/coerce (:value x) (:datatype-iri x))
+                           x)))))
 
 ;; TODO - CLJS datetime is not a variable present in the function
 (defn tz
   [x]
   (where/->typed-val
-    #?(:clj (condp contains? (:datatype-iri x)
-              #{const/iri-xsd-dateTime const/iri-xsd-date}
-              (.toString (.getOffset ^OffsetDateTime (->offset-date-time (:value x))))
-              #{const/iri-xsd-time}
-              (.toString (.getOffset ^OffsetTime (->offset-time (:value x)))))
-       :cljs (.getTimeZoneOffset ^js/Date (if (string? (:value x))
-                                            (datatype/coerce (:value x) (:datatype-iri x))
-                                            x)))))
+   #?(:clj (condp contains? (:datatype-iri x)
+             #{const/iri-xsd-dateTime const/iri-xsd-date}
+             (.toString (.getOffset ^OffsetDateTime (->offset-date-time (:value x))))
+             #{const/iri-xsd-time}
+             (.toString (.getOffset ^OffsetTime (->offset-time (:value x)))))
+      :cljs (.getTimeZoneOffset ^js/Date (if (string? (:value x))
+                                           (datatype/coerce (:value x) (:datatype-iri x))
+                                           x)))))
 
 (defn sha256
   [{x :value}]
@@ -481,8 +506,8 @@
 (defn isBlank
   [{x :value}]
   (where/->typed-val
-    (and (string? x)
-         (str/starts-with? x "_:"))))
+   (and (string? x)
+        (str/starts-with? x "_:"))))
 
 (defn sparql-str
   [{x :value}]
@@ -538,13 +563,13 @@
   (where/->typed-val (quot num div)))
 
 (defn untyped-equal
-  ([{x :value}]  (where/->typed-val true))
+  ([_]  (where/->typed-val true))
   ([{x :value} {y :value}] (where/->typed-val (= x y)))
   ([{x :value} {y :value} & more]
    (where/->typed-val (apply = x y (mapv :value more)))))
 
 (defn untyped-not-equal
-  ([{x :value}]  (where/->typed-val false))
+  ([_]  (where/->typed-val false))
   ([{x :value} {y :value}] (where/->typed-val (not= x y)))
   ([{x :value} {y :value} & more]
    (where/->typed-val (apply not= x y (mapv :value more)))))
@@ -570,17 +595,17 @@
 (defn dotProduct
   [{v1 :value} {v2 :value}]
   (where/->typed-val
-    (score/dot-product v1 v2)))
+   (score/dot-product v1 v2)))
 
 (defn cosineSimilarity
   [{v1 :value} {v2 :value}]
   (where/->typed-val
-    (score/cosine-similarity v1 v2 )))
+   (score/cosine-similarity v1 v2)))
 
 (defn euclideanDistance
   [{v1 :value} {v2 :value}]
   (where/->typed-val
-    (score/euclidian-distance v1 v2 )))
+   (score/euclidian-distance v1 v2)))
 
 (def qualified-symbols
   '{!              fluree.db.query.exec.eval/-not
@@ -773,7 +798,7 @@
         (mapcat (fn [var]
                   `[mch# (get ~soln-sym (quote ~var))
                     ;; convert match to TypedValue
-                    ~var (if (= ::group/grouping (::where/datatype-iri mch#))
+                    ~var (if (= ::group/grouping (where/get-datatype-iri mch#))
                            (mapv mch->typed-val (where/get-binding mch#))
                            (mch->typed-val mch#))]))
         var-syms))

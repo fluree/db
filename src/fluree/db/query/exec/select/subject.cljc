@@ -1,8 +1,8 @@
 (ns fluree.db.query.exec.select.subject
-  (:require [fluree.db.util.async :refer [<?]]
-            [clojure.core.async :as async :refer [<! >! go]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+  (:require [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.constants :as const]
+            [fluree.db.util.async :refer [<?]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -10,7 +10,7 @@
 (defprotocol SubjectFormatter
   (-forward-properties [db iri select-spec context compact-fn cache fuel-tracker error-ch])
   (-reverse-property [db iri reverse-spec context compact-fn cache fuel-tracker error-ch])
-  (-iri-visible? [db iri]))
+  (-iri-visible? [db fuel-tracker iri]))
 
 (defn subject-formatter?
   [x]
@@ -19,9 +19,9 @@
 (declare format-subject)
 
 (defn append-id
-  ([ds iri compact-fn error-ch]
-   (append-id ds iri nil compact-fn error-ch nil))
-  ([ds iri {:keys [wildcard?] :as select-spec} compact-fn error-ch node-ch]
+  ([ds fuel-tracker iri compact-fn error-ch]
+   (append-id ds fuel-tracker iri nil compact-fn error-ch nil))
+  ([ds fuel-tracker iri {:keys [wildcard?] :as select-spec} compact-fn error-ch node-ch]
    (go
      (try*
        (let [node  (if (nil? node-ch)
@@ -30,7 +30,7 @@
              node* (if (or (nil? select-spec)
                            wildcard?
                            (contains? select-spec const/iri-id))
-                     (if (<? (-iri-visible? ds iri))
+                     (if (<? (-iri-visible? ds fuel-tracker iri))
                        (let [;; TODO: we generate id-key here every time, this
                              ;; should be done in the :spec once beforehand and
                              ;; used from there
@@ -41,8 +41,8 @@
                      node)]
          (not-empty node*))
        (catch* e
-               (log/error e "Error appending subject iri")
-               (>! error-ch e))))))
+         (log/error e "Error appending subject iri")
+         (>! error-ch e))))))
 
 (defn encode-reference
   [iri spec]
@@ -69,7 +69,7 @@
                       fuel-tracker error-ch)
 
       :else
-      (append-id ds o-iri compact-fn error-ch))))
+      (append-id ds fuel-tracker o-iri compact-fn error-ch))))
 
 (defn resolve-reference
   [ds cache context compact-fn select-spec current-depth fuel-tracker error-ch v]
@@ -127,4 +127,4 @@
                       forward-ch)]
      (->> subject-ch
           (resolve-references ds cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-          (append-id ds iri select-spec compact-fn error-ch)))))
+          (append-id ds fuel-tracker iri select-spec compact-fn error-ch)))))

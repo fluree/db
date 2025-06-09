@@ -1,9 +1,9 @@
 (ns fluree.db.dataset
-  (:require [fluree.db.util.core :as util]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.exec.where :as where]
+  (:require [clojure.core.async :as async]
             [fluree.db.query.exec.select.subject :as subject]
-            [clojure.core.async :as async]))
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util]))
 
 (defrecord DataSet [named default active])
 
@@ -80,14 +80,14 @@
       where/nil-channel))
 
   (-activate-alias [ds alias]
-    (activate ds alias))
+    (go-try
+      (activate ds alias)))
 
   (-aliases [ds]
     (names ds))
 
   (-finalize [_ _ _ solution-ch]
     solution-ch)
-
 
   subject/SubjectFormatter
   (-forward-properties [ds iri select-spec context compact-fn cache fuel-tracker error-ch]
@@ -119,15 +119,14 @@
                     []
                     prop-ch)))
 
-  (-iri-visible? [ds iri]
+  (-iri-visible? [ds fuel-tracker iri]
     (go-try
       (some? (loop [[db & r] (all ds)]
                (if db
-                 (if (<? (subject/-iri-visible? db iri))
+                 (if (<? (subject/-iri-visible? db fuel-tracker iri))
                    db
                    (recur r))
                  nil))))))
-
 
 (defn combine
   [named-map defaults]

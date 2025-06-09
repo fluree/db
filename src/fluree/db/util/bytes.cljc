@@ -3,18 +3,15 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-
 (defn string->UTF8
   [x]
   #?(:clj  (.getBytes ^String x "UTF-8")
      :cljs (gcrypt/stringToUtf8ByteArray x)))
 
-
 (defn UTF8->string
   [arr]
   #?(:clj  (String. (byte-array arr) "UTF8")
      :cljs (gcrypt/utf8ByteArrayToString (apply array arr))))
-
 
 (defn UTF8->long
   [utf8]
@@ -39,7 +36,7 @@
          bs     []]
     (if (neg? offset)
       #?(:clj (byte-array bs)
-          :cljs (.from js/Int8Array bs))
+         :cljs (.from js/Int8Array bs))
       (let [b (bit-and (bit-shift-right l offset) 0xFF)]
         (if (zero? b)
           (recur (- offset 8) bs)

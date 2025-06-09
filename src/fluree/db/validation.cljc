@@ -1,11 +1,11 @@
 (ns fluree.db.validation
-  (:require [fluree.db.constants :as const]
+  (:require [clojure.string :as str]
+            [clojure.walk :as walk]
+            [fluree.db.constants :as const]
             [fluree.db.util.docs :as docs]
             [malli.core :as m]
             [malli.error :as me]
-            [malli.util :as mu]
-            [clojure.string :as str]
-            [clojure.walk :as walk]))
+            [malli.util :as mu]))
 
 (defn decode-json-ld-keyword
   [v]
@@ -19,6 +19,24 @@
   [x]
   (and (or (string? x) (symbol? x) (keyword? x))
        (-> x name first (= \?))))
+
+(defn bnode-variable?
+  [x]
+  (and (or (string? x) (symbol? x) (keyword? x))
+       (-> x name first (= \_))))
+
+(defn query-variable?
+  [x]
+  (or (variable? x)
+      (bnode-variable? x)))
+
+(defn property-path?
+  [x]
+  (when-let [path-iri (cond (string? x)  x
+                            (keyword? x) (str x))]
+    (and
+     (= \< (nth path-iri 0))
+     (= \> (nth path-iri (dec (count path-iri)))))))
 
 (def value? (complement sequential?))
 
@@ -180,14 +198,14 @@
         provided-value    (or value full-value)]
     [top-level-message root-message direct-message
      (some->> provided-value
-             pr-str
-             (str "Provided: "))
+              pr-str
+              (str "Provided: "))
      docs-pointer-msg]))
 
 (defn top-level-fn-error
   [errors]
   (first (filter #(and (empty? (:in %))
-                    (= :fn (m/type (:schema %)))) errors)))
+                       (= :fn (m/type (:schema %)))) errors)))
 
 (def default-error-overrides
   {:errors
@@ -324,6 +342,7 @@
     ::where                [:orn {:error/message "where clause must be a single node map pattern or a sequence of where patterns"}
                             [:single ::where-pattern]
                             [:collection [:sequential ::where-pattern]]]
+    ::construct            [:sequential ::node-map]
     ::ledger               ::iri
     ::from                 [:orn {:error/message "from must be a ledger iri or vector of ledger iris"}
                             [:single ::ledger]

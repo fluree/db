@@ -1,14 +1,13 @@
 (ns fluree.db.serde.json
-  (:require [fluree.db.constants :as const]
-            [fluree.db.serde.protocol :as serdeproto]
+  (:require #?(:clj  [fluree.db.util.clj-const :as uc]
+               :cljs [fluree.db.util.cljs-const :as uc])
+            [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.core :as util]
             [fluree.db.flake.index :as index]
-            [fluree.db.util.json :as json]
-            #?(:clj  [fluree.db.util.clj-const :as uc]
-               :cljs [fluree.db.util.cljs-const :as uc]))
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.serde.protocol :as serde]
+            [fluree.db.util.core :as util])
   #?(:clj (:import (java.time.format DateTimeFormatter))))
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -49,16 +48,17 @@
       (update :first deserialize-flake-bound)
       (update :rhs deserialize-flake-bound)))
 
-(defn keyword->int
+(defn parse-int
   [k]
   (-> k name util/str->int))
 
 (defn numerize-keys
   "Convert the keys of the provided map `m` to integers. Assumes that the keys are
-  keywordized integers and will throw an exception otherwise."
+  either stringified or keywordized integers and will throw an exception
+  otherwise."
   [m]
   (reduce-kv (fn [numerized k v]
-               (let [int-k (keyword->int k)]
+               (let [int-k (parse-int k)]
                  (assoc numerized int-k v)))
              {} m))
 
@@ -140,11 +140,11 @@
   types into seq."
   [m]
   (reduce-kv
-    (fn [acc k v]
-      (assoc acc (name k) (if (flake/flake? v)
-                            (serialize-flake v)
-                            v)))
-    {} m))
+   (fn [acc k v]
+     (assoc acc (name k) (if (flake/flake? v)
+                           (serialize-flake v)
+                           v)))
+   {} m))
 
 (defn serialize-garbage
   [{:keys [alias branch t garbage]}]
@@ -154,20 +154,20 @@
    "garbage" (vec garbage)})
 
 (defrecord Serializer []
-  serdeproto/StorageSerializer
+  serde/StorageSerializer
   (-serialize-db-root [_ db-root]
     (reduce-kv
-      (fn [acc k v]
-        (assoc acc (name k)
-                   (case k
-                     (:stats :config :garbage :prev-index)
-                     (util/stringify-keys v)
+     (fn [acc k v]
+       (assoc acc (name k)
+              (case k
+                (:stats :config :garbage :prev-index)
+                (util/stringify-keys v)
 
-                     (:spot :post :opst :tspo)
-                     (stringify-child v)
+                (:spot :post :opst :tspo)
+                (stringify-child v)
 
-                     v)))
-      {} db-root))
+                v)))
+     {} db-root))
   (-deserialize-db-root [_ db-root]
     (deserialize-db-root db-root))
   (-serialize-branch [_ {:keys [children] :as _branch}]
@@ -181,8 +181,17 @@
   (-serialize-garbage [_ garbage-map]
     (serialize-garbage garbage-map))
   (-deserialize-garbage [_ garbage]
-    (deserialize-garbage garbage)))
+    (deserialize-garbage garbage))
 
+  serde/BM25Serializer
+  (-serialize-bm25 [_ bm25]
+   ;; output as JSON, no additional parsing of keys/vals needed
+    bm25)
+  (-deserialize-bm25 [_ bm25]
+    (-> bm25
+        util/keywordize-keys
+        (update :namespace-codes numerize-keys)
+        (update :index-state util/keywordize-keys))))
 
 (defn json-serde
   "Returns a JSON serializer / deserializer"

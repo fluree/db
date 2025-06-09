@@ -1,9 +1,8 @@
 (ns fluree.db.virtual-graph.bm25.update
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
-            [fluree.db.virtual-graph.bm25.stemmer :as stm]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.log :as log]))
+            [fluree.db.virtual-graph.bm25.stemmer :as stm]))
 
 (set! *warn-on-reflection* true)
 
@@ -33,7 +32,8 @@
             (conj acc [idx frequency])
             acc))
         [])
-       (sort-by first)))
+       (sort-by first)
+       vec))
 
 (defn update-avg-len
   [avg-length item-count doc-len]
@@ -106,9 +106,9 @@
           item-count* (dec item-count)
           avg-length* (/ total-len* item-count*)]
       (assoc index :terms terms*
-                   :avg-length avg-length*
-                   :item-count item-count*
-                   :vectors vectors*))
+             :avg-length avg-length*
+             :item-count item-count*
+             :vectors vectors*))
     index))
 
 (defn update-terms
@@ -146,17 +146,17 @@
         [terms* dimensions*] (update-terms terms dimensions id terms-distinct)
         item-vec       (vectorize-item terms* term-freq)]
     (assoc index :terms terms*
-                 :dimensions dimensions*
-                 :avg-length avg-length*
-                 :item-count item-count*
-                 :vectors (assoc vectors id item-vec))))
+           :dimensions dimensions*
+           :avg-length avg-length*
+           :item-count item-count*
+           :vectors (assoc vectors id item-vec))))
 
 (defn upsert-items
   "Asserts items into the bm25 index, returns updated state.
 
   item-count will be 'nil' for an initialization query as we process results lazily
   and therefore the status-update won't be able to report % complete."
-  [{:keys [stemmer stopwords] :as bm25} latest-index item-count items-ch status-update]
+  [{:keys [stemmer stopwords] :as bm25} latest-index items-count items-ch status-update]
   (async/go
     (loop [i     0
            index latest-index]
@@ -169,7 +169,7 @@
                        (retract-item index id))]
           ;; supply status for every 100 items for timeout reporting, etc.
           (when (zero? (mod i 100))
-            (status-update [i item-count]))
+            (status-update [i items-count]))
           (recur (inc i) index*))
         (do
           (status-update [i i]) ;; 100% done - item-count can be nil for initialized query so use 'i' for both tuples

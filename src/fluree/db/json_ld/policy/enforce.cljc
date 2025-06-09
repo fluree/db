@@ -4,8 +4,6 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy :refer [root]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
             [fluree.db.util.parse :as util.parse]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -53,7 +51,7 @@
     (get-in policy-map [:view :default])))
 
 (defn policies-for-flake
-  [{:keys [policy namespace-codes] :as db} [s p o :as flake] modify?]
+  [{:keys [policy] :as _db} [s p _o :as _flake] modify?]
   (->> (default-policies policy modify?)
        (keep (fn [{:keys [s-targets p-targets default?] :as policy}]
                (when (or (and (or (nil? s-targets) (contains? s-targets s))
@@ -79,7 +77,7 @@
 (defn policies-allow?
   "Once narrowed to a specific set of policies, execute and return
   appropriate policy response."
-  [db modify? sid policies-to-eval]
+  [db fuel-tracker modify? sid policies-to-eval]
   (let [tracer (-> db :policy :trace)]
     (go-try
       (loop [[policy & r] policies-to-eval]
@@ -89,7 +87,7 @@
                  allowed-counter :allowed} (get tracer (:id policy))
 
                 query   (policy-query db sid policy)
-                result  (seq (<? (dbproto/-query (root db) query)))]
+                result  (seq (<? (dbproto/-query (root db) fuel-tracker query)))]
             (swap! exec-counter inc)
             (if result
               (do (swap! allowed-counter inc)

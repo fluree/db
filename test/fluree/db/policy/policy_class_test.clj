@@ -1,7 +1,7 @@
 (ns fluree.db.policy.policy-class-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.did :as did]
             [fluree.db.api :as fluree]
+            [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils]))
 
 (deftest ^:integration class-policy-query

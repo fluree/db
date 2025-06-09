@@ -9,7 +9,9 @@
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql.syntax :as syntax]
-            [fluree.db.util.context :as context]
+            [fluree.db.query.sparql :as sparql]
+            [fluree.db.query.sparql.translator :as sparql.translator]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.parse :as util.parse]
@@ -22,7 +24,7 @@
   "Returns x as a symbol if x is a valid variable, or nil otherwise. A valid
   variable is a string, symbol, or keyword whose name starts with '?'."
   [x]
-  (when (v/variable? x)
+  (when (v/query-variable? x)
     (symbol x)))
 
 (defn parse-variable
@@ -161,7 +163,7 @@
 
 (defn type-pred-match?
   [p-mch]
-  (let [p-iri (::where/iri p-mch)]
+  (let [p-iri (where/get-iri p-mch)]
     (contains? type-pred-iris p-iri)))
 
 (defn safe-read
@@ -360,24 +362,47 @@
 
 (defn parse-subject
   [id context]
-  (if (v/variable? id)
+  (if (v/query-variable? id)
     (parse-variable id)
     (parse-subject-iri id context)))
 
+(declare parse-predicate)
+(defn parse-property-path
+  [path context]
+  (let [path-expr  (subs path 1 (dec (count path))) ; remove angle brackets
+        ;; TODO: the parsing is slower than it needs to be
+        [pred mod] (->>
+                     ;; parse to validate
+                    (first (sparql/parse-path-expr path-expr))
+                     ;; translate back to string
+                    (sparql.translator/parse-term)
+                     ;; separate recursion modifier
+                    (split-at (dec (count path-expr)))
+                     ;; turn back into strings
+                    (map (partial apply str)))
+        recur-mod   ({"+" :one+ "*" :zero+} mod)]
+    (cond-> (parse-predicate pred context)
+      recur-mod (where/add-transitivity recur-mod))))
+
 (defn parse-predicate
   [p context]
-  (if (v/variable? p)
-    (parse-variable p)
-    (let [[expanded {reverse :reverse}] (json-ld/details p context)]
-      (if (contains? type-pred-iris expanded)
-        (where/->predicate const/iri-rdf-type reverse)
-        (where/->predicate expanded reverse)))))
+  (cond (v/variable? p)
+        (parse-variable p)
+
+        (v/property-path? p)
+        (parse-property-path p context)
+
+        :else
+        (let [[expanded {reverse :reverse}] (json-ld/details p context)]
+          (if (contains? type-pred-iris expanded)
+            (where/->predicate const/iri-rdf-type reverse)
+            (where/->predicate expanded reverse)))))
 
 (declare parse-statement parse-statements)
 
 (defn flip-reverse-pattern
   [[s-mch p-mch o-mch :as pattern]]
-  (if (::where/reverse p-mch)
+  (if (where/get-reverse p-mch)
     [o-mch p-mch s-mch]
     pattern))
 
@@ -404,7 +429,7 @@
 (defn parse-statement*
   [s-mch p-mch o vars context]
   (cond
-    (v/variable? o)
+    (v/query-variable? o)
     (let [o-mch (parse-variable o)]
       [(flip-reverse-pattern [s-mch p-mch o-mch])])
 
@@ -528,15 +553,37 @@
         syntax/coerce-where
         (parse-where-clause vars context))))
 
+(defn unwrap-tuple-patterns
+  "Construct accepts ::v/node-map patterns, which can produce :tuple patterns, :class
+  patterns, or :id patterns. We only need the pattern components as a template for
+  construct, the :id and :class patterns are for optimized query execution, so this
+  function unwraps :id and :class patterns and only returns the underlying components."
+  [patterns]
+  (mapv (fn [[pattern-type component :as pattern]]
+          (case pattern-type
+            :class component
+            :id    [component]
+            pattern))
+        patterns))
+
+(defn parse-construct
+  [q context]
+  (when-let [construct (:construct q)]
+    (-> construct
+        syntax/coerce-where
+        (parse-where-clause nil context)
+        unwrap-tuple-patterns
+        select/construct-selector)))
+
 (defn parse-select-as-fn
-  [f context]
+  [f context output]
   (let [parsed-fn  (parse-code f)
         fn-name    (some-> parsed-fn second first)
         bind-var   (last parsed-fn)
         aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
     (-> parsed-fn
         (eval/compile context)
-        (select/as-selector bind-var aggregate?))))
+        (select/as-selector output bind-var aggregate?))))
 
 (defn parse-select-aggregate
   [f context]
@@ -562,7 +609,7 @@
                       (dec depth))
              spec*  (-> spec
                         (assoc :spec (expand-selection v depth* context)
-                          :as k))]
+                               :as k))]
          (if (reverse? context k)
            (assoc-in acc [:reverse iri] spec*)
            (assoc acc iri spec*)))
@@ -579,61 +626,65 @@
    {:depth depth} selection))
 
 (defn parse-select-map
-  [sm depth context]
+  [sm depth context output]
   (log/trace "parse-select-map:" sm)
-  (let [[subj selection] (first sm)
-        spec             (expand-selection selection depth context)]
-    (if (v/variable? subj)
-      (let [var (parse-var-name subj)]
-        (select/subgraph-selector var selection depth spec))
-      (let [iri (json-ld/expand-iri subj context false)]
-        (select/subgraph-selector iri selection depth spec)))))
+  (if (= output :fql)
+    (let [[subj selection] (first sm)
+          spec             (expand-selection selection depth context)]
+      (if (v/variable? subj)
+        (let [var (parse-var-name subj)]
+          (select/subgraph-selector var selection depth spec))
+        (let [iri (json-ld/expand-iri subj context false)]
+          (select/subgraph-selector iri selection depth spec))))
+    (throw (ex-info "Can only use subgraph selector with FQL output formatting."
+                    {:status 400 :error :db/invalid-select}))))
 
 (defn parse-selector
-  [context depth s]
+  [context depth output s]
   (if (syntax/wildcard? s)
-    select/wildcard-selector
+    (select/wildcard-selector output)
     (let [[selector-type selector-val] (syntax/parse-selector s)]
       (case selector-type
-        :var (-> selector-val symbol select/variable-selector)
+        :var (-> selector-val symbol (select/variable-selector output))
         :aggregate (case (first selector-val)
                      :string-fn (if (re-find #"^\(as " s)
-                                  (parse-select-as-fn s context)
+                                  (parse-select-as-fn s context output)
                                   (parse-select-aggregate s context))
                      :list-fn (if (= 'as (first s))
-                                (parse-select-as-fn s context)
+                                (parse-select-as-fn s context output)
                                 (parse-select-aggregate s context))
                      :vector-fn (if (= "as" (first s))
-                                  (parse-select-as-fn s context)
+                                  (parse-select-as-fn s context output)
                                   (parse-select-aggregate s context)))
-        :select-map (parse-select-map s depth context)))))
+        :select-map (parse-select-map s depth context output)))))
 
 (defn parse-select-clause
-  [clause context depth]
+  [clause context output depth]
   (cond
     ;; singular function call
     (list? clause)
-    (parse-selector context depth clause)
+    (parse-selector context depth output clause)
 
     ;; collection of selectors
     (sequential? clause)
-    (mapv (partial parse-selector context depth)
+    (mapv (partial parse-selector context depth output)
           clause)
 
     ;; singular selector
     :else
-    (parse-selector context depth clause)))
+    (parse-selector context depth output clause)))
 
 (defn parse-select
   [q context]
-  (let [depth      (or (:depth q) 0)
-        select-key (some (fn [k]
-                           (when (contains? q k) k))
-                         [:select :select-one :select-distinct])
-        select     (-> q
-                       (get select-key)
-                       (parse-select-clause context depth))]
-    (assoc q select-key select)))
+  (if-let [select-key (some (fn [k] (when (contains? q k) k))
+                            [:select :select-one :select-distinct])]
+    (let [depth  (or (:depth q) 0)
+          output (or (-> q :opts :output) :fql)
+          select (-> q
+                     (get select-key)
+                     (parse-select-clause context output depth))]
+      (assoc q select-key select))
+    q))
 
 (defn ensure-vector
   [x]
@@ -673,32 +724,32 @@
     q))
 
 (defn get-named
-  [jsonld nme]
-  (or (get jsonld nme)
-      (get jsonld (keyword nme))))
-
-(defn extract-opts
-  [q]
-  (or (get q "opts")
-      (get q :opts)))
+  "Get the value from the map `m` associated with the key with name `nme`. This
+  key could be a string, keyword, or symbol."
+  [m nme]
+  (or (get m nme)
+      (get m (keyword nme))
+      (get m (symbol nme))))
 
 (defn parse-analytical-query
   ([q] (parse-analytical-query q nil))
   ([q parent-context]
-   (let [context  (cond->> (context/extract q)
-                           parent-context (merge parent-context))
-         [vars values] (-> (get-named q "values")
-                           (parse-values context))
-         where    (-> (get-named q "where")
-                      (parse-where vars context))
-         grouping (parse-grouping q)
-         ordering (parse-ordering q)]
+   (let [orig-context  (:context q)
+         context       (cond->> (json-ld/parse-context orig-context)
+                         parent-context (merge parent-context))
+         [vars values] (parse-values (:values q) context)
+         where         (parse-where (:where q) vars context)
+         construct     (parse-construct q context)
+         grouping      (parse-grouping q)
+         ordering      (parse-ordering q)]
      (-> q
          (assoc :context context
                 :where where)
          (cond-> (seq values) (assoc :values values)
-                 grouping (assoc :group-by grouping)
-                 ordering (assoc :order-by ordering))
+                 orig-context (assoc :orig-context orig-context)
+                 grouping  (assoc :group-by grouping)
+                 ordering  (assoc :order-by ordering)
+                 construct (assoc :construct construct))
          (parse-having context)
          (parse-select context)
          parse-fuel))))
@@ -735,31 +786,31 @@
                 (map vector (range) list))
 
     ;; literal object
-    (some? value)
-    (let [m*      (cond-> m
-                    language (assoc :lang language))
-          obj-cmp (if (v/variable? value)
-                    (parse-variable-if-allowed allowed-vars value)
-                    (parse-object-value value type context m*))]
-      (conj triples [subj-cmp pred-cmp obj-cmp]))
+        (some? value)
+        (let [m*      (cond-> m
+                        language (assoc :lang language))
+              obj-cmp (if (v/variable? value)
+                        (parse-variable-if-allowed allowed-vars value)
+                        (parse-object-value value type context m*))]
+          (conj triples [subj-cmp pred-cmp obj-cmp]))
 
     ;; ref object
-    :else
-    (let [ref-obj (if (v/variable? id)
-                    (parse-variable-if-allowed allowed-vars id)
-                    (where/match-iri
-                     (if (nil? id)
-                       (iri/new-blank-node-id)
-                       id)))
-          ref-cmp (if m
-                    (assoc ref-obj ::where/meta m)
-                    ref-obj)
-          v-map*  (if (nil? id)
+        :else
+        (let [ref-obj (if (v/variable? id)
+                        (parse-variable-if-allowed allowed-vars id)
+                        (where/match-iri
+                         (if (nil? id)
+                           (iri/new-blank-node-id)
+                           id)))
+              ref-cmp (if m
+                        (where/match-meta ref-obj m)
+                        ref-obj)
+              v-map*  (if (nil? id)
                     ;; project newly created bnode-id into v-map
-                    (assoc v-map :id (where/get-iri ref-cmp))
-                    v-map)]
-      (conj (parse-subj-cmp allowed-vars context triples v-map*)
-            [subj-cmp pred-cmp ref-cmp]))))
+                        (assoc v-map :id (where/get-iri ref-cmp))
+                        v-map)]
+          (conj (parse-subj-cmp allowed-vars context triples v-map*)
+                [subj-cmp pred-cmp ref-cmp]))))
 
 (defn parse-pred-cmp
   [allowed-vars context subj-cmp triples [pred values]]
@@ -808,38 +859,65 @@
             []
             expanded)
     (catch* e
-            (throw (ex-info (str "Parsing failure due to: " (ex-message e)
-                                 ". Query: " expanded)
-                            (or (ex-data e) {})
-                            e)))))
+      (throw (ex-info (str "Parsing failure due to: " (ex-message e)
+                           ". Query: " expanded)
+                      (or (ex-data e) {})
+                      e)))))
 
-(defn parse-txn
-  [txn context]
-  (let [[vars values] (-> (get-named txn "values")
-                          (parse-values context))
-        where         (-> (get-named txn "where")
-                          (parse-where vars context))
-        bound-vars    (-> where where/bound-variables (into vars))
-        delete        (when-let [dlt (get-named txn "delete")]
-                        (-> dlt
-                            (json-ld/expand context)
-                            util/get-graph
-                            util/sequential
-                            (parse-triples bound-vars context)))
-        insert        (when-let [ins (get-named txn "insert")]
-                        (-> ins
-                            (json-ld/expand context)
-                            util/get-graph
-                            util/sequential
-                            (parse-triples bound-vars context)))
-        annotation    (util/get-first-value txn const/iri-annotation)]
-    (when (and (empty? insert) (empty? delete))
-      (throw (ex-info (str "Invalid transaction, insert or delete clause must contain nodes with objects.")
-                      {:status 400 :error :db/invalid-transaction})))
-    (cond-> {}
-      context      (assoc :context context)
-      where        (assoc :where where)
-      annotation   (assoc :annotation annotation)
-      (seq values) (assoc :values values)
-      (seq delete) (assoc :delete delete)
-      (seq insert) (assoc :insert insert))))
+(defn parse-txn-opts
+  [txn-opts override-opts txn-context]
+  (let [{:keys [did] :as opts} (merge (syntax/coerce-txn-opts txn-opts)
+                                      (syntax/coerce-txn-opts override-opts))]
+    (-> opts
+        (assoc :context txn-context)
+        (update :identity #(or % did))
+        (dissoc :did))))
+
+(defn parse-stage-txn
+  ([txn]
+   (parse-stage-txn txn {}))
+  ([txn override-opts]
+   (let [context       (or (ctx-util/txn-context txn)
+                           (:context override-opts))
+         [vars values] (-> (get-named txn "values")
+                           (parse-values context))
+         where         (-> (get-named txn "where")
+                           (parse-where vars context))
+         bound-vars    (-> where where/bound-variables (into vars))
+         delete        (when-let [dlt (get-named txn "delete")]
+                         (-> dlt
+                             (json-ld/expand context)
+                             util/get-graph
+                             util/sequential
+                             (parse-triples bound-vars context)))
+         insert        (when-let [ins (get-named txn "insert")]
+                         (-> ins
+                             (json-ld/expand context)
+                             util/get-graph
+                             util/sequential
+                             (parse-triples bound-vars context)))
+         annotation    (util/get-first-value txn const/iri-annotation)
+         opts          (-> (get-named txn "opts")
+                           (parse-txn-opts override-opts context))]
+     (when (and (empty? insert) (empty? delete))
+       (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
+                       {:status 400 :error :db/invalid-transaction})))
+     (cond-> {}
+       context      (assoc :context context)
+       where        (assoc :where where)
+       annotation   (assoc :annotation annotation)
+       (seq values) (assoc :values values)
+       (seq delete) (assoc :delete delete)
+       (seq insert) (assoc :insert insert)
+       (seq opts)   (assoc :opts opts)))))
+
+(defn parse-ledger-txn
+  ([txn]
+   (parse-ledger-txn txn {}))
+  ([txn override-opts]
+   (if-let [ledger-id (get-named txn "ledger")]
+     (-> txn
+         (parse-stage-txn override-opts)
+         (assoc :ledger-id ledger-id))
+     (throw (ex-info "Invalid transaction, missing required key: ledger."
+                     {:status 400, :error :db/invalid-transaction})))))

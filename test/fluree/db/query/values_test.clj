@@ -33,7 +33,7 @@
         (testing "single var"
           (is (= [["foo1"] ["foo2"] ["foo3"]]
                  @(fluree/query db1 {"select" ["?foo"]
-                                     "values" ["?foo" ["foo1" "foo2" "foo3" ]]}))
+                                     "values" ["?foo" ["foo1" "foo2" "foo3"]]}))
               "syntactic form is parsed correctly")))
       (testing "iri values"
         (is (= [["Brian" "brian@example.org"]
@@ -115,11 +115,11 @@
                                                ["?s" [{"@type" "id" "@value" "ex:nikola"}]]]]]]}))
             "syntactic form is parsed correctly"))
       (testing "federated"
-        (let [db3 @(fluree/create-with-txn conn
-                                           {"@context" context
-                                            "ledger" "other-ledger"
-                                            "insert" [{"@id" "ex:khris"
-                                                       "schema:name" "Khris"}]})]
+        (let [_db3 @(fluree/create-with-txn conn
+                                            {"@context" context
+                                             "ledger" "other-ledger"
+                                             "insert" [{"@id" "ex:khris"
+                                                        "schema:name" "Khris"}]})]
           (is (= [["Khris"] ["Nikola"]]
                  @(fluree/query-connection conn
                                            {"@context" context
