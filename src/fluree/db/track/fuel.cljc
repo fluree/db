@@ -6,39 +6,27 @@
 
 (defn init
   [max-fuel]
-  (atom {:limit    (or max-fuel 0)
-         :counters []}))
+  (atom {:limit (or max-fuel 0)
+         :total 0}))
 
 (defn tally
   [fuel]
-  (let [{:keys [counters]} @fuel]
-    (reduce (fn [total ctr]
-              (+ total @ctr))
-            0 counters)))
-
-(defn with-counter
-  [fuel-state counter]
-  (update fuel-state :counters conj counter))
+  (:total @fuel))
 
 (defn track!
   [fuel error-ch]
   (fn [rf]
-    (let [limit   (:limit @fuel)
-          counter (volatile! 0)]
-      (swap! fuel with-counter counter)
-      (fn
-        ([]
-         (rf))
+    (fn
+      ([]
+       (rf))
 
-        ([result next]
-         (vswap! counter inc)
-         (when limit
-           (let [tly (tally fuel)]
-             (when (< 0 limit tly)
-               (log/error "Fuel limit of" limit "exceeded:" tly)
-               (put! error-ch
-                     (ex-info "Fuel limit exceeded" {:used tly, :limit limit})))))
-         (rf result next))
+      ([result next]
+       (let [{:keys [limit total]} (swap! fuel update :total inc)]
+         (when (< 0 limit total)
+           (log/error "Fuel limit of" limit "exceeded:" total)
+           (put! error-ch
+                 (ex-info "Fuel limit exceeded" {:used total, :limit limit}))))
+       (rf result next))
 
-        ([result]
-         (rf result))))))
+      ([result]
+       (rf result)))))
