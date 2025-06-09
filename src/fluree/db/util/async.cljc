@@ -134,18 +134,17 @@
 
      (defonce original-run dispatch/run)
 
-     ;; Try to use OpenTelemetry if available, otherwise fall back to just MDC wrapping
-     (try
-       #_{:clj-kondo/ignore true}
-       (import [io.opentelemetry.context Context])
-       (defn wrapped-runable ^Runnable [^Runnable r]
-         #_{:clj-kondo/ignore true}
-         (.wrap (Context/current) (wrap-mdc r)))
-       (catch ClassNotFoundException _
-         ;; OpenTelemetry not available, fall back to just MDC wrapping
-         (defn wrapped-runable ^Runnable [^Runnable r]
-           (wrap-mdc r))))
+     ;; if OpenTelemetry is on classpath than propagate otel context
+     ;; otherwise no-op
+     (if-let [context-class (Class/forName "io.opentelemetry.context.Context")]
+       (let [current-method (.getMethod context-class "current" (into-array Class []))
+             wrap-method (.getMethod context-class "wrap" (into-array Class [Runnable]))]
+         (defn wrap-otel ^Runnable [^Runnable r]
+           (let [current-context (.invoke current-method nil (into-array Object []))]
+             (.invoke wrap-method current-context (into-array Object [r])))))
+       (defn wrap-otel ^Runnable [^Runnable r] r))
 
+     (defn wrapped-runable ^Runnable [^Runnable r] (wrap-otel (wrap-mdc r)))
      (defn patched-run
        "Runs Runnable r with OpenTelemetry context propagation."
        [^Runnable r]
