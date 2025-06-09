@@ -136,8 +136,10 @@
 
      ;; Try to use OpenTelemetry if available, otherwise fall back to just MDC wrapping
      (try
+       #_{:clj-kondo/ignore true}
        (import [io.opentelemetry.context Context])
        (defn wrapped-runable ^Runnable [^Runnable r]
+         #_{:clj-kondo/ignore true}
          (.wrap (Context/current) (wrap-mdc r)))
        (catch ClassNotFoundException _
          ;; OpenTelemetry not available, fall back to just MDC wrapping
