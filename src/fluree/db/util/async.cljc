@@ -1,9 +1,12 @@
 (ns fluree.db.util.async
   (:require
+   #?(:clj [clojure.core.async.impl.dispatch :as dispatch])
    [clojure.core.async :as async]
    [clojure.core.async.impl.protocols :as async-protocols]
    [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]])
-  #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
+  #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]]))
+  #?(:clj (:import [java.util.concurrent Executor]
+                   [org.slf4j MDC])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -105,3 +108,54 @@
   "Returns true if core async channel."
   [x]
   (satisfies? async-protocols/Channel x))
+
+;;  "OpenTelemetry uses ThreadLocal storage to propagate trace state.
+;;   This typically requires wrapping your tasks or executors so that this state
+;;   is propagated to threads when desired.
+;;   See https://github.com/open-telemetry/opentelemetry-java/blob/main/context/src/main/java/io/opentelemetry/context/Context.java
+;;   core.async does not expose the thread pool direclty so we need to monkey patch it.
+
+;;   core.async will propagate clojure var bindings, so alternatively it might be possible
+;;   to implement a ContextStorageProvider that stores state in a var instead of thread locals.
+;;   I spent a bit of time trying to figure this out but it seems quite a bit more involved than
+;;   patching core.aysnc"
+#?(:clj
+   (do
+     (defn wrap-mdc ^Runnable [^Runnable r]
+       (let [context (MDC/getCopyOfContextMap)]
+         (reify Runnable
+           (run [_]
+             (let [current (MDC/getCopyOfContextMap)]
+               (try
+                 (MDC/setContextMap context)
+                 (.run r)
+                 (finally
+                   (MDC/setContextMap current))))))))
+
+     (defonce original-run dispatch/run)
+
+     ;; Try to use OpenTelemetry if available, otherwise fall back to just MDC wrapping
+     (try
+       (import [io.opentelemetry.context Context])
+       (defn wrapped-runable ^Runnable [^Runnable r]
+         (.wrap (Context/current) (wrap-mdc r)))
+       (catch ClassNotFoundException _
+         ;; OpenTelemetry not available, fall back to just MDC wrapping
+         (defn wrapped-runable ^Runnable [^Runnable r]
+           (wrap-mdc r))))
+
+     (defn patched-run
+       "Runs Runnable r with OpenTelemetry context propagation."
+       [^Runnable r]
+       (original-run (wrapped-runable r)))
+
+     (alter-var-root #'dispatch/run (constantly patched-run))
+
+     (defonce ^Executor original-thread-macro-executor @#'async/thread-macro-executor)
+
+     (defn context-wrapping-executor ^Executor [^Executor wrapped-executor]
+       (reify Executor
+         (execute [_ runnable]
+           (.execute wrapped-executor (wrapped-runable runnable)))))
+
+     (alter-var-root #'async/thread-macro-executor (constantly (context-wrapping-executor original-thread-macro-executor)))))
