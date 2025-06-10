@@ -217,7 +217,7 @@
   ([db json-ld] (stage db json-ld nil))
   ([db json-ld opts]
    (log/warn "DEPRECATED function `stage` superseded by `fluree.db.api/stage`")
-   (let [result-ch (transact-api/stage db json-ld opts)]
+   (let [result-ch (transact-api/update db json-ld opts)]
      (promise-wrap result-ch))))
 
 (defn ^{:deprecated    "3.0"

@@ -226,6 +226,23 @@
    (promise-wrap
     (transact-api/insert db json-ld opts))))
 
+(defn upsert
+  "Performs an upsert operation, which will insert the data if it does not exist,
+   or update the existing data if it does. This is useful for ensuring that a
+   specific document is present in the database with the desired values.
+
+   The 'opts' key is a map with the following key options:
+    - `:context` - (optional) and externally provided context that will be used
+                   for document expansion, the @context in the json-ld will be 
+                   ignored if present.
+
+   The data is expected to be in JSON-LD format, and will be expanded before
+   being inserted into the database."
+  ([db json-ld] (upsert db json-ld nil))
+  ([db json-ld opts]
+   (promise-wrap
+    (transact-api/upsert db json-ld opts))))
+
 (defn update
   "Performs an update and queues change if valid (does not commit).
    Multiple updates can be staged together and will be merged into a single
@@ -233,7 +250,7 @@
   ([db json-ld] (update db json-ld nil))
   ([db json-ld opts]
    (promise-wrap
-    (transact-api/stage db json-ld opts))))
+    (transact-api/update db json-ld opts))))
 
 ;; TODO - deprecate `stage` in favor of `update` eventually
 (defn stage
