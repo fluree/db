@@ -117,7 +117,7 @@
     ::issuer            [:maybe string?]
     ::role              :any
     ::identity          :any
-    ::format            [:enum :sparql :fql]
+    ::format            [:enum :sparql :fql :turtle]
     ::meta              [:orn
                          [:all :boolean]
                          [:specific [:map-of :keyword :boolean]]]

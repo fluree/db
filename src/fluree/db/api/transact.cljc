@@ -5,8 +5,10 @@
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.sparql :as sparql]
+            [fluree.db.query.turtle.parse :as turtle]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.context :as ctx-util]))
+            [fluree.db.util.context :as ctx-util]
+            [fluree.json-ld :as json-ld]))
 
 (defn format-txn
   [txn override-opts]
@@ -15,20 +17,20 @@
     txn))
 
 (defn insert
-  [db rdf override-opts]
+  [db rdf {:keys [context format] :as _opts}]
   (go-try
-    (let [parsed-triples (parse/jld->parsed-triples rdf nil (:context override-opts))
+    (let [context* (json-ld/parse-context context)
+          parsed-triples (if (= :turtle format)
+                           (turtle/parse rdf)
+                           (parse/jld->parsed-triples rdf nil context*))
           parsed-txn {:insert parsed-triples}]
       (<? (connection/stage-triples db parsed-txn)))))
 
 (defn upsert
-  "Takes an insertion RDF document and returns a map with :where and :delete keys.
-   
-   The :where key contains the triples to match existing data, while the :delete
-   key contains the triples to delete before inserting new data."
-  [db rdf override-opts]
+  [db rdf opts]
   (go-try
-    (let [parsed-txn (parse/parse-upsert-txn rdf override-opts)]
+    (let [opts* (assoc opts :context (json-ld/parse-context (:context opts)))
+          parsed-txn (parse/parse-upsert-txn rdf opts*)]
       (<? (connection/stage-triples db parsed-txn)))))
 
 (defn update
