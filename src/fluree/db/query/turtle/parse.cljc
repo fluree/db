@@ -4,7 +4,7 @@
             [fluree.db.query.exec.where :as exec.where]
             [quoll.raphael.core :as raphael]))
 
-(set! *warn-on-reflection* true)
+#?(:clj (set! *warn-on-reflection* true))
 
 (defrecord Generator [namespaces]
   raphael/NodeGenerator
