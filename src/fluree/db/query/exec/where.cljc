@@ -823,6 +823,14 @@
         (when-not (::invalidated solution*)
           solution*)))))
 
+(defmethod match-pattern :default
+  [_db _tracker _solution pattern error-ch]
+  (go
+    (>! error-ch
+        (ex-info (str "Unknown pattern type: " (pattern-type pattern))
+                 {:status 400
+                  :error  :db/invalid-query}))))
+
 (def blank-solution {})
 
 (defn values-initial-solution
