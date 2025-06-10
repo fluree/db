@@ -931,14 +931,55 @@
      (when (and (empty? insert) (empty? delete))
        (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
                        {:status 400 :error :db/invalid-transaction})))
-     (cond-> {}
+     (cond-> {:opts opts}
        context      (assoc :context context)
        where        (assoc :where where)
        annotation   (assoc :annotation annotation)
        (seq values) (assoc :values values)
        (seq delete) (assoc :delete delete)
-       (seq insert) (assoc :insert insert)
-       (seq opts)   (assoc :opts opts)))))
+       (seq insert) (assoc :insert insert)))))
+
+(defn blank-node-subject?
+  [parsed-triple]
+  (-> parsed-triple
+      first
+      where/get-iri
+      iri/blank-node-id?))
+
+(defn upsert-where-del
+  "For an upsert transaction.
+   
+   Takes a parsed transaction and for each triple, replaces the object position
+   with a variable and returns a map with :where and :delete keys.
+   
+   Skips blank nodes as they cannot be deleted."
+  [parsed-txn]
+  (loop [[next-triple & r] parsed-txn
+         i      0
+         where  []
+         delete []]
+    (if next-triple
+      (if (blank-node-subject? next-triple)
+        (recur r (inc i) where delete) ;; can't delete blank node properties
+        (let [new-var    (str "?f" i)
+              delete-smt (assoc next-triple 2 (parse-variable new-var))
+              where-smt  (where/->pattern :optional [delete-smt])] ;; use optional so other matched triples still delete if no match
+          (recur r (inc i) (conj where where-smt) (conj delete delete-smt))))
+      {:where  where
+       :delete delete})))
+
+(defn parse-upsert-txn
+  [txn override-opts]
+  (let [context    (or (ctx-util/txn-context txn)
+                       (:context override-opts))
+        opts       (parse-txn-opts nil override-opts context)
+        parsed-txn (jld->parsed-triples txn nil context)
+        {:keys [where delete]} (upsert-where-del parsed-txn)]
+    {:opts    opts
+     :context context
+     :where   where
+     :delete  delete
+     :insert  parsed-txn}))
 
 (defn parse-ledger-txn
   ([txn]
