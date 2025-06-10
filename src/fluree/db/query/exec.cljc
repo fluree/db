@@ -35,6 +35,14 @@
     (async/take limit solution-ch)
     solution-ch))
 
+(defn paginate
+  "Returns a channel that contains a page-worth of results, according to `:offset` and
+  `:limit`."
+  [q solution-ch]
+  (->> solution-ch
+       (drop-offset q)
+       (take-limit q)))
+
 (defn collect-results
   "Returns a channel that will eventually contain the stream of results from the
   `result-ch` channel collected into a single vector, but handles the special cases.
@@ -56,21 +64,20 @@
         (async/into [] result-ch)))
 
 (defn execute*
-  ([ds fuel-tracker q error-ch]
-   (execute* ds fuel-tracker q error-ch nil))
-  ([ds fuel-tracker q error-ch initial-soln]
-   (->> (where/search ds q fuel-tracker error-ch initial-soln)
+  ([ds tracker q error-ch]
+   (execute* ds tracker q error-ch nil))
+  ([ds tracker q error-ch initial-soln]
+   (->> (where/search ds q tracker error-ch initial-soln)
         (group/combine q)
         (having/filter q error-ch)
         (select/modify q)
-        (order/arrange q)
-        (drop-offset q)
-        (take-limit q))))
+        (order/arrange q))))
 
 (defn execute
-  [ds fuel-tracker q error-ch]
-  (->> (execute* ds fuel-tracker q error-ch)
-       (select/format ds q fuel-tracker error-ch)
+  [ds tracker q error-ch]
+  (->> (execute* ds tracker q error-ch)
+       (select/format ds q tracker error-ch)
+       (paginate q)
        (collect-results q)))
 
 ;; TODO: refactor namespace heirarchy so this isn't necessary
@@ -78,9 +85,10 @@
   "Closes over a subquery to allow processing the whole query pipeline from within the
   search."
   [subquery]
-  (fn [ds fuel-tracker error-ch]
-    (->> (execute* ds fuel-tracker subquery error-ch)
-         (select/subquery-format ds subquery fuel-tracker error-ch))))
+  (fn [ds tracker error-ch]
+    (->> (execute* ds tracker subquery error-ch)
+         (select/subquery-format ds subquery tracker error-ch)
+         (paginate subquery))))
 
 (defn prep-subqueries
   "Takes a query and returns a query with all subqueries within replaced by a subquery
@@ -99,11 +107,11 @@
   exception if there was an error."
   ([ds q]
    (query ds nil q))
-  ([ds fuel-tracker q]
+  ([ds tracker q]
    (go
      (let [error-ch  (async/chan)
            prepped-q (prep-subqueries q)
-           result-ch (execute ds fuel-tracker prepped-q error-ch)]
+           result-ch (execute ds tracker prepped-q error-ch)]
        (async/alt!
          error-ch ([e] e)
          result-ch ([result] result))))))

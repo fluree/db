@@ -5,7 +5,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.range :as query-range]
-            [fluree.db.track.fuel :as fuel]
+            [fluree.db.track :as track]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]))
 
@@ -96,28 +96,27 @@
         (remove nil?)))
 
 (defn forward-properties
-  [{:keys [t] :as db} iri select-spec context compact-fn cache fuel-tracker error-ch]
+  [{:keys [t] :as db} iri select-spec context compact-fn cache tracker error-ch]
   (let [sid                     (iri/encode-iri db iri)
         [start-flake end-flake] (flake-bounds db :spot [sid])
-        flake-xf                (when fuel-tracker
-                                  (comp (fuel/track fuel-tracker error-ch)))
-        range-opts              {:to-t        t
-                                 :start-flake start-flake
-                                 :end-flake   end-flake
-                                 :flake-xf    flake-xf}
+        flake-xf                (track/track-fuel! tracker error-ch)
+        range-opts              (cond-> {:to-t        t
+                                         :start-flake start-flake
+                                         :end-flake   end-flake}
+                                  flake-xf (assoc :flake-xf flake-xf))
         subj-xf                 (comp cat
                                       (format-subject-xf db cache context compact-fn
                                                          select-spec))]
-    (->> (query-range/resolve-flake-slices db fuel-tracker :spot error-ch range-opts)
+    (->> (query-range/resolve-flake-slices db tracker :spot error-ch range-opts)
          (async/transduce subj-xf (completing conj) {}))))
 
 (defn reverse-property
-  [{:keys [t] :as db} o-iri {:keys [as], p-iri :iri, :as reverse-spec} context fuel-tracker error-ch]
+  [{:keys [t] :as db} o-iri {:keys [as], p-iri :iri, :as reverse-spec} context tracker error-ch]
   (let [oid                     (iri/encode-iri db o-iri)
         pid                     (iri/encode-iri db p-iri)
         [start-flake end-flake] (flake-bounds db :opst [oid pid])
-        flake-xf                (if fuel-tracker
-                                  (comp (fuel/track fuel-tracker error-ch)
+        flake-xf                (if-let [track-fuel (track/track-fuel! tracker error-ch)]
+                                  (comp track-fuel
                                         (map flake/s))
                                   (map flake/s))
         range-opts              {:to-t        t
@@ -125,7 +124,7 @@
                                  :end-flake   end-flake
                                  :flake-xf    flake-xf}
         sid-xf                  (map (partial format-reference db reverse-spec))]
-    (->> (query-range/resolve-flake-slices db fuel-tracker :opst error-ch range-opts)
+    (->> (query-range/resolve-flake-slices db tracker :opst error-ch range-opts)
          (async/transduce (comp cat sid-xf)
                           (completing conj
                                       (fn [result]
@@ -135,7 +134,7 @@
 (defn format-subject-flakes
   "current-depth param is the depth of the graph crawl. Each successive 'ref'
   increases the graph depth, up to the requested depth within the select-spec"
-  [db cache context compact-fn {:keys [reverse] :as select-spec} current-depth fuel-tracker error-ch s-flakes]
+  [db cache context compact-fn {:keys [reverse] :as select-spec} current-depth tracker error-ch s-flakes]
   (if (not-empty s-flakes)
     (let [sid           (->> s-flakes first flake/s)
           s-iri         (iri/decode-sid db sid)
@@ -143,10 +142,10 @@
                               (format-subject-xf db cache context compact-fn select-spec)
                               s-flakes)
           subject-ch    (if reverse
-                          (let [reverse-ch (subject/format-reverse-properties db s-iri reverse context fuel-tracker error-ch)]
+                          (let [reverse-ch (subject/format-reverse-properties db s-iri reverse context tracker error-ch)]
                             (async/reduce conj subject-attrs reverse-ch))
                           (go subject-attrs))]
       (->> subject-ch
-           (subject/resolve-properties db cache context compact-fn select-spec current-depth fuel-tracker error-ch)
-           (subject/append-id db fuel-tracker s-iri select-spec compact-fn error-ch)))
+           (subject/resolve-properties db cache context compact-fn select-spec current-depth tracker error-ch)
+           (subject/append-id db tracker s-iri select-spec compact-fn error-ch)))
     (go)))

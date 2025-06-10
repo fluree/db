@@ -3,6 +3,12 @@
             [clojure.string :as str]
             [fluree.db.constants :as const]))
 
+(def bnode-counter (atom 0))
+
+(defn new-bnode!
+  []
+  (str "_:b" (swap! bnode-counter inc)))
+
 (defn rule?
   [x]
   (and (sequential? x)
@@ -31,11 +37,19 @@
     "false" false
     "true" true))
 
+(defmethod parse-term :ANON
+  [_]
+  (new-bnode!))
+
 (defmethod parse-term :Var
   ;; Var ::= VAR1 WS | VAR2 WS
   ;; [:Var "n" "u" "m" "s"]
   [[_ & var]]
   (str "?" (str/join var)))
+
+(defmethod parse-term :Separator
+  [[_ & separator-chars]]
+  (apply str separator-chars))
 
 (def supported-aggregate-functions
   {"MAX"       "max"
@@ -43,7 +57,8 @@
    "SAMPLE"    "sample1"
    "COUNT"     "count"
    "SUM"       "sum"
-   "AVG"       "avg"})
+   "AVG"       "avg"
+   "GROUP_CONCAT" "groupconcat"})
 
 (defmethod parse-term :Aggregate
   ;; Aggregate ::= 'COUNT' WS <'('> WS 'DISTINCT'? WS ( '*' | Expression ) WS <')'> WS
@@ -65,8 +80,8 @@
 
                   :else
                   f)
-          body (if distinct? (second body) (first body))]
-      (str "(" f " " (parse-term body) ")"))
+          [mset scalarvals] (if distinct? (rest body) body)]
+      (str "(" f " " (parse-term mset) (when scalarvals (str " " (literal-quote (parse-term scalarvals)))) ")"))
     (throw (ex-info (str "Unsupported aggregate function: " func)
                     {:status 400 :error :db/invalid-query}))))
 
@@ -405,20 +420,34 @@
   ;; <Verb> ::= VarOrIri | Type
   [[_ verb objects]]
   (let [p (parse-term verb)]
-    (mapv #(vector p (if (= const/iri-type p)
+    (mapv #(vector p (if (and (= const/iri-type p)
+                              (not= \? (first %)))
                        (get % const/iri-id)
-                       %)) (parse-term objects))))
+                       %))
+          (parse-term objects))))
 
 (defmethod parse-term :PropertyListNotEmpty
   ;; PropertyListNotEmpty ::= PropertyObjectList ( <';'>  WS ( PropertyObjectList )? )*
   [[_ & properties]]
   (mapcat parse-term properties))
 
-(defmethod parse-term :TriplesSameSubject
-  ;; TriplesSameSubject ::= VarOrTerm PropertyListNotEmpty | TriplesNode PropertyList
+(defmethod parse-term :PropertyList
+  ;; PropertyList ::= PropertyListNotEmpty?
+  [[_ plist]]
+  (if plist
+    (parse-term plist)
+    []))
+
+(defmethod parse-term :TriplesSameSubject1
+  ;; TriplesSameSubject1 ::= VarOrTerm PropertyListNotEmpty
   [[_ subject properties]]
   (let [s (parse-term subject)]
     (mapv (fn [[p o]] {"@id" s p o}) (parse-term properties))))
+
+(defmethod parse-term :TriplesSameSubject2
+  ;; TriplesSameSubject1 ::= TriplesNode PropertyList
+  [[_ node plist]]
+  [(into (parse-term node) (parse-term plist))])
 
 (defmethod parse-rule :ConstructTemplate
   ;; ConstructTemplate   ::=   <'{'> WS ConstructTriples? WS <'}'> WS
@@ -493,7 +522,13 @@
   [[_ & bindings]]
   ;; bindings come in as val, var; need to be reversed to var, val.
   (into [:bind] (->> bindings
-                     (mapv parse-term)
+                     (mapv (fn [term]
+                             (let [terms (into #{} (flatten term))
+                                   parsed (parse-term term)]
+                               (if (and (terms :iriOrFunction) (not= \( (first parsed)))
+                                 ;; static iri
+                                 {const/iri-id parsed}
+                                 (parse-term term)))))
                      (partition-all 2)
                      (mapcat reverse))))
 
@@ -610,7 +645,12 @@
 (defmethod parse-term :PathElt
   [[_ primary mod]]
   (if mod
-    (str "<" (parse-term primary) (parse-term mod) ">")
+    (let [term  (parse-term primary)
+          term* (if ((set (flatten primary)) :IRIREF)
+                  ;; expanded IRIs need to be wrapped in angle brackets in a transitive path
+                  (str "<" term ">")
+                  term)]
+      (str "<" term* (parse-term mod) ">"))
     (parse-term primary)))
 
 (defmethod parse-term :PathSequence
@@ -633,18 +673,28 @@
   ;; Object ::= GraphNode
   ;; <GraphNode> ::= VarOrTerm | TriplesNode
   ;; <VarOrTerm> ::= Var | GraphTerm WS
-  ;; TriplesNode ::= Collection | BlankNodePropertyList
+  ;; <TriplesNode> ::= Collection | BlankNodePropertyList
   ;; Collection ::=  '(' GraphNode+ ')'
-  ;; BlankNodePropertyList ::= '[' PropertyListNotEmpty ']'
   [[_ & path]]
   (mapv parse-term path))
+
+(defmethod parse-term :BlankNodePropertyList
+  ;; BlankNodePropertyList ::= <'['> PropertyListNotEmpty <']'>
+  [[_ plist]]
+  (into {const/iri-id (new-bnode!)} (parse-term plist)))
+
+(defmethod parse-term :BlankNodePropertyListPath
+  ;; BlankNodePropertyListPath ::= <'['> PropertyListPathNotEmpty <']'>
+  [[_ plist]]
+  (->> (partition-all 2 (parse-term plist))
+       (mapv (fn [[p o]] (if (= p const/iri-type) [p (get o const/iri-id)] [p o])))
+       (into {const/iri-id (new-bnode!)})))
 
 (defmethod parse-term :ObjectPath
   ;; ObjectPath ::= GraphNodePath
   ;; <GraphNodePath> ::= VarOrTerm | TriplesNodePath
-  ;; TriplesNodePath  ::=  CollectionPath WS | BlankNodePropertyListPath WS
+  ;; <TriplesNodePath>  ::=  CollectionPath WS | BlankNodePropertyListPath WS
   ;; CollectionPath ::= '(' GraphNodePath+ ')'
-  ;; BlankNodePropertyListPath ::= '[' PropertyListPathNotEmpty ']'
   [[_ & objs]]
   (mapv (fn [[tag :as obj]]
           (if (= tag :iri)
@@ -674,7 +724,11 @@
   [[_ subject properties]]
   (let [s (parse-term subject)]
     (->> (partition-all 2 (parse-term properties))
-         (mapv (fn [[p o]] {"@id" s p o})))))
+         (reduce (fn [triples [p o]]
+                   (into triples (if (and (get o const/iri-id) (> (count o) 1))
+                                   ;; unpack nested object into a separate triple with ref
+                                   [{"@id" s p (select-keys o [const/iri-id])} o]
+                                   [{"@id" s p o}]))) []))))
 
 (defmethod parse-term :TriplesBlock
   ;; TriplesBlock ::= WS TriplesSameSubjectPath WS ( <'.'> TriplesBlock? WS )?
@@ -940,6 +994,7 @@
 
 (defn translate
   [parsed]
+  (reset! bnode-counter 0)
   (reduce (fn [fql rule] (into fql (parse-rule rule)))
           {}
           parsed))

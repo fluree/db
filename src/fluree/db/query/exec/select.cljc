@@ -20,7 +20,7 @@
 
 (defprotocol ValueSelector
   :extend-via-metadata true
-  (format-value [fmt db iri-cache context compact fuel-tracker error-ch solution]
+  (format-value [fmt db iri-cache context compact tracker error-ch solution]
     "Async format a search solution (map of pattern matches) by extracting relevant match."))
 
 (defprotocol ValueAdapter
@@ -110,10 +110,10 @@
 (defrecord SubgraphSelector [subj selection depth spec]
   ValueSelector
   (format-value
-    [_ ds iri-cache context compact fuel-tracker error-ch solution]
+    [_ ds iri-cache context compact tracker error-ch solution]
     (if-let [iri (get-subject-iri solution subj)]
       (subject/format-subject ds iri context compact spec iri-cache
-                              fuel-tracker error-ch)
+                              tracker error-ch)
       (go
         (let [match    (get solution subj)
               value    (where/get-value match)
@@ -161,26 +161,26 @@
 (defn format-values
   "Formats the values from the specified where search solution `solution`
   according to the selector or collection of selectors specified by `selectors`"
-  [selectors db iri-cache context output-format compact fuel-tracker error-ch solution]
+  [selectors db iri-cache context output-format compact tracker error-ch solution]
   (if (sequential? selectors)
     (go-loop [selectors selectors
               values []]
       (if-let [selector (first selectors)]
         (let [value (<! (format-value selector db iri-cache context compact
-                                      fuel-tracker error-ch solution))]
+                                      tracker error-ch solution))]
           (recur (rest selectors)
                  (conj values value)))
 
         (if (= output-format :sparql)
           (apply merge values)
           values)))
-    (format-value selectors db iri-cache context compact fuel-tracker
+    (format-value selectors db iri-cache context compact tracker
                   error-ch solution)))
 
 (defn format
   "Formats each solution within the stream of solutions in `solution-ch` according
   to the selectors within the select clause of the supplied parsed query `q`."
-  [db q fuel-tracker error-ch solution-ch]
+  [db q tracker error-ch solution-ch]
   (let [context             (or (:selection-context q)
                                 (:context q))
         compact             (json-ld/compact-fn context)
@@ -204,7 +204,7 @@
                           (fn [solution ch]
                             (log/trace "select/format solution:" solution)
                             (-> (format-values selectors db iri-cache context output-format compact
-                                               fuel-tracker error-ch solution)
+                                               tracker error-ch solution)
                                 (async/pipe ch)))
                           solution-ch)
     format-ch))
@@ -224,7 +224,7 @@
 (defn subquery-format
   "Formats each solution within the stream of solutions in `solution-ch` according
   to the selectors within the select clause of the supplied parsed query `q`."
-  [_db q _fuel-tracker error-ch solution-ch]
+  [_db q _tracker error-ch solution-ch]
   (let [selectors (or (:select q)
                       (:select-one q)
                       (:select-distinct q))

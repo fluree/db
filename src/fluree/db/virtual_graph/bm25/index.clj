@@ -102,6 +102,10 @@
   (go
     (try*
       (let [{::vg-parse/keys [target limit timeout] :as search-params} (vg-parse/get-search-params solution)
+            _ (when-not target
+                (throw (ex-info "No search target for virtual graph. Did you forget @context in your query?"
+                                {:status 400 :error
+                                 :db/invalid-query})))
             {:keys [pending-ch index]} @index-state
 
             ;; TODO - check for "sync" options and don't wait for pending-ch if sync is false
@@ -130,7 +134,6 @@
              (vg-parse/process-sparse-results bm25 solution search-params)
              (async/onto-chan! out-ch)))
       (catch* e
-        (log/error e "Error ranking vectors")
         (>! error-ch e)))))
 
 (defn bm25-upsert*
@@ -244,16 +247,16 @@
     (bm25-initialize this source-db))
 
   where/Matcher
-  (-match-triple [_ _fuel-tracker solution triple _error-ch]
+  (-match-triple [_ _tracker solution triple _error-ch]
     (vg-parse/match-search-triple solution triple))
 
-  (-finalize [this _fuel-tracker error-ch solution-ch]
+  (-finalize [this _tracker error-ch solution-ch]
     (vg-parse/finalize (partial search this) error-ch solution-ch))
 
-  (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
+  (-match-id [_ _tracker _solution _s-mch _error-ch]
     where/nil-channel)
 
-  (-match-class [_ _fuel-tracker _solution _s-mch _error-ch]
+  (-match-class [_ _tracker _solution _s-mch _error-ch]
     where/nil-channel)
 
   ;; activate-alias should not be called on an index VG, return empty chan

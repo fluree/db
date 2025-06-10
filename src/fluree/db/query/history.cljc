@@ -24,13 +24,13 @@
              (nil? to)      (:t db))])))
 
 (defprotocol AuditLog
-  (-history [db fuel-tracker context from-t to-t commit-details? include error-ch history-q])
-  (-commits [db fuel-tracker context from-t to-t include error-ch]))
+  (-history [db tracker context from-t to-t commit-details? include error-ch history-q])
+  (-commits [db tracker context from-t to-t include error-ch]))
 
 (defn query
   ([db context q]
    (query db nil context q))
-  ([db fuel-tracker context q]
+  ([db tracker context q]
    (go-try
      (let [{:keys [history t commit-details] :as parsed-query}
            (parse/parse-history-query q)
@@ -40,8 +40,8 @@
            error-ch      (async/chan)
            include       (not-empty (select-keys parsed-query [:commit :data :txn]))
            result-ch     (if history
-                           (-history db fuel-tracker context from-t to-t commit-details include error-ch history)
-                           (-commits db fuel-tracker context from-t to-t include error-ch))]
+                           (-history db tracker context from-t to-t commit-details include error-ch history)
+                           (-commits db tracker context from-t to-t include error-ch))]
        (when commit-details
          (log/warn "DEPRECATED history option `commit-details` superseded by options `commit`, `data`, and `txn`."))
        (async/alt! result-ch ([result] result)

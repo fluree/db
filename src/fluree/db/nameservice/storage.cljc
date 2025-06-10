@@ -11,7 +11,7 @@
   [ledger-alias]
   (str ledger-alias ".json"))
 
-(defn publishing-address
+(defn publishing-address*
   [store ledger-alias]
   (-> store
       storage/location
@@ -47,14 +47,17 @@
   nameservice/Publisher
   (publish [_ commit-jsonld]
     (let [ledger-alias (get commit-jsonld "alias")
-          ns-address   (publishing-address store ledger-alias)
+          ns-address   (publishing-address* store ledger-alias)
           record       (ns-record ns-address commit-jsonld)
           record-bytes (json/stringify-UTF8 record)
           filename     (local-filename ledger-alias)]
       (storage/write-bytes store filename record-bytes)))
 
+  (retract [_ ledger-alias]
+    (storage/delete store (publishing-address* store (local-filename ledger-alias))))
+
   (publishing-address [_ ledger-alias]
-    (go (publishing-address store ledger-alias)))
+    (go (publishing-address* store ledger-alias)))
 
   nameservice/iNameService
   (lookup [_ ledger-address]

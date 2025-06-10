@@ -20,14 +20,14 @@
 (defn cached-class-policies
   [policy sid]
   (when-let [classes (get @(:cache policy) sid)]
-    (enforce/policies-for-classes policy false classes)))
+    (enforce/view-policies-for-classes policy classes)))
 
 (defn class-policies
-  [{:keys [policy] :as db} fuel-tracker sid]
+  [{:keys [policy] :as db} tracker sid]
   (go-try
-    (let [class-sids (<? (dbproto/-class-ids db fuel-tracker sid))]
+    (let [class-sids (<? (dbproto/-class-ids db tracker sid))]
       (swap! (:cache policy) assoc sid class-sids)
-      (enforce/policies-for-classes policy false class-sids))))
+      (enforce/view-policies-for-classes policy class-sids))))
 
 (defn allow-flake?
   "Returns one of:
@@ -38,29 +38,29 @@
   Note: does not check here for unrestricted-view? as that should
   happen upstream. Assumes this is a policy-wrapped db if it ever
   hits this fn."
-  [{:keys [policy] :as db} fuel-tracker flake]
+  [{:keys [policy] :as db} tracker flake]
   (go-try
     (let [pid      (flake/p flake)
           sid      (flake/s flake)
-          policies (concat (enforce/policies-for-property policy false pid)
+          policies (concat (enforce/view-policies-for-property policy pid)
                            (or (cached-class-policies policy sid)
                                (when (-> policy :view :class not-empty)
                                  ;; only do range scan if we have /any/ class policies
-                                 (<? (class-policies db fuel-tracker sid))))
-                           (enforce/policies-for-flake db flake false))]
+                                 (<? (class-policies db tracker sid))))
+                           (enforce/view-policies-for-flake db flake))]
       (if-some [required-policies (not-empty (filter :required? policies))]
-        (<? (enforce/policies-allow? db fuel-tracker false sid required-policies))
-        (<? (enforce/policies-allow? db fuel-tracker false sid policies))))))
+        (<? (enforce/policies-allow-viewing? db tracker sid required-policies))
+        (<? (enforce/policies-allow-viewing? db tracker sid policies))))))
 
 (defn allow-iri?
   "Returns async channel with truthy value if iri is visible for query results"
-  [db fuel-tracker iri]
+  [db tracker iri]
   (if (unrestricted? db)
     (go true)
     (try*
       (let [sid      (iri/encode-iri db iri)
             id-flake (flake/create sid const/$id nil nil nil nil nil)]
-        (allow-flake? db fuel-tracker id-flake))
+        (allow-flake? db tracker id-flake))
       (catch* e
         (log/error e "Unexpected exception in allow-iri? checking permission for iri: " iri)
         (go (ex-info (str "Unexpected exception in allow-iri? checking permission for iri: " iri

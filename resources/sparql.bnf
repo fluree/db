@@ -21,7 +21,7 @@ WhereClause	  ::=  	<'WHERE'?> WS GroupGraphPattern WS
 SolutionModifier	  ::=  	GroupClause? HavingClause? OrderClause? LimitOffsetClauses?
 GroupClause	  ::=  	<'GROUP' WS 'BY' WS> GroupCondition+
 GroupCondition	  ::=  	BuiltInCall | FunctionCall | <'('> Expression ( As Var )? <')'> | Var
-HavingClause	  ::=  	<'HAVING'> HavingCondition+
+HavingClause ::= <'HAVING'> WS HavingCondition+
 HavingCondition	  ::=  	Constraint
 OrderClause	  ::=  	<'ORDER' WS 'BY'> WS OrderCondition+ WS
 <OrderCondition>	  ::=  	ExplicitOrderCondition | Constraint | Var
@@ -83,8 +83,10 @@ ArgList	  ::=  	NIL | <'('> 'DISTINCT'? Expression ( <','> Expression )* <')'>
 ExpressionList	  ::=  	NIL | <'('> Expression ( <','> Expression )* <')'>
 ConstructTemplate	  ::=  	<'{'> WS ConstructTriples? WS <'}'> WS
 <ConstructTriples>	  ::=  	TriplesSameSubject ( <'.'> WS ConstructTriples? )?
-TriplesSameSubject	  ::=  	VarOrTerm PropertyListNotEmpty | TriplesNode PropertyList
-PropertyList	  ::=  	PropertyListNotEmpty?
+<TriplesSameSubject> ::= TriplesSameSubject1 | TriplesSameSubject2
+TriplesSameSubject1 ::= VarOrTerm PropertyListNotEmpty
+TriplesSameSubject2 ::= TriplesNode PropertyList
+PropertyList ::= PropertyListNotEmpty?
 PropertyObjectList ::= Verb ObjectList
 PropertyListNotEmpty ::= PropertyObjectList ( <';'>  WS ( PropertyObjectList )? )*
 <Verb> ::= VarOrIri | Type
@@ -107,10 +109,10 @@ PathPrimary	  ::=  	iri | Type | '!' PathNegatedPropertySet | <'('> Path <')'>
 PathNegatedPropertySet	  ::=  	PathOneInPropertySet | '(' ( PathOneInPropertySet ( '|' PathOneInPropertySet )* )? ')'
 PathOneInPropertySet	  ::=  	iri | Type | '^' ( iri | Type )
 Integer	  ::=  	INTEGER
-TriplesNode	  ::=  	Collection | BlankNodePropertyList
-BlankNodePropertyList	  ::=  	'[' PropertyListNotEmpty ']'
-TriplesNodePath	  ::=  	CollectionPath WS | BlankNodePropertyListPath WS
-BlankNodePropertyListPath	  ::=  	'[' PropertyListPathNotEmpty ']'
+<TriplesNode> ::= Collection | BlankNodePropertyList
+BlankNodePropertyList ::= <'['> PropertyListNotEmpty <']'>
+<TriplesNodePath> ::= CollectionPath WS | BlankNodePropertyListPath WS
+BlankNodePropertyListPath ::= <'['> PropertyListPathNotEmpty <']'>
 Collection	  ::=  	'(' GraphNode+ ')'
 CollectionPath	  ::=  	'(' GraphNodePath+ ')'
 <GraphNode>	  ::=  	VarOrTerm | TriplesNode
@@ -131,7 +133,7 @@ As ::= WS <('AS' | 'as')> WS
 <AdditiveExpression>	  ::=  	MultiplicativeExpression (WS '+' WS MultiplicativeExpression | WS '-' WS MultiplicativeExpression | ( NumericLiteralPositive | NumericLiteralNegative ) ( (WS '*' WS UnaryExpression ) | (WS '/' WS UnaryExpression ) )* )*
 
 
-MultiplicativeExpression ::= UnaryExpression ( '*' UnaryExpression | '/' UnaryExpression )*
+MultiplicativeExpression ::= UnaryExpression ( '*' WS UnaryExpression | '/' WS UnaryExpression )*
 UnaryExpression ::= '!' PrimaryExpression
 | '+' PrimaryExpression
 | '-' PrimaryExpression
@@ -202,13 +204,14 @@ SubstringExpression   ::=   <'SUBSTR'> <'('> Expression <','> Expression ( <','>
 StrReplaceExpression    ::=   <'REPLACE'> <'('> Expression <','> Expression <','> Expression ( <','> Expression )? <')'>
 ExistsFunc    ::=   <'EXISTS'> GroupGraphPattern
 NotExistsFunc   ::=   <'NOT'> WS <'EXISTS'> GroupGraphPattern
+Separator ::= ( <';'> WS <('SEPARATOR' | 'separator')> WS <'='> String )
 Aggregate   ::=     'COUNT' WS <'('> WS 'DISTINCT'? WS ( '*' | Expression ) WS <')'> WS
 | 'SUM' WS <'('> WS 'DISTINCT'? Expression <')'>
 | 'MIN' <'('>  WS 'DISTINCT'? Expression <')'>
 | 'MAX' <'('>  WS 'DISTINCT'? Expression <')'>
 | 'AVG' <'('>  WS 'DISTINCT'? Expression <')'>
 | 'SAMPLE' <'('>  WS 'DISTINCT'? Expression? Expression <')'>
-| 'GROUP_CONCAT' <'('> WS 'DISTINCT'? Expression ( <';'> WS 'SEPARATOR' WS <'='> WS String WS )? <')'>
+| 'GROUP_CONCAT' <'('> WS 'DISTINCT'? Expression Separator? <')'>
 iriOrFunction	  ::=  	iri ArgList?
 RDFLiteral	  ::=  	String WS ( LANGTAG | ( '^^' iri ) )? WS
 NumericLiteral	  ::=  	NumericLiteralUnsigned WS | NumericLiteralPositive WS | NumericLiteralNegative WS
@@ -245,7 +248,7 @@ EXPONENT	  ::=  	#"[eE][+-]?[0-9]+"
 ECHAR	  ::=  	#"\\[tbnrf]"
 NIL	  ::=  	'(' WS* ')'
 <WS>	  ::=  	<#"[\x20\x09\x0D\x0A]*\#[^\n]*\n*[\x20\x09\x0D\x0A]*|[\x20\x09\x0D\x0A]*">
-ANON	  ::=  	'[' WS* ']'
+ANON ::= <'['> WS* <']'>
 <PN_CHARS_U>	  ::=  	PN_CHARS_BASE | #"_"
 <VARNAME>	  ::=  	( PN_CHARS_U | #"[0-9]" ) ( PN_CHARS_U | #"[0-9]|\u00B7|[\u0300-\u036F]|[\u203F-\u2040]" )*
 <PN_CHARS>	  ::=  	PN_CHARS_U | #"-|[0-9]|\u00B7|[\u0300-\u036F]|[\u203F-\u2040]|/"

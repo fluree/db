@@ -84,7 +84,18 @@
   [coll]
   (where/->typed-val (count coll)))
 
-(def groupconcat clojure.core/concat)
+(defn groupconcat
+  "GroupConcat is a set function which performs a string concatenation across the values
+  of an expression with a group. The order of the strings is not specified. The
+  separator character used in the concatenation may be given with the scalar argument
+  SEPARATOR.
+
+  If the separator scalar argument is absent from GROUP_CONCAT then it is taken to be
+  the space character, unicode codepoint U+0020."
+  ([coll]
+   (groupconcat coll (where/->typed-val " ")))
+  ([coll separator]
+   (where/->typed-val (str/join (:value separator) (mapv :value coll)))))
 
 (defn sample
   [{n :value} coll]
@@ -135,16 +146,16 @@
   ([] (where/->typed-val true))
   ([x] x)
   ([x & next]
-   `(let [and# (:value ~x)]
-      (where/->typed-val (if and# (and (:value ~@next)) and#)))))
+   `(let [and# ~x]
+      (if (:value and#) (-and ~@next) ~x))))
 
 (defmacro -or
   "Equivalent to or"
   ([] (where/->typed-val nil))
   ([x] x)
   ([x & next]
-   `(let [or# (:value ~x)]
-      (where/->typed-val (if or# or# (or (:value ~@next)))))))
+   `(let [or# ~x]
+      (if (:value or#) ~x (-or ~@next)))))
 
 (defn strStarts
   [{s :value} {substr :value}]
@@ -788,10 +799,6 @@
     :else
     x))
 
-(defn mch->typed-val
-  [{::where/keys [val iri datatype-iri meta]}]
-  (where/->typed-val (or iri val) (if iri const/iri-id datatype-iri) (:lang meta)))
-
 (defn bind-variables
   [soln-sym var-syms ctx]
   (into `[~context-var ~ctx]
@@ -799,8 +806,8 @@
                   `[mch# (get ~soln-sym (quote ~var))
                     ;; convert match to TypedValue
                     ~var (if (= ::group/grouping (where/get-datatype-iri mch#))
-                           (mapv mch->typed-val (where/get-binding mch#))
-                           (mch->typed-val mch#))]))
+                           (mapv where/mch->typed-val (where/get-binding mch#))
+                           (where/mch->typed-val mch#))]))
         var-syms))
 
 (defn compile*

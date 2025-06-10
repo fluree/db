@@ -271,6 +271,29 @@
         f    (eval/compile code context false)]
     (where/->var-filter var-name f)))
 
+(defn parse-static-bind
+  [var-name static-value context]
+  (let [mch (where/unmatched-var var-name)
+        v   (get static-value const/iri-value)]
+    (if (some? v)
+      ;; value map
+      (if-let [dt (get static-value const/iri-type)]
+        (where/match-value mch v (json-ld/expand-iri dt context))
+        (if-let [lang (get static-value const/iri-language)]
+          (where/match-lang mch v lang)
+          (where/match-value mch v)))
+      (if-let [iri (get static-value const/iri-id)]
+        ;; id map
+        (where/match-iri mch (json-ld/expand-iri iri context))
+        ;; literal value
+        (where/match-value mch static-value (datatype/infer-iri static-value))))))
+
+(defn parse-bind-expression
+  [var-name expression context]
+  (if (syntax/function? expression)
+    (parse-bind-function var-name expression context)
+    (parse-static-bind var-name expression context)))
+
 (defn parse-subject-iri
   [x context]
   (-> x
@@ -292,9 +315,9 @@
   (into {}
         (comp (partition-all 2)
               (map (fn [[k v]]
-                     (let [var (parse-var-name k)
-                           f   (parse-bind-function var v context)]
-                       [var f]))))
+                     (let [var     (parse-var-name k)
+                           binding (parse-bind-expression var v context)]
+                       [var binding]))))
         binds))
 
 (defn higher-order-pattern?
@@ -377,7 +400,7 @@
                      ;; translate back to string
                     (sparql.translator/parse-term)
                      ;; separate recursion modifier
-                    (split-at (dec (count path-expr)))
+                    (#(split-at (dec (count %)) %))
                      ;; turn back into strings
                     (map (partial apply str)))
         recur-mod   ({"+" :one+ "*" :zero+} mod)]
@@ -873,6 +896,20 @@
         (update :identity #(or % did))
         (dissoc :did))))
 
+(defn jld->parsed-triples
+  "Parses a JSON-LD document into a sequence of update triples. The document
+   will be expanded using the context inside the txn merged with the 
+   provided parsed-context, if not nil.
+   
+   If bound-vars is non-nil, it will replace any variables in the document
+   assuming it is a valid variable placement, otherwise it will throw."
+  [jld bound-vars parsed-context]
+  (-> jld
+      (json-ld/expand parsed-context)
+      util/get-graph
+      util/sequential
+      (parse-triples bound-vars parsed-context)))
+
 (defn parse-stage-txn
   ([txn]
    (parse-stage-txn txn {}))
@@ -885,31 +922,64 @@
                            (parse-where vars context))
          bound-vars    (-> where where/bound-variables (into vars))
          delete        (when-let [dlt (get-named txn "delete")]
-                         (-> dlt
-                             (json-ld/expand context)
-                             util/get-graph
-                             util/sequential
-                             (parse-triples bound-vars context)))
+                         (jld->parsed-triples dlt bound-vars context))
          insert        (when-let [ins (get-named txn "insert")]
-                         (-> ins
-                             (json-ld/expand context)
-                             util/get-graph
-                             util/sequential
-                             (parse-triples bound-vars context)))
+                         (jld->parsed-triples ins bound-vars context))
          annotation    (util/get-first-value txn const/iri-annotation)
          opts          (-> (get-named txn "opts")
                            (parse-txn-opts override-opts context))]
      (when (and (empty? insert) (empty? delete))
        (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
                        {:status 400 :error :db/invalid-transaction})))
-     (cond-> {}
+     (cond-> {:opts opts}
        context      (assoc :context context)
        where        (assoc :where where)
        annotation   (assoc :annotation annotation)
        (seq values) (assoc :values values)
        (seq delete) (assoc :delete delete)
-       (seq insert) (assoc :insert insert)
-       (seq opts)   (assoc :opts opts)))))
+       (seq insert) (assoc :insert insert)))))
+
+(defn blank-node-subject?
+  [parsed-triple]
+  (-> parsed-triple
+      first
+      where/get-iri
+      iri/blank-node-id?))
+
+(defn upsert-where-del
+  "For an upsert transaction.
+   
+   Takes a parsed transaction and for each triple, replaces the object position
+   with a variable and returns a map with :where and :delete keys.
+   
+   Skips blank nodes as they cannot be deleted."
+  [parsed-txn]
+  (loop [[next-triple & r] parsed-txn
+         i      0
+         where  []
+         delete []]
+    (if next-triple
+      (if (blank-node-subject? next-triple)
+        (recur r (inc i) where delete) ;; can't delete blank node properties
+        (let [new-var    (str "?f" i)
+              delete-smt (assoc next-triple 2 (parse-variable new-var))
+              where-smt  (where/->pattern :optional [delete-smt])] ;; use optional so other matched triples still delete if no match
+          (recur r (inc i) (conj where where-smt) (conj delete delete-smt))))
+      {:where  where
+       :delete delete})))
+
+(defn parse-upsert-txn
+  [txn override-opts]
+  (let [context    (or (ctx-util/txn-context txn)
+                       (:context override-opts))
+        opts       (parse-txn-opts nil override-opts context)
+        parsed-txn (jld->parsed-triples txn nil context)
+        {:keys [where delete]} (upsert-where-del parsed-txn)]
+    {:opts    opts
+     :context context
+     :where   where
+     :delete  delete
+     :insert  parsed-txn}))
 
 (defn parse-ledger-txn
   ([txn]

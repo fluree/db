@@ -8,7 +8,7 @@
             [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.range :as query-range]
-            [fluree.db.track.fuel :as fuel]
+            [fluree.db.track :as track]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
@@ -292,12 +292,12 @@
   (vec patterns))
 
 (defprotocol Matcher
-  (-match-id [s fuel-tracker solution s-match error-ch])
-  (-match-triple [s fuel-tracker solution triple error-ch])
-  (-match-class [s fuel-tracker solution triple error-ch])
+  (-match-id [s tracker solution s-match error-ch])
+  (-match-triple [s tracker solution triple error-ch])
+  (-match-class [s tracker solution triple error-ch])
   (-activate-alias [s alias])
   (-aliases [s])
-  (-finalize [s fuel-tracker error-ch solution-ch]))
+  (-finalize [s tracker error-ch solution-ch]))
 
 (defn matcher?
   [x]
@@ -319,7 +319,7 @@
   "Return a channel that will contain all pattern match solutions from flakes in
    `db` that are compatible with the initial solution `solution` and matches the
    additional where-clause pattern `pattern`."
-  (fn [_ds _fuel-tracker _solution pattern _error-ch]
+  (fn [_ds _tracker _solution pattern _error-ch]
     (pattern-type pattern)))
 
 (defn assign-solution-filter
@@ -459,7 +459,7 @@
     [o o-fn]))
 
 (defn resolve-flake-range
-  [{:keys [t] :as db} fuel-tracker error-ch [s-mch p-mch o-mch]]
+  [{:keys [t] :as db} tracker error-ch [s-mch p-mch o-mch]]
   (let [s    (get-sid s-mch db)
         s-fn (::fn s-mch)
         p    (get-sid p-mch db)
@@ -476,8 +476,7 @@
         [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
         start-flake (flake/create s p o* o-dt nil nil util/min-integer)
         end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
-        track-fuel  (when fuel-tracker
-                      (fuel/track fuel-tracker error-ch))
+        track-fuel  (track/track-fuel! tracker error-ch)
         subj-filter (when s-fn
                       (filter (fn [f]
                                 (-> unmatched
@@ -501,7 +500,7 @@
                      :start-flake start-flake
                      :end-flake   end-flake
                      :flake-xf    flake-xf}]
-    (query-range/resolve-flake-slices db fuel-tracker idx error-ch opts)))
+    (query-range/resolve-flake-slices db tracker idx error-ch opts)))
 
 (defn compute-sid
   [s-mch db]
@@ -544,19 +543,19 @@
     async/close!))
 
 (defmethod match-pattern :id
-  [ds fuel-tracker solution pattern error-ch]
+  [ds tracker solution pattern error-ch]
   (let [s-mch (pattern-data pattern)]
-    (-match-id ds fuel-tracker solution s-mch error-ch)))
+    (-match-id ds tracker solution s-mch error-ch)))
 
 (defmethod match-pattern :tuple
-  [ds fuel-tracker solution pattern error-ch]
+  [ds tracker solution pattern error-ch]
   (let [tuple (pattern-data pattern)]
-    (-match-triple ds fuel-tracker solution tuple error-ch)))
+    (-match-triple ds tracker solution tuple error-ch)))
 
 (defmethod match-pattern :class
-  [ds fuel-tracker solution pattern error-ch]
+  [ds tracker solution pattern error-ch]
   (let [triple (pattern-data pattern)]
-    (-match-class ds fuel-tracker solution triple error-ch)))
+    (-match-class ds tracker solution triple error-ch)))
 
 (defn filter-exception
   "Reformats raw filter exception to try to provide more useful feedback."
@@ -585,8 +584,20 @@
   ([value dt-iri lang]
    (->TypedValue (when (some? value) (datatype/coerce value dt-iri)) dt-iri lang)))
 
+(defn mch->typed-val
+  [{::keys [val iri datatype-iri meta]}]
+  (->typed-val (or iri val) (if iri const/iri-id datatype-iri) (:lang meta)))
+
+(defn typed-val->mch
+  [mch {v :value dt :datatype-iri lang :lang}]
+  (if (= dt const/iri-id)
+    (match-iri mch v)
+    (if lang
+      (match-lang mch v lang)
+      (match-value mch v dt))))
+
 (defmethod match-pattern :filter
-  [_ds _fuel-tracker solution pattern error-ch]
+  [_ds _tracker solution pattern error-ch]
   (go
     (let [f (pattern-data pattern)]
       (try*
@@ -598,12 +609,12 @@
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the
   solutions in `solution-ch` and also match the where-clause pattern `pattern`."
-  [ds fuel-tracker pattern error-ch solution-ch]
+  [ds tracker pattern error-ch solution-ch]
   (let [out-ch (async/chan 2)]
     (async/pipeline-async 2
                           out-ch
                           (fn [solution ch]
-                            (-> (match-pattern ds fuel-tracker solution pattern error-ch)
+                            (-> (match-pattern ds tracker solution pattern error-ch)
                                 (async/pipe ch)))
                           solution-ch)
     out-ch))
@@ -617,24 +628,24 @@
   "Returns a channel that will eventually contain all match solutions in the
   dataset `ds` extending from `solution` that also match all the patterns in the
   parsed where clause collection `clause`."
-  [ds fuel-tracker solution clause error-ch]
+  [ds tracker solution clause error-ch]
   (let [initial-ch (async/to-chan! [solution])
         {subquery-patterns true
          other-patterns false} (group-by subquery? clause)
         result-ch (reduce (fn [solution-ch pattern]
-                            (with-constraint ds fuel-tracker pattern error-ch solution-ch))
+                            (with-constraint ds tracker pattern error-ch solution-ch))
                           initial-ch
                           ;; process subqueries before other patterns
                           (into (vec subquery-patterns) other-patterns))]
-    (-finalize ds fuel-tracker error-ch result-ch)))
+    (-finalize ds tracker error-ch result-ch)))
 
 (defn match-alias
-  [ds alias fuel-tracker solution clause error-ch]
+  [ds alias tracker solution clause error-ch]
   (let [res-ch (async/chan)]
     (go
       (try*
         (when-let [graph (<? (-activate-alias ds alias))]
-          (-> (match-clause graph fuel-tracker solution clause error-ch)
+          (-> (match-clause graph tracker solution clause error-ch)
               (async/pipe res-ch)))
         (catch* e
           (log/error e "Error activating alias" alias)
@@ -646,24 +657,24 @@
     res-ch))
 
 (defmethod match-pattern :exists
-  [ds fuel-tracker solution pattern error-ch]
+  [ds tracker solution pattern error-ch]
   (let [clause (pattern-data pattern)]
     (go
       ;; exists uses existing bindings
-      (when (async/<! (match-clause ds fuel-tracker solution clause error-ch))
+      (when (async/<! (match-clause ds tracker solution clause error-ch))
         solution))))
 
 (defmethod match-pattern :not-exists
-  [ds fuel-tracker solution pattern error-ch]
+  [ds tracker solution pattern error-ch]
   ;; not exists removes a pattern
   (let [clause (pattern-data pattern)]
     (go
       ;; not-exists uses existing bindings
-      (when-not (async/<! (match-clause ds fuel-tracker solution clause error-ch))
+      (when-not (async/<! (match-clause ds tracker solution clause error-ch))
         solution))))
 
 (defmethod match-pattern :minus
-  [ds fuel-tracker solution pattern error-ch]
+  [ds tracker solution pattern error-ch]
   ;; minus performs a set difference, removing a provided solution if the same solution
   ;; produced by the minus pattern
   (let [clause   (pattern-data pattern)
@@ -674,52 +685,52 @@
     (go
       ;; minus does not use existing bindings
       ;; if a minus solutions equals the provided solution, remove the provided solution
-      (when-not (-> (match-clause ds fuel-tracker {} clause error-ch)
+      (when-not (-> (match-clause ds tracker {} clause error-ch)
                     (async/pipe minus-ch)
                     (async/<!))
         solution))))
 
 (defmethod match-pattern :query
-  [ds fuel-tracker solution pattern error-ch]
+  [ds tracker solution pattern error-ch]
   (let [subquery-fn (pattern-data pattern)
         out-ch (async/chan 2 (map (fn [soln] (merge solution soln))))]
-    (async/pipe (subquery-fn ds fuel-tracker error-ch) out-ch)))
+    (async/pipe (subquery-fn ds tracker error-ch) out-ch)))
 
 (defmethod match-pattern :graph
-  [ds fuel-tracker solution pattern error-ch]
+  [ds tracker solution pattern error-ch]
   (let [[g clause] (pattern-data pattern)]
     (if-let [v (get-variable g)]
       (if-let [v-match (get solution v)]
         (let [alias (or (get-iri v-match)
                         (get-value v-match))]
-          (match-alias ds alias fuel-tracker solution clause error-ch))
+          (match-alias ds alias tracker solution clause error-ch))
         (let [out-ch   (async/chan)
               alias-ch (-> ds -aliases async/to-chan!)]
           (async/pipeline-async 2
                                 out-ch
                                 (fn [alias ch]
                                   (let [solution* (update solution v match-iri alias)]
-                                    (-> (match-alias ds alias fuel-tracker solution* clause error-ch)
+                                    (-> (match-alias ds alias tracker solution* clause error-ch)
                                         (async/pipe ch))))
                                 alias-ch)
           out-ch))
-      (match-alias ds g fuel-tracker solution clause error-ch))))
+      (match-alias ds g tracker solution clause error-ch))))
 
 (defmethod match-pattern :union
-  [db fuel-tracker solution pattern error-ch]
+  [db tracker solution pattern error-ch]
   (let [clauses   (pattern-data pattern)
         clause-ch (async/to-chan! clauses)
         out-ch    (async/chan 2)]
     (async/pipeline-async 2
                           out-ch
                           (fn [clause ch]
-                            (-> (match-clause db fuel-tracker solution clause error-ch)
+                            (-> (match-clause db tracker solution clause error-ch)
                                 (async/pipe ch)))
                           clause-ch)
     out-ch))
 
 (defmethod match-pattern :values
-  [_db _fuel-tracker solution pattern _error-ch]
+  [_db _tracker solution pattern _error-ch]
   (let [inline-solutions (pattern-data pattern)
         ;; transform a match into its identity for equality checks
         match-identity   (juxt get-iri get-value get-datatype-iri (comp get-meta :lang))
@@ -774,35 +785,36 @@
                    rf))))))))
 
 (defmethod match-pattern :optional
-  [db fuel-tracker solution pattern error-ch]
+  [db tracker solution pattern error-ch]
   (let [clause (pattern-data pattern)
         opt-ch (async/chan 2 (with-default solution))]
-    (-> (match-clause db fuel-tracker solution clause error-ch)
+    (-> (match-clause db tracker solution clause error-ch)
         (async/pipe opt-ch))))
 
-(defn bind-function-result
-  [solution var-name result]
-  (let [{v :value dt :datatype-iri} result
-        mch (if (= dt const/iri-id)
-              (-> var-name unmatched-var (match-iri v))
-              (-> var-name unmatched-var (match-value v dt)))]
-    (if-let [current (get solution var-name)]
-      (when (and (= (get-binding mch) (get-binding current))
-                 (= (get-datatype-iri mch) (get-datatype-iri current))
-                 (= (get-lang mch) (get-lang current)))
-        solution)
-      (assoc solution var-name mch))))
+(defn update-solution-binding
+  [solution var-name mch]
+  (if-let [current (get solution var-name)]
+    (when (and (= (get-binding mch) (get-binding current))
+               (= (get-datatype-iri mch) (get-datatype-iri current))
+               (= (get-lang mch) (get-lang current)))
+      solution)
+    (assoc solution var-name mch)))
 
 (defmethod match-pattern :bind
-  [_db _fuel-tracker solution pattern error-ch]
+  [_db _tracker solution pattern error-ch]
   (go
     (let [binds     (-> pattern pattern-data vals)
           solution* (reduce (fn [soln b]
                               (let [f        (::fn b)
                                     var-name (::var b)]
                                 (try*
-                                  (let [result (f soln)]
-                                    (or (bind-function-result soln var-name result)
+                                  (if f
+                                    (let [result (f soln)
+                                          result-mch (typed-val->mch (unmatched-var var-name) result)]
+                                      (or (update-solution-binding soln var-name result-mch)
+                                          (assoc soln ::invalidated true)))
+                                    ;; static binding
+                                    (or (update-solution-binding soln var-name b)
                                         (assoc soln ::invalidated true)))
                                   (catch* e (update soln ::errors conj e)))))
                             solution binds)]
@@ -810,6 +822,14 @@
         (async/onto-chan! error-ch errors)
         (when-not (::invalidated solution*)
           solution*)))))
+
+(defmethod match-pattern :default
+  [_db _tracker _solution pattern error-ch]
+  (go
+    (>! error-ch
+        (ex-info (str "Unknown pattern type: " (pattern-type pattern))
+                 {:status 400
+                  :error  :db/invalid-query}))))
 
 (def blank-solution {})
 
@@ -822,9 +842,9 @@
       async/to-chan!))
 
 (defn search
-  ([ds q fuel-tracker error-ch]
-   (search ds q fuel-tracker error-ch nil))
-  ([ds q fuel-tracker error-ch initial-solution-ch]
+  ([ds q tracker error-ch]
+   (search ds q tracker error-ch nil))
+  ([ds q tracker error-ch initial-solution-ch]
    (let [out-ch               (async/chan 2)
          initial-solution-ch* (or initial-solution-ch
                                   (values-initial-solution q))]
@@ -832,7 +852,7 @@
        (async/pipeline-async 2
                              out-ch
                              (fn [initial-solution ch]
-                               (-> (match-clause ds fuel-tracker initial-solution where-clause error-ch)
+                               (-> (match-clause ds tracker initial-solution where-clause error-ch)
                                    (async/pipe ch)))
                              initial-solution-ch*)
        (async/pipe initial-solution-ch* out-ch))

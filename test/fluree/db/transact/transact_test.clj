@@ -5,7 +5,7 @@
             [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
-            [jsonista.core :as json]
+            [fluree.db.util.json :as json]
             [test-with-files.tools :refer [with-tmp-dir]]))
 
 (deftest ^:integration staging-data
@@ -233,8 +233,8 @@
 (deftest ^:integration transact-large-dataset-test
   (with-tmp-dir storage-path
     (testing "can transact a big movies dataset w/ SHACL constraints"
-      (let [shacl   (-> "movies2-schema.json" io/resource json/read-value)
-            movies  (-> "movies2.json" io/resource json/read-value)
+      (let [shacl   (-> "movies2-schema.json" io/resource slurp (json/parse false))
+            movies  (-> "movies2.json" io/resource slurp (json/parse false))
             ;; TODO: Once :method :memory supports indexing, switch to that.
             conn    @(fluree/connect-file {:storage-path storage-path})
             ledger  @(fluree/create conn "movies2")
