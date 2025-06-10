@@ -11,6 +11,7 @@
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.query.sparql.translator :as sparql.translator]
+            [fluree.db.query.turtle.parse :as turtle]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
@@ -969,11 +970,15 @@
        :delete delete})))
 
 (defn parse-upsert-txn
-  [txn override-opts]
-  (let [context    (or (ctx-util/txn-context txn)
-                       (:context override-opts))
-        opts       (parse-txn-opts nil override-opts context)
-        parsed-txn (jld->parsed-triples txn nil context)
+  [txn {:keys [context format] :as opts}]
+  (let [turtle?    (= :turtle format)
+        context    (when-not turtle?
+                     (or (ctx-util/txn-context txn)
+                         context))
+        opts       (parse-txn-opts nil opts context)
+        parsed-txn (if turtle?
+                     (turtle/parse txn)
+                     (jld->parsed-triples txn nil context))
         {:keys [where delete]} (upsert-where-del parsed-txn)]
     {:opts    opts
      :context context

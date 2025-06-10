@@ -219,13 +219,15 @@
    Multiple inserts and updates can be staged together and will be merged into a single
    transaction when committed.
 
+   Supports JSON-LD (default) and Turtle (TTL) formats.
+
    The 'opts' key is a map with the following key options:
     - `:context` - (optional) and externally provided context that will be used
-                   for document expansition, the @context in the json-ld will be
-                   ignored if present.
-
-   The data is expected to be in JSON-LD format, and will be expanded before
-   being inserted into the database."
+                   for JSON-LD document expansition, the @context in the json-ld
+                   will be ignored if present.
+    - `:format`  - (optional) the format of the data, currently json-ld is assumed
+                  unless `:format` is set to `:turtle`. If `:turtle` is set,
+                  the `:context` option will be ignored if provided."
   ([db json-ld] (insert db json-ld nil))
   ([db json-ld opts]
    (promise-wrap
@@ -236,10 +238,15 @@
    or update the existing data if it does. This is useful for ensuring that a
    specific document is present in the database with the desired values.
 
+   Supports JSON-LD and Turtle (TTL) formats.
+
    The 'opts' key is a map with the following key options:
     - `:context` - (optional) and externally provided context that will be used
                    for document expansion, the @context in the json-ld will be 
                    ignored if present.
+   - `:format`  - (optional) the format of the data, currently json-ld is assumed
+                  unless `:format` is set to `:turtle`. If `:turtle` is set,
+                  the `:context` option will be ignored if provided.
 
    The data is expected to be in JSON-LD format, and will be expanded before
    being inserted into the database."
