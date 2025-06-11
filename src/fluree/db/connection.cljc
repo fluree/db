@@ -356,9 +356,8 @@
                 publish-addrs (<? (publishing-addresses conn ledger-alias))
                 pubs          (publishers conn)
                 ledger-opts   (parse-ledger-options conn opts)
-                ledger        (<! (ledger/create {:conn              conn
-                                                  :alias             ledger-alias
-                                                  :address           addr
+                ledger        (<! (ledger/create {:alias             ledger-alias
+                                                  :primary-address   addr
                                                   :publish-addresses publish-addrs
                                                   :commit-catalog    commit-catalog
                                                   :index-catalog     index-catalog
@@ -400,7 +399,7 @@
                 {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
 
                 pubs   (publishers conn)
-                ledger (ledger/instantiate conn ledger-alias address branch commit-catalog
+                ledger (ledger/instantiate ledger-alias address branch commit-catalog
                                            index-catalog pubs indexing did expanded-commit)]
             (subscribe-ledger conn ledger-alias)
             (async/put! ledger-chan ledger)
@@ -532,22 +531,25 @@
 (def f-context {"f" "https://ns.flur.ee/ledger#"})
 
 (defn save-txn!
-  [{:keys [commit-catalog] :as _conn} ledger-alias txn]
+  [{:keys [commit-catalog] ledger-alias :alias,  :as _ledger} txn]
   (let [path (str/join "/" [ledger-alias "txn"])]
     (storage/content-write-json commit-catalog path txn)))
 
 (defn resolve-txn
+  "Reads a transaction from the commit catalog by address.
+   
+   Used by fluree/server in consensus/events."
   [{:keys [commit-catalog] :as _conn} address]
   (storage/read-json commit-catalog address))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
 ;; TODO - however this is really a concern of "commit", not staging and I don't think the db should be handling any of it
 (defn write-transaction!
-  [conn ledger-alias staged]
+  [ledger staged]
   (go-try
     (let [{:keys [txn author annotation]} staged]
       (if txn
-        (let [{txn-id :address} (<? (save-txn! conn ledger-alias txn))]
+        (let [{txn-id :address} (<? (save-txn! ledger txn))]
           {:txn-id     txn-id
            :author     author
            :annotation annotation})
@@ -587,9 +589,11 @@
 
 (defn publish-commit
   "Publishes commit to all nameservices registered with the ledger."
-  [{:keys [primary-publisher secondary-publishers] :as _conn} commit-jsonld]
+  [{:keys [publishers] :as _ledger} commit-jsonld]
   (go-try
-    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
+    (let [primary-publisher (first publishers)
+          secondary-publishers (rest publishers)
+          result (<? (nameservice/publish primary-publisher commit-jsonld))]
       (nameservice/publish-to-all commit-jsonld secondary-publishers)
       result)))
 
@@ -653,11 +657,11 @@
   returns a db with an updated :commit."
   ([ledger db]
    (commit! ledger db {}))
-  ([{:keys [conn] ledger-alias :alias, :as ledger}
+  ([{ledger-alias :alias, :as ledger}
     {:keys [branch t stats commit] :as staged-db}
     opts]
    (go-try
-     (let [{:keys [commit-catalog]} conn
+     (let [{:keys [commit-catalog]} ledger
 
            {:keys [tag time message did private commit-data-opts index-files-ch]
             :or   {time (util/current-time-iso)}}
@@ -667,7 +671,7 @@
            (flake-db/db->jsonld staged-db commit-data-opts)
 
            {:keys [txn-id author annotation]}
-           (<? (write-transaction! conn ledger-alias staged-txn))
+           (<? (write-transaction! ledger staged-txn))
 
            data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
            db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
@@ -696,7 +700,7 @@
 
        (log/debug "Committing t" t "at" time)
 
-       (<? (publish-commit conn commit-jsonld))
+       (<? (publish-commit ledger commit-jsonld))
 
        (if (track/track-txn? opts)
          (-> write-result
