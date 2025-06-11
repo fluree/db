@@ -156,12 +156,11 @@
   context."
   [{:keys [alias primary-address publish-addresses commit-catalog index-catalog
            publishers]}
-   {:keys [did branch indexing] :as opts}]
+   {:keys [did branch indexing] :as _opts}]
   (go-try
     (let [ledger-alias*  (normalize-alias alias)
           ;; internal-only opt used for migrating ledgers without genesis commits
-          init-time      (or (:fluree.db.json-ld.migrate.sid/time opts)
-                             (util/current-time-iso))
+          init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit
                               commit-catalog alias branch publish-addresses init-time))]
       (instantiate ledger-alias* primary-address branch commit-catalog index-catalog
