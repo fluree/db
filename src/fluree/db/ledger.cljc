@@ -116,7 +116,7 @@
                     current-t)
           ::newer)))))
 
-(defrecord Ledger [conn id address alias did state cache commit-catalog
+(defrecord Ledger [id address alias did state cache commit-catalog
                    index-catalog reasoner publishers])
 
 (defn initial-state
