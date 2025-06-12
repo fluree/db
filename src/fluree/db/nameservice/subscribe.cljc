@@ -2,9 +2,9 @@
   (:require [clojure.core.async :as async :refer [<! go-loop]]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
-            [fluree.db.nameservice :as nameservice]
             [fluree.db.ledger :as ledger]
-            [fluree.db.util.async :refer [<? go-try]] 
+            [fluree.db.nameservice :as nameservice]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.log :as log]))
 

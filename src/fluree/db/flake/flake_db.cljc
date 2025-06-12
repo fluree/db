@@ -30,12 +30,12 @@
             [fluree.db.query.fql :as fql]
             [fluree.db.query.history :refer [AuditLog]]
             [fluree.db.query.range :as query-range]
-            [fluree.db.reasoner :as reasoner] 
+            [fluree.db.reasoner :as reasoner]
             [fluree.db.time-travel :refer [TimeTravel]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [try* catch* get-first get-first-value]]
-            [fluree.db.util.reasoner :as reasoner-util]
             [fluree.db.util.log :as log]
+            [fluree.db.util.reasoner :as reasoner-util]
             [fluree.db.virtual-graph.flat-rank :as flat-rank]
             [fluree.db.virtual-graph.index-graph :as vg])
   #?(:clj (:import (java.io Writer))))
