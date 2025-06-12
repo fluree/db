@@ -4,8 +4,8 @@
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.transact :as flake.transact]
             [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.util.log :as log]))
@@ -91,7 +91,7 @@
       ;; note, index updates will have same t value as current one, so still need to check if t = current-t
       (cond
         (= commit-t (flake/next-t current-t))
-        (let [updated-db (<? (transact/-merge-commit db expanded-commit expanded-data))]
+        (let [updated-db (<? (flake.transact/-merge-commit db expanded-commit expanded-data))]
           (update-commit! ledger branch updated-db)
           ::updated)
 

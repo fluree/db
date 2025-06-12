@@ -4,6 +4,7 @@
             [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake.flake-db :as flake-db]
+            [fluree.db.flake.transact :as flake.transact]
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
@@ -11,7 +12,6 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.history :as history]
             [fluree.db.time-travel :as time-travel]
-            [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log])
@@ -121,15 +121,15 @@
       (let [db (<? db-chan)]
         (<? (subject/-iri-visible? db tracker iri)))))
 
-  transact/Transactable
+  flake.transact/Transactable
   (-stage-txn [_ tracker context identity author annotation raw-txn parsed-txn]
     (go-try
       (let [db (<? db-chan)]
-        (<? (transact/-stage-txn db tracker context identity author annotation raw-txn parsed-txn)))))
+        (<? (flake.transact/-stage-txn db tracker context identity author annotation raw-txn parsed-txn)))))
   (-merge-commit [_ commit-jsonld commit-data-jsonld]
     (go-try
       (let [db (<? db-chan)]
-        (<? (transact/-merge-commit db commit-jsonld commit-data-jsonld)))))
+        (<? (flake.transact/-merge-commit db commit-jsonld commit-data-jsonld)))))
 
   indexer/Indexable
   (index [_ changes-ch]

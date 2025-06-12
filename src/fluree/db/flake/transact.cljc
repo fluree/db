@@ -16,6 +16,10 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defprotocol Transactable
+  (-stage-txn [db tracker context identity author annotation raw-txn parsed-txn])
+  (-merge-commit [db commit-jsonld commit-data-jsonld]))
+
 ;; TODO - can use transient! below
 (defn stage-update-novelty
   "If a db is staged more than once, any retractions in a previous stage will
