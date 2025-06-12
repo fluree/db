@@ -1,4 +1,4 @@
-(ns fluree.db.nameservice.subscribe
+(ns fluree.db.nameservice.sub
   (:require [clojure.core.async :as async :refer [<! go-loop]]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]

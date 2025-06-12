@@ -9,7 +9,7 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.nameservice.subscribe :as ns-subscribe]
+            [fluree.db.nameservice.sub :as ns-subscribe]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
