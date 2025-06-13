@@ -117,7 +117,7 @@
           ::newer)))))
 
 (defrecord Ledger [id address alias did state cache commit-catalog
-                   index-catalog reasoner publishers])
+                   index-catalog reasoner primary-publisher secondary-publishers])
 
 (defn initial-state
   [branches current-branch]
@@ -128,20 +128,22 @@
 (defn instantiate
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [ledger-alias ledger-address branch commit-catalog index-catalog publishers
+  [ledger-alias ledger-address branch commit-catalog index-catalog primary-publisher secondary-publishers
    indexing-opts did latest-commit]
-  (let [branches {branch (branch/state-map ledger-alias branch commit-catalog index-catalog
+  (let [publishers (cons primary-publisher secondary-publishers)
+        branches {branch (branch/state-map ledger-alias branch commit-catalog index-catalog
                                            publishers latest-commit indexing-opts)}]
-    (map->Ledger {:id             (random-uuid)
-                  :did            did
-                  :state          (atom (initial-state branches branch))
-                  :alias          ledger-alias
-                  :address        ledger-address
-                  :commit-catalog commit-catalog
-                  :index-catalog  index-catalog
-                  :publishers     publishers
-                  :cache          (atom {})
-                  :reasoner       #{}})))
+    (map->Ledger {:id                   (random-uuid)
+                  :did                  did
+                  :state                (atom (initial-state branches branch))
+                  :alias                ledger-alias
+                  :address              ledger-address
+                  :commit-catalog       commit-catalog
+                  :index-catalog        index-catalog
+                  :primary-publisher    primary-publisher
+                  :secondary-publishers secondary-publishers
+                  :cache                (atom {})
+                  :reasoner             #{}})))
 
 (defn normalize-alias
   "For a ledger alias, removes any preceding '/' or '#' if exists."
@@ -155,7 +157,7 @@
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
   [{:keys [alias primary-address publish-addresses commit-catalog index-catalog
-           publishers]}
+           primary-publisher secondary-publishers]}
    {:keys [did branch indexing] :as _opts}]
   (go-try
     (let [ledger-alias*  (normalize-alias alias)
@@ -164,4 +166,4 @@
           genesis-commit (<? (commit-storage/write-genesis-commit
                               commit-catalog alias branch publish-addresses init-time))]
       (instantiate ledger-alias* primary-address branch commit-catalog index-catalog
-                   publishers indexing did genesis-commit))))
+                   primary-publisher secondary-publishers indexing did genesis-commit))))

@@ -345,7 +345,7 @@
                   {:status 409, :error :db/ledger-exists})))
 
 (defn create-ledger
-  [{:keys [commit-catalog index-catalog] :as conn} ledger-alias opts]
+  [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn} ledger-alias opts]
   (go-try
     (if (<? (ledger-exists? conn ledger-alias))
       (throw-ledger-exists ledger-alias)
@@ -354,14 +354,14 @@
           (throw-ledger-exists ledger-alias)
           (let [addr          (<? (primary-address conn ledger-alias))
                 publish-addrs (<? (publishing-addresses conn ledger-alias))
-                pubs          (publishers conn)
                 ledger-opts   (parse-ledger-options conn opts)
-                ledger        (<! (ledger/create {:alias             ledger-alias
-                                                  :primary-address   addr
-                                                  :publish-addresses publish-addrs
-                                                  :commit-catalog    commit-catalog
-                                                  :index-catalog     index-catalog
-                                                  :publishers        pubs}
+                ledger        (<! (ledger/create {:alias                ledger-alias
+                                                  :primary-address      addr
+                                                  :publish-addresses    publish-addrs
+                                                  :commit-catalog       commit-catalog
+                                                  :index-catalog        index-catalog
+                                                  :primary-publisher    primary-publisher 
+                                                  :secondary-publishers secondary-publishers}
                                                  ledger-opts))]
             (when (util/exception? ledger)
               (release-ledger conn ledger-alias))
@@ -384,7 +384,7 @@
                   {:status 400, :error :db/missing-branch})))
 
 (defn load-ledger*
-  [{:keys [commit-catalog index-catalog] :as conn}
+  [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn}
    ledger-chan address]
   (go-try
     (if-let [commit (<? (lookup-commit conn address))]
@@ -397,10 +397,8 @@
                                     (or (throw-missing-branch address ledger-alias)))
 
                 {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
-
-                pubs   (publishers conn)
-                ledger (ledger/instantiate ledger-alias address branch commit-catalog
-                                           index-catalog pubs indexing did expanded-commit)]
+                ledger (ledger/instantiate ledger-alias address branch commit-catalog index-catalog
+                                           primary-publisher secondary-publishers indexing did expanded-commit)]
             (subscribe-ledger conn ledger-alias)
             (async/put! ledger-chan ledger)
             ledger))
@@ -589,11 +587,9 @@
 
 (defn publish-commit
   "Publishes commit to all nameservices registered with the ledger."
-  [{:keys [publishers] :as _ledger} commit-jsonld]
+  [{:keys [primary-publisher secondary-publishers] :as _ledger} commit-jsonld]
   (go-try
-    (let [primary-publisher (first publishers)
-          secondary-publishers (rest publishers)
-          result (<? (nameservice/publish primary-publisher commit-jsonld))]
+    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
       (nameservice/publish-to-all commit-jsonld secondary-publishers)
       result)))
 
