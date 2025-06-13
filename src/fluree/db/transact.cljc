@@ -200,11 +200,9 @@
 
 (defn publish-commit
   "Publishes commit to all nameservices registered with the ledger."
-  [{:keys [publishers] :as _ledger} commit-jsonld]
+  [{:keys [primary-publisher secondary-publishers] :as _ledger} commit-jsonld]
   (go-try
-    (let [primary-publisher (first publishers)
-          secondary-publishers (rest publishers)
-          result (<? (nameservice/publish primary-publisher commit-jsonld))]
+    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
       (nameservice/publish-to-all commit-jsonld secondary-publishers)
       result)))
 
