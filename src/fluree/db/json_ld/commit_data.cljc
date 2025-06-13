@@ -493,7 +493,7 @@
 
 (defn- handle-list-values
   [objs]
-  {"@list" (->> objs (sort-by :i) (map #(dissoc % :i)))})
+  {"@list" (->> objs (sort-by :i) (mapv #(dissoc % :i)))})
 
 (defn- add-obj-list-meta
   [obj-ser flake]
