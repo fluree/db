@@ -87,13 +87,13 @@ publish-webworker: js-packages/webworker/fluree-webworker.js js-packages/webwork
 
 publish-js: publish-nodejs publish-browser publish-webworker
 
-docs/fluree.db.json-ld.api.html docs/index.html: src/fluree/db/json_ld/api.cljc
+docs/fluree.db.api.html docs/index.html: src/fluree/db/api.cljc
 	clojure -T:build docs :output-path "\"$(@D)\""
 
 docs/%.html: docs/%.md
 	clojure -T:build docs :output-path "\"$(@D)\""
 
-docs: docs/fluree.db.json-ld.api.html docs/index.html $(DOCS_TARGETS)
+docs: docs/fluree.db.api.html docs/index.html $(DOCS_TARGETS)
 
 cljs-browser-test: node_modules package-lock.json
 	npx shadow-cljs release browser-test
