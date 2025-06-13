@@ -360,7 +360,7 @@
                                                   :publish-addresses    publish-addrs
                                                   :commit-catalog       commit-catalog
                                                   :index-catalog        index-catalog
-                                                  :primary-publisher    primary-publisher 
+                                                  :primary-publisher    primary-publisher
                                                   :secondary-publishers secondary-publishers}
                                                  ledger-opts))]
             (when (util/exception? ledger)
