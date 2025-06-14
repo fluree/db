@@ -2,7 +2,7 @@
   (:require [clojure.core.async :as async :refer [>! chan go]]
             [clojure.string :as str]
             [fluree.db.constants :as const]
-            [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-first-id

@@ -2,10 +2,10 @@
   (:require [clojure.core.async :as async :refer [<! >! go go-loop]]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.index :as index]
             [fluree.db.flake.index.storage :as storage]
             [fluree.db.indexer.garbage :as garbage]
-            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]))

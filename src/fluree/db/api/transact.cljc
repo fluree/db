@@ -1,13 +1,16 @@
 (ns fluree.db.api.transact
   (:refer-clojure :exclude [update])
-  (:require [fluree.db.connection :as connection]
+  (:require [clojure.core.async :as async]
+            [fluree.db.connection :as connection]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.query.turtle.parse :as turtle]
+            [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
+            [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]))
 
 (defn format-txn
@@ -24,14 +27,14 @@
                            (turtle/parse rdf)
                            (parse/jld->parsed-triples rdf nil context*))
           parsed-txn {:insert parsed-triples}]
-      (<? (connection/stage-triples db parsed-txn)))))
+      (<? (transact/stage-triples db parsed-txn)))))
 
 (defn upsert
   [db rdf opts]
   (go-try
     (let [opts* (assoc opts :context (json-ld/parse-context (:context opts)))
           parsed-txn (parse/parse-upsert-txn rdf opts*)]
-      (<? (connection/stage-triples db parsed-txn)))))
+      (<? (transact/stage-triples db parsed-txn)))))
 
 (defn update
   [db txn override-opts]
@@ -39,7 +42,11 @@
     (let [parsed-txn (-> txn
                          (format-txn override-opts)
                          (parse/parse-stage-txn override-opts))]
-      (<? (connection/stage-triples db parsed-txn)))))
+      (<? (transact/stage-triples db parsed-txn)))))
+
+(defn- not-found?
+  [e]
+  (-> e ex-data :status (= 404)))
 
 (defn transact!
   ([conn txn]
@@ -48,8 +55,16 @@
    (go-try
      (let [parsed-txn (-> txn
                           (format-txn override-opts)
-                          (parse/parse-ledger-txn override-opts))]
-       (<? (connection/transact! conn parsed-txn))))))
+                          (parse/parse-ledger-txn override-opts))
+           ledger-id (:ledger-id parsed-txn)
+           ledger (async/<! (connection/load-ledger conn ledger-id))]
+       (if (util/exception? ledger)
+         (if (not-found? ledger)
+           (throw (ex-info (str "Ledger " ledger-id " does not exist")
+                           {:status 409 :error :db/ledger-not-exists}
+                           ledger))
+           (throw ledger))
+         (<? (transact/transact-ledger! ledger parsed-txn)))))))
 
 (defn credential-transact!
   "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.
@@ -88,7 +103,7 @@
                                                                            ; to check.
            ledger-opts (-> parsed-txn :opts syntax/coerce-ledger-opts)
            ledger      (<? (connection/create-ledger conn ledger-id ledger-opts))]
-       (<? (connection/transact-ledger! conn ledger parsed-txn))))))
+       (<? (transact/transact-ledger! ledger parsed-txn))))))
 
 (defn credential-create-with-txn!
   [conn txn]
