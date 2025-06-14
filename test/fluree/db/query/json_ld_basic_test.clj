@@ -50,16 +50,22 @@
                                              :depth     3})]
             (is (= {:id                               :wiki/Q836821,
                     :type                             :schema/Movie,
-                    :schema/name                      "The Hitchhiker's Guide to the Galaxy",
-                    :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
-                    :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
+                    :schema/name                      {:value "The Hitchhiker's Guide to the Galaxy",
+                                                       :type  :xsd/string},
+                    :schema/disambiguatingDescription {:value "2005 British-American comic science fiction film directed by Garth Jennings",
+                                                       :type  :xsd/string},
+                    :schema/titleEIDR                 {:value "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
+                                                       :type  :xsd/string},
                     :schema/isBasedOn                 {:id            :wiki/Q3107329,
                                                        :type          :schema/Book,
-                                                       :schema/name   "The Hitchhiker's Guide to the Galaxy",
-                                                       :schema/isbn   "0-330-25864-8",
+                                                       :schema/name   {:value "The Hitchhiker's Guide to the Galaxy",
+                                                                       :type  :xsd/string},
+                                                       :schema/isbn   {:value "0-330-25864-8",
+                                                                       :type  :xsd/string},
                                                        :schema/author {:id          :wiki/Q42,
                                                                        :type        :schema/Person,
-                                                                       :schema/name "Douglas Adams"}}}
+                                                                       :schema/name {:value "Douglas Adams",
+                                                                                     :type  :xsd/string}}}}
                    query-res))))
         (testing "using graph sub-selection"
           (let [query-res @(fluree/query db {:context   context
@@ -67,17 +73,48 @@
                                              :depth     3})]
             (is (= {:id                               :wiki/Q836821,
                     :type                             :schema/Movie,
-                    :schema/name                      "The Hitchhiker's Guide to the Galaxy",
-                    :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
-                    :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
+                    :schema/name                      {:value            "The Hitchhiker's Guide to the Galaxy",
+                                                       :type             :xsd/string},
+                    :schema/disambiguatingDescription {:value            "2005 British-American comic science fiction film directed by Garth Jennings"
+                                                       :type             :xsd/string},
+                    :schema/titleEIDR                 {:value            "10.5240/B752-5B47-DBBE-E5D4-5A3F-N"
+                                                       :type             :xsd/string},
                     :schema/isBasedOn                 {:id            :wiki/Q3107329,
                                                        :type          :schema/Book,
-                                                       :schema/name   "The Hitchhiker's Guide to the Galaxy",
-                                                       :schema/isbn   "0-330-25864-8",
+                                                       :schema/name   {:value            "The Hitchhiker's Guide to the Galaxy",
+                                                                       :type             :xsd/string},
+                                                       :schema/isbn   {:value            "0-330-25864-8",
+                                                                       :type             :xsd/string},
                                                        :schema/author {:id          :wiki/Q42,
                                                                        :type        :schema/Person,
                                                                        :schema/name "Douglas Adams"}}}
-                   query-res))))))))
+                   query-res)))))
+      (testing "expanding literal nodes"
+        (testing "with wildcard"
+          (let [q {:context context
+                   :selectOne {:wiki/Q836821 [:* {:schema/name [:*]}]}}]
+            (is (= {:type             :schema/Movie,
+                    :schema/disambiguatingDescription
+                    "2005 British-American comic science fiction film directed by Garth Jennings",
+                    :schema/isBasedOn {:id :wiki/Q3107329},
+                    :schema/name
+                    {:value "The Hitchhiker's Guide to the Galaxy", :type :xsd/string},
+                    :schema/titleEIDR "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
+                    :id               :wiki/Q836821}
+                   @(fluree/query db q))
+                "returns all defined virtual properties")))
+        (testing "with specific virtual properties"
+          (let [q {:context   context
+                   :selectOne {:wiki/Q836821 [:* {:schema/name [:type]}]}}]
+            (is (= {:type             :schema/Movie,
+                    :schema/disambiguatingDescription
+                    "2005 British-American comic science fiction film directed by Garth Jennings",
+                    :schema/isBasedOn {:id :wiki/Q3107329},
+                    :schema/name      {:type :xsd/string},
+                    :schema/titleEIDR "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
+                    :id               :wiki/Q836821}
+                   @(fluree/query db q))
+                "returns only the virtual properties queried for")))))))
 
 (deftest ^:integration json-ld-rdf-type-query
   (testing "json-ld rdf type queries"

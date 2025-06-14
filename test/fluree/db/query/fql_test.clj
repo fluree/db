@@ -335,23 +335,23 @@
         (is (= [{:id :ex/alice,
                  :ex/firstLetter ["A"],
                  :ex/const ["const"],
-                 :ex/greeting [{"@value" "hola", "@language" "es"}],
-                 :ex/date [{"@value" "2020-01-10", :type "ex:mydate"}]}
+                 :ex/greeting [{:value "hola", "@language" "es"}],
+                 :ex/date [{:value "2020-01-10", :type "ex:mydate"}]}
                 {:id :ex/brian,
                  :ex/firstLetter ["B"],
                  :ex/const ["const"],
-                 :ex/greeting [{"@value" "hola", "@language" "es"}],
-                 :ex/date [{"@value" "2020-01-10", :type "ex:mydate"}]}
+                 :ex/greeting [{:value "hola", "@language" "es"}],
+                 :ex/date [{:value "2020-01-10", :type "ex:mydate"}]}
                 {:id :ex/cam,
                  :ex/firstLetter ["C"],
                  :ex/const ["const"],
-                 :ex/greeting [{"@value" "hola", "@language" "es"}],
-                 :ex/date [{"@value" "2020-01-10", :type "ex:mydate"}]}
+                 :ex/greeting [{:value "hola", "@language" "es"}],
+                 :ex/date [{:value "2020-01-10", :type "ex:mydate"}]}
                 {:id :ex/liam,
                  :ex/firstLetter ["L"],
                  :ex/const ["const"],
-                 :ex/greeting [{"@value" "hola", "@language" "es"}],
-                 :ex/date [{"@value" "2020-01-10", :type "ex:mydate"}]}]
+                 :ex/greeting [{:value "hola", "@language" "es"}],
+                 :ex/date [{:value "2020-01-10", :type "ex:mydate"}]}]
                res))))
 
     (testing "with invalid aggregate fn"
