@@ -129,6 +129,10 @@
          (<? (track-execution ds* tracker #(fql/query ds* tracker query**)))
          (<? (fql/query ds* query**)))))))
 
+(defn explain
+  [ds query override-opts]
+  (query-fql ds query (assoc override-opts :meta true)))
+
 (defn query-sparql
   [db query override-opts]
   (go-try
