@@ -1,8 +1,8 @@
 (ns fluree.db.flake.transact
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.index.novelty :as novelty]
-            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.modify :as policy.modify]
             [fluree.db.json-ld.shacl :as shacl]

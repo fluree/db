@@ -1,4 +1,4 @@
-(ns fluree.db.json-ld.commit-data
+(ns fluree.db.flake.commit-data
   (:require [fluree.crypto :as crypto]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]

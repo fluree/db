@@ -4,8 +4,8 @@
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.transact :as flake.transact]
-            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.util.log :as log]))
