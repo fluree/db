@@ -4,8 +4,8 @@
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.transact :as transact]
+            [fluree.db.flake.commit-data :as commit-data]
+            [fluree.db.flake.transact :as flake.transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.util.log :as log]))
@@ -91,7 +91,7 @@
       ;; note, index updates will have same t value as current one, so still need to check if t = current-t
       (cond
         (= commit-t (flake/next-t current-t))
-        (let [updated-db (<? (transact/-merge-commit db expanded-commit expanded-data))]
+        (let [updated-db (<? (flake.transact/-merge-commit db expanded-commit expanded-data))]
           (update-commit! ledger branch updated-db)
           ::updated)
 
@@ -116,8 +116,8 @@
                     current-t)
           ::newer)))))
 
-(defrecord Ledger [conn id address alias did state cache commit-catalog
-                   index-catalog reasoner])
+(defrecord Ledger [id address alias did state cache commit-catalog
+                   index-catalog reasoner primary-publisher secondary-publishers])
 
 (defn initial-state
   [branches current-branch]
@@ -128,20 +128,22 @@
 (defn instantiate
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [conn ledger-alias ledger-address branch commit-catalog index-catalog publishers
+  [ledger-alias ledger-address branch commit-catalog index-catalog primary-publisher secondary-publishers
    indexing-opts did latest-commit]
-  (let [branches {branch (branch/state-map ledger-alias branch commit-catalog index-catalog
+  (let [publishers (cons primary-publisher secondary-publishers)
+        branches {branch (branch/state-map ledger-alias branch commit-catalog index-catalog
                                            publishers latest-commit indexing-opts)}]
-    (map->Ledger {:conn           conn
-                  :id             (random-uuid)
-                  :did            did
-                  :state          (atom (initial-state branches branch))
-                  :alias          ledger-alias
-                  :address        ledger-address
-                  :commit-catalog commit-catalog
-                  :index-catalog  index-catalog
-                  :cache          (atom {})
-                  :reasoner       #{}})))
+    (map->Ledger {:id                   (random-uuid)
+                  :did                  did
+                  :state                (atom (initial-state branches branch))
+                  :alias                ledger-alias
+                  :address              ledger-address
+                  :commit-catalog       commit-catalog
+                  :index-catalog        index-catalog
+                  :primary-publisher    primary-publisher
+                  :secondary-publishers secondary-publishers
+                  :cache                (atom {})
+                  :reasoner             #{}})))
 
 (defn normalize-alias
   "For a ledger alias, removes any preceding '/' or '#' if exists."
@@ -154,8 +156,8 @@
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [{:keys [conn alias primary-address publish-addresses commit-catalog index-catalog
-           publishers]}
+  [{:keys [alias primary-address publish-addresses commit-catalog index-catalog
+           primary-publisher secondary-publishers]}
    {:keys [did branch indexing] :as _opts}]
   (go-try
     (let [ledger-alias*  (normalize-alias alias)
@@ -163,5 +165,5 @@
           init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit
                               commit-catalog alias branch publish-addresses init-time))]
-      (instantiate conn ledger-alias* primary-address branch commit-catalog index-catalog
-                   publishers indexing did genesis-commit))))
+      (instantiate ledger-alias* primary-address branch commit-catalog index-catalog
+                   primary-publisher secondary-publishers indexing did genesis-commit))))

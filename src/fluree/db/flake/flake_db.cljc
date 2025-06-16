@@ -9,6 +9,7 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.format :as jld-format]
             [fluree.db.flake.history :as history]
             [fluree.db.flake.index :as index]
@@ -18,7 +19,6 @@
             [fluree.db.flake.reasoner :as flake.reasoner]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.indexer :as indexer]
-            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.query :as qpolicy]
@@ -31,19 +31,16 @@
             [fluree.db.query.history :refer [AuditLog]]
             [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
-            [fluree.db.serde.json :as serde-json]
             [fluree.db.time-travel :refer [TimeTravel]]
-            [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [try* catch* get-first get-first-value]]
             [fluree.db.util.log :as log]
+            [fluree.db.util.reasoner :as reasoner-util]
             [fluree.db.virtual-graph.flat-rank :as flat-rank]
             [fluree.db.virtual-graph.index-graph :as vg])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(def data-version 0)
 
 (defn empty-all-novelty
   [db]
@@ -329,7 +326,7 @@
   (-finalize [_ _ _ solution-ch]
     solution-ch)
 
-  transact/Transactable
+  flake.transact/Transactable
   (-stage-txn [db tracker context identity author annotation raw-txn parsed-txn]
     (flake.transact/stage db tracker context identity author annotation raw-txn parsed-txn))
   (-merge-commit [db commit-jsonld commit-data-jsonld]
@@ -401,7 +398,7 @@
   (-reason [db methods rule-sources tracker reasoner-max]
     (flake.reasoner/reason db methods rule-sources tracker reasoner-max))
   (-reasoned-facts [db]
-    (flake.reasoner/reasoned-facts db)))
+    (reasoner-util/reasoned-facts db)))
 
 (defn db?
   [x]
@@ -482,7 +479,7 @@
   [db error-ch [commit-jsonld db-data-jsonld]]
   (go
     (try*
-      (<? (transact/-merge-commit db commit-jsonld db-data-jsonld))
+      (<? (flake.transact/-merge-commit db commit-jsonld db-data-jsonld))
       (catch* e
         (log/error e "Error merging commit")
         (>! error-ch e)))))
@@ -568,157 +565,3 @@
                          indexed-db*
                          (<? (load-novelty commit-catalog indexed-db* index-t commit-jsonld)))]
        (<? (shacl/hydrate-shape-cache! loaded-db))))))
-
-(defn get-s-iri
-  "Returns a compact IRI from a subject id (sid)."
-  [db sid compact-fn]
-  (compact-fn (iri/decode-sid db sid)))
-
-(defn- serialize-obj
-  [flake db compact-fn]
-  (let [pdt (flake/dt flake)]
-    (cond
-      (= const/$id pdt) ;; ref to another node
-      (if (= const/$rdf:type (flake/p flake))
-        (get-s-iri db (flake/o flake) compact-fn) ;; @type values don't need to be in an @id map
-        {"@id" (get-s-iri db (flake/o flake) compact-fn)})
-
-      (datatype/inferable? pdt)
-      (serde-json/serialize-object (flake/o flake) pdt)
-
-      :else
-      {"@value" (serde-json/serialize-object (flake/o flake) pdt)
-       "@type"  (get-s-iri db pdt compact-fn)})))
-
-(defn- add-obj-list-meta
-  [obj-ser flake]
-  (let [list-i (-> flake flake/m :i)]
-    (if (map? obj-ser)
-      (assoc obj-ser :i list-i)
-      {"@value" obj-ser
-       :i       list-i})))
-
-(defn- subject-block-pred
-  [db compact-fn list? p-flakes]
-  (loop [[p-flake & r] p-flakes
-         acc nil]
-    (let [obj-ser (cond-> (serialize-obj p-flake db compact-fn)
-                    list? (add-obj-list-meta p-flake))
-          acc'    (conj acc obj-ser)]
-      (if (seq r)
-        (recur r acc')
-        acc'))))
-
-(defn- handle-list-values
-  [objs]
-  {"@list" (->> objs (sort-by :i) (map #(dissoc % :i)))})
-
-(defn- subject-block
-  [s-flakes db compact-fn]
-  (loop [[p-flakes & r] (partition-by flake/p s-flakes)
-         acc nil]
-    (let [fflake (first p-flakes)
-          list?  (-> fflake flake/m :i)
-          pid    (flake/p fflake)
-          p-iri  (get-s-iri db pid compact-fn)
-          objs   (subject-block-pred db compact-fn list?
-                                     p-flakes)
-          objs*  (cond-> objs
-                   list? handle-list-values
-                   (= 1 (count objs)) first)
-          acc'   (assoc acc p-iri objs*)]
-      (if (seq r)
-        (recur r acc')
-        acc'))))
-
-(defn commit-flakes
-  "Returns commit flakes from novelty based on 't' value."
-  [{:keys [novelty t] :as _db}]
-  (-> novelty
-      :tspo
-      (flake/match-tspo t)
-      not-empty))
-
-(defn generate-commit
-  "Generates assertion and retraction flakes for a given set of flakes
-  which is assumed to be for a single (t) transaction.
-
-  Returns a map of
-  :assert - assertion flakes
-  :retract - retraction flakes
-  :refs-ctx - context that must be included with final context, for refs (@id) values
-  :flakes - all considered flakes, for any downstream processes that need it"
-  [{:keys [reasoner] :as db} {:keys [compact-fn id-key] :as _opts}]
-  (when-let [flakes (cond-> (commit-flakes db)
-                      reasoner flake.reasoner/non-reasoned-flakes)]
-    (log/trace "generate-commit flakes:" flakes)
-    (loop [[s-flakes & r] (partition-by flake/s flakes)
-           assert  (transient [])
-           retract (transient [])]
-      (if s-flakes
-        (let [sid   (flake/s (first s-flakes))
-              s-iri (get-s-iri db sid compact-fn)
-              [assert* retract*]
-              (if (and (= 1 (count s-flakes))
-                       (= const/$rdfs:Class (->> s-flakes first flake/o))
-                       (= const/$rdf:type (->> s-flakes first flake/p)))
-                ;; we don't output auto-generated rdfs:Class definitions for classes
-                ;; (they are implied when used in rdf:type statements)
-                [assert retract]
-                (let [{assert-flakes  true
-                       retract-flakes false}
-                      (group-by flake/op s-flakes)
-
-                      s-assert  (when assert-flakes
-                                  (-> (subject-block assert-flakes db compact-fn)
-                                      (assoc id-key s-iri)))
-                      s-retract (when retract-flakes
-                                  (-> (subject-block retract-flakes db compact-fn)
-                                      (assoc id-key s-iri)))]
-                  [(cond-> assert
-                     s-assert (conj! s-assert))
-                   (cond-> retract
-                     s-retract (conj! s-retract))]))]
-          (recur r assert* retract*))
-        {:assert   (persistent! assert)
-         :retract  (persistent! retract)
-         :flakes   flakes}))))
-
-(defn new-namespaces
-  [{:keys [max-namespace-code namespace-codes] :as _db}]
-  (->> namespace-codes
-       (filter (fn [[k _v]]
-                 (> k max-namespace-code)))
-       (sort-by key)
-       (mapv val)))
-
-(defn db->jsonld
-  "Creates the JSON-LD map containing a new ledger update"
-  [{:keys [t commit stats staged] :as db}
-   {:keys [type-key compact ctx-used-atom id-key] :as commit-opts}]
-  (let [prev-dbid (commit-data/data-id commit)
-
-        {:keys [assert retract refs-ctx]}
-        (generate-commit db commit-opts)
-
-        prev-db-key (compact const/iri-previous)
-        assert-key  (compact const/iri-assert)
-        retract-key (compact const/iri-retract)
-        refs-ctx*   (cond-> refs-ctx
-                      prev-dbid     (assoc-in [prev-db-key "@type"] "@id")
-                      (seq assert)  (assoc-in [assert-key "@container"] "@graph")
-                      (seq retract) (assoc-in [retract-key "@container"] "@graph"))
-        nses        (new-namespaces db)
-        db-json     (cond-> {id-key                ""
-                             type-key              [(compact const/iri-DB)]
-                             (compact const/iri-fluree-t) t
-                             (compact const/iri-v) data-version}
-                      prev-dbid       (assoc prev-db-key prev-dbid)
-                      (seq assert)    (assoc assert-key assert)
-                      (seq retract)   (assoc retract-key retract)
-                      (seq nses)      (assoc (compact const/iri-namespaces) nses)
-                      (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
-                      (:size stats)   (assoc (compact const/iri-size) (:size stats))
-                      true            (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
-    {:db-jsonld   db-json
-     :staged-txn  staged}))

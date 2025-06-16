@@ -1,8 +1,8 @@
 (ns fluree.db.flake.transact
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.index.novelty :as novelty]
-            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.json-ld.policy.modify :as policy.modify]
             [fluree.db.json-ld.shacl :as shacl]
@@ -15,6 +15,10 @@
             [fluree.db.virtual-graph.index-graph :as vg]))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(defprotocol Transactable
+  (-stage-txn [db tracker context identity author annotation raw-txn parsed-txn])
+  (-merge-commit [db commit-jsonld commit-data-jsonld]))
 
 ;; TODO - can use transient! below
 (defn stage-update-novelty

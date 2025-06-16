@@ -1,63 +1,23 @@
-(ns fluree.db.json-ld.commit-data
+(ns fluree.db.flake.commit-data
   (:require [fluree.crypto :as crypto]
             [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql.parse :as q-parse]
+            [fluree.db.serde.json :as serde-json]
             [fluree.db.util.core :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.util.reasoner :as reasoner-util]))
 
 (def commit-version 1)
+(def data-version 0)
 
 (def default-branch
   "main")
-
-(comment
-  ;; commit map - this map is what gets recorded in a few places:
-  ;; - in a 'commit' file: (translated to JSON-LD, and optionally wrapped in a Verifiable Credential)
-  ;; - attached to each DB: to know the last commit state when db was pulled from ledger
-  ;; - in the ledger-state: since a db may be operated on asynchronously, it can
-  ;;                        see if anything (e.g. an index) has since been updated
-  {:id       "fluree:commit:sha256:ljklj" ;; relative from source, source is the 'ledger address'
-   :address  "" ;; commit address, if using something like IPFS this is blank
-   :v        0 ;; version of commit format
-   :alias    "mydb" ;; human-readable alias name for ledger
-   :branch   "main" ;; ledger's "branch" - if not included, default of 'main'
-   :time     "2022-08-26T19:51:27.220086Z" ;; ISO-8601 timestamp of commit
-   :tag      [] ;; optional commit tags
-   :message  "optional commit message"
-   :issuer   {:id ""} ;; issuer of the commit
-   :previous {:id      "fluree:commit:sha256:ljklj"
-              :address "previous commit address"} ;; previous commit address
-   ;; data information commit refers to:
-   :data     {:id       "fluree:db:sha256:lkjlkjlj" ;; db's unique identifier
-              :t        52
-              :address  "fluree:ipfs://sdfsdfgfdgk" ;; address to locate data file / db
-              :previous {:id      "fluree:db:sha256:lkjlkjlj" ;; previous db
-                         :address "fluree:ipfs://sdfsdfgfdgk"}
-              :flakes   4242424
-              :size     123145
-              :source   {:id      "csv:sha256:lkjsdfkljsdf" ;; sha256 of original source (e.g. signed transaction, CSV file)
-                         :address "/ipfs/sdfsdfgfdgk"
-                         :issuer  {:id ""}}} ;; issuer of the commit
-   ;; name service(s) used to manage global ledger state
-   :ns       {:id  "fluree:ipns://data.flur.ee/my/db" ;; one (or more) Name Services that can be consulted for the latest ledger state
-              :foo ""} ;; each name service can contain additional data relevant to it
-   ;; latest index (note the index roots below are not recorded into JSON-LD commit file, but short-cut when internally managing transitions)
-   :index    {:id      "fluree:index:sha256:fghfgh" ;; unique id (hash of root) of index
-              :address "fluree:ipfs://lkjdsflkjsdf" ;; address to get to index 'root'
-              :data    {:id      "fluree:db:sha256:lkjlkjlj" ;; db of last index unique identifier
-                        :t       42
-                        :address "fluree:ipfs://sdfsdfgfdgk" ;; address to locate db
-                        :flakes  4240000
-                        :size    120000}
-              :spot    "fluree:ipfs://spot" ;; following 4 items are not recorded in the commit, but used to shortcut updated index retrieval in-process
-              :post    "fluree:ipfs://post"
-              :opst    "fluree:ipfs://opst"
-              :tspo    "fluree:ipfs://tspo"}})
 
 (def json-ld-base-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
@@ -530,3 +490,157 @@
     (-> db*
         (update-novelty commit-flakes)
         add-tt-id)))
+
+(defn- handle-list-values
+  [objs]
+  {"@list" (->> objs (sort-by :i) (mapv #(dissoc % :i)))})
+
+(defn- add-obj-list-meta
+  [obj-ser flake]
+  (let [list-i (-> flake flake/m :i)]
+    (if (map? obj-ser)
+      (assoc obj-ser :i list-i)
+      {"@value" obj-ser
+       :i       list-i})))
+
+(defn- get-s-iri
+  "Returns a compact IRI from a subject id (sid)."
+  [db sid compact-fn]
+  (compact-fn (iri/decode-sid db sid)))
+
+(defn- serialize-obj
+  [flake db compact-fn]
+  (let [pdt (flake/dt flake)]
+    (cond
+      (= const/$id pdt) ;; ref to another node
+      (if (= const/$rdf:type (flake/p flake))
+        (get-s-iri db (flake/o flake) compact-fn) ;; @type values don't need to be in an @id map
+        {"@id" (get-s-iri db (flake/o flake) compact-fn)})
+
+      (datatype/inferable? pdt)
+      (serde-json/serialize-object (flake/o flake) pdt)
+
+      :else
+      {"@value" (serde-json/serialize-object (flake/o flake) pdt)
+       "@type"  (get-s-iri db pdt compact-fn)})))
+
+(defn- subject-block-pred
+  [db compact-fn list? p-flakes]
+  (loop [[p-flake & r] p-flakes
+         acc nil]
+    (let [obj-ser (cond-> (serialize-obj p-flake db compact-fn)
+                    list? (add-obj-list-meta p-flake))
+          acc'    (conj acc obj-ser)]
+      (if (seq r)
+        (recur r acc')
+        acc'))))
+
+(defn- subject-block
+  [s-flakes db compact-fn]
+  (loop [[p-flakes & r] (partition-by flake/p s-flakes)
+         acc nil]
+    (let [fflake (first p-flakes)
+          list?  (-> fflake flake/m :i)
+          pid    (flake/p fflake)
+          p-iri  (get-s-iri db pid compact-fn)
+          objs   (subject-block-pred db compact-fn list?
+                                     p-flakes)
+          objs*  (cond-> objs
+                   list? handle-list-values
+                   (= 1 (count objs)) first)
+          acc'   (assoc acc p-iri objs*)]
+      (if (seq r)
+        (recur r acc')
+        acc'))))
+
+(defn- commit-flakes
+  "Returns commit flakes from novelty based on 't' value."
+  [{:keys [novelty t] :as _db}]
+  (-> novelty
+      :tspo
+      (flake/match-tspo t)
+      not-empty))
+
+(defn generate-commit
+  "Generates assertion and retraction flakes for a given set of flakes
+  which is assumed to be for a single (t) transaction.
+
+  Returns a map of
+  :assert - assertion flakes
+  :retract - retraction flakes
+  :refs-ctx - context that must be included with final context, for refs (@id) values
+  :flakes - all considered flakes, for any downstream processes that need it"
+  [{:keys [reasoner] :as db} {:keys [compact-fn id-key] :as _opts}]
+  (when-let [flakes (cond-> (commit-flakes db)
+                      reasoner reasoner-util/non-reasoned-flakes)]
+    (log/trace "generate-commit flakes:" flakes)
+    (loop [[s-flakes & r] (partition-by flake/s flakes)
+           assert  (transient [])
+           retract (transient [])]
+      (if s-flakes
+        (let [sid   (flake/s (first s-flakes))
+              s-iri (get-s-iri db sid compact-fn)
+              [assert* retract*]
+              (if (and (= 1 (count s-flakes))
+                       (= const/$rdfs:Class (->> s-flakes first flake/o))
+                       (= const/$rdf:type (->> s-flakes first flake/p)))
+                ;; we don't output auto-generated rdfs:Class definitions for classes
+                ;; (they are implied when used in rdf:type statements)
+                [assert retract]
+                (let [{assert-flakes  true
+                       retract-flakes false}
+                      (group-by flake/op s-flakes)
+
+                      s-assert  (when assert-flakes
+                                  (-> (subject-block assert-flakes db compact-fn)
+                                      (assoc id-key s-iri)))
+                      s-retract (when retract-flakes
+                                  (-> (subject-block retract-flakes db compact-fn)
+                                      (assoc id-key s-iri)))]
+                  [(cond-> assert
+                     s-assert (conj! s-assert))
+                   (cond-> retract
+                     s-retract (conj! s-retract))]))]
+          (recur r assert* retract*))
+        {:assert   (persistent! assert)
+         :retract  (persistent! retract)
+         :flakes   flakes}))))
+
+(defn- new-namespaces
+  [{:keys [max-namespace-code namespace-codes] :as _db}]
+  (->> namespace-codes
+       (filter (fn [[k _v]]
+                 (> k max-namespace-code)))
+       (sort-by key)
+       (mapv val)))
+
+(defn db->jsonld
+  "Creates the JSON-LD map containing a new ledger update"
+  [{:keys [t commit stats staged] :as db}
+   {:keys [type-key compact ctx-used-atom id-key] :as commit-opts}]
+  (let [prev-dbid (data-id commit)
+
+        {:keys [assert retract refs-ctx]}
+        (generate-commit db commit-opts)
+
+        prev-db-key (compact const/iri-previous)
+        assert-key  (compact const/iri-assert)
+        retract-key (compact const/iri-retract)
+        refs-ctx*   (cond-> refs-ctx
+                      prev-dbid     (assoc-in [prev-db-key "@type"] "@id")
+                      (seq assert)  (assoc-in [assert-key "@container"] "@graph")
+                      (seq retract) (assoc-in [retract-key "@container"] "@graph"))
+        nses        (new-namespaces db)
+        db-json     (cond-> {id-key                ""
+                             type-key              [(compact const/iri-DB)]
+                             (compact const/iri-fluree-t) t
+                             (compact const/iri-v) data-version}
+                      prev-dbid       (assoc prev-db-key prev-dbid)
+                      (seq assert)    (assoc assert-key assert)
+                      (seq retract)   (assoc retract-key retract)
+                      (seq nses)      (assoc (compact const/iri-namespaces) nses)
+                      (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
+                      (:size stats)   (assoc (compact const/iri-size) (:size stats))
+                      true            (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
+    {:db-jsonld   db-json
+     :staged-txn  staged}))

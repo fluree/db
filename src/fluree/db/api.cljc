@@ -13,6 +13,7 @@
             [fluree.db.query.api :as query-api]
             [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
+            [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
@@ -285,10 +286,10 @@
   distributed rules."
   ([ledger db]
    (promise-wrap
-    (connection/commit! ledger db)))
+    (transact/commit! ledger db {})))
   ([ledger db opts]
    (promise-wrap
-    (connection/commit! ledger db opts))))
+    (transact/commit! ledger db opts))))
 
 (defn transact!
   ([conn txn] (transact! conn txn nil))
