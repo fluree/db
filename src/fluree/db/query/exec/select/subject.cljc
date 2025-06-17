@@ -88,23 +88,16 @@
                        tracker error-ch)))
 
 (defn display-literal
-  [attrs spec select-spec cache compact-fn current-depth]
-  (let [max-depth (:depth select-spec)
-        subselect (:spec spec)]
-    (cond
-      subselect
+  [attrs spec cache compact-fn]
+  (let [subselect (:spec spec)]
+    (if subselect
       (literal/format-literal attrs compact-fn subselect cache)
-
-      (< current-depth max-depth)
-      (literal/format-literal attrs compact-fn select-spec cache)
-
-      :else
       (literal/get-value attrs))))
 
 (defn resolve-literal
-  [cache compact-fn select-spec current-depth v]
+  [cache compact-fn v]
   (let [{::keys [spec] :as attrs} (::literal v)]
-    (display-literal attrs spec select-spec cache compact-fn current-depth)))
+    (display-literal attrs spec cache compact-fn)))
 
 (defn resolve-properties
   [ds cache context compact-fn select-spec current-depth tracker error-ch attr-ch]
@@ -123,7 +116,7 @@
                                (recur r resolved-values))
 
                              (literal? value)
-                             (recur r (conj resolved-values (resolve-literal cache compact-fn select-spec current-depth value)))
+                             (recur r (conj resolved-values (resolve-literal cache compact-fn value)))
 
                              :else value)
                            (not-empty resolved-values)))
@@ -132,7 +125,7 @@
                          (<! (resolve-reference ds cache context compact-fn select-spec current-depth tracker error-ch v))
 
                          (literal? v)
-                         (resolve-literal cache compact-fn select-spec current-depth v)
+                         (resolve-literal cache compact-fn v)
 
                          :else v))]
               (if (some? v')

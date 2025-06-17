@@ -90,22 +90,16 @@
                                "type" "Movie"
                                "name" "Gone with the Wind"}}]
             (is (= [{"type"                      "Movie",
-                     "disambiguatingDescription" {"value" "1939 film by Victor Fleming",
-                                                  "type"  "xsd:string"},
+                     "disambiguatingDescription" "1939 film by Victor Fleming",
                      "isBasedOn"                 {"type"   "Book",
                                                   "author" {"type" "Person",
-                                                            "name" {"value" "Margaret Mitchell"
-                                                                    "type"  "xsd:string"},
+                                                            "name" "Margaret Mitchell",
                                                             "id"   "https://www.wikidata.org/wiki/Q173540"},
-                                                  "isbn"   {"value" "0-582-41805-4",
-                                                            "type"  "xsd:string"},
-                                                  "name"   {"value" "Gone with the Wind",
-                                                            "type"  "xsd:string"},
+                                                  "isbn"   "0-582-41805-4",
+                                                  "name"   "Gone with the Wind",
                                                   "id"     "https://www.wikidata.org/wiki/Q2870"},
-                     "name"                      {"value" "Gone with the Wind",
-                                                  "type"  "xsd:string"},
-                     "titleEIDR"                 {"value" "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
-                                                  "type"  "xsd:string"},
+                     "name"                      "Gone with the Wind",
+                     "titleEIDR"                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
                      "id"                        "https://www.wikidata.org/wiki/Q2875"}]
                    @(fluree/query-connection conn q))
                 "returns unified results for the requested subject"))))
@@ -135,22 +129,16 @@
                     :where      [[:graph "test/movies" {"@id"  ?goneWithTheWind
                                                         "name" "Gone with the Wind"}]]}]
             (is (= [{"type"                      "Movie",
-                     "disambiguatingDescription" {"value" "1939 film by Victor Fleming",
-                                                  "type"  "xsd:string"},
+                     "disambiguatingDescription" "1939 film by Victor Fleming",
                      "isBasedOn"                 {"type"   "Book",
                                                   "author" {"type" "Person",
-                                                            "name" {"value" "Margaret Mitchell"
-                                                                    "type"  "xsd:string"},
+                                                            "name" "Margaret Mitchell",
                                                             "id"   "https://www.wikidata.org/wiki/Q173540"},
-                                                  "isbn"   {"value" "0-582-41805-4",
-                                                            "type"  "xsd:string"},
-                                                  "name"   {"value" "Gone with the Wind"
-                                                            "type"  "xsd:string"},
+                                                  "isbn"   "0-582-41805-4",
+                                                  "name"   "Gone with the Wind",
                                                   "id"     "https://www.wikidata.org/wiki/Q2870"},
-                     "name"                      {"value" "Gone with the Wind",
-                                                  "type"  "xsd:string"},
-                     "titleEIDR"                 {"value" "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
-                                                  "type"  "xsd:string"},
+                     "name"                      "Gone with the Wind",
+                     "titleEIDR"                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
                      "id"                        "https://www.wikidata.org/wiki/Q2875"}]
                    @(fluree/query-connection conn q))
                 "returns unified results for the requested subject")))))))
@@ -245,22 +233,16 @@
                                "type" "Movie"
                                "name" "Gone with the Wind"}}]
             (is (= [{"type"                      "Movie",
-                     "disambiguatingDescription" {"value" "1939 film by Victor Fleming",
-                                                  "type"  "xsd:string"},
+                     "disambiguatingDescription" "1939 film by Victor Fleming",
                      "isBasedOn"                 {"type"   "Book",
                                                   "author" {"type" "Person",
-                                                            "name" {"value" "Margaret Mitchell",
-                                                                    "type"  "xsd:string"},
+                                                            "name" "Margaret Mitchell",
                                                             "id"   "https://www.wikidata.org/wiki/Q173540"},
-                                                  "isbn"   {"value" "0-582-41805-4",
-                                                            "type"  "xsd:string"},
-                                                  "name"   {"value" "Gone with the Wind",
-                                                            "type"  "xsd:string"},
+                                                  "isbn"   "0-582-41805-4",
+                                                  "name"   "Gone with the Wind",
                                                   "id"     "https://www.wikidata.org/wiki/Q2870"},
-                     "name"                      {"value" "Gone with the Wind",
-                                                  "type"  "xsd:string"},
-                     "titleEIDR"                 {"value" "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
-                                                  "type"  "xsd:string"},
+                     "name"                      "Gone with the Wind",
+                     "titleEIDR"                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
                      "id"                        "https://www.wikidata.org/wiki/Q2875"}]
                    @(fluree/query dataset q))
                 "returns unified results for the requested subject"))))
@@ -288,22 +270,16 @@
                     :where    [[:graph "test/movies" {"@id"  ?goneWithTheWind
                                                       "name" "Gone with the Wind"}]]}]
             (is (= [{"type"                      "Movie",
-                     "disambiguatingDescription" {"value" "1939 film by Victor Fleming",
-                                                  "type"  "xsd:string"},
+                     "disambiguatingDescription" "1939 film by Victor Fleming",
                      "isBasedOn"                 {"type"   "Book",
                                                   "author" {"type" "Person",
-                                                            "name" {"value" "Margaret Mitchell",
-                                                                    "type"  "xsd:string"},
+                                                            "name" "Margaret Mitchell",
                                                             "id"   "https://www.wikidata.org/wiki/Q173540"},
-                                                  "isbn"   {"value" "0-582-41805-4",
-                                                            "type"  "xsd:string"},
-                                                  "name"   {"value" "Gone with the Wind",
-                                                            "type"  "xsd:string"},
+                                                  "isbn"   "0-582-41805-4",
+                                                  "name"   "Gone with the Wind",
                                                   "id"     "https://www.wikidata.org/wiki/Q2870"},
-                     "name"                      {"value" "Gone with the Wind",
-                                                  "type"  "xsd:string"},
-                     "titleEIDR"                 {"value" "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
-                                                  "type"  "xsd:string"},
+                     "name"                      "Gone with the Wind",
+                     "titleEIDR"                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
                      "id"                        "https://www.wikidata.org/wiki/Q2875"}]
                    @(fluree/query dataset q))
                 "returns unified results for the requested subject")))))))
