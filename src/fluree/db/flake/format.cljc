@@ -59,20 +59,15 @@
 (defn format-object
   [db spec f]
   (let [obj (flake/o f)
-        dt (flake/dt f)]
+        dt  (flake/dt f)]
     (if (= const/$id dt)
       (format-reference db spec obj)
-      (if (= const/$rdf:json dt)
-        (json/parse obj false)
-        obj))))
-
-(defn wildcard-spec
-  [db cache compact-fn iri]
-  (or (get @cache iri)
-      (when-let [spec (get-in db [:schema :pred iri])]
-        (let [spec* (assoc spec :as (compact-fn (:iri spec)))]
-          (vswap! cache assoc iri spec*)
-          spec*))))
+      (let [value  (if (= const/$rdf:json dt)
+                     (json/parse obj false)
+                     obj)
+            dt-iri (iri/decode-sid db dt)
+            lang   (-> f flake/m :lang)]
+        (subject/encode-literal value dt-iri lang spec)))))
 
 (defn format-property
   [db cache context compact-fn {:keys [wildcard?] :as select-spec} p-flakes]
@@ -81,8 +76,7 @@
         iri (iri/decode-sid db pid)]
     (when-let [spec (or (get select-spec iri)
                         (when wildcard?
-                          (or (wildcard-spec db cache compact-fn iri)
-                              (cache-sid->iri db cache compact-fn pid))))]
+                          (cache-sid->iri db cache compact-fn pid)))]
       (let [p-iri (:as spec)
             v     (if (rdf-type? pid)
                     (type-value db cache compact-fn p-flakes)
@@ -117,7 +111,7 @@
          (async/transduce subj-xf (completing conj) {}))))
 
 (defn reverse-property
-  [{:keys [t] :as db} o-iri {:keys [as spec], p-iri :iri, :as reverse-spec} context compact-fn cache tracker error-ch]
+  [{:keys [t] :as db} o-iri {:keys [as], p-iri :iri, :as reverse-spec} context tracker error-ch]
   (let [oid                     (iri/encode-iri db o-iri)
         pid                     (iri/encode-iri db p-iri)
         [start-flake end-flake] (flake-bounds db :opst [oid pid])
@@ -129,10 +123,7 @@
                                  :start-flake start-flake
                                  :end-flake   end-flake
                                  :flake-xf    flake-xf}
-        sid-xf                  (if spec
-                                  (map (partial format-reference db reverse-spec))
-                                  (comp (map (partial cache-sid->iri db cache compact-fn))
-                                        (map :as)))]
+        sid-xf                  (map (partial format-reference db reverse-spec))]
     (->> (query-range/resolve-flake-slices db tracker :opst error-ch range-opts)
          (async/transduce (comp cat sid-xf)
                           (completing conj
@@ -151,10 +142,10 @@
                               (format-subject-xf db cache context compact-fn select-spec)
                               s-flakes)
           subject-ch    (if reverse
-                          (let [reverse-ch (subject/format-reverse-properties db s-iri reverse context compact-fn cache tracker error-ch)]
+                          (let [reverse-ch (subject/format-reverse-properties db s-iri reverse context tracker error-ch)]
                             (async/reduce conj subject-attrs reverse-ch))
                           (go subject-attrs))]
       (->> subject-ch
-           (subject/resolve-references db cache context compact-fn select-spec current-depth tracker error-ch)
+           (subject/resolve-properties db cache context compact-fn select-spec current-depth tracker error-ch)
            (subject/append-id db tracker s-iri select-spec compact-fn error-ch)))
     (go)))

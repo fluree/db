@@ -176,7 +176,7 @@
     ::subselect-map     [:map-of {:error/message "must be map from iri to subselection"}
                          ::iri [:ref ::subselection]]
     ::subselection      [:sequential {:error/message
-                                      "subselection must be a vector"}
+                                      "subselection must be a sequence"}
                          [:orn {:error/message "subselection must be a wildcard (\"*\") or subselection map"}
                           [:wildcard ::wildcard]
                           [:predicate ::iri]

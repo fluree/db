@@ -101,13 +101,13 @@
                             db-ch)
       (async/reduce merge-subgraphs {} prop-ch)))
 
-  (-reverse-property [ds iri reverse-spec context compact-fn cache tracker error-ch]
+  (-reverse-property [ds iri reverse-spec context tracker error-ch]
     (let [db-ch   (->> ds all async/to-chan!)
           prop-ch (async/chan)]
       (async/pipeline-async 2
                             prop-ch
                             (fn [db ch]
-                              (-> (subject/-reverse-property db iri reverse-spec context compact-fn cache tracker error-ch)
+                              (-> (subject/-reverse-property db iri reverse-spec context tracker error-ch)
                                   (async/pipe ch)))
                             db-ch)
       (async/reduce (fn [combined-prop db-prop]

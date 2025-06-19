@@ -336,8 +336,8 @@
   (-forward-properties [db iri spec context compact-fn cache tracker error-ch]
     (jld-format/forward-properties db iri spec context compact-fn cache tracker error-ch))
 
-  (-reverse-property [db iri reverse-spec context compact-fn cache tracker error-ch]
-    (jld-format/reverse-property db iri reverse-spec context compact-fn cache tracker error-ch))
+  (-reverse-property [db iri reverse-spec context tracker error-ch]
+    (jld-format/reverse-property db iri reverse-spec context tracker error-ch))
 
   (-iri-visible? [db tracker iri]
     (qpolicy/allow-iri? db tracker iri))

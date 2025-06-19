@@ -206,7 +206,7 @@
              @(fluree/query db2 {"@context" [context {"ex:reversed-pred" {"@reverse" "ex:new-pred"}}]
                                  "select"   {"ex:nested" ["id" {"ex:reversed-pred" ["*"]}]}}))
           "via reverse crawl")
-      (is (= [{"id" "ex:nested", "ex:reversed-pred" "ex:subject-as-predicate"}]
+      (is (= [{"id" "ex:nested", "ex:reversed-pred" {"id" "ex:subject-as-predicate"}}]
              @(fluree/query db3 {"@context" [context {"ex:reversed-pred" {"@reverse" "ex:unlabeled-pred"}}]
                                  "select"   {"ex:nested" ["id" "ex:reversed-pred"]}}))
           "via reverse no subgraph"))))
