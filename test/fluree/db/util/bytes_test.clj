@@ -3,8 +3,7 @@
             [clojure.test.check :as check]
             [clojure.test.check.properties :as prop]
             [fluree.db.util.bytes :as bytes]
-            [malli.generator :as mgen]
-            [malli.core :as m]))
+            [malli.generator :as mgen]))
 
 (defn string->longs
   [^String s]

@@ -1,8 +1,9 @@
 (ns fluree.db.query.sparql
-  (:require #?(:clj [clojure.java.io :as io])
-            #?(:clj  [instaparse.core :as insta :refer [defparser]]
+  (:require #?(:clj  [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])
+            #?(:clj [clojure.java.io :as io])
             #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
+            [clojure.string :as str]
             [fluree.db.query.sparql.translator :as sparql.translator]
             [fluree.db.util.docs :as docs]
             [fluree.db.util.log :as log]))
@@ -19,22 +20,42 @@
 
 (def grammar
   (str
-    #?(:clj  (slurp (io/resource "sparql.bnf"))
-       :cljs (inline-resource "sparql.bnf"))
-    PN_CHARS_BASE))
+   #?(:clj  (slurp (io/resource "sparql.bnf"))
+      :cljs (inline-resource "sparql.bnf"))
+   PN_CHARS_BASE))
+
+(def property-path-grammar
+  (str
+   #?(:clj  (slurp (io/resource "sparql-property-path.bnf"))
+      :cljs (inline-resource "sparql-property-path.bnf"))
+   PN_CHARS_BASE))
 
 (defparser parser grammar)
+
+(defparser path-parser property-path-grammar)
+
+(defn parse-path-expr
+  [s]
+  (let [parsed (path-parser s)]
+    (if (insta/failure? parsed)
+      (do (log/debug (insta/get-failure parsed) "Property path expression failed to parse.")
+          (throw (ex-info "Invalid property path expression. Must be a valid SPARQL property path expression, see https://www.w3.org/TR/sparql11-query/#pp-language"
+                          {:status 400
+                           :error :db/invalid-property-path
+                           :path s})))
+      parsed)))
 
 (defn parse
   [sparql]
   (let [parsed (parser sparql)]
     (if (insta/failure? parsed)
-      (do
-        (log/debug (insta/get-failure parsed) "SPARQL query failed to parse")
-        (throw (ex-info (str "Improperly formatted SPARQL query: " sparql " "
-                             "Note: Fluree does not support all SPARQL features. "
-                             "See here for more information: "
-                             docs/error-codes-page "#query-sparql-improper")
+      (let [failure (with-out-str (println (insta/get-failure parsed)))]
+        (log/debug failure "SPARQL query failed to parse")
+        (throw (ex-info (str/join "\n" ["Improperly formatted SPARQL query:"
+                                        failure
+                                        "Note: Fluree does not support all SPARQL features."
+                                        "See here for more information:"
+                                        (str docs/error-codes-page "#query-sparql-improper")])
                         {:status   400
                          :error    :db/invalid-query})))
       (do
@@ -45,3 +66,7 @@
   [sparql]
   (let [parsed (parse sparql)]
     (sparql.translator/translate parsed)))
+
+(defn sparql-format?
+  [opts]
+  (= :sparql (:format opts)))

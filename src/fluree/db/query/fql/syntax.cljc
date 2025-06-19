@@ -1,10 +1,10 @@
 (ns fluree.db.query.fql.syntax
-  (:require [fluree.db.util.core :refer [try* catch*]]
+  (:require [camel-snake-kebab.core :as csk]
+            [clojure.edn :as edn]
+            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util.docs :as docs]
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]
-            [fluree.db.util.docs :as docs]
-            [camel-snake-kebab.core :as csk]
-            [clojure.edn :as edn]
             [malli.core :as m]
             [malli.transform :as mt]))
 
@@ -22,12 +22,16 @@
   [x]
   (boolean (#{'desc "desc" :desc} x)))
 
+(defn function?
+  [x]
+  (m/validate ::v/function x {:registry v/registry}))
+
 (defn one-select-key-present?
   [q]
   (log/trace "one-select-key-present? q:" q)
   (if (map? q)
     (let [skeys (->> q keys
-                     (map #{:select :select-one :select-distinct})
+                     (map #{:select :select-one :select-distinct :construct})
                      (remove nil?))]
       (log/trace "one-select-key-present? skeys:" skeys)
       (= 1 (count skeys)))
@@ -40,6 +44,7 @@
    [:where {:optional true} ::where]
    [:t {:optional true} ::t]
    [:context {:optional true} ::context]
+   [:selection-context {:optional true} ::context]
    [:order-by {:optional true} ::order-by]
    [:group-by {:optional true} ::group-by]
    [:having {:optional true} ::function]
@@ -58,7 +63,7 @@
    [:fn {:error/fn
          (fn [_ _]
            (str "Query does not have exactly one select clause. "
-                "One of 'select', 'selectOne', 'select-one', 'selectDistinct', or 'select-distinct' is required in queries. "
+                "One of 'select', 'selectOne', 'select-one', 'selectDistinct', 'select-distinct', or 'construct' is required in queries. "
                 "See documentation here for more details: "
                 docs/error-codes-page "#query-missing-select"))}
     one-select-key-present?]
@@ -73,7 +78,8 @@
   (-> common-query-schema
       (into [[:select {:optional true} ::select]
              [:select-one {:optional true} ::select]
-             [:select-distinct {:optional true} ::select]])
+             [:select-distinct {:optional true} ::select]
+             [:construct {:optional true} ::construct]])
       (into extra-kvs)
       wrap-query-map-schema))
 
@@ -111,27 +117,38 @@
     ::issuer            [:maybe string?]
     ::role              :any
     ::identity          :any
+    ::format            [:enum :sparql :fql :turtle]
+    ::meta              [:orn
+                         [:all :boolean]
+                         [:specific [:map-of :keyword :boolean]]]
     ::opts              [:map
                          [:max-fuel {:optional true} ::max-fuel]
-                         [:issuer {:optional true} ::issuer]
-                         [:role {:optional true} ::role]
                          [:identity {:optional true} ::identity]
+                         [:policy {:optional true} :any]
+                         [:policy-class {:optional true} :any]
                          [:policy-values {:optional true} :any]
+                         [:meta {:optional true} ::meta]
+                         [:format {:optional true} ::format]
+                         [:output {:optional true} [:enum :sparql :fql]]
                          ;; deprecated
+                         [:role {:optional true} ::role]
+                         [:issuer {:optional true} ::issuer]
                          [:pretty-print {:optional true} ::pretty-print]
                          [:did {:optional true} ::identity]
                          [:default-allow? {:optional true} ::default-allow?]
                          [:parse-json {:optional true} ::parse-json]]
     ::stage-opts        [:map
-                         [:meta {:optional true} :boolean]
+                         [:meta {:optional true} ::meta]
                          [:max-fuel {:optional true} ::max-fuel]
                          [:identity {:optional true} ::identity]
+                         [:format {:optional true} ::format]
                          [:did {:optional true} ::identity]
                          [:context {:optional true} ::context]
                          [:raw-txn {:optional true} :any]
                          [:author {:optional true} ::identity]
                          [:policy-values {:optional true} :any]]
     ::commit-opts       [:map
+                         [:meta {:optional true} ::meta]
                          [:identity {:optional true} ::identity]
                          [:context {:optional true} ::context]
                          [:raw-txn {:optional true} :any]
@@ -201,6 +218,7 @@
     ::group-by          [:orn {:error/message "groupBy clause must be a variable or a vector of variables"}
                          [:clause ::var]
                          [:collection [:sequential ::var]]]
+    ::construct         ::v/construct
     ::filter            ::v/filter
     ::where             ::v/where
     ::values            ::v/values
@@ -215,9 +233,9 @@
 
 (def fql-transformer
   (mt/transformer
-    {:name     :fql
-     :decoders (mt/-json-decoders)}
-    (mt/key-transformer {:decode csk/->kebab-case-keyword})))
+   {:name     :fql
+    :decoders (mt/-json-decoders)}
+   (mt/key-transformer {:decode csk/->kebab-case-keyword})))
 
 (def coerce-query*
   (m/coercer ::query fql-transformer {:registry registry}))
@@ -234,12 +252,12 @@
 (defn coerce-query
   [qry]
   (try*
-   (coerce-query* qry)
-   (catch* e
-           (-> e
-               humanize-error
-               (ex-info {:status 400, :error :db/invalid-query})
-               throw))))
+    (coerce-query* qry)
+    (catch* e
+      (-> e
+          humanize-error
+          (ex-info {:status 400, :error :db/invalid-query})
+          throw))))
 
 (def coerce-subquery*
   (m/coercer ::subquery fql-transformer {:registry registry}))
@@ -250,12 +268,12 @@
 (defn coerce-subquery
   [qry]
   (try*
-   (coerce-subquery* qry)
-   (catch* e
-           (-> e
-               humanize-error
-               (ex-info {:status 400, :error :db/invalid-query})
-               throw))))
+    (coerce-subquery* qry)
+    (catch* e
+      (-> e
+          humanize-error
+          (ex-info {:status 400, :error :db/invalid-query})
+          throw))))
 
 (def coerce-where*
   (m/coercer ::where fql-transformer {:registry registry}))
@@ -279,7 +297,7 @@
 (defn coerce-txn-opts
   [opts]
   (try*
-    (coerce-txn-opts* opts)
+    (some-> opts coerce-txn-opts*)
     (catch* e
       (-> e
           humanize-error
@@ -294,7 +312,7 @@
   (try*
     (coerce-ledger-opts* opts)
     (catch* e
-            (-> e
-                humanize-error
-                (ex-info {:status 400, :error :db/invalid-ledger-opts})
-                throw))))
+      (-> e
+          humanize-error
+          (ex-info {:status 400, :error :db/invalid-ledger-opts})
+          throw))))

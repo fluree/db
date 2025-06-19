@@ -3,26 +3,19 @@
   (:require [clojure.core.async :as async :refer [<! go go-loop]]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
-            [fluree.db.constants :as const]
             [fluree.db.commit.storage :as commit-storage]
-            [fluree.db.did :as did]
-            [fluree.db.fuel :as fuel]
-            [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.json-ld.credential :as credential]
-            [fluree.db.json-ld.iri :as iri]
-            [fluree.db.json-ld.policy :as policy]
-            [fluree.db.json-ld.policy.rules :as policy.rules]
-            [fluree.db.flake.flake-db :as flake-db]
+            [fluree.db.constants :as const]
+            [fluree.db.flake.commit-data :as commit-data]
+            [fluree.db.indexer.garbage :as garbage]
+            [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.transact :as transact]
-            [fluree.db.storage :as storage]
-            [fluree.db.util.core :as util :refer [get-first-value try* catch*]]
-            [fluree.db.util.context :as context]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.nameservice.sub :as ns-subscribe]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.ledger :as ledger])
+            [fluree.db.storage :as storage]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [get-first get-first-value try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -34,31 +27,30 @@
                                :branch   {}}}
    :subscriptions {}})
 
-(defn blank-state
-  "Returns top-level state for connection"
-  []
-  (atom {:ledger        {}
-         :subscriptions {}}))
+(def blank-state
+  "Initial connection state"
+  {:ledger        {}
+   :subscriptions {}})
 
 (defn printer-map
   "Returns map of important data for print writer"
   [conn]
-  {:id (:id conn)})
+  (select-keys conn [:id]))
 
 (defrecord Connection [id state parallelism commit-catalog index-catalog primary-publisher
                        secondary-publishers remote-systems serializer cache defaults])
 
 #?(:clj
    (defmethod print-method Connection [^Connection conn, ^Writer w]
-     (.write w (str "#fluree/Connection "))
+     (.write w "#fluree/Connection ")
      (binding [*out* w]
        (pr (printer-map conn))))
    :cljs
-     (extend-type Connection
-       IPrintWithWriter
-       (-pr-writer [conn w _opts]
-         (-write w "#fluree/Connection ")
-         (-write w (pr (printer-map conn))))))
+   (extend-type Connection
+     IPrintWithWriter
+     (-pr-writer [conn w _opts]
+       (-write w "#fluree/Connection ")
+       (-write w (pr (printer-map conn))))))
 
 (defmethod pprint/simple-dispatch Connection [^Connection conn]
   (pr conn))
@@ -72,7 +64,7 @@
            primary-publisher secondary-publishers remote-systems defaults]
     :or   {serializer (json-serde)} :as _opts}]
   (let [id    (random-uuid)
-        state (blank-state)]
+        state (atom blank-state)]
     (->Connection id state parallelism commit-catalog index-catalog primary-publisher
                   secondary-publishers remote-systems serializer cache defaults)))
 
@@ -81,51 +73,50 @@
   in-memory on the conn.
 
   Returns a two-tuple of
-  [not-cached? promise-chan]
+  [cached? promise-chan]
 
-  where not-cached? is true if a new promise-chan was created, false if an
-  existing promise-chan was found.
+  where `cached?` is true if an existing promise-chan was found, false if a new
+  promise-chan was created.
 
-  promise-chan is the new promise channel that must have the final ledger `put!` into it
-  assuming success? is true, otherwise it will return the existing found promise-chan when
-  success? is false"
+  `promise-chan` is a promise channel that must have the final ledger `put!`
+  into it assuming `success?` is true, otherwise it will return the existing
+  found promise-chan when `success?` is false"
   [{:keys [state] :as _conn} ledger-alias]
   (let [new-p-chan (async/promise-chan)
-        new-state  (swap! state update-in [:ledger ledger-alias]
-                           (fn [existing]
-                             (or existing new-p-chan)))
-        p-chan     (get-in new-state [:ledger ledger-alias])
+        p-chan     (-> state
+                       (swap! update-in [:ledger ledger-alias]
+                              (fn [existing]
+                                (or existing new-p-chan)))
+                       (get-in [:ledger ledger-alias]))
         cached?    (not= p-chan new-p-chan)]
     (log/debug "Registering ledger: " ledger-alias " cached? " cached?)
     [cached? p-chan]))
 
-(defn release-ledger
-  "Opposite of register-ledger. Removes reference to a ledger from conn"
-  [{:keys [state] :as _conn} ledger-alias]
-  (swap! state update :ledger dissoc ledger-alias))
-
-(defn cached-ledger
-  "Returns a cached ledger from the connection if it is cached, else nil"
-  [{:keys [state] :as _conn} ledger-alias]
-  (get-in @state [:ledger ledger-alias]))
-
-(defn notify-commit
-  [conn commit-map]
+(defn notify
+  [{:keys [commit-catalog] :as conn} address hash]
   (go-try
-    (let [expanded-commit (json-ld/expand commit-map)
-          ledger-alias    (get-first-value expanded-commit const/iri-alias)]
-      (if ledger-alias
-        (if-let [ledger-c (cached-ledger conn ledger-alias)]
-          (<? (ledger/notify (<? ledger-c) expanded-commit))
-          (log/debug "No cached ledger found for commit: " commit-map))
+    (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address hash))]
+      (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
+        (if-let [ledger-ch (ns-subscribe/cached-ledger conn ledger-alias)]
+          (do (log/debug "Notification received for ledger" ledger-alias
+                         "of new commit:" expanded-commit)
+              (let [ledger        (<? ledger-ch)
+                    db-address    (-> expanded-commit
+                                      (get-first const/iri-data)
+                                      (get-first-value const/iri-address))
+                    expanded-data (<? (commit-storage/read-data-jsonld commit-catalog db-address))]
+                (case (<? (ledger/notify ledger expanded-commit expanded-data))
+                  (::ledger/current ::ledger/newer ::ledger/updated)
+                  (do (log/debug "Ledger" ledger-alias "is up to date")
+                      true)
+
+                  ::ledger/stale
+                  (do (log/debug "Dropping state for stale ledger:" ledger-alias)
+                      (ns-subscribe/release-ledger conn ledger-alias)))))
+          (log/debug "No cached ledger found for commit: " expanded-commit))
         (log/warn "Notify called with a data that does not have a ledger alias."
-                  "Are you sure it is a commit?: " commit-map)))))
-
-(defn notify-address
-  [{:keys [commit-catalog] :as conn} address]
-  (go-try
-    (let [commit-map (<? (commit-storage/read-commit-jsonld commit-catalog address))]
-      (<? (notify-commit conn commit-map)))))
+                  "Are you sure it is a commit?: " expanded-commit))
+      (log/warn "No commit found for address:" address))))
 
 (defn publishers
   [{:keys [primary-publisher secondary-publishers] :as _conn}]
@@ -250,67 +241,6 @@
     (into (<? (published-addresses conn ledger-alias))
           (<? (known-addresses conn ledger-alias)))))
 
-(defn all-publications
-  [{:keys [remote-systems] :as _conn}]
-  remote-systems)
-
-(defn subscribe-all
-  [publications ledger-alias]
-  (->> publications
-       (map (fn [pub]
-              (nameservice/subscribe pub ledger-alias)))
-       async/merge))
-
-(defn subscribed?
-  [current-state ledger-alias]
-  (contains? (:subscriptions current-state) ledger-alias))
-
-(defn get-subscription
-  [current-state ledger-alias]
-  (get-in current-state [:subscriptions ledger-alias]))
-
-(defn add-subscription
-  [current-state publications ledger-alias]
-  (if-not (subscribed? current-state ledger-alias)
-    (let [sub-ch (subscribe-all publications ledger-alias)]
-      (assoc-in current-state [:subscriptions ledger-alias] sub-ch))
-    current-state))
-
-(defn remove-subscription
-  [current-state ledger-alias]
-  (update current-state :subscriptions dissoc ledger-alias))
-
-;; TODO; Were subscribing to every remote system for every ledger we load.
-;; Perhaps we should ensure that a remote system manages a particular ledger
-;; before subscribing
-(defn subscribe-ledger
-  "Initiates subscription requests for a ledger into all remote systems on a
-  connection."
-  [{:keys [state] :as conn} ledger-alias]
-  (let [pubs                   (all-publications conn)
-        [prev-state new-state] (swap-vals! state add-subscription pubs ledger-alias)]
-    (when-not (subscribed? prev-state ledger-alias)
-      (let [sub-ch (get-subscription new-state ledger-alias)]
-        (go-loop []
-          (when-let [msg (<! sub-ch)]
-            (log/info "Subscribed ledger:" ledger-alias "received subscription message:" msg)
-            (let [action (get msg "action")
-                  data   (get msg "data")]
-              (if (= "new-commit" action)
-                (notify-commit conn data)
-                (log/info "New subscrition message with action: " action "received, ignored.")))
-            (recur)))
-        :subscribed))))
-
-(defn unsubscribe-ledger
-  "Initiates unsubscription requests for a ledger into all namespaces on a connection."
-  [{:keys [state] :as conn} ledger-alias]
-  (->> (all-publications conn)
-       (map (fn [pub]
-              (nameservice/unsubscribe pub ledger-alias)))
-       dorun)
-  (swap! state remove-subscription ledger-alias))
-
 (defn parse-identity
   [conn identity]
   (if identity
@@ -321,7 +251,7 @@
 
 (defn parse-ledger-options
   [conn {:keys [did branch indexing]
-         :or   {branch :main}}]
+         :or   {branch commit-data/default-branch}}]
   (let [did*           (parse-identity conn did)
         ledger-default (-> conn :defaults :indexing)
         indexing*      (merge ledger-default indexing)]
@@ -329,31 +259,34 @@
      :branch   branch
      :indexing indexing*}))
 
+(defn throw-ledger-exists
+  [ledger-alias]
+  (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
+                  {:status 409, :error :db/ledger-exists})))
+
 (defn create-ledger
-  [{:keys [commit-catalog index-catalog] :as conn}
-   ledger-alias opts]
+  [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn} ledger-alias opts]
   (go-try
-    (let [[cached? ledger-chan] (register-ledger conn ledger-alias)]
-      (if cached?
-        (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
-                        {:status 400
-                         :error  :db/ledger-exists}))
-        (let [addr          (<? (primary-address conn ledger-alias))
-              publish-addrs (<? (publishing-addresses conn ledger-alias))
-              pubs          (publishers conn)
-              ledger-opts   (parse-ledger-options conn opts)
-              ledger        (<! (ledger/create {:conn              conn
-                                                :alias             ledger-alias
-                                                :address           addr
-                                                :publish-addresses publish-addrs
-                                                :commit-catalog    commit-catalog
-                                                :index-catalog     index-catalog
-                                                :publishers        pubs}
-                                               ledger-opts))]
-          (when (util/exception? ledger)
-            (release-ledger conn ledger-alias))
-          (async/put! ledger-chan ledger)
-          ledger)))))
+    (if (<? (ledger-exists? conn ledger-alias))
+      (throw-ledger-exists ledger-alias)
+      (let [[cached? ledger-chan] (register-ledger conn ledger-alias)]
+        (if  cached?
+          (throw-ledger-exists ledger-alias)
+          (let [addr          (<? (primary-address conn ledger-alias))
+                publish-addrs (<? (publishing-addresses conn ledger-alias))
+                ledger-opts   (parse-ledger-options conn opts)
+                ledger        (<! (ledger/create {:alias                ledger-alias
+                                                  :primary-address      addr
+                                                  :publish-addresses    publish-addrs
+                                                  :commit-catalog       commit-catalog
+                                                  :index-catalog        index-catalog
+                                                  :primary-publisher    primary-publisher
+                                                  :secondary-publishers secondary-publishers}
+                                                 ledger-opts))]
+            (when (util/exception? ledger)
+              (ns-subscribe/release-ledger conn ledger-alias))
+            (async/put! ledger-chan ledger)
+            ledger))))))
 
 (defn commit->ledger-alias
   "Returns ledger alias from commit map, if present. If not present
@@ -364,27 +297,33 @@
            (some (fn [ns]
                    (nameservice/alias ns db-alias))))))
 
+(defn throw-missing-branch
+  [address ledger-alias]
+  (throw (ex-info (str "No committed branches exist for ledger: " ledger-alias
+                       " at address: " address)
+                  {:status 400, :error :db/missing-branch})))
+
 (defn load-ledger*
-  [{:keys [commit-catalog index-catalog] :as conn}
+  [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn}
    ledger-chan address]
   (go-try
     (if-let [commit (<? (lookup-commit conn address))]
       (do (log/debug "Attempting to load from address:" address
                      "with commit:" commit)
-          (let [commit*      (json-ld/expand commit)
-                ledger-alias (commit->ledger-alias conn address commit*)
-                branch       (keyword (get-first-value commit const/iri-branch))
+          (let [expanded-commit (json-ld/expand commit)
+                ledger-alias    (commit->ledger-alias conn address expanded-commit)
+                branch          (-> expanded-commit
+                                    (get-first-value const/iri-branch)
+                                    (or (throw-missing-branch address ledger-alias)))
 
                 {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
-
-                pubs   (publishers conn)
-                ledger (ledger/instantiate conn ledger-alias address branch commit-catalog
-                                           index-catalog pubs indexing did commit*)]
-            (subscribe-ledger conn ledger-alias)
+                ledger (ledger/instantiate ledger-alias address branch commit-catalog index-catalog
+                                           primary-publisher secondary-publishers indexing did expanded-commit)]
+            (ns-subscribe/subscribe-ledger conn ledger-alias)
             (async/put! ledger-chan ledger)
             ledger))
-      (throw (ex-info (str "Unable to load. No record of ledger exists: " address)
-                      {:status 400 :error :db/invalid-db})))))
+      (throw (ex-info (str "Unable to load. No record of ledger at address: " address " exists.")
+                      {:status 404, :error :db/unkown-address})))))
 
 (defn load-ledger-address
   [conn address]
@@ -399,7 +338,7 @@
   (go
     (try* (<? (load-ledger* conn ledger-chan addr))
           (catch* e
-                  (log/debug e "Unable to load ledger alias" alias "at address:" addr)))))
+            (log/debug e "Unable to load ledger alias" alias "at address:" addr)))))
 
 (defn load-ledger-alias
   [conn alias]
@@ -411,10 +350,9 @@
           (if addr
             (or (<? (try-load-address conn ledger-chan alias addr))
                 (recur r))
-            (do (release-ledger conn alias)
+            (do (ns-subscribe/release-ledger conn alias)
                 (let [ex (ex-info (str "Load for " alias " failed due to failed address lookup.")
-                                  {:status 404 :error :db/unknown-address}
-                                  addr)]
+                                  {:status 404, :error :db/unkown-ledger})]
                   (async/put! ledger-chan ex)
                   (throw ex)))))))))
 
@@ -424,234 +362,96 @@
     (load-ledger-address conn alias-or-address)
     (load-ledger-alias conn alias-or-address)))
 
-(def f-context {"f" "https://ns.flur.ee/ledger#"})
+(defn drop-commit-artifacts
+  [{:keys [commit-catalog] :as _conn} latest-commit]
+  (let [error-ch  (async/chan)
+        commit-ch (commit-storage/trace-commits commit-catalog latest-commit 0 error-ch)]
+    (go-loop []
+      (when-let [[commit _] (<! commit-ch)]
+        (let [txn-address         (util/get-first-value commit const/iri-txn)
+              commit-address      (util/get-first-value commit const/iri-address)
+              data-address        (-> (util/get-first commit const/iri-data)
+                                      (util/get-first-value const/iri-address))]
+          (log/debug "Dropping commit" (-> (util/get-first commit const/iri-data)
+                                           (util/get-first-value const/iri-fluree-t)))
+          (when data-address
+            (log/debug "Deleting data" data-address)
+            (storage/delete commit-catalog data-address))
+          (when commit-address
+            (log/debug "Deleting commit" commit-address)
+            (storage/delete commit-catalog commit-address))
+          (when txn-address
+            (log/debug "Deleting txn" txn-address)
+            (storage/delete commit-catalog txn-address))
+          (recur))))))
 
-(defn write-transaction
-  [storage ledger-alias txn]
-  (let [path (str/join "/" [ledger-alias "txn"])]
-    (storage/content-write-json storage path txn)))
-
-;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
-;; TODO - however this is really a concern of "commit", not staging and I don't think the db should be handling any of it
-(defn write-transaction!
-  [storage ledger-alias staged]
+(defn drop-index-nodes
+  "Build up a list of node addresses in leaf->root order, then delete them."
+  [storage node-address]
   (go-try
-    (let [[txn author-did annotation] staged]
-      (if txn
-        (let [{txn-id :address} (<? (write-transaction storage ledger-alias txn))]
-          [txn-id author-did annotation])
-        staged))))
+    (loop [[address & r] [node-address]
+           addresses     (list)]
+      (if address
+        (if-let [children (->> (:children (<? (storage/read-json storage address true)))
+                               (mapv :id))]
+          (recur (into r children) (conj addresses address))
+          (recur r (conj addresses address)))
 
-(defn update-commit-address
-  "Once a commit address is known, which might be after the commit is written
-  if IPFS, add the final address into the commit map."
-  [[commit-map commit-jsonld] commit-address]
-  [(assoc commit-map :address commit-address)
-   (assoc commit-jsonld "address" commit-address)])
+        (doseq [address addresses]
+          (log/debug "Dropping node" address)
+          (storage/delete storage address))))
+    :nodes-dropped))
 
-(defn update-commit-id
-  "Once a commit address is known, which might be after the commit is written
-  if IPFS, add the final address into the commit map."
-  [[commit-map commit-jsonld] commit-hash]
-  (let [commit-id (commit-data/hash->commit-id commit-hash)]
-    [(assoc commit-map :id commit-id)
-     (assoc commit-jsonld "@id" commit-id)]))
-
-(defn write-commit
-  [commit-storage alias {:keys [did private]} commit]
+(defn drop-index-artifacts
+  [{:keys [index-catalog] :as _conn} latest-commit]
   (go-try
-    (let [commit-jsonld (commit-data/->json-ld commit)
+    (let [storage       (:storage index-catalog)
+          index-address (some-> (util/get-first latest-commit const/iri-index)
+                                (util/get-first-value const/iri-address))]
+      (when index-address
+        (log/debug "Dropping index" index-address)
+        (let [{:keys [spot opst post tspo]} (<? (storage/read-json storage index-address true))
 
-          signed-commit (if did
-                          (<? (credential/generate commit-jsonld private (:id did)))
-                          commit-jsonld)
-          commit-res    (<? (commit-storage/write-jsonld commit-storage alias signed-commit))
+              garbage-ch (garbage/clean-garbage* index-catalog index-address 0)
+              spot-ch    (drop-index-nodes storage (:id spot))
+              post-ch    (drop-index-nodes storage (:id post))
+              tspo-ch    (drop-index-nodes storage (:id tspo))
+              opst-ch    (drop-index-nodes storage (:id opst))]
+          (<? garbage-ch)
+          (<? spot-ch)
+          (<? post-ch)
+          (<? tspo-ch)
+          (<? opst-ch)
+          (<? (storage/delete storage index-address))))
+      :index-dropped)))
 
-          [commit* commit-jsonld*] (-> [commit commit-jsonld]
-                                       (update-commit-id (:hash commit-res))
-                                       (update-commit-address (:address commit-res)))]
-      {:commit-map    commit*
-       :commit-jsonld commit-jsonld*
-       :write-result  commit-res})))
+(defn drop-ledger
+  [conn alias]
+  (go
+    (try*
+      (let [alias (if (fluree-address? alias)
+                    (nameservice/address-path alias)
+                    alias)]
+        (loop [[publisher & r] (publishers conn)]
+          (when publisher
+            (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
+                  latest-commit (-> (<? (nameservice/lookup publisher ledger-addr))
+                                    json-ld/expand)]
+              (log/warn "Dropping ledger" ledger-addr)
+              (drop-index-artifacts conn latest-commit)
+              (drop-commit-artifacts conn latest-commit)
+              (<? (nameservice/retract publisher alias))
+              (recur r))))
+        (log/warn "Dropped ledger" alias)
+        :dropped)
+      (catch* e (log/debug e "Failed to complete ledger deletion")))))
 
-(defn publish-commit
-  "Publishes commit to all nameservices registered with the ledger."
-  [{:keys [primary-publisher secondary-publishers] :as _conn} commit-jsonld]
-  (go-try
-    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
-      (nameservice/publish-to-all commit-jsonld secondary-publishers)
-      result)))
-
-(defn formalize-commit
-  [{prev-commit :commit :as staged-db} new-commit]
-  (let [max-ns-code (-> staged-db :namespace-codes iri/get-max-namespace-code)]
-    (-> staged-db
-        (assoc :commit new-commit
-               :staged nil
-               :prev-commit prev-commit
-               :max-namespace-code max-ns-code)
-        (commit-data/add-commit-flakes))))
-
-(defn sanitize-commit-options
-  "Parses the commit options and removes non-public opts."
-  [opts]
-  (if (string? opts)
-    {:message opts}
-    (select-keys opts [:context :did :private :message :tag :index-files-ch])))
-
-(defn parse-commit-context
-  [context]
-  (let [parsed-context (if context
-                         (-> context
-                             json-ld/parse-context
-                             (json-ld/parse-context f-context))
-                         (json-ld/parse-context f-context))]
-    (context/stringify parsed-context)))
-
-(defn parse-keypair
-  [ledger {:keys [did private] :as opts}]
-  (let [private* (or private
-                     (:private did)
-                     (-> ledger :did :private))
-        did*     (or (some-> private* did/private->did)
-                     did
-                     (:did ledger))]
-    (assoc opts :did did*, :private private*)))
-
-(defn parse-data-helpers
-  [{:keys [context] :as opts}]
-  (let [ctx-used-atom (atom {})
-        compact-fn    (json-ld/compact-fn context ctx-used-atom)]
-    (assoc opts
-           :commit-data-opts {:compact-fn    compact-fn
-                              :compact       (fn [iri] (json-ld/compact iri compact-fn))
-                              :id-key        (json-ld/compact "@id" compact-fn)
-                              :type-key      (json-ld/compact "@type" compact-fn)
-                              :ctx-used-atom ctx-used-atom})))
-
-(defn parse-commit-opts
-  [ledger opts]
-  (-> opts
-      (update :context parse-commit-context)
-      (->> (parse-keypair ledger))
-      parse-data-helpers))
-
-(defn apply-stage!
-  [{:keys [conn] ledger-alias :alias, :as ledger}
-   {:keys [branch t stats commit] :as staged-db}
-   opts]
-  (go-try
-    (let [{:keys [commit-catalog]} conn
-
-          {:keys [tag time message did private commit-data-opts index-files-ch]
-           :or   {time (util/current-time-iso)}}
-          (parse-commit-opts ledger opts)
-
-          {:keys [db-jsonld staged-txn]}
-          (flake-db/db->jsonld staged-db commit-data-opts)
-
-          [txn-id author annotation]
-          (<? (write-transaction! commit-catalog ledger-alias staged-txn))
-
-          data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
-          db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
-          dbid              (commit-data/hash->db-id (:hash data-write-result))
-          keypair           {:did did, :private private}
-
-          new-commit (commit-data/new-db-commit-map {:old-commit commit
-                                                     :issuer     did
-                                                     :message    message
-                                                     :tag        tag
-                                                     :dbid       dbid
-                                                     :t          t
-                                                     :time       time
-                                                     :db-address db-address
-                                                     :author     author
-                                                     :annotation annotation
-                                                     :txn-id     txn-id
-                                                     :flakes     (:flakes stats)
-                                                     :size       (:size stats)})
-
-          {:keys [commit-map commit-jsonld write-result]}
-          (<? (write-commit commit-catalog ledger-alias keypair new-commit))
-
-          db  (formalize-commit staged-db commit-map)
-          db* (ledger/update-commit! ledger branch db index-files-ch)]
-
-      (log/debug "Committing t" t "at" time)
-
-      (<? (publish-commit conn commit-jsonld))
-
-      (-> write-result
-          (select-keys [:address :hash :size])
-          (assoc :t t, :db db*)))))
-
-(defn commit!
-  "Finds all uncommitted transactions and wraps them in a Commit document as the subject
-  of a VerifiableCredential. Persists according to the :ledger :conn :method and
-  returns a db with an updated :commit."
-  ([ledger staged-db]
-   (commit! ledger staged-db nil))
-  ([ledger staged-db opts]
-   (go-try
-     (:db (<? (apply-stage! ledger staged-db opts))))))
-
-(defn track?
-  [parsed-opts]
-  (or (:max-fuel parsed-opts)
-      (:meta parsed-opts)))
-
-(defn stage-triples
-  "Stages a new transaction that is already parsed into the
-   internal Fluree triples format."
-  [db parsed-txn parsed-opts]
-  (go-try
-    (let [identity  (:identity parsed-opts)
-          policy-db (if (policy/policy-enforced-opts? parsed-opts)
-                      (let [parsed-context (:context parsed-opts)]
-                        (<? (policy/policy-enforce-db db parsed-context parsed-opts)))
-                      db)]
-      (if (track? parsed-opts)
-        (let [start-time   #?(:clj (System/nanoTime)
-                            :cljs (util/current-time-millis))
-              fuel-tracker (fuel/tracker (:max-fuel parsed-opts))]
-          (try*
-            (let [result        (<? (transact/stage policy-db fuel-tracker identity parsed-txn parsed-opts))
-                  policy-report (policy.rules/enforcement-report result)]
-              (cond-> {:status 200
-                       :result result
-                       :time   (util/response-time-formatted start-time)
-                       :fuel   (fuel/tally fuel-tracker)}
-                policy-report (assoc :policy policy-report)))
-            (catch* e
-                    (throw (ex-info (ex-message e)
-                                    (let [policy-report (policy.rules/enforcement-report policy-db)]
-                                      (cond-> {:time (util/response-time-formatted start-time)
-                                               :fuel (fuel/tally fuel-tracker)}
-                                        policy-report (assoc :policy policy-report)))
-                                    e)))))
-        (<? (transact/stage policy-db identity parsed-txn parsed-opts))))))
-
-(defn transact-ledger!
-  [_conn ledger triples {:keys [branch] :as parsed-opts, :or {branch :main}}]
-  (log/info "transacting ledger:" parsed-opts)
-  (go-try
-    (let [db       (ledger/current-db ledger branch)
-          staged   (<? (stage-triples db triples parsed-opts))
-          ;; commit API takes a did-map and parsed context as opts
-          ;; whereas stage API takes a did IRI and unparsed context.
-          ;; Dissoc them until deciding at a later point if they can carry through.
-          cmt-opts (dissoc parsed-opts :context :identity)]
-      (if (track? parsed-opts)
-        (assoc staged :result (<? (commit! ledger (:result staged) cmt-opts)))
-        (<? (commit! ledger staged cmt-opts))))))
-
-(defn transact!
-  [conn ledger-id triples parsed-opts]
-  (log/info "transacting:" parsed-opts)
-  (go-try
-    (let [ledger (<? (load-ledger conn ledger-id))]
-      (<? (transact-ledger! conn ledger triples parsed-opts)))))
+(defn resolve-txn
+  "Reads a transaction from the commit catalog by address.
+   
+   Used by fluree/server in consensus/events."
+  [{:keys [commit-catalog] :as _conn} address]
+  (storage/read-json commit-catalog address))
 
 (defn replicate-index-node
   [conn address data]

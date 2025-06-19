@@ -3,14 +3,14 @@
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.flake-db :as flake-db]
+            [fluree.db.flake.transact :as flake.transact]
             [fluree.db.indexer :as indexer]
-            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.transact :as transact]
+            [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.history :as history]
-            [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :refer [try* catch*]]
@@ -23,10 +23,14 @@
 
 (defrecord AsyncDB [alias branch commit t db-chan]
   dbproto/IFlureeDb
-  (-query [this query-map]
+  (-query [_ tracker query-map]
     (go-try
       (let [db (<? db-chan)]
-        (<? (dbproto/-query db query-map)))))
+        (<? (dbproto/-query db tracker query-map)))))
+  (-class-ids [_ tracker subject]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (dbproto/-class-ids db tracker subject)))))
   (-index-update [_ commit-index]
     (let [commit* (assoc commit :index commit-index)
           updated-db (->async-db alias branch commit* t)]
@@ -35,48 +39,49 @@
           (deliver! updated-db (dbproto/-index-update db commit-index))))
       updated-db))
   where/Matcher
-  (-match-id [_ fuel-tracker solution s-match error-ch]
+  (-match-id [_ tracker solution s-match error-ch]
     (let [match-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (where/-match-id fuel-tracker solution s-match error-ch)
+                (where/-match-id tracker solution s-match error-ch)
                 (async/pipe match-ch)))
           (catch* e
             (log/error e "Error loading database")
             (>! error-ch e))))
       match-ch))
 
-  (-match-triple [_ fuel-tracker solution triple error-ch]
+  (-match-triple [_ tracker solution triple error-ch]
     (let [match-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (where/-match-triple fuel-tracker solution triple error-ch)
+                (where/-match-triple tracker solution triple error-ch)
                 (async/pipe match-ch)))
           (catch* e
             (log/error e "Error loading database")
             (>! error-ch e))))
       match-ch))
 
-  (-match-class [_ fuel-tracker solution triple error-ch]
+  (-match-class [_ tracker solution triple error-ch]
     (let [match-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (where/-match-class fuel-tracker solution triple error-ch)
+                (where/-match-class tracker solution triple error-ch)
                 (async/pipe match-ch)))
           (catch* e
             (log/error e "Error loading database")
             (>! error-ch e))))
       match-ch))
 
-  (-activate-alias [db alias']
-    (when (= alias alias')
-      db))
+  (-activate-alias [_ alias']
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (where/-activate-alias db alias')))))
 
   (-aliases [_]
     [alias])
@@ -85,46 +90,46 @@
     solution-ch)
 
   subject/SubjectFormatter
-  (-forward-properties [_ iri select-spec context compact-fn cache fuel-tracker error-ch]
+  (-forward-properties [_ iri select-spec context compact-fn cache tracker error-ch]
     (let [prop-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (subject/-forward-properties iri select-spec context compact-fn cache fuel-tracker error-ch)
+                (subject/-forward-properties iri select-spec context compact-fn cache tracker error-ch)
                 (async/pipe prop-ch)))
           (catch* e
             (log/error e "Error loading database")
             (>! error-ch e))))
       prop-ch))
 
-  (-reverse-property [_ iri reverse-spec context compact-fn cache fuel-tracker error-ch]
+  (-reverse-property [_ iri reverse-spec context compact-fn cache tracker error-ch]
     (let [prop-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (subject/-reverse-property iri reverse-spec context compact-fn cache fuel-tracker error-ch)
+                (subject/-reverse-property iri reverse-spec context compact-fn cache tracker error-ch)
                 (async/pipe prop-ch)))
           (catch* e
             (log/error e "Error loading database")
             (>! error-ch e))))
       prop-ch))
 
-  (-iri-visible? [_ iri]
+  (-iri-visible? [_ tracker iri]
     (go-try
       (let [db (<? db-chan)]
-        (<? (subject/-iri-visible? db iri)))))
+        (<? (subject/-iri-visible? db tracker iri)))))
 
-  transact/Transactable
-  (-stage-txn [_ fuel-tracker context identity author annotation raw-txn parsed-txn]
+  flake.transact/Transactable
+  (-stage-txn [_ tracker context identity author annotation raw-txn parsed-txn]
     (go-try
       (let [db (<? db-chan)]
-        (<? (transact/-stage-txn db fuel-tracker context identity author annotation raw-txn parsed-txn)))))
+        (<? (flake.transact/-stage-txn db tracker context identity author annotation raw-txn parsed-txn)))))
   (-merge-commit [_ commit-jsonld commit-data-jsonld]
     (go-try
       (let [db (<? db-chan)]
-        (<? (transact/-merge-commit db commit-jsonld commit-data-jsonld)))))
+        (<? (flake.transact/-merge-commit db commit-jsonld commit-data-jsonld)))))
 
   indexer/Indexable
   (index [_ changes-ch]
@@ -155,18 +160,18 @@
       db-at-t))
 
   history/AuditLog
-  (-history [_ context from-t to-t commit-details? include error-ch history-q]
+  (-history [_ tracker context from-t to-t commit-details? include error-ch history-q]
     (go-try
       (let [db (<? db-chan)]
-        (<? (history/-history db context from-t to-t commit-details? include error-ch history-q)))))
+        (<? (history/-history db tracker context from-t to-t commit-details? include error-ch history-q)))))
 
-  (-commits [_ context from-t to-t include error-ch]
+  (-commits [_ tracker context from-t to-t include error-ch]
     (let [commit-ch (async/chan)]
       (go
         (try*
           (let [db (<? db-chan)]
             (-> db
-                (history/-commits context from-t to-t include error-ch)
+                (history/-commits context tracker from-t to-t include error-ch)
                 (async/pipe commit-ch)))
           (catch* e
             (log/error e "Error loading database for commit range")
@@ -176,8 +181,12 @@
   policy/Restrictable
   (wrap-policy [_ policy policy-values]
     (go-try
-     (let [db (<? db-chan)]
-       (<? (policy/wrap-policy db policy policy-values)))))
+      (let [db (<? db-chan)]
+        (<? (policy/wrap-policy db policy policy-values)))))
+  (wrap-policy [_ tracker policy policy-values]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (policy/wrap-policy db tracker policy policy-values)))))
   (root [_]
     (let [root-ch (async/promise-chan)
           root-db (->AsyncDB alias branch commit t root-ch)]
@@ -236,12 +245,14 @@
   (->AsyncDB ledger-alias branch commit-map t (async/promise-chan)))
 
 (defn load
-  [ledger-alias branch commit-catalog index-catalog commit-jsonld indexing-opts]
-  (let [commit-map (commit-data/jsonld->clj commit-jsonld)
-        t          (-> commit-map :data :t)
-        async-db   (->async-db ledger-alias branch commit-map t)]
-    (go
-      (let [db (<! (flake-db/load ledger-alias commit-catalog index-catalog branch
-                                  [commit-jsonld commit-map] indexing-opts))]
-        (deliver! async-db db)))
-    async-db))
+  ([ledger-alias branch commit-catalog index-catalog commit-jsonld indexing-opts]
+   (let [commit-map (commit-data/jsonld->clj commit-jsonld)]
+     (load ledger-alias branch commit-catalog index-catalog commit-jsonld commit-map indexing-opts)))
+  ([ledger-alias branch commit-catalog index-catalog commit-jsonld commit-map indexing-opts]
+   (let [t        (-> commit-map :data :t)
+         async-db (->async-db ledger-alias branch commit-map t)]
+     (go
+       (let [db (<! (flake-db/load ledger-alias commit-catalog index-catalog branch
+                                   [commit-jsonld commit-map] indexing-opts))]
+         (deliver! async-db db)))
+     async-db)))

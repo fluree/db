@@ -4,8 +4,6 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy :refer [root]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
             [fluree.db.util.parse :as util.parse]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -18,84 +16,110 @@
   [policy]
   (true? (get-in policy [:view :root?])))
 
-(defn class-policy-map
-  "Returns class policy map"
-  [policy modify?]
-  (if modify?
-    (get-in policy [:modify :class])
-    (get-in policy [:view :class])))
+(defn view-class-policy-map
+  [policy]
+  (get-in policy [:view :class]))
 
-(defn property-policy-map
-  "Returns property policy map"
-  [policy modify?]
-  (if modify?
-    (get-in policy [:modify :property])
-    (get-in policy [:view :property])))
+(defn modify-class-policy-map
+  [policy]
+  (get-in policy [:modify :class]))
 
-(defn policies-for-classes
-  "Returns sequence of policies that apply to the provided classes."
-  [policy modify? classes]
-  (let [class-policies (class-policy-map policy modify?)]
+(defn modify-property-policy-map
+  [policy]
+  (get-in policy [:modify :property]))
+
+(defn view-property-policy-map
+  [policy]
+  (get-in policy [:view :property]))
+
+(defn view-policies-for-classes
+  [policy classes]
+  (let [class-policies (view-class-policy-map policy)]
     (seq (apply concat (keep #(get class-policies %) classes)))))
 
-(defn policies-for-property
-  "Returns policy properties if they exist for the provided property
-  else nil"
-  [policy-map modify? property]
-  (let [prop-policies (property-policy-map policy-map modify?)]
+(defn modify-policies-for-classes
+  [policy classes]
+  (let [class-policies (modify-class-policy-map policy)]
+    (seq (apply concat (keep #(get class-policies %) classes)))))
+
+(defn modify-policies-for-property
+  [policy-map property]
+  (let [prop-policies (modify-property-policy-map policy-map)]
     (get prop-policies property)))
 
-(defn default-policies
-  "Returns default policies if they exist else nil"
-  [policy-map modify?]
-  (if modify?
-    (get-in policy-map [:modify :default])
-    (get-in policy-map [:view :default])))
+(defn view-policies-for-property
+  [policy-map property]
+  (let [prop-policies (view-property-policy-map policy-map)]
+    (get prop-policies property)))
 
-(defn policies-for-flake
-  [{:keys [policy namespace-codes] :as db} [s p o :as flake] modify?]
-  (->> (default-policies policy modify?)
-       (keep (fn [{:keys [s-targets p-targets default?] :as policy}]
-               (when (or (and (or (nil? s-targets) (contains? s-targets s))
-                              (or (nil? p-targets) (contains? p-targets p)))
-                         default?)
-                 policy)))))
+(defn default-view-policies
+  [policy-map]
+  (get-in policy-map [:view :default]))
+
+(defn default-modify-policies
+  [policy-map]
+  (get-in policy-map [:modify :default]))
+
+(defn applies-to-flake?
+  [{:keys [s-targets p-targets default?] :as _policy} [s p _o :as _flake]]
+  (or (and (or (nil? s-targets) (contains? s-targets s))
+           (or (nil? p-targets) (contains? p-targets p)))
+      default?))
+
+(defn view-policies-for-flake
+  [{:keys [policy] :as _db} flake]
+  (filter (fn [policy]
+            (applies-to-flake? policy flake))
+          (default-view-policies policy)))
+
+(defn modify-policies-for-flake
+  [{:keys [policy] :as _db} flake]
+  (filter (fn [policy]
+            (applies-to-flake? policy flake))
+          (default-modify-policies policy)))
 
 (defn policy-query
-  [db sid policy]
+  [db sid query]
   (let [policy-values (-> db :policy :policy-values)
-        query         (:query policy)
         this-val      (iri/decode-sid db sid)
         values        (-> (util.parse/normalize-values policy-values)
                           (policy/inject-value-binding "?$this" {"@value" this-val "@type" const/iri-id}))]
     (policy/inject-where-pattern query ["values" values])))
 
-(defn modify-exception
-  [policies]
-  (ex-info (or (some :ex-message policies)
-               "Policy enforcement prevents modification.")
-           {:status 403 :error :db/policy-exception}))
+(def ^:const deny-query-result false)
 
-(defn policies-allow?
+(defn- policies-allow?
   "Once narrowed to a specific set of policies, execute and return
   appropriate policy response."
-  [db modify? sid policies-to-eval]
+  [db tracker sid policies]
   (let [tracer (-> db :policy :trace)]
     (go-try
-      (loop [[policy & r] policies-to-eval]
+      (loop [[policy & r] policies]
         ;; return first truthy response, else false
         (if policy
           (let [{exec-counter :executed
                  allowed-counter :allowed} (get tracer (:id policy))
 
-                query   (policy-query db sid policy)
-                result  (seq (<? (dbproto/-query (root db) query)))]
+                query   (when-let [query (:query policy)]
+                          (policy-query db sid query))
+                result  (if query
+                          (seq (<? (dbproto/-query (root db) tracker query)))
+                          deny-query-result)]
             (swap! exec-counter inc)
             (if result
               (do (swap! allowed-counter inc)
                   true)
               (recur r)))
           ;; no more policies left to evaluate - all returned false
-          (if modify?
-            (modify-exception policies-to-eval)
-            false))))))
+          false)))))
+
+(defn policies-allow-viewing?
+  [db tracker sid policies]
+  (policies-allow? db tracker sid policies))
+
+(defn policies-allow-modification?
+  [db tracker sid policies]
+  (go-try (or (<? (policies-allow? db tracker sid policies))
+              (ex-info (or (some :ex-message policies)
+                           "Policy enforcement prevents modification.")
+                       {:status 403 :error :db/policy-exception}))))

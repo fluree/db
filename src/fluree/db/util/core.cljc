@@ -1,9 +1,9 @@
 (ns fluree.db.util.core
-  (:require [clojure.string :as str]
-            #?@(:clj [[fluree.db.util.clj-exceptions :as clj-exceptions]
-                      [fluree.db.util.cljs-exceptions :as cljs-exceptions]]))
+  (:require #?@(:clj [[fluree.db.util.clj-exceptions :as clj-exceptions]
+                      [fluree.db.util.cljs-exceptions :as cljs-exceptions]])
+            [clojure.string :as str])
   #?(:cljs (:require-macros [fluree.db.util.core :refer [case+]]))
-  #?(:clj (:import (java.util UUID Date)
+  #?(:clj (:import (java.util Date)
                    (java.time Instant OffsetDateTime ZoneId)
                    (java.time.format DateTimeFormatter)
                    (java.net URLEncoder URLDecoder)))
@@ -11,10 +11,9 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-
-(def ^:const max-long #?(:clj  (Long/MAX_VALUE)
+(def ^:const max-long #?(:clj  Long/MAX_VALUE
                          :cljs 9007199254740991))           ;; 2^53-1 for javascript
-(def ^:const min-long #?(:clj  (Long/MIN_VALUE)
+(def ^:const min-long #?(:clj  Long/MIN_VALUE
                          :cljs -9007199254740991))
 (def ^:const max-integer 2147483647)
 (def ^:const min-integer -2147483647)
@@ -31,19 +30,18 @@
      [then else]
      (if (cljs-env? &env) then else)))
 
-
 #?(:clj
    (defmacro try-catchall
      "A cross-platform variant of try-catch that catches all exceptions.
    Does not (yet) support finally, and does not need or want an exception class."
      [& body]
      (let [try-body (butlast body)
-           [catch sym & catch-body :as catch-form] (last body)]
+           [catch sym & catch-body :as _catch-form] (last body)]
        (assert (= catch 'catch))
        (assert (symbol? sym))
        `(if-cljs
-            (try ~@try-body (~'catch js/Object ~sym ~@catch-body))
-            (try ~@try-body (~'catch Throwable ~sym ~@catch-body))))))
+         (try ~@try-body (~'catch js/Object ~sym ~@catch-body))
+         (try ~@try-body (~'catch Throwable ~sym ~@catch-body))))))
 
 (declare catch*)
 
@@ -57,8 +55,8 @@
      Also supports an optional finally clause."
      [& body]
      `(if-cljs
-        (cljs-exceptions/try* ~@body)
-        (clj-exceptions/try* ~@body))))
+       (cljs-exceptions/try* ~@body)
+       (clj-exceptions/try* ~@body))))
 
 (defn index-of
   "Returns index integer (n) of item within a Vector.
@@ -96,7 +94,6 @@
     (throw (ex-info (str "Invalid date: " (pr-str date))
                     {:status 400 :error :db/invalid-date}))))
 
-
 (defn current-time-millis
   "Returns current time in epoch milliseonds for closure/script"
   []
@@ -119,7 +116,6 @@
      :cljs (-> (- (current-time-millis) start-time)
                (str "ms"))))
 
-
 (defn deep-merge [v & vs]
   (letfn [(rec-merge [v1 v2]
             (if (and (map? v1) (map? v2))
@@ -129,11 +125,9 @@
       (reduce #(rec-merge %1 %2) v vs)
       v)))
 
-
 (defn email?
   [email]
   (re-matches #"^[\w-\+]+(\.[\w]+)*@[\w-]+(\.[\w]+)*(\.[a-z]{2,})$" email))
-
 
 (defn pred-ident?
   "Tests if an predicate identity two-tuple
@@ -143,11 +137,9 @@
        (= 2 (count x))
        (string? (first x))))
 
-
 (defn temp-ident?
   [x]
   (string? x))
-
 
 (defn str->int
   "Converts string to integer. Assumes you've already verified the string is
@@ -191,11 +183,11 @@
   "Does simple (top-level keys only) keywordize-keys if the key is a string."
   [m]
   (reduce-kv
-    (fn [acc k v]
-      (if (string? k)
-        (assoc acc (keyword k) v)
-        (assoc acc k v)))
-    {} m))
+   (fn [acc k v]
+     (if (string? k)
+       (assoc acc (keyword k) v)
+       (assoc acc k v)))
+   {} m))
 
 (defn stringify-keys
   "Does simple (top-level keys only) conversion of keyword keys to strings.
@@ -204,12 +196,11 @@
   properly to JSON."
   [m]
   (reduce-kv
-    (fn [acc k v]
-      (if (keyword? k)
-        (assoc acc (name k) v)
-        (assoc acc k v)))
-    {} m))
-
+   (fn [acc k v]
+     (if (keyword? k)
+       (assoc acc (name k) v)
+       (assoc acc k v)))
+   {} m))
 
 (defn str->epoch-ms
   "Takes time as a string and returns epoch millis."
@@ -226,11 +217,15 @@
   "Takes milliseconds since the epoch and returns an ISO-8601 formatted string
   for that datetime. Optionally takes a ZoneId string (e.g. 'America/Denver')."
   ([millis] (epoch-ms->iso-8601-str millis "Z"))
-  ([millis zone-id]
-   #?(:clj  (-> millis Instant/ofEpochMilli
-                (OffsetDateTime/ofInstant (ZoneId/of zone-id))
-                (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME))
-      :cljs (-> millis js/Date. .toISOString))))
+  #?(:clj
+     ([millis zone-id]
+      (-> millis Instant/ofEpochMilli
+          (OffsetDateTime/ofInstant (ZoneId/of zone-id))
+          (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME)))
+
+     :cljs
+     ([millis _]
+      (-> millis js/Date. .toISOString))))
 
 (defn trunc
   "Truncate string s to n characters."
@@ -263,12 +258,10 @@
   ([start end] (range start (inc end)))
   ([start end step] (range start (+ end step) step)))
 
-
 (defn exception?
   "x-platform, returns true if is an exception"
   [x]
   (instance? #?(:clj Throwable :cljs js/Error) x))
-
 
 (defn url-encode
   [string]
@@ -277,15 +270,17 @@
 
 (defn url-decode
   ([string] (url-decode string "UTF-8"))
-  ([string ^String encoding]
-   #?(:clj  (some-> string str (URLDecoder/decode encoding))
-      :cljs (some-> string str (js/decodeURIComponent)))))
+  #?(:clj
+     ([string ^String encoding]
+      (some-> string str (URLDecoder/decode encoding)))
 
+     :cljs
+     ([string _]
+      (some-> string str (js/decodeURIComponent)))))
 
 (defn map-invert
   [m]
   (reduce (fn [m [k v]] (assoc m v k)) {} m))
-
 
 (defn zero-pad
   "Zero pads x"
@@ -339,7 +334,7 @@
                          n (count clause)]
                      (case n
                        0 `(throw (IllegalArgumentException.
-                                   (str "No matching clause: " ~expr)))
+                                  (str "No matching clause: " ~expr)))
                        1 a
                        (let [preds (if (and (coll? a)
                                             (not (= 'fn* (first a)))
@@ -382,14 +377,13 @@
                            (last clauses))
            clauses       (if default (drop-last clauses) clauses)]
        (if-cljs
-         `(condp = ~value
-            ~@(concat clauses default))
-         `(case ~value
-            ~@(concat (->> clauses
-                           (map #(-> % first eval-dispatch (list (second %))))
-                           (mapcat identity))
-                      default))))))
-
+        `(condp = ~value
+           ~@(concat clauses default))
+        `(case ~value
+           ~@(concat (->> clauses
+                          (map #(-> % first eval-dispatch (list (second %))))
+                          (mapcat identity))
+                     default))))))
 
 (defn vswap!
   "This silly fn exists to work around a bug in go macros where they sometimes clobber

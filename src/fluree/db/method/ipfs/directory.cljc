@@ -1,11 +1,11 @@
 (ns fluree.db.method.ipfs.directory
-  (:require [fluree.db.util.async :refer [<? go-try channel?]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [clojure.core.async :as async]
+  (:require [clojure.core.async :as async]
             [clojure.string :as str]
+            [fluree.db.method.ipfs.xhttp :as ipfs]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.xhttp :as xhttp]
-            [fluree.db.method.ipfs.xhttp :as ipfs]))
+            [fluree.db.util.xhttp :as xhttp]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -13,7 +13,6 @@
 
 ;; maintains current state tree for IPNS
 (def ipns-state (atom {}))
-
 
 (defn generate-dag
   "Generates a dag directory file given list/vector of items to add in the file
@@ -80,7 +79,6 @@
           parent-cid     (<? (write-dag! ipfs-endpoint (vals (:child dag-map**))))]
       (assoc dag-map** :hash parent-cid))))
 
-
 (defn dag-map
   "Returns a nested map of a directory-dag containing the key of
   the file/directory name and values of maps with keys:
@@ -104,7 +102,6 @@
                                                      :hash hash
                                                      :size size}))))
            acc))))))
-
 
 (defn flatten-dag
   "Flattens our dag representation returning a list of two-tuples as:
@@ -132,7 +129,6 @@
     (let [{:keys [child]} (<? (dag-map ipfs-endpoint root-cid))]
       (->> (flatten-dag child nil)
            (into {})))))
-
 
 ;; TODO - probably makes sense to have a queue for updates, and apply multiple pending updates simultaneously under the same IPNS address
 (defn refresh-state

@@ -62,7 +62,6 @@
   [tmpl-str tmpl v]
   (str/replace tmpl-str tmpl v))
 
-
 (def collection
   "Template for representing flake collections"
   (template-for :collection))

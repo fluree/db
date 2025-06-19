@@ -1,8 +1,8 @@
 (ns fluree.db.query.fql-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.util.core :refer [exception?]]
+            [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
-            [fluree.db.api :as fluree]))
+            [fluree.db.util.core :refer [exception?]]))
 
 (deftest ^:integration grouping-test
   (testing "grouped queries"
@@ -137,22 +137,31 @@
                 "returns ordered results")))))))
 
 (deftest ^:integration select-distinct-test
-  (testing "Distinct queries"
-    (let [conn   (test-utils/create-conn)
-          people (test-utils/load-people conn)
-          db     (fluree/db people)
-          q      {:context         [test-utils/default-context
-                                    {:ex "http://example.org/ns/"}]
-                  :select-distinct '[?name ?email]
-                  :where           '{:schema/name  ?name
-                                     :schema/email ?email
-                                     :ex/favNums   ?favNum}
-                  :order-by        '?favNum}]
-      (is (= [["Cam" "cam@example.org"]
+  (let [conn   (test-utils/create-conn)
+        people (test-utils/load-people conn)
+        db     (fluree/db people)]
+    (testing "distinct results"
+      (is (= [["Alice" "alice@example.org"]
               ["Brian" "brian@example.org"]
-              ["Alice" "alice@example.org"]
+              ["Cam" "cam@example.org"]
               ["Liam" "liam@example.org"]]
-             @(fluree/query db q))
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select-distinct '[?name ?email]
+                                :where '{:schema/name ?name
+                                         :schema/email ?email
+                                         :ex/favNums ?favNum}}))
+          "return results without repeated entries"))
+    (testing "distinct results with limit and offset"
+      (is (= [["Brian" "brian@example.org"]
+              ["Cam" "cam@example.org"]]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select-distinct '[?name ?email]
+                                :where '{:schema/name ?name
+                                         :schema/email ?email
+                                         :ex/favNums ?favNum}
+                                :limit 2 :offset 1}))
           "return results without repeated entries"))))
 
 (deftest ^:integration select-one-test
@@ -304,6 +313,47 @@
                 ["L" "Liam" false]]
                res))))
 
+    (testing "with static binds"
+      (let [q   {:context  [test-utils/default-context
+                            {:ex "http://example.org/ns/"}]
+                 :construct '[{:id ?s
+                               :ex/firstLetter ?firstLetterOfName
+                               :ex/const ?const
+                               :ex/greeting ?langstring
+                               :ex/date     ?date}]
+                 :where    '[{:id ?s
+                              :schema/age  ?age
+                              :schema/name ?name}
+                             [:bind
+                              ?firstLetterOfName (subStr ?name 1 1)
+                              ?const             "const"
+                              ?langstring        {"@value" "hola" "@language" "es"}
+                              ?bool              false
+                              ?date              {"@value" "2020-01-10" "@type" "ex:mydate"}]]
+                 :order-by '?name}
+            res (-> @(fluree/query db q) (get "@graph"))]
+        (is (= [{:id :ex/alice,
+                 :ex/firstLetter ["A"],
+                 :ex/const ["const"],
+                 :ex/greeting [{"@value" "hola", "@language" "es"}],
+                 :ex/date [{"@value" "2020-01-10", :type "ex:mydate"}]}
+                {:id :ex/brian,
+                 :ex/firstLetter ["B"],
+                 :ex/const ["const"],
+                 :ex/greeting [{"@value" "hola", "@language" "es"}],
+                 :ex/date [{"@value" "2020-01-10", :type "ex:mydate"}]}
+                {:id :ex/cam,
+                 :ex/firstLetter ["C"],
+                 :ex/const ["const"],
+                 :ex/greeting [{"@value" "hola", "@language" "es"}],
+                 :ex/date [{"@value" "2020-01-10", :type "ex:mydate"}]}
+                {:id :ex/liam,
+                 :ex/firstLetter ["L"],
+                 :ex/const ["const"],
+                 :ex/greeting [{"@value" "hola", "@language" "es"}],
+                 :ex/date [{"@value" "2020-01-10", :type "ex:mydate"}]}]
+               res))))
+
     (testing "with invalid aggregate fn"
       (let [q {:context  [test-utils/default-context
                           {:ex "http://example.org/ns/"}]
@@ -364,23 +414,23 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "jobs")
           db     @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" {"ex"         "http://example.com/vocab/"
-                                 "occupation" {"@id"        "ex:occupation"
-                                               "@container" "@language"}}
-                     "insert"   [{"@id"        "ex:frank"
-                                  "occupation" {"en" {"@value" "Ninja"}
-                                                "ja" "忍者"}}
-                                 {"@id"             "ex:bob"
-                                  "ex:nativeTongue" "fr"
-                                  "occupation"      {"en" "Boss"
-                                                     "fr" "Chef"
-                                                     "de" "Bossin"}}
-                                 {"@id"             "ex:jack"
-                                  "ex:nativeTongue" "de"
-                                  "occupation"      {"en" {"@value" "Chef"}
-                                                     "fr" {"@value" "Cuisinier"}
-                                                     "de" {"@value" "Köchin"}}}]})]
+                   (fluree/db ledger)
+                   {"@context" {"ex"         "http://example.com/vocab/"
+                                "occupation" {"@id"        "ex:occupation"
+                                              "@container" "@language"}}
+                    "insert"   [{"@id"        "ex:frank"
+                                 "occupation" {"en" {"@value" "Ninja"}
+                                               "ja" "忍者"}}
+                                {"@id"             "ex:bob"
+                                 "ex:nativeTongue" "fr"
+                                 "occupation"      {"en" "Boss"
+                                                    "fr" "Chef"
+                                                    "de" "Bossin"}}
+                                {"@id"             "ex:jack"
+                                 "ex:nativeTongue" "de"
+                                 "occupation"      {"en" {"@value" "Chef"}
+                                                    "fr" {"@value" "Cuisinier"}
+                                                    "de" {"@value" "Köchin"}}}]})]
       (testing "with bound language tags"
         (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
                                       :select    [?job ?lang]
@@ -424,22 +474,22 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "people")
           db     @(fluree/stage
-                    (fluree/db ledger)
-                    {"@context" [test-utils/default-context
-                                 {:ex    "http://example.org/ns/"
-                                  :value "@value"
-                                  :type  "@type"}]
-                     "insert"
-                     [{:id      :ex/homer
-                       :ex/name "Homer"
-                       :ex/age  36}
-                      {:id      :ex/marge
-                       :ex/name "Marge"
-                       :ex/age  {:value 36
-                                 :type  :xsd/int}}
-                      {:id      :ex/bart
-                       :ex/name "Bart"
-                       :ex/age  "forever 10"}]})]
+                   (fluree/db ledger)
+                   {"@context" [test-utils/default-context
+                                {:ex    "http://example.org/ns/"
+                                 :value "@value"
+                                 :type  "@type"}]
+                    "insert"
+                    [{:id      :ex/homer
+                      :ex/name "Homer"
+                      :ex/age  36}
+                     {:id      :ex/marge
+                      :ex/name "Marge"
+                      :ex/age  {:value 36
+                                :type  :xsd/int}}
+                     {:id      :ex/bart
+                      :ex/name "Bart"
+                      :ex/age  "forever 10"}]})]
       (testing "with literal values"
         (testing "specifying an explicit data type"
           (testing "compatible with the value"

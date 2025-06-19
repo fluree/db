@@ -1,8 +1,8 @@
 (ns fluree.db.nameservice.storage
   (:require [clojure.core.async :refer [go]]
             [clojure.string :as str]
-            [fluree.db.storage :as storage]
             [fluree.db.nameservice :as nameservice]
+            [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
@@ -11,7 +11,7 @@
   [ledger-alias]
   (str ledger-alias ".json"))
 
-(defn publishing-address
+(defn publishing-address*
   [store ledger-alias]
   (-> store
       storage/location
@@ -31,18 +31,33 @@
                        "address" address
                        "commit"  commit-jsonld}]}))
 
+(defn get-commit
+  ([record]
+   (get-commit record nil))
+  ([record branch]
+   (log/info "Fetching commit from record:" record)
+   (let [branch-iri (if branch
+                      (str (get record "@id") "(" branch ")")
+                      (get record "defaultBranch"))]
+     (some #(when (= (get % "@id") branch-iri)
+              (get % "commit"))
+           (get record "branches")))))
+
 (defrecord StorageNameService [store]
   nameservice/Publisher
   (publish [_ commit-jsonld]
     (let [ledger-alias (get commit-jsonld "alias")
-          ns-address   (publishing-address store ledger-alias)
+          ns-address   (publishing-address* store ledger-alias)
           record       (ns-record ns-address commit-jsonld)
           record-bytes (json/stringify-UTF8 record)
           filename     (local-filename ledger-alias)]
       (storage/write-bytes store filename record-bytes)))
 
+  (retract [_ ledger-alias]
+    (storage/delete store (publishing-address* store (local-filename ledger-alias))))
+
   (publishing-address [_ ledger-alias]
-    (go (publishing-address store ledger-alias)))
+    (go (publishing-address* store ledger-alias)))
 
   nameservice/iNameService
   (lookup [_ ledger-address]
@@ -51,7 +66,7 @@
             filename                (local-filename alias)]
         (when-let [record-bytes (<? (storage/read-bytes store filename))]
           (let [record (json/parse record-bytes false)]
-            (nameservice/commit-from-record record))))))
+            (get-commit record))))))
 
   (alias [_ ledger-address]
     ;; TODO: need to validate that the branch doesn't have a slash?

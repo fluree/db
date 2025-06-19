@@ -1,14 +1,14 @@
 (ns fluree.db.flake.index.novelty
-  (:require [fluree.db.flake.index :as index]
+  (:require [clojure.core.async :as async :refer [<! >! go go-loop]]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.flake.commit-data :as commit-data]
+            [fluree.db.flake.index :as index]
             [fluree.db.flake.index.storage :as storage]
             [fluree.db.indexer.garbage :as garbage]
-            [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [clojure.core.async :as async :refer [<! >! go go-loop]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.commit-data :as commit-data]))
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -93,7 +93,7 @@
   (into [maybe-leftmost]
         (map (fn [non-left-node]
                (assoc non-left-node
-                 :leftmost? false)))
+                      :leftmost? false)))
         not-leftmost))
 
 (defn rebalance-children
@@ -268,11 +268,11 @@
   Takes original node, and map of temp left ids to final leaf ids for updating children."
   [temp->final-ids {:keys [children] :as branch-node}]
   (let [children* (reduce-kv
-                    (fn [acc k v]
-                      (if-let [updated-id (get temp->final-ids (:id v))]
-                        (assoc acc k (assoc v :id updated-id))
-                        acc))
-                    children children)]
+                   (fn [acc k v]
+                     (if-let [updated-id (get temp->final-ids (:id v))]
+                       (assoc acc k (assoc v :id updated-id))
+                       acc))
+                   children children)]
     (assoc branch-node :children children*)))
 
 (defn update-node-id
@@ -314,10 +314,9 @@
                 (update-node-id node* write-response))))
 
         (catch* e
-                (log/error e
-                           "Error writing novel index node:" display-node)
-                (async/>! error-ch e))))))
-
+          (log/error e
+                     "Error writing novel index node:" display-node)
+          (async/>! error-ch e))))))
 
 (defn write-resolved-nodes
   [db idx changes-ch error-ch index-ch]
@@ -355,14 +354,12 @@
      ::novelty      index-novelty
      ::t            t}))
 
-
 (defn tally
   [db-status {:keys [idx root garbage] :as _tally-data}]
   (-> db-status
       (update :db assoc idx root)
       (update :indexes conj idx)
       (update :garbage into garbage)))
-
 
 (defn refresh-all
   ([db error-ch]
@@ -388,40 +385,40 @@
             refresh-ch (refresh-all db changes-ch error-ch)]
         (log/info "Refreshing Index:" init-stats)
         (async/alt!
-         error-ch
-         ([e]
-          (throw e))
+          error-ch
+          ([e]
+           (throw e))
 
-         refresh-ch
-         ([{:keys [garbage], refreshed-db :db, :as _status}]
-          (let [{:keys [index-catalog alias branch] :as refreshed-db*}
-                (assoc-in refreshed-db [:stats :indexed] t)
+          refresh-ch
+          ([{:keys [garbage], refreshed-db :db, :as _status}]
+           (let [{:keys [index-catalog alias branch] :as refreshed-db*}
+                 (assoc-in refreshed-db [:stats :indexed] t)
                 ;; TODO - ideally issue garbage/root writes to RAFT together
                 ;;        as a tx, currently requires waiting for both
                 ;;        through raft sync
-                garbage-res   (when (seq garbage)
-                                (let [write-res (<? (storage/write-garbage index-catalog alias branch t garbage))]
-                                  (<! (notify-new-index-file write-res :garbage t changes-ch))
-                                  write-res))
-                db-root-res   (<? (storage/write-db-root index-catalog refreshed-db* (:address garbage-res)))
-                _             (<! (notify-new-index-file db-root-res :root t changes-ch))
+                 garbage-res   (when (seq garbage)
+                                 (let [write-res (<? (storage/write-garbage index-catalog alias branch t garbage))]
+                                   (<! (notify-new-index-file write-res :garbage t changes-ch))
+                                   write-res))
+                 db-root-res   (<? (storage/write-db-root index-catalog refreshed-db* (:address garbage-res)))
+                 _             (<! (notify-new-index-file db-root-res :root t changes-ch))
 
-                index-address (:address db-root-res)
-                index-id      (str "fluree:index:sha256:" (:hash db-root-res))
-                commit-index  (commit-data/new-index (-> refreshed-db* :commit :data)
-                                                     index-id
-                                                     index-address
-                                                     (select-keys refreshed-db* index/types))
-                indexed-db    (dbproto/-index-update refreshed-db* commit-index)
-                duration      (- (util/current-time-millis) start-time-ms)
-                end-stats     (assoc init-stats
-                                :end-time (util/current-time-iso)
-                                :duration duration
-                                :address (:address db-root-res)
-                                :garbage (:address garbage-res))]
-            (log/info "Index refresh complete:" end-stats)
+                 index-address (:address db-root-res)
+                 index-id      (str "fluree:index:sha256:" (:hash db-root-res))
+                 commit-index  (commit-data/new-index (-> refreshed-db* :commit :data)
+                                                      index-id
+                                                      index-address
+                                                      (select-keys refreshed-db* index/types))
+                 indexed-db    (dbproto/-index-update refreshed-db* commit-index)
+                 duration      (- (util/current-time-millis) start-time-ms)
+                 end-stats     (assoc init-stats
+                                      :end-time (util/current-time-iso)
+                                      :duration duration
+                                      :address (:address db-root-res)
+                                      :garbage (:address garbage-res))]
+             (log/info "Index refresh complete:" end-stats)
             ;; kick off automatic garbage collection in the background
-            (garbage/clean-garbage indexed-db max-old-indexes)
+             (garbage/clean-garbage indexed-db max-old-indexes)
 
-            indexed-db))))
+             indexed-db))))
       db)))

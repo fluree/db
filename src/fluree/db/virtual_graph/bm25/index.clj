@@ -5,14 +5,14 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph :as vg]
+            [fluree.db.virtual-graph.bm25.search :as bm25.search]
             [fluree.db.virtual-graph.bm25.stemmer :as stm]
             [fluree.db.virtual-graph.bm25.stopwords :as stopwords]
             [fluree.db.virtual-graph.bm25.update :as bm25.update]
-            [fluree.db.virtual-graph.bm25.search :as bm25.search]
-            [fluree.db.virtual-graph.parse :as vg-parse]
-            [fluree.db.virtual-graph.proto :as vgproto]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log])
+            [fluree.db.virtual-graph.parse :as vg-parse])
   (:refer-clojure :exclude [assert]))
 
 (set! *warn-on-reflection* true)
@@ -83,6 +83,7 @@
     (cond
       percentage (str "Index is " percentage "% complete.")
       (pos-int? processed-n) (str "Index has processed " processed-n " items of an unknown total to process.")
+      (and (zero? processed-n) (zero? item-count)) "Index is 100% complete." ;; when updates have no items to process
       :else "Index is 0% complete.")))
 
 (defn score-candidates
@@ -101,6 +102,10 @@
   (go
     (try*
       (let [{::vg-parse/keys [target limit timeout] :as search-params} (vg-parse/get-search-params solution)
+            _ (when-not target
+                (throw (ex-info "No search target for virtual graph. Did you forget @context in your query?"
+                                {:status 400 :error
+                                 :db/invalid-query})))
             {:keys [pending-ch index]} @index-state
 
             ;; TODO - check for "sync" options and don't wait for pending-ch if sync is false
@@ -126,14 +131,13 @@
              (score-candidates query-terms vectors avg-length k1 b)
              (sort-by :score #(compare %2 %1))
              (vg-parse/limit-results limit)
-             (vg-parse/process-results bm25 solution search-params true)
+             (vg-parse/process-sparse-results bm25 solution search-params)
              (async/onto-chan! out-ch)))
       (catch* e
-              (log/error e "Error ranking vectors")
         (>! error-ch e)))))
 
 (defn bm25-upsert*
-  [{:keys [index-state] :as bm25} db item-count assertions-ch]
+  [{:keys [index-state] :as bm25} {:keys [t alias namespaces namespace-codes] :as _db} items-count items-ch]
   (let [{:keys [pending-ch index] :as prior-idx-state} @index-state
         new-pending-ch  (promise-chan)
         new-index-state (atom (assoc prior-idx-state :pending-ch new-pending-ch))]
@@ -146,20 +150,20 @@
                             index)
             status-update (fn [status]
                             (swap! new-index-state assoc :pending-status status))
-            new-index     (<! (bm25.update/upsert-items bm25 latest-index item-count assertions-ch status-update))]
+            new-index     (<! (bm25.update/upsert-items bm25 latest-index items-count items-ch status-update))]
         ;; reset index state atom once index is complete, remove pending-ch
         (swap! new-index-state (fn [idx-state]
                                  (assoc idx-state :index new-index
-                                                  :pending-ch nil)))
+                                        :pending-ch nil)))
         (>! new-pending-ch new-index)))
 
     ;; new bm25 record returned to get attached to db
-    (assoc bm25 :t (:t db)
-                :namespaces (:namespaces db)
-                :namespace-codes (:namespace-codes db)
+    (assoc bm25 :t t
+           :namespaces namespaces
+           :namespace-codes namespace-codes
                 ;; unlikely, but in case db's alias has been changed keep in sync
-                :db-alias (:alias db)
-                :index-state new-index-state)))
+           :db-alias alias
+           :index-state new-index-state)))
 
 (defn property-dependencies
   [vg]
@@ -167,7 +171,7 @@
 
 (defn parsed-query
   [vg]
-  (:query-parsed vg))
+  (:parsed-query vg))
 
 (defn affected-subjs
   [prop-deps add removes]
@@ -210,25 +214,25 @@
   (let [prop-deps      (property-dependencies bm25)
         affected-sids  (affected-subjs prop-deps add removes)
         affected-iris  (map #(iri/decode-sid db %) affected-sids)
-        item-count     (count affected-iris)
+        items-count    (count affected-iris)
         pq             (parsed-query bm25)
         upsert-docs-ch (upsert-queries db pq affected-iris)]
 
-    (bm25-upsert* bm25 db item-count upsert-docs-ch)))
+    (bm25-upsert* bm25 db items-count upsert-docs-ch)))
 
 (defn bm25-initialize
-  [{:keys [query-parsed] :as bm25} db]
-  (let [query-result (exec/query db nil query-parsed)
+  [{:keys [parsed-query] :as bm25} db]
+  (let [query-result (exec/query db nil parsed-query)
         items-ch     (async/chan 1 (map #(vector ::bm25.update/upsert %)))]
     ;; break up query results into individual document items on a new chan
     (async/pipeline-async 1 items-ch #(async/onto-chan! %2 %1) query-result)
     (bm25-upsert* bm25 db nil items-ch)))
 
 (defrecord BM25-VirtualGraph
-  [stemmer stopwords k1 b index-state initialized genesis-t t
-   alias query query-parsed property-deps
+           [stemmer stopwords k1 b index-state initialized genesis-t t
+            alias query parsed-query property-deps
    ;; following taken from db - needs to be kept up to date with new db updates
-   db-alias namespaces namespace-codes]
+            db-alias namespaces namespace-codes]
 
   iri/IRICodec
   (encode-iri [_ iri]
@@ -236,50 +240,53 @@
   (decode-sid [_ sid]
     (iri/sid->iri sid namespace-codes))
 
-  vgproto/UpdatableVirtualGraph
+  vg/UpdatableVirtualGraph
   (upsert [this source-db new-flakes remove-flakes]
     (bm25-upsert this source-db new-flakes remove-flakes))
   (initialize [this source-db]
     (bm25-initialize this source-db))
-  (serialize [_] {}) ;; TODO - VG - serialize to JSON (plus, call when writing index to store)
-  (deserialize [_ source-db data] {}) ;; TODO - VG - deserialize to JSON (plus, reify when reading index from store)
 
   where/Matcher
-  (-match-triple [_ _fuel-tracker solution triple _error-ch]
+  (-match-triple [_ _tracker solution triple _error-ch]
     (vg-parse/match-search-triple solution triple))
 
-  (-finalize [this _fuel-tracker error-ch solution-ch]
+  (-finalize [this _tracker error-ch solution-ch]
     (vg-parse/finalize (partial search this) error-ch solution-ch))
 
-  (-match-id [_ _fuel-tracker _solution _s-mch _error-ch]
+  (-match-id [_ _tracker _solution _s-mch _error-ch]
     where/nil-channel)
 
-  (-match-class [_ _fuel-tracker _solution _s-mch _error-ch]
+  (-match-class [_ _tracker _solution _s-mch _error-ch]
     where/nil-channel)
 
-  (-activate-alias [this _]
-    this)
+  ;; activate-alias should not be called on an index VG, return empty chan
+  (-activate-alias [_ _]
+    (let [ch (async/chan)]
+      (async/close! ch)
+      ch))
 
   ;; return db-alias here, as it is used when encoding/decoding IRIs in the search function which is original db-dependent
-  (-aliases [_] [db-alias]))
+  (-aliases [_]
+    [db-alias]))
+
+(defn bm25-iri?
+  [idx-rdf-type]
+  (some #(= % const/$fluree:index-BM25) idx-rdf-type))
 
 ;; TODO - VG - triggering updates only works for queries for single subject, no nested nodes
-;; TODO - VG - prevent :select ["*"] syntax from being allowed, need to list properties explicitly
-;; TODO - VG - prevent :selectOne from being used, or maybe just util/seq all results
-;; TODO - VG - ensure "@id" is one of the selected properties
 ;; TODO - VG - future feature - weighted properties
+;; TODO - VG - drop index
 (defn new-bm25-index
   [{:keys [namespaces namespace-codes alias] :as _db} index-flakes vg-opts]
-  (let [opts (-> (idx-flakes->opts index-flakes)
-                 (merge vg-opts)
-                 ;; index-state held as atom, as we need -match-triple, etc. to hold both
-                 ;; current index state and future index state... as we don't know
-                 ;; yet if 'sync' option is used, but need to return a where/Matcher proto
-                 (assoc :t 0
-                        :initialized (util/current-time-millis)
-                        :index-state (atom initialized-index)
-                        :namespaces namespaces
-                        :namespace-codes namespace-codes
-                        :db-alias alias))
-        bm25 (map->BM25-VirtualGraph opts)]
-    bm25))
+  (-> (idx-flakes->opts index-flakes)
+      (merge vg-opts)
+      ;; index-state held as atom, as we need -match-triple, etc. to hold both
+      ;; current index state and future index state... as we don't know yet if
+      ;; 'sync' option is used, but need to return a where/Matcher proto
+      (assoc :t 0
+             :initialized (util/current-time-millis)
+             :index-state (atom initialized-index)
+             :namespaces namespaces
+             :namespace-codes namespace-codes
+             :db-alias alias)
+      map->BM25-VirtualGraph))

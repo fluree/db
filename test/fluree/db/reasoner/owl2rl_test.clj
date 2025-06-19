@@ -1,5 +1,5 @@
 (ns fluree.db.reasoner.owl2rl-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 
@@ -60,12 +60,12 @@
 
           (is (= (list "ex:carol" "ex:carol-lynn")
                  (sort
-                   @(fluree/query db-reasoned
-                                  {:context {"ex"  "http://example.org/"
-                                             "owl" "http://www.w3.org/2002/07/owl#"}
-                                   :select  "?same"
-                                   :where   {"@id"        "ex:carol-lynn"
-                                             "owl:sameAs" "?same"}})))
+                  @(fluree/query db-reasoned
+                                 {:context {"ex"  "http://example.org/"
+                                            "owl" "http://www.w3.org/2002/07/owl#"}
+                                  :select  "?same"
+                                  :where   {"@id"        "ex:carol-lynn"
+                                            "owl:sameAs" "?same"}})))
               "ex:carol-lynn should be deemed the same as ex:carol")))
 
       (testing "Testing owl:sameAs passed along as a reasoned rule"
@@ -74,17 +74,16 @@
                                                           "owl" "http://www.w3.org/2002/07/owl#"}
                                             "@id"        "ex:carol"
                                             "owl:sameAs" {"@id" "ex:carol-lynn"}}])]
-          
+
           (is (= (list "ex:carol" "ex:carol-lynn")
                  (sort
-                   @(fluree/query db-reasoned
-                                  {:context {"ex"  "http://example.org/"
-                                             "owl" "http://www.w3.org/2002/07/owl#"}
-                                   :select  "?same"
-                                   :where   {"@id"        "ex:carol-lynn"
-                                             "owl:sameAs" "?same"}})))
+                  @(fluree/query db-reasoned
+                                 {:context {"ex"  "http://example.org/"
+                                            "owl" "http://www.w3.org/2002/07/owl#"}
+                                  :select  "?same"
+                                  :where   {"@id"        "ex:carol-lynn"
+                                            "owl:sameAs" "?same"}})))
               "ex:carol-lynn should be deemed the same as ex:carol")))
-
 
       (testing "Testing owl:sameAs transitivity (eq-trans)"
         (let [ledger      @(fluree/create conn "reasoner/eq-trans" nil)
@@ -102,22 +101,22 @@
 
           (is (= (list "ex:carol1" "ex:carol2" "ex:carol3" "ex:carol4")
                  (sort
-                   @(fluree/query db-reasoned
-                                  {:context {"ex"  "http://example.org/"
-                                             "owl" "http://www.w3.org/2002/07/owl#"}
-                                   :select  "?same"
-                                   :where   {"@id"        "ex:carol1"
-                                             "owl:sameAs" "?same"}})))
+                  @(fluree/query db-reasoned
+                                 {:context {"ex"  "http://example.org/"
+                                            "owl" "http://www.w3.org/2002/07/owl#"}
+                                  :select  "?same"
+                                  :where   {"@id"        "ex:carol1"
+                                            "owl:sameAs" "?same"}})))
               "ex:carol1 should be sameAs all other carols")
 
           (is (= (list "ex:carol1" "ex:carol2" "ex:carol3" "ex:carol4")
                  (sort
-                   @(fluree/query db-reasoned
-                                  {:context {"ex"  "http://example.org/"
-                                             "owl" "http://www.w3.org/2002/07/owl#"}
-                                   :select  "?same"
-                                   :where   {"@id"        "ex:carol2"
-                                             "owl:sameAs" "?same"}})))
+                  @(fluree/query db-reasoned
+                                 {:context {"ex"  "http://example.org/"
+                                            "owl" "http://www.w3.org/2002/07/owl#"}
+                                  :select  "?same"
+                                  :where   {"@id"        "ex:carol2"
+                                            "owl:sameAs" "?same"}})))
               "ex:carol2 should be sameAs all other carols")))
 
       ;; Most documentation recommends not using owl:sameAs for properties
@@ -196,21 +195,21 @@
 
       (testing "Testing rdfs:domain - rule: prp-dom"
         (let [db-prp-dom @(fluree/reason
-                            db-base :owl2rl
-                            [{"@context"    {"ex"   "http://example.org/"
-                                             "owl"  "http://www.w3.org/2002/07/owl#"
-                                             "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                              "@id"         "ex:parents"
-                              "@type"       ["owl:ObjectProperty"]
-                              "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"}]}])]
+                           db-base :owl2rl
+                           [{"@context"    {"ex"   "http://example.org/"
+                                            "owl"  "http://www.w3.org/2002/07/owl#"
+                                            "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                             "@id"         "ex:parents"
+                             "@type"       ["owl:ObjectProperty"]
+                             "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"}]}])]
 
           (is (= (list "ex:Child" "ex:Person")
                  (sort
-                   @(fluree/query db-prp-dom
-                                  {:context {"ex" "http://example.org/"}
-                                   :select  "?t"
-                                   :where   {"@id"   "ex:brian"
-                                             "@type" "?t"}})))
+                  @(fluree/query db-prp-dom
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?t"
+                                  :where   {"@id"   "ex:brian"
+                                            "@type" "?t"}})))
               "ex:brian should be of type ex:Person and ex:Child")
 
           (is (= ["ex:brian" "ex:carol"]
@@ -223,21 +222,21 @@
 
       (testing "Testing rdfs:range - rule: prp-rng"
         (let [db-prp-rng @(fluree/reason
-                            db-base :owl2rl
-                            [{"@context"   {"ex"   "http://example.org/"
-                                            "owl"  "http://www.w3.org/2002/07/owl#"
-                                            "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                              "@id"        "ex:parents"
-                              "@type"      ["owl:ObjectProperty"]
-                              "rdfs:range" [{"@id" "ex:Person"} {"@id" "ex:parents"}]}])]
+                           db-base :owl2rl
+                           [{"@context"   {"ex"   "http://example.org/"
+                                           "owl"  "http://www.w3.org/2002/07/owl#"
+                                           "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                             "@id"        "ex:parents"
+                             "@type"      ["owl:ObjectProperty"]
+                             "rdfs:range" [{"@id" "ex:Person"} {"@id" "ex:parents"}]}])]
 
           (is (= (list "ex:Person" "ex:parents")
                  (sort
-                   @(fluree/query db-prp-rng
-                                  {:context {"ex" "http://example.org/"}
-                                   :select  "?t"
-                                   :where   {"@id"   "ex:carol"
-                                             "@type" "?t"}})))
+                  @(fluree/query db-prp-rng
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?t"
+                                  :where   {"@id"   "ex:carol"
+                                            "@type" "?t"}})))
               "ex:carol should be of type ex:Person and ex:parents")
 
           (is (= ["ex:carol" "ex:cheryl"]
@@ -248,17 +247,16 @@
                                            "@type" "ex:parents"}}))
               "ex:carol and ex:cheryl should be the only subjects of type ex:parents")))
 
-
       (testing "Testing multiple rules rdfs:domain + rdfs:range - rules: prp-dom & prp-rng"
         (let [db-prp-dom+rng @(fluree/reason
-                                db-base :owl2rl
-                                [{"@context"    {"ex"   "http://example.org/"
-                                                 "owl"  "http://www.w3.org/2002/07/owl#"
-                                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                  "@id"         "ex:parents"
-                                  "@type"       ["owl:ObjectProperty"]
-                                  "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"} {"@id" "ex:Human"}]
-                                  "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:parents"}]}])]
+                               db-base :owl2rl
+                               [{"@context"    {"ex"   "http://example.org/"
+                                                "owl"  "http://www.w3.org/2002/07/owl#"
+                                                "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                 "@id"         "ex:parents"
+                                 "@type"       ["owl:ObjectProperty"]
+                                 "rdfs:domain" [{"@id" "ex:Person"} {"@id" "ex:Child"} {"@id" "ex:Human"}]
+                                 "rdfs:range"  [{"@id" "ex:Person"} {"@id" "ex:parents"}]}])]
 
           (is (= ["ex:brian" "ex:carol"]
                  @(fluree/query db-prp-dom+rng
@@ -278,11 +276,11 @@
 
           (is (= (list "ex:brian" "ex:carol" "ex:cheryl")
                  (sort
-                   @(fluree/query db-prp-dom+rng
-                                  {:context {"ex" "http://example.org/"}
-                                   :select  "?s"
-                                   :where   {"@id"   "?s"
-                                             "@type" "ex:Person"}})))
+                  @(fluree/query db-prp-dom+rng
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?s"
+                                  :where   {"@id"   "?s"
+                                            "@type" "ex:Person"}})))
               "ex:brian, ex:carol, and ex:cheryl should be of type ex:Person"))))))
 
 (deftest ^:integration functional-properties
@@ -296,50 +294,50 @@
                                                   {"@id"       "ex:ralph"
                                                    "ex:mother" [{"@id" "ex:anne"} {"@id" "ex:anne2"}]}]})
           db-reasoned @(fluree/reason
-                         db-base :owl2rl
-                         [{"@context" {"ex"  "http://example.org/"
-                                       "owl" "http://www.w3.org/2002/07/owl#"}
-                           "@id"      "ex:mother"
-                           "@type"    ["owl:ObjectProperty" "owl:FunctionalProperty"]}])]
+                        db-base :owl2rl
+                        [{"@context" {"ex"  "http://example.org/"
+                                      "owl" "http://www.w3.org/2002/07/owl#"}
+                          "@id"      "ex:mother"
+                          "@type"    ["owl:ObjectProperty" "owl:FunctionalProperty"]}])]
 
       (is (= (list "ex:carol" "ex:carol2")
              (sort
-               @(fluree/query db-reasoned
-                              {:context {"ex"  "http://example.org/"
-                                         "owl" "http://www.w3.org/2002/07/owl#"}
-                               :select  "?same"
-                               :where   {"@id"        "ex:carol"
-                                         "owl:sameAs" "?same"}})))
+              @(fluree/query db-reasoned
+                             {:context {"ex"  "http://example.org/"
+                                        "owl" "http://www.w3.org/2002/07/owl#"}
+                              :select  "?same"
+                              :where   {"@id"        "ex:carol"
+                                        "owl:sameAs" "?same"}})))
           "ex:carol should be deemed the same as ex:carol2")
 
       (is (= (list "ex:carol" "ex:carol2")
              (sort
-               @(fluree/query db-reasoned
-                              {:context {"ex"  "http://example.org/"
-                                         "owl" "http://www.w3.org/2002/07/owl#"}
-                               :select  "?same"
-                               :where   {"@id"        "ex:carol2"
-                                         "owl:sameAs" "?same"}})))
+              @(fluree/query db-reasoned
+                             {:context {"ex"  "http://example.org/"
+                                        "owl" "http://www.w3.org/2002/07/owl#"}
+                              :select  "?same"
+                              :where   {"@id"        "ex:carol2"
+                                        "owl:sameAs" "?same"}})))
           "ex:carol2 should be deemed the same as ex:carol")
 
       (is (= (list "ex:anne" "ex:anne2")
              (sort
-               @(fluree/query db-reasoned
-                              {:context {"ex"  "http://example.org/"
-                                         "owl" "http://www.w3.org/2002/07/owl#"}
-                               :select  "?same"
-                               :where   {"@id"        "ex:anne"
-                                         "owl:sameAs" "?same"}})))
+              @(fluree/query db-reasoned
+                             {:context {"ex"  "http://example.org/"
+                                        "owl" "http://www.w3.org/2002/07/owl#"}
+                              :select  "?same"
+                              :where   {"@id"        "ex:anne"
+                                        "owl:sameAs" "?same"}})))
           "ex:anne2 should be deemed the same as ex:anne")
 
       (is (= (list "ex:anne" "ex:anne2")
              (sort
-               @(fluree/query db-reasoned
-                              {:context {"ex"  "http://example.org/"
-                                         "owl" "http://www.w3.org/2002/07/owl#"}
-                               :select  "?same"
-                               :where   {"@id"        "ex:anne2"
-                                         "owl:sameAs" "?same"}})))
+              @(fluree/query db-reasoned
+                             {:context {"ex"  "http://example.org/"
+                                        "owl" "http://www.w3.org/2002/07/owl#"}
+                              :select  "?same"
+                              :where   {"@id"        "ex:anne2"
+                                        "owl:sameAs" "?same"}})))
           "ex:anne should be deemed the same as ex:anne2"))))
 
 (deftest ^:integration inverse-functional-properties
@@ -357,30 +355,30 @@
                                                   {"@id"      "ex:ralph2"
                                                    "ex:email" "ralph@example.org"}]})
           db-reasoned @(fluree/reason
-                         db-base :owl2rl
-                         [{"@context" {"ex"  "http://example.org/"
-                                       "owl" "http://www.w3.org/2002/07/owl#"}
-                           "@id"      "ex:email"
-                           "@type"    ["owl:ObjectProperty" "owl:InverseFunctionalProperty"]}])]
-      
+                        db-base :owl2rl
+                        [{"@context" {"ex"  "http://example.org/"
+                                      "owl" "http://www.w3.org/2002/07/owl#"}
+                          "@id"      "ex:email"
+                          "@type"    ["owl:ObjectProperty" "owl:InverseFunctionalProperty"]}])]
+
       (is (= (list "ex:brian" "ex:brian2")
              (sort
-               @(fluree/query db-reasoned
-                              {:context {"ex"  "http://example.org/"
-                                         "owl" "http://www.w3.org/2002/07/owl#"}
-                               :select  "?same"
-                               :where   {"@id"        "ex:brian"
-                                         "owl:sameAs" "?same"}})))
+              @(fluree/query db-reasoned
+                             {:context {"ex"  "http://example.org/"
+                                        "owl" "http://www.w3.org/2002/07/owl#"}
+                              :select  "?same"
+                              :where   {"@id"        "ex:brian"
+                                        "owl:sameAs" "?same"}})))
           "ex:carol should be deemed the same as ex:carol2")
 
       (is (= (list "ex:ralph" "ex:ralph2")
              (sort
-               @(fluree/query db-reasoned
-                              {:context {"ex"  "http://example.org/"
-                                         "owl" "http://www.w3.org/2002/07/owl#"}
-                               :select  "?same"
-                               :where   {"@id"        "ex:ralph"
-                                         "owl:sameAs" "?same"}})))
+              @(fluree/query db-reasoned
+                             {:context {"ex"  "http://example.org/"
+                                        "owl" "http://www.w3.org/2002/07/owl#"}
+                              :select  "?same"
+                              :where   {"@id"        "ex:ralph"
+                                        "owl:sameAs" "?same"}})))
           "ex:carol2 should be deemed the same as ex:carol"))))
 
 (deftest ^:integration symetric-properties
@@ -398,13 +396,13 @@
                                                        "ex:livesWith" {"@id" "ex:person-b"}}})
 
               db-prp-symp  @(fluree/reason
-                              db-livesWith :owl2rl
-                              [{"@context" {"ex"   "http://example.org/"
-                                            "owl"  "http://www.w3.org/2002/07/owl#"
-                                            "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                "@id"      "ex:livesWith"
-                                "@type"    ["owl:ObjectProperty" "owl:SymetricProperty"]}])]
-          
+                             db-livesWith :owl2rl
+                             [{"@context" {"ex"   "http://example.org/"
+                                           "owl"  "http://www.w3.org/2002/07/owl#"
+                                           "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                               "@id"      "ex:livesWith"
+                               "@type"    ["owl:ObjectProperty" "owl:SymetricProperty"]}])]
+
           (is (= ["ex:person-a"]
                  @(fluree/query db-prp-symp
                                 {:context {"ex" "http://example.org/"}
@@ -430,20 +428,20 @@
                                                     "ex:livesWith" {"@id" "ex:person-d"}}]})
 
           db-prp-trp   @(fluree/reason
-                          db-livesWith :owl2rl
-                          [{"@context" {"ex"   "http://example.org/"
-                                        "owl"  "http://www.w3.org/2002/07/owl#"
-                                        "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                            "@id"      "ex:livesWith"
-                            "@type"    ["owl:ObjectProperty" "owl:TransitiveProperty"]}])]
-      
+                         db-livesWith :owl2rl
+                         [{"@context" {"ex"   "http://example.org/"
+                                       "owl"  "http://www.w3.org/2002/07/owl#"
+                                       "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                           "@id"      "ex:livesWith"
+                           "@type"    ["owl:ObjectProperty" "owl:TransitiveProperty"]}])]
+
       (is (= (list "ex:person-b" "ex:person-c" "ex:person-d")
              (sort
-               @(fluree/query db-prp-trp
-                              {:context {"ex" "http://example.org/"}
-                               :select  "?people"
-                               :where   {"@id"          "ex:person-a"
-                                         "ex:livesWith" "?people"}})))
+              @(fluree/query db-prp-trp
+                             {:context {"ex" "http://example.org/"}
+                              :select  "?people"
+                              :where   {"@id"          "ex:person-a"
+                                        "ex:livesWith" "?people"}})))
           "ex:person-a should also live with ex:person-c and d (transitive)"))))
 
 (deftest ^:integration owl2rl-rdfs-subPropertyOf
@@ -456,27 +454,27 @@
                                                    "ex:mother" {"@id" "ex:alice-mom"}
                                                    "ex:father" {"@id" "ex:greg-dad"}}]})
           db-reasoned @(fluree/reason
-                         db-base :owl2rl
-                         [{"@context"           {"ex"   "http://example.org/"
-                                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
-                                                 "owl"  "http://www.w3.org/2002/07/owl#"}
-                           "@id"                "ex:mother"
-                           "@type"              ["owl:ObjectProperty"]
-                           "rdfs:subPropertyOf" {"@id" "ex:parents"}}
-                          {"@context"           {"ex"   "http://example.org/"
-                                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
-                                                 "owl"  "http://www.w3.org/2002/07/owl#"}
-                           "@id"                "ex:father"
-                           "@type"              ["owl:ObjectProperty"]
-                           "rdfs:subPropertyOf" {"@id" "ex:parents"}}])]
+                        db-base :owl2rl
+                        [{"@context"           {"ex"   "http://example.org/"
+                                                "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
+                                                "owl"  "http://www.w3.org/2002/07/owl#"}
+                          "@id"                "ex:mother"
+                          "@type"              ["owl:ObjectProperty"]
+                          "rdfs:subPropertyOf" {"@id" "ex:parents"}}
+                         {"@context"           {"ex"   "http://example.org/"
+                                                "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
+                                                "owl"  "http://www.w3.org/2002/07/owl#"}
+                          "@id"                "ex:father"
+                          "@type"              ["owl:ObjectProperty"]
+                          "rdfs:subPropertyOf" {"@id" "ex:parents"}}])]
 
       (is (= (list "ex:alice-mom" "ex:greg-dad")
              (sort
-               @(fluree/query db-reasoned
-                              {:context {"ex" "http://example.org/"}
-                               :select  "?parents"
-                               :where   {"@id"       "ex:bob"
-                                         "ex:parents" "?parents"}})))
+              @(fluree/query db-reasoned
+                             {:context {"ex" "http://example.org/"}
+                              :select  "?parents"
+                              :where   {"@id"       "ex:bob"
+                                        "ex:parents" "?parents"}})))
           "all values from ex:mother and ex:father are now show for ex:parents"))))
 
 (deftest ^:integration prop-chain-axiom
@@ -494,34 +492,34 @@
                                                   {"@id"       "ex:mom-mom"
                                                    "ex:parents" [{"@id" "ex:mom-mom-mom"} {"@id" "ex:mom-mom-dad"}]}]})
           db-reasoned @(fluree/reason
-                         db-base :owl2rl
-                         [{"@context"               {"ex"  "http://example.org/"
-                                                     "owl" "http://www.w3.org/2002/07/owl#"}
-                           "@id"                    "ex:grandparent"
-                           "@type"                  ["owl:ObjectProperty"]
-                           "owl:propertyChainAxiom" {"@list" [{"@id" "ex:parents"} {"@id" "ex:parents"}]}}
-                          {"@context"               {"ex"  "http://example.org/"
-                                                     "owl" "http://www.w3.org/2002/07/owl#"}
-                           "@id"                    "ex:greatGrandparent"
-                           "@type"                  ["owl:ObjectProperty"]
-                           "owl:propertyChainAxiom" {"@list" [{"@id" "ex:parents"} {"@id" "ex:parents"} {"@id" "ex:parents"}]}}])]
-      
+                        db-base :owl2rl
+                        [{"@context"               {"ex"  "http://example.org/"
+                                                    "owl" "http://www.w3.org/2002/07/owl#"}
+                          "@id"                    "ex:grandparent"
+                          "@type"                  ["owl:ObjectProperty"]
+                          "owl:propertyChainAxiom" {"@list" [{"@id" "ex:parents"} {"@id" "ex:parents"}]}}
+                         {"@context"               {"ex"  "http://example.org/"
+                                                    "owl" "http://www.w3.org/2002/07/owl#"}
+                          "@id"                    "ex:greatGrandparent"
+                          "@type"                  ["owl:ObjectProperty"]
+                          "owl:propertyChainAxiom" {"@list" [{"@id" "ex:parents"} {"@id" "ex:parents"} {"@id" "ex:parents"}]}}])]
+
       (is (= (list "ex:dad-dad" "ex:dad-mom" "ex:mom-dad" "ex:mom-mom")
              (sort
-               @(fluree/query db-reasoned
-                              {:context {"ex" "http://example.org/"}
-                               :select  "?people"
-                               :where   {"@id"            "ex:person-a"
-                                         "ex:grandparent" "?people"}})))
+              @(fluree/query db-reasoned
+                             {:context {"ex" "http://example.org/"}
+                              :select  "?people"
+                              :where   {"@id"            "ex:person-a"
+                                        "ex:grandparent" "?people"}})))
           "all four of ex:person-a's grandparents should be found")
 
       (is (= (list "ex:mom-mom-dad" "ex:mom-mom-mom")
              (sort
-               @(fluree/query db-reasoned
-                              {:context {"ex" "http://example.org/"}
-                               :select  "?people"
-                               :where   {"@id"            "ex:mom"
-                                         "ex:grandparent" "?people"}})))
+              @(fluree/query db-reasoned
+                             {:context {"ex" "http://example.org/"}
+                              :select  "?people"
+                              :where   {"@id"            "ex:mom"
+                                        "ex:grandparent" "?people"}})))
           "all two of ex:mom's grandparents should be found")
 
       (is (= (list "ex:mom-mom-dad" "ex:mom-mom-mom")
@@ -630,20 +628,20 @@
 
       (is (= (list "ex:brian" "ex:brian2")
              (sort
-               @(fluree/query db-reasoned
-                              {:context {"ex"  "http://example.org/"
-                                         "owl" "http://www.w3.org/2002/07/owl#"}
-                               :select  "?x"
-                               :where   {"@id"        "ex:brian"
-                                         "owl:sameAs" "?x"}})))
+              @(fluree/query db-reasoned
+                             {:context {"ex"  "http://example.org/"
+                                        "owl" "http://www.w3.org/2002/07/owl#"}
+                              :select  "?x"
+                              :where   {"@id"        "ex:brian"
+                                        "owl:sameAs" "?x"}})))
           "ex:brian should be the same as ex:brian2 because ex:hasWaitingListN is identical")
 
       (is (= (list "ex:t1" "ex:t2")
              (sort
-               @(fluree/query db-reasoned
-                              {:context {"ex"  "http://example.org/"
-                                         "owl" "http://www.w3.org/2002/07/owl#"}
-                               :select  "?x"
-                               :where   {"@id"        "ex:t1"
-                                         "owl:sameAs" "?x"}})))
+              @(fluree/query db-reasoned
+                             {:context {"ex"  "http://example.org/"
+                                        "owl" "http://www.w3.org/2002/07/owl#"}
+                              :select  "?x"
+                              :where   {"@id"        "ex:t1"
+                                        "owl:sameAs" "?x"}})))
           "ex:t1 should be same as ex:t2 because ex:donorId, ex:recipientId, and ex:ofOrgan are identical"))))

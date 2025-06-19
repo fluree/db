@@ -1,8 +1,7 @@
 (ns fluree.db.query.subquery-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.log :as log]))
+            [fluree.db.test-utils :as test-utils]))
 
 (deftest ^:integration subquery-basics
   (testing "Basic subquery"

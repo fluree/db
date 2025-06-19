@@ -1,9 +1,9 @@
 (ns fluree.db.dataset
-  (:require [fluree.db.util.core :as util]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.exec.where :as where]
+  (:require [clojure.core.async :as async]
             [fluree.db.query.exec.select.subject :as subject]
-            [clojure.core.async :as async]))
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util]))
 
 (defrecord DataSet [named default active])
 
@@ -49,38 +49,39 @@
 
 (extend-type DataSet
   where/Matcher
-  (-match-id [ds fuel-tracker solution s-mch error-ch]
+  (-match-id [ds tracker solution s-mch error-ch]
     (if-let [active-graph (get-active-graph ds)]
       (if (sequential? active-graph)
         (->> active-graph
              (map (fn [db]
-                    (where/-match-id db fuel-tracker solution s-mch error-ch)))
+                    (where/-match-id db tracker solution s-mch error-ch)))
              async/merge)
-        (where/-match-id active-graph fuel-tracker solution s-mch error-ch))
+        (where/-match-id active-graph tracker solution s-mch error-ch))
       where/nil-channel))
 
-  (-match-triple [ds fuel-tracker solution triple error-ch]
+  (-match-triple [ds tracker solution triple error-ch]
     (if-let [active-graph (get-active-graph ds)]
       (if (sequential? active-graph)
         (->> active-graph
              (map (fn [db]
-                    (where/-match-triple db fuel-tracker solution triple error-ch)))
+                    (where/-match-triple db tracker solution triple error-ch)))
              async/merge)
-        (where/-match-triple active-graph fuel-tracker solution triple error-ch))
+        (where/-match-triple active-graph tracker solution triple error-ch))
       where/nil-channel))
 
-  (-match-class [ds fuel-tracker solution triple error-ch]
+  (-match-class [ds tracker solution triple error-ch]
     (if-let [active-graph (get-active-graph ds)]
       (if (sequential? active-graph)
         (->> active-graph
              (map (fn [db]
-                    (where/-match-class db fuel-tracker solution triple error-ch)))
+                    (where/-match-class db tracker solution triple error-ch)))
              async/merge)
-        (where/-match-class active-graph fuel-tracker solution triple error-ch))
+        (where/-match-class active-graph tracker solution triple error-ch))
       where/nil-channel))
 
   (-activate-alias [ds alias]
-    (activate ds alias))
+    (go-try
+      (activate ds alias)))
 
   (-aliases [ds]
     (names ds))
@@ -88,26 +89,25 @@
   (-finalize [_ _ _ solution-ch]
     solution-ch)
 
-
   subject/SubjectFormatter
-  (-forward-properties [ds iri select-spec context compact-fn cache fuel-tracker error-ch]
+  (-forward-properties [ds iri select-spec context compact-fn cache tracker error-ch]
     (let [db-ch   (->> ds all async/to-chan!)
           prop-ch (async/chan)]
       (async/pipeline-async 4
                             prop-ch
                             (fn [db ch]
-                              (-> (subject/-forward-properties db iri select-spec context compact-fn cache fuel-tracker error-ch)
+                              (-> (subject/-forward-properties db iri select-spec context compact-fn cache tracker error-ch)
                                   (async/pipe ch)))
                             db-ch)
       (async/reduce merge-subgraphs {} prop-ch)))
 
-  (-reverse-property [ds iri reverse-spec context compact-fn cache fuel-tracker error-ch]
+  (-reverse-property [ds iri reverse-spec context compact-fn cache tracker error-ch]
     (let [db-ch   (->> ds all async/to-chan!)
           prop-ch (async/chan)]
       (async/pipeline-async 2
                             prop-ch
                             (fn [db ch]
-                              (-> (subject/-reverse-property db iri reverse-spec context compact-fn cache fuel-tracker error-ch)
+                              (-> (subject/-reverse-property db iri reverse-spec context compact-fn cache tracker error-ch)
                                   (async/pipe ch)))
                             db-ch)
       (async/reduce (fn [combined-prop db-prop]
@@ -119,15 +119,14 @@
                     []
                     prop-ch)))
 
-  (-iri-visible? [ds iri]
+  (-iri-visible? [ds tracker iri]
     (go-try
       (some? (loop [[db & r] (all ds)]
                (if db
-                 (if (<? (subject/-iri-visible? db iri))
+                 (if (<? (subject/-iri-visible? db tracker iri))
                    db
                    (recur r))
                  nil))))))
-
 
 (defn combine
   [named-map defaults]

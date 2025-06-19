@@ -1,10 +1,8 @@
 (ns fluree.db.query.exec.eval-test
   (:require [clojure.test :as t :refer [deftest testing is]]
-            [fluree.db.query.exec.eval :as fun]
-            [fluree.db.query.exec.where :as where]
             [fluree.db.constants :as const]
-            [fluree.db.datatype :as datatype])
-  (:import [java.time OffsetDateTime LocalDateTime LocalDate LocalTime OffsetTime]))
+            [fluree.db.query.exec.eval :as fun]
+            [fluree.db.query.exec.where :as where]))
 
 (deftest equality
   (testing "type-indifferent equal"
@@ -289,3 +287,29 @@
       (is (= (where/->typed-val "Z")
              (fun/tz (where/->typed-val "10:43:44Z" const/iri-xsd-time)))
           "OffsetTime"))))
+
+(deftest logic-fns
+  (testing "or"
+    (is (= (where/->typed-val nil)
+           (fun/-or)))
+    (is (= (where/->typed-val false)
+           (fun/-or (where/->typed-val false))))
+    (is (= (where/->typed-val true)
+           (fun/-or (where/->typed-val true))))
+    (is (= (where/->typed-val "ex:1" const/iri-id)
+           (fun/-or (where/->typed-val false) (where/->typed-val "ex:1" const/iri-id))))
+    (is (= (where/->typed-val "ex:1" const/iri-id)
+           (fun/-or (where/->typed-val false) (where/->typed-val false) (where/->typed-val false)
+                    (where/->typed-val "ex:1" const/iri-id)))))
+  (testing "and"
+    (is (= (where/->typed-val true)
+           (fun/-and)))
+    (is (= (where/->typed-val false)
+           (fun/-and (where/->typed-val false))))
+    (is (= (where/->typed-val true)
+           (fun/-and (where/->typed-val true))))
+    (is (= (where/->typed-val "ex:1" const/iri-id)
+           (fun/-and (where/->typed-val true) (where/->typed-val "ex:1" const/iri-id))))
+    (is (= (where/->typed-val "ex:1" const/iri-id)
+           (fun/-and (where/->typed-val true) (where/->typed-val true) (where/->typed-val true)
+                     (where/->typed-val "ex:1" const/iri-id))))))

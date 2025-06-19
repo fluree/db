@@ -1,12 +1,10 @@
 (ns fluree.db.query.exec.update
-  (:require [fluree.db.flake :as flake]
+  (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.iri :as iri]
             [fluree.db.datatype :as datatype]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.util.log :as log]
-            [clojure.core.async :as async]))
+            [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.exec.where :as where]))
 
 (defn assign-clause
   [clause solution]
@@ -15,7 +13,7 @@
        clause))
 
 (defn retract-triple-matches
-  [db t fuel-tracker error-ch matched-ch]
+  [db t tracker error-ch matched-ch]
   (let [retract-ch (async/chan 2 (comp cat
                                        (map (fn [f]
                                               (flake/flip-flake f t)))))]
@@ -23,20 +21,20 @@
                           retract-ch
                           (fn [matched-triple ch]
                             (-> db
-                                (where/resolve-flake-range fuel-tracker error-ch matched-triple)
+                                (where/resolve-flake-range tracker error-ch matched-triple)
                                 (async/pipe ch)))
                           matched-ch)
     retract-ch))
 
 (defn retract
-  [db txn {:keys [t] :as _tx-state} fuel-tracker error-ch solution-ch]
+  [db txn {:keys [t] :as _tx-state} tracker error-ch solution-ch]
   (let [clause     (:delete txn)
         matched-ch (async/pipe solution-ch
                                (async/chan 2 (comp (mapcat (partial assign-clause clause))
                                                    (filter where/all-matched?)
                                                    (map (partial where/compute-sids db))
                                                    (remove nil?))))]
-    (retract-triple-matches db t fuel-tracker error-ch matched-ch)))
+    (retract-triple-matches db t tracker error-ch matched-ch)))
 
 (defn build-sid
   [{:keys [namespaces] :as _db} ns nme]
@@ -69,7 +67,7 @@
     (flake/create sid pid oid dt t true m)))
 
 (defn create-scalar-flake
-  [db-vol p-iri sid pid o-mch t m]
+  [db-vol _p-iri sid pid o-mch t m]
   (let [v  (where/get-value o-mch)
         dt (or (some-> o-mch
                        where/get-datatype-iri
@@ -102,7 +100,7 @@
     (async/pipe solution-ch insert-ch)))
 
 (defn insert-retract
-  [db-vol mdfn tx-state fuel-tracker error-ch solution-ch]
+  [db-vol mdfn tx-state tracker error-ch solution-ch]
   (let [solution-ch*    (async/chan 2)  ; create an extra channel to multiply so
                                         ; solutions don't get dropped before we
                                         ; can add taps to process them.
@@ -112,7 +110,7 @@
         insert-ch       (insert db-vol mdfn tx-state insert-soln-ch)
         retract-soln-ch (->> (async/chan 2)
                              (async/tap solution-mult))
-        retract-ch      (retract @db-vol mdfn tx-state fuel-tracker error-ch retract-soln-ch)]
+        retract-ch      (retract @db-vol mdfn tx-state tracker error-ch retract-soln-ch)]
     (async/pipe solution-ch solution-ch*) ; now hook up the solution input
                                           ; after everything is wired
     (async/merge [insert-ch retract-ch])))
@@ -126,16 +124,16 @@
   (contains? txn :delete))
 
 (defn modify
-  [db-vol parsed-txn tx-state fuel-tracker error-ch solution-ch]
+  [db-vol parsed-txn tx-state tracker error-ch solution-ch]
   (let [solution-ch* (async/pipe solution-ch
                                  (async/chan 2 (comp (where/with-default where/blank-solution))))]
     (cond
       (and (insert? parsed-txn)
            (retract? parsed-txn))
-      (insert-retract db-vol parsed-txn tx-state fuel-tracker error-ch solution-ch*)
+      (insert-retract db-vol parsed-txn tx-state tracker error-ch solution-ch*)
 
       (insert? parsed-txn)
       (insert db-vol parsed-txn tx-state solution-ch*)
 
       (retract? parsed-txn)
-      (retract @db-vol parsed-txn tx-state fuel-tracker error-ch solution-ch*))))
+      (retract @db-vol parsed-txn tx-state tracker error-ch solution-ch*))))

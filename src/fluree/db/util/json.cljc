@@ -1,12 +1,14 @@
 (ns fluree.db.util.json
-  (:require #?(:clj [cheshire.core :as cjson])
-            #?(:clj [cheshire.parse :as cparse])
-            #?(:clj [cheshire.generate :refer [add-encoder encode-seq remove-encoder]])
-            #?(:cljs [goog.object :as gobject])
-            [fluree.db.util.bytes :as butil]
-            #?(:cljs [fluree.db.util.core :as util])
-            [fluree.db.util.log :as log]
-            [fluree.db.flake :as flake])
+  (:require #?@(:clj
+                [[cheshire.core :as cjson]
+                 [cheshire.generate :refer [add-encoder encode-seq remove-encoder]]
+                 [cheshire.parse :as cparse]
+                 [fluree.db.util.log :as log]
+                 [fluree.db.flake :as flake]]
+                :cljs
+                [[fluree.db.util.core :as util]
+                 [goog.object :as gobject]])
+            [fluree.db.util.bytes :as butil])
   #?(:clj
      (:import (fluree.db.flake Flake)
               (java.io ByteArrayInputStream)
@@ -25,8 +27,8 @@
      [enable]
      (if enable
        (add-encoder java.math.BigDecimal
-                     (fn [n ^JsonGenerator jsonGenerator]
-                       (.writeString jsonGenerator (str n))))
+                    (fn [n ^JsonGenerator jsonGenerator]
+                      (.writeString jsonGenerator (str n))))
        (remove-encoder java.math.BigDecimal))))
 
 ;;https://purelyfunctional.tv/mini-guide/json-serialization-api-clojure/
@@ -78,7 +80,6 @@
                 (js/JSON.parse)
                 (js->clj :keywordize-keys keywordize-keys?)))))
 
-
 #?(:cljs
    (defn stringify-preserve-namespace
      [x]
@@ -89,11 +90,9 @@
   #?(:clj  (cjson/encode x)
      :cljs (js/JSON.stringify (clj->js x))))
 
-
 (defn stringify-UTF8
   [x]
   (butil/string->UTF8 (stringify x)))
-
 
 (defn- valid-coordinates?
   "Given a sequence of coordinates, ensure that, for the given depth:
@@ -160,7 +159,8 @@
   (and (valid-coordinates? 4 (:coordinates geometry))
        (every? #(every? linear-ring? %) (:coordinates geometry))))
 
-(defmethod valid-geojson? :default [geometry] false)
+(defmethod valid-geojson? :default [_geometry]
+  false)
 
 (comment
 

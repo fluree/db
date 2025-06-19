@@ -12,14 +12,12 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true])
   (:import #?@(:clj  ((org.httpkit.client TimeoutException)
-                      (java.nio HeapCharBuffer))
-               :cljs ((goog.net.ErrorCode)))))
+                      (java.nio HeapCharBuffer)))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 ;; allow large websocket frames of ~10mb
 #?(:clj (System/setProperty "org.asynchttpclient.webSocketMaxFrameSize" "10000000"))
-
 
 (defn format-error-response
   [url e]
@@ -63,8 +61,7 @@
     (ex-info message
              (cond-> {:url   url
                       :error error}
-                     status (assoc :status status)))))
-
+               status (assoc :status status)))))
 
 #?(:clj
    (defn throw-if-timeout [response]
@@ -82,49 +79,51 @@
   (let [{:keys [request-timeout token headers keywordize-keys json?]
          :or   {request-timeout 5000
                 keywordize-keys true}} opts
+
         response-chan (async/chan)
         multipart?    (and (map? message)
                            (contains? message :multipart))
         headers*      (cond-> headers
                         json? (assoc "Content-Type" "application/json")
-                        token (assoc "Authorization" (str "Bearer " token)))
-        base-req      (if multipart? ;; multipart requests need to be sent in special map structure
+                        token (assoc "Authorization" (str "Bearer " token)))]
+    #?(:clj
+       (let [base-req (if multipart? ;; multipart requests need to be sent in special map structure
                         message
                         {:body message})]
-    #?(:clj (http/post url (assoc base-req :headers headers*
-                                           :timeout request-timeout)
-                       (fn [{:keys [error status body] :as response}]
-                         (try ;; TODO - throw-if-timeout will throw but uncaught as `post` fn returns response-chan - adding a 'try/catch' for now
-                           ;; TODO - ideally throw-if-timeout should be part of the format-error-response fn to put ex on response-chan and can remove outer try/catch
-                           (if (or error (< 299 status))
-                             (do
-                               (throw-if-timeout response)
-                               (async/put!
-                                 response-chan
-                                 (format-error-response
-                                   url
-                                   (or error (ex-info "error response"
-                                                      response)))))
-                             (let [data (try (cond-> (bs/to-string body)
-                                                     json? (json/parse keywordize-keys))
-                                             (catch Exception e
-                                               ;; don't throw, as `data` will get exception and put on response-chan
-                                               (ex-info (str "JSON parsing error for xhttp post request to: " url
-                                                             " with error message: " (ex-message e))
-                                                        {:status 400 :error :db/invalid-json}
-                                                        e)))]
-                               (async/put! response-chan data)))
-                           (catch Exception e
-                             (async/put! response-chan e)))))
+         (http/post url (assoc base-req :headers headers*
+                               :timeout request-timeout)
+                    (fn [{:keys [error status body] :as response}]
+                      (try ;; TODO - throw-if-timeout will throw but uncaught as `post` fn returns response-chan - adding a 'try/catch' for now
+                        ;; TODO - ideally throw-if-timeout should be part of the format-error-response fn to put ex on response-chan and can remove outer try/catch
+                        (if (or error (< 299 status))
+                          (do
+                            (throw-if-timeout response)
+                            (async/put!
+                             response-chan
+                             (format-error-response
+                              url
+                              (or error (ex-info "error response"
+                                                 response)))))
+                          (let [data (try (cond-> (bs/to-string body)
+                                            json? (json/parse keywordize-keys))
+                                          (catch Exception e
+                                            ;; don't throw, as `data` will get exception and put on response-chan
+                                            (ex-info (str "JSON parsing error for xhttp post request to: " url
+                                                          " with error message: " (ex-message e))
+                                                     {:status 400 :error :db/invalid-json}
+                                                     e)))]
+                            (async/put! response-chan data)))
+                        (catch Exception e
+                          (async/put! response-chan e))))))
        :cljs
-       (let [req {:url url
-                  :method "post"
+       (let [req {:url     url
+                  :method  "post"
                   :timeout request-timeout
                   :headers (cond-> headers*
                              multipart? (assoc "Content-Type" "multipart/form-data"))
-                  :data (if multipart?
-                          (mapv :content (:multipart message))
-                          message)}]
+                  :data    (if multipart?
+                             (mapv :content (:multipart message))
+                             message)}]
          (-> axios
              (.request (clj->js req))
              (.then (fn [resp]
@@ -135,7 +134,6 @@
              (.catch (fn [err]
                        (async/put! response-chan (format-error-response url err)))))))
     response-chan))
-
 
 (defn post-json
   "Posts JSON content, returns parsed JSON response as core async channel.
@@ -149,7 +147,6 @@
                    (json/stringify message))]
     (post url base-req (assoc opts :json? true))))
 
-
 (defn get
   "Returns result body as a string, or an exception.
 
@@ -157,48 +154,47 @@
   It is assumed body is already in a format that can be sent directly in request (already encoded).
 
   Options
-  - output-format - can be :text, :json, :edn or :binary (default :text), or special format (wikidata) to handle wikidata errors, which come back as html.
-
-  "
+  - output-format - can be :text, :json, :edn or :binary (default :text), or special format (wikidata) to handle wikidata errors, which come back as html."
   [url opts]
-  (let [{:keys [request-timeout token headers body output-format]
+  (let [{:keys [request-timeout token headers output-format]
          :or   {request-timeout 5000
                 output-format   :text}} opts
+
         response-chan (async/chan)
         headers       (cond-> {}
-                              headers (merge headers)
-                              token (assoc "Authorization" (str "Bearer " token)))]
-    #?(:clj  (http/get url (util/without-nils
-                             {:headers headers
-                              :timeout request-timeout
-                              :body    body})
-                       (fn [{:keys [error status body] :as response}]
-                         (if (or error (< 299 status))
-                           (if (= :wikidata output-format)
-                             (let [err-body (-> error ex-data :body)
-                                   res'     (cond
-                                              (= (type err-body) java.io.ByteArrayInputStream)
-                                              (slurp err-body)
+                        headers (merge headers)
+                        token   (assoc "Authorization" (str "Bearer " token)))]
+    #?(:clj
+       (http/get url (util/without-nils
+                      {:headers headers
+                       :timeout request-timeout
+                       :body    (:body opts)})
+                 (fn [{:keys [error status body] :as response}]
+                   (if (or error (< 299 status))
+                     (if (= :wikidata output-format)
+                       (let [err-body (-> error ex-data :body)
+                             res'     (cond
+                                        (= (type err-body) java.io.ByteArrayInputStream)
+                                        (slurp err-body)
 
-                                              :else
-                                              err-body)
-                                   error    {:status  (or (-> error ex-data :status) 400)
-                                             :message (str res')
-                                             :error   :db/invalid-query}]
-                               (async/put! response-chan error))
-                             (async/put! response-chan
-                                         (format-error-response
-                                           url
-                                           (or error (ex-info "error response"
-                                                              response)))))
-                           (do
-                             (throw-if-timeout response)
-                             (async/put! response-chan
-                                         (case output-format
-                                           (:text :json) (bs/to-string body)
-                                           (:edn :wikidata) (-> body bs/to-string json/parse)
-                                           ;; else
-                                           (bs/to-byte-array body)))))))
+                                        :else
+                                        err-body)
+                             error {:status  (or (-> error ex-data :status) 400)
+                                    :message (str res')
+                                    :error   :db/invalid-query}]
+                         (async/put! response-chan error))
+                       (async/put! response-chan
+                                   (format-error-response
+                                    url
+                                    (or error (ex-info "error response"
+                                                       response)))))
+                     (do
+                       (throw-if-timeout response)
+                       (async/put! response-chan
+                                   (case output-format
+                                     (:text :json)    (bs/to-string body)
+                                     (:edn :wikidata) (-> body bs/to-string json/parse)
+                                     (bs/to-byte-array body)))))))
        :cljs (-> axios
                  (.request (clj->js {:url     url
                                      :method  "get"
@@ -210,12 +206,10 @@
                                         (case output-format
                                           :text data
                                           :json (json/stringify data)
-                                          ;; else
                                           (throw (ex-info "http get only supports output formats of json and text." {})))))))
                  (.catch (fn [err]
                            (async/put! response-chan (format-error-response url err))))))
     response-chan))
-
 
 (defn get-json
   "http get with JSON response.
@@ -226,7 +220,7 @@
   (let [opts* (cond-> (-> opts
                           (assoc-in [:headers "Accept"] "application/json")
                           (assoc :output-format :json))
-                      (:body opts) (assoc :body (json/stringify (:body opts))))]
+                (:body opts) (assoc :body (json/stringify (:body opts))))]
     (get url opts*)))
 
 (def ws-close-status-codes
@@ -245,8 +239,6 @@
    :service      {:code 1013 :reason "Try again later"}
    :gateway      {:code 1014 :reason "Bad gateway"}
    :tls          {:code 1015 :reason "TLS handshake"}})
-
-
 
 (defn close-websocket
   "Closes websocket with optional reason-keyword which
@@ -289,8 +281,8 @@
               (async/put! resp-chan true)
               (async/close! resp-chan))
             (catch* e
-                    (log/error e "Error sending websocket message:" msg)
-                    (async/put! resp-chan false)))
+              (log/error e "Error sending websocket message:" msg)
+              (async/put! resp-chan false)))
           (recur))))))
 
 (declare try-socket)
@@ -302,12 +294,10 @@
     (let [retry-timeout (min (* retries 1000) 20000)
           ws            (async/<! (try-socket url sub-chan pub-chan timeout close-fn))]
       (when (util/exception? ws)
-        (do
-          (log/info "Unable to establish websocket connection, retrying in " retry-timeout "ms. "
-                    "Reported websocket exception: " (ex-message ws))
-          (async/<! (async/timeout (min (* retries 500) 10000))) ;; timeout maxes at 10s
-          (recur (inc retries)))))))
-
+        (log/info "Unable to establish websocket connection, retrying in " retry-timeout "ms. "
+                  "Reported websocket exception: " (ex-message ws))
+        (async/<! (async/timeout (min (* retries 500) 10000))) ;; timeout maxes at 10s
+        (recur (inc retries))))))
 
 (defn abnormal-socket-close?
   [status-code]

@@ -2,10 +2,10 @@
   (:require [clojure.core.async :as async :refer [<! >! go go-loop]]
             [fluree.db.flake :as flake]
             [fluree.db.flake.index :as index]
-            [fluree.db.flake.index.storage :as storage]
             [fluree.db.flake.index.novelty :refer [update-node-id]]
-            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.flake.index.storage :as storage]
             [fluree.db.util.async :refer [<?]]
+            [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
 (defn partition-flakes
@@ -105,8 +105,8 @@
             (update-node-id write-response)
             index/unresolve))
       (catch* e
-              (log/error e "Error writing rebalanced flake index leaf node")
-              (>! error-ch e)))))
+        (log/error e "Error writing rebalanced flake index leaf node")
+        (>! error-ch e)))))
 
 (defn write-branch
   [{:keys [alias index-catalog] :as _db} idx branch error-ch]
@@ -117,8 +117,8 @@
             (update-node-id write-response)
             index/unresolve))
       (catch* e
-              (log/error e "Error writing rebalanced flake index branch node")
-              (>! error-ch e)))))
+        (log/error e "Error writing rebalanced flake index branch node")
+        (>! error-ch e)))))
 
 (defn write-node
   [db idx node error-ch]

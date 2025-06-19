@@ -1,14 +1,15 @@
 (ns fluree.db.query.range
-  (:require [fluree.db.flake.index :as index]
-            [fluree.db.util.schema :as schema-util]
+  (:require #?(:clj  [clojure.core.async :refer [chan go >!] :as async]
+               :cljs [cljs.core.async :refer [chan  >!] :refer-macros [go] :as async])
+            [fluree.db.flake :as flake]
+            [fluree.db.flake.index :as index]
+            [fluree.db.json-ld.iri :as iri]
+            [fluree.db.json-ld.policy.query :as policy]
+            [fluree.db.track :as track]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.flake :as flake]
-            #?(:clj  [clojure.core.async :refer [chan go >!] :as async]
-               :cljs [cljs.core.async :refer [chan  >!] :refer-macros [go] :as async])
-            [fluree.db.json-ld.policy.query :as policy]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.json-ld.iri :as iri]))
+            [fluree.db.util.schema :as schema-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -20,7 +21,6 @@
         (throw (ex-info (str "Invalid predicate, does not exist: " pred)
                         {:status 400, :error :db/invalid-predicate})))
     pred))
-
 
 (defn match->flake-parts
   "Takes a match from index-range, and based on the index
@@ -34,14 +34,12 @@
       :opst [p3 (coerce-predicate db p2) p1 p4 op m]
       :tspo [p2 (coerce-predicate db p3) p4 p1 op m])))
 
-
 (def ^{:private true :const true} subject-min-match [flake/min-s])
 (def ^{:private true :const true} subject-max-match [flake/max-s])
 (def ^{:private true :const true} pred-min-match [flake/min-p])
 (def ^{:private true :const true} pred-max-match [flake/max-p])
 (def ^{:private true :const true} txn-max-match [flake/min-t])
 (def ^{:private true :const true} txn-min-match [flake/max-t])
-
 
 (defn- min-match
   "Smallest index flake part match by index"
@@ -51,7 +49,6 @@
     :post pred-min-match
     :opst subject-min-match
     :tspo txn-min-match))
-
 
 (defn- max-match
   "Biggest index flake part match by index"
@@ -109,57 +106,64 @@
     e*))
 
 (defn authorize-flake
-  [db error-ch flake]
+  [db tracker error-ch flake]
   (go
     (try* (if (or (schema-util/is-schema-flake? db flake)
-                  (<? (policy/allow-flake? db flake)))
+                  (<? (policy/allow-flake? db tracker flake)))
             flake
             ::unauthorized)
           (catch* e
-                  (>! error-ch (authorize-flake-exception e db flake))))))
+            (>! error-ch (authorize-flake-exception e db flake))))))
 
 (defn authorize-flakes
   "Authorize each flake in the supplied `flakes` collection asynchronously,
   returning a collection containing only allowed flakes according to the
   policy of the supplied `db`."
-  [db error-ch flakes]
+  [db tracker error-ch flakes]
   (->> flakes
-       (map (partial authorize-flake db error-ch))
+       (map (partial authorize-flake db tracker error-ch))
        (async/map (fn [& fs]
                     (into [] (remove unauthorized?) fs)))))
 
-(defn filter-authorized
-  "Returns a channel that will eventually return a stream of flake slices
-  containing only the schema flakes and the flakes validated by
-  allow-flake? function for the database `db`
-  from the `flake-slices` channel"
-  [db error-ch flake-slices]
-  #?(:cljs
-     flake-slices ; Note this bypasses all permissions in CLJS for now!
-
-     :clj
+#?(:clj
+   (defn filter-authorized
+     "Returns a channel that will eventually return a stream of flake slices
+     containing only the schema flakes and the flakes validated by
+     allow-flake? function for the database `db`
+     from the `flake-slices` channel"
+     [db tracker error-ch flake-slices]
      (if (policy/unrestricted? db)
        flake-slices
        (let [auth-fn (fn [flakes ch]
-                       (-> (authorize-flakes db error-ch flakes)
+                       (-> (authorize-flakes db tracker error-ch flakes)
                            (async/pipe ch)))
              out-ch  (chan)]
          (async/pipeline-async 2 out-ch auth-fn flake-slices)
-         out-ch))))
+         out-ch)))
+
+   :cljs
+   (defn filter-authorized
+     "Returns the unfiltered channel `flake-slices`.
+
+     Note: this bypasses all permissions in CLJS for now!"
+     [_ _ _ flake-slices]
+     flake-slices))
 
 (defn resolve-flake-slices
   "Returns a channel that will contain a stream of chunked flake collections that
   contain the flakes between `start-flake` and `end-flake` and are within the
   transaction range starting at `from-t` and ending at `to-t`."
-  [{:keys [index-catalog t] :as db} idx error-ch
-   {:keys [to-t start-flake end-flake] :as opts}]
-  (let [root      (get db idx)
-        novelty   (get-in db [:novelty idx])
-        novelty-t (get-in db [:novelty :t])
-        resolver  (index/index-catalog->t-range-resolver index-catalog novelty-t novelty to-t)
-        query-xf  (extract-query-flakes opts)]
-    (->> (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)
-         (filter-authorized db error-ch))))
+  ([db idx error-ch opts]
+   (resolve-flake-slices db nil idx error-ch opts))
+  ([{:keys [index-catalog] :as db} tracker idx error-ch
+    {:keys [to-t start-flake end-flake] :as opts}]
+   (let [root      (get db idx)
+         novelty   (get-in db [:novelty idx])
+         novelty-t (get-in db [:novelty :t])
+         resolver  (index/index-catalog->t-range-resolver index-catalog novelty-t novelty to-t)
+         query-xf  (extract-query-flakes opts)]
+     (->> (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)
+          (filter-authorized db tracker error-ch)))))
 
 (defn filter-subject-page
   "Returns a transducer to filter a stream of flakes to only contain flakes from
@@ -188,8 +192,8 @@
 (defn index-range*
   "Return a channel that will eventually hold a sorted vector of the range of
   flakes from `db` that meet the criteria specified in the `opts` map."
-  [db error-ch {:keys [idx limit offset flake-limit] :as opts}]
-  (->> (resolve-flake-slices db idx error-ch opts)
+  [db tracker error-ch {:keys [idx limit offset flake-limit] :as opts}]
+  (->> (resolve-flake-slices db tracker idx error-ch opts)
        (into-page limit offset flake-limit)))
 
 (defn expand-range-interval
@@ -218,10 +222,12 @@
            when :chan is supplied.
   :flake-limit - max number of flakes to return"
   ([db idx test match opts]
+   (time-range db nil idx test match opts))
+  ([db tracker idx test match opts]
    (let [[start-test start-match end-test end-match]
          (expand-range-interval idx test match)]
-     (time-range db idx start-test start-match end-test end-match opts)))
-  ([{:keys [t index-catalog] :as db} idx start-test start-match end-test end-match opts]
+     (time-range db tracker idx start-test start-match end-test end-match opts)))
+  ([{:keys [t index-catalog] :as db} tracker idx start-test start-match end-test end-match opts]
    (let [{:keys [limit offset flake-limit from-t to-t]
           :or   {from-t t, to-t t}}
          opts
@@ -251,7 +257,7 @@
      (go-try
        (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake
                                               in-range? 1 query-xf error-ch)
-                             (filter-authorized db error-ch)
+                             (filter-authorized db tracker error-ch)
                              (into-page limit offset flake-limit))]
          (async/alt!
            error-ch ([e]
@@ -271,15 +277,16 @@
   :xform - xform applied to each result individually. This is not used when :chan is supplied.
   :limit - max number of flakes to return"
   ([db idx] (index-range db idx {}))
-  ([db idx opts] (index-range db idx >= (min-match idx) <= (max-match idx) opts))
-  ([db idx test match] (index-range db idx test match {}))
-  ([db idx test match opts]
+  ([db idx opts] (index-range db nil idx >= (min-match idx) <= (max-match idx) opts))
+  ([db idx test match] (index-range db nil idx test match {}))
+  ([db idx test match opts] (index-range db nil idx test match opts))
+  ([db tracker idx test match opts]
    (let [[start-test start-match end-test end-match]
          (expand-range-interval idx test match)]
-     (index-range db idx start-test start-match end-test end-match opts)))
-  ([db idx start-test start-match end-test end-match]
-   (index-range db idx start-test start-match end-test end-match {}))
-  ([{:keys [t] :as db} idx start-test start-match end-test end-match opts]
+     (index-range db tracker idx start-test start-match end-test end-match opts)))
+  ([db tracker idx start-test start-match end-test end-match]
+   (index-range db tracker idx start-test start-match end-test end-match {}))
+  ([{:keys [t] :as db} tracker idx start-test start-match end-test end-match opts]
    (let [[s1 p1 o1 t1 op1 m1]
          (match->flake-parts db idx start-match)
 
@@ -302,15 +309,21 @@
                            (iri/encode-iri db s2))
              end-flake   (resolve-match-flake end-test s2* p2 o2 t2 op2 m2)
              error-ch    (chan)
+             track-fuel  (track/track-fuel! tracker error-ch)
+             flake-xf*   (->> [(:flake-xf opts) track-fuel]
+                              (remove nil?)
+                              (apply comp))
              range-ch    (index-range* db
+                                       tracker
                                        error-ch
                                        (assoc opts
-                                         :idx idx
-                                         :to-t t
-                                         :start-test start-test
-                                         :start-flake start-flake
-                                         :end-test end-test
-                                         :end-flake end-flake))]
+                                              :idx idx
+                                              :to-t t
+                                              :start-test start-test
+                                              :start-flake start-flake
+                                              :end-test end-test
+                                              :end-flake end-flake
+                                              :flake-xf flake-xf*))]
          (async/alt!
            error-ch ([e]
                      (throw e))

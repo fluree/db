@@ -1,14 +1,15 @@
-(ns fluree.db.json-ld.branch
-  (:require [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.indexer :as indexer]
-            [fluree.json-ld :as json-ld]
+(ns fluree.db.branch
+  (:require [clojure.core.async :as async :refer [go <! go-loop]]
             [fluree.db.async-db :as async-db]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake.commit-data :as commit-data]
+            [fluree.db.indexer :as indexer]
+            [fluree.db.json-ld.policy :as policy]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<?]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [clojure.core.async :as async :refer [go <! go-loop]]
-            [fluree.db.nameservice :as nameservice]))
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -43,10 +44,10 @@
   (-> commit-map commit-data/->json-ld json-ld/expand))
 
 (defn load-db
-  [alias branch commit-catalog index-catalog commit]
-  (let [commit-jsonld (commit-map->commit-jsonld commit)]
+  [alias branch commit-catalog index-catalog commit-map]
+  (let [commit-jsonld (commit-map->commit-jsonld commit-map)]
     (async-db/load alias branch commit-catalog index-catalog
-                   commit-jsonld nil)))
+                   commit-jsonld commit-map nil)))
 
 (defn update-index-async
   "Returns an updated async-db with the index changes.
@@ -111,7 +112,7 @@
     (let [updated-db (or (use-latest-db db idx-commit branch-state)
                          (try* (dbproto/-index-update db (:index idx-commit))
                                (catch* e (log/error e "Exception updating db with new index, attempting full reload. Exception:" (ex-message e))
-                                 (reload-with-index db alias branch (:index idx-commit)))))]
+                                       (reload-with-index db alias branch (:index idx-commit)))))]
       updated-db)
     db))
 
@@ -143,9 +144,9 @@
   ([ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld]
    (state-map ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld nil))
   ([ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld indexing-opts]
-   (let [initial-db (async-db/load ledger-alias branch-name commit-catalog index-catalog
-                                   commit-jsonld indexing-opts)
-         commit-map (commit-data/jsonld->clj commit-jsonld)
+   (let [commit-map (commit-data/jsonld->clj commit-jsonld)
+         initial-db (async-db/load ledger-alias branch-name commit-catalog index-catalog
+                                   commit-jsonld commit-map indexing-opts)
          state      (atom {:commit     commit-map
                            :current-db initial-db})
          idx-q      (index-queue ledger-alias branch-name publishers state)]
@@ -193,7 +194,7 @@
   't' should be the same (if just updating an index) or after the db's 't' value."
   [{:keys [state index-queue] :as branch-map} new-db index-files-ch]
   (let [updated-db (-> state
-                       (swap! update-commit new-db)
+                       (swap! update-commit (policy/root-db new-db))
                        :current-db)]
     (enqueue-index! index-queue updated-db index-files-ch)
     branch-map))
@@ -202,7 +203,3 @@
   "Returns current db from branch data"
   [{:keys [state] :as _branch-map}]
   (:current-db @state))
-
-(defn current-commit
-  [{:keys [state] :as _branch-map}]
-  (:commit @state))

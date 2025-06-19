@@ -11,7 +11,9 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defprotocol Restrictable
-  (wrap-policy [db policy-rules policy-values])
+  (wrap-policy
+    [db policy-rules policy-values]
+    [db tracker policy-rules policy-values])
   (root [db]))
 
 (def root-policy-map
@@ -34,28 +36,28 @@
   would looses the @type information."
   [query-results]
   (mapv
-    (fn [{q   const/iri-query
-          t-s const/iri-targetSubject
-          t-p const/iri-targetProperty :as policy}]
-      (cond-> policy
-        q   (assoc const/iri-query {"@value" q "@type" "@json"})
-        t-s (assoc const/iri-targetSubject  (mapv #(if (get % "@id") % {"@value" % "@type" "@json"}) (util/sequential t-s)))
-        t-p (assoc const/iri-targetProperty (mapv #(if (get % "@id") % {"@value" % "@type" "@json"}) (util/sequential t-p)))))
-    query-results))
+   (fn [{q   const/iri-query
+         t-s const/iri-targetSubject
+         t-p const/iri-targetProperty :as policy}]
+     (cond-> policy
+       q   (assoc const/iri-query {"@value" q "@type" "@json"})
+       t-s (assoc const/iri-targetSubject  (mapv #(if (get % "@id") % {"@value" % "@type" "@json"}) (util/sequential t-s)))
+       t-p (assoc const/iri-targetProperty (mapv #(if (get % "@id") % {"@value" % "@type" "@json"}) (util/sequential t-p)))))
+   query-results))
 
 (defn wrap-class-policy
   "Given one or more policy classes, queries for policies
   containing those classes and calls `wrap-policy`"
-  [db classes policy-values]
+  [db tracker classes policy-values]
   (go
     (let [c-values  (->> classes ;; for passing in classes as query `values`
                          util/sequential
                          (mapv (fn [c] {"@value" c
                                         "@type"  const/iri-id})))
-          policies  (<! (dbproto/-query db {"select" {"?policy" ["*"]}
-                                            "where"  [{"@id"   "?policy"
-                                                       "@type" "?classes"}]
-                                            "values" ["?classes" c-values]}))
+          policies  (<! (dbproto/-query db tracker {"select" {"?policy" ["*"]}
+                                                    "where"  [{"@id"   "?policy"
+                                                               "@type" "?classes"}]
+                                                    "values" ["?classes" c-values]}))
           policies* (if (util/exception? policies)
                       policies
                       (policy-from-query policies))]
@@ -66,7 +68,7 @@
                       " with error: " (ex-message policies*))
                  {:status 400 :error :db/policy-exception}
                  policies*)
-        (<! (wrap-policy db (json-ld/expand policies*) policy-values))))))
+        (<! (wrap-policy db tracker (json-ld/expand policies*) policy-values))))))
 
 (defn inject-value-binding
   "Inject the given var and value into a normalized values clause."
@@ -87,13 +89,13 @@
   "Given an identity (@id) that exists in the db which contains a
   property `f:policyClass` listing policy classes associated with
   that identity, queries for those classes and calls `wrap-policy`"
-  [db identity policy-values]
+  [db tracker identity policy-values]
   (go
-    (let [policies  (<! (dbproto/-query db {"select" {"?policy" ["*"]}
-                                            "where"  [{"@id"                 identity
-                                                       const/iri-policyClass "?classes"}
-                                                      {"@id"   "?policy"
-                                                       "@type" "?classes"}]}))
+    (let [policies  (<! (dbproto/-query db tracker {"select" {"?policy" ["*"]}
+                                                    "where"  [{"@id"                 identity
+                                                               const/iri-policyClass "?classes"}
+                                                              {"@id"   "?policy"
+                                                               "@type" "?classes"}]}))
           policies* (if (util/exception? policies)
                       policies
                       (policy-from-query policies))
@@ -105,7 +107,7 @@
                       " with error: " (ex-message policies*))
                  {:status 400 :error :db/policy-exception}
                  policies*)
-        (<! (wrap-policy db (json-ld/expand policies*) policy-values*))))))
+        (<! (wrap-policy db tracker (json-ld/expand policies*) policy-values*))))))
 
 (defn policy-enforced-opts?
   "Tests 'options' for a query or transaction to see if the options request
@@ -117,19 +119,21 @@
 
 (defn policy-enforce-db
   "Policy enforces a db based on the query/transaction options"
-  [db parsed-context opts]
-  (go-try
-    (let [{:keys [identity policy-class policy policy-values]} opts
-          policy-values* (util.parse/normalize-values policy-values)]
-      (cond
+  ([db parsed-context opts]
+   (policy-enforce-db db nil parsed-context opts))
+  ([db tracker parsed-context opts]
+   (go-try
+     (let [{:keys [identity policy-class policy policy-values]} opts
+           policy-values* (util.parse/normalize-values policy-values)]
+       (cond
 
-        identity
-        (<? (wrap-identity-policy db identity policy-values*))
+         identity
+         (<? (wrap-identity-policy db tracker identity policy-values*))
 
-        policy-class
-        (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policy-class))]
-          (<? (wrap-class-policy db classes policy-values*)))
+         policy-class
+         (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policy-class))]
+           (<? (wrap-class-policy db tracker classes policy-values*)))
 
-        policy
-        (let [expanded-policy (json-ld/expand policy parsed-context)]
-          (<? (wrap-policy db expanded-policy policy-values*)))))))
+         policy
+         (let [expanded-policy (json-ld/expand policy parsed-context)]
+           (<? (wrap-policy db tracker expanded-policy policy-values*))))))))

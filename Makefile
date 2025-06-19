@@ -1,7 +1,9 @@
 .PHONY: all deps jar install deploy nodejs browser webworker cljtest	\
 	cljs-browser-test cljs-node-test cljstest test eastwood ci clean	\
 	js-packages sync-package-json publish-nodejs publish-browser		\
-	publish-webworker publish-js pending-tests pt
+	publish-webworker publish-js pending-tests pt clj-kondo-lint            \
+	clj-kondo-lint-ci cljfmt-check
+
 
 DOCS_MARKDOWN := $(shell find docs -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
@@ -85,13 +87,13 @@ publish-webworker: js-packages/webworker/fluree-webworker.js js-packages/webwork
 
 publish-js: publish-nodejs publish-browser publish-webworker
 
-docs/fluree.db.json-ld.api.html docs/index.html: src/fluree/db/json_ld/api.cljc
+docs/fluree.db.api.html docs/index.html: src/fluree/db/api.cljc
 	clojure -T:build docs :output-path "\"$(@D)\""
 
 docs/%.html: docs/%.md
 	clojure -T:build docs :output-path "\"$(@D)\""
 
-docs: docs/fluree.db.json-ld.api.html docs/index.html $(DOCS_TARGETS)
+docs: docs/fluree.db.api.html docs/index.html $(DOCS_TARGETS)
 
 cljs-browser-test: node_modules package-lock.json
 	npx shadow-cljs release browser-test
@@ -116,12 +118,24 @@ pending-tests:
 
 pt: pending-tests
 
+clj-kondo-lint:
+	clj-kondo --lint src:test:build.clj
+
+clj-kondo-lint-ci:
+	clj-kondo --lint src:test:build.clj --config .clj-kondo/ci-config.edn
+
+cljfmt-check:
+	cljfmt check src dev test build.clj
+
+cljfmt-fix:
+	cljfmt fix src dev test build.clj
+
 test: cljtest cljstest nodejs-test browser-test
 
 eastwood:
 	clojure -M:dev:cljtest:eastwood
 
-ci: test eastwood
+ci: test eastwood clj-kondo-lint-ci cljfmt-check
 
 clean:
 	clojure -T:build clean

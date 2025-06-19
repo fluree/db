@@ -3,10 +3,9 @@
   (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.db.storage :as storage]
-            [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]))
+            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -21,6 +20,8 @@
 (defprotocol Publisher
   (publish [publisher commit-jsonld]
     "Publishes new commit.")
+  (retract [publisher ledger-alias]
+    "Remove the nameservice record for the ledger.")
   (publishing-address [publisher ledger-alias]
     "Returns full publisher address/iri which will get published in commit. If
     'private', return `nil`."))
@@ -37,12 +38,12 @@
   [commit-jsonld publishers]
   (->> publishers
        (map (fn [ns]
-                (go
-                  (try*
-                    (<? (publish ns commit-jsonld))
-                    (catch* e
-                      (log/warn e "Publisher failed to publish commit")
-                      ::publishing-error)))))
+              (go
+                (try*
+                  (<? (publish ns commit-jsonld))
+                  (catch* e
+                    (log/warn e "Publisher failed to publish commit")
+                    ::publishing-error)))))
        async/merge))
 
 (defn published-ledger?
@@ -50,23 +51,6 @@
   (go-try
     (let [addr (<? (publishing-address nsv ledger-alias))]
       (boolean (<? (lookup nsv addr))))))
-
-(defn commit-from-record
-  ([record]
-   (commit-from-record record nil))
-  ([record branch]
-   (log/info "Fetching commit from record:" record)
-   (let [branch-iri (if branch
-                      (str (get record "@id") "(" branch ")")
-                      (get record "defaultBranch"))]
-     (some #(when (= (get % "@id") branch-iri)
-              (get % "commit"))
-           (get record "branches")))))
-
-(defn commit-address-from-record
-  [record branch]
-  (let [commit-data (commit-from-record record branch)]
-    (get commit-data "address")))
 
 (defn address-path
   [address]
