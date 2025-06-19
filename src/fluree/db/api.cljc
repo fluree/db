@@ -195,12 +195,12 @@
   [conn ledger-alias-or-address]
   (validate-connection conn)
   (promise-wrap
-    (go-try
-      (let [address (if (address? ledger-alias-or-address)
-                      ledger-alias-or-address
-                      (<? (alias->address conn ledger-alias-or-address)))]
-        (log/debug "exists? - ledger address:" address)
-        (<? (connection/ledger-exists? conn address))))))
+   (go-try
+     (let [address (if (address? ledger-alias-or-address)
+                     ledger-alias-or-address
+                     (<? (alias->address conn ledger-alias-or-address)))]
+       (log/debug "exists? - ledger address:" address)
+       (<? (connection/ledger-exists? conn address))))))
 
 (defn notify
   "Notifies the connection of a new commit stored at address `commit-address`.
