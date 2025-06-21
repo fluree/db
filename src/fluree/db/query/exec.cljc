@@ -95,8 +95,8 @@
   executor function."
   [q]
   (update q :where #(walk/postwalk (fn [x]
-                                     (if (= :query (where/pattern-type x))
-                                       (let [subquery (second x)]
+                                     (if (where/subquery? x)
+                                       (let [subquery (where/pattern-data x)]
                                          (where/->pattern :query (subquery-executor subquery)))
                                        x))
                                    %)))
