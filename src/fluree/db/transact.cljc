@@ -149,9 +149,11 @@
       parse-data-helpers))
 
 (defn save-txn!
-  [{:keys [commit-catalog] ledger-alias :alias,  :as _ledger} txn]
-  (let [path (str/join "/" [ledger-alias "txn"])]
-    (storage/content-write-json commit-catalog path txn)))
+  ([{:keys [commit-catalog] ledger-alias :alias :as _ledger} txn]
+   (save-txn! commit-catalog ledger-alias txn))
+  ([commit-catalog ledger-alias txn]
+   (let [path (str/join "/" [ledger-alias "txn"])]
+     (storage/content-write-json commit-catalog path txn))))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
 ;; TODO - however this is really a concern of "commit", not staging and I don't think the db should be handling any of it
