@@ -4,7 +4,7 @@
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :refer [exception?]]))
 
-(def default-context
+(def context-edn
   {:id     "@id"
    :type   "@type"
    :schema "http://schema.org/"
@@ -18,15 +18,15 @@
     (testing "Querying predicates with mixed datatypes"
       (let [mixed-db @(fluree/stage (fluree/db ledger)
                                     {"insert"
-                                     [{:context     default-context
+                                     [{:context     context-edn
                                        :id          :ex/coco
                                        :type        :schema/Person
                                        :schema/name "Coco"}
-                                      {:context     default-context
+                                      {:context     context-edn
                                        :id          :ex/halie
                                        :type        :schema/Person
                                        :schema/name "Halie"}
-                                      {:context     default-context
+                                      {:context     context-edn
                                        :id          :ex/john
                                        :type        :schema/Person
                                        :schema/name 3}]})]
@@ -34,13 +34,13 @@
                  :type        :schema/Person
                  :schema/name "Halie"}]
                @(fluree/query mixed-db
-                              {:context default-context
+                              {:context context-edn
                                :select  {'?u [:*]}
                                :where   {:id '?u, :schema/name "Halie"}}))
             "only returns the data type queried")
         (is (= []
                @(fluree/query mixed-db
-                              {:context default-context
+                              {:context context-edn
                                :select  {'?u [:*]}
                                :where   {:id '?u, :schema/name "a"}}))
             "does not return results without matching subjects")
@@ -48,7 +48,7 @@
                  :type        :schema/Person
                  :schema/name 3}]
                @(fluree/query mixed-db
-                              {:context default-context
+                              {:context context-edn
                                :select  {'?u [:*]}
                                :where   {:id '?u, :schema/name 3}}))
             "only returns the data type queried")))))
