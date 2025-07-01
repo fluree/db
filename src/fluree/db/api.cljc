@@ -243,7 +243,7 @@
 
    The 'opts' key is a map with the following key options:
     - `:context` - (optional) and externally provided context that will be used
-                   for document expansion, the @context in the json-ld will be 
+                   for document expansion, the @context in the json-ld will be
                    ignored if present.
    - `:format`  - (optional) the format of the data, currently json-ld is assumed
                   unless `:format` is set to `:turtle`. If `:turtle` is set,
