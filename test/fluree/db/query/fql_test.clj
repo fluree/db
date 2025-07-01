@@ -468,7 +468,6 @@
             (is (= [["ex:bob"]] sut)
                 "returns correctly filtered results")))))))
 
-
 (deftest ^:integration t-test
   (testing "querying with t values"
     (let [conn   (test-utils/create-conn)
