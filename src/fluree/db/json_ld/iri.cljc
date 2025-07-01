@@ -22,6 +22,9 @@
 (def ^:const type-iri "@type")
 (def ^:const json-iri "@json")
 (def ^:const rdf:type-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+;; Note this JSON-iri is not a valid rdf IRI per spec.. but used internally only for now
+;; to represent @json data type. Transactions convert @json into this IRI, then select converts
+;; this IRI back into @json.
 (def ^:const rdf:JSON-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON")
 
 (defn normalize
