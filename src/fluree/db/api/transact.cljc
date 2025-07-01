@@ -55,62 +55,36 @@
   (-> e ex-data :status (= 404)))
 
 (defn transact!
-  ([conn txn]
-   (transact! conn txn nil))
-  ([conn txn override-opts]
-   (go-try
-     (let [parsed-txn (-> txn
-                          (format-txn override-opts)
-                          (parse/parse-ledger-txn override-opts))
-           ledger-id (:ledger-id parsed-txn)
-           ledger (async/<! (connection/load-ledger conn ledger-id))]
-       (if (util/exception? ledger)
-         (if (not-found? ledger)
-           (throw (ex-info (str "Ledger " ledger-id " does not exist")
-                           {:status 409 :error :db/ledger-not-exists}
-                           ledger))
-           (throw ledger))
-         (<? (transact/transact-ledger! ledger parsed-txn)))))))
+  [conn ledger-id parsed-txn parsed-opts]
+  (go-try
+    (let [ledger (async/<! (connection/load-ledger conn ledger-id))]
+      (if (util/exception? ledger)
+        (if (not-found? ledger)
+          (throw (ex-info (str "Ledger " ledger-id " does not exist")
+                          {:status 409 :error :db/ledger-not-exists}
+                          ledger))
+          (throw ledger))
+        (let [staged      (<? (transact/stage-triples (ledger/current-db ledger) parsed-txn))
+              commit-opts (dissoc parsed-opts :context :identity)]
+          (if (track/track-txn? parsed-opts)
+            (let [staged-db     (:db staged)
+                  commit-result (<? (transact/commit! ledger staged-db commit-opts))]
+              (merge staged commit-result))
+            (<? (transact/commit! ledger staged commit-opts))))))))
 
 (defn insert!
   [conn ledger-id txn override-opts]
   (go-try
-    (let [ledger (async/<! (connection/load-ledger conn ledger-id))]
-      (if (util/exception? ledger)
-        (if (not-found? ledger)
-          (throw (ex-info (str "Ledger " ledger-id " does not exist")
-                          {:status 409 :error :db/ledger-not-exists}
-                          ledger))
-          (throw ledger))
-        (let [parsed-opts (prep-opts override-opts)
-              parsed-txn  (parse/parse-insert-txn txn parsed-opts)
-              staged      (<? (transact/stage-triples (ledger/current-db ledger) parsed-txn))
-              commit-opts (dissoc parsed-opts :context :identity)]
-          (if (track/track-txn? parsed-opts)
-            (let [staged-db     (:db staged)
-                  commit-result (<? (transact/commit! ledger staged-db commit-opts))]
-              (merge staged commit-result))
-            (<? (transact/commit! ledger staged commit-opts))))))))
+    (let [parsed-opts (prep-opts override-opts)
+          parsed-txn  (parse/parse-insert-txn txn parsed-opts)]
+      (transact! conn ledger-id parsed-txn parsed-opts))))
 
 (defn upsert!
   [conn ledger-id txn override-opts]
   (go-try
-    (let [ledger (async/<! (connection/load-ledger conn ledger-id))]
-      (if (util/exception? ledger)
-        (if (not-found? ledger)
-          (throw (ex-info (str "Ledger " ledger-id " does not exist")
-                          {:status 409 :error :db/ledger-not-exists}
-                          ledger))
-          (throw ledger))
-        (let [parsed-opts (prep-opts override-opts)
-              parsed-txn  (parse/parse-upsert-txn txn parsed-opts)
-              staged      (<? (transact/stage-triples (ledger/current-db ledger) parsed-txn))
-              commit-opts (dissoc parsed-opts :context :identity)]
-          (if (track/track-txn? parsed-opts)
-            (let [staged-db     (:db staged)
-                  commit-result (<? (transact/commit! ledger staged-db commit-opts))]
-              (merge staged commit-result))
-            (<? (transact/commit! ledger staged commit-opts))))))))
+    (let [parsed-opts (prep-opts override-opts)
+          parsed-txn  (parse/parse-upsert-txn txn parsed-opts)]
+      (transact! conn ledger-id parsed-txn parsed-opts))))
 
 (defn update!
   [conn txn override-opts]
