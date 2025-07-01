@@ -296,14 +296,14 @@
   ([conn txn opts]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/transact! conn txn opts))))
+    (transact-api/update! conn txn opts))))
 
 (defn update!
   ([conn txn] (update! conn txn nil))
   ([conn txn opts]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/transact! conn txn opts))))
+    (transact-api/update! conn txn opts))))
 
 (defn upsert!
   ([conn ledger-id txn] (upsert! conn ledger-id txn nil))

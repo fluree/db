@@ -116,6 +116,22 @@
               (merge staged commit-result))
             (<? (transact/commit! ledger staged commit-opts))))))))
 
+(defn update!
+  [conn txn override-opts]
+  (go-try
+    (let [parsed-txn (-> txn
+                         (format-txn override-opts)
+                         (parse/parse-ledger-txn override-opts))
+          ledger-id (:ledger-id parsed-txn)
+          ledger (async/<! (connection/load-ledger conn ledger-id))]
+      (if (util/exception? ledger)
+        (if (not-found? ledger)
+          (throw (ex-info (str "Ledger " ledger-id " does not exist")
+                          {:status 409 :error :db/ledger-not-exists}
+                          ledger))
+          (throw ledger))
+        (<? (transact/transact-ledger! ledger parsed-txn))))))
+
 (defn credential-transact!
   "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.
 
@@ -125,10 +141,10 @@
     (let [{txn* :subject identity :did} (<? (cred/verify txn))
           parent-context (when (map? txn) ;; parent-context only relevant for verifiable credential
                            (ctx-util/txn-context txn))]
-      (<? (transact! conn txn* (assoc opts
-                                      :raw-txn txn
-                                      :identity identity
-                                      :context parent-context))))))
+      (<? (update! conn txn* (assoc opts
+                                    :raw-txn txn
+                                    :identity identity
+                                    :context parent-context))))))
 
 (defn create-with-txn
   ([conn txn]
