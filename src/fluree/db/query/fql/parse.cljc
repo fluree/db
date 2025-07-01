@@ -755,8 +755,8 @@
       (get m (keyword nme))
       (get m (symbol nme))))
 
-(defn parse-analytical-query
-  ([q] (parse-analytical-query q nil))
+(defn parse-query*
+  ([q] (parse-query* q nil))
   ([q parent-context]
    (let [orig-context  (:context q)
          context       (cond->> (json-ld/parse-context orig-context)
@@ -782,13 +782,13 @@
   [[_ sub-query] _vars context]
   (let [sub-query* (-> sub-query
                        syntax/coerce-subquery
-                       (parse-analytical-query context))]
+                       (parse-query* context))]
     [(where/->pattern :query sub-query*)]))
 
 (defn parse-query
   [q]
   (log/trace "parse-query" q)
-  (-> q syntax/coerce-query parse-analytical-query))
+  (-> q syntax/coerce-query parse-query*))
 
 (declare parse-subj-cmp)
 
@@ -899,9 +899,9 @@
 
 (defn jld->parsed-triples
   "Parses a JSON-LD document into a sequence of update triples. The document
-   will be expanded using the context inside the txn merged with the 
+   will be expanded using the context inside the txn merged with the
    provided parsed-context, if not nil.
-   
+
    If bound-vars is non-nil, it will replace any variables in the document
    assuming it is a valid variable placement, otherwise it will throw."
   [jld bound-vars parsed-context]
@@ -949,10 +949,10 @@
 
 (defn upsert-where-del
   "For an upsert transaction.
-   
+
    Takes a parsed transaction and for each triple, replaces the object position
    with a variable and returns a map with :where and :delete keys.
-   
+
    Skips blank nodes as they cannot be deleted."
   [parsed-txn]
   (loop [[next-triple & r] parsed-txn
