@@ -150,3 +150,45 @@
                 results @(fluree/query db query)]
             (is (= [["Marge" 36 :xsd/int]]
                    results))))))))
+
+(deftest ^:integration json-datatype-test
+  (testing "querying with @json datatype"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "json-test")
+          db     @(fluree/stage
+                   (fluree/db ledger)
+                   {"@context" {"ex"    "http://example.org/ns/"}
+                    "insert"
+                    [{"id"      "ex:doc1"
+                      "ex:name" "Document 1"
+                      "ex:data" {"@value" {"name" "John" "age" 30}
+                                 "@type"  "@json"}}
+                     {"id"      "ex:doc2"
+                      "ex:name" "Document 2"
+                      "ex:data" "plain string data"}]})]
+      (testing "retrieving @json datatype using bind"
+        (let [query   {"@context" {"ex" "http://example.org/ns/"
+                                   "xsd" "http://www.w3.org/2001/XMLSchema#"}
+                       "select"  ["?name" "?data" "?dt"]
+                       "where"   [{"ex:name" "?name"
+                                   "ex:data" "?data"}
+                                  ["bind" "?dt" "(datatype ?data)"]]}
+              results @(fluree/query db query)]
+          (is (= 2 (count results))
+              "should return both documents")
+          (is (some #(= ["Document 1" "{\"age\":30,\"name\":\"John\"}" "@json"] %) results)
+              "should include Document 1 with @json datatype")
+          (is (some #(= ["Document 2" "plain string data" "xsd:string"] %) results)
+              "should include Document 2 with string datatype")))
+      (testing "filtering by @json datatype"
+        (let [query   {"@context" {"ex" "http://example.org/ns/"}
+                       "select"  ["?name" "?data"]
+                       "where"   [{"ex:name" "?name"
+                                   "ex:data" "?data"}
+                                  ["bind" "?dt" "(datatype ?data)"]
+                                  ["filter" "(= \"@json\" ?dt)"]]}
+              results @(fluree/query db query)]
+          (is (= 1 (count results))
+              "should return only document with @json datatype")
+          (is (= [["Document 1" "{\"age\":30,\"name\":\"John\"}"]] results)
+              "should return the correct document"))))))

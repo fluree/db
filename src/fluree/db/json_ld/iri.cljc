@@ -241,15 +241,19 @@
 (def type-sid
   (iri->sid "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"))
 
+(def json-sid
+  (iri->sid "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"))
+
 (defn sid->iri
   "Converts an sid back into a string iri."
   ([sid]
    (sid->iri sid default-namespace-codes))
   ([sid namespace-codes]
-   (if (= type-sid sid)
-     type-iri
-     (str (get-namespace sid namespace-codes)
-          (get-name sid)))))
+   (cond
+     (= type-sid sid) type-iri
+     (= json-sid sid) json-iri
+     :else (str (get-namespace sid namespace-codes)
+                (get-name sid)))))
 
 (defprotocol IRICodec
   (encode-iri [codec iri])
