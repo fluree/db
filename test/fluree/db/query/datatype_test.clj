@@ -192,3 +192,36 @@
               "should return only document with @json datatype")
           (is (= [["Document 1" {"age" 30 "name" "John"}]] results)
               "should return the correct document"))))))
+
+;; Note this test is syntax for binding the @type directly to a variable that we discussed supporting but not currently working
+(deftest ^:integration ^:pending value-type-binding-test
+  (testing "querying with @value and @type variable bindings"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "value-type-test")
+          db     @(fluree/stage
+                   (fluree/db ledger)
+                   {"@context" {"ex"  "http://example.org/ns/"
+                                "xsd" "http://www.w3.org/2001/XMLSchema#"}
+                    "insert"
+                    [{"@id"     "ex:homer"
+                      "ex:name" "Homer"
+                      "ex:age"  36}
+                     {"@id"     "ex:marge"
+                      "ex:name" "Marge"
+                      "ex:age"  {"@value" 36
+                                 "@type"  "xsd:int"}}
+                     {"@id"     "ex:bart"
+                      "ex:name" "Bart"
+                      "ex:age"  "forever 10"}]})]
+      (testing "binding @type to a variable in JSON query"
+        (let [query   {"@context" {"ex"  "http://example.org/ns/"
+                                   "xsd" "http://www.w3.org/2001/XMLSchema#"}
+                       "select"  ["?name" "?age" "?ageType"]
+                       "where"   [{"ex:name" "?name"
+                                   "ex:age"  {"@value" "?age"
+                                              "@type"  "?ageType"}}]}
+              results @(fluree/query db query)]
+          (is (= #{["Marge" 36 "xsd:int"]
+                   ["Homer" 36 "xsd:int"]
+                   ["Bart" "forever 10" "xsd:string"]}
+                 (set results)) "should bind datatype to ?ageType"))))))
