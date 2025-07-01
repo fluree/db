@@ -20,13 +20,15 @@
     txn))
 
 (defn insert
-  [db rdf {:keys [context format] :as _opts}]
+  [db rdf opts]
   (go-try
-    (let [context* (json-ld/parse-context context)
+    (let [{:keys [context format] :as parsed-opts}
+          (-> (parse/parse-txn-opts nil opts nil)
+              (clojure.core/update :context json-ld/parse-context))
           parsed-triples (if (= :turtle format)
                            (turtle/parse rdf)
-                           (parse/jld->parsed-triples rdf nil context*))
-          parsed-txn {:insert parsed-triples}]
+                           (parse/jld->parsed-triples rdf nil context))
+          parsed-txn     {:insert parsed-triples :opts opts}]
       (<? (transact/stage-triples db parsed-txn)))))
 
 (defn upsert
