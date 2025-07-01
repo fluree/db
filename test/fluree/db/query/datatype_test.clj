@@ -176,7 +176,7 @@
               results @(fluree/query db query)]
           (is (= 2 (count results))
               "should return both documents")
-          (is (some #(= ["Document 1" "{\"age\":30,\"name\":\"John\"}" "@json"] %) results)
+          (is (some #(= ["Document 1" {"age" 30 "name" "John"} "@json"] %) results)
               "should include Document 1 with @json datatype")
           (is (some #(= ["Document 2" "plain string data" "xsd:string"] %) results)
               "should include Document 2 with string datatype")))
@@ -190,5 +190,5 @@
               results @(fluree/query db query)]
           (is (= 1 (count results))
               "should return only document with @json datatype")
-          (is (= [["Document 1" "{\"age\":30,\"name\":\"John\"}"]] results)
+          (is (= [["Document 1" {"age" 30 "name" "John"}]] results)
               "should return the correct document"))))))

@@ -27,6 +27,10 @@
   [match _compact]
   {"value" (where/get-value match) "type" "literal" "datatype" const/iri-rdf-json})
 
+(defmethod display "@json"
+  [match _compact]
+  {"value" (where/get-value match) "type" "literal" "datatype" "@json"})
+
 (defmethod display const/iri-id
   [match _compact]
   (let [iri (where/get-iri match)]

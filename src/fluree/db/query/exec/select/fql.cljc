@@ -18,6 +18,10 @@
   [match _compact]
   (-> match where/get-value (json/parse false)))
 
+(defmethod display "@json"
+  [match _compact]
+  (-> match where/get-value (json/parse false)))
+
 (defmethod display const/iri-id
   [match compact]
   (some-> match where/get-iri compact))

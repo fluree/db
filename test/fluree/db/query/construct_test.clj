@@ -90,7 +90,7 @@
       (is (= {"@graph"
               [{"@id" "ex:fran",
                 "json" [{"@value" "{\"paths\":[\"dev\",\"src\"]}",
-                         "@type" "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}],
+                         "@type" "@json"}],
                 "name" [{"@value" "Francois", "@language" "fr"}],
                 "date" [{"@value" #time/date "2020-10-20",
                          "@type" "http://www.w3.org/2001/XMLSchema#date"}]}],
