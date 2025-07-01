@@ -14,10 +14,6 @@
   [match _compact]
   (where/get-value match))
 
-(defmethod display const/iri-rdf-json
-  [match _compact]
-  (-> match where/get-value (json/parse false)))
-
 (defmethod display "@json"
   [match _compact]
   (-> match where/get-value (json/parse false)))
