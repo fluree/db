@@ -35,7 +35,7 @@
         org.clojars.quoll/raphael           {:mvn/version "0.3.12"} ;; turtle (TTL) parsing
 
         ;; cryptography
-        com.fluree/crypto {:mvn/version "3.0.0"}
+        com.fluree/crypto {:mvn/version "3.0.1"}
         org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
         ;; storage
