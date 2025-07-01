@@ -21,12 +21,17 @@
     (sparql/->fql txn)
     txn))
 
+(defn prep-opts
+  ([opts]
+   (prep-opts opts nil))
+  ([opts override-opts]
+   (-> (parse/parse-txn-opts opts override-opts nil)
+       (clojure.core/update :context json-ld/parse-context))))
+
 (defn insert
   [db rdf opts]
   (go-try
-    (let [{:keys [context format] :as parsed-opts}
-          (-> (parse/parse-txn-opts nil opts nil)
-              (clojure.core/update :context json-ld/parse-context))
+    (let [{:keys [context format] :as parsed-opts} (prep-opts opts)
           parsed-triples (if (= :turtle format)
                            (turtle/parse rdf)
                            (parse/jld->parsed-triples rdf nil context))
@@ -36,7 +41,7 @@
 (defn upsert
   [db rdf opts]
   (go-try
-    (let [opts* (assoc opts :context (json-ld/parse-context (:context opts)))
+    (let [opts*      (prep-opts opts)
           parsed-txn (parse/parse-upsert-txn rdf opts*)]
       (<? (transact/stage-triples db parsed-txn)))))
 
@@ -81,8 +86,7 @@
                           ledger))
           (throw ledger))
         (let [{:keys [format context] :as parsed-opts}
-              (-> (parse/parse-txn-opts nil override-opts nil)
-                  (clojure.core/update :context json-ld/parse-context))
+              (prep-opts override-opts)
               parsed-triples (if (= :turtle format)
                                (turtle/parse txn)
                                (parse/jld->parsed-triples txn nil context))
@@ -105,8 +109,7 @@
                           {:status 409 :error :db/ledger-not-exists}
                           ledger))
           (throw ledger))
-        (let [parsed-opts (-> (parse/parse-txn-opts nil override-opts nil)
-                              (clojure.core/update :context json-ld/parse-context))
+        (let [parsed-opts (prep-opts override-opts)
               parsed-txn  (parse/parse-upsert-txn txn parsed-opts)
               staged      (<? (transact/stage-triples (ledger/current-db ledger) parsed-txn))
               commit-opts (dissoc parsed-opts :context :identity)]
