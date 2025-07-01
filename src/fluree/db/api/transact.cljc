@@ -3,10 +3,12 @@
   (:require [clojure.core.async :as async]
             [fluree.db.connection :as connection]
             [fluree.db.json-ld.credential :as cred]
+            [fluree.db.ledger :as ledger]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.query.turtle.parse :as turtle]
+            [fluree.db.track :as track]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
@@ -28,7 +30,7 @@
           parsed-triples (if (= :turtle format)
                            (turtle/parse rdf)
                            (parse/jld->parsed-triples rdf nil context))
-          parsed-txn     {:insert parsed-triples :opts opts}]
+          parsed-txn     {:insert parsed-triples :opts parsed-opts}]
       (<? (transact/stage-triples db parsed-txn)))))
 
 (defn upsert
@@ -67,6 +69,52 @@
                            ledger))
            (throw ledger))
          (<? (transact/transact-ledger! ledger parsed-txn)))))))
+
+(defn insert!
+  [conn ledger-id txn override-opts]
+  (go-try
+    (let [ledger (async/<! (connection/load-ledger conn ledger-id))]
+      (if (util/exception? ledger)
+        (if (not-found? ledger)
+          (throw (ex-info (str "Ledger " ledger-id " does not exist")
+                          {:status 409 :error :db/ledger-not-exists}
+                          ledger))
+          (throw ledger))
+        (let [{:keys [format context] :as parsed-opts}
+              (-> (parse/parse-txn-opts nil override-opts nil)
+                  (clojure.core/update :context json-ld/parse-context))
+              parsed-triples (if (= :turtle format)
+                               (turtle/parse txn)
+                               (parse/jld->parsed-triples txn nil context))
+              parsed-txn     {:insert parsed-triples :opts parsed-opts}
+              staged         (<? (transact/stage-triples (ledger/current-db ledger) parsed-txn))
+              commit-opts    (dissoc parsed-opts :context :identity)]
+          (if (track/track-txn? parsed-opts)
+            (let [staged-db     (:db staged)
+                  commit-result (<? (transact/commit! ledger staged-db commit-opts))]
+              (merge staged commit-result))
+            (<? (transact/commit! ledger staged commit-opts))))))))
+
+(defn upsert!
+  [conn ledger-id txn override-opts]
+  (go-try
+    (let [ledger (async/<! (connection/load-ledger conn ledger-id))]
+      (if (util/exception? ledger)
+        (if (not-found? ledger)
+          (throw (ex-info (str "Ledger " ledger-id " does not exist")
+                          {:status 409 :error :db/ledger-not-exists}
+                          ledger))
+          (throw ledger))
+        (let [parsed-opts (-> (parse/parse-txn-opts nil override-opts nil)
+                              (clojure.core/update :context json-ld/parse-context))
+              parsed-txn  (parse/parse-upsert-txn txn parsed-opts)
+              staged      (<? (transact/stage-triples (ledger/current-db ledger) parsed-txn))
+              commit-opts (dissoc parsed-opts :context :identity)]
+          (if (track/track-txn? parsed-opts)
+            (let [staged-db     (:db staged)
+                  commit-result (<? (transact/commit! ledger staged-db commit-opts))]
+              (merge staged commit-result))
+            (<? (transact/commit! ledger staged commit-opts))))))))
 
 (defn credential-transact!
   "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.

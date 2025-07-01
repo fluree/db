@@ -298,6 +298,27 @@
    (promise-wrap
     (transact-api/transact! conn txn opts))))
 
+(defn update!
+  ([conn txn] (update! conn txn nil))
+  ([conn txn opts]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/transact! conn txn opts))))
+
+(defn upsert!
+  ([conn ledger-id txn] (upsert! conn ledger-id txn nil))
+  ([conn ledger-id txn opts]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/upsert! conn ledger-id txn opts))))
+
+(defn insert!
+  ([conn ledger-id txn] (insert! conn ledger-id txn nil))
+  ([conn ledger-id txn opts]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/insert! conn ledger-id txn opts))))
+
 (defn credential-transact!
   ([conn txn] (credential-transact! conn txn nil))
   ([conn txn opts]
