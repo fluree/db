@@ -31,11 +31,8 @@
 (defn insert
   [db rdf opts]
   (go-try
-    (let [{:keys [context format] :as parsed-opts} (prep-opts opts)
-          parsed-triples (if (= :turtle format)
-                           (turtle/parse rdf)
-                           (parse/jld->parsed-triples rdf nil context))
-          parsed-txn     {:insert parsed-triples :opts parsed-opts}]
+    (let [parsed-opts (prep-opts opts)
+          parsed-txn  (parse/parse-insert-txn rdf parsed-opts)]
       (<? (transact/stage-triples db parsed-txn)))))
 
 (defn upsert
@@ -85,14 +82,10 @@
                           {:status 409 :error :db/ledger-not-exists}
                           ledger))
           (throw ledger))
-        (let [{:keys [format context] :as parsed-opts}
-              (prep-opts override-opts)
-              parsed-triples (if (= :turtle format)
-                               (turtle/parse txn)
-                               (parse/jld->parsed-triples txn nil context))
-              parsed-txn     {:insert parsed-triples :opts parsed-opts}
-              staged         (<? (transact/stage-triples (ledger/current-db ledger) parsed-txn))
-              commit-opts    (dissoc parsed-opts :context :identity)]
+        (let [parsed-opts (prep-opts override-opts)
+              parsed-txn  (parse/parse-insert-txn txn parsed-opts)
+              staged      (<? (transact/stage-triples (ledger/current-db ledger) parsed-txn))
+              commit-opts (dissoc parsed-opts :context :identity)]
           (if (track/track-txn? parsed-opts)
             (let [staged-db     (:db staged)
                   commit-result (<? (transact/commit! ledger staged-db commit-opts))]

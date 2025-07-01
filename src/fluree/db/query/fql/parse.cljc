@@ -986,6 +986,14 @@
      :delete  delete
      :insert  parsed-txn}))
 
+(defn parse-insert-txn
+  [txn {:keys [format context] :as opts}]
+  {:insert (if (= :turtle format)
+             (turtle/parse txn)
+             (jld->parsed-triples txn nil context))
+   :context context
+   :opts opts})
+
 (defn parse-ledger-txn
   ([txn]
    (parse-ledger-txn txn {}))
