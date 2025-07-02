@@ -1004,8 +1004,7 @@
 
 (defn ensure-ledger
   [txn]
-  (if-let [ledger-id (get-named txn "ledger")]
+  (if (get-named txn "ledger")
     txn
     (throw (ex-info "Invalid transaction, missing required key: ledger."
                     {:status 400, :error :db/invalid-transaction}))))
-

@@ -3,12 +3,8 @@
   (:require [clojure.core.async :as async]
             [fluree.db.connection :as connection]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.ledger :as ledger]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.fql.syntax :as syntax]
-            [fluree.db.query.sparql :as sparql]
-            [fluree.db.query.turtle.parse :as turtle]
-            [fluree.db.track :as track]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
@@ -51,7 +47,7 @@
   (-> e ex-data :status (= 404)))
 
 (defn transact!
-  [conn ledger-id parsed-txn parsed-opts]
+  [conn ledger-id parsed-txn]
   (go-try
     (let [ledger (async/<! (connection/load-ledger conn ledger-id))]
       (if (util/exception? ledger)
@@ -67,24 +63,24 @@
   (go-try
     (let [parsed-opts (prep-opts override-opts)
           parsed-txn  (parse/parse-insert-txn txn parsed-opts)]
-      (<? (transact! conn ledger-id parsed-txn parsed-opts)))))
+      (<? (transact! conn ledger-id parsed-txn)))))
 
 (defn upsert!
   [conn ledger-id txn override-opts]
   (go-try
     (let [parsed-opts (prep-opts override-opts)
           parsed-txn  (parse/parse-upsert-txn txn parsed-opts)]
-      (<? (transact! conn ledger-id parsed-txn parsed-opts)))))
+      (<? (transact! conn ledger-id parsed-txn)))))
 
 (defn update!
   [conn txn override-opts]
   (go-try
-    (let [{:keys [ledger-id opts] :as parsed-txn}
+    (let [{:keys [ledger-id] :as parsed-txn}
           (-> txn
               (parse/parse-sparql override-opts)
               (parse/ensure-ledger)
               (parse/parse-update-txn override-opts))]
-      (<? (transact! conn ledger-id parsed-txn opts)))))
+      (<? (transact! conn ledger-id parsed-txn)))))
 
 (defn credential-transact!
   "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.
