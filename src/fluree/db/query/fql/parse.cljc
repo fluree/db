@@ -1009,9 +1009,3 @@
     (throw (ex-info "Invalid transaction, missing required key: ledger."
                     {:status 400, :error :db/invalid-transaction}))))
 
-(defn parse-ledger-txn
-  ([txn]
-   (parse-ledger-txn txn {}))
-  ([txn override-opts]
-   (-> (ensure-ledger txn)
-       (parse-update-txn override-opts))))

@@ -15,12 +15,6 @@
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]))
 
-(defn format-txn
-  [txn override-opts]
-  (if (sparql/sparql-format? override-opts)
-    (sparql/->fql txn)
-    txn))
-
 (defn prep-opts
   ([opts]
    (prep-opts opts nil))
