@@ -23,9 +23,9 @@
       (and v lang)                                                 (assoc "xml:lang" lang)
       (and v (not (#{const/iri-string const/iri-lang-string} dt))) (assoc "datatype" dt))))
 
-(defmethod display const/iri-rdf-json
+(defmethod display "@json"
   [match _compact]
-  {"value" (where/get-value match) "type" "literal" "datatype" const/iri-rdf-json})
+  {"value" (where/get-value match) "type" "literal" "datatype" "@json"})
 
 (defmethod display const/iri-id
   [match _compact]
