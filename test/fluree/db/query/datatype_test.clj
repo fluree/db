@@ -194,7 +194,7 @@
               "should return the correct document"))))))
 
 ;; Note this test is syntax for binding the @type directly to a variable that we discussed supporting but not currently working
-(deftest ^:integration ^:pending value-type-binding-test
+(deftest ^:integration value-type-binding-test
   (testing "querying with @value and @type variable bindings"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "value-type-test")
@@ -221,7 +221,92 @@
                                    "ex:age"  {"@value" "?age"
                                               "@type"  "?ageType"}}]}
               results @(fluree/query db query)]
-          (is (= #{["Marge" 36 "xsd:int"]
-                   ["Homer" 36 "xsd:int"]
-                   ["Bart" "forever 10" "xsd:string"]}
-                 (set results)) "should bind datatype to ?ageType"))))))
+          (is (= [["Bart" "forever 10" "xsd:string"]
+                  ["Homer" 36 "xsd:integer"]
+                  ["Marge" 36 "xsd:int"]]
+                 results)))))))
+
+(deftest ^:integration language-binding-test
+  (testing "language binding with lang function"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "lang-test")
+          db     @(fluree/stage
+                   (fluree/db ledger)
+                   {"@context" {"ex" "http://example.org/ns/"}
+                    "insert"
+                    [{"@id"      "ex:greeting"
+                      "ex:hello" {"@value" "Hello" "@language" "en"}}
+                     {"@id"      "ex:salutation"
+                      "ex:hello" {"@value" "Bonjour" "@language" "fr"}}]})]
+      (testing "binding language to a variable with lang function"
+        (let [query {"@context" {"ex" "http://example.org/ns/"}
+                     "select"  ["?id" "?val" "?lang"]
+                     "where"   [{"@id" "?id"
+                                 "ex:hello" "?val"}
+                                ["bind" "?lang" "(lang ?val)"]]}
+              results @(fluree/query db query)]
+          (is (= #{["ex:greeting" "Hello" "en"]
+                   ["ex:salutation" "Bonjour" "fr"]}
+                 (set results))
+              "lang function should bind language correctly")))
+      (testing "binding language to a variable with lang function"
+        (let [query {"@context" {"ex" "http://example.org/ns/"}
+                     "select"  ["?id" "?val" "?lang"]
+                     "where"   [{"@id" "?id"
+                                 "ex:hello" {"@value" "?val"
+                                             "@language" "?lang"}}]}
+              results @(fluree/query db query)]
+          (is (= #{["ex:greeting" "Hello" "en"]
+                   ["ex:salutation" "Bonjour" "fr"]}
+                 (set results))
+              "lang function should bind language correctly"))))))
+
+(deftest ^:integration transaction-binding-test
+  (testing "transaction (@t) binding with t as a variable"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "t-test")
+          ;; First transaction
+          db1    @(fluree/stage
+                   (fluree/db ledger)
+                   {"@context" {"ex" "http://example.org/ns/"}
+                    "insert"
+                    [{"@id"     "ex:alice"
+                      "ex:name" "Alice"
+                      "ex:age"  30}]})
+          db1*   @(fluree/commit! ledger db1)
+          ;; Second transaction
+          db2    @(fluree/stage
+                   db1*
+                   {"@context" {"ex" "http://example.org/ns/"}
+                    "insert"
+                    [{"@id"      "ex:alice"
+                      "ex:hobby" "Reading"}]})
+          db2*   @(fluree/commit! ledger db2)
+          ;; Third transaction
+          db3    @(fluree/stage
+                   db2*
+                   {"@context" {"ex" "http://example.org/ns/"}
+                    "insert"
+                    [{"@id"     "ex:alice"
+                      "ex:city" "Boston"}]})
+          db3*   @(fluree/commit! ledger db3)]
+      (testing "binding transaction number to a variable"
+        (let [query {"@context" {"ex" "http://example.org/ns/"}
+                     "select"  ["?p" "?o" "?t"]
+                     "where"   [{"@id" "ex:alice"
+                                 "?p"  {"@value" "?o"
+                                        "@t"     "?t"}}]}
+              results @(fluree/query db3* query)]
+          (is (= 4 (count results))
+              "should return all predicates with their transaction numbers")
+          (is (= #{1 2 3} (set (map #(nth % 2) results)))
+              "should have data from 3 different transactions")
+          ;; Verify specific data
+          (is (some #(= ["ex:name" "Alice" 1] %) results)
+              "name should be from transaction 1")
+          (is (some #(= ["ex:age" 30 1] %) results)
+              "age should be from transaction 1")
+          (is (some #(= ["ex:hobby" "Reading" 2] %) results)
+              "hobby should be from transaction 2")
+          (is (some #(= ["ex:city" "Boston" 3] %) results)
+              "city should be from transaction 3"))))))

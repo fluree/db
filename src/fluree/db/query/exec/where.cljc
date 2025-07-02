@@ -180,15 +180,15 @@
 
 (defn link-lang-var
   [mch var]
-  (link-var mch :lang var))
+  (link-var mch :lang (symbol var)))
 
 (defn link-dt-var
   [mch var]
-  (link-var mch :dt var))
+  (link-var mch :dt (symbol var)))
 
 (defn link-t-var
   [mch var]
-  (link-var mch :t var))
+  (link-var mch :t (symbol var)))
 
 (defn sanitize-match
   [match]
@@ -390,7 +390,10 @@
   [var db flake]
   (let [var-mch (unmatched-var var)
         dt-sid (flake/dt flake)
-        dt-iri (iri/decode-sid db dt-sid)]
+        ;; Get datatype - either explicit from flake or inferred from value
+        dt-iri (if dt-sid
+                 (iri/decode-sid db dt-sid)
+                 (datatype/infer-iri (flake/o flake)))]
     (match-iri var-mch dt-iri)))
 
 (defn match-linked-lang

@@ -353,7 +353,11 @@
           filter-fn    (some-> attrs
                                (get const/iri-filter)
                                (parse-filter-function var vars context))
-          f            (combine-filters t-matcher dt-matcher lang-matcher filter-fn)]
+          filters (cond->> [filter-fn]
+                    (not (v/variable? t)) (cons t-matcher)
+                    (not (v/variable? dt)) (cons dt-matcher)
+                    (not (v/variable? lang)) (cons lang-matcher))
+          f       (apply combine-filters filters)]
       (cond-> var-mch
         (v/variable? dt)   (where/link-dt-var dt)
         (v/variable? lang) (where/link-lang-var lang)
