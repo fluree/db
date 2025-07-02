@@ -220,11 +220,11 @@
                        "where"   [{"ex:name" "?name"
                                    "ex:age"  {"@value" "?age"
                                               "@type"  "?ageType"}}]}
-              results @(fluree/query db query)] 
-          (is (= [["Bart" "forever 10" "xsd:string"] 
-                  ["Homer" 36 "xsd:integer"] 
-                  ["Marge" 36 "xsd:int"]] 
-                 results)) )))))
+              results @(fluree/query db query)]
+          (is (= [["Bart" "forever 10" "xsd:string"]
+                  ["Homer" 36 "xsd:integer"]
+                  ["Marge" 36 "xsd:int"]]
+                 results)))))))
 
 (deftest ^:integration language-binding-test
   (testing "language binding with lang function"
@@ -236,7 +236,7 @@
                     "insert"
                     [{"@id"      "ex:greeting"
                       "ex:hello" {"@value" "Hello" "@language" "en"}}
-                     {"@id"      "ex:salutation"  
+                     {"@id"      "ex:salutation"
                       "ex:hello" {"@value" "Bonjour" "@language" "fr"}}]})]
       (testing "binding language to a variable with lang function"
         (let [query {"@context" {"ex" "http://example.org/ns/"}
