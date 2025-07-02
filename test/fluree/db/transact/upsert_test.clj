@@ -91,3 +91,28 @@
              @(fluree/query db2 query)
              @(fluree/query db3 query))
           "Resulting data should be identical to original insert"))))
+
+(deftest upsert-and-commit
+  (let [conn    @(fluree/connect-memory)
+        _ledger @(fluree/create conn "tx/upsert")
+
+        _db1 @(fluree/insert! conn "tx/upsert" sample-insert-txn)
+        db2  @(fluree/upsert! conn "tx/upsert" sample-upsert-txn)]
+    (testing "upsert! commits the data"
+      (is (= [{"@type" "ex:User",
+               "schema:age" 42,
+               "schema:name" "Alice2",
+               "@id" "ex:alice"}
+              {"@type" "ex:User",
+               "schema:age" 22,
+               "schema:name" "Bob2",
+               "@id" "ex:bob"}
+              {"schema:name" "Jane2",
+               "@id" "ex:jane"}]
+             @(fluree/query db2
+                            {"@context" {"ex" "http://example.org/ns/"
+                                         "schema" "http://schema.org/"}
+                             "select" {"?id" ["*"]}
+                             "where" {"@id" "?id"
+                                      "schema:name" "?name"}})))
+      (is (= 2 (:t db2))))))
