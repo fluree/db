@@ -66,43 +66,31 @@
                           {:status 409 :error :db/ledger-not-exists}
                           ledger))
           (throw ledger))
-        (let [staged      (<? (transact/stage-triples (ledger/current-db ledger) parsed-txn))
-              commit-opts (dissoc parsed-opts :context :identity)]
-          (if (track/track-txn? parsed-opts)
-            (let [staged-db     (:db staged)
-                  commit-result (<? (transact/commit! ledger staged-db commit-opts))]
-              (merge staged commit-result))
-            (<? (transact/commit! ledger staged commit-opts))))))))
+        (<? (transact/transact-ledger! ledger parsed-txn))))))
 
 (defn insert!
   [conn ledger-id txn override-opts]
   (go-try
     (let [parsed-opts (prep-opts override-opts)
           parsed-txn  (parse/parse-insert-txn txn parsed-opts)]
-      (transact! conn ledger-id parsed-txn parsed-opts))))
+      (<? (transact! conn ledger-id parsed-txn parsed-opts)))))
 
 (defn upsert!
   [conn ledger-id txn override-opts]
   (go-try
     (let [parsed-opts (prep-opts override-opts)
           parsed-txn  (parse/parse-upsert-txn txn parsed-opts)]
-      (transact! conn ledger-id parsed-txn parsed-opts))))
+      (<? (transact! conn ledger-id parsed-txn parsed-opts)))))
 
 (defn update!
   [conn txn override-opts]
   (go-try
-    (let [parsed-txn (-> txn
-                         (parse/parse-sparql override-opts)
-                         (parse/parse-ledger-txn override-opts))
-          ledger-id (:ledger-id parsed-txn)
-          ledger (async/<! (connection/load-ledger conn ledger-id))]
-      (if (util/exception? ledger)
-        (if (not-found? ledger)
-          (throw (ex-info (str "Ledger " ledger-id " does not exist")
-                          {:status 409 :error :db/ledger-not-exists}
-                          ledger))
-          (throw ledger))
-        (<? (transact/transact-ledger! ledger parsed-txn))))))
+    (let [{:keys [ledger-id opts] :as parsed-txn}
+          (-> txn
+              (parse/parse-sparql override-opts)
+              (parse/ensure-ledger)
+              (parse/parse-update-txn override-opts))]
+      (<? (transact! conn ledger-id parsed-txn opts)))))
 
 (defn credential-transact!
   "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.
@@ -129,7 +117,8 @@
            {:keys [ledger-id] :as parsed-txn}
            (-> txn
                (parse/parse-sparql override-opts)
-               (parse/parse-ledger-txn override-opts)
+               (parse/ensure-ledger)
+               (parse/parse-update-txn override-opts)
                (clojure.core/update :opts dissoc :context :did :identity)) ; Using an
                                                                            ; identity option
                                                                            ; with an empty
