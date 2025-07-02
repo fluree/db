@@ -311,6 +311,11 @@
   (fn [pattern _vars _context]
     (v/where-pattern-type pattern)))
 
+(defn parse-pattern-with-orig
+  "Wrap each parsed pattern with its source so we can map it back for explain queries."
+  [pattern vars context]
+  (map #(with-meta % {:orig pattern :context context}) (parse-pattern pattern vars context)))
+
 (defn parse-bind-map
   [binds context]
   (into {}
@@ -333,8 +338,7 @@
                   [clause]
                   (util/sequential clause))]
     (->> clause*
-         (mapcat (fn [pattern]
-                   (parse-pattern pattern vars context)))
+         (mapcat (fn [pattern] (parse-pattern-with-orig pattern vars context)))
          where/->where-clause)))
 
 (defn parse-variable-attributes
@@ -587,10 +591,10 @@
   construct, the :id and :class patterns are for optimized query execution, so this
   function unwraps :id and :class patterns and only returns the underlying components."
   [patterns]
-  (mapv (fn [[pattern-type component :as pattern]]
+  (mapv (fn [{:keys [pattern-type data] :as pattern}]
           (case pattern-type
-            :class component
-            :id    [component]
+            :class data
+            :id    [data]
             pattern))
         patterns))
 
