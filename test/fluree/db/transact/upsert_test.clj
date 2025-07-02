@@ -42,7 +42,7 @@
 (deftest upsert-parsing
   (testing "Parsed upsert txn is identical to long-form update txn"
     (is (= (parse/parse-upsert-txn sample-upsert-txn {})
-           (parse/parse-stage-txn sample-update-txn {})))))
+           (parse/parse-update-txn sample-update-txn {})))))
 
 (deftest ^:integration upsert-data
   (testing "Upserting data into a ledger is identitcal to long-form update txn"

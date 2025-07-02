@@ -11,6 +11,7 @@
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.ledger :as ledger]
             [fluree.db.query.api :as query-api]
+            [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.transact :as transact]
@@ -275,7 +276,7 @@
   "Reformats the transaction `txn` as JSON-QL if it is formatted as SPARQL,
   returning it unchanged otherwise."
   [txn override-opts]
-  (transact-api/format-txn txn override-opts))
+  (parse/parse-sparql txn override-opts))
 
 (defn commit!
   "Commits a staged database to the ledger with all changes since the last commit

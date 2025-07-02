@@ -25,8 +25,10 @@
   ([opts]
    (prep-opts opts nil))
   ([opts override-opts]
-   (-> (parse/parse-txn-opts opts override-opts nil)
-       (clojure.core/update :context json-ld/parse-context))))
+   (let [parsed-opts (parse/parse-txn-opts opts override-opts nil)]
+     (if (contains? parsed-opts :context)
+       (clojure.core/update parsed-opts :context json-ld/parse-context)
+       parsed-opts))))
 
 (defn insert
   [db rdf opts]
@@ -46,8 +48,8 @@
   [db txn override-opts]
   (go-try
     (let [parsed-txn (-> txn
-                         (format-txn override-opts)
-                         (parse/parse-stage-txn override-opts))]
+                         (parse/parse-sparql override-opts)
+                         (parse/parse-update-txn override-opts))]
       (<? (transact/stage-triples db parsed-txn)))))
 
 (defn- not-found?
@@ -90,7 +92,7 @@
   [conn txn override-opts]
   (go-try
     (let [parsed-txn (-> txn
-                         (format-txn override-opts)
+                         (parse/parse-sparql override-opts)
                          (parse/parse-ledger-txn override-opts))
           ledger-id (:ledger-id parsed-txn)
           ledger (async/<! (connection/load-ledger conn ledger-id))]
@@ -126,7 +128,7 @@
            ;; Dissoc them until deciding at a later point if they can carry through.
            {:keys [ledger-id] :as parsed-txn}
            (-> txn
-               (format-txn override-opts)
+               (parse/parse-sparql override-opts)
                (parse/parse-ledger-txn override-opts)
                (clojure.core/update :opts dissoc :context :did :identity)) ; Using an
                                                                            ; identity option
