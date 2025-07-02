@@ -260,3 +260,53 @@
                    ["ex:salutation" "Bonjour" "fr"]}
                  (set results))
               "lang function should bind language correctly"))))))
+
+(deftest ^:integration transaction-binding-test
+  (testing "transaction (@t) binding with t as a variable"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "t-test")
+          ;; First transaction
+          db1    @(fluree/stage
+                   (fluree/db ledger)
+                   {"@context" {"ex" "http://example.org/ns/"}
+                    "insert"
+                    [{"@id"     "ex:alice"
+                      "ex:name" "Alice"
+                      "ex:age"  30}]})
+          db1*   @(fluree/commit! ledger db1)
+          ;; Second transaction
+          db2    @(fluree/stage
+                   db1*
+                   {"@context" {"ex" "http://example.org/ns/"}
+                    "insert"
+                    [{"@id"      "ex:alice"
+                      "ex:hobby" "Reading"}]})
+          db2*   @(fluree/commit! ledger db2)
+          ;; Third transaction
+          db3    @(fluree/stage
+                   db2*
+                   {"@context" {"ex" "http://example.org/ns/"}
+                    "insert"
+                    [{"@id"     "ex:alice"
+                      "ex:city" "Boston"}]})
+          db3*   @(fluree/commit! ledger db3)]
+      (testing "binding transaction number to a variable"
+        (let [query {"@context" {"ex" "http://example.org/ns/"}
+                     "select"  ["?p" "?o" "?t"]
+                     "where"   [{"@id" "ex:alice"
+                                 "?p"  {"@value" "?o"
+                                        "@t"     "?t"}}]}
+              results @(fluree/query db3* query)]
+          (is (= 4 (count results))
+              "should return all predicates with their transaction numbers")
+          (is (= #{1 2 3} (set (map #(nth % 2) results)))
+              "should have data from 3 different transactions")
+          ;; Verify specific data
+          (is (some #(= ["ex:name" "Alice" 1] %) results)
+              "name should be from transaction 1")
+          (is (some #(= ["ex:age" 30 1] %) results)
+              "age should be from transaction 1")
+          (is (some #(= ["ex:hobby" "Reading" 2] %) results)
+              "hobby should be from transaction 2")
+          (is (some #(= ["ex:city" "Boston" 3] %) results)
+              "city should be from transaction 3"))))))

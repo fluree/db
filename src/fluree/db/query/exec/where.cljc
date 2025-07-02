@@ -188,7 +188,7 @@
 
 (defn link-t-var
   [mch var]
-  (link-var mch :t var))
+  (link-var mch :t (symbol var)))
 
 (defn sanitize-match
   [match]
