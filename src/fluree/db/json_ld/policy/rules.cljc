@@ -4,7 +4,6 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.track :as track]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]))
 
@@ -189,8 +188,8 @@
                          (update-vals p-report deref)))))
 
 (defn build-wrapper
-  [db tracker]
-  (fn [wrapper {:keys [id] :as policy}]
+  [db]
+  (fn [wrapper policy]
     (cond
       (seq (:on-property policy))
       (add-property-restriction policy db wrapper)
@@ -222,7 +221,7 @@
                                      (async/pipe ch)))))
 
     ;; build policy wrapper attached to db containing parsed policies
-    (async/reduce (build-wrapper db tracker) {:trace {}} policy-ch)))
+    (async/reduce (build-wrapper db) {} policy-ch)))
 
 (defn wrap-policy
   ([db policy-rules policy-values]

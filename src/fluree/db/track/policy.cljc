@@ -1,5 +1,4 @@
-(ns fluree.db.track.policy
-  (:require [clojure.walk :as walk]))
+(ns fluree.db.track.policy)
 
 (defn register-policies!
   [tracker policy-db]
@@ -13,8 +12,6 @@
                                   (->> policy-db :policy :modify :class (vals) (mapv :id))
                                   (->> policy-db :policy :modify :property (vals) (mapv :id))
                                   (->> policy-db :policy :modify :default (mapv :id))))))
-
-
 
 (defn init
   "Map of `<policy-id>->{:executed <count> :allowed <count>}`, where `:executed` is the

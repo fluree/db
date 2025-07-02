@@ -5,7 +5,6 @@
             [fluree.db.connection :as connection]
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.json-ld.policy.rules :as policy.rules]
             [fluree.db.ledger :as ledger]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.syntax :as syntax]
