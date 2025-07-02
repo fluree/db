@@ -332,7 +332,7 @@
                                 "select" "?name"
                                 "opts" {"policy"
                                         {"@id" "ex:mystatepolicy"
-                                         "@type" ["f:Policy" "ex:StatePolicy"]
+                                         "@type" ["f:AccessPolicy" "ex:StatePolicy"]
                                          "f:action" {"@id" "f:view"}
                                          "f:query" {"@type" "@json"
                                                     "@value"
@@ -344,7 +344,7 @@
                                 "select" "?name"
                                 "opts" {"policy"
                                         {"@id" "ex:mystatepolicy"
-                                         "@type" ["f:Policy" "ex:StatePolicy"]
+                                         "@type" ["f:AccessPolicy" "ex:StatePolicy"]
                                          "f:action" {"@id" "f:view"}
                                          "f:query" {"@type" "@json"
                                                     "@value"
@@ -357,7 +357,7 @@
                                 "select" "?name"
                                 "opts" {"policy"
                                         {"@id" "ex:mystatepolicy"
-                                         "@type" ["f:Policy" "ex:StatePolicy"]
+                                         "@type" ["f:AccessPolicy" "ex:StatePolicy"]
                                          "f:action" {"@id" "f:view"}
                                          "f:query" {"@type" "@json"
                                                     "@value"
