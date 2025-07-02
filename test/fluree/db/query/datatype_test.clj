@@ -194,7 +194,7 @@
               "should return the correct document"))))))
 
 ;; Note this test is syntax for binding the @type directly to a variable that we discussed supporting but not currently working
-(deftest ^:integration ^:pending value-type-binding-test
+(deftest ^:integration value-type-binding-test
   (testing "querying with @value and @type variable bindings"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "value-type-test")
@@ -220,8 +220,43 @@
                        "where"   [{"ex:name" "?name"
                                    "ex:age"  {"@value" "?age"
                                               "@type"  "?ageType"}}]}
+              results @(fluree/query db query)] 
+          (is (= [["Bart" "forever 10" "xsd:string"] 
+                  ["Homer" 36 "xsd:integer"] 
+                  ["Marge" 36 "xsd:int"]] 
+                 results)) )))))
+
+(deftest ^:integration language-binding-test
+  (testing "language binding with lang function"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "lang-test")
+          db     @(fluree/stage
+                   (fluree/db ledger)
+                   {"@context" {"ex" "http://example.org/ns/"}
+                    "insert"
+                    [{"@id"      "ex:greeting"
+                      "ex:hello" {"@value" "Hello" "@language" "en"}}
+                     {"@id"      "ex:salutation"  
+                      "ex:hello" {"@value" "Bonjour" "@language" "fr"}}]})]
+      (testing "binding language to a variable with lang function"
+        (let [query {"@context" {"ex" "http://example.org/ns/"}
+                     "select"  ["?id" "?val" "?lang"]
+                     "where"   [{"@id" "?id"
+                                 "ex:hello" "?val"}
+                                ["bind" "?lang" "(lang ?val)"]]}
               results @(fluree/query db query)]
-          (is (= #{["Marge" 36 "xsd:int"]
-                   ["Homer" 36 "xsd:int"]
-                   ["Bart" "forever 10" "xsd:string"]}
-                 (set results)) "should bind datatype to ?ageType"))))))
+          (is (= #{["ex:greeting" "Hello" "en"]
+                   ["ex:salutation" "Bonjour" "fr"]}
+                 (set results))
+              "lang function should bind language correctly")))
+      (testing "binding language to a variable with lang function"
+        (let [query {"@context" {"ex" "http://example.org/ns/"}
+                     "select"  ["?id" "?val" "?lang"]
+                     "where"   [{"@id" "?id"
+                                 "ex:hello" {"@value" "?val"
+                                             "@language" "?lang"}}]}
+              results @(fluree/query db query)]
+          (is (= #{["ex:greeting" "Hello" "en"]
+                   ["ex:salutation" "Bonjour" "fr"]}
+                 (set results))
+              "lang function should bind language correctly"))))))
