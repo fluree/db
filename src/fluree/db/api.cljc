@@ -293,6 +293,7 @@
     (transact/commit! ledger db opts))))
 
 (defn transact!
+  "Stages the given transaction with update semantics and then commits."
   ([conn txn] (transact! conn txn nil))
   ([conn txn opts]
    (validate-connection conn)
@@ -300,6 +301,7 @@
     (transact-api/update! conn txn opts))))
 
 (defn update!
+  "Stages the given transaction with update semantics and then commits."
   ([conn txn] (update! conn txn nil))
   ([conn txn opts]
    (validate-connection conn)
@@ -307,6 +309,7 @@
     (transact-api/update! conn txn opts))))
 
 (defn upsert!
+  "Stages the given transaction with upsert semantics and then commits."
   ([conn ledger-id txn] (upsert! conn ledger-id txn nil))
   ([conn ledger-id txn opts]
    (validate-connection conn)
@@ -314,6 +317,7 @@
     (transact-api/upsert! conn ledger-id txn opts))))
 
 (defn insert!
+  "Stages the given transaction with insert semantics and then commits."
   ([conn ledger-id txn] (insert! conn ledger-id txn nil))
   ([conn ledger-id txn opts]
    (validate-connection conn)
