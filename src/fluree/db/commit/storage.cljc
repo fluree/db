@@ -62,7 +62,7 @@
   (go-try
     (let [jsonld (<? (storage/read-json storage address))]
       (-> jsonld
-          (assoc "f:address" address)
+          (assoc const/iri-address address)
           json-ld/expand))))
 
 (defn get-commit-t

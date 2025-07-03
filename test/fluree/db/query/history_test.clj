@@ -1279,7 +1279,7 @@
                              {"f:action"     [{"id" "f:modify"} {"id" "f:view"}],
                               "f:targetRole" {"id" "ex:rootRole"},
                               "id"           "ex:rootAccessAllow"}
-                             {"type"         "f:Policy",
+                             {"type"         "f:AccessPolicy",
                               "f:allow"      {"id" "ex:rootAccessAllow"},
                               "f:targetNode" {"id" "f:allNodes"},
                               "id"           "ex:rootPolicy"}],
