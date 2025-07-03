@@ -221,11 +221,16 @@
     (if (iri/sid? segment)
       (<? (resolve-predicate-path data-db tracker focus-node segment))
       (let [{[inverse-path]   const/sh_inversePath
-             alternative-path const/sh_alternativePath}
+             alternative-path const/sh_alternativePath
+             zero-or-one-path const/sh_zeroOrOnePath
+             one+-path        const/sh_oneOrMorePath
+             zero+-path       const/sh_zeroOrMorePath}
             segment]
+        (when (or zero-or-one-path one+-path zero+-path)
+          (throw (ex-info "Unsupported property path segment." {:segment segment})))
         (cond inverse-path     (<? (resolve-inverse-path data-db tracker focus-node inverse-path))
               alternative-path (<? (resolve-alternative-path data-db tracker focus-node alternative-path))
-              :else            (throw (ex-info "Unsupported property path segment." {:segment segment})))))))
+              :else            (<? (resolve-predicate-path data-db tracker focus-node (get segment const/$id))))))))
 
 (defn resolve-value-nodes
   "Return the value nodes resolved via the path from the focus node."

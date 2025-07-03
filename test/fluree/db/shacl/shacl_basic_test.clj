@@ -3161,3 +3161,40 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                                                         "sh:path" {"@id" "ex:term"}}],
                                         "sh:targetSubjectsOf" {"@id" "ex:foo" "ex:extra" "data"}}]})]
           (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:me" "ex:foo" "foo" "ex:term" 123}}))))))))
+
+(deftest path-segment-handling
+  (let [conn @(fluree/connect-memory)
+        ledger @(fluree/create conn "shacl-pp")
+        db0  (fluree/db ledger)
+        db1 @(fluree/stage db0 {"@context" {"ex" "http://example.org/",
+                                            "schema" "http://schema.org/",
+                                            "sh" "http://www.w3.org/ns/shacl#",
+                                            "rdf" "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
+                                "ledger" "test-shacl",
+                                ;; insert a predicate with some metadata (description)
+                                "insert" [{"@id" "schema:name", "ex:description" "This property is the name."}]})
+        db2 @(fluree/stage db1 {"@context" {"ex" "http://example.org/",
+                                            "schema" "http://schema.org/",
+                                            "sh" "http://www.w3.org/ns/shacl#"},
+                                "ledger" "test-shacl",
+                                "insert" {"@id" "ex:UserShape",
+                                          "@type" ["sh:NodeShape"],
+                                          "sh:targetClass" {"@id" "ex:User"},
+                                          ;; sh:path references a predicate that has additional data on it
+                                          "sh:property" [{"sh:path" {"@id" "schema:name"},
+                                                          "sh:hasValue" {"@id" "ex:Fred"}}]}})
+        db3 @(fluree/stage db2 {"@context" {"ex" "http://example.org/",
+                                            "schema" "http://schema.org/"},
+                                "ledger" "test-shacl",
+                                "insert" {"@id" "ex:dolly",
+                                          "@type" ["ex:User"],
+                                          "schema:age" 77,
+                                          "schema:name" {"@id" "ex:Fred"}}})]
+    (testing "shape that exercises path with additional data does not error"
+      (is (= [{"@id" "ex:dolly"
+               "@type" "ex:User",
+               "schema:age" 77,
+               "schema:name" {"@id" "ex:Fred"}}]
+             @(fluree/query db3 {"@context" {"ex" "http://example.org/",
+                                             "schema" "http://schema.org/"},
+                                 "select" {"ex:dolly" ["*"]}}))))))
