@@ -47,5 +47,31 @@
                             {:context [test-utils/default-context
                                        {:ex "http://example.org/ns/"}]
                              :select '?name
-                             :where  {:schema/name '?name}})))
-      "Inserted data should be retrievable.")))
+                             :where  {:schema/name '?name}}))
+          "Inserted data should be retrievable.")))
+
+  (testing "Insert and commit data"
+    (let [conn    @(fluree/connect-memory)
+          _ledger @(fluree/create-with-txn conn {"ledger" "tx/insert"
+                                                 "insert" {"@id" "ex:foo" "ex:bar" 3}})
+          db     @(fluree/insert!
+                   conn
+                   "tx/insert"
+                   {"@context" [test-utils/default-str-context
+                                {"ex" "http://example.org/ns/"}]
+                    "@graph"   [{"id"         "ex:alice",
+                                 "type"        "ex:User",
+                                 "schema:name" "Alice"
+                                 "schema:age"  42}
+                                {"id"         "ex:bob",
+                                 "type"        "ex:User",
+                                 "schema:name" "Bob"
+                                 "schema:age"  22}]})]
+      (testing "insert! commits the data"
+        (is (= ["Alice" "Bob"]
+               @(fluree/query db
+                              {:context [test-utils/default-context
+                                         {:ex "http://example.org/ns/"}]
+                               :select '?name
+                               :where  {:schema/name '?name}})))
+        (is (= 2 (:t db)))))))

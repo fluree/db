@@ -11,6 +11,7 @@
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.ledger :as ledger]
             [fluree.db.query.api :as query-api]
+            [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.transact :as transact]
@@ -243,7 +244,7 @@
 
    The 'opts' key is a map with the following key options:
     - `:context` - (optional) and externally provided context that will be used
-                   for document expansion, the @context in the json-ld will be 
+                   for document expansion, the @context in the json-ld will be
                    ignored if present.
    - `:format`  - (optional) the format of the data, currently json-ld is assumed
                   unless `:format` is set to `:turtle`. If `:turtle` is set,
@@ -275,7 +276,7 @@
   "Reformats the transaction `txn` as JSON-QL if it is formatted as SPARQL,
   returning it unchanged otherwise."
   [txn override-opts]
-  (transact-api/format-txn txn override-opts))
+  (parse/parse-sparql txn override-opts))
 
 (defn commit!
   "Commits a staged database to the ledger with all changes since the last commit
@@ -292,11 +293,36 @@
     (transact/commit! ledger db opts))))
 
 (defn transact!
+  "Stages the given transaction with update semantics and then commits."
   ([conn txn] (transact! conn txn nil))
   ([conn txn opts]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/transact! conn txn opts))))
+    (transact-api/update! conn txn opts))))
+
+(defn update!
+  "Stages the given transaction with update semantics and then commits."
+  ([conn txn] (update! conn txn nil))
+  ([conn txn opts]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/update! conn txn opts))))
+
+(defn upsert!
+  "Stages the given transaction with upsert semantics and then commits."
+  ([conn ledger-id txn] (upsert! conn ledger-id txn nil))
+  ([conn ledger-id txn opts]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/upsert! conn ledger-id txn opts))))
+
+(defn insert!
+  "Stages the given transaction with insert semantics and then commits."
+  ([conn ledger-id txn] (insert! conn ledger-id txn nil))
+  ([conn ledger-id txn opts]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/insert! conn ledger-id txn opts))))
 
 (defn credential-transact!
   ([conn txn] (credential-transact! conn txn nil))

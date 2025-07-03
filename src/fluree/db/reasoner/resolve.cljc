@@ -63,9 +63,9 @@
   (let [context         (get rule "@context")
         where           (get rule "where")
         insert          (get rule "insert")
-        rule-parsed     (parse/parse-stage-txn {:context context
-                                                :where   where
-                                                :insert  insert})
+        rule-parsed     (parse/parse-update-txn {:context context
+                                                 :where   where
+                                                 :insert  insert})
         where-patterns  (extract-patterns (::exec-where/patterns (:where rule-parsed)))
         insert-patterns (extract-patterns (:insert rule-parsed))]
     {:deps        where-patterns
