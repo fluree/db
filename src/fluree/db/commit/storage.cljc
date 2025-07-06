@@ -121,10 +121,13 @@
                                       (<? (read-verified-commit storage prev-commit-addr))
                                       (catch* e
                                         (log/error e "Error tracing commits")
-                                        (>! error-ch e)))]
-                (recur verified-commit commit-t commit-tuples*)))))
+                                        (>! error-ch e)
+                                        (async/close! resp-ch)
+                                        nil))]
+                (when verified-commit
+                  (recur verified-commit commit-t commit-tuples*))))))
         (catch* e
-          (>! resp-ch e)
+          (>! error-ch e)
           (async/close! resp-ch))))
     resp-ch))
 
