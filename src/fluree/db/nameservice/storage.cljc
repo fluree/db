@@ -1,6 +1,7 @@
 (ns fluree.db.nameservice.storage
   (:require [clojure.core.async :refer [go]]
             [clojure.string :as str]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
@@ -23,7 +24,7 @@
   need to merge changes from different branches into existing metadata map"
   [ns-address {address "address", alias "alias", branch "branch", :as commit-jsonld}]
   (let [branch-iri (str ns-address "(" branch ")")]
-    {"@context"      "https://ns.flur.ee/ledger/v1"
+    {"@context"      iri/fluree-context-url
      "@id"           ns-address
      "defaultBranch" branch-iri
      "ledgerAlias"   alias

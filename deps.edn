@@ -26,7 +26,7 @@
 
         ;; parsing / serialization
         com.fluree/json-ld                  {:git/url "https://github.com/fluree/json-ld.git"
-                                             :git/sha "73a990a4b803d0b4cfbbbe4dc16275b39a3add4e"}
+                                             :git/sha "e6c6c70a6bfe5365de311df0e6ab60b72a3c150e"}
         com.fluree/alphabase                {:mvn/version "3.3.0"}
         cheshire/cheshire                   {:mvn/version "5.13.0"}
         camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.3"}

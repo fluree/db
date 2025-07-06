@@ -6,6 +6,8 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(def ^:const fluree-context-url "https://ns.flur.ee/ledger/v1")
+
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const f-t-ns "https://ns.flur.ee/ledger/transaction#")
 (def ^:const f-idx-ns "https://ns.flur.ee/index#")
