@@ -117,16 +117,10 @@
 
             (if (= from-t commit-t)
               (async/onto-chan! resp-ch commit-tuples*)
-              (let [verified-commit (try*
-                                      (<? (read-verified-commit storage prev-commit-addr))
-                                      (catch* e
-                                        (log/error e "Error tracing commits")
-                                        (>! error-ch e)
-                                        (async/close! resp-ch)
-                                        nil))]
-                (when verified-commit
-                  (recur verified-commit commit-t commit-tuples*))))))
+              (when-let [verified-commit (<? (read-verified-commit storage prev-commit-addr))]
+                (recur verified-commit commit-t commit-tuples*)))))
         (catch* e
+          (log/error e "Error tracing commits")
           (>! error-ch e)
           (async/close! resp-ch))))
     resp-ch))
