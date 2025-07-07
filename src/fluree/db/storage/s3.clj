@@ -26,7 +26,7 @@
       (:cognitect.aws.client/throwable resp)
       resp
 
-      ;; Other errors become excepftions
+      ;; Other errors become exceptions
       :else
       (ex-info "S3 read failed"
                {:status 500, :error :db/unexpected-error, :aws/response resp}))
@@ -42,16 +42,13 @@
 
 (defn read-s3-data
   [s3-client s3-bucket s3-prefix path]
-  (let [ch        (async/promise-chan)
+  (let [ch        (async/promise-chan (map handle-s3-response))
         full-path (str s3-prefix "/" path)
         req       {:op      :GetObject
                    :ch      ch
                    :request {:Bucket s3-bucket, :Key full-path}}]
     (aws/invoke-async s3-client req)
-    (go
-      (let [resp (<! ch)
-            result (handle-s3-response resp)]
-        result))))
+    ch))
 
 (defn write-s3-data
   [s3-client s3-bucket s3-prefix path ^bytes data]

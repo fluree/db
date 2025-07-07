@@ -61,6 +61,7 @@
 
               @(fluree/commit! ledger db1)
 
+              ;; FIXME: Replace with deterministic waiting for indexing completion
               ;; Wait for async indexing
               (Thread/sleep 3000)
 
@@ -77,6 +78,7 @@
 
               @(fluree/commit! ledger db2)
 
+              ;; FIXME: Replace with deterministic waiting for indexing completion
               ;; Wait for indexing to complete
               (Thread/sleep 5000)
 

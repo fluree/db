@@ -161,23 +161,23 @@
       (when-not s3-endpoint
         (throw (ex-info "S3 endpoint is required for S3 connection. Examples: 'https://s3.us-east-1.amazonaws.com' for AWS, 'http://localhost:4566' for LocalStack"
                         {:status 400 :error :db/invalid-config})))
-      (let [s3-config (cond-> {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
+      (let [s3-config {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
                                            "@vocab" "https://ns.flur.ee/system#"}
                                "@id"      "s3"
-                               "@graph"   [(cond-> {"@id"      "s3Storage"
-                                                    "@type"    "Storage"
-                                                    "s3Bucket" s3-bucket}
-                                             s3-prefix   (assoc "s3Prefix" s3-prefix)
-                                             s3-endpoint (assoc "s3Endpoint" s3-endpoint))
-                                           {"@id"              "connection"
-                                            "@type"            "Connection"
-                                            "parallelism"      parallelism
-                                            "cacheMaxMb"       cache-max-mb
-                                            "commitStorage"    {"@id" "s3Storage"}
-                                            "indexStorage"     {"@id" "s3Storage"}
-                                            "primaryPublisher" {"@type"   "Publisher"
-                                                                "storage" {"@id" "s3Storage"}}}]}
-                        defaults (assoc-in ["@graph" 1 "defaults"] (convert-keys defaults)))]
+                               "@graph"   [(cond-> {"@id"        "s3Storage"
+                                                    "@type"      "Storage"
+                                                    "s3Bucket"   s3-bucket
+                                                    "s3Endpoint" s3-endpoint}
+                                             s3-prefix (assoc "s3Prefix" s3-prefix))
+                                           (cond-> {"@id"              "connection"
+                                                    "@type"            "Connection"
+                                                    "parallelism"      parallelism
+                                                    "cacheMaxMb"       cache-max-mb
+                                                    "commitStorage"    {"@id" "s3Storage"}
+                                                    "indexStorage"     {"@id" "s3Storage"}
+                                                    "primaryPublisher" {"@type"   "Publisher"
+                                                                        "storage" {"@id" "s3Storage"}}}
+                                             defaults (assoc "defaults" (convert-keys defaults)))]}]
         (connect s3-config)))))
 
 (defn address?
