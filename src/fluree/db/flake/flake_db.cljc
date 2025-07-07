@@ -466,19 +466,13 @@
   (let [to (async/chan)
         af (fn [input ch]
              (go
-               ;; Check if input is an exception
-               (if (util/exception? input)
-                 (do
-                   (>! error-ch input)
-                   (async/close! ch))
-                 ;; Normal processing path
-                 (let [[commit-jsonld _commit-proof] input
-                       db-address (-> commit-jsonld
-                                      (get-first const/iri-data)
-                                      (get-first-value const/iri-address))]
-                   (-> commit-storage
-                       (read-commit-data commit-jsonld db-address error-ch)
-                       (async/pipe ch))))))]
+               (let [[commit-jsonld _commit-proof] input
+                     db-address (-> commit-jsonld
+                                    (get-first const/iri-data)
+                                    (get-first-value const/iri-address))]
+                 (-> commit-storage
+                     (read-commit-data commit-jsonld db-address error-ch)
+                     (async/pipe ch)))))]
     (async/pipeline-async 2 to af commits-ch)
     to))
 
