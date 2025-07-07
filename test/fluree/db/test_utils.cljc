@@ -1,5 +1,6 @@
 (ns fluree.db.test-utils
-  (:require #?@(:cljs [[clojure.core.async.interop :refer [<p!]]
+  (:require #?(:clj [cognitect.aws.client.api :as aws])
+            #?@(:cljs [[clojure.core.async.interop :refer [<p!]]
                        [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]])
             [clojure.string :as str]
             [fluree.db.api :as fluree]
@@ -165,16 +166,16 @@
 (defn load-people
   [conn]
   (#?(:clj do, :cljs go)
-    (let [ledger-p (fluree/create conn "test/people")
-          ledger   #?(:clj @ledger-p :cljs (<p! ledger-p))
-          staged-p (fluree/stage (fluree/db ledger) {"@context" [default-context
-                                                                 {:ex "http://example.org/ns/"}]
-                                                     "insert" people})
-          staged   #?(:clj @staged-p, :cljs (<p! staged-p))
-          commit-p (fluree/commit! ledger staged {:message "Adding people"
-                                                  :push? true})]
-      #?(:clj @commit-p, :cljs (<p! commit-p))
-      ledger)))
+   (let [ledger-p (fluree/create conn "test/people")
+         ledger   #?(:clj @ledger-p :cljs (<p! ledger-p))
+         staged-p (fluree/stage (fluree/db ledger) {"@context" [default-context
+                                                                {:ex "http://example.org/ns/"}]
+                                                    "insert" people})
+         staged   #?(:clj @staged-p, :cljs (<p! staged-p))
+         commit-p (fluree/commit! ledger staged {:message "Adding people"
+                                                 :push? true})]
+     #?(:clj @commit-p, :cljs (<p! commit-p))
+     ledger)))
 
 (defn retry-promise-wrapped
   "Retries a fn that when deref'd might return a Throwable. Intended for
@@ -334,3 +335,17 @@
           :shacl/violation)
        (= (error-status x)
           422)))
+
+#?(:clj
+   (defn s3-available?
+     "Check if LocalStack S3 is available at localhost:4566"
+     []
+     (try
+       (let [client (aws/client {:api :s3
+                                 :endpoint-override {:protocol :http
+                                                     :hostname "localhost"
+                                                     :port 4566}})]
+         (aws/invoke client {:op :ListBuckets})
+         true)
+       (catch Exception _
+         false))))
