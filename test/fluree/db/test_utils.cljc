@@ -344,8 +344,9 @@
        (let [client (aws/client {:api :s3
                                  :endpoint-override {:protocol :http
                                                      :hostname "localhost"
-                                                     :port 4566}})]
-         (aws/invoke client {:op :ListBuckets})
-         true)
+                                                     :port 4566}})
+             future-result (future (aws/invoke client {:op :ListBuckets}))
+             result (deref future-result 2000 :timeout)]  ; 2 second timeout
+         (not= result :timeout))
        (catch Exception _
          false))))
