@@ -3,7 +3,6 @@
   (:require [clojure.test :refer [deftest is testing]]
             [cognitect.aws.client.api :as aws]
             [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
             [fluree.db.util.log :as log]))
 
 (defn setup-s3-test-env []

@@ -3,9 +3,7 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [cognitect.aws.client.api :as aws]
-            [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.log :as log]))
+            [fluree.db.api :as fluree]))
 
 (defn setup-env []
   (System/setProperty "aws.accessKeyId" "test")
