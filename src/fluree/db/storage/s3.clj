@@ -151,7 +151,7 @@
     (go-try
       (when-let [resp (<? (read-s3-data client bucket prefix path))]
         (when-let [body (:Body resp)]
-          (.getBytes body))))))
+          (.getBytes ^String body))))))
 
 (defn open
   ([bucket prefix]
