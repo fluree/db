@@ -22,11 +22,11 @@
   (let [callbacks (get-in @(:state conn) [:listeners subject])]
     (doseq [[k f] callbacks]
       (#?(:clj future :cljs do)
-       (try* (f event-type event-data)
-             (catch* e
-               (log/error e
-                          (str "Error calling registered callback: " (pr-str k) " for db: " subject
-                               ". Event: " event-type " Data: " (pr-str event-data) "."))))))))
+        (try* (f event-type event-data)
+              (catch* e
+                (log/error e
+                           (str "Error calling registered callback: " (pr-str k) " for db: " subject
+                                ". Event: " event-type " Data: " (pr-str event-data) "."))))))))
 
 (defn process-events
   "Processes incoming events from the ledger.
