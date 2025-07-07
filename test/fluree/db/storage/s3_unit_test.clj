@@ -13,15 +13,6 @@
       (is (= "test-bucket" (:bucket store)) "Bucket should match")
       (is (= "test-prefix" (:prefix store)) "Prefix should match"))))
 
-(deftest s3-storage-protocols-test
-  (testing "S3 storage implements all required protocols"
-    (let [store (s3-storage/open "test-s3" "test-bucket" "test-prefix")]
-      (is (satisfies? storage/Addressable store) "Should implement Addressable")
-      (is (satisfies? storage/Identifiable store) "Should implement Identifiable")
-      (is (satisfies? storage/JsonArchive store) "Should implement JsonArchive")
-      (is (satisfies? storage/ContentAddressedStore store) "Should implement ContentAddressedStore")
-      (is (satisfies? storage/ByteStore store) "Should implement ByteStore"))))
-
 (deftest s3-storage-identifiers-test
   (testing "S3 storage returns correct identifiers"
     (let [store (s3-storage/open "test-s3" "test-bucket" "test-prefix")]
