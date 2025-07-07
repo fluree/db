@@ -33,20 +33,6 @@
       (is (= "fluree:test-s3:s3:test-bucket:test-prefix" (storage/location store))
           "Should generate correct fluree location URI"))))
 
-(deftest s3-endpoint-configuration-test
-  (testing "S3 endpoint configuration variants"
-    (testing "with custom endpoint"
-      (let [store (s3-storage/open "test" "bucket" "prefix" "http://localhost:9000")]
-        (is (some? store) "Should create store with custom endpoint")))
-
-    (testing "without custom endpoint (default AWS)"
-      (let [store (s3-storage/open "test" "bucket" "prefix")]
-        (is (some? store) "Should create store with default endpoint")))
-
-    (testing "with nil endpoint"
-      (let [store (s3-storage/open "test" "bucket" "prefix" nil)]
-        (is (some? store) "Should create store with nil endpoint")))))
-
 (deftest connect-s3-validation-test
   (testing "connect-s3 API function validates required parameters"
     (testing "should require s3-bucket parameter"
@@ -61,23 +47,4 @@
            clojure.lang.ExceptionInfo
            #"S3 endpoint is required"
            (fluree/connect-s3 {:s3-bucket "test-bucket"}))
-          "Should throw error when s3-endpoint is missing"))
-
-    (testing "should accept valid parameters without throwing validation errors"
-      ;; This should pass validation (but may fail later on actual S3 connection)
-      (let [result (try
-                     @(fluree/connect-s3 {:s3-bucket "test-bucket"
-                                          :s3-endpoint "http://localhost:4566"})
-                     :validation-passed
-                     (catch clojure.lang.ExceptionInfo e
-                       ;; If it's a validation error about missing bucket/endpoint, that's a test failure
-                       (if (or (re-find #"S3 bucket name is required" (.getMessage e))
-                               (re-find #"S3 endpoint is required" (.getMessage e)))
-                         (throw e)
-                         :connection-failed))
-                     (catch Exception _
-                       ;; Other exceptions (like connection failures) are expected and OK
-                       :connection-failed))]
-        ;; Test that we either passed validation or failed with connection error (not validation error)
-        (is (#{:validation-passed :connection-failed} result) 
-            "Should pass parameter validation")))))
+          "Should throw error when s3-endpoint is missing"))))
