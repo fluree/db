@@ -65,16 +65,19 @@
 
     (testing "should accept valid parameters without throwing validation errors"
       ;; This should pass validation (but may fail later on actual S3 connection)
-      (try
-        @(fluree/connect-s3 {:s3-bucket "test-bucket"
-                             :s3-endpoint "http://localhost:4566"})
-        (catch clojure.lang.ExceptionInfo e
-          ;; If it's a validation error about missing bucket/endpoint, that's a test failure
-          (when (or (re-find #"S3 bucket name is required" (.getMessage e))
-                    (re-find #"S3 endpoint is required" (.getMessage e)))
-            (throw e)))
-        (catch Exception _
-          ;; Other exceptions (like connection failures) are expected and OK
-          :connection-failed))
-      ;; If we get here without validation errors, the test passes
-      (is true "Should pass parameter validation"))))
+      (let [result (try
+                     @(fluree/connect-s3 {:s3-bucket "test-bucket"
+                                          :s3-endpoint "http://localhost:4566"})
+                     :validation-passed
+                     (catch clojure.lang.ExceptionInfo e
+                       ;; If it's a validation error about missing bucket/endpoint, that's a test failure
+                       (if (or (re-find #"S3 bucket name is required" (.getMessage e))
+                               (re-find #"S3 endpoint is required" (.getMessage e)))
+                         (throw e)
+                         :connection-failed))
+                     (catch Exception _
+                       ;; Other exceptions (like connection failures) are expected and OK
+                       :connection-failed))]
+        ;; Test that we either passed validation or failed with connection error (not validation error)
+        (is (#{:validation-passed :connection-failed} result) 
+            "Should pass parameter validation")))))
