@@ -183,22 +183,22 @@
   do it for you. In CLJS it will not retry and will return a core.async chan."
   [pwrapped max-attempts & [retry-on-false?]]
   (#?(:clj loop, :cljs go-loop) [attempt 0]
-    (let [res' (try*
-                 (let [res (#?(:clj deref, :cljs <p!) (pwrapped))]
-                   (if (util/exception? res)
-                     (throw res)
-                     res))
-                 (catch* e e))]
-      (if (= (inc attempt) max-attempts)
-        (if (util/exception? res')
-          (throw res')
-          res')
-        (if (or (util/exception? res')
-                (and retry-on-false? (false? res')))
-          (do
-            #?(:clj (Thread/sleep 100))
-            (recur (inc attempt)))
-          res')))))
+                                (let [res' (try*
+                                             (let [res (#?(:clj deref, :cljs <p!) (pwrapped))]
+                                               (if (util/exception? res)
+                                                 (throw res)
+                                                 res))
+                                             (catch* e e))]
+                                  (if (= (inc attempt) max-attempts)
+                                    (if (util/exception? res')
+                                      (throw res')
+                                      res')
+                                    (if (or (util/exception? res')
+                                            (and retry-on-false? (false? res')))
+                                      (do
+                                        #?(:clj (Thread/sleep 100))
+                                        (recur (inc attempt)))
+                                      res')))))
 
 (defn retry-load
   "Retry loading a ledger until it loads or max-attempts. Hopefully not needed
