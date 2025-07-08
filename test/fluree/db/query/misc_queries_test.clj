@@ -1,9 +1,9 @@
 (ns fluree.db.query.misc-queries-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [babashka.fs :refer [with-temp-dir]]
+            [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]
-            [test-with-files.tools :refer [with-tmp-dir]]))
+            [fluree.db.util.core :as util]))
 
 (deftest ^:integration result-formatting
   (let [conn   (test-utils/create-conn)
@@ -177,28 +177,28 @@
                   ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn" :f/flakes 11]
                   ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn" :f/size 1266]
                   ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn" :f/t 1]
-                  ["fluree:commit:sha256:bbs2ggy7vuaimeqgzstb35jmstqn63phlboetqnvvuatndgvigjii"
+                  ["fluree:commit:sha256:bb24pojkwhsfup64tbeiluh4toxtljdktpu7g5su5fthbbsqp6pyf"
                    "https://www.w3.org/2018/credentials#issuer"
                    "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                  ["fluree:commit:sha256:bbs2ggy7vuaimeqgzstb35jmstqn63phlboetqnvvuatndgvigjii"
+                  ["fluree:commit:sha256:bb24pojkwhsfup64tbeiluh4toxtljdktpu7g5su5fthbbsqp6pyf"
                    :f/address
-                   "fluree:memory://bs2ggy7vuaimeqgzstb35jmstqn63phlboetqnvvuatndgvigjii"]
-                  ["fluree:commit:sha256:bbs2ggy7vuaimeqgzstb35jmstqn63phlboetqnvvuatndgvigjii"
+                   "fluree:memory://b24pojkwhsfup64tbeiluh4toxtljdktpu7g5su5fthbbsqp6pyf"]
+                  ["fluree:commit:sha256:bb24pojkwhsfup64tbeiluh4toxtljdktpu7g5su5fthbbsqp6pyf"
                    :f/alias
                    "query/everything"]
-                  ["fluree:commit:sha256:bbs2ggy7vuaimeqgzstb35jmstqn63phlboetqnvvuatndgvigjii"
+                  ["fluree:commit:sha256:bb24pojkwhsfup64tbeiluh4toxtljdktpu7g5su5fthbbsqp6pyf"
                    :f/branch
                    "main"]
-                  ["fluree:commit:sha256:bbs2ggy7vuaimeqgzstb35jmstqn63phlboetqnvvuatndgvigjii"
+                  ["fluree:commit:sha256:bb24pojkwhsfup64tbeiluh4toxtljdktpu7g5su5fthbbsqp6pyf"
                    :f/data
                    "fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"]
-                  ["fluree:commit:sha256:bbs2ggy7vuaimeqgzstb35jmstqn63phlboetqnvvuatndgvigjii"
+                  ["fluree:commit:sha256:bb24pojkwhsfup64tbeiluh4toxtljdktpu7g5su5fthbbsqp6pyf"
                    :f/previous
                    "fluree:commit:sha256:bb6dtkig73qu77wvwzpumlkmy2ftq3ikv2lhltti4eqvripnpqoqz"]
-                  ["fluree:commit:sha256:bbs2ggy7vuaimeqgzstb35jmstqn63phlboetqnvvuatndgvigjii"
+                  ["fluree:commit:sha256:bb24pojkwhsfup64tbeiluh4toxtljdktpu7g5su5fthbbsqp6pyf"
                    :f/time
                    720000]
-                  ["fluree:commit:sha256:bbs2ggy7vuaimeqgzstb35jmstqn63phlboetqnvvuatndgvigjii"
+                  ["fluree:commit:sha256:bb24pojkwhsfup64tbeiluh4toxtljdktpu7g5su5fthbbsqp6pyf"
                    :f/v
                    1]
                   [:ex/alice :type :ex/User]
@@ -345,14 +345,14 @@
         "Can transact with rdf:type aliased to type.")))
 
 (deftest ^:integration load-with-new-connection
-  (with-tmp-dir storage-path
-    (let [conn0     @(fluree/connect-file {:storage-path storage-path})
+  (with-temp-dir [storage-path {}]
+    (let [conn0     @(fluree/connect-file {:storage-path (str storage-path)})
           ledger-id "new3"
           _ledger    @(fluree/create-with-txn conn0 {"@context" {"ex" {"ex" "http://example.org/ns/"}}
                                                      "ledger"   ledger-id
                                                      "insert"   {"ex:createdAt" "now"}})
 
-          conn1 @(fluree/connect-file {:storage-path storage-path})]
+          conn1 @(fluree/connect-file {:storage-path (str storage-path)})]
       (is (= [{"ex:createdAt" "now"}]
              @(fluree/query-connection conn1 {"@context" {"ex" {"ex" "http://example.org/ns/"}}
                                               :from      ledger-id

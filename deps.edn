@@ -25,8 +25,7 @@
         hato/hato         {:mvn/version "1.0.0"}
 
         ;; parsing / serialization
-        com.fluree/json-ld                  {:git/url "https://github.com/fluree/json-ld.git"
-                                             :git/sha "73a990a4b803d0b4cfbbbe4dc16275b39a3add4e"}
+        com.fluree/json-ld                  {:mvn/version "1.0.1"}
         com.fluree/alphabase                {:mvn/version "3.3.0"}
         cheshire/cheshire                   {:mvn/version "5.13.0"}
         camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.3"}
@@ -35,7 +34,7 @@
         org.clojars.quoll/raphael           {:mvn/version "0.3.12"} ;; turtle (TTL) parsing
 
         ;; cryptography
-        com.fluree/crypto {:mvn/version "3.0.0"}
+        com.fluree/crypto {:mvn/version "3.0.1"}
         org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
         ;; storage
@@ -64,8 +63,7 @@
    :extra-deps  {lambdaisland/kaocha                   {:mvn/version "1.91.1392"}
                  org.clojure/test.check                {:mvn/version "1.1.1"}
                  com.gfredericks/test.chuck            {:mvn/version "0.2.13"}
-                 io.github.cap10morgan/test-with-files {:git/tag "v1.0.1"
-                                                        :git/sha "a48d6d0"}}
+                 babashka/fs                           {:mvn/version "0.5.20"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/skip-meta [:pending]}}
 
@@ -73,8 +71,7 @@
   {:extra-paths ["test" "dev-resources" "test-resources"]
    :extra-deps  {lambdaisland/kaocha                   {:mvn/version "1.91.1392"}
                  org.clojure/test.check                {:mvn/version "1.1.1"}
-                 io.github.cap10morgan/test-with-files {:git/tag "v1.0.1"
-                                                        :git/sha "a48d6d0"}}
+                 babashka/fs                           {:mvn/version "0.5.20"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/focus-meta [:pending]}}
 

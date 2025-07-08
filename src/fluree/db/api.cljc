@@ -11,6 +11,7 @@
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.ledger :as ledger]
             [fluree.db.query.api :as query-api]
+            [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.transact :as transact]
@@ -73,8 +74,9 @@
 
 (defn disconnect
   [conn]
-  (go-try
-    (-> conn ::system-map system/terminate)))
+  (promise-wrap
+   (go-try
+     (-> conn ::system-map system/terminate))))
 
 (defn convert-config-key
   [[k v]]
@@ -136,6 +138,47 @@
                                                                "storage" {"@id" "fileStorage"}}}]}
                        defaults (assoc-in ["@graph" 1 "defaults"] (convert-keys defaults)))]
      (connect file-config))))
+
+#?(:clj
+   (defn connect-s3
+     "Forms a connection backed by S3 storage.
+     
+     Options:
+       - s3-bucket (required): The S3 bucket name
+       - s3-endpoint (required): S3 endpoint URL
+         * For AWS S3: 'https://s3.<region>.amazonaws.com' (e.g., 'https://s3.us-east-1.amazonaws.com')
+         * For LocalStack: 'http://localhost:4566'
+         * For MinIO: 'http://localhost:9000'
+       - s3-prefix (optional): The prefix within the bucket
+       - parallelism (optional): Number of parallel operations (default: 4)
+       - cache-max-mb (optional): Maximum memory for caching in MB (default: 1000)
+       - defaults (optional): Default options for ledgers created with this connection"
+     ([{:keys [s3-bucket s3-prefix s3-endpoint parallelism cache-max-mb defaults],
+        :or   {parallelism 4, cache-max-mb 1000}}]
+      (when-not s3-bucket
+        (throw (ex-info "S3 bucket name is required for S3 connection"
+                        {:status 400 :error :db/invalid-config})))
+      (when-not s3-endpoint
+        (throw (ex-info "S3 endpoint is required for S3 connection. Examples: 'https://s3.us-east-1.amazonaws.com' for AWS, 'http://localhost:4566' for LocalStack"
+                        {:status 400 :error :db/invalid-config})))
+      (let [s3-config {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
+                                   "@vocab" "https://ns.flur.ee/system#"}
+                       "@id"      "s3"
+                       "@graph"   [(cond-> {"@id"        "s3Storage"
+                                            "@type"      "Storage"
+                                            "s3Bucket"   s3-bucket
+                                            "s3Endpoint" s3-endpoint}
+                                     s3-prefix (assoc "s3Prefix" s3-prefix))
+                                   (cond-> {"@id"              "connection"
+                                            "@type"            "Connection"
+                                            "parallelism"      parallelism
+                                            "cacheMaxMb"       cache-max-mb
+                                            "commitStorage"    {"@id" "s3Storage"}
+                                            "indexStorage"     {"@id" "s3Storage"}
+                                            "primaryPublisher" {"@type"   "Publisher"
+                                                                "storage" {"@id" "s3Storage"}}}
+                                     defaults (assoc "defaults" (convert-keys defaults)))]}]
+        (connect s3-config)))))
 
 (defn address?
   "Returns true if the argument is a full ledger address, false if it is just an
@@ -243,7 +286,7 @@
 
    The 'opts' key is a map with the following key options:
     - `:context` - (optional) and externally provided context that will be used
-                   for document expansion, the @context in the json-ld will be 
+                   for document expansion, the @context in the json-ld will be
                    ignored if present.
    - `:format`  - (optional) the format of the data, currently json-ld is assumed
                   unless `:format` is set to `:turtle`. If `:turtle` is set,
@@ -275,7 +318,7 @@
   "Reformats the transaction `txn` as JSON-QL if it is formatted as SPARQL,
   returning it unchanged otherwise."
   [txn override-opts]
-  (transact-api/format-txn txn override-opts))
+  (parse/parse-sparql txn override-opts))
 
 (defn commit!
   "Commits a staged database to the ledger with all changes since the last commit
@@ -292,11 +335,36 @@
     (transact/commit! ledger db opts))))
 
 (defn transact!
+  "Stages the given transaction with update semantics and then commits."
   ([conn txn] (transact! conn txn nil))
   ([conn txn opts]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/transact! conn txn opts))))
+    (transact-api/update! conn txn opts))))
+
+(defn update!
+  "Stages the given transaction with update semantics and then commits."
+  ([conn txn] (update! conn txn nil))
+  ([conn txn opts]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/update! conn txn opts))))
+
+(defn upsert!
+  "Stages the given transaction with upsert semantics and then commits."
+  ([conn ledger-id txn] (upsert! conn ledger-id txn nil))
+  ([conn ledger-id txn opts]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/upsert! conn ledger-id txn opts))))
+
+(defn insert!
+  "Stages the given transaction with insert semantics and then commits."
+  ([conn ledger-id txn] (insert! conn ledger-id txn nil))
+  ([conn ledger-id txn opts]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/insert! conn ledger-id txn opts))))
 
 (defn credential-transact!
   ([conn txn] (credential-transact! conn txn nil))

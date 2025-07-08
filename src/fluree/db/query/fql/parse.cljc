@@ -915,9 +915,9 @@
       util/sequential
       (parse-triples bound-vars parsed-context)))
 
-(defn parse-stage-txn
+(defn parse-update-txn
   ([txn]
-   (parse-stage-txn txn {}))
+   (parse-update-txn txn {}))
   ([txn override-opts]
    (let [context       (or (ctx-util/txn-context txn)
                            (:context override-opts))
@@ -932,11 +932,13 @@
                          (jld->parsed-triples ins bound-vars context))
          annotation    (util/get-first-value txn const/iri-annotation)
          opts          (-> (get-named txn "opts")
-                           (parse-txn-opts override-opts context))]
+                           (parse-txn-opts override-opts context))
+         ledger-id     (get-named txn "ledger")]
      (when (and (empty? insert) (empty? delete))
        (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
                        {:status 400 :error :db/invalid-transaction})))
      (cond-> {:opts opts}
+       ledger-id    (assoc :ledger-id ledger-id)
        context      (assoc :context context)
        where        (assoc :where where)
        annotation   (assoc :annotation annotation)
@@ -990,13 +992,23 @@
      :delete  delete
      :insert  parsed-txn}))
 
-(defn parse-ledger-txn
-  ([txn]
-   (parse-ledger-txn txn {}))
-  ([txn override-opts]
-   (if-let [ledger-id (get-named txn "ledger")]
-     (-> txn
-         (parse-stage-txn override-opts)
-         (assoc :ledger-id ledger-id))
-     (throw (ex-info "Invalid transaction, missing required key: ledger."
-                     {:status 400, :error :db/invalid-transaction})))))
+(defn parse-insert-txn
+  [txn {:keys [format context] :as opts}]
+  {:insert (if (= :turtle format)
+             (turtle/parse txn)
+             (jld->parsed-triples txn nil context))
+   :context context
+   :opts opts})
+
+(defn parse-sparql
+  [txn opts]
+  (if (sparql/sparql-format? opts)
+    (sparql/->fql txn)
+    txn))
+
+(defn ensure-ledger
+  [txn]
+  (if (get-named txn "ledger")
+    txn
+    (throw (ex-info "Invalid transaction, missing required key: ledger."
+                    {:status 400, :error :db/invalid-transaction}))))

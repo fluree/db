@@ -6,8 +6,9 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(def ^:const fluree-context-url "https://ns.flur.ee/ledger/v1")
+
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
-(def ^:const f-t-ns "https://ns.flur.ee/ledger/transaction#")
 (def ^:const f-idx-ns "https://ns.flur.ee/index#")
 (def ^:const f-did-ns "did:fluree:")
 (def ^:const f-commit-256-ns "fluree:commit:sha256:")
@@ -51,7 +52,6 @@
    "http://www.w3.org/2002/07/owl#"              6
    "https://www.w3.org/2018/credentials#"        7
    f-ns                                          8
-   f-t-ns                                        9
    fdb-256-ns                                    10
    f-did-ns                                      11
    f-commit-256-ns                               12

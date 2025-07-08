@@ -8,7 +8,6 @@
             [fluree.db.json-ld.credential :as credential]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.json-ld.policy.rules :as policy.rules]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
@@ -82,22 +81,19 @@
           parsed-context (:context parsed-opts)
           identity       (:identity parsed-opts)]
       (if (track/track-txn? parsed-opts)
-        (let [tracker     (track/init parsed-opts)
-              policy-db   (if (policy/policy-enforced-opts? parsed-opts)
-                            (<? (policy/policy-enforce-db db tracker parsed-context parsed-opts))
-                            db)]
+        (let [tracker   (track/init parsed-opts)
+              policy-db (if (policy/policy-enforced-opts? parsed-opts)
+                          (<? (policy/policy-enforce-db db tracker parsed-context parsed-opts))
+                          db)]
+          (track/register-policies! tracker policy-db)
           (try*
             (let [staged-db     (<? (stage policy-db tracker identity parsed-txn parsed-opts))
-                  policy-report (policy.rules/enforcement-report staged-db)
                   tally         (track/tally tracker)]
-              (cond-> (assoc tally :status 200, :db staged-db)
-                policy-report (assoc :policy policy-report)))
+              (assoc tally :status 200, :db staged-db))
             (catch* e
               (throw (ex-info (ex-message e)
-                              (let [policy-report (policy.rules/enforcement-report policy-db)
-                                    tally         (track/tally tracker)]
-                                (cond-> (merge (ex-data e) tally)
-                                  policy-report (assoc :policy policy-report)))
+                              (let [tally (track/tally tracker)]
+                                (merge (ex-data e) tally))
                               e)))))
         (let [policy-db (if (policy/policy-enforced-opts? parsed-opts)
                           (<? (policy/policy-enforce-db db parsed-context parsed-opts))

@@ -17,8 +17,18 @@
 (defn handle-s3-response
   [resp]
   (if (:cognitect.anomalies/category resp)
-    (if (:cognitect.aws.client/throwable resp)
+    (cond
+      ;; Handle NoSuchKey as a special not-found response (file doesn't exist)
+      ;; Return a keyword instead of nil to avoid core.async channel issues
+      (= "NoSuchKey" (get-in resp [:Error :Code]))
+      ::not-found
+
+      ;; Return throwables as-is
+      (:cognitect.aws.client/throwable resp)
       resp
+
+      ;; Other errors become exceptions
+      :else
       (ex-info "S3 read failed"
                {:status 500, :error :db/unexpected-error, :aws/response resp}))
     (let [{in :Body} resp
@@ -87,12 +97,6 @@
           (async/close! ch))))
     ch))
 
-(defn s3-key-exists?
-  [s3-client s3-bucket s3-prefix key]
-  (go
-    (let [list (<! (s3-list s3-client s3-bucket s3-prefix key))]
-      (< 0 (:KeyCount list)))))
-
 (defn s3-address
   [identifier s3-bucket s3-prefix path]
   (storage/build-fluree-address identifier method-name path [s3-bucket s3-prefix]))
@@ -109,8 +113,10 @@
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go-try
-      (when-let [data (<? (read-s3-data client bucket prefix address))]
-        (json/parse data keywordize?))))
+      (let [path (storage/get-local-path address)
+            resp (<? (read-s3-data client bucket prefix path))]
+        (when (not= resp ::not-found)
+          (some-> resp :Body (json/parse keywordize?))))))
 
   storage/ContentAddressedStore
   (-content-write-bytes [_ dir data]
@@ -134,7 +140,11 @@
     (write-s3-data client bucket prefix path bytes))
 
   (read-bytes [_ path]
-    (read-s3-data client bucket prefix path)))
+    (go-try
+      (let [resp (<? (read-s3-data client bucket prefix path))]
+        (when (not= resp ::not-found)
+          (when-let [body (:Body resp)]
+            (.getBytes ^String body)))))))
 
 (defn open
   ([bucket prefix]
@@ -143,6 +153,18 @@
    (open identifier bucket prefix nil))
   ([identifier bucket prefix endpoint-override]
    (let [aws-opts (cond-> {:api :s3}
-                    endpoint-override (assoc :endpoint-override endpoint-override))
+                    endpoint-override
+                    (assoc :endpoint-override
+                           (if (string? endpoint-override)
+                             ;; Parse URL string like "http://localhost:4566"
+                             (let [url (java.net.URL. endpoint-override)]
+                               {:protocol (keyword (.getProtocol url))
+                                :hostname (.getHost url)
+                                :port (let [p (.getPort url)]
+                                        (if (= -1 p)
+                                          (if (= "https" (.getProtocol url)) 443 80)
+                                          p))})
+                             ;; Already a map
+                             endpoint-override)))
          client   (aws/client aws-opts)]
      (->S3Store identifier client bucket prefix))))

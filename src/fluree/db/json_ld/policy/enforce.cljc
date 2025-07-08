@@ -3,6 +3,7 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy :refer [root]]
+            [fluree.db.track :as track]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.parse :as util.parse]))
 
@@ -92,26 +93,21 @@
   "Once narrowed to a specific set of policies, execute and return
   appropriate policy response."
   [db tracker sid policies]
-  (let [tracer (-> db :policy :trace)]
-    (go-try
-      (loop [[policy & r] policies]
-        ;; return first truthy response, else false
-        (if policy
-          (let [{exec-counter :executed
-                 allowed-counter :allowed} (get tracer (:id policy))
-
-                query   (when-let [query (:query policy)]
-                          (policy-query db sid query))
-                result  (if query
-                          (seq (<? (dbproto/-query (root db) tracker query)))
-                          deny-query-result)]
-            (swap! exec-counter inc)
-            (if result
-              (do (swap! allowed-counter inc)
-                  true)
-              (recur r)))
-          ;; no more policies left to evaluate - all returned false
-          false)))))
+  (go-try
+    (loop [[{:keys [id query] :as policy} & r] policies]
+      ;; return first truthy response, else false
+      (if policy
+        (let [query*  (when query (policy-query db sid query))
+              result  (if query*
+                        (seq (<? (dbproto/-query (root db) tracker query*)))
+                        deny-query-result)]
+          (track/policy-exec! tracker id)
+          (if result
+            (do (track/policy-allow! tracker id)
+                true)
+            (recur r)))
+        ;; no more policies left to evaluate - all returned false
+        false))))
 
 (defn policies-allow-viewing?
   [db tracker sid policies]
