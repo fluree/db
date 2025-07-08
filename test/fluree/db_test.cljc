@@ -7,8 +7,7 @@
                        [babashka.fs :refer [with-temp-dir]]]
                 :cljs [[cljs.test :refer-macros [deftest is testing async]]
                        [clojure.core.async :refer [go <!]]
-                       [clojure.core.async.interop :refer [<p!]]
-                       [babashka.fs :refer [with-temp-dir]]])
+                       [clojure.core.async.interop :refer [<p!]]])
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]))
