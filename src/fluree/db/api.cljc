@@ -74,8 +74,9 @@
 
 (defn disconnect
   [conn]
-  (go-try
-    (-> conn ::system-map system/terminate)))
+  (promise-wrap
+   (go-try
+     (-> conn ::system-map system/terminate))))
 
 (defn convert-config-key
   [[k v]]
@@ -137,6 +138,47 @@
                                                                "storage" {"@id" "fileStorage"}}}]}
                        defaults (assoc-in ["@graph" 1 "defaults"] (convert-keys defaults)))]
      (connect file-config))))
+
+#?(:clj
+   (defn connect-s3
+     "Forms a connection backed by S3 storage.
+     
+     Options:
+       - s3-bucket (required): The S3 bucket name
+       - s3-endpoint (required): S3 endpoint URL
+         * For AWS S3: 'https://s3.<region>.amazonaws.com' (e.g., 'https://s3.us-east-1.amazonaws.com')
+         * For LocalStack: 'http://localhost:4566'
+         * For MinIO: 'http://localhost:9000'
+       - s3-prefix (optional): The prefix within the bucket
+       - parallelism (optional): Number of parallel operations (default: 4)
+       - cache-max-mb (optional): Maximum memory for caching in MB (default: 1000)
+       - defaults (optional): Default options for ledgers created with this connection"
+     ([{:keys [s3-bucket s3-prefix s3-endpoint parallelism cache-max-mb defaults],
+        :or   {parallelism 4, cache-max-mb 1000}}]
+      (when-not s3-bucket
+        (throw (ex-info "S3 bucket name is required for S3 connection"
+                        {:status 400 :error :db/invalid-config})))
+      (when-not s3-endpoint
+        (throw (ex-info "S3 endpoint is required for S3 connection. Examples: 'https://s3.us-east-1.amazonaws.com' for AWS, 'http://localhost:4566' for LocalStack"
+                        {:status 400 :error :db/invalid-config})))
+      (let [s3-config {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
+                                   "@vocab" "https://ns.flur.ee/system#"}
+                       "@id"      "s3"
+                       "@graph"   [(cond-> {"@id"        "s3Storage"
+                                            "@type"      "Storage"
+                                            "s3Bucket"   s3-bucket
+                                            "s3Endpoint" s3-endpoint}
+                                     s3-prefix (assoc "s3Prefix" s3-prefix))
+                                   (cond-> {"@id"              "connection"
+                                            "@type"            "Connection"
+                                            "parallelism"      parallelism
+                                            "cacheMaxMb"       cache-max-mb
+                                            "commitStorage"    {"@id" "s3Storage"}
+                                            "indexStorage"     {"@id" "s3Storage"}
+                                            "primaryPublisher" {"@type"   "Publisher"
+                                                                "storage" {"@id" "s3Storage"}}}
+                                     defaults (assoc "defaults" (convert-keys defaults)))]}]
+        (connect s3-config)))))
 
 (defn address?
   "Returns true if the argument is a full ledger address, false if it is just an
