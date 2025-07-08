@@ -97,12 +97,6 @@
           (async/close! ch))))
     ch))
 
-(defn s3-key-exists?
-  [s3-client s3-bucket s3-prefix key]
-  (go
-    (let [list (<! (s3-list s3-client s3-bucket s3-prefix key))]
-      (< 0 (:KeyCount list)))))
-
 (defn s3-address
   [identifier s3-bucket s3-prefix path]
   (storage/build-fluree-address identifier method-name path [s3-bucket s3-prefix]))
@@ -119,10 +113,10 @@
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (go-try
-      (let [path (storage/get-local-path address)]
-        (let [resp (<? (read-s3-data client bucket prefix path))]
-          (when (not= resp ::not-found)
-            (some-> resp :Body (json/parse keywordize?)))))))
+      (let [path (storage/get-local-path address)
+            resp (<? (read-s3-data client bucket prefix path))]
+        (when (not= resp ::not-found)
+          (some-> resp :Body (json/parse keywordize?))))))
 
   storage/ContentAddressedStore
   (-content-write-bytes [_ dir data]
