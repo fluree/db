@@ -143,7 +143,8 @@
     (go-try
       (let [resp (<? (read-s3-data client bucket prefix path))]
         (when (not= resp ::not-found)
-          (some-> resp :Body (.getBytes)))))))
+          (when-let [body (:Body resp)]
+            (.getBytes ^String body)))))))
 
 (defn open
   ([bucket prefix]
