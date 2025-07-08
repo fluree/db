@@ -1,5 +1,5 @@
 (ns fluree.db.vector.bm25-test
-  (:require [babashka.fs :as fs]
+  (:require [babashka.fs :refer [with-temp-dir]]
             [clojure.core.async :as async]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
@@ -416,7 +416,7 @@
                  (ex-message ex-db))))))))
 
 (deftest ^:integration bm25-search-persist
-  (fs/with-temp-dir [storage-path {}]
+  (with-temp-dir [storage-path {}]
     (testing "Loading bm25 from disk is identical to inital transactions"
 
       (testing "where an index was written"

@@ -1,5 +1,5 @@
 (ns fluree.db.query.history-test
-  (:require [babashka.fs :as fs]
+  (:require [babashka.fs :refer [with-temp-dir]]
             [clojure.test :refer [deftest is testing]]
             [fluree.crypto :as crypto]
             [fluree.db.api :as fluree]
@@ -794,7 +794,7 @@
 (deftest loaded-file-ledger-history-test
   (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
     (testing "history commit details on a loaded file ledger"
-      (fs/with-temp-dir [storage-path {}]
+      (with-temp-dir [storage-path {}]
         (let [ledger-name "loaded-history-file"
               conn        @(fluree/connect-file {:storage-path (str storage-path)
                                                  :defaults     {:identity (did/private->did-map

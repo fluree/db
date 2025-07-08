@@ -1,12 +1,12 @@
 (ns fluree.db.flake.index.novelty-test
-  (:require [babashka.fs :as fs]
+  (:require [babashka.fs :refer [with-temp-dir]]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 
 (deftest ^:integration index-datetimes-test
   (testing "Serialize and reread flakes with time types"
-    (fs/with-temp-dir [storage-path {}]
+    (with-temp-dir [storage-path {}]
       (let [conn    @(fluree/connect-file {:storage-path (str storage-path)
                                            :defaults
                                            {:indexing {:reindex-min-bytes 12

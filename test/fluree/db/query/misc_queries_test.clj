@@ -1,5 +1,5 @@
 (ns fluree.db.query.misc-queries-test
-  (:require [babashka.fs :as fs]
+  (:require [babashka.fs :refer [with-temp-dir]]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
@@ -345,7 +345,7 @@
         "Can transact with rdf:type aliased to type.")))
 
 (deftest ^:integration load-with-new-connection
-  (fs/with-temp-dir [storage-path {}]
+  (with-temp-dir [storage-path {}]
     (let [conn0     @(fluree/connect-file {:storage-path (str storage-path)})
           ledger-id "new3"
           _ledger    @(fluree/create-with-txn conn0 {"@context" {"ex" {"ex" "http://example.org/ns/"}}

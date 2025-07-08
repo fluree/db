@@ -4,11 +4,11 @@
                        [fluree.db.did :as did]
                        [fluree.db.async-db :as async-db]
                        [fluree.db.util.filesystem :as fs]
-                       [babashka.fs :as bfs]]
+                       [babashka.fs :refer [with-temp-dir]]]
                 :cljs [[cljs.test :refer-macros [deftest is testing async]]
                        [clojure.core.async :refer [go <!]]
                        [clojure.core.async.interop :refer [<p!]]
-                       [babashka.fs :as bfs]])
+                       [babashka.fs :refer [with-temp-dir]]])
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]))
@@ -67,7 +67,7 @@
 #?(:clj
    (deftest load-from-file-test
      (testing "can load a file ledger with single cardinality predicates"
-       (bfs/with-temp-dir [storage-path {}]
+       (with-temp-dir [storage-path {}]
          (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
                ledger-alias "load-from-file-test-single-card"
                ledger       @(fluree/create conn ledger-alias)
@@ -109,7 +109,7 @@
            (is (= target-t (:t loaded-db))))))
 
      (testing "can load a file ledger with multi-cardinality predicates"
-       (bfs/with-temp-dir [storage-path {}]
+       (with-temp-dir [storage-path {}]
          (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
                ledger-alias "load-from-file-test-multi-card"
                ledger       @(fluree/create conn ledger-alias)
@@ -158,7 +158,7 @@
            (is (= target-t (:t loaded-db))))))
 
      (testing "query returns the correct results from a loaded ledger"
-       (bfs/with-temp-dir [storage-path {}]
+       (with-temp-dir [storage-path {}]
          (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
                ledger-alias "load-from-file-query"
                ledger       @(fluree/create conn ledger-alias)
@@ -186,7 +186,7 @@
            (is (= res1 res2)))))
 
      (testing "can load a ledger with `list` values"
-       (bfs/with-temp-dir [storage-path {}]
+       (with-temp-dir [storage-path {}]
          (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
                ledger-alias "load-lists-test"
                ledger       @(fluree/create conn ledger-alias
@@ -224,7 +224,7 @@
                                               :where   '{:id ?s, :type :ex/User}}))))))
 
        (testing "can load with policies"
-         (bfs/with-temp-dir [storage-path {}]
+         (with-temp-dir [storage-path {}]
            (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
                  ledger-alias "load-policy-test"
                  ledger       @(fluree/create conn ledger-alias)
@@ -298,7 +298,7 @@
                                       :where   '{:id ?s, :type :f/Policy}}))))))))
 
      (testing "Can load a ledger with time values"
-       (bfs/with-temp-dir [storage-path {}]
+       (with-temp-dir [storage-path {}]
          (let [conn   @(fluree/connect-file {:storage-path (str storage-path)})
                ledger @(fluree/create conn "index/datetimes")
                db     @(fluree/stage
@@ -996,7 +996,7 @@
 
 #?(:clj
    (deftest policy-loading-test
-     (bfs/with-temp-dir [storage-path {}]
+     (with-temp-dir [storage-path {}]
        (let [conn1 @(fluree/connect-file {:storage-path (str storage-path)})
              conn2 @(fluree/connect-file {:storage-path (str storage-path)})
              _db   @(fluree/create-with-txn conn1 {"ledger" "user/ledger",
@@ -1030,7 +1030,7 @@
 
 #?(:clj
    (deftest drop-test
-     (bfs/with-temp-dir [storage-path {}]
+     (with-temp-dir [storage-path {}]
        (let [primary-path   (str storage-path "/primary")
              secondary-path (str storage-path "/secondary")
 

@@ -1,5 +1,5 @@
 (ns fluree.db.transact.transact-test
-  (:require [babashka.fs :as fs]
+  (:require [babashka.fs :refer [with-temp-dir]]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
@@ -231,7 +231,7 @@
              (set @(fluree/query db-policy-first user-query)))))))
 
 (deftest ^:integration transact-large-dataset-test
-  (fs/with-temp-dir [storage-path {}]
+  (with-temp-dir [storage-path {}]
     (testing "can transact a big movies dataset w/ SHACL constraints"
       (let [shacl   (-> "movies2-schema.json" io/resource slurp (json/parse false))
             movies  (-> "movies2.json" io/resource slurp (json/parse false))
