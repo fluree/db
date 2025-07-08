@@ -1,10 +1,10 @@
 (ns fluree.db.vector.bm25-test
-  (:require [clojure.core.async :as async]
+  (:require [babashka.fs :as fs]
+            [clojure.core.async :as async]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]
-            [test-with-files.tools :refer [with-tmp-dir]]))
+            [fluree.db.util.core :as util]))
 
 (defn full-text-search
   "Performs a full text search and returns a couple attributes joined from the db
@@ -416,11 +416,11 @@
                  (ex-message ex-db))))))))
 
 (deftest ^:integration bm25-search-persist
-  (with-tmp-dir storage-path
+  (fs/with-temp-dir [storage-path {}]
     (testing "Loading bm25 from disk is identical to inital transactions"
 
       (testing "where an index was written"
-        (let [conn            @(fluree/connect-file {:storage-path storage-path
+        (let [conn            @(fluree/connect-file {:storage-path (str storage-path)
                                                      :defaults     {:indexing {:reindex-min-bytes 1e2 ;; be sure to generate an index
                                                                                :reindex-max-bytes 1e9}}})
               ledger-name     "bm25-search-persist-idx"
@@ -458,7 +458,7 @@
 
               db2-c           @(fluree/commit! ledger db2)
               _               (Thread/sleep 1000) ;; wait for index to complete and write new NS record - ideally replace with a force load
-              db2-l           (db-with-index {:storage-path storage-path} ledger-name)
+              db2-l           (db-with-index {:storage-path (str storage-path)} ledger-name)
               expected-result [["ex:hobby-article" 0.741011563872269 "This is an article about hobbies"]
                                ["ex:food-article" 0.6510910594922633 "This is one title of a document about food"]]]
           (is (= expected-result
@@ -469,7 +469,7 @@
               "db returned from (fluree/load ...) had issues")))
 
       (testing "Loading where an index was not written"
-        (let [conn            @(fluree/connect-file {:storage-path storage-path
+        (let [conn            @(fluree/connect-file {:storage-path (str storage-path)
                                                      :defaults     {:indexing {:reindex-min-bytes 1e8 ;; be sure *not* to generate an index
                                                                                :reindex-max-bytes 1e9}}})
               ledger-name     "bm25-search-persist-no-idx"
@@ -506,7 +506,7 @@
                                                               "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
 
               db2-c           @(fluree/commit! ledger db2)
-              conn2           @(fluree/connect-file {:storage-path storage-path})
+              conn2           @(fluree/connect-file {:storage-path (str storage-path)})
               loaded          @(fluree/load conn2 ledger-name)
               db2-l           (fluree/db loaded)
               expected-result [["ex:hobby-article" 0.741011563872269 "This is an article about hobbies"]

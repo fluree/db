@@ -1,12 +1,12 @@
 (ns fluree.db.transact.transact-test
-  (:require [clojure.java.io :as io]
+  (:require [babashka.fs :as fs]
+            [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util.core :as util]
-            [fluree.db.util.json :as json]
-            [test-with-files.tools :refer [with-tmp-dir]]))
+            [fluree.db.util.json :as json]))
 
 (deftest ^:integration staging-data
   (testing "Disallow staging invalid transactions"
@@ -231,12 +231,12 @@
              (set @(fluree/query db-policy-first user-query)))))))
 
 (deftest ^:integration transact-large-dataset-test
-  (with-tmp-dir storage-path
+  (fs/with-temp-dir [storage-path {}]
     (testing "can transact a big movies dataset w/ SHACL constraints"
       (let [shacl   (-> "movies2-schema.json" io/resource slurp (json/parse false))
             movies  (-> "movies2.json" io/resource slurp (json/parse false))
             ;; TODO: Once :method :memory supports indexing, switch to that.
-            conn    @(fluree/connect-file {:storage-path storage-path})
+            conn    @(fluree/connect-file {:storage-path (str storage-path)})
             ledger  @(fluree/create conn "movies2")
             db      (fluree/db ledger)
             db0     @(fluree/stage db {"@context" [test-utils/default-str-context
