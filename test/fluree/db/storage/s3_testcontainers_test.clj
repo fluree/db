@@ -19,14 +19,14 @@
 (def ^:dynamic *s3-endpoint* nil)
 
 (defn start-localstack-container []
-  (let [container (doto (LocalStackContainer. "3.0.2")
-                    (.withServices (into-array [LocalStackContainer$Service/S3])))]
+  (let [^LocalStackContainer container (doto (LocalStackContainer. "3.0.2")
+                                         (.withServices (into-array LocalStackContainer$Service [LocalStackContainer$Service/S3])))]
     (.start container)
     {:container container
      :endpoint (.getEndpointOverride container LocalStackContainer$Service/S3)}))
 
 (defn stop-localstack-container [container-info]
-  (when-let [container (:container container-info)]
+  (when-let [^LocalStackContainer container (:container container-info)]
     (.stop container)))
 
 (defn localstack-fixture [f]
