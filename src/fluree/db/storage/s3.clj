@@ -18,9 +18,10 @@
   [resp]
   (if (:cognitect.anomalies/category resp)
     (cond
-      ;; Handle NoSuchKey as nil (file doesn't exist)
+      ;; Handle NoSuchKey as a special not-found response (file doesn't exist)
+      ;; Return a keyword instead of nil to avoid core.async channel issues
       (= "NoSuchKey" (get-in resp [:Error :Code]))
-      nil
+      ::not-found
 
       ;; Return throwables as-is
       (:cognitect.aws.client/throwable resp)
@@ -119,9 +120,9 @@
   (-read-json [_ address keywordize?]
     (go-try
       (let [path (storage/get-local-path address)]
-        (when-let [resp (<? (read-s3-data client bucket prefix path))]
-          (when-let [data (:Body resp)]
-            (json/parse data keywordize?))))))
+        (let [resp (<? (read-s3-data client bucket prefix path))]
+          (when (not= resp ::not-found)
+            (some-> resp :Body (json/parse keywordize?)))))))
 
   storage/ContentAddressedStore
   (-content-write-bytes [_ dir data]
@@ -146,9 +147,9 @@
 
   (read-bytes [_ path]
     (go-try
-      (when-let [resp (<? (read-s3-data client bucket prefix path))]
-        (when-let [body (:Body resp)]
-          (.getBytes ^String body))))))
+      (let [resp (<? (read-s3-data client bucket prefix path))]
+        (when (not= resp ::not-found)
+          (some-> resp :Body (.getBytes)))))))
 
 (defn open
   ([bucket prefix]
