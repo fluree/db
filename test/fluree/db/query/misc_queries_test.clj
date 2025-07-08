@@ -1,9 +1,9 @@
 (ns fluree.db.query.misc-queries-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [babashka.fs :refer [with-temp-dir]]
+            [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]
-            [test-with-files.tools :refer [with-tmp-dir]]))
+            [fluree.db.util.core :as util]))
 
 (deftest ^:integration result-formatting
   (let [conn   (test-utils/create-conn)
@@ -345,14 +345,14 @@
         "Can transact with rdf:type aliased to type.")))
 
 (deftest ^:integration load-with-new-connection
-  (with-tmp-dir storage-path
-    (let [conn0     @(fluree/connect-file {:storage-path storage-path})
+  (with-temp-dir [storage-path {}]
+    (let [conn0     @(fluree/connect-file {:storage-path (str storage-path)})
           ledger-id "new3"
           _ledger    @(fluree/create-with-txn conn0 {"@context" {"ex" {"ex" "http://example.org/ns/"}}
                                                      "ledger"   ledger-id
                                                      "insert"   {"ex:createdAt" "now"}})
 
-          conn1 @(fluree/connect-file {:storage-path storage-path})]
+          conn1 @(fluree/connect-file {:storage-path (str storage-path)})]
       (is (= [{"ex:createdAt" "now"}]
              @(fluree/query-connection conn1 {"@context" {"ex" {"ex" "http://example.org/ns/"}}
                                               :from      ledger-id

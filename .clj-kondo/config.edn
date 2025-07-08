@@ -1,8 +1,8 @@
-{:source-paths   #{"src"}
+{:source-paths   #{"src" "test"}
  :linters        {:unresolved-symbol {:exclude [(fluree.db.util.core/catch*)
-                                                (test-with-files.tools/with-tmp-dir)
                                                 goog.isObject]}}
- :lint-as        {instaparse.core/defparser clojure.core/def}
+ :lint-as        {instaparse.core/defparser clojure.core/def
+                  babashka.fs/with-temp-dir clojure.core/let}
  :config-in-call {cljs.core/pr-sequential-writer {:ignore [:private-call]}}
  :config-in-ns   {fluree.db.json-ld.api {:ignore true}}
  :output         {:pattern "::{{level}} file={{filename}},line={{row}},col={{col}}::{{message}}"}}
