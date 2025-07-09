@@ -2,9 +2,20 @@
 
 Usage [documentation](https://docs.fluree.com) is located at https://docs.fluree.com.
 
+## Documentation
+
+- **Official Documentation**: https://docs.fluree.com
+- **API Reference**: See below or run `make docs` to generate HTML documentation
+- **Additional Documentation**: See the [`docs/`](docs/) directory for:
+  - [Clojure Developer Guide](docs/clojure_developer_guide.md) - Idiomatic Clojure usage with keywords and symbols
+  - [JSON-LD Query Syntax Reference](docs/json_ld_query_syntax.md)
+  - [Semantic Web Developer Guide](docs/semantic_web_guide.md) - Turtle, SPARQL, SHACL, OWL
+  - [S3 Storage Configuration Guide](docs/s3_storage_guide.md)
+  - [Fluree Namespace Variables Reference](docs/fluree-namespace-variables.md)
+
 ## API Reference
 
-Comprehensive API documentation is available:
+API documentation is available:
 - Generated docs: Run `make docs` to generate HTML documentation from docstrings
 - Source: See `src/fluree/db/api.cljc` for detailed function documentation
 
@@ -63,10 +74,14 @@ Fluree supports multiple deployment patterns:
 
 Key features include:
 - **Immutable & Temporal**: Complete transaction history with time-travel queries
-- **Semantic Graph**: RDF/JSON-LD native with SPARQL support
-- **Policy-Based Security**: Data-level permissions and verifiable credentials
+- **Semantic Graph**: RDF/[JSON-LD](https://www.w3.org/TR/json-ld11/) native with SPARQL support
+- **Policy-Based Security**: Fine-grained data access control with custom policy syntax and verifiable credentials
+- **SHACL Data Validation**: Policy enforcement by data shape using [W3C SHACL](https://www.w3.org/TR/shacl/) standard
 - **Reasoning**: Built-in datalog and OWL2RL reasoning engines
 - **Multi-Format**: Supports JSON-LD, Turtle, and SPARQL
+- **Scale-Out Architecture**: Distributed, cloud-native design for horizontal scaling
+- **Cryptographic Provenance**: Verifiable data integrity and authorship
+- **Decentralized Federated Query**: Query across multiple distributed databases and data sources
 
 The best way to get started with Fluree is to visit the [documentation](https://docs.fluree.com).
 
@@ -82,16 +97,102 @@ The best way to get started with Fluree is to visit the [documentation](https://
 (def ledger @(fluree/create conn "my-ledger"))
 
 ;; Insert some data
-(def db @(fluree/insert! conn "my-ledger" 
+(def db @(fluree/insert (fluree/db ledger)
                         [{"@id" "ex:alice"
-                          "@type" "Person"
-                          "name" "Alice"
-                          "age" 30}]))
+                          "@type" "schema:Person"
+                          "schema:name" "Alice"
+                          "schema:age" 30}]
+                        {"context" {"ex" "http://example.com/"
+                                    "schema" "http://schema.org/"}}))
+
+;; Commit the changes
+@(fluree/commit! ledger db)
 
 ;; Query the data
-(def results @(fluree/query db {"@context" {"ex" "http://example.com/"}
-                               "select" "*"
-                               "where" {"@type" "Person"}}))
+(def results @(fluree/query db {"@context" {"ex" "http://example.com/"
+                                           "schema" "http://schema.org/"}
+                                "th" ["?s" "?name"]
+                                "where" {"@id" "?s"
+                                         "@type" "schema:Person"
+                                         "schema:name" "?name"}}))
+
+;; Clean up
+@(fluree/disconnect conn)
+```
+
+### Alternative: Using Turtle and SPARQL
+
+```clojure
+(require '[fluree.db.api :as fluree])
+
+;; Create an in-memory connection
+(def conn @(fluree/connect-memory))
+
+;; Create a ledger
+(def ledger @(fluree/create conn "my-ledger"))
+
+;; Insert some data using Turtle format
+(def db @(fluree/insert (fluree/db ledger)
+                        "@prefix ex: <http://example.com/> .
+                         @prefix schema: <http://schema.org/> .
+                         
+                         ex:alice a schema:Person ;
+                                  schema:name \"Alice\" ;
+                                  schema:age 30 ."
+                        {"format" "turtle"}))
+
+;; Commit the changes
+@(fluree/commit! ledger db)
+
+;; Query the data using SPARQL
+(def results @(fluree/query db "PREFIX ex: <http://example.com/>
+                                PREFIX schema: <http://schema.org/>
+                                
+                                SELECT ?s ?name WHERE {
+                                  ?s a schema:Person ;
+                                     schema:name ?name .
+                                }"
+                                {"format" :sparql}))
+
+;; Clean up
+@(fluree/disconnect conn)
+```
+
+### Clojure-Focused: Using Keywords
+
+```clojure
+(require '[fluree.db.api :as fluree])
+
+;; Create an in-memory connection
+(def conn @(fluree/connect-memory))
+
+;; Create a ledger
+(def ledger @(fluree/create conn "my-ledger"))
+
+;; Insert data using keyword context for Clojure developers
+(def db @(fluree/insert (fluree/db ledger)
+                        [{:id :ex/alice
+                          :type :schema/Person
+                          :schema/name "Alice"
+                          :schema/age 30}]
+                        {:context {:id "@id"
+                                   :type "@type"
+                                   :ex "http://example.com/"
+                                   :schema "http://schema.org/"}}))
+
+;; Commit the changes
+@(fluree/commit! ledger db)
+
+;; Query using keyword-based analytical query
+(def results @(fluree/query db {:context {:id "@id"
+                                          :type "@type"
+                                          :ex "http://example.com/"
+                                          :schema "http://schema.org/"}
+                                :select '[?s ?name ?age]
+                                :where '{:id ?s
+                                         :type :schema/Person
+                                         :schema/name ?name
+                                         :schema/age ?age}}))
 
 ;; Clean up
 @(fluree/disconnect conn)
