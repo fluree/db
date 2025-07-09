@@ -123,10 +123,10 @@
   (testing "Some basic datalog rules"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "reasoner/basic-datalog" nil)
-          db0    @(fluree/stage (fluree/db ledger) reasoning-db-data)]
+          db0    @(fluree/update (fluree/db ledger) reasoning-db-data)]
 
       (testing "A standard relationship"
-        (let [grandparent-db  @(fluree/stage db0 {"insert" [grandparent-rule]})
+        (let [grandparent-db  @(fluree/update db0 {"insert" [grandparent-rule]})
 
               grandparent-db* @(fluree/reason grandparent-db :datalog)
 
@@ -146,7 +146,7 @@
               "Only one reasoned triple should be added")))
 
       (testing "A filter rule works"
-        (let [senior-db  @(fluree/stage
+        (let [senior-db  @(fluree/update
                            db0
                            {"insert" [senior-rule]})
               senior-db* @(fluree/reason senior-db :datalog)
@@ -163,7 +163,7 @@
               "Only one reasoned triple should be added")))
 
       (testing "Inferring based on a relationship and IRI value"
-        (let [brother-db  @(fluree/stage
+        (let [brother-db  @(fluree/update
                             db0
                             {"insert" [brother-rule]})
               brother-db* @(fluree/reason brother-db :datalog)]
@@ -185,7 +185,7 @@
   (testing "Datalog rules given as JSON-LD at query-time"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "reasoner/basic-datalog-rules" nil)
-          db0    @(fluree/stage (fluree/db ledger) reasoning-db-data)]
+          db0    @(fluree/update (fluree/db ledger) reasoning-db-data)]
 
       (testing "A recursive relationship"
         (let [grandparents-db @(fluree/reason db0 :datalog [grandparent-rule])
@@ -205,13 +205,13 @@
   (testing "multiple rule sources"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "reasoner/multiple-rule-dbs")
-          db0    @(fluree/stage (fluree/db ledger) reasoning-db-data)
+          db0    @(fluree/update (fluree/db ledger) reasoning-db-data)
 
           rule-ledger-1 @(fluree/create conn "reasoner/rule-ledger-1")
-          rule-db-1     @(fluree/stage (fluree/db rule-ledger-1) {"insert" [uncle-rule]})
+          rule-db-1     @(fluree/update (fluree/db rule-ledger-1) {"insert" [uncle-rule]})
 
           rule-ledger-2 @(fluree/create conn "reasoner/rule-ledger-2")
-          rule-db-2     @(fluree/stage (fluree/db rule-ledger-2) {"insert" [aunt-rule]})]
+          rule-db-2     @(fluree/update (fluree/db rule-ledger-2) {"insert" [aunt-rule]})]
 
       (testing "multiple graphs as rule sources"
         (let [half-reasoned-db @(fluree/reason db0 :datalog [aunt-rule])
@@ -307,7 +307,7 @@
   (testing "Some basic datalog rules"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "reasoner/recursive-datalog" nil)
-          db0    @(fluree/stage
+          db0    @(fluree/update
                    (fluree/db ledger)
                    {"@context" {"ex" "http://example.org/"}
                     "insert"   [{"@id"                    "ex:task1"
@@ -333,7 +333,7 @@
                                                            {"@id" "ex:task1-1-2-2"}]}]})]
 
       (testing "A recursive relationship"
-        (let [db1  @(fluree/stage
+        (let [db1  @(fluree/update
                      db0
                      {"insert" [has-subtask-rule has-subtask-transitive]})
               db1* @(fluree/reason db1 :datalog)]

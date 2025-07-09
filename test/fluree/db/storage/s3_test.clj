@@ -76,7 +76,7 @@
                                        :parallelism 1})
             ledger @(fluree/create conn1 ledger-name)
             db0 (fluree/db ledger)
-            db1 @(fluree/stage db0 {"@context" context "insert" test-data})
+            db1 @(fluree/update db0 {"@context" context "insert" test-data})
             committed @(fluree/commit! ledger db1)]
 
         (is (some? committed) "Data should commit to S3")

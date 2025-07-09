@@ -16,20 +16,20 @@
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "ledger/datatype")]
     (testing "Querying predicates with mixed datatypes"
-      (let [mixed-db @(fluree/stage (fluree/db ledger)
-                                    {"insert"
-                                     [{:context     context-edn
-                                       :id          :ex/coco
-                                       :type        :schema/Person
-                                       :schema/name "Coco"}
-                                      {:context     context-edn
-                                       :id          :ex/halie
-                                       :type        :schema/Person
-                                       :schema/name "Halie"}
-                                      {:context     context-edn
-                                       :id          :ex/john
-                                       :type        :schema/Person
-                                       :schema/name 3}]})]
+      (let [mixed-db @(fluree/update (fluree/db ledger)
+                                     {"insert"
+                                      [{:context     context-edn
+                                        :id          :ex/coco
+                                        :type        :schema/Person
+                                        :schema/name "Coco"}
+                                       {:context     context-edn
+                                        :id          :ex/halie
+                                        :type        :schema/Person
+                                        :schema/name "Halie"}
+                                       {:context     context-edn
+                                        :id          :ex/john
+                                        :type        :schema/Person
+                                        :schema/name 3}]})]
         (is (= [{:id          :ex/halie
                  :type        :schema/Person
                  :schema/name "Halie"}]
@@ -57,7 +57,7 @@
   (testing "querying with datatypes"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "people")
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"@context" [test-utils/default-context
                                 {:ex    "http://example.org/ns/"
@@ -155,7 +155,7 @@
   (testing "querying with @json datatype"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "json-test")
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"@context" {"ex"    "http://example.org/ns/"}
                     "insert"
@@ -198,7 +198,7 @@
   (testing "querying with @value and @type variable bindings"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "value-type-test")
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"@context" {"ex"  "http://example.org/ns/"
                                 "xsd" "http://www.w3.org/2001/XMLSchema#"}
@@ -230,7 +230,7 @@
   (testing "language binding with lang function"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "lang-test")
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
@@ -266,7 +266,7 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "t-test")
           ;; First transaction
-          db1    @(fluree/stage
+          db1    @(fluree/update
                    (fluree/db ledger)
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
@@ -275,7 +275,7 @@
                       "ex:age"  30}]})
           db1*   @(fluree/commit! ledger db1)
           ;; Second transaction
-          db2    @(fluree/stage
+          db2    @(fluree/update
                    db1*
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
@@ -283,7 +283,7 @@
                       "ex:hobby" "Reading"}]})
           db2*   @(fluree/commit! ledger db2)
           ;; Third transaction
-          db3    @(fluree/stage
+          db3    @(fluree/update
                    db2*
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"

@@ -36,10 +36,10 @@
 
 (defn ^:export stage
   ([db json-ld]
-   (fluree/stage db (js->clj json-ld)))
+   (fluree/update db (js->clj json-ld)))
   ([db json-ld opts]
-   (fluree/stage db (js->clj json-ld)
-                 (js->clj opts :keywordize-keys true))))
+   (fluree/update db (js->clj json-ld)
+                  (js->clj opts :keywordize-keys true))))
 
 (defn ^:export commit
   ([ledger db] (.then (fluree/commit! ledger db)

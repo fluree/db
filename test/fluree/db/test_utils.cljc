@@ -156,8 +156,8 @@
   [conn]
   (let [ledger @(fluree/create conn "test/movies")]
     (doseq [movie movies]
-      (let [staged @(fluree/stage (fluree/db ledger) {"@context" default-str-context
-                                                      "insert" movie})]
+      (let [staged @(fluree/update (fluree/db ledger) {"@context" default-str-context
+                                                       "insert" movie})]
         @(fluree/commit! ledger staged
                          {:message (str "Commit " (get movie "name"))
                           :push?   true})))
@@ -168,9 +168,9 @@
   (#?(:clj do, :cljs go)
     (let [ledger-p (fluree/create conn "test/people")
           ledger   #?(:clj @ledger-p :cljs (<p! ledger-p))
-          staged-p (fluree/stage (fluree/db ledger) {"@context" [default-context
-                                                                 {:ex "http://example.org/ns/"}]
-                                                     "insert" people})
+          staged-p (fluree/update (fluree/db ledger) {"@context" [default-context
+                                                                  {:ex "http://example.org/ns/"}]
+                                                      "insert" people})
           staged   #?(:clj @staged-p, :cljs (<p! staged-p))
           commit-p (fluree/commit! ledger staged {:message "Adding people"
                                                   :push? true})]
