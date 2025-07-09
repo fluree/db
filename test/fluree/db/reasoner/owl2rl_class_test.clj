@@ -9,17 +9,17 @@
   (testing "adding subClassOf declarations within the reasoning data set"
     (let [conn      (test-utils/create-conn)
           ledger    @(fluree/create conn "reasoner/owl-equiv" nil)
-          db-base   @(fluree/stage (fluree/db ledger)
-                                   {"@context" {"ex" "http://example.org/"}
-                                    "insert"   [{"@id"     "ex:brian"
-                                                 "@type"   "ex:Person"
-                                                 "ex:name" "Brian"}
-                                                {"@id"     "ex:laura"
-                                                 "@type"   "ex:Employee"
-                                                 "ex:name" "Laura"}
-                                                {"@id"     "ex:alice"
-                                                 "@type"   "ex:Human"
-                                                 "ex:name" "Alice"}]})
+          db-base   @(fluree/update (fluree/db ledger)
+                                    {"@context" {"ex" "http://example.org/"}
+                                     "insert"   [{"@id"     "ex:brian"
+                                                  "@type"   "ex:Person"
+                                                  "ex:name" "Brian"}
+                                                 {"@id"     "ex:laura"
+                                                  "@type"   "ex:Employee"
+                                                  "ex:name" "Laura"}
+                                                 {"@id"     "ex:alice"
+                                                  "@type"   "ex:Human"
+                                                  "ex:name" "Alice"}]})
 
           db-reason @(fluree/reason db-base :owl2rl
                                     [{"@context"        {"owl"  "http://www.w3.org/2002/07/owl#"
@@ -65,17 +65,17 @@
   (testing "owl:equivalentClass test"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/owl-equiv" nil)
-          db-base @(fluree/stage (fluree/db ledger)
-                                 {"@context" {"ex" "http://example.org/"}
-                                  "insert"   [{"@id"     "ex:brian"
-                                               "@type"   "ex:Person"
-                                               "ex:name" "Brian"}
-                                              {"@id"     "ex:laura"
-                                               "@type"   "ex:Human"
-                                               "ex:name" "Laura"}
-                                              {"@id"     "ex:alice"
-                                               "@type"   "ex:HumanBeing"
-                                               "ex:name" "Alice"}]})]
+          db-base @(fluree/update (fluree/db ledger)
+                                  {"@context" {"ex" "http://example.org/"}
+                                   "insert"   [{"@id"     "ex:brian"
+                                                "@type"   "ex:Person"
+                                                "ex:name" "Brian"}
+                                               {"@id"     "ex:laura"
+                                                "@type"   "ex:Human"
+                                                "ex:name" "Laura"}
+                                               {"@id"     "ex:alice"
+                                                "@type"   "ex:HumanBeing"
+                                                "ex:name" "Alice"}]})]
 
       (testing "Testing single owl:equivalentClass declaration"
         (let [db-equiv @(fluree/reason db-base :owl2rl
@@ -142,18 +142,18 @@
   (testing "owl:Restriction hasValue test - cls-hv1, cls-hv2"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/owl-cls-hv" nil)
-          db-base @(fluree/stage (fluree/db ledger)
-                                 {"@context" {"ex" "http://example.org/"}
-                                  "insert"   [{"@id"           "ex:alice"
-                                               "@type"         "ex:Person"
-                                               "ex:hasAccount" true
-                                               "ex:age"        21}
-                                              {"@id"           "ex:bob"
-                                               "@type"         "ex:Person"
-                                               "ex:hasAccount" false
-                                               "ex:age"        12}
-                                              {"@id"   "ex:susan"
-                                               "@type" ["ex:Person" "ex:Customer"]}]})]
+          db-base @(fluree/update (fluree/db ledger)
+                                  {"@context" {"ex" "http://example.org/"}
+                                   "insert"   [{"@id"           "ex:alice"
+                                                "@type"         "ex:Person"
+                                                "ex:hasAccount" true
+                                                "ex:age"        21}
+                                               {"@id"           "ex:bob"
+                                                "@type"         "ex:Person"
+                                                "ex:hasAccount" false
+                                                "ex:age"        12}
+                                               {"@id"   "ex:susan"
+                                                "@type" ["ex:Person" "ex:Customer"]}]})]
 
       (testing "Testing single owl:Restriction for a property value"
         (let [db-equiv @(fluree/reason db-base :owl2rl
@@ -203,30 +203,30 @@
   (testing "owl:Restriction owl:someValuesFrom test - cls-svf1, cls-svf2"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/owl-cls-svf" nil)
-          db-base @(fluree/stage (fluree/db ledger)
-                                 {"@context" {"ex" "http://example.org/"}
-                                  "insert"   [{"@id"   "ex:winery1"
-                                               "@type" "ex:Winery"}
-                                              {"@id"   "ex:textile-company"
-                                               "@type" "ex:TextileFactory"}
-                                              {"@id"   "ex:winery2"
-                                               "@type" "ex:Winery"}
-                                              {"@id"   "ex:maybe-winery"
-                                               "@type" "ex:MaybeWinery"}
-                                              {"@id"         "ex:maybe-a-wine"
-                                               "@type"       "ex:Product"
-                                               "ex:hasMaker" [{"@id" "ex:winery1"}
-                                                              {"@id" "ex:textile-company"}]}
-                                              {"@id"         "ex:a-wine-1"
-                                               "@type"       "ex:Product"
-                                               "ex:hasMaker" [{"@id" "ex:winery1"}
-                                                              {"@id" "ex:winery2"}]}
-                                              {"@id"         "ex:a-wine-2"
-                                               "@type"       "ex:Product"
-                                               "ex:hasMaker" {"@id" "ex:winery2"}}
-                                              {"@id"         "ex:not-a-wine-1"
-                                               "@type"       "ex:Product"
-                                               "ex:hasMaker" {"@id" "ex:textile-company"}}]})]
+          db-base @(fluree/update (fluree/db ledger)
+                                  {"@context" {"ex" "http://example.org/"}
+                                   "insert"   [{"@id"   "ex:winery1"
+                                                "@type" "ex:Winery"}
+                                               {"@id"   "ex:textile-company"
+                                                "@type" "ex:TextileFactory"}
+                                               {"@id"   "ex:winery2"
+                                                "@type" "ex:Winery"}
+                                               {"@id"   "ex:maybe-winery"
+                                                "@type" "ex:MaybeWinery"}
+                                               {"@id"         "ex:maybe-a-wine"
+                                                "@type"       "ex:Product"
+                                                "ex:hasMaker" [{"@id" "ex:winery1"}
+                                                               {"@id" "ex:textile-company"}]}
+                                               {"@id"         "ex:a-wine-1"
+                                                "@type"       "ex:Product"
+                                                "ex:hasMaker" [{"@id" "ex:winery1"}
+                                                               {"@id" "ex:winery2"}]}
+                                               {"@id"         "ex:a-wine-2"
+                                                "@type"       "ex:Product"
+                                                "ex:hasMaker" {"@id" "ex:winery2"}}
+                                               {"@id"         "ex:not-a-wine-1"
+                                                "@type"       "ex:Product"
+                                                "ex:hasMaker" {"@id" "ex:textile-company"}}]})]
 
       (testing "Testing single owl:Restriction someValuesFrom for a property value"
         (let [db-some-val @(fluree/reason db-base :owl2rl
@@ -288,13 +288,13 @@
   (testing "owl:maxCardinality test - rule cls-maxc2 (cls-maxc1 is 'false' and ignored)"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/owl-max-card" nil)
-          db-base @(fluree/stage (fluree/db ledger)
-                                 {"@context" {"ex" "http://example.org/"}
-                                  "insert"   [{"@id"       "ex:brian"
-                                               "@type"     "ex:Person"
-                                               "ex:mother" [{"@id" "ex:carol"}
-                                                            {"@id" "ex:carol2"}
-                                                            {"@id" "ex:carol3"}]}]})]
+          db-base @(fluree/update (fluree/db ledger)
+                                  {"@context" {"ex" "http://example.org/"}
+                                   "insert"   [{"@id"       "ex:brian"
+                                                "@type"     "ex:Person"
+                                                "ex:mother" [{"@id" "ex:carol"}
+                                                             {"@id" "ex:carol2"}
+                                                             {"@id" "ex:carol3"}]}]})]
 
       (testing "Testing owl:maxCardinality=1 declaration (rule cls-maxc2)"
         (let [db-equiv @(fluree/reason db-base :owl2rl
@@ -356,16 +356,16 @@
   (testing "owl:maxQualifiedCardinality test - rules cls-maxqc3, cls-maxqc4"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/owl-max-qual-card" nil)
-          db-base @(fluree/stage (fluree/db ledger)
-                                 {"@context" {"ex" "http://example.org/"}
-                                  "insert"   [{"@id"       "ex:brian"
-                                               "@type"     "ex:Person"
-                                               "ex:mother" [{"@id"   "ex:carol"
-                                                             "@type" "ex:Parent"}
-                                                            {"@id"   "ex:carol2"
-                                                             "@type" "ex:Parent"}
-                                                            {"@id"   "ex:carol-not"
-                                                             "@type" "ex:NotParent"}]}]})]
+          db-base @(fluree/update (fluree/db ledger)
+                                  {"@context" {"ex" "http://example.org/"}
+                                   "insert"   [{"@id"       "ex:brian"
+                                                "@type"     "ex:Person"
+                                                "ex:mother" [{"@id"   "ex:carol"
+                                                              "@type" "ex:Parent"}
+                                                             {"@id"   "ex:carol2"
+                                                              "@type" "ex:Parent"}
+                                                             {"@id"   "ex:carol-not"
+                                                              "@type" "ex:NotParent"}]}]})]
 
       (testing "Testing owl:maxQualifiedCardinality=1 declaration (rule cls-maxqc3)"
         (let [db-equiv @(fluree/reason db-base :owl2rl
@@ -468,13 +468,13 @@
   (testing "owl:oneOf test - rule cls-oo"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/owl-one-of" nil)
-          db-base @(fluree/stage (fluree/db ledger)
-                                 {"@context" {"ex" "http://example.org/"}
-                                  "insert"   [{"@id"      "ex:widget"
-                                               "ex:color" {"@id" "ex:Red"}}
-                                              {"@id" "ex:Green"}
-                                              {"@id" "ex:Blue"}
-                                              {"@id" "ex:Red"}]})]
+          db-base @(fluree/update (fluree/db ledger)
+                                  {"@context" {"ex" "http://example.org/"}
+                                   "insert"   [{"@id"      "ex:widget"
+                                                "ex:color" {"@id" "ex:Red"}}
+                                               {"@id" "ex:Green"}
+                                               {"@id" "ex:Blue"}
+                                               {"@id" "ex:Red"}]})]
 
       (testing "Testing owl:oneOf simple declaration as list"
         (let [db-equiv @(fluree/reason db-base :owl2rl
@@ -540,17 +540,17 @@
   (testing "owl:intersectionOf tests - rules cls-int1, cls-int2, scm-int"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/owl-intersection" nil)
-          db-base @(fluree/stage (fluree/db ledger)
-                                 {"@context" {"ex" "http://example.org/"}
-                                  "insert"   [{"@id"   "ex:carol"
-                                               "@type" ["ex:Woman" "ex:Parent"]}
-                                              {"@id"    "ex:alice"
-                                               "@type"  "ex:Woman"
-                                               "ex:age" 21}
-                                              {"@id"   "ex:bob"
-                                               "@type" ["ex:Parent" "ex:Father"]}
-                                              {"@id"   "ex:jen"
-                                               "@type" ["ex:Mother"]}]})]
+          db-base @(fluree/update (fluree/db ledger)
+                                  {"@context" {"ex" "http://example.org/"}
+                                   "insert"   [{"@id"   "ex:carol"
+                                                "@type" ["ex:Woman" "ex:Parent"]}
+                                               {"@id"    "ex:alice"
+                                                "@type"  "ex:Woman"
+                                                "ex:age" 21}
+                                               {"@id"   "ex:bob"
+                                                "@type" ["ex:Parent" "ex:Father"]}
+                                               {"@id"   "ex:jen"
+                                                "@type" ["ex:Mother"]}]})]
 
       (testing "Testing owl:intersectionOf declaration"
         (let [db-reasoned @(fluree/reason db-base :owl2rl
@@ -614,17 +614,17 @@
   (testing "owl:unionOf tests - rules cls-uni, scm-uni"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/owl-union" nil)
-          db-base @(fluree/stage (fluree/db ledger)
-                                 {"@context" {"ex" "http://example.org/"}
-                                  "insert"   [{"@id"   "ex:carol"
-                                               "@type" "ex:Mother"}
-                                              {"@id"   "ex:Alice"
-                                               "@type" "ex:Woman"}
-                                              {"@id"   "ex:bob"
-                                               "@type" "ex:Father"}
-                                              {"@id"         "ex:sue"
-                                               "@type"       "ex:Woman"
-                                               "ex:isParent" true}]})]
+          db-base @(fluree/update (fluree/db ledger)
+                                  {"@context" {"ex" "http://example.org/"}
+                                   "insert"   [{"@id"   "ex:carol"
+                                                "@type" "ex:Mother"}
+                                               {"@id"   "ex:Alice"
+                                                "@type" "ex:Woman"}
+                                               {"@id"   "ex:bob"
+                                                "@type" "ex:Father"}
+                                               {"@id"         "ex:sue"
+                                                "@type"       "ex:Woman"
+                                                "ex:isParent" true}]})]
 
       (testing "Testing owl:unionOf declaration"
         (let [db-reasoned @(fluree/reason db-base :owl2rl

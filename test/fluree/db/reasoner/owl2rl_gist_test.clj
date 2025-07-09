@@ -13,12 +13,12 @@
     (let [gist-ontology (json/parse (slurp (io/resource "gistCore12.1.0.jsonld")) false)
           conn          (test-utils/create-conn)
           ledger        @(fluree/create conn "reasoner/owl-gist-core-can-reason" nil)
-          db-base       @(fluree/stage (fluree/db ledger)
-                                       {"@context" {"ex"   "http://example.org/"
-                                                    "gist" "https://ontologies.semanticarts.com/gist/"}
-                                        "insert"   [{"@id"               "ex:is-account"
-                                                     "@type"             "gist:Agreement"
-                                                     "gist:hasMagnitude" []}]})]
+          db-base       @(fluree/update (fluree/db ledger)
+                                        {"@context" {"ex"   "http://example.org/"
+                                                     "gist" "https://ontologies.semanticarts.com/gist/"}
+                                         "insert"   [{"@id"               "ex:is-account"
+                                                      "@type"             "gist:Agreement"
+                                                      "gist:hasMagnitude" []}]})]
 
       (testing "Pass ontology directly to reasoner (not inside db)"
         (let [db-reason @(fluree/reason db-base :owl2rl [gist-ontology])]
@@ -27,7 +27,7 @@
               "No exceptions should be thrown when reasoning with the entire ontology")))
 
       (testing "Transact ontology into db then reason"
-        (let [db+ontology @(fluree/stage db-base {"insert" gist-ontology})
+        (let [db+ontology @(fluree/update db-base {"insert" gist-ontology})
               db-reason   @(fluree/reason db+ontology :owl2rl)]
 
           (is (not (util/exception? db-reason))
@@ -35,7 +35,7 @@
 
       (testing "Transact ontology into a different db, then reason"
         (let [ontology-ledger @(fluree/create conn "reasoner/owl-gist-ontology" nil)
-              ontology-db     @(fluree/stage (fluree/db ontology-ledger) {"insert" gist-ontology})
+              ontology-db     @(fluree/update (fluree/db ontology-ledger) {"insert" gist-ontology})
               db-reason       @(fluree/reason db-base :owl2rl [ontology-db])]
 
           (is (not (util/exception? db-reason))
@@ -45,12 +45,12 @@
     (testing "gist:Account description described in owl with owl2rl reasoning"
       (let [conn      (test-utils/create-conn)
             ledger    @(fluree/create conn "reasoner/owl-equiv" nil)
-            db-base   @(fluree/stage (fluree/db ledger)
-                                     {"@context" {"ex"   "http://example.org/"
-                                                  "gist" "https://ontologies.semanticarts.com/gist/"}
-                                      "insert"   [{"@id"               "ex:is-account"
-                                                   "@type"             "gist:Agreement"
-                                                   "gist:hasMagnitude" []}]})
+            db-base   @(fluree/update (fluree/db ledger)
+                                      {"@context" {"ex"   "http://example.org/"
+                                                   "gist" "https://ontologies.semanticarts.com/gist/"}
+                                       "insert"   [{"@id"               "ex:is-account"
+                                                    "@type"             "gist:Agreement"
+                                                    "gist:hasMagnitude" []}]})
 
             db-reason @(fluree/reason db-base :owl2rl
                                       [{"@context"            {"gist" "https://w3id.org/semanticarts/ns/ontology/gist/",
@@ -89,17 +89,17 @@
   (testing "gist:Agreement description described in owl with owl2rl reasoning"
     (let [conn      (test-utils/create-conn)
           ledger    @(fluree/create conn "reasoner/owl-equiv" nil)
-          db-base   @(fluree/stage (fluree/db ledger)
-                                   {"@context" {"ex"   "http://example.org/"
-                                                "gist" "https://ontologies.semanticarts.com/gist/"}
-                                    "insert"   [{"@id"                "ex:doc-commitment"
-                                                 "@type"              "gist:Commitment"
-                                                 "gist:hasParty"      {"@id"   "ex:brian"
-                                                                       "@type" "gist:Person"}
-                                                 "gist:hasDirectPart" [{"@id"   "ex:doc-obligation-1"
-                                                                        "@type" "gist:Obligation"}
-                                                                       {"@id"   "ex:doc-obligation-2"
-                                                                        "@type" "gist:Obligation"}]}]})
+          db-base   @(fluree/update (fluree/db ledger)
+                                    {"@context" {"ex"   "http://example.org/"
+                                                 "gist" "https://ontologies.semanticarts.com/gist/"}
+                                     "insert"   [{"@id"                "ex:doc-commitment"
+                                                  "@type"              "gist:Commitment"
+                                                  "gist:hasParty"      {"@id"   "ex:brian"
+                                                                        "@type" "gist:Person"}
+                                                  "gist:hasDirectPart" [{"@id"   "ex:doc-obligation-1"
+                                                                         "@type" "gist:Obligation"}
+                                                                        {"@id"   "ex:doc-obligation-2"
+                                                                         "@type" "gist:Obligation"}]}]})
 
           db-reason @(fluree/reason db-base :owl2rl
                                     [{"@context"            {"gist" "https://ontologies.semanticarts.com/gist/"
@@ -140,11 +140,11 @@
   (testing "gist:BaseUnit description described in owl with owl2rl reasoning"
     (let [conn      (test-utils/create-conn)
           ledger    @(fluree/create conn "reasoner/owl-equiv" nil)
-          db-base   @(fluree/stage (fluree/db ledger)
-                                   {"@context" {"ex"   "http://example.org/"
-                                                "gist" "https://ontologies.semanticarts.com/gist/"}
-                                    "insert"   [{"@id"   "ex:some-data-to-create-db"
-                                                 "@type" "ex:IgnoreThis"}]})
+          db-base   @(fluree/update (fluree/db ledger)
+                                    {"@context" {"ex"   "http://example.org/"
+                                                 "gist" "https://ontologies.semanticarts.com/gist/"}
+                                     "insert"   [{"@id"   "ex:some-data-to-create-db"
+                                                  "@type" "ex:IgnoreThis"}]})
 
           db-reason @(fluree/reason db-base :owl2rl
                                     [{"@context"            {"gist" "https://ontologies.semanticarts.com/gist/"

@@ -153,9 +153,9 @@
                                   "@value" {}}}
            tx        [root-user pleb-user policy d-policy]
            ;; can't use credentials until after an identity with a role has been created
-           db1       @(fluree/transact! conn {"@context" context
-                                              "ledger"   ledger-id
-                                              "insert"   tx})
+           db1       @(fluree/update! conn {"@context" context
+                                            "ledger"   ledger-id
+                                            "insert"   tx})
 
            mdfn {"@context" context
                  "ledger"   ledger-id
@@ -166,7 +166,7 @@
                              "ct:name"    "D"
                              "ct:favnums" [4 5 6]}}
 
-           db2 @(fluree/credential-transact! conn (async/<!! (cred/generate mdfn (:private auth))))
+           db2 @(fluree/credential-update! conn (async/<!! (cred/generate mdfn (:private auth))))
 
            ledger @(fluree/load conn ledger-id)
 

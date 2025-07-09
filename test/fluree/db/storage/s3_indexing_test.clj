@@ -54,7 +54,7 @@
                   db0 (fluree/db ledger)
                   data1 [{"@id" "ex:alice" "ex:name" "Alice" "ex:age" 30}
                          {"@id" "ex:bob" "ex:name" "Bob" "ex:age" 25}]
-                  db1 @(fluree/stage db0 {"@context" context "insert" data1})]
+                  db1 @(fluree/update db0 {"@context" context "insert" data1})]
 
               (is (some? ledger) "Ledger should be created successfully")
               (is (some? db1) "Data should stage successfully")
@@ -74,7 +74,7 @@
                   db-current (fluree/db ledger)
                   data2 [{"@id" "ex:carol" "ex:name" "Carol" "ex:age" 35}
                          {"@id" "ex:dave" "ex:name" "Dave" "ex:age" 40}]
-                  db2 @(fluree/stage db-current {"@context" context "insert" data2})]
+                  db2 @(fluree/update db-current {"@context" context "insert" data2})]
 
               @(fluree/commit! ledger db2)
 

@@ -6,7 +6,7 @@
 (deftest ^:integration filter-test
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/filter")
-        db     @(fluree/stage
+        db     @(fluree/update
                  (fluree/db ledger)
                  {"@context" [test-utils/default-context
                               {:ex "http://example.org/ns/"}]
@@ -135,7 +135,7 @@
                                            [:filter "(in ?nameLength [2 3 {\"@value\" 4 :type :xsd/int}])"]]}))))
 
     (testing "filtering variables bound to iris"
-      (let [db-dads @(fluree/stage
+      (let [db-dads @(fluree/update
                       db
                       {"@context" {"ex" "http://example.org/"}
                        "insert"   {"@id"       "ex:bob"

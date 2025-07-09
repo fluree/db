@@ -412,7 +412,7 @@
   (testing "Querying ledgers loaded with language-tagged strings"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "jobs")
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"@context" {"ex"         "http://example.com/vocab/"
                                 "occupation" {"@id"        "ex:occupation"
@@ -472,43 +472,43 @@
   (testing "querying with t values"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "people")
-          db1    @(fluree/stage (fluree/db ledger)
-                                {"@context" [test-utils/default-context
-                                             {:ex    "http://example.org/ns/"
-                                              :value "@value"
-                                              :type  "@type"}]
-                                 "insert"
-                                 [{:id      :ex/homer
-                                   :ex/name "Homer"
-                                   :ex/age  36}
-                                  {:id      :ex/marge
-                                   :ex/name "Marge"
-                                   :ex/age  {:value 36
-                                             :type  :xsd/int}}
-                                  {:id      :ex/bart
-                                   :ex/name "Bart"
-                                   :ex/age  "forever 10"}]})
+          db1    @(fluree/update (fluree/db ledger)
+                                 {"@context" [test-utils/default-context
+                                              {:ex    "http://example.org/ns/"
+                                               :value "@value"
+                                               :type  "@type"}]
+                                  "insert"
+                                  [{:id      :ex/homer
+                                    :ex/name "Homer"
+                                    :ex/age  36}
+                                   {:id      :ex/marge
+                                    :ex/name "Marge"
+                                    :ex/age  {:value 36
+                                              :type  :xsd/int}}
+                                   {:id      :ex/bart
+                                    :ex/name "Bart"
+                                    :ex/age  "forever 10"}]})
           db1*   @(fluree/commit! ledger db1)
-          db2    @(fluree/stage db1* {"@context" [test-utils/default-context
-                                                  {:ex    "http://example.org/ns/"
-                                                   :value "@value"
-                                                   :type  "@type"}]
-                                      "insert"
-                                      [{:id     :ex/homer
-                                        :ex/son {:id :ex/bart}}
-                                       {:id            :ex/bart
-                                        :ex/dad        {:id :ex/homer}
-                                        :ex/occupation "Getting into mischief"}]})
+          db2    @(fluree/update db1* {"@context" [test-utils/default-context
+                                                   {:ex    "http://example.org/ns/"
+                                                    :value "@value"
+                                                    :type  "@type"}]
+                                       "insert"
+                                       [{:id     :ex/homer
+                                         :ex/son {:id :ex/bart}}
+                                        {:id            :ex/bart
+                                         :ex/dad        {:id :ex/homer}
+                                         :ex/occupation "Getting into mischief"}]})
           db2*   @(fluree/commit! ledger db2)
-          db3    @(fluree/stage db2* {"@context" [test-utils/default-context
-                                                  {:ex    "http://example.org/ns/"
-                                                   :value "@value"
-                                                   :type  "@type"}]
-                                      "insert"
-                                      [{:id     :ex/marge
-                                        :ex/son {:id :ex/bart}}
-                                       {:id     :ex/bart
-                                        :ex/mom {:id :ex/marge}}]})
+          db3    @(fluree/update db2* {"@context" [test-utils/default-context
+                                                   {:ex    "http://example.org/ns/"
+                                                    :value "@value"
+                                                    :type  "@type"}]
+                                       "insert"
+                                       [{:id     :ex/marge
+                                         :ex/son {:id :ex/bart}}
+                                        {:id     :ex/bart
+                                         :ex/mom {:id :ex/marge}}]})
           db3*   @(fluree/commit! ledger db3)]
       (testing "using a specific t"
         (let [query   {:context [test-utils/default-context
@@ -547,26 +547,26 @@
 (deftest ^:integration subject-object-test
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "test/love")
-        db     @(fluree/stage (fluree/db ledger)
-                              {"@context" {"id"     "@id",
-                                           "type"   "@type",
-                                           "ex"     "http://example.org/",
-                                           "f"      "https://ns.flur.ee/ledger#",
-                                           "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-                                           "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
-                                           "schema" "http://schema.org/",
-                                           "xsd"    "http://www.w3.org/2001/XMLSchema#"}
-                               "insert"
-                               [{"@id"                "ex:fluree",
-                                 "@type"              "schema:Organization",
-                                 "schema:description" "We ❤️ Data"}
-                                {"@id"                "ex:w3c",
-                                 "@type"              "schema:Organization",
-                                 "schema:description" "We ❤️ Internet"}
-                                {"@id"                "ex:mosquitos",
-                                 "@type"              "ex:Monster",
-                                 "schema:description" "We ❤️ Human Blood"}]}
-                              {})]
+        db     @(fluree/update (fluree/db ledger)
+                               {"@context" {"id"     "@id",
+                                            "type"   "@type",
+                                            "ex"     "http://example.org/",
+                                            "f"      "https://ns.flur.ee/ledger#",
+                                            "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                                            "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
+                                            "schema" "http://schema.org/",
+                                            "xsd"    "http://www.w3.org/2001/XMLSchema#"}
+                                "insert"
+                                [{"@id"                "ex:fluree",
+                                  "@type"              "schema:Organization",
+                                  "schema:description" "We ❤️ Data"}
+                                 {"@id"                "ex:w3c",
+                                  "@type"              "schema:Organization",
+                                  "schema:description" "We ❤️ Internet"}
+                                 {"@id"                "ex:mosquitos",
+                                  "@type"              "ex:Monster",
+                                  "schema:description" "We ❤️ Human Blood"}]}
+                               {})]
     (testing "subject-object scans"
       (let [q       {:context {"id"     "@id",
                                "type"   "@type",

@@ -10,7 +10,7 @@
           ledger    @(fluree/create conn "policy/class-policy-query")
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
-          db        @(fluree/stage
+          db        @(fluree/update
                       (fluree/db ledger)
                       {"@context" {"ex"     "http://example.org/ns/"
                                    "schema" "http://schema.org/"

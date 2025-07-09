@@ -8,10 +8,10 @@
 (deftest ^:integration result-formatting
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query-context")
-        db     @(fluree/stage (fluree/db ledger) {"@context" [test-utils/default-context
-                                                              {:ex "http://example.org/ns/"}]
-                                                  "insert"   [{:id :ex/dan :ex/x 1}
-                                                              {:id :ex/wes :ex/x 2}]})]
+        db     @(fluree/update (fluree/db ledger) {"@context" [test-utils/default-context
+                                                               {:ex "http://example.org/ns/"}]
+                                                   "insert"   [{:id :ex/dan :ex/x 1}
+                                                               {:id :ex/wes :ex/x 2}]})]
 
     @(fluree/commit! ledger db)
 
@@ -81,7 +81,7 @@
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/everything")
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"@context" [test-utils/default-context
                                 {:ex "http://example.org/ns/"}]
@@ -244,7 +244,7 @@
 (deftest ^:integration class-queries
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/class")
-        db     @(fluree/stage
+        db     @(fluree/update
                  (fluree/db ledger)
                  {"@context" [test-utils/default-context
                               {:ex "http://example.org/ns/"}]
@@ -281,7 +281,7 @@
                                      :select  '[?s ?class]
                                      :where   '{:id ?s, :type ?class}})))))
     (testing "shacl targetClass"
-      (let [shacl-db @(fluree/stage
+      (let [shacl-db @(fluree/update
                        (fluree/db ledger)
                        {"@context" [test-utils/default-context
                                     {:ex "http://example.org/ns/"}]
@@ -301,25 +301,25 @@
   (let [conn   @(fluree/connect-memory)
         ledger @(fluree/create conn "type-handling")
         db0    (fluree/db ledger)
-        db1    @(fluree/stage db0 {"@context" [test-utils/default-str-context
-                                               {"ex" "http://example.org/ns/"}]
-                                   "insert"   [{"id"   "ex:ace"
-                                                "type" "ex:Spade"}
-                                               {"id"   "ex:king"
-                                                "type" "ex:Heart"}
-                                               {"id"   "ex:queen"
-                                                "type" "ex:Heart"}
-                                               {"id"   "ex:jack"
-                                                "type" "ex:Club"}]})
-        db2    @(fluree/stage db1 {"@context" [test-utils/default-str-context
-                                               {"ex" "http://example.org/ns/"}]
-                                   "insert"   [{"id"       "ex:two"
-                                                "rdf:type" "ex:Diamond"}]})
-        db3    @(fluree/stage db1 {"@context" [test-utils/default-str-context
-                                               {"ex" "http://example.org/ns/"}
-                                               {"rdf:type" "@type"}]
-                                   "insert"   {"id"       "ex:two"
-                                               "rdf:type" "ex:Diamond"}})]
+        db1    @(fluree/update db0 {"@context" [test-utils/default-str-context
+                                                {"ex" "http://example.org/ns/"}]
+                                    "insert"   [{"id"   "ex:ace"
+                                                 "type" "ex:Spade"}
+                                                {"id"   "ex:king"
+                                                 "type" "ex:Heart"}
+                                                {"id"   "ex:queen"
+                                                 "type" "ex:Heart"}
+                                                {"id"   "ex:jack"
+                                                 "type" "ex:Club"}]})
+        db2    @(fluree/update db1 {"@context" [test-utils/default-str-context
+                                                {"ex" "http://example.org/ns/"}]
+                                    "insert"   [{"id"       "ex:two"
+                                                 "rdf:type" "ex:Diamond"}]})
+        db3    @(fluree/update db1 {"@context" [test-utils/default-str-context
+                                                {"ex" "http://example.org/ns/"}
+                                                {"rdf:type" "@type"}]
+                                    "insert"   {"id"       "ex:two"
+                                                "rdf:type" "ex:Diamond"}})]
     (is (= #{{"id" "ex:queen" "type" "ex:Heart"}
              {"id" "ex:king" "type" "ex:Heart"}}
            (set @(fluree/query db1 {"@context" [test-utils/default-str-context
@@ -365,10 +365,10 @@
           ledger @(fluree/create conn "dup-flakes")
           db0    (fluree/db ledger)
           tx     {"insert" {"@id" "ex:1" "ex:foo" 30}}
-          db1    @(fluree/stage db0 tx)
+          db1    @(fluree/update db0 tx)
           ;; advance the `t`
           db2    @(fluree/commit! ledger db1)
-          db3    @(fluree/stage db2 tx)]
+          db3    @(fluree/update db2 tx)]
       (testing "do not become multicardinal result values"
         (is (= [{"ex:foo" 30, "@id" "ex:1"}]
                @(fluree/query db3 {"select" {"ex:1" ["*"]}})))))))
@@ -377,9 +377,9 @@
   (let [conn @(fluree/connect-memory)
         ledger @(fluree/create conn "base")
         db0 (fluree/db ledger)
-        db1 @(fluree/stage db0 {"@context" {"@base" "https://flur.ee/" "ex" "http://example.com/"}
-                                "insert" [{"@id" "freddy" "@type" "Yeti" "name" "Freddy"}
-                                          {"@id" "ex:betty" "@type" "Yeti" "name" "Betty"}]})]
+        db1 @(fluree/update db0 {"@context" {"@base" "https://flur.ee/" "ex" "http://example.com/"}
+                                 "insert" [{"@id" "freddy" "@type" "Yeti" "name" "Freddy"}
+                                           {"@id" "ex:betty" "@type" "Yeti" "name" "Betty"}]})]
     (is (= [["name" "Freddy"]
             ["@type" "Yeti"]]
            @(fluree/query db1 {"@context" {"@base" "https://flur.ee/"}

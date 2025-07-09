@@ -1,6 +1,7 @@
 # Fluree Namespace Variables Reference
 
-This document provides a comprehensive list of all Fluree namespace variables used in the codebase.
+This document provides a comprehensive list of all Fluree namespace variables
+used in the codebase.
 
 ## Namespace Definitions
 
@@ -82,8 +83,10 @@ The primary Fluree namespaces are defined in `/src/fluree/db/json_ld/iri.cljc`:
 | `f:targetSubject` | Target subject for policy | ✅ `iri-target-subject` |
 | `f:targetProperty` | Target property for policy | ✅ `iri-target-property` |
 | `f:targetObjectsOf` | Target objects of property | ✅ `iri-target-objects-of` |
-| `f:onProperty` | Property constraint (legacy) | ✅ `iri-onProperty` | ⚠️ **LEGACY**: Use `f:targetProperty` instead |
-| `f:onSubject` | Subject constraint | ✅ `iri-onSubject` | ⚠️ **LEGACY**: Use `f:targetSubject` instead |
+| `f:onProperty` | Property constraint (legacy) | ✅ `iri-onProperty` | ⚠️
+**LEGACY**: Use `f:targetProperty` instead |
+| `f:onSubject` | Subject constraint | ✅ `iri-onSubject` | ⚠️ **LEGACY**: Use
+`f:targetSubject` instead |
 
 ### Policy Logic
 | Variable | Description | Defined in constants.cljc |
