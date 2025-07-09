@@ -51,15 +51,12 @@
                     {:status 400 :error :db/invalid-connection}))))
 
 (defn connect
-  "Forms connection to ledger, enabling automatic pulls of new updates, event
-  services, index service.
+  "Creates a connection from a JSON-LD configuration map.
 
-  Multiple connections to same endpoint will share underlying network
-  connection.
+  Config should contain @graph with storage, connection, and optional system definitions.
+  Returns a promise that resolves to a connection object.
 
-  Options include:
-    - did - (optional) DId information to use, if storing blocks as verifiable
-            credentials, or issuing queries against a permissioned database."
+  See documentation for configuration schema."
   [config]
   ;; TODO - do some validation
   (promise-wrap
@@ -73,6 +70,8 @@
        (assoc conn ::system-map system-map)))))
 
 (defn disconnect
+  "Terminates a connection and releases associated resources.
+  Returns a promise that resolves when disconnection is complete."
   [conn]
   (promise-wrap
    (go-try
@@ -95,8 +94,12 @@
             m))
 
 (defn connect-memory
-  "Forms an in-memory connection using default settings.
-  - did - (optional) DId information to use, if storing blocks as verifiable credentials"
+  "Creates an in-memory connection with default settings.
+
+  Options map (all optional):
+    :parallelism - Number of parallel operations (default: 4)
+    :cache-max-mb - Maximum cache size in MB (default: 1000)
+    :defaults - Default settings map for operations"
   ([]
    (connect-memory {}))
   ([{:keys [parallelism cache-max-mb defaults],
@@ -118,6 +121,13 @@
      (connect memory-config))))
 
 (defn connect-file
+  "Creates a file-based connection.
+
+  Options map (all optional):
+    :storage-path - Directory for storage (default: \"data\")
+    :parallelism - Number of parallel operations (default: 4)
+    :cache-max-mb - Maximum cache size in MB (default: 1000)
+    :defaults - Default settings map for operations"
   ([]
    (connect-file {}))
   ([{:keys [storage-path parallelism cache-max-mb defaults],
@@ -187,23 +197,16 @@
   (connection/fluree-address? ledger-alias-or-address))
 
 (defn create
-  "Creates a new json-ld ledger. A connection (conn)
-  must always be supplied.
+  "Creates a new ledger with an initial empty commit at t=0.
 
-  Ledger-name (optional) is a friendly name that is used for:
-  - When publishing to a naming service that allows multiple pointers for the
-    same namespace (e.g. IPNS), this becomes a sub-directory off the namespace.
-    For multple directories deep, use '/' for a
-    e.g. the ledgers movies/popular, books/authors, books/best-sellers could
-    use the same IPNS id (in this example using IPNS DNSLink):
-    fluree:ipns://my.dns.com/books/authors
-    fluree:ipns://my.dns.com/books/best-sellers
-    fluree:ipns://my.dns.com/movies/top-rated
-  - When combining multiple ledgers, each ledger becomes an individual named
-    graph which can be referenced by name.
-
-  Options map (opts) can include:
-  - did - DId information to use, if storing blocks as verifiable credentials"
+  Parameters:
+    conn - Connection object
+    ledger-alias - Unique alias/name for the ledger
+    opts - (optional) Options map:
+      :branch - Branch name (default: \"main\")
+      :did - DID for signing commits
+      :context - Default JSON-LD context
+      :indexing - Indexing configuration"
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
    (validate-connection conn)
@@ -213,21 +216,24 @@
       (connection/create-ledger conn ledger-alias opts)))))
 
 (defn alias->address
-  "Returns a core.async channel with the connection-specific address of the
-  given ledger-alias."
+  "Resolves a ledger alias to its address.
+
+  Returns a core.async channel containing the address."
   [conn ledger-alias]
   (validate-connection conn)
   (connection/primary-address conn ledger-alias))
 
 (defn load
-  "Loads an existing ledger by its alias (which will be converted to a
-  connection-specific address first)."
+  "Loads an existing ledger by alias or address.
+  Returns a promise that resolves to the ledger object."
   [conn alias-or-address]
   (validate-connection conn)
   (promise-wrap
    (connection/load-ledger conn alias-or-address)))
 
 (defn drop
+  "Deletes a ledger and its associated data.
+  Returns a promise that resolves when deletion is complete."
   [conn ledger-alias]
   (promise-wrap
    (connection/drop-ledger conn ledger-alias)))
@@ -246,87 +252,101 @@
        (<? (connection/ledger-exists? conn address))))))
 
 (defn notify
-  "Notifies the connection of a new commit stored at address `commit-address`.
+  "Notifies the connection of a new commit for maintaining current db state.
 
-  If the connection knows of the ledger, and is currently maintaining an
-  in-memory version of the ledger, will attempt to update the db if the commit
-  is for the next 't' value. If a commit is for a past 't' value, noop. If
-  commit is for a future 't' value, will drop in-memory ledger for reload upon
-  next request."
+  Parameters:
+    conn - Connection object
+    commit-address - Address where commit is stored
+    commit-hash - Hash of the commit
+
+  Updates in-memory ledger if commit is next in sequence.
+  Returns promise resolving when notification is processed."
   [conn commit-address commit-hash]
   (validate-connection conn)
   (promise-wrap
    (connection/notify conn commit-address commit-hash)))
 
 (defn insert
-  "Inserts a new set of data into the database if valid (does not commit).
-   Multiple inserts and updates can be staged together and will be merged into a single
-   transaction when committed.
+  "Stages insertion of new entities into a database.
 
-   Supports JSON-LD (default) and Turtle (TTL) formats.
+  Parameters:
+    db - Database value
+    rdf - JSON-LD or Turtle RDF data to insert
+    opts - (optional) Options map:
+      :context - Context override (ignored if present in json-ld)
+      :format - Data format (:json-ld default, or :turtle)
 
-   The 'opts' key is a map with the following key options:
-    - `:context` - (optional) and externally provided context that will be used
-                   for JSON-LD document expansition, the @context in the json-ld
-                   will be ignored if present.
-    - `:format`  - (optional) the format of the data, currently json-ld is assumed
-                  unless `:format` is set to `:turtle`. If `:turtle` is set,
-                  the `:context` option will be ignored if provided."
-  ([db json-ld] (insert db json-ld nil))
-  ([db json-ld opts]
+  Throws exception if any entity @id already exists.
+  For insert-or-update behavior, use `upsert`.
+
+  Returns promise resolving to updated database."
+  ([db rdf] (insert db rdf nil))
+  ([db rdf opts]
    (promise-wrap
-    (transact-api/insert db json-ld opts))))
+    (transact-api/insert db rdf opts))))
 
 (defn upsert
-  "Performs an upsert operation, which will insert the data if it does not exist,
-   or update the existing data if it does. This is useful for ensuring that a
-   specific document is present in the database with the desired values.
+  "Stages insertion or update of entities.
 
-   Supports JSON-LD and Turtle (TTL) formats.
+  Parameters:
+    db - Database value
+    rdf - JSON-LD or Turtle RDF data to upsert
+    opts - (optional) Options map:
+      :context - Context override (ignored if present in json-ld)
+      :format - Data format (:json-ld default, or :turtle)
 
-   The 'opts' key is a map with the following key options:
-    - `:context` - (optional) and externally provided context that will be used
-                   for document expansion, the @context in the json-ld will be
-                   ignored if present.
-   - `:format`  - (optional) the format of the data, currently json-ld is assumed
-                  unless `:format` is set to `:turtle`. If `:turtle` is set,
-                  the `:context` option will be ignored if provided.
+  Creates new entities or updates existing ones based on @id.
 
-   The data is expected to be in JSON-LD format, and will be expanded before
-   being inserted into the database."
-  ([db json-ld] (upsert db json-ld nil))
-  ([db json-ld opts]
+  Returns promise resolving to updated database."
+  ([db rdf] (upsert db rdf nil))
+  ([db rdf opts]
    (promise-wrap
-    (transact-api/upsert db json-ld opts))))
+    (transact-api/upsert db rdf opts))))
 
 (defn update
-  "Performs an update and queues change if valid (does not commit).
-   Multiple updates can be staged together and will be merged into a single
-   transaction when committed."
+  "Stages updates to a database without committing.
+
+  Parameters:
+    db - Database value
+    json-ld - JSON-LD document with transaction operations
+    opts - (optional) Options map:
+      :context - Override default context
+
+  Multiple updates can be staged and committed together.
+  Returns promise resolving to updated database."
   ([db json-ld] (update db json-ld nil))
   ([db json-ld opts]
    (promise-wrap
     (transact-api/update db json-ld opts))))
 
 ;; TODO - deprecate `stage` in favor of `update` eventually
-(defn stage
+(defn ^:deprecated stage
   "Renamed to `update`, prefer that API instead."
   ([db json-ld] (update db json-ld nil))
   ([db json-ld opts] (update db json-ld opts)))
 
 (defn format-txn
-  "Reformats the transaction `txn` as JSON-QL if it is formatted as SPARQL,
-  returning it unchanged otherwise."
+  "Converts SPARQL Update syntax to Fluree transaction format.
+
+  Parameters:
+    txn - Transaction data (string or map)
+    override-opts - Options map with :format key
+
+  If :format is :sparql, parses SPARQL Update and converts to FQL.
+  Otherwise returns txn unchanged."
   [txn override-opts]
   (parse/parse-sparql txn override-opts))
 
 (defn commit!
-  "Commits a staged database to the ledger with all changes since the last commit
-  aggregated together.
+  "Persists a staged database as a new immutable version in the ledger.
 
-  Commits are tracked in the local environment, but if the ledger is distributed
-  it will still need a 'push' to ensure it is published and verified as per the
-  distributed rules."
+  Parameters:
+    ledger - Ledger object
+    db - Staged database with changes
+    opts - (optional) Options map
+
+  Creates a new commit and notifies the nameservice of the new version.
+  Returns promise resolving to the committed database."
   ([ledger db]
    (promise-wrap
     (transact/commit! ledger db {})))
@@ -334,8 +354,10 @@
    (promise-wrap
     (transact/commit! ledger db opts))))
 
-(defn transact!
-  "Stages the given transaction with update semantics and then commits."
+(defn ^:deprecated transact!
+  "Deprecated: Use `update!` instead.
+  
+  Updates a ledger and commits the changes in one operation."
   ([conn txn] (transact! conn txn nil))
   ([conn txn opts]
    (validate-connection conn)
@@ -343,7 +365,18 @@
     (transact-api/update! conn txn opts))))
 
 (defn update!
-  "Stages the given transaction with update semantics and then commits."
+  "Stages updates to a database and commits in one atomic operation.
+
+  Parameters:
+    conn - Connection object
+    txn - Transaction map with:
+      'from' or 'ledger' - Ledger identifier
+      JSON-LD document with transaction operations
+    opts - (optional) Options map:
+      :context - Override default context
+
+  Equivalent to calling `update` then `commit!`.
+  Returns promise resolving to committed database."
   ([conn txn] (update! conn txn nil))
   ([conn txn opts]
    (validate-connection conn)
@@ -351,7 +384,19 @@
     (transact-api/update! conn txn opts))))
 
 (defn upsert!
-  "Stages the given transaction with upsert semantics and then commits."
+  "Stages insertion or update of entities and commits in one atomic operation.
+
+  Parameters:
+    conn - Connection object
+    ledger-id - Ledger alias or address
+    rdf - JSON-LD or Turtle RDF data to upsert
+    opts - (optional) Options map:
+      :context - Context override (ignored if present in json-ld)
+      :format - Data format (:json-ld default, or :turtle)
+
+  Creates new entities or updates existing ones based on @id.
+  Equivalent to calling `upsert` then `commit!`.
+  Returns promise resolving to committed database."
   ([conn ledger-id txn] (upsert! conn ledger-id txn nil))
   ([conn ledger-id txn opts]
    (validate-connection conn)
@@ -359,21 +404,64 @@
     (transact-api/upsert! conn ledger-id txn opts))))
 
 (defn insert!
-  "Stages the given transaction with insert semantics and then commits."
+  "Stages insertion of new entities and commits in one atomic operation.
+
+  Parameters:
+    conn - Connection object
+    ledger-id - Ledger alias or address
+    rdf - JSON-LD or Turtle RDF data to insert
+    opts - (optional) Options map:
+      :context - Context override (ignored if present in json-ld)
+      :format - Data format (:json-ld default, or :turtle)
+
+  Throws exception if any entity @id already exists.
+  For insert-or-update behavior, use `upsert!`.
+  Equivalent to calling `insert` then `commit!`.
+  Returns promise resolving to committed database."
   ([conn ledger-id txn] (insert! conn ledger-id txn nil))
   ([conn ledger-id txn opts]
    (validate-connection conn)
    (promise-wrap
     (transact-api/insert! conn ledger-id txn opts))))
 
-(defn credential-transact!
-  ([conn txn] (credential-transact! conn txn nil))
-  ([conn txn opts]
+(defn credential-update!
+  "Stages updates to a database and commits using a verifiable credential.
+
+  Parameters:
+    conn - Connection object
+    credential - Verifiable credential containing transaction with:
+      'from' or 'ledger' - Ledger identifier
+      JSON-LD document with transaction operations
+    opts - (optional) Options map:
+      :context - Override default context
+
+  Verifies credential signature and applies identity-based policies.
+  Equivalent to calling `update!` with credential verification.
+  Returns promise resolving to committed database."
+  ([conn credential] (credential-update! conn credential nil))
+  ([conn credential opts]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/credential-transact! conn txn opts))))
+    (transact-api/credential-transact! conn credential opts))))
+
+(defn ^:deprecated credential-transact!
+  "Deprecated: Use `credential-update!` instead.
+  
+  Executes a transaction using a verifiable credential."
+  ([conn txn] (credential-update! conn txn nil))
+  ([conn txn opts] (credential-update! conn txn opts)))
 
 (defn create-with-txn
+  "Creates a new ledger and applies an initial transaction.
+
+  Parameters:
+    conn - Connection object
+    txn - Transaction map containing:
+      'ledger' - Ledger alias (required)
+      'insert'/'delete'/'where' - Transaction operations
+    opts - (optional) Additional options
+
+  Returns promise resolving to initial database."
   ([conn txn]
    (validate-connection conn)
    (promise-wrap
@@ -384,21 +472,32 @@
     (transact-api/create-with-txn conn txn opts))))
 
 (defn status
-  "Returns current status of ledger branch."
+  "Returns current status of a ledger branch.
+
+  Parameters:
+    ledger - Ledger object
+    branch - (optional) Branch name (default: current branch)
+
+  Returns status map with commit and index information."
   ([ledger] (ledger/status ledger))
   ([ledger branch] (ledger/status ledger branch)))
 
 ;; db operations
 
 (defn db
-  "Retrieves latest db, or optionally a db at a moment in time
-  and/or permissioned to a specific identity."
+  "Returns the current database value from a ledger."
   [ledger]
   (ledger/current-db ledger))
 
 (defn wrap-policy
-  "Restricts the provided db with the provided json-ld
-  policy restrictions"
+  "Applies policy restrictions to a database.
+
+  Parameters:
+    db - Database value
+    policy - JSON-LD policy document
+    policy-values - (optional) Values for policy variables
+
+  Returns promise resolving to policy-wrapped database."
   ([db policy]
    (wrap-policy db policy nil))
   ([db policy policy-values]
@@ -407,8 +506,15 @@
       (policy/wrap-policy db policy* policy-values)))))
 
 (defn wrap-class-policy
-  "Restricts the provided db with policies in the db
-  which have a class @type of the provided class(es)."
+  "Applies policy restrictions based on policy classes in the database.
+
+  Parameters:
+    db - Database value
+    policy-classes - IRI or vector of IRIs of policy classes
+    policy-values - (optional) Values for policy variables
+
+  Finds and applies all policies with matching @type.
+  Returns promise resolving to policy-wrapped database."
   ([db policy-classes]
    (wrap-class-policy db policy-classes nil))
   ([db policy-classes policy-values]
@@ -416,12 +522,17 @@
     (policy/wrap-class-policy db nil policy-classes policy-values))))
 
 (defn wrap-identity-policy
-  "For provided identity, locates specific property f:policyClass on
-  the identity containing a list of class IRIs that identity the policies
-  that should be applied to the identity.
+  "Applies policy restrictions based on an identity's policy classes.
 
-  With the policy classes, finds all policies containing that class
-  declaration."
+  Parameters:
+    db - Database value
+    identity - IRI of the identity
+    policy-values - (optional) Values for policy variables
+
+  Looks up the identity's f:policyClass property and applies
+  all policies with those class IRIs.
+
+  Returns promise resolving to policy-wrapped database."
   ([db identity]
    (wrap-identity-policy db identity nil))
   ([db identity policy-values]
@@ -455,7 +566,14 @@
    (query-api/dataset named-graphs default-graphs)))
 
 (defn query
-  "Queries a dataset or single db and returns a promise with the results."
+  "Executes a query against a database or dataset.
+
+  Parameters:
+    ds - Database value or dataset
+    q - Query map (JSON-LD or analytical)
+    opts - (optional) Options map
+
+  Returns promise resolving to query results."
   ([ds q]
    (query ds q {}))
   ([ds q opts]
@@ -464,12 +582,17 @@
      (promise-wrap (query-api/query ds q opts)))))
 
 (defn credential-query
-  "Issues a policy-enforced query to the specified dataset/db as a verifiable
-  credential.
+  "Executes a query using a verifiable credential.
 
-  Extracts the query from the credential, and cryptographically verifies the
-  signing identity, which is then used by `wrap-identity-policy` to extract
-  the policy classes and apply the policies to the query."
+  Parameters:
+    ds - Database value or dataset
+    cred-query - Verifiable credential containing query
+    opts - (optional) Options map:
+      :values-map - Values for policy variables
+      :format - Query format (:sparql or default)
+
+  Verifies credential signature and applies identity-based policies.
+  Returns promise resolving to query results."
   ([ds cred-query] (credential-query ds cred-query {}))
   ([ds cred-query {:keys [values-map format] :as opts}]
    (promise-wrap
@@ -482,15 +605,30 @@
           (<? (query-api/query policy-db query opts))))))))
 
 (defn query-connection
-  "Queries the latest db in the ledger specified by the 'from' parameter in the
-  query (what that actually looks like is format-specific). Returns a promise
-  with the results."
+  "Executes a query using the connection's query engine.
+
+  Parameters:
+    conn - Connection object
+    q - Query map with 'from' key specifying ledger
+    opts - (optional) Options map
+
+  Uses the current database state at query time.
+  Returns promise resolving to query results."
   ([conn q] (query-connection conn q {}))
   ([conn q opts]
    (validate-connection conn)
    (promise-wrap (query-api/query-connection conn q opts))))
 
 (defn credential-query-connection
+  "Executes a query via connection using a verifiable credential.
+
+  Parameters:
+    conn - Connection object
+    cred-query - Verifiable credential containing query
+    opts - (optional) Options map
+
+  Verifies credential and applies identity-based policies.
+  Returns promise resolving to query results."
   ([conn cred-query] (credential-query-connection conn cred-query {}))
   ([conn cred-query {:keys [format] :as opts}]
    (validate-connection conn)
@@ -503,8 +641,17 @@
         @(query-connection conn query (assoc opts :identity identity)))))))
 
 (defn history
-  "Return the change history over a specified time range. Optionally include the commit
-  that produced the changes."
+  "Queries the history of entities across commits.
+
+  Parameters:
+    ledger - Ledger object
+    query - Query map with:
+      'history' - Subject IRI or pattern
+      't' - Specific time or {'from': t1, 'to': t2}
+      'commit-details' - Include commit metadata (default: false)
+    opts - (optional) Options map
+
+  Returns promise resolving to historical flakes."
   ([ledger query]
    (history ledger query nil))
   ([ledger query override-opts]
@@ -512,12 +659,15 @@
     (query-api/history ledger query override-opts))))
 
 (defn credential-history
-  "Issues a policy-enforced history query to the specified ledger as a
-  verifiable credential.
+  "Executes a history query using a verifiable credential.
 
-  Extracts the query from the credential, and cryptographically verifies the
-  signing identity, which is then used by `wrap-identity-policy` to extract
-  the policy classes and apply the policies to the query."
+  Parameters:
+    ledger - Ledger object
+    cred-query - Verifiable credential containing history query
+    opts - (optional) Options map
+
+  Verifies credential and applies identity-based policies.
+  Returns promise resolving to historical data."
   ([ledger cred-query] (credential-history ledger cred-query {}))
   ([ledger cred-query override-opts]
    (promise-wrap
@@ -526,8 +676,17 @@
         (<? (query-api/history ledger query (assoc override-opts :identity identity))))))))
 
 (defn range
-  "Performs a range scan against the specified index using test functions
-  of >=, <=, >, <"
+  "Performs a range scan on a database index.
+
+  Parameters:
+    db - Database value
+    index - Index name (:spot, :psot, :post, :opst, :tspo)
+    test - Test function (>=, <=, >, <) or start-test for two-sided
+    match - Value to match or start-match for two-sided
+    end-test - (optional) End test function for two-sided range
+    end-match - (optional) End value for two-sided range
+
+  Returns promise resolving to matching flakes."
   ;; TODO - assert index is valid index type
   ([db index test match]
    (promise-wrap
@@ -537,44 +696,67 @@
     (query-range/index-range db nil index start-test start-match end-test end-match))))
 
 (defn slice
-  "Like range, but returns all flakes that match the supplied flake parts."
+  "Returns all flakes that exactly match the supplied pattern.
+
+  Parameters:
+    db - Database value
+    index - Index name (:spot, :psot, :post, :opst, :tspo)
+    match - Flake pattern to match
+
+  Returns promise resolving to matching flakes."
   [db index match]
   (promise-wrap
    (query-range/index-range db index = match)))
 
 (defn expand-iri
-  "Expands given IRI with the default database context, or provided context."
+  "Expands a compact IRI to its full form using the context.
+
+  Parameters:
+    context - JSON-LD context for expansion
+    compact-iri - The compact IRI to expand
+
+  Returns the expanded IRI string."
   ([context compact-iri]
    (json-ld/expand-iri compact-iri
                        (json-ld/parse-context context))))
 
 (defn encode-iri
-  "Returns the internal Fluree IRI identifier (a compact form).
-  This can be used for doing range scans, slices and for other
-  more advanced needs."
+  "Encodes an IRI to Fluree's internal compact format.
+
+  Parameters:
+    db - Database value  
+    iri - IRI string to encode
+
+  Used for range scans, slices and advanced index operations.
+  Returns the encoded identifier."
   [db iri]
   (iri/encode-iri db iri))
 
 (defn decode-iri
-  "Opposite of encode-iri. When doing more advanced features
-  like direct range-scans of indexes, IRIs are returned in their
-  internal compact format. This allows the IRI to be returned
-  as a full string IRI."
+  "Decodes a Fluree internal identifier back to an IRI string.
+
+  Parameters:
+    db - Database value
+    iri - Encoded identifier to decode
+
+  Opposite of encode-iri. Used when working with raw index data.
+  Returns the full IRI string."
   [db iri]
   (iri/decode-sid db iri))
 
 ;; reasoning APIs
 
 (defn reason
-  "Sets the reasoner methods(s) to perform on a db.
-  Supported methods are :datalog and :owl2rl.
-  One or more methods can be supplied as a sequential list/vector.
+  "Applies reasoning rules to a database.
 
-  Reasoning is done in-memory at the db-level and is not persisted.
+  Parameters:
+    db - Database value
+    methods - Reasoner method or vector of methods (:datalog, :owl2rl)
+    rule-sources - (optional) JSON-LD rules or nil to use rules from db
+    opts - (optional) Options map
 
-  A rules graph containing rules in JSON-LD format can be supplied,
-  or if no rules graph is supplied, the rules will be looked for within
-  the db itself."
+  Reasoning is done in-memory and not persisted.
+  Returns promise resolving to reasoning-enabled database."
   ([db methods] (reason db methods nil nil))
   ([db methods rule-sources] (reason db methods rule-sources nil))
   ([db methods rule-sources opts]
@@ -582,25 +764,22 @@
     (reasoner/reason db methods rule-sources opts))))
 
 (defn reasoned-count
-  "Returns a count of reasoned facts in the provided db."
+  "Returns the number of facts inferred by reasoning.
+
+  Must have reasoning enabled on the database."
   [db]
   (reasoner/reasoned-count db))
 
 (defn reasoned-facts
-  "Returns all reasoned facts in the provided db as  4-tuples of:
-  [subject property object rule-iri]
-  where the rule-iri is the @id of the rule that generated the fact
+  "Returns facts inferred by reasoning.
 
-  Returns 4-tuples of  where
-  the rule-iri is the @id of the rule that generated the fact.
+  Parameters:
+    db - Database value with reasoning enabled
+    opts - (optional) Options map:
+      :group-by - Grouping option (:rule, :subject, or :property)
 
-  NOTE: Currently returns internal fluree ids for subject, property and object.
-  This will be changed to return IRIs in a future release.
-
-  Optional opts map specified grouping, or no grouping (default):
-  {:group-by :rule} - group by rule IRI
-  {:group-by :subject} - group by the reasoned triples' subject
-  {:group-by ::property} - group by the reasoned triples' property IRI"
+  Returns 4-tuples of [subject-iri property-iri object rule-id]
+  where rule-id is the identifier of the rule that generated the fact."
   ([db] (reasoned-facts db nil))
   ([db opts]
    (let [grouping (:group-by opts)]
