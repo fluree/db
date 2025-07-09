@@ -14,7 +14,7 @@
             [fluree.db.query.fql :as fql]
             [fluree.db.query.range :as query-range]
             [fluree.db.serde.json :as serdejson]
-            [fluree.db.util.async :refer [<? <?? go-try merge-into?]]
+            [fluree.db.util.async :refer [<? <?? go-try]]
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]))
 

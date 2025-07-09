@@ -1,13 +1,7 @@
 (ns fluree.db.util.async
-  (:require
-   [clojure.core.async :as async]
-   [clojure.core.async.impl.protocols :as async-protocols]
-   [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]])
-  #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
+  (:require [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-;; some macros for working with core async
 
 #?(:clj
    (defn cljs-env?
@@ -42,13 +36,6 @@
      `(throw-err (clojure.core.async/<!! ~ch))))
 
 #?(:clj
-   (defmacro alts??
-     "Like alts!! but throws errors. Only works for Java platform - no JavaScript."
-     [ports & opts]
-     `(let [[result# ch#] (clojure.core.async/alts!! ~ports ~@opts)]
-        [(throw-err result#) ch#])))
-
-#?(:clj
    (defmacro go-try
      "Like go but catches the first thrown error and puts it on the returned channel."
      [& body]
@@ -61,47 +48,3 @@
          (try
            ~@body
            (catch Throwable t# t#))))))
-
-(defn throw-if-exception
-  "Helper method that checks if x is Exception and if yes, wraps it in a new
-  exception, passing though ex-data if any, and throws it. The wrapping is done
-  to maintain a full stack trace when jumping between multiple contexts."
-  [x]
-  (if (instance? #?(:clj Throwable :cljs js/Error) x)
-    (throw (ex-info #?(:clj (or (.getMessage ^Throwable x) (str x))
-                       :cljs (str x))
-                    (or (ex-data x) {})
-                    x))
-    x))
-
-(defn merge-into?
-  "Takes a sequence of single-value chans and returns the conjoined into collection.
-  Realizes entire channel sequence first, and if an error value exists returns just the exception."
-  [coll chs]
-  (async/go
-    (try*
-      (loop [[c & r] chs
-             acc coll]
-        (if-not c
-          acc
-          (recur r (conj acc (<? c)))))
-      (catch* e
-        e))))
-
-(defn into?
-  "Like async/into, but checks each item for an error response and returns exception
-  onto the response channel instead of results if there is one."
-  [coll chan]
-  (async/go
-    (try*
-      (loop [acc coll]
-        (if-some [v (<? chan)]
-          (recur (conj acc v))
-          acc))
-      (catch* e
-        e))))
-
-(defn channel?
-  "Returns true if core async channel."
-  [x]
-  (satisfies? async-protocols/Channel x))
