@@ -868,7 +868,7 @@
 (defmethod parse-term :QuadsNotTriples
   ;; QuadsNotTriples ::= <'GRAPH'> WS VarOrIri <'{'> WS TriplesTemplate? <'}'> WS
   [[_ graph-iri & triples]]
-  ;; This is how we would translate it if we supported it in FQL
+  ;; This is how we would translate it if we supported it in JSON-LD Query
   [(into [:graph (parse-term graph-iri)] (mapv parse-term triples))])
 
 (defmethod parse-term :Quads

@@ -332,7 +332,7 @@
     txn - Transaction data (string or map)
     override-opts - Options map with :format key
 
-  If :format is :sparql, parses SPARQL Update and converts to FQL.
+  If :format is :sparql, parses SPARQL Update and converts to JSON-LD Query.
   Otherwise returns txn unchanged."
   [txn override-opts]
   (parse/parse-sparql txn override-opts))

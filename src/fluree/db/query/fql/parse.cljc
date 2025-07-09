@@ -664,7 +664,7 @@
           (select/subgraph-selector var selection depth spec))
         (let [iri (json-ld/expand-iri subj context false)]
           (select/subgraph-selector iri selection depth spec))))
-    (throw (ex-info "Can only use subgraph selector with FQL output formatting."
+    (throw (ex-info "Can only use subgraph selector with JSON-LD Query output formatting."
                     {:status 400 :error :db/invalid-select}))))
 
 (defn parse-selector
