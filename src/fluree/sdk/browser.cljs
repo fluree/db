@@ -1,7 +1,5 @@
 (ns fluree.sdk.browser
-  (:require [clojure.walk :as walk]
-            [fluree.db.api :as fluree]
-            [fluree.db.async-db :as async-db]
+  (:require [fluree.db.api :as fluree]
             [fluree.db.util.log :as log]
             [fluree.sdk.version :refer [version]]))
 
