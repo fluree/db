@@ -1,5 +1,7 @@
 (ns fluree.sdk.browser
-  (:require [fluree.db.api :as fluree]
+  (:require [clojure.walk :as walk]
+            [fluree.db.api :as fluree]
+            [fluree.db.async-db :as async-db]
             [fluree.db.util.log :as log]
             [fluree.sdk.version :refer [version]]))
 
@@ -23,6 +25,34 @@
   [opts]
   (fluree/connect (js->clj opts :keywordize-keys false)))
 
+(defn ^:export connectMemory
+  [opts]
+  (fluree/connect-memory (js->clj opts :keywordize-keys true)))
+
+(defn ^:export connectLocalStorage
+  [opts]
+  (let [opts* (js->clj opts :keywordize-keys true)
+        storage-id (or (:storage-id opts*) "fluree-db")
+        config {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
+                            "@vocab" "https://ns.flur.ee/system#"}
+                "@id"      "localStorage"
+                "@graph"   [{"@id"          "localStorageStorage"
+                             "@type"        "Storage"
+                             "storageType"  "localstorage"
+                             "identifier"   storage-id}
+                            {"@id"              "connection"
+                             "@type"            "Connection"
+                             "parallelism"      (or (:parallelism opts*) 4)
+                             "cacheMaxMb"       (or (:cache-max-mb opts*) 100)
+                             "commitStorage"    {"@id" "localStorageStorage"}
+                             "indexStorage"     {"@id" "localStorageStorage"}
+                             "primaryPublisher" {"@type"   "Publisher"
+                                                 "storage" {"@id" "localStorageStorage"}}}]}
+        config* (if-let [defaults (:defaults opts*)]
+                  (assoc-in config ["@graph" 1 "defaults"] defaults)
+                  config)]
+    (fluree/connect config*)))
+
 (defn ^:export create
   ([conn ledger-alias] (fluree/create conn ledger-alias))
   ([conn ledger-alias opts] (fluree/create conn ledger-alias (js->clj opts :keywordize-keys true))))
@@ -42,11 +72,20 @@
                   (js->clj opts :keywordize-keys true))))
 
 (defn ^:export commit
-  ([ledger db] (.then (fluree/commit! ledger db)
-                      (fn [result] (clj->js result))))
+  ([ledger db] (fluree/commit! ledger db))
   ([ledger db opts] (.then (fluree/commit! ledger db
                                            (js->clj opts :keywordize-keys true))
-                           (fn [result] (clj->js result)))))
+                           (fn [result]
+                             (if (map? result)
+                               ;; If result is a map with :db key, handle it specially
+                               (let [db-val (:db result)
+                                     js-result (-> result
+                                                   (dissoc :db)
+                                                   clj->js)]
+                                 (aset js-result "db" db-val)
+                                 js-result)
+                               ;; Otherwise just return the db as-is
+                               result)))))
 
 (defn ^:export status
   ([ledger] (clj->js (fluree/status ledger)))
@@ -58,10 +97,7 @@
 
 (defn ^:export query
   [db query]
-  (let [query* (->> (js->clj query :keywordize-keys false)
-                    (reduce-kv (fn [acc k v]
-                                 (assoc acc (keyword k) v))
-                               {}))]
+  (let [query* (js->clj query :keywordize-keys false)]
     (.then (fluree/query db query*)
            (fn [result] (clj->js result)))))
 
@@ -83,13 +119,15 @@
     (log/set-level! (keyword level))))
 
 (def ^:export fluree-browser-sdk
-  #js {:commit          commit
-       :connect         connect
-       :create          create
-       :db              db
-       :exists          exists
-       :load            load
-       :query           query
-       :setLogging      setLogging
-       :stage           stage
-       :status          status})
+  #js {:commit               commit
+       :connect              connect
+       :connectMemory        connectMemory
+       :connectLocalStorage  connectLocalStorage
+       :create               create
+       :db                   db
+       :exists               exists
+       :load                 load
+       :query                query
+       :setLogging           setLogging
+       :stage                stage
+       :status               status})

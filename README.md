@@ -7,6 +7,7 @@ Usage [documentation](https://docs.fluree.com) is located at https://docs.fluree
 - **Official Documentation**: https://docs.fluree.com
 - **API Reference**: See below or run `make docs` to generate HTML documentation
 - **Additional Documentation**: See the [`docs/`](docs/) directory for:
+  - [JavaScript Developer Guide](docs/javascript-developers-guide.md) - Using Fluree with Node.js and browsers
   - [Clojure Developer Guide](docs/clojure_developer_guide.md) - Idiomatic Clojure usage with keywords and symbols
   - [JSON-LD Query Syntax Reference](docs/json_ld_query_syntax.md)
   - [Semantic Web Developer Guide](docs/semantic_web_guide.md) - Turtle, SPARQL, SHACL, OWL
