@@ -9,6 +9,7 @@
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql.syntax :as syntax]
+            [fluree.db.query.optimize :as optimize]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.query.sparql.translator :as sparql.translator]
             [fluree.db.query.turtle.parse :as turtle]
@@ -500,7 +501,8 @@
         attrs (dissoc m const/iri-id)]
     (if (empty? attrs)
       [(where/->pattern :id s-mch)]
-      (parse-statements s-mch attrs vars context))))
+      (let [statements (parse-statements s-mch attrs vars context)]
+        (sort optimize/compare-triples statements)))))
 
 (defn parse-node-map
   [m vars context]
