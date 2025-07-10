@@ -23,8 +23,8 @@
 
             ;; Read it back
             (let [read-back (async/<!! (storage/read-bytes encrypted-store test-path))]
-              (is (bytes? read-back) "Should return bytes")
-              (is (= test-data (String. read-back "UTF-8"))
+              (is (string? read-back) "Should return string")
+              (is (= test-data read-back)
                   "Data should be readable with correct key"))))
 
         (testing "Raw encrypted file is not readable as plaintext"
@@ -45,7 +45,7 @@
                 ;; AES decryption with wrong key should throw BadPaddingException
                 result (async/<!! (storage/read-bytes wrong-key-store test-path))]
             (is (instance? Throwable result) "Should return an exception")
-            (is (or (instance? javax.crypto.BadPaddingException (.getCause result))
+            (is (or (instance? javax.crypto.BadPaddingException (.getCause ^Throwable result))
                     (re-find #"BadPaddingException" (str result)))
                 "Should throw BadPaddingException when using wrong key")))
 
@@ -87,7 +87,7 @@
             ;; Write and read through the FileStore
             (async/<!! (storage/write-bytes file-store test-path test-bytes))
             (let [read-back (async/<!! (storage/read-bytes file-store test-path))]
-              (is (= test-data (String. read-back "UTF-8"))
+              (is (= test-data read-back)
                   "Data should be readable through FileStore"))
 
             ;; Verify raw file is encrypted

@@ -36,29 +36,8 @@
   (-read-json [_ address keywordize?]
     (go-try
       (let [path (storage-path root address)]
-        #?(:clj
-           ;; For Clojure, read raw bytes
-           (try
-             (let [file (java.io.File. path)]
-               (when (.exists file)
-                 (let [raw-bytes (java.nio.file.Files/readAllBytes (.toPath file))
-                       data (if encryption-key
-                              (String. (aes/decrypt raw-bytes encryption-key
-                                                    {:input-format :none
-                                                     :output-format :none}) "UTF-8")
-                              (String. raw-bytes "UTF-8"))]
-                   (json/parse data keywordize?))))
-             (catch java.io.FileNotFoundException _
-               nil))
-           :cljs
-           ;; For ClojureScript, use existing fs/read-file
-           (when-let [raw-data (<? (fs/read-file path))]
-             (let [data (if encryption-key
-                          (aes/decrypt raw-data encryption-key
-                                       {:input-format :none
-                                        :output-format :string})
-                          raw-data)]
-               (json/parse data keywordize?)))))))
+        (when-let [data (<? (fs/read-file path encryption-key))]
+          (json/parse data keywordize?)))))
 
   storage/EraseableStore
   (delete [_ address]
@@ -99,30 +78,9 @@
           (fs/write-file final-bytes))))
 
   (read-bytes [_ path]
-    (go-try
-      #?(:clj
-         ;; For Clojure, we need to read raw bytes
-         (let [file-path (full-path root path)]
-           (try
-             (let [file (java.io.File. file-path)]
-               (when (.exists file)
-                 (let [raw-bytes (java.nio.file.Files/readAllBytes (.toPath file))]
-                   (if encryption-key
-                     (aes/decrypt raw-bytes encryption-key
-                                  {:input-format :none
-                                   :output-format :none})
-                     raw-bytes))))
-             (catch java.io.FileNotFoundException _
-               nil)))
-         :cljs
-         ;; For ClojureScript, fs/read-file returns a string, need to handle differently
-         (when-let [raw-data (<? (fs/read-file (full-path root path)))]
-           (let [raw-bytes (bytes/string->UTF8 raw-data)]
-             (if encryption-key
-               (aes/decrypt raw-bytes encryption-key
-                            {:input-format :none
-                             :output-format :none})
-               raw-bytes)))))))
+    (-> root
+        (full-path path)
+        (fs/read-file encryption-key))))
 
 (defn open
   ([root-path]
