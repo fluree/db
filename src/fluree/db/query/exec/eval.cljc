@@ -14,7 +14,8 @@
             [fluree.db.util :as util]
             [fluree.db.util.log :as log]
             [fluree.db.vector.scoring :as score]
-            [fluree.json-ld :as json-ld])
+            [fluree.json-ld :as json-ld]
+            [sci.core :as sci])
   #?(:clj (:import (java.time LocalDateTime OffsetDateTime LocalDate OffsetTime LocalTime
                               ZoneId ZoneOffset))))
 
@@ -701,6 +702,42 @@
     cosineSimilarity  fluree.db.query.exec.eval/cosineSimilarity
     euclidianDistance fluree.db.query.exec.eval/euclideanDistance})
 
+;; SCI context for GraalVM-compatible code evaluation
+(defn create-sci-context []
+  (let [;; Build namespace bindings for all our functions
+        eval-ns-bindings (into {} 
+                              (map (fn [[k v]]
+                                    ;; Map the simple name to the actual function
+                                    [(symbol (name k)) (resolve v)])
+                                   qualified-symbols))
+        ;; Add special functions
+        eval-ns-bindings (assoc eval-ns-bindings
+                               '->typed-val where/->typed-val)
+        ;; Build qualified symbol mappings for user namespace
+        qualified-mappings (into {} 
+                                (map (fn [[k v]]
+                                      ;; Create qualified symbol mapping
+                                      [(symbol v) (resolve v)])
+                                     qualified-symbols))
+        qualified-mappings (assoc qualified-mappings
+                                 'fluree.db.query.exec.where/->typed-val where/->typed-val)]
+    (sci/init {:namespaces {;; Define the fluree.db.query.exec.eval namespace with all our functions
+                           'fluree.db.query.exec.eval eval-ns-bindings
+                           ;; Define the where namespace
+                           'fluree.db.query.exec.where {'->typed-val where/->typed-val}
+                           ;; Pre-import our namespaces in user namespace
+                           'user (merge 
+                                  ;; Include all eval functions directly in user namespace
+                                  eval-ns-bindings
+                                  ;; Include qualified symbol mappings
+                                  qualified-mappings
+                                  ;; Core functions that might be used
+                                  {'get get
+                                   'assoc assoc
+                                   '-> (with-meta '-> {:sci/macro true})
+                                   'clojure.core/fn (with-meta 'fn {:sci/macro true})
+                                   'clojure.core/let (with-meta 'let {:sci/macro true})})}})))
+
 (def allowed-aggregate-fns
   '#{avg ceil count count-distinct distinct floor groupconcat
      median max min rand sample sample1 stddev str sum variance})
@@ -820,19 +857,50 @@
        (let ~bdg
          ~qualified-code))))
 
+;; Helper to replace qualified symbols with direct function references
+(defn replace-qualified-symbols
+  "Replaces qualified symbols like 'fluree.db.query.exec.eval/plus' with 
+   the actual function reference for SCI evaluation."
+  [form]
+  (cond
+    ;; If it's a qualified symbol that we recognize, replace with actual function
+    (and (symbol? form) 
+         (namespace form)
+         (= "fluree.db.query.exec.eval" (namespace form)))
+    (let [sym-name (symbol (name form))
+          fn-ref (get qualified-symbols sym-name)]
+      (if fn-ref
+        (resolve fn-ref)
+        form))
+    
+    ;; Recursively process sequences
+    (sequential? form)
+    (map replace-qualified-symbols form)
+    
+    ;; Leave everything else as-is
+    :else form))
+
 (defn compile
   ([code ctx] (compile code ctx true))
   ([code ctx allow-aggregates?]
-   (let [fn-code (compile* code ctx allow-aggregates?)]
+   (let [fn-code (compile* code ctx allow-aggregates?)
+         ;; Replace qualified symbols before SCI evaluation
+         prepared-code (replace-qualified-symbols fn-code)
+         sci-ctx (create-sci-context)]
      (log/trace "compiled fn:" fn-code)
-     (eval fn-code))))
+     (log/trace "prepared code for SCI:" prepared-code)
+     (sci/eval-form sci-ctx prepared-code))))
 
 (defn compile-filter
   [code var ctx]
   (let [f        (compile code ctx)
-        soln-sym 'solution]
-    (eval `(fn [~soln-sym ~var]
-             (-> ~soln-sym
-                 (assoc (quote ~var) ~var)
-                 ~f
-                 :value)))))
+        soln-sym 'solution
+        filter-fn-code `(fn [~soln-sym ~var]
+                          (-> ~soln-sym
+                              (assoc (quote ~var) ~var)
+                              ~f
+                              :value))
+        ;; Replace qualified symbols before SCI evaluation
+        prepared-code (replace-qualified-symbols filter-fn-code)
+        sci-ctx (create-sci-context)]
+    (sci/eval-form sci-ctx prepared-code)))

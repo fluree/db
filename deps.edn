@@ -37,6 +37,9 @@
         com.fluree/crypto {:mvn/version "3.0.1"}
         org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
+        ;; SCI for GraalVM-compatible code evaluation
+        org.babashka/sci {:mvn/version "0.10.47"}
+
         ;; storage
         com.cognitect.aws/api       {:mvn/version "0.8.692"}
         com.cognitect.aws/endpoints {:mvn/version "1.1.12.718"}
