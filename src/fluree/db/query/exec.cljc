@@ -97,7 +97,8 @@
   (update q :where #(walk/postwalk (fn [x]
                                      (if (where/subquery? x)
                                        (let [subquery (where/pattern-data x)]
-                                         (where/->pattern :query (subquery-executor subquery)))
+                                         (with-meta (where/->pattern :query (subquery-executor subquery))
+                                           (meta x)))
                                        x))
                                    %)))
 
