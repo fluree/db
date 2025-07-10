@@ -1,0 +1,14 @@
+{
+  "name": "fluree-nodejs-demo",
+  "version": "1.0.0",
+  "description": "Demonstration of Fluree Node.js SDK usage",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
