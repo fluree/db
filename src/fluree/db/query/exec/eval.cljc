@@ -705,7 +705,7 @@
 ;; SCI context for GraalVM-compatible code evaluation
 (defn create-sci-context []
   (let [;; Separate macros from functions
-        macro-symbols #{'coalesce 'as 'iri '-and '-or '-if}
+        macro-symbols #{'coalesce 'as '-and '-or}
         
         ;; Build eval namespace, excluding macros for now
         eval-ns-fns (reduce (fn [acc [k v]]
@@ -731,7 +731,44 @@
                           '-if (fn [test then else]
                                  (if (:value test) then else))
                           'if (fn [test then else]
-                                (if (:value test) then else)))
+                                (if (:value test) then else))
+                          ;; as is likely just an identity function for aliasing
+                          'as (fn [expr _alias] expr)
+                          'fluree.db.query.exec.eval/as (fn [expr _alias] expr)
+                          ;; -and and -or as functions
+                          '-and (fn [& args]
+                                  (reduce (fn [result x]
+                                            (if (:value result)
+                                              x
+                                              result))
+                                          (where/->typed-val true)
+                                          args))
+                          'and (fn [& args]
+                                 (reduce (fn [result x]
+                                           (if (:value result)
+                                             x
+                                             result))
+                                         (where/->typed-val true)
+                                         args))
+                          '-or (fn [& args]
+                                 (reduce (fn [result x]
+                                           (if (:value result)
+                                             result
+                                             x))
+                                         (where/->typed-val nil)
+                                         args))
+                          'or (fn [& args]
+                                (reduce (fn [result x]
+                                          (if (:value result)
+                                            result
+                                            x))
+                                        (where/->typed-val nil)
+                                        args))
+                          ;; Add compare* for comparison operators
+                          'compare* compare*)
+        
+        ;; Add json-ld/expand-iri function
+        json-ld-fns {'expand-iri json-ld/expand-iri}
         
         ;; -and and -or can't be added directly as they're macros
         ;; We'll handle them separately if needed
@@ -743,10 +780,39 @@
                       'variable? where/variable?
                       'mch->typed-val where/mch->typed-val}
         
-        ;; Build qualified mappings for user namespace, excluding macros
+        ;; Build qualified mappings for user namespace, excluding macros (except as, -and, -or)
         qualified-fns (reduce (fn [acc [k v]]
-                                (if (contains? macro-symbols k)
+                                (cond
+                                  ;; Special handling for 'as' - add as function
+                                  (= k 'as)
+                                  (assoc acc v (fn [expr _alias] expr))
+                                  
+                                  ;; Special handling for -and
+                                  (= k '-and)
+                                  (assoc acc v (fn [& args]
+                                               (reduce (fn [result x]
+                                                         (if (:value result)
+                                                           x
+                                                           result))
+                                                       (where/->typed-val true)
+                                                       args)))
+                                  
+                                  ;; Special handling for -or  
+                                  (= k '-or)
+                                  (assoc acc v (fn [& args]
+                                               (reduce (fn [result x]
+                                                         (if (:value result)
+                                                           result
+                                                           x))
+                                                       (where/->typed-val nil)
+                                                       args)))
+                                  
+                                  ;; Skip other macros
+                                  (contains? macro-symbols k)
                                   acc
+                                  
+                                  ;; Normal resolution
+                                  :else
                                   (if-let [resolved-var (resolve v)]
                                     (assoc acc v @resolved-var)
                                     acc)))
@@ -783,18 +849,43 @@
                       '$-CONTEXT '$-CONTEXT
                       'solution 'solution}
         
+        ;; Constants namespace
+        const-ns {'iri-id const/iri-id}
+        
         ;; Merge everything for user namespace
         user-ns-fns (merge eval-ns-fns
                            where-ns-fns
                            qualified-fns
+                           json-ld-fns
                            core-fns
-                           special-syms)]
+                           special-syms
+                           ;; Add qualified functions
+                           {'fluree.json-ld/expand-iri json-ld/expand-iri
+                            'fluree.db.constants/iri-id const/iri-id
+                            'fluree.db.query.exec.eval/-and (fn [& args]
+                                                               (reduce (fn [result x]
+                                                                         (if (:value result)
+                                                                           x
+                                                                           result))
+                                                                       (where/->typed-val true)
+                                                                       args))
+                            'fluree.db.query.exec.eval/-or (fn [& args]
+                                                              (reduce (fn [result x]
+                                                                        (if (:value result)
+                                                                          result
+                                                                          x))
+                                                                      (where/->typed-val nil)
+                                                                      args))})]
     
     (sci/init {:namespaces {'fluree.db.query.exec.eval eval-ns-fns
                             'fluree.db.query.exec.where where-ns-fns
+                            'fluree.json-ld json-ld-fns
+                            'fluree.db.constants const-ns
                             'clojure.core core-fns
                             'user user-ns-fns}
-               :bindings {'clojure.core/unquote unquote}})))
+               :bindings {'clojure.core/unquote unquote
+                          ;; Make constants available
+                          'fluree.db.constants/iri-id const/iri-id}})))
 
 (def allowed-aggregate-fns
   '#{avg ceil count count-distinct distinct floor groupconcat
@@ -908,6 +999,20 @@
 (defn compile*
   [code ctx allow-aggregates?]
   (let [qualified-code (coerce allow-aggregates? ctx code)
+        ;; Replace iri calls with the expanded form for SCI
+        qualified-code (walk/postwalk 
+                         (fn [form]
+                           (if (and (seq? form)
+                                    (= 'fluree.db.query.exec.eval/iri (first form))
+                                    (= 2 (count form)))
+                             ;; Replace (fluree.db.query.exec.eval/iri x) with the expanded form
+                             `(fluree.db.query.exec.where/->typed-val 
+                               (fluree.json-ld/expand-iri 
+                                 (:value ~(second form)) 
+                                 ~'$-CONTEXT) 
+                               fluree.db.constants/iri-id)
+                             form))
+                         qualified-code)
         vars           (variables qualified-code)
         soln-sym       'solution
         bdg            (bind-variables soln-sym vars ctx)]

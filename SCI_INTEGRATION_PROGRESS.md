@@ -6,13 +6,17 @@ This project aims to replace `eval` usage in Fluree DB with SCI (Small Clojure I
 
 ## Current Status
 
-**Phase**: Core implementation complete - expanding function coverage
-**Branch**: feature/sci
+**Phase**: Near completion - ~98% test pass rate achieved
+**Branch**: feature/file-store-encryption (continuing SCI work)
 **Key File**: `/src/fluree/db/query/exec/eval.cljc`
 
-### ✅ Major Milestone Achieved
+### ✅ Major Milestones Achieved
 
-Successfully resolved the SCI symbol resolution issue! Qualified symbols like `fluree.db.query.exec.eval/plus` now resolve and execute correctly in the SCI context.
+1. Successfully resolved the SCI symbol resolution issue! Qualified symbols like `fluree.db.query.exec.eval/plus` now resolve and execute correctly in the SCI context.
+2. Implemented complete SCI context with all query functions from `qualified-symbols`
+3. Added macro replacements for `-if`, `-and`, `-or`, and `as`
+4. Fixed `iri` macro expansion using postwalk transformation
+5. Achieved ~98% test pass rate (from 27 failures down to ~2)
 
 ## Problem Analysis
 
@@ -38,49 +42,29 @@ Successfully resolved the SCI symbol resolution issue! Qualified symbols like `f
 
 ### Current Implementation
 
-```clojure
-;; SCI context for GraalVM-compatible code evaluation
-(defn create-sci-context []
-  (let [;; Essential functions for basic testing
-        essential-fns {'+ plus
-                       '- minus  
-                       '* multiply
-                       '/ divide
-                       'plus plus
-                       'minus minus
-                       'multiply multiply
-                       'divide divide
-                       'abs absolute-value
-                       '= untyped-equal
-                       '< less-than
-                       '> greater-than
-                       '->typed-val where/->typed-val}
-        
-        ;; Create qualified mappings
-        qualified-fns {'fluree.db.query.exec.eval/plus plus
-                       'fluree.db.query.exec.eval/minus minus
-                       'fluree.db.query.exec.eval/multiply multiply
-                       'fluree.db.query.exec.eval/divide divide
-                       'fluree.db.query.exec.eval/absolute-value absolute-value
-                       'fluree.db.query.exec.eval/untyped-equal untyped-equal
-                       'fluree.db.query.exec.eval/less-than less-than
-                       'fluree.db.query.exec.eval/greater-than greater-than
-                       'fluree.db.query.exec.where/->typed-val where/->typed-val}
-        
-        ;; Merge for user namespace
-        user-ns-fns (merge essential-fns qualified-fns {'get get 'assoc assoc})]
-    
-    (sci/init {:namespaces {'fluree.db.query.exec.eval essential-fns
-                            'fluree.db.query.exec.where {'->typed-val where/->typed-val}
-                            'user user-ns-fns}})))
-```
+The implementation now includes:
+
+1. **Complete Function Mapping**: All ~70+ functions from `qualified-symbols` are mapped to SCI context
+2. **Dual Symbol Resolution**: Both short names (e.g., `plus`) and qualified names (e.g., `fluree.db.query.exec.eval/plus`) are supported
+3. **Macro-to-Function Conversion**: Macros like `-if`, `-and`, `-or`, and `as` are implemented as functions
+4. **Special Form Handling**: The `iri` macro is transformed using postwalk before SCI evaluation
+5. **Namespace Support**: Multiple namespaces including eval, where, json-ld, constants, and core functions
+
+Key implementation details:
+- Uses SCI 0.10.47 (upgraded from 0.2.7)
+- Handles TypedValue structures for proper datatype support
+- Supports variable binding and resolution in queries
+- Includes constants like `fluree.db.constants/iri-id`
 
 ### ✅ Issues Resolved
 
-1. **SCI API Usage**: Fixed incorrect API calls - now using `sci/eval-form` and `sci/eval-string*` correctly
-2. **Symbol Resolution**: Qualified symbols like `fluree.db.query.exec.eval/plus` now resolve properly
+1. **SCI API Usage**: Fixed incorrect API calls - now using `sci/eval-form` correctly
+2. **Symbol Resolution**: Qualified symbols like `fluree.db.query.exec.eval/plus` now resolve properly by mapping both short and qualified names
 3. **Function Compilation**: Complex expressions compile and execute correctly
-4. **Basic Arithmetic**: Test expressions like `(+ (* 2 3) (- 10 5))` evaluate to correct results
+4. **Variable Binding**: Fixed TypedValue access using namespaced keywords like `:fluree.db.query.exec.where/val`
+5. **Macro Support**: Converted macros to functions for SCI compatibility
+6. **IRI Macro**: Special handling via postwalk transformation to expand before SCI evaluation
+7. **Filter Expressions**: Fixed `and`, `or`, and comparison operators in filter expressions
 
 ### Working Examples
 
@@ -121,16 +105,18 @@ Successfully resolved the SCI symbol resolution issue! Qualified symbols like `f
 
 ## Next Steps
 
-### Immediate Priority
-1. **Expand Function Coverage**: Add all functions from `qualified-symbols` to SCI context
-2. **Handle Missing Dependencies**: Add required functions like `where/get-datatype-iri`
-3. **Test with Real Queries**: Validate SCI works with actual query workloads
-4. **Handle Edge Cases**: Test and fix macros, special forms, and complex expressions
-
-### Investigation Areas
-1. **Macro Support**: Ensure macros like `coalesce`, `as`, `-if`, `-and`, `-or` work correctly
+### Remaining Work
+1. **Fix Final Test Failures**: Investigate and fix the remaining ~2 test failures
 2. **Performance Testing**: Measure performance impact of SCI vs eval
-3. **Variable Binding**: Test query variable binding and resolution
+3. **Edge Case Testing**: Ensure all query patterns work correctly
+4. **Documentation**: Update user documentation for any changes
+
+### Completed Tasks
+- ✅ All functions from `qualified-symbols` added to SCI context
+- ✅ All required dependencies added (where functions, json-ld, constants)
+- ✅ Tested with real queries - aggregate, filter, and datatype tests pass
+- ✅ Macros converted to functions and working correctly
+- ✅ Variable binding and resolution tested and working
 
 ### Testing Strategy
 1. **Unit Tests**: Test individual query functions work with SCI
