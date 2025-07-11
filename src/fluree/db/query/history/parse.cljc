@@ -1,7 +1,7 @@
 (ns fluree.db.query.history.parse
   (:require [fluree.db.datatype :as datatype]
             [fluree.db.query.fql.syntax :as syntax]
-            [fluree.db.util :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.validation :as v]
             [malli.core :as m]))
 

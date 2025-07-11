@@ -2,7 +2,7 @@
   (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.query.exec :as exec]
             [fluree.db.query.fql.parse :as parse]
-            [fluree.db.util :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]])
+            [fluree.db.util :as util :refer [try* catch*]])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
