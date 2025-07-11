@@ -87,9 +87,9 @@
           current-items)))))
 
 (defn void-unlike-keys
-  [cmp key-fn k items]
+  [key-cmp key-fn k items]
   (mapv (fn [item]
-          (if (zero? (cmp (key-fn item) k))
+          (if (zero? (key-cmp (key-fn item) k))
             item
             ::void))
         items))
@@ -99,18 +99,18 @@
   (every? (complement void?) xs))
 
 (defn fuse-by
-  ([cmp key-fn chs]
-   (fuse-by cmp key-fn nil chs))
-  ([cmp key-fn buf-or-n chs]
-   (fuse-by cmp key-fn buf-or-n nil chs))
-  ([cmp key-fn buf-or-n xform chs]
+  ([key-cmp key-fn chs]
+   (fuse-by key-cmp key-fn nil chs))
+  ([key-cmp key-fn buf-or-n chs]
+   (fuse-by key-cmp key-fn buf-or-n nil chs))
+  ([key-cmp key-fn buf-or-n xform chs]
    (let [item-count (count chs)
-         out-ch   (async/chan buf-or-n xform)]
+         out-ch     (async/chan buf-or-n xform)]
      (go
        (loop [cur-items (nil-vec item-count)]
          (if-some [next-items (<! (fill-voids cur-items chs))]
-           (let [max-k  (apply max-key-by cmp key-fn next-items)
-                 pruned-items (void-unlike-keys cmp key-fn max-k next-items)]
+           (let [max-k        (apply max-key-by key-cmp key-fn next-items)
+                 pruned-items (void-unlike-keys key-cmp key-fn max-k next-items)]
              (if (full? pruned-items)
                (do (>! out-ch pruned-items)
                    (recur (nil-vec item-count)))
