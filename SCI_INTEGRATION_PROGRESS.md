@@ -6,9 +6,13 @@ This project aims to replace `eval` usage in Fluree DB with SCI (Small Clojure I
 
 ## Current Status
 
-**Phase**: Implementation in progress - debugging symbol resolution issues
-**Branch**: docs/update (continuing from previous work)
+**Phase**: Core implementation complete - expanding function coverage
+**Branch**: feature/sci
 **Key File**: `/src/fluree/db/query/exec/eval.cljc`
+
+### ✅ Major Milestone Achieved
+
+Successfully resolved the SCI symbol resolution issue! Qualified symbols like `fluree.db.query.exec.eval/plus` now resolve and execute correctly in the SCI context.
 
 ## Problem Analysis
 
@@ -37,31 +41,59 @@ This project aims to replace `eval` usage in Fluree DB with SCI (Small Clojure I
 ```clojure
 ;; SCI context for GraalVM-compatible code evaluation
 (defn create-sci-context []
-  (let [eval-fns (into {} (map (fn [[k v]]
-                                [(symbol (name k)) (resolve v)])
-                              qualified-symbols))
-        all-fns (merge eval-fns
-                       {'->typed-val where/->typed-val})]
-    (sci/init {:namespaces {'fluree.db.query.exec.eval all-fns
+  (let [;; Essential functions for basic testing
+        essential-fns {'+ plus
+                       '- minus  
+                       '* multiply
+                       '/ divide
+                       'plus plus
+                       'minus minus
+                       'multiply multiply
+                       'divide divide
+                       'abs absolute-value
+                       '= untyped-equal
+                       '< less-than
+                       '> greater-than
+                       '->typed-val where/->typed-val}
+        
+        ;; Create qualified mappings
+        qualified-fns {'fluree.db.query.exec.eval/plus plus
+                       'fluree.db.query.exec.eval/minus minus
+                       'fluree.db.query.exec.eval/multiply multiply
+                       'fluree.db.query.exec.eval/divide divide
+                       'fluree.db.query.exec.eval/absolute-value absolute-value
+                       'fluree.db.query.exec.eval/untyped-equal untyped-equal
+                       'fluree.db.query.exec.eval/less-than less-than
+                       'fluree.db.query.exec.eval/greater-than greater-than
+                       'fluree.db.query.exec.where/->typed-val where/->typed-val}
+        
+        ;; Merge for user namespace
+        user-ns-fns (merge essential-fns qualified-fns {'get get 'assoc assoc})]
+    
+    (sci/init {:namespaces {'fluree.db.query.exec.eval essential-fns
                             'fluree.db.query.exec.where {'->typed-val where/->typed-val}
-                            'clojure.core all-fns}})))
+                            'user user-ns-fns}})))
 ```
 
-### Current Issue: Function Syntax Compatibility
+### ✅ Issues Resolved
 
-**Problem**: Generated query code uses function syntax that's incompatible with SCI's expectations.
+1. **SCI API Usage**: Fixed incorrect API calls - now using `sci/eval-form` and `sci/eval-string*` correctly
+2. **Symbol Resolution**: Qualified symbols like `fluree.db.query.exec.eval/plus` now resolve properly
+3. **Function Compilation**: Complex expressions compile and execute correctly
+4. **Basic Arithmetic**: Test expressions like `(+ (* 2 3) (- 10 5))` evaluate to correct results
 
-**Error**: "Parameter declaration solution should be a vector"
+### Working Examples
 
-**Root Cause**: SCI generates functions with parameter lists like `[solution]` but our code generates `(fn [solution] ...)` with qualified symbols.
+```clojure
+;; Simple arithmetic
+(compile '(+ 1 2) {}) ; => Returns function that evaluates to TypedValue{:value 3}
 
-**Progress Made**: 
-- Fixed qualified symbol resolution by mapping them in user namespace
-- Basic SCI evaluation now works for simple expressions
-- Core macros (fn, let) are properly mapped
-- The `coerce` function correctly transforms expressions like `(+ 1 2)` to `(fluree.db.query.exec.eval/plus ...)`
+;; Complex nested expression  
+(compile '(+ (* 2 3) (- 10 5)) {}) ; => Returns function that evaluates to TypedValue{:value 11}
 
-**Remaining Issue**: Function parameter syntax compatibility between compile* output and SCI expectations.
+;; Comparisons
+(compile '(< 5 10) {}) ; => Returns function that evaluates to TypedValue{:value true}
+```
 
 ## Technical Decisions Made
 
@@ -90,14 +122,15 @@ This project aims to replace `eval` usage in Fluree DB with SCI (Small Clojure I
 ## Next Steps
 
 ### Immediate Priority
-1. **Fix Symbol Resolution**: Debug why qualified symbols aren't resolving in SCI context
-2. **Test Simple Cases**: Verify basic arithmetic operations work
-3. **Incremental Testing**: Test each category of functions (math, string, logic, etc.)
+1. **Expand Function Coverage**: Add all functions from `qualified-symbols` to SCI context
+2. **Handle Missing Dependencies**: Add required functions like `where/get-datatype-iri`
+3. **Test with Real Queries**: Validate SCI works with actual query workloads
+4. **Handle Edge Cases**: Test and fix macros, special forms, and complex expressions
 
 ### Investigation Areas
-1. **Namespace Mapping**: Ensure qualified symbols map correctly to SCI namespaces
-2. **Function References**: Verify all function references resolve properly
-3. **Context Initialization**: Check if SCI context is properly initialized
+1. **Macro Support**: Ensure macros like `coalesce`, `as`, `-if`, `-and`, `-or` work correctly
+2. **Performance Testing**: Measure performance impact of SCI vs eval
+3. **Variable Binding**: Test query variable binding and resolution
 
 ### Testing Strategy
 1. **Unit Tests**: Test individual query functions work with SCI

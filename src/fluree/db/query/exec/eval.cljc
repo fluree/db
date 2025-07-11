@@ -704,39 +704,38 @@
 
 ;; SCI context for GraalVM-compatible code evaluation
 (defn create-sci-context []
-  (let [;; Build namespace bindings for all our functions
-        eval-ns-bindings (into {} 
-                              (map (fn [[k v]]
-                                    ;; Map the simple name to the actual function
-                                    [(symbol (name k)) (resolve v)])
-                                   qualified-symbols))
-        ;; Add special functions
-        eval-ns-bindings (assoc eval-ns-bindings
-                               '->typed-val where/->typed-val)
-        ;; Build qualified symbol mappings for user namespace
-        qualified-mappings (into {} 
-                                (map (fn [[k v]]
-                                      ;; Create qualified symbol mapping
-                                      [(symbol v) (resolve v)])
-                                     qualified-symbols))
-        qualified-mappings (assoc qualified-mappings
-                                 'fluree.db.query.exec.where/->typed-val where/->typed-val)]
-    (sci/init {:namespaces {;; Define the fluree.db.query.exec.eval namespace with all our functions
-                           'fluree.db.query.exec.eval eval-ns-bindings
-                           ;; Define the where namespace
-                           'fluree.db.query.exec.where {'->typed-val where/->typed-val}
-                           ;; Pre-import our namespaces in user namespace
-                           'user (merge 
-                                  ;; Include all eval functions directly in user namespace
-                                  eval-ns-bindings
-                                  ;; Include qualified symbol mappings
-                                  qualified-mappings
-                                  ;; Core functions that might be used
-                                  {'get get
-                                   'assoc assoc
-                                   '-> (with-meta '-> {:sci/macro true})
-                                   'clojure.core/fn (with-meta 'fn {:sci/macro true})
-                                   'clojure.core/let (with-meta 'let {:sci/macro true})})}})))
+  (let [;; Essential functions for basic testing
+        essential-fns {'+ plus
+                       '- minus  
+                       '* multiply
+                       '/ divide
+                       'plus plus
+                       'minus minus
+                       'multiply multiply
+                       'divide divide
+                       'abs absolute-value
+                       '= untyped-equal
+                       '< less-than
+                       '> greater-than
+                       '->typed-val where/->typed-val}
+        
+        ;; Create qualified mappings
+        qualified-fns {'fluree.db.query.exec.eval/plus plus
+                       'fluree.db.query.exec.eval/minus minus
+                       'fluree.db.query.exec.eval/multiply multiply
+                       'fluree.db.query.exec.eval/divide divide
+                       'fluree.db.query.exec.eval/absolute-value absolute-value
+                       'fluree.db.query.exec.eval/untyped-equal untyped-equal
+                       'fluree.db.query.exec.eval/less-than less-than
+                       'fluree.db.query.exec.eval/greater-than greater-than
+                       'fluree.db.query.exec.where/->typed-val where/->typed-val}
+        
+        ;; Merge for user namespace
+        user-ns-fns (merge essential-fns qualified-fns {'get get 'assoc assoc})]
+    
+    (sci/init {:namespaces {'fluree.db.query.exec.eval essential-fns
+                            'fluree.db.query.exec.where {'->typed-val where/->typed-val}
+                            'user user-ns-fns}})))
 
 (def allowed-aggregate-fns
   '#{avg ceil count count-distinct distinct floor groupconcat
@@ -863,17 +862,18 @@
    the actual function reference for SCI evaluation."
   [form]
   (cond
-    ;; If it's a qualified symbol that we recognize, replace with actual function
+    ;; If it's a qualified symbol that we recognize, keep as symbol
+    ;; (they should resolve properly in our SCI context)
     (and (symbol? form) 
          (namespace form)
          (= "fluree.db.query.exec.eval" (namespace form)))
-    (let [sym-name (symbol (name form))
-          fn-ref (get qualified-symbols sym-name)]
-      (if fn-ref
-        (resolve fn-ref)
-        form))
+    form
     
-    ;; Recursively process sequences
+    ;; Preserve vectors (important for function parameters)
+    (vector? form)
+    (mapv replace-qualified-symbols form)
+    
+    ;; Recursively process other sequences
     (sequential? form)
     (map replace-qualified-symbols form)
     
@@ -884,12 +884,9 @@
   ([code ctx] (compile code ctx true))
   ([code ctx allow-aggregates?]
    (let [fn-code (compile* code ctx allow-aggregates?)
-         ;; Replace qualified symbols before SCI evaluation
-         prepared-code (replace-qualified-symbols fn-code)
          sci-ctx (create-sci-context)]
      (log/trace "compiled fn:" fn-code)
-     (log/trace "prepared code for SCI:" prepared-code)
-     (sci/eval-form sci-ctx prepared-code))))
+     (sci/eval-form sci-ctx fn-code))))
 
 (defn compile-filter
   [code var ctx]
@@ -900,7 +897,5 @@
                               (assoc (quote ~var) ~var)
                               ~f
                               :value))
-        ;; Replace qualified symbols before SCI evaluation
-        prepared-code (replace-qualified-symbols filter-fn-code)
         sci-ctx (create-sci-context)]
-    (sci/eval-form sci-ctx prepared-code)))
+    (sci/eval-form sci-ctx filter-fn-code)))
