@@ -63,13 +63,13 @@
   (map (partial repartition-by f)
        chs))
 
-(defn nil-vec
-  [n]
-  (vec (repeat n nil)))
-
 (defn void?
   [x]
   (= ::void x))
+
+(defn void-vec
+  [n]
+  (vec (repeat n ::void)))
 
 (defn fill-voids
   [items chs]
@@ -127,13 +127,13 @@
    (let [item-count (count chs)
          out-ch     (async/chan buf-or-n xform)]
      (go
-       (loop [cur-items (nil-vec item-count)]
+       (loop [cur-items (void-vec item-count)]
          (if-some [next-items (<! (fill-voids cur-items chs))]
            (let [max-k        (apply max-key-by key-cmp key-fn next-items)
                  pruned-items (void-unlike-keys key-cmp key-fn max-k next-items)]
              (if (full? pruned-items)
                (do (>! out-ch pruned-items)
-                   (recur (nil-vec item-count)))
+                   (recur (void-vec item-count)))
                (recur pruned-items)))
            (async/close! out-ch))))
      out-ch)))
