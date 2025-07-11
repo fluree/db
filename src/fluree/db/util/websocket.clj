@@ -2,7 +2,7 @@
   "WebSocket client implementation using Java 11 HttpClient.
    Designed for GraalVM native image compatibility."
   (:require [clojure.core.async :as async]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.log :as log])
   (:import [java.net URI]
            [java.net.http HttpClient WebSocket WebSocket$Listener WebSocket$Builder]
