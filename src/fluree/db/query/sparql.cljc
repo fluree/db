@@ -3,6 +3,7 @@
                :cljs [instaparse.core :as insta :refer-macros [defparser]])
             #?(:clj [clojure.java.io :as io])
             #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
+            #?(:clj [fluree.db.util.graalvm :refer [embed-resource]])
             [clojure.string :as str]
             [fluree.db.query.sparql.translator :as sparql.translator]
             [fluree.db.util.docs :as docs]
@@ -14,19 +15,19 @@
   "CLJ and CLJS use different (and incompatible) unicode character syntax, so in the regex
   for PN_CHARS_BASE needs to be platform specific."
   #?(:clj
-     (slurp (io/resource "sparql.pn_chars_base.jvm.bnf"))
+     (embed-resource "sparql.pn_chars_base.jvm.bnf")
      :cljs
      (inline-resource "sparql.pn_chars_base.js.bnf")))
 
 (def grammar
   (str
-   #?(:clj  (slurp (io/resource "sparql.bnf"))
+   #?(:clj  (embed-resource "sparql.bnf")
       :cljs (inline-resource "sparql.bnf"))
    PN_CHARS_BASE))
 
 (def property-path-grammar
   (str
-   #?(:clj  (slurp (io/resource "sparql-property-path.bnf"))
+   #?(:clj  (embed-resource "sparql-property-path.bnf")
       :cljs (inline-resource "sparql-property-path.bnf"))
    PN_CHARS_BASE))
 
