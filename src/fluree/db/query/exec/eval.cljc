@@ -705,20 +705,24 @@
 ;; SCI context for GraalVM-compatible code evaluation
 (defn create-sci-context []
   (let [;; Separate macros from functions
-        macro-symbols #{'coalesce 'as '-and '-or}
+        macro-symbols #{'coalesce 'as '-and '-or 'iri '-if 'if}
         
         ;; Build eval namespace, excluding macros for now
         eval-ns-fns (reduce (fn [acc [k v]]
                               (if (contains? macro-symbols k)
                                 acc
-                                (if-let [resolved-var (resolve v)]
-                                  ;; Use both the short name and the qualified name
-                                  (let [short-name (symbol (name k))
-                                        qualified-name (symbol (name v))]
-                                    (-> acc
-                                        (assoc short-name @resolved-var)
-                                        (assoc qualified-name @resolved-var)))
-                                  acc)))
+                                (try
+                                  (if-let [resolved-var (resolve v)]
+                                    ;; Use both the short name and the qualified name
+                                    (let [short-name (symbol (name k))
+                                          qualified-name (symbol (name v))]
+                                      (-> acc
+                                          (assoc short-name @resolved-var)
+                                          (assoc qualified-name @resolved-var)))
+                                    acc)
+                                  (catch Exception _
+                                    ;; If we can't resolve (e.g., it's a macro), skip it
+                                    acc))))
                             {}
                             qualified-symbols)
         
