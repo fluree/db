@@ -66,6 +66,10 @@
   [n]
   (vec (repeat n nil)))
 
+(defn void?
+  [x]
+  (= ::void x))
+
 (defn fill-voids
   [items chs]
   (go
@@ -74,7 +78,7 @@
              i             0]
         (if (< i item-count)
           (let [next-i (inc i)]
-            (if (nil? (nth current-items i))
+            (if (void? (nth current-items i))
               (when-some [new-item (<! (nth chs i))] ; return empty channel on
                                                      ; any closed input channel.
                 (recur (assoc current-items i new-item) next-i))
@@ -84,8 +88,9 @@
 (defn void-unlike-keys
   [cmp key-fn k items]
   (mapv (fn [item]
-          (when (zero? (cmp (key-fn item) k))
-            item))
+          (if (zero? (cmp (key-fn item) k))
+            item
+            ::void))
         items))
 
 (defn full?
