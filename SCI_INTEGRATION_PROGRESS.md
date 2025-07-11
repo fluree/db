@@ -9,14 +9,14 @@ This project aims to replace `eval` usage in Fluree DB with SCI (Small Clojure I
 **Phase**: ✅ COMPLETE - GraalVM compatibility achieved!
 **Branch**: feature/sci
 **Test Pass Rate**: ~98% (from 27 failures to ~2)
-**Native Image**: ✅ Successfully tested with GraalVM
+**Native Image**: ✅ Resource loading fixed, ready for native image build
 
 **Key Files**: 
 - `/src/fluree/db/query/exec/eval.cljc` - SCI integration
 - `/src/fluree/db/flake.cljc` - case+ macro replacement  
 - `/src/fluree/db/util/json.cljc` - reflection fix
-- `/graalvm/fluree_native_test.clj` - Native image test
-- `/test/graalvm_simple_test.clj` - Simple validation test
+- `/src/fluree/db/util/graalvm.cljc` - GraalVM utilities and resource embedding
+- `/src/fluree/db/query/sparql.cljc` - Fixed resource loading with embed-resource
 
 ### ✅ Major Milestones Achieved
 
@@ -28,6 +28,7 @@ This project aims to replace `eval` usage in Fluree DB with SCI (Small Clojure I
 6. Fixed `Class/forName` reflection with direct class reference
 7. Created GraalVM configuration files and build scripts
 8. Verified all changes work with simple test suite
+9. Fixed resource loading for SPARQL BNF grammar files using embed-resource macro
 
 ## Problem Analysis
 
@@ -121,6 +122,15 @@ Key implementation details:
 2. **Optimization**: Profile and optimize hot paths if needed
 3. **Documentation**: Update user documentation for native image support
 
+### Resource Loading Fix
+
+GraalVM native images have limitations with `io/resource` which returns nil at runtime. To address this:
+
+1. **Created `embed-resource` macro**: Embeds resource content at compile time
+2. **Updated SPARQL parser**: Replaced `io/resource` calls with `embed-resource` for BNF grammar files
+3. **Resources embedded**: All SPARQL grammar files are now embedded in the compiled code
+4. **Result**: Native images can now access these resources without runtime resource loading
+
 ### Production Readiness
 1. **Native Image Build**: Create production Docker images with native executables
 2. **CI/CD Integration**: Add native image builds to CI pipeline
@@ -144,13 +154,14 @@ Key implementation details:
 - `/src/fluree/db/query/exec/eval.cljc` - Main SCI integration
 - `/src/fluree/db/flake.cljc` - Replaced case+ macro with condp
 - `/src/fluree/db/util/json.cljc` - Fixed Class/forName reflection
-- `/src/fluree/db/util/graalvm.cljc` - New utility file for GraalVM checks
+- `/src/fluree/db/util/graalvm.cljc` - New utility file with case-const and embed-resource macros
+- `/src/fluree/db/query/sparql.cljc` - Updated to use embed-resource for BNF files
 - `/deps.edn` - Added SCI dependency
 
 ### Test Files
 - `/test/fluree/db/query/exec/eval_test.clj` - Contains existing function tests
-- `/test/graalvm_simple_test.clj` - Simple GraalVM validation test
-- `/graalvm/fluree_native_test.clj` - Comprehensive native image test
+- `/test_graalvm.clj` - Test file for native image validation
+- `/simple_test.clj` - Simple test for resource loading
 
 ### GraalVM Configuration
 - `/graalvm/reflect-config.json` - Reflection configuration
