@@ -704,38 +704,97 @@
 
 ;; SCI context for GraalVM-compatible code evaluation
 (defn create-sci-context []
-  (let [;; Essential functions for basic testing
-        essential-fns {'+ plus
-                       '- minus  
-                       '* multiply
-                       '/ divide
-                       'plus plus
-                       'minus minus
-                       'multiply multiply
-                       'divide divide
-                       'abs absolute-value
-                       '= untyped-equal
-                       '< less-than
-                       '> greater-than
-                       '->typed-val where/->typed-val}
+  (let [;; Separate macros from functions
+        macro-symbols #{'coalesce 'as 'iri '-and '-or '-if}
         
-        ;; Create qualified mappings
-        qualified-fns {'fluree.db.query.exec.eval/plus plus
-                       'fluree.db.query.exec.eval/minus minus
-                       'fluree.db.query.exec.eval/multiply multiply
-                       'fluree.db.query.exec.eval/divide divide
-                       'fluree.db.query.exec.eval/absolute-value absolute-value
-                       'fluree.db.query.exec.eval/untyped-equal untyped-equal
-                       'fluree.db.query.exec.eval/less-than less-than
-                       'fluree.db.query.exec.eval/greater-than greater-than
-                       'fluree.db.query.exec.where/->typed-val where/->typed-val}
+        ;; Build eval namespace, excluding macros for now
+        eval-ns-fns (reduce (fn [acc [k v]]
+                              (if (contains? macro-symbols k)
+                                acc
+                                (if-let [resolved-var (resolve v)]
+                                  ;; Use both the short name and the qualified name
+                                  (let [short-name (symbol (name k))
+                                        qualified-name (symbol (name v))]
+                                    (-> acc
+                                        (assoc short-name @resolved-var)
+                                        (assoc qualified-name @resolved-var)))
+                                  acc)))
+                            {}
+                            qualified-symbols)
         
-        ;; Merge for user namespace
-        user-ns-fns (merge essential-fns qualified-fns {'get get 'assoc assoc})]
+        ;; Add special function
+        eval-ns-fns (assoc eval-ns-fns '->typed-val where/->typed-val)
+        
+        ;; Add macro replacements as functions
+        ;; -if: (if (:value test) then else)
+        eval-ns-fns (assoc eval-ns-fns 
+                          '-if (fn [test then else]
+                                 (if (:value test) then else))
+                          'if (fn [test then else]
+                                (if (:value test) then else)))
+        
+        ;; -and and -or can't be added directly as they're macros
+        ;; We'll handle them separately if needed
+        
+        ;; Build where namespace with required functions
+        where-ns-fns {'->typed-val where/->typed-val
+                      'get-datatype-iri where/get-datatype-iri
+                      'get-binding where/get-binding
+                      'variable? where/variable?
+                      'mch->typed-val where/mch->typed-val}
+        
+        ;; Build qualified mappings for user namespace, excluding macros
+        qualified-fns (reduce (fn [acc [k v]]
+                                (if (contains? macro-symbols k)
+                                  acc
+                                  (if-let [resolved-var (resolve v)]
+                                    (assoc acc v @resolved-var)
+                                    acc)))
+                              {}
+                              qualified-symbols)
+        
+        ;; Add where namespace qualified symbols
+        qualified-fns (merge qualified-fns
+                             {'fluree.db.query.exec.where/->typed-val where/->typed-val
+                              'fluree.db.query.exec.where/get-datatype-iri where/get-datatype-iri
+                              'fluree.db.query.exec.where/get-binding where/get-binding
+                              'fluree.db.query.exec.where/variable? where/variable?
+                              'fluree.db.query.exec.where/mch->typed-val where/mch->typed-val})
+        
+        ;; Core functions that might be used in generated code
+        core-fns {'get get
+                  'assoc assoc
+                  'mapv mapv
+                  'vec vec
+                  'int int
+                  'count count
+                  'first first
+                  'second second
+                  'last last
+                  'take take
+                  'drop drop
+                  'filter filter
+                  'map map
+                  'reduce reduce
+                  'into into}
+        
+        ;; Special symbols for generated code
+        special-syms {'quote 'quote
+                      '$-CONTEXT '$-CONTEXT
+                      'solution 'solution}
+        
+        ;; Merge everything for user namespace
+        user-ns-fns (merge eval-ns-fns
+                           where-ns-fns
+                           qualified-fns
+                           core-fns
+                           special-syms)]
     
-    (sci/init {:namespaces {'fluree.db.query.exec.eval essential-fns
-                            'fluree.db.query.exec.where {'->typed-val where/->typed-val}
-                            'user user-ns-fns}})))
+    (sci/init {:namespaces {'fluree.db.query.exec.eval eval-ns-fns
+                            'fluree.db.query.exec.where where-ns-fns
+                            'clojure.core core-fns
+                            'user user-ns-fns}
+               :bindings {'clojure.core/unquote unquote}})))
 
 (def allowed-aggregate-fns
   '#{avg ceil count count-distinct distinct floor groupconcat
