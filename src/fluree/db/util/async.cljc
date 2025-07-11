@@ -104,14 +104,15 @@
 
   Takes a collection of input channels `chs`, each containing items pre-sorted
   by `key-fn` using the `key-cmp` comparator. Returns a channel that outputs
-  vectors (chunks) where each chunk contains exactly one item from each input
-  channel, and all items in the chunk have the same key value when `key-fn` is
+  chunks (vectors) where each chunk contains exactly one item from each input
+  channel, and all items in the chunk have the same value when `key-fn` is
   applied.
 
   The function advances through all channels simultaneously, always processing
-  items with the current maximum key value. Items are only output when all
-  channels have an item with the same key - this creates an 'inner join'
-  behavior where only keys present in ALL channels appear in the output.
+  items with the current maximum key value and ignoring any items with a key
+  value less than the current maximum. Items are only output when all channels
+  have an item with the same key. This creates an 'inner join' behavior where
+  only keys present in ALL channels appear in the output.
 
   Input channels must be pre-sorted in ascending order by the result of applying
   `key-fn` and comparing with `key-cmp`.
