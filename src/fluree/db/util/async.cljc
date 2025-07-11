@@ -1,5 +1,7 @@
 (ns fluree.db.util.async
-  (:require [fluree.db.util.core :as util]))
+  (:require [clojure.core.async :as async :refer [<! >! chan go]]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.compare :refer [max-key-by]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -48,3 +50,53 @@
          (try
            ~@body
            (catch Throwable t# t#))))))
+
+(defn nil-vec
+  [n]
+  (vec (repeat n nil)))
+
+(defn fill-voids
+  [items chs]
+  (go
+    (let [item-count (count items)]
+      (loop [current-items items
+             i             0]
+        (if (< i item-count)
+          (let [next-i (inc i)]
+            (if (nil? (nth current-items i))
+              (when-some [new-item (<! (nth chs i))] ; return empty channel on
+                                                     ; any closed input channel.
+                (recur (assoc current-items i new-item) next-i))
+              (recur current-items next-i)))
+          current-items)))))
+
+(defn void-unlike-keys
+  [cmp key-fn k items]
+  (mapv (fn [item]
+          (when (zero? (cmp (key-fn item) k))
+            item))
+        items))
+
+(defn full?
+  [xs]
+  (every? some? xs))
+
+(defn fuse-by
+  ([key-fn cmp chs]
+   (fuse-by key-fn cmp nil chs))
+  ([key-fn cmp buf-or-n chs]
+   (fuse-by key-fn cmp buf-or-n nil chs))
+  ([key-fn cmp buf-or-n xform chs]
+   (let [ch-count (count chs)
+         out-ch   (async/chan buf-or-n xform)]
+     (go
+       (loop [cur-items (nil-vec ch-count)]
+         (if-some [next-items (<! (fill-voids cur-items chs))]
+           (let [max-k  (apply max-key-by cmp key-fn next-items)
+                 pruned (void-unlike-keys cmp key-fn max-k next-items)]
+             (if (full? pruned)
+               (do (>! out-ch pruned)
+                   (recur (nil-vec ch-count)))
+               (recur pruned)))
+           (async/close! out-ch))))
+     out-ch)))
