@@ -78,15 +78,6 @@
      :cljs (-> (- (current-time-millis) start-time)
                (str "ms"))))
 
-(defn deep-merge [v & vs]
-  (letfn [(rec-merge [v1 v2]
-            (if (and (map? v1) (map? v2))
-              (merge-with deep-merge v1 v2)
-              v2))]
-    (if (some identity vs)
-      (reduce #(rec-merge %1 %2) v vs)
-      v)))
-
 (defn str->int
   "Converts string to integer. Assumes you've already verified the string is
   parsable to an integer."
@@ -111,18 +102,6 @@
     (keyword? k) (subs (str k) 1)
     (string? k) k
     :else (throw (ex-info (str "Cannot convert type " (type k) " to string: " (pr-str k))
-                          {:status 500 :error :db/unexpected-error}))))
-
-(defn str->keyword
-  "Converts a string to a keyword, checking to see if
-  the string starts with a ':', which it strips before converting."
-  [s]
-  (cond
-    (string? s) (if (str/starts-with? s ":")
-                  (keyword (subs s 1))
-                  (keyword s))
-    (keyword? s) s
-    :else (throw (ex-info (str "Cannot convert type " (type s) " to keyword: " (pr-str s))
                           {:status 500 :error :db/unexpected-error}))))
 
 (defn keywordize-keys
@@ -172,13 +151,6 @@
      :cljs
      ([millis _]
       (-> millis js/Date. .toISOString))))
-
-#?(:clj
-   (defmacro some-of
-     ([] nil)
-     ([x] x)
-     ([x & more]
-      `(let [x# ~x] (if (nil? x#) (some-of ~@more) x#)))))
 
 (defn filter-vals
   "Filters map k/v pairs dropping any where predicate applied to value is false."
