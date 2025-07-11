@@ -51,6 +51,17 @@
            ~@body
            (catch Throwable t# t#))))))
 
+(defn repartition-by
+  [f ch]
+  (let [xf     (comp cat (partition-by f))
+        out-ch (chan 1 xf)]
+    (async/pipe ch out-ch)))
+
+(defn repartition-each-by
+  [f chs]
+  (map (partial repartition-by f)
+       chs))
+
 (defn nil-vec
   [n]
   (vec (repeat n nil)))
