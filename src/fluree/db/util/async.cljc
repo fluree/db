@@ -98,7 +98,7 @@
   [xs]
   (every? (complement void?) xs))
 
-(defn fuse-by
+(defn inner-join-by
   "Merges the items from multiple pre-sorted input channels into an output channel
   containing chunks where all items have the same key.
 
@@ -119,9 +119,9 @@
   `buf-or-n` is either a number or a buffer, and `xform` is a transducer. When
   those arguments are supplied, they will be applied to the output channel."
   ([key-cmp key-fn chs]
-   (fuse-by key-cmp key-fn nil chs))
+   (inner-join-by key-cmp key-fn nil chs))
   ([key-cmp key-fn buf-or-n chs]
-   (fuse-by key-cmp key-fn buf-or-n nil chs))
+   (inner-join-by key-cmp key-fn buf-or-n nil chs))
   ([key-cmp key-fn buf-or-n xform chs]
    (let [item-count (count chs)
          out-ch     (async/chan buf-or-n xform)]
