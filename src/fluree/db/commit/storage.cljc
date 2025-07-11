@@ -4,9 +4,9 @@
             [fluree.db.constants :as const]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.storage :as storage]
+            [fluree.db.util :as util :refer [get-first get-first-id
+                                             get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-first-id
-                                                  get-first-value try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 

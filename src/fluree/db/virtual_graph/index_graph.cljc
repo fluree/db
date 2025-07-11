@@ -4,7 +4,7 @@
                       [fluree.db.virtual-graph.parse :as vg-parse]])
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph :as vg]))

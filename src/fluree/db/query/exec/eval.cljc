@@ -11,7 +11,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util.core :as util]
+            [fluree.db.util :as util]
             [fluree.db.util.log :as log]
             [fluree.db.vector.scoring :as score]
             [fluree.json-ld :as json-ld])

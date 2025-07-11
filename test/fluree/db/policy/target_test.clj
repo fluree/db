@@ -1,7 +1,7 @@
 (ns fluree.db.policy.target-test
   (:require [clojure.test :as t :refer [deftest testing is]]
             [fluree.db.api :as fluree]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util :as util]))
 
 (def burt
   {:id    "did:fluree:TfE2Frz2qkMjnCNJM5yPv7B8gq5Xhk5bqkm"

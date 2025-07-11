@@ -1,7 +1,7 @@
 (ns fluree.db.util.async
   (:require [clojure.core.async :as async :refer [<! >! chan go]]
-            [fluree.db.util.compare :refer [max-key-by]]
-            [fluree.db.util.core :as util])
+            [fluree.db.util :as util]
+            [fluree.db.util.compare :refer [max-key-by]])
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
 
 #?(:clj (set! *warn-on-reflection* true))

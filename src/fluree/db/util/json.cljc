@@ -6,7 +6,7 @@
                  [fluree.db.util.log :as log]
                  [fluree.db.flake :as flake]]
                 :cljs
-                [[fluree.db.util.core :as util]
+                [[fluree.db.util :as util]
                  [goog.object :as gobject]])
             [fluree.db.util.bytes :as butil])
   #?(:clj

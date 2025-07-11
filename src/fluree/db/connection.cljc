@@ -12,8 +12,8 @@
             [fluree.db.nameservice.sub :as ns-subscribe]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
+            [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
@@ -437,18 +437,18 @@
             (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
                   latest-commit (-> (<? (nameservice/lookup publisher ledger-addr))
                                     json-ld/expand)]
-              (log/warn "Dropping ledger" ledger-addr)
+              (log/debug "Dropping ledger" ledger-addr)
               (drop-index-artifacts conn latest-commit)
               (drop-commit-artifacts conn latest-commit)
               (<? (nameservice/retract publisher alias))
               (recur r))))
-        (log/warn "Dropped ledger" alias)
+        (log/debug "Dropped ledger" alias)
         :dropped)
       (catch* e (log/debug e "Failed to complete ledger deletion")))))
 
 (defn resolve-txn
   "Reads a transaction from the commit catalog by address.
-   
+
    Used by fluree/server in consensus/events."
   [{:keys [commit-catalog] :as _conn} address]
   (storage/read-json commit-catalog address))

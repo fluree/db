@@ -1,7 +1,7 @@
 (ns fluree.db.reasoner.owl-datalog
   (:require [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
 ;; conversions of owl statements to datalog

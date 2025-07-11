@@ -6,7 +6,7 @@
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.range :as query-range]
             [fluree.db.track :as track]
-            [fluree.db.util.core :as util]
+            [fluree.db.util :as util]
             [fluree.db.util.json :as json]))
 
 #?(:clj (set! *warn-on-reflection* true))

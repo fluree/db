@@ -1,5 +1,5 @@
 (ns fluree.db.util.clj-const
-  (:require [fluree.db.util.core :refer [case+]])
+  (:require [fluree.db.util :refer [case+]])
   (:refer-clojure :exclude [case]))
 
 (set! *warn-on-reflection* true)
@@ -22,7 +22,7 @@
     :got-something-else)
 
   NB: While this can inline anything that can be eval'd at compile time, you
-  should use fluree.db.util.core/case+ directly if you're using anything but
+  should use fluree.db.util/case+ directly if you're using anything but
   ^:const dispatch values and literals."
 
   [value & clauses]

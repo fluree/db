@@ -1,6 +1,6 @@
 (ns fluree.db.reasoner
   (:require [fluree.db.track :as track]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
