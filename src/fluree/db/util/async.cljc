@@ -104,16 +104,16 @@
   ([cmp key-fn buf-or-n chs]
    (fuse-by cmp key-fn buf-or-n nil chs))
   ([cmp key-fn buf-or-n xform chs]
-   (let [ch-count (count chs)
+   (let [item-count (count chs)
          out-ch   (async/chan buf-or-n xform)]
      (go
-       (loop [cur-items (nil-vec ch-count)]
+       (loop [cur-items (nil-vec item-count)]
          (if-some [next-items (<! (fill-voids cur-items chs))]
            (let [max-k  (apply max-key-by cmp key-fn next-items)
-                 pruned (void-unlike-keys cmp key-fn max-k next-items)]
-             (if (full? pruned)
-               (do (>! out-ch pruned)
-                   (recur (nil-vec ch-count)))
-               (recur pruned)))
+                 pruned-items (void-unlike-keys cmp key-fn max-k next-items)]
+             (if (full? pruned-items)
+               (do (>! out-ch pruned-items)
+                   (recur (nil-vec item-count)))
+               (recur pruned-items)))
            (async/close! out-ch))))
      out-ch)))
