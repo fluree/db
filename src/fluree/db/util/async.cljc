@@ -93,11 +93,11 @@
   (every? some? xs))
 
 (defn fuse-by
-  ([key-fn cmp chs]
-   (fuse-by key-fn cmp nil chs))
-  ([key-fn cmp buf-or-n chs]
-   (fuse-by key-fn cmp buf-or-n nil chs))
-  ([key-fn cmp buf-or-n xform chs]
+  ([cmp key-fn chs]
+   (fuse-by cmp key-fn nil chs))
+  ([cmp key-fn buf-or-n chs]
+   (fuse-by cmp key-fn buf-or-n nil chs))
+  ([cmp key-fn buf-or-n xform chs]
    (let [ch-count (count chs)
          out-ch   (async/chan buf-or-n xform)]
      (go
