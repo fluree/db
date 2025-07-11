@@ -6,8 +6,8 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.transact :as flake.transact]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util :as util :refer [get-first get-first-value]]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))

@@ -13,9 +13,9 @@
             [fluree.db.reasoner :as reasoner]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.track :as track]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
-            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))

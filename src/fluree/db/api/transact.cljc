@@ -6,9 +6,9 @@
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.transact :as transact]
+            [fluree.db.util :as util]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
-            [fluree.db.util :as util]
             [fluree.json-ld :as json-ld]))
 
 (defn prep-opts

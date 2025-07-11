@@ -2,8 +2,8 @@
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.db.method.ipfs.xhttp :as ipfs]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util :as util]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.xhttp :as xhttp]))
 

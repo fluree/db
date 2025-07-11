@@ -1,7 +1,7 @@
 (ns fluree.db.method.ipfs.xhttp
   (:require [clojure.core.async :as async]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util :as util]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.xhttp :as xhttp])
   (:refer-clojure :exclude [cat]))

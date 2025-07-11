@@ -2,8 +2,8 @@
   (:require [clojure.core.async :as async]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util :as util]))
+            [fluree.db.util :as util]
+            [fluree.db.util.async :refer [<? go-try]]))
 
 (defrecord DataSet [named default active])
 

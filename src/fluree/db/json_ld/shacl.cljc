@@ -6,8 +6,8 @@
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util :as util]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.util.regex Pattern))))
 

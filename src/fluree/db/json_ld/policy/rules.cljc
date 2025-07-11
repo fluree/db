@@ -4,8 +4,8 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.util.async :refer [<?]]
-            [fluree.db.util :as util :refer [try* catch*]]))
+            [fluree.db.util :as util :refer [try* catch*]]
+            [fluree.db.util.async :refer [<?]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
