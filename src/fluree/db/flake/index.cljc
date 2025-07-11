@@ -6,7 +6,7 @@
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]))
 
 (def comparators

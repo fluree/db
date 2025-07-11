@@ -1,5 +1,5 @@
 (ns fluree.db.track.time
-  (:require [fluree.db.util.core :as util]))
+  (:require [fluree.db.util :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

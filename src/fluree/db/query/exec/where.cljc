@@ -10,7 +10,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.track :as track]
             [fluree.db.util.async :refer [<?]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (clojure.lang MapEntry))))

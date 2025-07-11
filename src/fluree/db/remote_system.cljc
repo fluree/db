@@ -4,7 +4,7 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.util.xhttp :as xhttp]))

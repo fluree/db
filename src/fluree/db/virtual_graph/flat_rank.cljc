@@ -7,7 +7,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.track :as track]
             [fluree.db.util.async :refer [<?]]
-            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.vector.scoring :refer [dot-product cosine-similarity euclidian-distance]]
             [fluree.db.virtual-graph.parse :as vg-parse]))

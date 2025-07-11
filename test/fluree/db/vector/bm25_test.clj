@@ -3,7 +3,7 @@
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]
+            [fluree.db.util :as util]
             [test-with-files.tools :refer [with-tmp-dir]]))
 
 (defn full-text-search

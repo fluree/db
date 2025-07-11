@@ -7,7 +7,7 @@
             [fluree.db.json-ld.policy.query :as policy]
             [fluree.db.track :as track]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.schema :as schema-util]))
 

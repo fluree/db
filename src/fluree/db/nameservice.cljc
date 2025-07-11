@@ -4,7 +4,7 @@
             [clojure.string :as str]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))

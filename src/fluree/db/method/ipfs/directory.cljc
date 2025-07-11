@@ -3,7 +3,7 @@
             [clojure.string :as str]
             [fluree.db.method.ipfs.xhttp :as ipfs]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]
+            [fluree.db.util :as util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.xhttp :as xhttp]))
 

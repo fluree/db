@@ -8,7 +8,7 @@
                        [fluree.db.platform :as platform]
                        [clojure.string :as str]])
             [clojure.core.async :as async]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true])
   (:import #?@(:clj  ((org.httpkit.client TimeoutException)

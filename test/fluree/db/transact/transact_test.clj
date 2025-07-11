@@ -4,7 +4,7 @@
             [fluree.db.api :as fluree]
             [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]
+            [fluree.db.util :as util]
             [fluree.db.util.json :as json]
             [test-with-files.tools :refer [with-tmp-dir]]))
 

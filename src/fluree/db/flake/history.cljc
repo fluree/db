@@ -8,7 +8,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 

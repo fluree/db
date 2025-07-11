@@ -5,7 +5,7 @@
             [fluree.db.flake.index.novelty :refer [update-node-id]]
             [fluree.db.flake.index.storage :as storage]
             [fluree.db.util.async :refer [<?]]
-            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
 (defn partition-flakes

@@ -3,7 +3,7 @@
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util :as util]))
 
 (defrecord DataSet [named default active])
 

@@ -16,7 +16,7 @@
             [fluree.db.reasoner :as reasoner]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.util.core :as util]
+            [fluree.db.util :as util]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge load range exists? update drop]))

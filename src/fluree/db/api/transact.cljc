@@ -8,7 +8,7 @@
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
-            [fluree.db.util.core :as util]
+            [fluree.db.util :as util]
             [fluree.json-ld :as json-ld]))
 
 (defn prep-opts

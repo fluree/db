@@ -2,7 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]
+            [fluree.db.util :as util]
             [test-with-files.tools :refer [with-tmp-dir]]))
 
 (deftest ^:integration result-formatting
@@ -78,7 +78,7 @@
           "nil context on history query"))))
 
 (deftest ^:integration s+p+o-full-db-queries
-  (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
+  (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/everything")
           db     @(fluree/stage

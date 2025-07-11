@@ -5,7 +5,7 @@
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-first-value]]
+            [fluree.db.util :as util :refer [get-first get-first-value]]
             [fluree.db.util.log :as log]))
 
 (defn cached-ledger

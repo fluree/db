@@ -8,7 +8,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.serde.json :as serde-json]
-            [fluree.db.util.core :as util :refer [get-first get-first-value try* catch*]]
+            [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]))

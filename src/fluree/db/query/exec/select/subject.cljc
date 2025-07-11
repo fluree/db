@@ -3,7 +3,7 @@
             [fluree.db.constants :as const]
             [fluree.db.query.exec.select.literal :as literal]
             [fluree.db.util.async :refer [<?]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))

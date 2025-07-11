@@ -4,7 +4,7 @@
             [clojure.data.avl :as avl]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.core :as util])
+            [fluree.db.util :as util])
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
 #?(:clj (set! *warn-on-reflection* true))

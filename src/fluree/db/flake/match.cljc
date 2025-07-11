@@ -7,7 +7,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [vswap!]]))
+            [fluree.db.util :as util :refer [vswap!]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

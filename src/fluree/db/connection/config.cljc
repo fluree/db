@@ -2,7 +2,7 @@
   (:require [clojure.string :as str]
             [fluree.db.connection.vocab :as conn-vocab]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.core :as util :refer [get-id get-first get-first-value
+            [fluree.db.util :as util :refer [get-id get-first get-first-value
                                                   get-value try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]

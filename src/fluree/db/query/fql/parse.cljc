@@ -13,7 +13,7 @@
             [fluree.db.query.sparql.translator :as sparql.translator]
             [fluree.db.query.turtle.parse :as turtle]
             [fluree.db.util.context :as ctx-util]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.parse :as util.parse]
             [fluree.db.validation :as v]

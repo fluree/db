@@ -1,7 +1,7 @@
 (ns fluree.db.time-travel
   (:require [clojure.core.async :as async]
             [fluree.db.util.async :refer [<?]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))

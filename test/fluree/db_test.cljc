@@ -11,7 +11,7 @@
                        [test-with-files.tools :as-alias twf]])
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util :as util]))
 
 (deftest exists?-test
   (testing "returns false before committing data to a ledger"

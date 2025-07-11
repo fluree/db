@@ -15,7 +15,7 @@
             [fluree.db.track :as track]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))

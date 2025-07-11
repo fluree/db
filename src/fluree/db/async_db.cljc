@@ -13,7 +13,7 @@
             [fluree.db.query.history :as history]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util :refer [try* catch*]]
             [fluree.db.util.log :as log])
   #?(:clj (:import (java.io Writer))))
 

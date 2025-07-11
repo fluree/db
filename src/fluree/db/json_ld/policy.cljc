@@ -3,7 +3,7 @@
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]
+            [fluree.db.util :as util]
             [fluree.db.util.log :as log]
             [fluree.db.util.parse :as util.parse]
             [fluree.json-ld :as json-ld]))

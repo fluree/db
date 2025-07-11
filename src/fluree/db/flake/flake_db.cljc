@@ -33,7 +33,7 @@
             [fluree.db.reasoner :as reasoner]
             [fluree.db.time-travel :refer [TimeTravel]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [try* catch* get-first get-first-value]]
+            [fluree.db.util :as util :refer [try* catch* get-first get-first-value]]
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]
             [fluree.db.virtual-graph.flat-rank :as flat-rank]

@@ -1,8 +1,8 @@
-(ns fluree.db.util.core
+(ns fluree.db.util
   (:require #?@(:clj [[fluree.db.util.clj-exceptions :as clj-exceptions]
                       [fluree.db.util.cljs-exceptions :as cljs-exceptions]])
             [clojure.string :as str])
-  #?(:cljs (:require-macros [fluree.db.util.core :refer [case+]]))
+  #?(:cljs (:require-macros [fluree.db.util :refer [case+]]))
   #?(:clj (:import (java.time Instant OffsetDateTime ZoneId)
                    (java.time.format DateTimeFormatter)))
   (:refer-clojure :exclude [vswap!]))

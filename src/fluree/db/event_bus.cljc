@@ -1,7 +1,7 @@
 (ns fluree.db.event-bus
   (:require #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
-            [fluree.db.util.core :as util]))
+            [fluree.db.util :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
