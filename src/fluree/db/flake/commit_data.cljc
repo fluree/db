@@ -21,7 +21,7 @@
 
 (def json-ld-base-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
-  [["@context" "https://ns.flur.ee/ledger/v1"]
+  [["@context" iri/fluree-context-url]
    ["id" :id]
    ["v" :v]
    ["address" :address]

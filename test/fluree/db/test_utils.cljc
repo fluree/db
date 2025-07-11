@@ -1,5 +1,6 @@
 (ns fluree.db.test-utils
-  (:require #?@(:cljs [[clojure.core.async.interop :refer [<p!]]
+  (:require #?(:clj [cognitect.aws.client.api :as aws])
+            #?@(:cljs [[clojure.core.async.interop :refer [<p!]]
                        [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]])
             [clojure.string :as str]
             [fluree.db.api :as fluree]
@@ -334,3 +335,18 @@
           :shacl/violation)
        (= (error-status x)
           422)))
+
+#?(:clj
+   (defn s3-available?
+     "Check if LocalStack S3 is available at localhost:4566"
+     []
+     (try
+       (let [client (aws/client {:api :s3
+                                 :endpoint-override {:protocol :http
+                                                     :hostname "localhost"
+                                                     :port 4566}})
+             future-result (future (aws/invoke client {:op :ListBuckets}))
+             result (deref future-result 2000 :timeout)]  ; 2 second timeout
+         (not= result :timeout))
+       (catch Exception _
+         false))))

@@ -464,9 +464,10 @@
 (defn with-commit-data
   [commit-storage error-ch commits-ch]
   (let [to (async/chan)
-        af (fn [[commit-jsonld _commit-proof] ch]
+        af (fn [input ch]
              (go
-               (let [db-address (-> commit-jsonld
+               (let [[commit-jsonld _commit-proof] input
+                     db-address (-> commit-jsonld
                                     (get-first const/iri-data)
                                     (get-first-value const/iri-address))]
                  (-> commit-storage

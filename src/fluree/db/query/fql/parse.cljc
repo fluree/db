@@ -9,6 +9,7 @@
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql.syntax :as syntax]
+            [fluree.db.query.optimize :as optimize]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.query.sparql.translator :as sparql.translator]
             [fluree.db.query.turtle.parse :as turtle]
@@ -500,7 +501,8 @@
         attrs (dissoc m const/iri-id)]
     (if (empty? attrs)
       [(where/->pattern :id s-mch)]
-      (parse-statements s-mch attrs vars context))))
+      (let [statements (parse-statements s-mch attrs vars context)]
+        (sort optimize/compare-triples statements)))))
 
 (defn parse-node-map
   [m vars context]
@@ -759,8 +761,8 @@
       (get m (keyword nme))
       (get m (symbol nme))))
 
-(defn parse-analytical-query
-  ([q] (parse-analytical-query q nil))
+(defn parse-query*
+  ([q] (parse-query* q nil))
   ([q parent-context]
    (let [orig-context  (:context q)
          context       (cond->> (json-ld/parse-context orig-context)
@@ -786,13 +788,13 @@
   [[_ sub-query] _vars context]
   (let [sub-query* (-> sub-query
                        syntax/coerce-subquery
-                       (parse-analytical-query context))]
+                       (parse-query* context))]
     [(where/->pattern :query sub-query*)]))
 
 (defn parse-query
   [q]
   (log/trace "parse-query" q)
-  (-> q syntax/coerce-query parse-analytical-query))
+  (-> q syntax/coerce-query parse-query*))
 
 (declare parse-subj-cmp)
 

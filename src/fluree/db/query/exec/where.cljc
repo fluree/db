@@ -451,14 +451,16 @@
            (nil? p)
            s
            o)
-    (let [f (if o-fn
-              (fn [mch]
-                (and (#{o} (or (get-value mch)
-                               (get-sid mch db)))
-                     (o-fn mch)))
-              (fn [mch]
-                (#{o} (get-value mch))))]
-      [nil f])
+    (let [match-fn (fn [mch]
+                     (when-let [v (or (get-value mch)
+                                      (get-sid mch db))]
+                       (= o v)))
+          o-fn*    (if o-fn
+                     (fn [mch]
+                       (and (match-fn mch)
+                            (o-fn mch)))
+                     match-fn)]
+      [nil o-fn*])
     [o o-fn]))
 
 (defn resolve-flake-range
