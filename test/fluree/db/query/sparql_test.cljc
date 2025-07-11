@@ -894,16 +894,55 @@
 
 (deftest parse-update
   (testing "insert data"
-    (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+    (testing "with basic triple patterns"
+      (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
                INSERT DATA
                  {
                    <http://example/book1> dc:title \"A new book\" ;
                                           dc:creator \"A.N.Other\" .
                  }"]
-      (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
-              :insert  [{"@id" "http://example/book1", "dc:title" "A new book"}
-                        {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
-             (sparql/->fql query)))))
+        (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
+                :insert  [{"@id" "http://example/book1", "dc:title" "A new book"}
+                          {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
+               (sparql/->fql query)))))
+    (testing "with a graph pattern"
+      (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+                   INSERT DATA
+                     {
+                       GRAPH <ledger/graph1>
+                       {
+                         <http://example/book1> dc:title \"A new book\" .
+                         <http://example/book2> dc:creator \"A.N.Other\" .
+                       }
+                     }"]
+        (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
+                :ledger "ledger/graph1",
+                :insert
+                [{"@id" "http://example/book1", "dc:title" "A new book"}
+                 {"@id" "http://example/book2", "dc:creator" "A.N.Other"}]}
+               (sparql/->fql query)))))
+    (testing "with multiple graph patterns"
+      (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+                   INSERT DATA
+                     {
+                       GRAPH <ledger/graph1>
+                       {
+                         <http://example/book1> dc:title \"A new book\" .
+                         <http://example/book2> dc:creator \"A.N.Other\" .
+
+                       }
+                       GRAPH <ledger/graph2>
+                       {
+                         <http://example/book3> dc:title \"A new book\" .
+                         <http://example/book4> dc:creator \"A.N.Other\" .
+
+                       }
+                     }"]
+        (is (= ["Multiple GRAPH declarations not supported in INSERT DATA."
+                {:status 400, :error :db/invalid-update}]
+               (try* (sparql/->fql query)
+                     (catch* e [(ex-message e)
+                                (ex-data e)])))))))
   (testing "delete-data"
     (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
                DELETE DATA
