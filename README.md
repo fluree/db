@@ -26,6 +26,47 @@ of your data.
 The best way to get started with Fluree is to go to the [Getting Started](https://flur.ee/getstarted/) page
 at https://flur.ee/getstarted/.
 
+## Quick Start
+
+### Basic File Storage
+
+```clojure
+(require '[fluree.db.api :as fluree])
+
+;; Connect to local file storage
+(def conn @(fluree/connect-file {:storage-path "./my-data"}))
+
+;; Create a ledger
+(def ledger @(fluree/create conn "my-ledger"))
+
+;; Add some data
+(def db @(fluree/stage
+          (fluree/db ledger)
+          {"@context" {"ex" "http://example.org/"}
+           "@id" "ex:alice"
+           "ex:name" "Alice"
+           "ex:age" 30}))
+
+;; Commit the transaction
+@(fluree/commit! ledger db)
+```
+
+### Encrypted File Storage
+
+```clojure
+;; Connect with AES-256 encryption
+(def secure-conn @(fluree/connect-file {:storage-path "./secure-data"
+                                        :aes256-key "my-secret-32-byte-encryption-key!"}))
+```
+
+### Configuration Options
+
+See the [File Storage Guide](./docs/FILE_STORAGE_GUIDE.md) for complete configuration options including:
+- Storage path configuration
+- Performance tuning (parallelism, cache size)
+- AES-256 encryption setup
+- Security best practices
+
 ## Development
 
 ### Contributing

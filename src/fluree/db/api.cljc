@@ -118,16 +118,45 @@
      (connect memory-config))))
 
 (defn connect-file
+  "Forms a connection backed by local file storage.
+  
+  Options:
+    - storage-path (optional): Directory path for file storage (default: \"data\")
+    - parallelism (optional): Number of parallel operations (default: 4)
+    - cache-max-mb (optional): Maximum memory for caching in MB (default: 1000)
+    - aes256-key (optional): AES-256 encryption key for file storage encryption.
+      When provided, all data will be encrypted using AES-256-CBC with PKCS5 padding.
+      The key should be exactly 32 bytes long for optimal security.
+      Example: \"my-secret-32-byte-encryption-key!\"
+    - defaults (optional): Default options for ledgers created with this connection
+  
+  Returns a core.async channel that resolves to a connection, or an exception if
+  the connection cannot be established.
+  
+  Examples:
+    ;; Basic file storage
+    (connect-file {:storage-path \"./my-data\"})
+    
+    ;; File storage with encryption
+    (connect-file {:storage-path \"./secure-data\"
+                   :aes256-key \"my-secret-32-byte-encryption-key!\"})
+                   
+    ;; Full configuration
+    (connect-file {:storage-path \"./data\"
+                   :parallelism 8
+                   :cache-max-mb 2000
+                   :aes256-key \"my-secret-32-byte-encryption-key!\"})"
   ([]
    (connect-file {}))
-  ([{:keys [storage-path parallelism cache-max-mb defaults],
+  ([{:keys [storage-path parallelism cache-max-mb defaults aes256-key],
      :or   {storage-path "data", parallelism 4, cache-max-mb 1000}}]
    (let [file-config (cond-> {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
                                           "@vocab" "https://ns.flur.ee/system#"}
                               "@id"      "file"
-                              "@graph"   [{"@id"      "fileStorage"
-                                           "@type"    "Storage"
-                                           "filePath" storage-path}
+                              "@graph"   [(cond-> {"@id"      "fileStorage"
+                                                   "@type"    "Storage"
+                                                   "filePath" storage-path}
+                                            aes256-key (assoc "AES256Key" aes256-key))
                                           {"@id"              "connection"
                                            "@type"            "Connection"
                                            "parallelism"      parallelism

@@ -157,9 +157,10 @@
 
 (defmethod ig/init-key :fluree.db.storage/file
   [_ config]
-  (let [identifier (config/get-first-string config conn-vocab/address-identifier)
-        root-path  (config/get-first-string config conn-vocab/file-path)]
-    (file-storage/open identifier root-path)))
+  (let [identifier     (config/get-first-string config conn-vocab/address-identifier)
+        root-path      (config/get-first-string config conn-vocab/file-path)
+        aes256-key     (config/get-first-string config conn-vocab/aes256-key)]
+    (file-storage/open identifier root-path aes256-key)))
 
 (defmethod ig/init-key :fluree.db.storage/memory
   [_ config]
