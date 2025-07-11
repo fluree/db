@@ -99,6 +99,25 @@
   (every? (complement void?) xs))
 
 (defn fuse-by
+  "Merges the items from multiple pre-sorted input channels into an output channel
+  containing chunks where all items have the same key.
+
+  Takes a collection of input channels `chs`, each containing items pre-sorted
+  by `key-fn` using the `key-cmp` comparator. Returns a channel that outputs
+  vectors (chunks) where each chunk contains exactly one item from each input
+  channel, and all items in the chunk have the same key value when `key-fn` is
+  applied.
+
+  The function advances through all channels simultaneously, always processing
+  items with the current maximum key value. Items are only output when all
+  channels have an item with the same key - this creates an 'inner join'
+  behavior where only keys present in ALL channels appear in the output.
+
+  Input channels must be pre-sorted in ascending order by the result of applying
+  `key-fn` and comparing with `key-cmp`.
+
+  `buf-or-n` is either a number or a buffer, and `xform` is a transducer. When
+  those arguments are supplied, they will be applied to the output channel."
   ([key-cmp key-fn chs]
    (fuse-by key-cmp key-fn nil chs))
   ([key-cmp key-fn buf-or-n chs]
