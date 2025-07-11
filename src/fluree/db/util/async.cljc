@@ -117,8 +117,9 @@
   Input channels must be pre-sorted in ascending order by the result of applying
   `key-fn` and comparing with `key-cmp`.
 
-  `buf-or-n` is either a number or a buffer, and `xform` is a transducer. When
-  those arguments are supplied, they will be applied to the output channel."
+  `buf-or-n` is either a number corresponding to a buffer size or a buffer, and
+  `xform` is a transducer. When those arguments are supplied, they will be
+  applied to the output channel."
   ([key-cmp key-fn chs]
    (inner-join-by key-cmp key-fn nil chs))
   ([key-cmp key-fn buf-or-n chs]
