@@ -5,7 +5,6 @@
         org.clojars.mmb90/cljs-cache     {:mvn/version "0.1.4"}
         org.clojure/data.avl             {:mvn/version "0.2.0"}
         environ/environ                  {:mvn/version "1.2.0"}
-        byte-streams/byte-streams        {:mvn/version "0.2.4"}
         metosin/malli                    {:mvn/version "0.17.0"}
         nano-id/nano-id                  {:mvn/version "1.1.0"}
         integrant/integrant              {:mvn/version "0.10.0"}
@@ -22,7 +21,6 @@
 
         ;; http
         http-kit/http-kit {:mvn/version "2.8.0"}
-        hato/hato         {:mvn/version "1.0.0"}
 
         ;; parsing / serialization
         com.fluree/json-ld                  {:mvn/version "1.0.1"}
