@@ -1,0 +1,14 @@
+{
+  "resources": {
+    "includes": [
+      {"pattern": "logback.xml"},
+      {"pattern": "logback-test.xml"},
+      {"pattern": "META-INF/services/.*"},
+      {"pattern": "fluree/.*\\.edn$"},
+      {"pattern": "fluree/.*\\.json$"},
+      {"pattern": "clojure/.*\\.clj$"},
+      {"pattern": "sci/.*"}
+    ]
+  },
+  "bundles": []
+}

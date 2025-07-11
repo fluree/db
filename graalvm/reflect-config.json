@@ -1,0 +1,44 @@
+[
+  {
+    "name": "[B",
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "fluree.db.query.exec.where.TypedValue",
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true,
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "fluree.db.flake.Flake",
+    "allDeclaredFields": true,
+    "allDeclaredMethods": true,
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "java.time.Instant",
+    "methods": [
+      {"name": "now", "parameterTypes": []},
+      {"name": "parse", "parameterTypes": ["java.lang.String"]}
+    ]
+  },
+  {
+    "name": "java.time.LocalDate",
+    "methods": [
+      {"name": "parse", "parameterTypes": ["java.lang.String"]}
+    ]
+  },
+  {
+    "name": "java.time.LocalDateTime",
+    "methods": [
+      {"name": "parse", "parameterTypes": ["java.lang.String"]}
+    ]
+  },
+  {
+    "name": "java.time.OffsetDateTime",
+    "methods": [
+      {"name": "parse", "parameterTypes": ["java.lang.String"]}
+    ]
+  }
+]

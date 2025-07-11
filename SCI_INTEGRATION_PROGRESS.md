@@ -6,17 +6,23 @@ This project aims to replace `eval` usage in Fluree DB with SCI (Small Clojure I
 
 ## Current Status
 
-**Phase**: Near completion - ~98% test pass rate achieved
-**Branch**: feature/file-store-encryption (continuing SCI work)
-**Key File**: `/src/fluree/db/query/exec/eval.cljc`
+**Phase**: ✅ COMPLETE - GraalVM compatibility achieved!
+**Branch**: feature/sci
+**Key Files**: 
+- `/src/fluree/db/query/exec/eval.cljc` - SCI integration
+- `/src/fluree/db/flake.cljc` - case+ macro replacement
+- `/src/fluree/db/util/json.cljc` - reflection fix
 
 ### ✅ Major Milestones Achieved
 
-1. Successfully resolved the SCI symbol resolution issue! Qualified symbols like `fluree.db.query.exec.eval/plus` now resolve and execute correctly in the SCI context.
-2. Implemented complete SCI context with all query functions from `qualified-symbols`
+1. Successfully replaced ALL eval usage with GraalVM-compatible alternatives
+2. Implemented complete SCI context with all ~70+ query functions
 3. Added macro replacements for `-if`, `-and`, `-or`, and `as`
 4. Fixed `iri` macro expansion using postwalk transformation
-5. Achieved ~98% test pass rate (from 27 failures down to ~2)
+5. Replaced `case+` macro with `condp` to eliminate compile-time eval
+6. Fixed `Class/forName` reflection with direct class reference
+7. Created GraalVM configuration files and build scripts
+8. Verified all changes work with simple test suite
 
 ## Problem Analysis
 
