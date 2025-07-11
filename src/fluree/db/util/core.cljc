@@ -5,8 +5,7 @@
   #?(:cljs (:require-macros [fluree.db.util.core :refer [case+]]))
   #?(:clj (:import (java.util Date)
                    (java.time Instant OffsetDateTime ZoneId)
-                   (java.time.format DateTimeFormatter)
-                   (java.net URLEncoder URLDecoder)))
+                   (java.time.format DateTimeFormatter)))
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -58,42 +57,6 @@
        (cljs-exceptions/try* ~@body)
        (clj-exceptions/try* ~@body))))
 
-(defn index-of
-  "Returns index integer (n) of item within a Vector.
-  If item cannot be found, returns nil."
-  [^clojure.lang.PersistentVector coll value]
-  #?(:clj  (let [n (.indexOf coll value)]
-             (if (< n 0)
-               nil
-               n))
-     :cljs (some (fn [[item idx]] (when (= value item) idx))
-                 (partition 2 (interleave coll (range))))))
-
-(defn date->millis
-  "Given a date, returns epoch millis if possible."
-  [date]
-  (cond
-    (string? date)
-    #?(:clj  (-> (Instant/parse date)
-                 (.toEpochMilli))
-       :cljs (-> (js/Date.parse date)
-                 (.getTime)))
-
-    (number? date)
-    date
-
-    #?@(:clj  [(instance? Instant date)
-               (.toEpochMilli ^Instant date)
-
-               (instance? Date date)
-               (.getTime ^Date date)]
-        :cljs [(instance? js/Date date)
-               (.getTime date)])
-
-    :else
-    (throw (ex-info (str "Invalid date: " (pr-str date))
-                    {:status 400 :error :db/invalid-date}))))
-
 (defn current-time-millis
   "Returns current time in epoch milliseonds for closure/script"
   []
@@ -124,22 +87,6 @@
     (if (some identity vs)
       (reduce #(rec-merge %1 %2) v vs)
       v)))
-
-(defn email?
-  [email]
-  (re-matches #"^[\w-\+]+(\.[\w]+)*@[\w-]+(\.[\w]+)*(\.[a-z]{2,})$" email))
-
-(defn pred-ident?
-  "Tests if an predicate identity two-tuple
-  in form of [pred-name-or-id pred-value]"
-  [x]
-  (and (sequential? x)
-       (= 2 (count x))
-       (string? (first x))))
-
-(defn temp-ident?
-  [x]
-  (string? x))
 
 (defn str->int
   "Converts string to integer. Assumes you've already verified the string is
@@ -227,13 +174,6 @@
      ([millis _]
       (-> millis js/Date. .toISOString))))
 
-(defn trunc
-  "Truncate string s to n characters."
-  [s n]
-  (if (< (count s) n)
-    s
-    (str (subs s 0 n) " ...")))
-
 #?(:clj
    (defmacro some-of
      ([] nil)
@@ -251,44 +191,10 @@
   [m]
   (filter-vals #(if (coll? %) (not-empty %) (some? %)) m))
 
-(defn inclusive-range
-  "Like range, but includes start/end values."
-  ([] (range))
-  ([end] (range (inc end)))
-  ([start end] (range start (inc end)))
-  ([start end step] (range start (+ end step) step)))
-
 (defn exception?
   "x-platform, returns true if is an exception"
   [x]
   (instance? #?(:clj Throwable :cljs js/Error) x))
-
-(defn url-encode
-  [string]
-  #?(:clj  (some-> string str (URLEncoder/encode "UTF-8") (.replace "+" "%20"))
-     :cljs (some-> string str (js/encodeURIComponent) (.replace "+" "%20"))))
-
-(defn url-decode
-  ([string] (url-decode string "UTF-8"))
-  #?(:clj
-     ([string ^String encoding]
-      (some-> string str (URLDecoder/decode encoding)))
-
-     :cljs
-     ([string _]
-      (some-> string str (js/decodeURIComponent)))))
-
-(defn map-invert
-  [m]
-  (reduce (fn [m [k v]] (assoc m v k)) {} m))
-
-(defn zero-pad
-  "Zero pads x"
-  [x pad]
-  (loop [s (str x)]
-    (if (< #?(:clj (.length s) :cljs (.-length s)) pad)
-      (recur (str "0" s))
-      s)))
 
 (defn conjv
   "Like conj, but if collection is nil creates a new vector instead of list.
@@ -298,54 +204,12 @@
     (vector x)
     (conj coll x)))
 
-(defn conjs
-  "Like conj, but if collection is nil creates a new set instead of list.
-  Not built to handle variable arity values"
-  [coll x]
-  (if (nil? coll)
-    #{x}
-    (conj coll x)))
-
 (defn sequential
   "Returns input wrapped in a vector if not already sequential."
   [x]
   (if (sequential? x)
     x
     [x]))
-
-#?(:clj
-   (defmacro condps
-     "Takes an expression and a set of clauses.
-     Each clause can take the form of either:
-
-     unary-predicate-fn? result-expr
-     (unary-predicate-fn?-1 ... unary-predicate-fn?-N) result-expr
-
-     For each clause, (unary-predicate-fn? expr) is evalated (for each
-     unary-predicate-fn? in the clause when >1 is given). If it returns logical
-     true, the clause is a match.
-
-     Similar to condp but takes unary predicates instead of binary and allows
-     multiple predicates to be supplied in a list similar to case."
-     [expr & clauses]
-     (let [gexpr (gensym "expr__")
-           emit  (fn emit [expr args]
-                   (let [[[a b :as clause] more] (split-at 2 args)
-                         n (count clause)]
-                     (case n
-                       0 `(throw (IllegalArgumentException.
-                                  (str "No matching clause: " ~expr)))
-                       1 a
-                       (let [preds (if (and (coll? a)
-                                            (not (= 'fn* (first a)))
-                                            (not (= 'fn (first a))))
-                                     (vec a)
-                                     [a])]
-                         `(if ((apply some-fn ~preds) ~expr)
-                            ~b
-                            ~(emit expr more))))))]
-       `(let [~gexpr ~expr]
-          ~(emit gexpr clauses)))))
 
 #?(:clj
    (defn- eval-dispatch
