@@ -19,7 +19,7 @@
 
 #?(:clj (add-encoder Flake encode-seq))
 
-#?(:clj (add-encoder (Class/forName "[B") encode-seq))
+#?(:clj (add-encoder (class (byte-array 0)) encode-seq))
 
 #?(:clj
    (defn encode-BigDecimal-as-string
