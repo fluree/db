@@ -14,7 +14,7 @@
             [fluree.db.storage.file :as file-storage]
             [fluree.db.storage.ipfs :as ipfs-storage]
             [fluree.db.storage.memory :as memory-storage]
-            [fluree.db.util.core :as util :refer [get-id get-first get-first-value]]
+            [fluree.db.util :as util :refer [get-id get-first get-first-value]]
             [integrant.core :as ig]))
 
 (derive :fluree.db.storage/file :fluree.db/content-storage)

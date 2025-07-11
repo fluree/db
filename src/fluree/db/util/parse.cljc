@@ -1,5 +1,5 @@
 (ns fluree.db.util.parse
-  (:require [fluree.db.util.core :as util]))
+  (:require [fluree.db.util :as util]))
 
 (defn normalize-values
   "Normalize the structure of the values clause to

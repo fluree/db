@@ -6,8 +6,8 @@
             [fluree.db.flake.index :as index]
             [fluree.db.flake.index.storage :as storage]
             [fluree.db.indexer.garbage :as garbage]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))

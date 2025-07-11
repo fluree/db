@@ -1,5 +1,5 @@
 {:source-paths   #{"src"}
- :linters        {:unresolved-symbol {:exclude [(fluree.db.util.core/catch*)
+ :linters        {:unresolved-symbol {:exclude [(fluree.db.util/catch*)
                                                 (test-with-files.tools/with-tmp-dir)
                                                 goog.isObject]}}
  :lint-as        {instaparse.core/defparser clojure.core/def}

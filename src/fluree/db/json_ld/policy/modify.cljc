@@ -4,8 +4,8 @@
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.policy.enforce :as enforce]
             [fluree.db.json-ld.policy.rules :as policy.rules]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util :as util]
+            [fluree.db.util.async :refer [<? go-try]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

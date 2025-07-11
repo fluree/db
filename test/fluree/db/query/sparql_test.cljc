@@ -8,7 +8,7 @@
    [fluree.db.api :as fluree]
    [fluree.db.query.sparql :as sparql]
    [fluree.db.test-utils :as test-utils]
-   [fluree.db.util.core :as util :refer [try* catch*]]))
+   [fluree.db.util :as util :refer [try* catch*]]))
 
 (deftest parse-select
   (testing "basic SELECT"
