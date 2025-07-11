@@ -96,7 +96,7 @@
 
 (defn full?
   [xs]
-  (every? some? xs))
+  (every? (complement void?) xs))
 
 (defn fuse-by
   ([cmp key-fn chs]
