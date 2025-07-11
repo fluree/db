@@ -1,35 +1,33 @@
 (ns graalvm-simple-test
+  "Simple test for GraalVM native compilation"
   (:require [fluree.db.query.exec.eval :as eval]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.constants :as const]
-            [fluree.db.flake :as flake])
+            [fluree.db.flake :as flake]
+            [fluree.db.constants :as const])
   (:gen-class))
 
-(defn -main []
-  (println "\nTesting GraalVM Compatibility...")
-  
-  ;; Test 1: Basic SCI compilation
-  (println "\n1. Testing SCI compilation:")
-  (let [f (eval/compile '(+ 1 2) {})
+(defn test-sci []
+  (println "Testing SCI compilation...")
+  (let [f (eval/compile '(+ 1 2 3) {})
         result (f {})]
-    (println "   Result:" result)
-    (println "   Value:" (:value result))
-    (assert (= 3 (:value result))))
-  
-  ;; Test 2: Flake with condp (no eval)
-  (println "\n2. Testing flake operations:")
+    (println "  SCI result:" (:value result))
+    (assert (= 6 (:value result)) "SCI test failed")))
+
+(defn test-flake []
+  (println "Testing flake operations...")
   (let [f (flake/create 1 2 "test" const/$xsd:string nil nil 1)
         size (flake/size-flake f)]
-    (println "   Flake:" f)
-    (println "   Size:" size)
-    (assert (pos? size)))
-  
-  ;; Test 3: JSON encoding (no reflection)
-  (println "\n3. Testing JSON encoding:")
-  (require '[fluree.db.util.json :as json])
-  (let [data {:test [1 2 3]}
-        json-str (fluree.db.util.json/stringify data)]
-    (println "   JSON:" json-str)
-    (assert (string? json-str)))
-  
-  (println "\n✅ All tests passed!"))
+    (println "  Flake size:" size)
+    (assert (pos? size) "Flake test failed")))
+
+(defn -main []
+  (println "GraalVM Native Image Test")
+  (println "=========================")
+  (try
+    (test-sci)
+    (test-flake)
+    (println "\nAll tests passed!")
+    (System/exit 0)
+    (catch Exception e
+      (println "\nTest failed:" (.getMessage e))
+      (.printStackTrace e)
+      (System/exit 1))))

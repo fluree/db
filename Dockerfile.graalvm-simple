@@ -1,0 +1,52 @@
+# Build stage
+FROM container-registry.oracle.com/graalvm/native-image:11-ol8 as builder
+
+# Native-image is already installed in this image
+
+# Install build tools
+RUN microdnf install -y wget tar gzip
+
+# Install Clojure
+RUN wget https://download.clojure.org/install/linux-install-1.11.1.1237.sh && \
+    chmod +x linux-install-1.11.1.1237.sh && \
+    ./linux-install-1.11.1.1237.sh && \
+    rm linux-install-1.11.1.1237.sh
+
+WORKDIR /build
+
+# Copy deps and download dependencies
+COPY deps.edn ./
+RUN clojure -P
+
+# Copy source files
+COPY src ./src
+COPY test ./test
+COPY resources ./resources
+COPY graalvm ./graalvm
+
+# Compile test class
+RUN mkdir -p classes && \
+    clojure -M:dev -e "(compile 'graalvm-simple-test)"
+
+# Print classpath for debugging
+RUN echo "Classpath:" && clojure -Spath
+
+# Build native image with verbose output
+RUN native-image \
+    -cp "$(clojure -Spath):classes" \
+    -H:ConfigurationFileDirectories=graalvm \
+    -H:+ReportExceptionStackTraces \
+    --initialize-at-build-time \
+    --no-fallback \
+    --verbose \
+    -H:Name=fluree-test \
+    graalvm_simple_test || \
+    (echo "Native image build failed" && exit 1)
+
+# Test the binary
+RUN ./fluree-test || (echo "Native test failed" && exit 1)
+
+# Runtime stage
+FROM debian:bullseye-slim
+COPY --from=builder /build/fluree-test /usr/local/bin/
+ENTRYPOINT ["fluree-test"]

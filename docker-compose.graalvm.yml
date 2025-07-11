@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  graalvm-build:
+    build:
+      context: .
+      dockerfile: Dockerfile.graalvm
+    volumes:
+      - ./native-output:/output
+    command: |
+      sh -c "cp /app/fluree-db-test /output/ && echo 'Native image copied to ./native-output/fluree-db-test'"

@@ -1,0 +1,47 @@
+# Use GraalVM CE 11 as base image
+FROM ghcr.io/graalvm/graalvm-ce:java11-22.3.5
+
+# Install native-image
+RUN gu install native-image
+
+# Install Clojure
+RUN curl -O https://download.clojure.org/install/linux-install-1.11.1.1237.sh && \
+    chmod +x linux-install-1.11.1.1237.sh && \
+    ./linux-install-1.11.1.1237.sh && \
+    rm linux-install-1.11.1.1237.sh
+
+# Set working directory
+WORKDIR /app
+
+# Copy project files
+COPY deps.edn ./
+COPY src ./src
+COPY test ./test
+COPY graalvm ./graalvm
+COPY resources ./resources
+
+# Download dependencies
+RUN clojure -P
+
+# Compile test class
+RUN mkdir -p classes && \
+    clojure -M:dev -e "(compile 'graalvm-simple-test)"
+
+# Build native image
+RUN native-image \
+    -cp "$(clojure -Spath):classes" \
+    -H:ConfigurationFileDirectories=graalvm \
+    -H:+ReportExceptionStackTraces \
+    -H:+PrintClassInitialization \
+    --no-fallback \
+    --verbose \
+    -H:Name=fluree-db-test \
+    graalvm_simple_test
+
+# Test the native image
+RUN ./fluree-db-test
+
+# Create a minimal runtime image
+FROM debian:bullseye-slim
+COPY --from=0 /app/fluree-db-test /usr/local/bin/
+CMD ["fluree-db-test"]
