@@ -1,5 +1,6 @@
 (ns fluree.db.util.async
-  (:require [fluree.db.util.core :as util]))
+  (:require [fluree.db.util.core :as util])
+  #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
