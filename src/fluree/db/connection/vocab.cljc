@@ -43,6 +43,9 @@
 (def file-path
   (system-iri "filePath"))
 
+(def aes256-key
+  (system-iri "AES256Key"))
+
 (def s3-bucket
   (system-iri "s3Bucket"))
 
