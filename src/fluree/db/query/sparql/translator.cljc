@@ -553,7 +553,7 @@
 (defmethod parse-term :OptionalGraphPattern
   ;; OptionalGraphPattern ::= <'OPTIONAL'> GroupGraphPattern
   [[_ & optional]]
-  (into [:optional] (mapv parse-term optional)))
+  (into [:optional] (mapcat parse-term optional)))
 
 (defmethod parse-term :MinusGraphPattern
   [[_ & patterns]]
