@@ -11,8 +11,7 @@
    :js-options      {:resolve {"fs"      false
                                "path"    false
                                "process" false
-                               "buffer"  false
-                               "crypto"  false}}
+                               "buffer"  false}}
    :modules         {:fluree-browser-sdk {:exports {default fluree.sdk.browser/fluree-browser-sdk}}}
    :build-hooks     [(shadow.cljs.build-report/hook)]
    :devtools        {:watch-dir "dev/browser"}}
@@ -43,8 +42,7 @@
    :js-options      {:resolve {"fs"      false
                                "path"    false
                                "process" false
-                               "buffer"  false
-                               "crypto"  false}}
+                               "buffer"  false}}
    :modules
    {:fluree-webworker {:entries [fluree.sdk.webworker]
                        :init-fn fluree.sdk.webworker/init}}
@@ -67,5 +65,4 @@
    :js-options       {:resolve {"fs"      false
                                 "path"    false
                                 "process" false
-                                "buffer"  false
-                                "crypto"  false}}}}}
+                                "buffer"  false}}}}}
