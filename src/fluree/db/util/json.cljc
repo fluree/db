@@ -11,8 +11,7 @@
             [fluree.db.util.bytes :as butil])
   #?(:clj
      (:import (fluree.db.flake Flake)
-              (java.io ByteArrayInputStream)
-              (byte_streams InputStream)
+              (java.io ByteArrayInputStream InputStream)
               (com.fasterxml.jackson.core JsonGenerator))))
 
 #?(:clj (set! *warn-on-reflection* true))

@@ -10,7 +10,7 @@
             [fluree.db.serde.protocol :as serde]
             [fluree.db.storage :as storage]
             [fluree.db.util :as util]
-            [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.virtual-graph :as vg]))
 
 #?(:clj (set! *warn-on-reflection* true))

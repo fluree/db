@@ -6,7 +6,7 @@
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.util :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]))

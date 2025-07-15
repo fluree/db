@@ -553,7 +553,7 @@
 (defmethod parse-term :OptionalGraphPattern
   ;; OptionalGraphPattern ::= <'OPTIONAL'> GroupGraphPattern
   [[_ & optional]]
-  (into [:optional] (mapv parse-term optional)))
+  (into [:optional] (mapcat parse-term optional)))
 
 (defmethod parse-term :MinusGraphPattern
   [[_ & patterns]]
@@ -868,8 +868,7 @@
 (defmethod parse-term :QuadsNotTriples
   ;; QuadsNotTriples ::= <'GRAPH'> WS VarOrIri <'{'> WS TriplesTemplate? <'}'> WS
   [[_ graph-iri & triples]]
-  ;; This is how we would translate it if we supported it in FQL
-  [(into [:graph (parse-term graph-iri)] (mapv parse-term triples))])
+  [(conj [:graph (parse-term graph-iri)] (vec (mapcat parse-term triples)))])
 
 (defmethod parse-term :Quads
   ;; <Quads> ::= TriplesTemplate? ( QuadsNotTriples '.'? TriplesTemplate? )*
