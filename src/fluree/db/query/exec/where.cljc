@@ -624,6 +624,12 @@
                           solution-ch)
     out-ch))
 
+(defn with-constraints
+  [ds tracker patterns error-ch solution-ch]
+  (reduce (fn [solution-ch pattern]
+            (with-constraint ds tracker pattern error-ch solution-ch))
+          solution-ch patterns))
+
 (defn subquery?
   [pattern]
   (and (sequential? pattern)
@@ -634,14 +640,13 @@
   dataset `ds` extending from `solution` that also match all the patterns in the
   parsed where clause collection `clause`."
   [ds tracker solution clause error-ch]
-  (let [initial-ch (async/to-chan! [solution])
-        {subquery-patterns true
-         other-patterns false} (group-by subquery? clause)
-        result-ch (reduce (fn [solution-ch pattern]
-                            (with-constraint ds tracker pattern error-ch solution-ch))
-                          initial-ch
-                          ;; process subqueries before other patterns
-                          (into (vec subquery-patterns) other-patterns))]
+  (let [{subquery-patterns true
+         other-patterns    false} (group-by subquery? clause)
+
+        ;; process subqueries before other patterns
+        patterns    (into (vec subquery-patterns) other-patterns)
+        solution-ch (async/to-chan! [solution])
+        result-ch   (with-constraints ds tracker patterns error-ch solution-ch)]
     (-finalize ds tracker error-ch result-ch)))
 
 (defn match-alias
