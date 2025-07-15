@@ -123,7 +123,7 @@
                      (-> ledger :did :private))
         did*     (or (some-> private* did/private->did)
                      did
-                     (:did ledger))]
+                     (-> ledger :did :id))]
     (assoc opts :did did*, :private private*)))
 
 (defn parse-data-helpers
