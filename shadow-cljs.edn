@@ -67,8 +67,11 @@
    :closure-defines  {fluree.db.platform/BROWSER true
                       cljs.core/*global*         "window"}
    :compiler-options {:pretty-print true
-                      :pseudo-names true}
-   :js-options       {:resolve {"fs"      false
+                      :pseudo-names true
+                      :infer-externs true}
+   :js-options       {:js-provider :shadow
+                      :resolve {"fs"      false
                                 "path"    false
                                 "process" false
-                                "buffer"  false}}}}}
+                                "buffer"  false
+                                "crypto"  false}}}}}
