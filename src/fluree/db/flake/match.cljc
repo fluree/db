@@ -200,6 +200,11 @@
       (async/close! out-ch))
     out-ch))
 
+(defn match-properties
+  [db tracker solution triples error-ch]
+  (let [solution-ch (async/to-chan! [solution])]
+    (where/with-constraints db tracker triples error-ch solution-ch)))
+
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
   subject ids repeated from previously processed flakes."
