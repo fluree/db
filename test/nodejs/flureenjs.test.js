@@ -1,6 +1,6 @@
-const flureenjs = require("@fluree/fluree-node-sdk");
-const fs = require("fs");
-const path = require("path");
+import * as flureenjs from "@fluree/fluree-node-sdk";
+import fs from "fs";
+import path from "path";
 
 test("expect all flureenjs functions to be defined", () => {
   expect(Object.keys(flureenjs).sort()).toStrictEqual([

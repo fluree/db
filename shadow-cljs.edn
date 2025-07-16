@@ -17,22 +17,27 @@
    :devtools        {:watch-dir "dev/browser"}}
 
   :fluree-node-sdk
-  {:target           :node-library
-   :output-to        "out/nodejs/fluree-node-sdk.js"
+  {:target           :esm
+   :output-dir       "out/nodejs/"
+   :runtime          :node
+   :js-options       {:js-provider :external
+                      :external-config {:node-modules-dir "node_modules"}}
    :closure-defines  {fluree.db.platform/BROWSER false}
-   :compiler-options {:optimizations :simple}
-   :exports          {:commit            fluree.sdk.node/commit
-                      :connect           fluree.sdk.node/connect
-                      :connectMemory     fluree.sdk.node/connectMemory
-                      :connectFile       fluree.sdk.node/connectFile
-                      :create            fluree.sdk.node/create
-                      :db                fluree.sdk.node/db
-                      :exists            fluree.sdk.node/exists
-                      :load              fluree.sdk.node/load
-                      :query             fluree.sdk.node/query
-                      :setLogging        fluree.sdk.node/setLogging
-                      :stage             fluree.sdk.node/stage
-                      :status            fluree.sdk.node/status}}
+   :compiler-options {:infer-externs true
+                      :optimizations :simple}
+   :modules          {:fluree-node-sdk 
+                      {:exports {commit            fluree.sdk.node/commit
+                                 connect           fluree.sdk.node/connect
+                                 connectMemory     fluree.sdk.node/connectMemory
+                                 connectFile       fluree.sdk.node/connectFile
+                                 create            fluree.sdk.node/create
+                                 db                fluree.sdk.node/db
+                                 exists            fluree.sdk.node/exists
+                                 load              fluree.sdk.node/load
+                                 query             fluree.sdk.node/query
+                                 setLogging        fluree.sdk.node/setLogging
+                                 stage             fluree.sdk.node/stage
+                                 status            fluree.sdk.node/status}}}}
 
   :fluree-webworker
   {:target          :esm
@@ -53,7 +58,8 @@
    :output-to        "out/nodejs-test/node-tests.js"
    :autorun          true
    :closure-defines  {fluree.db.platform/BROWSER false}
-   :compiler-options {:optimizations :simple}}
+   :compiler-options {:infer-externs true
+                      :optimizations :simple}}
 
   :browser-test ; runs the cljs tests in the browser via karma
   {:target           :karma

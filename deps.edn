@@ -25,7 +25,7 @@
         hato/hato         {:mvn/version "1.0.0"}
 
         ;; parsing / serialization
-        com.fluree/json-ld                  {:mvn/version "1.0.1"}
+        com.fluree/json-ld                  {:git/sha "4ee3a9ee94a6093d5ad460cd73844999335d6c17"}
         com.fluree/alphabase                {:mvn/version "3.3.0"}
         cheshire/cheshire                   {:mvn/version "5.13.0"}
         camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.3"}

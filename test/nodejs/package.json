@@ -2,12 +2,13 @@
   "name": "flureenjstest",
   "version": "0.0.0",
   "description": "Use this to test builds of fluree-node-sdk",
+  "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "jest"
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js"
   },
   "dependencies": {
-    "@fluree/fluree-node-sdk": "file:../../out/nodejs/fluree-node-sdk.js"
+    "@fluree/fluree-node-sdk": "file:../../out/nodejs/"
   },
   "devDependencies": {
     "jest": "^29.7.0",
