@@ -17,27 +17,36 @@
    :devtools        {:watch-dir "dev/browser"}}
 
   :fluree-node-sdk
-  {:target           :esm
-   :output-dir       "out/nodejs/"
-   :runtime          :node
-   :js-options       {:js-provider :external
-                      :external-config {:node-modules-dir "node_modules"}}
+  {:target           :node-library
+   :output-to        "out/nodejs/fluree-node-sdk.js"
    :closure-defines  {fluree.db.platform/BROWSER false}
-   :compiler-options {:infer-externs true
-                      :optimizations :simple}
-   :modules          {:fluree-node-sdk 
-                      {:exports {commit            fluree.sdk.node/commit
-                                 connect           fluree.sdk.node/connect
-                                 connectMemory     fluree.sdk.node/connectMemory
-                                 connectFile       fluree.sdk.node/connectFile
-                                 create            fluree.sdk.node/create
-                                 db                fluree.sdk.node/db
-                                 exists            fluree.sdk.node/exists
-                                 load              fluree.sdk.node/load
-                                 query             fluree.sdk.node/query
-                                 setLogging        fluree.sdk.node/setLogging
-                                 stage             fluree.sdk.node/stage
-                                 status            fluree.sdk.node/status}}}}
+   :compiler-options {:optimizations :simple
+                      :infer-externs true
+                      :source-map false}
+   :js-options       {:js-provider :shadow
+                      :keep-native-requires true
+                      :keep-as-require #{"fs" "path" "crypto" "stream" "util" "http" "https" "url" 
+                                         "querystring" "zlib" "buffer" "events" "net" "tls" 
+                                         "dgram" "dns" "os" "child_process" "cluster" "readline"
+                                         "repl" "tty" "v8" "vm" "assert" "console" "constants"
+                                         "domain" "punycode" "string_decoder" "timers" "module"
+                                         "process" "worker_threads" "diagnostics_channel" "stream/web"
+                                         "perf_hooks" "inspector" "async_hooks" "fs/promises"
+                                         "util/types" "stream/promises" "crypto/promises" "path/posix" "path/win32"}
+                      :resolve {"rdf-canonize-native" false
+                                "undici" false}}
+   :exports          {:commit            fluree.sdk.node/commit
+                      :connect           fluree.sdk.node/connect
+                      :connectMemory     fluree.sdk.node/connectMemory
+                      :connectFile       fluree.sdk.node/connectFile
+                      :create            fluree.sdk.node/create
+                      :db                fluree.sdk.node/db
+                      :exists            fluree.sdk.node/exists
+                      :load              fluree.sdk.node/load
+                      :query             fluree.sdk.node/query
+                      :setLogging        fluree.sdk.node/setLogging
+                      :stage             fluree.sdk.node/stage
+                      :status            fluree.sdk.node/status}}
 
   :fluree-webworker
   {:target          :esm
@@ -66,14 +75,16 @@
    :output-to        "out/browser-test/browser-tests.js"
    :closure-defines  {fluree.db.platform/BROWSER true
                       cljs.core/*global*         "window"}
-   :compiler-options {:pretty-print true
-                      :pseudo-names true
-                      :infer-externs true
-                      :source-map true}
+   :compiler-options {:optimizations :simple
+                      :pretty-print true
+                      :source-map true
+                      :output-feature-set :es-next}
    :js-options       {:js-provider :shadow
                       :resolve {"fs"      false
                                 "path"    false
                                 "process" false
                                 "buffer"  false
                                 "crypto"  false
-                                "@peculiar/webcrypto" false}}}}}
+                                "@peculiar/webcrypto" false
+                                "axios"   false
+                                "ws"      false}}}}}

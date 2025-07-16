@@ -25,8 +25,8 @@
         hato/hato         {:mvn/version "1.0.0"}
 
         ;; parsing / serialization
-        com.fluree/json-ld                  {:git/url "https://github.com/fluree/json-ld.git"
-                                             :git/sha "4ee3a9ee94a6093d5ad460cd73844999335d6c17"}
+        com.fluree/json-ld {:git/url "https://github.com/fluree/json-ld.git"
+                            :git/sha "6a07ba03bea19fec2d5970dd51da084c9b903789"}
         com.fluree/alphabase                {:mvn/version "3.3.0"}
         cheshire/cheshire                   {:mvn/version "5.13.0"}
         camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.3"}
@@ -36,7 +36,7 @@
 
         ;; cryptography
         com.fluree/crypto {:git/url "https://github.com/fluree/fluree.crypto.git"
-                           :git/sha "0db37977cccfcbe7f07ee8f43ab7979881f0154d"}
+                           :git/sha "aefa358f0b37dc9366e7c8c6ca1bf796735b99e9"}
         org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
         ;; storage
