@@ -82,7 +82,7 @@
 
 (defn -count
   [coll]
-  (where/->typed-val (count coll)))
+  (where/->typed-val (count (keep :value coll))))
 
 (defn groupconcat
   "GroupConcat is a set function which performs a string concatenation across the values
