@@ -8,12 +8,12 @@
     (let [conn      (test-utils/create-conn)
           ledger    @(fluree/create conn "class/testing")
           context   [test-utils/default-context {:ex "http://example.org/ns/"}]
-          db1       @(fluree/stage
+          db1       @(fluree/update
                       (fluree/db ledger)
                       {"@context" context
                        "insert"   {:id                 :ex/MyClass
                                    :schema/description "Just a basic object not used as a class"}})
-          db2       @(fluree/stage
+          db2       @(fluree/update
                       db1
                       {:context context
                        "insert" {:id                 :ex/myClassInstance
@@ -34,7 +34,7 @@
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
-          db         @(fluree/stage
+          db         @(fluree/update
                        (fluree/db ledger)
                        {"@context" context
                         "insert"
@@ -47,7 +47,7 @@
                                            :sh/maxCount 1
                                            :sh/datatype :xsd/string}]}})]
       (testing "cardinality ok"
-        (let [db-ok @(fluree/stage
+        (let [db-ok @(fluree/update
                       db
                       {"@context" context
                        "insert"
@@ -62,7 +62,7 @@
                  @(fluree/query db-ok user-query))
               "basic rdf:type query response not correct")))
       (testing "cardinality less than"
-        (let [db-no-names @(fluree/stage
+        (let [db-no-names @(fluree/update
                             db
                             {"@context" context
                              "insert"
@@ -88,7 +88,7 @@
           (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/minCount of shape :ex/pshape1 - count 0 is less than minimum count of 1."
                  (ex-message db-no-names)))))
       (testing "cardinality greater than"
-        (let [db-two-names @(fluree/stage
+        (let [db-two-names @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -123,7 +123,7 @@
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
-          db         @(fluree/stage
+          db         @(fluree/update
                        (fluree/db ledger)
                        {"@context" context
                         "insert"
@@ -134,7 +134,7 @@
                                            :sh/path     :schema/name
                                            :sh/datatype :xsd/string}]}})]
       (testing "datatype ok"
-        (let [db-ok @(fluree/stage
+        (let [db-ok @(fluree/update
                       db
                       {"@context" context
                        "insert"
@@ -147,7 +147,7 @@
                    :schema/name "John"}])
               "basic rdf:type query response not correct")))
       (testing "incorrect literal type"
-        (let [db-int-name @(fluree/stage
+        (let [db-int-name @(fluree/update
                             db
                             {"@context" context
                              "insert"
@@ -174,7 +174,7 @@
           (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/datatype of shape :ex/pshape1 - the following values do not have expected datatype :xsd/string: 42."
                  (ex-message db-int-name)))))
       (testing "incorrect ref type"
-        (let [db-bool-name @(fluree/stage
+        (let [db-bool-name @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -209,7 +209,7 @@
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
-          db         @(fluree/stage
+          db         @(fluree/update
                        (fluree/db ledger)
                        {"@context" context
                         "insert"
@@ -221,7 +221,7 @@
                          :sh/closed            true
                          :sh/ignoredProperties [:type]}})]
       (testing "no extra properties"
-        (let [db-ok @(fluree/stage
+        (let [db-ok @(fluree/update
                       db
                       {"@context" context
                        "insert"
@@ -234,7 +234,7 @@
                  @(fluree/query db-ok user-query))
               "basic type query response not correct")))
       (testing "extra properties"
-        (let [db-extra-prop @(fluree/stage
+        (let [db-extra-prop @(fluree/update
                               db
                               {"@context" context
                                "insert"
@@ -269,7 +269,7 @@
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}]
       (testing "single-cardinality equals"
-        (let [db @(fluree/stage
+        (let [db @(fluree/update
                    (fluree/db ledger)
                    {"@context" context
                     "insert"
@@ -280,7 +280,7 @@
                                        :sh/path   :schema/name
                                        :sh/equals :ex/firstName}]}})
 
-              db-not-equal @(fluree/stage
+              db-not-equal @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -306,7 +306,7 @@
                  (ex-data db-not-equal)))
           (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/equals of shape :ex/pshape1 - path [:schema/name] values John do not equal :ex/firstName values Jack."
                  (ex-message db-not-equal)))
-          (let [db-ok @(fluree/stage
+          (let [db-ok @(fluree/update
                         db
                         {"@context" context
                          "insert"
@@ -320,7 +320,7 @@
                      :ex/firstName "Alice"}]
                    @(fluree/query db-ok user-query))))))
       (testing "multi-cardinality equals"
-        (let [db @(fluree/stage
+        (let [db @(fluree/update
                    (fluree/db ledger)
                    {"@context" context
                     "insert"
@@ -330,7 +330,7 @@
                      :sh/property    [{:id        :ex/pshape1
                                        :sh/path   :ex/favNums
                                        :sh/equals :ex/luckyNums}]}})]
-          (let [db-not-equal1 @(fluree/stage
+          (let [db-not-equal1 @(fluree/update
                                 db
                                 {"@context" context
                                  "insert"
@@ -357,7 +357,7 @@
                    (ex-data db-not-equal1)))
             (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape :ex/pshape1 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 13, 18."
                    (ex-message db-not-equal1))))
-          (let [db-not-equal2 @(fluree/stage
+          (let [db-not-equal2 @(fluree/update
                                 db
                                 {"@context" context
                                  "insert"
@@ -384,7 +384,7 @@
                    (ex-data db-not-equal2)))
             (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape :ex/pshape1 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11."
                    (ex-message db-not-equal2))))
-          (let [db-not-equal3 @(fluree/stage
+          (let [db-not-equal3 @(fluree/update
                                 db
                                 {"@context" context
                                  "insert"
@@ -411,7 +411,7 @@
                    (ex-data db-not-equal3)))
             (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape :ex/pshape1 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17, 18."
                    (ex-message db-not-equal3))))
-          (let [db-not-equal4 @(fluree/stage
+          (let [db-not-equal4 @(fluree/update
                                 db
                                 {"@context" context
                                  "insert"
@@ -438,7 +438,7 @@
                    (ex-data db-not-equal4)))
             (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/equals of shape :ex/pshape1 - path [:ex/favNums] values 11, 17 do not equal :ex/luckyNums values 11, 17."
                    (ex-message db-not-equal4))))
-          (let [db-ok @(fluree/stage
+          (let [db-ok @(fluree/update
                         db
                         {"@context" context
                          "insert"
@@ -453,7 +453,7 @@
                      :ex/favNums   [11 17]
                      :ex/luckyNums [11 17]}]
                    @(fluree/query db-ok user-query))))
-          (let [db-ok2 @(fluree/stage
+          (let [db-ok2 @(fluree/update
                          db
                          {"@context" context
                           "insert"
@@ -469,7 +469,7 @@
                      :ex/luckyNums [11 17]}]
                    @(fluree/query db-ok2 user-query))))))
       (testing "disjoint"
-        (let [db @(fluree/stage
+        (let [db @(fluree/update
                    (fluree/db ledger)
                    {"@context" context
                     "insert"
@@ -480,7 +480,7 @@
                                        :sh/path     :ex/favNums
                                        :sh/disjoint :ex/luckyNums}]}})]
           (testing "disjoint values"
-            (let [db-ok @(fluree/stage
+            (let [db-ok @(fluree/update
                           db
                           {"@context" context
                            "insert"
@@ -496,7 +496,7 @@
                        :ex/luckyNums 1}]
                      @(fluree/query db-ok user-query)))))
           (testing "single not disjoint value"
-            (let [db-not-disjoint1 @(fluree/stage
+            (let [db-not-disjoint1 @(fluree/update
                                      db
                                      {"@context" context
                                       "insert"
@@ -524,7 +524,7 @@
               (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape :ex/pshape1 - path [:ex/favNums] values 11 are not disjoint with :ex/luckyNums values 11."
                      (ex-message db-not-disjoint1)))))
           (testing "multiple disjoint tests"
-            (let [db-not-disjoint2 @(fluree/stage
+            (let [db-not-disjoint2 @(fluree/update
                                      db
                                      {"@context" context
                                       "insert"
@@ -553,7 +553,7 @@
               (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape :ex/pshape1 - path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11."
                      (ex-message db-not-disjoint2)))))
           (testing "multiple non disjoint values"
-            (let [db-not-disjoint3 @(fluree/stage
+            (let [db-not-disjoint3 @(fluree/update
                                      db
                                      {"@context" context
                                       "insert"
@@ -582,7 +582,7 @@
               (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape :ex/pshape1 - path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11, 13, 18."
                      (ex-message db-not-disjoint3)))))))
       (testing "lessThan"
-        (let [db     @(fluree/stage
+        (let [db     @(fluree/update
                        (fluree/db ledger)
                        {"@context" context
                         "insert"
@@ -592,7 +592,7 @@
                          :sh/property    [{:id          :ex/pshape1
                                            :sh/path     :ex/p1
                                            :sh/lessThan :ex/p2}]}})
-              db-ok1 @(fluree/stage
+              db-ok1 @(fluree/update
                        db
                        {"@context" context
                         "insert"
@@ -602,7 +602,7 @@
                          :ex/p1       [11 17]
                          :ex/p2       [18 19]}})
 
-              db-ok2 @(fluree/stage
+              db-ok2 @(fluree/update
                        db
                        {"@context" context
                         "insert"
@@ -625,7 +625,7 @@
                      :ex/p2       18}]
                    @(fluree/query db-ok2 user-query))))
           (testing "values not less than other value"
-            (let [db-fail1 @(fluree/stage
+            (let [db-fail1 @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -653,7 +653,7 @@
               (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape :ex/pshape1 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 17."
                      (ex-message db-fail1)))))
           (testing "values not comparable to other values"
-            (let [db-fail2 @(fluree/stage
+            (let [db-fail2 @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -681,7 +681,7 @@
               (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape :ex/pshape1 - path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 18, 19."
                      (ex-message db-fail2)))))
           (testing "values not less than all other values"
-            (let [db-fail3 @(fluree/stage
+            (let [db-fail3 @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -709,7 +709,7 @@
               (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape :ex/pshape1 - path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 18."
                      (ex-message db-fail3)))))
           (testing "values not less than all"
-            (let [db-fail4 @(fluree/stage
+            (let [db-fail4 @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -737,7 +737,7 @@
               (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape :ex/pshape1 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16."
                      (ex-message db-fail4)))))
           (testing "not comparable with iris"
-            (let [db-iris @(fluree/stage
+            (let [db-iris @(fluree/update
                             db
                             {"@context" context
                              "insert"
@@ -765,7 +765,7 @@
               (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape :ex/pshape1 - path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john."
                      (ex-message db-iris)))))))
       (testing "lessThanOrEquals"
-        (let [db @(fluree/stage
+        (let [db @(fluree/update
                    (fluree/db ledger)
                    {"@context" context
                     "insert"
@@ -776,7 +776,7 @@
                                        :sh/path             :ex/p1
                                        :sh/lessThanOrEquals :ex/p2}]}})]
           (testing "all values less than or equal"
-            (let [db-ok1 @(fluree/stage
+            (let [db-ok1 @(fluree/update
                            db
                            {"@context" context
                             "insert"
@@ -786,7 +786,7 @@
                              :ex/p1       [11 17]
                              :ex/p2       [17 19]}})
 
-                  db-ok2 @(fluree/stage
+                  db-ok2 @(fluree/update
                            db
                            {"@context" context
                             "insert"
@@ -808,7 +808,7 @@
                        :ex/p2       17}]
                      @(fluree/query db-ok2 user-query)))))
           (testing "all values not less than other value"
-            (let [db-fail1 @(fluree/stage
+            (let [db-fail1 @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -836,7 +836,7 @@
               (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape :ex/pshape1 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 10."
                      (ex-message db-fail1)))))
           (testing "all values not comparable with other values"
-            (let [db-fail2 @(fluree/stage
+            (let [db-fail2 @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -864,7 +864,7 @@
               (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape :ex/pshape1 - path [:ex/p1] values 11, 17 are not all comparable with :ex/p2 values 17, 19."
                      (ex-message db-fail2)))))
           (testing "all values not less than other values"
-            (let [db-fail3 @(fluree/stage
+            (let [db-fail3 @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -892,7 +892,7 @@
               (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape :ex/pshape1 - path [:ex/p1] values 12, 17 are not all less than :ex/p2 values 10, 17."
                      (ex-message db-fail3)))))
           (testing "all values not less than all other values"
-            (let [db-fail4 @(fluree/stage
+            (let [db-fail4 @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -929,7 +929,7 @@
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}]
       (testing "exclusive constraints"
-        (let [db @(fluree/stage
+        (let [db @(fluree/update
                    (fluree/db ledger)
                    {"@context" context
                     "insert"
@@ -941,7 +941,7 @@
                                        :sh/minExclusive 1
                                        :sh/maxExclusive 100}]}})]
           (testing "values in range"
-            (let [db-ok @(fluree/stage
+            (let [db-ok @(fluree/update
                           db
                           {"@context" context
                            "insert"
@@ -953,7 +953,7 @@
                        :schema/age 2}]
                      @(fluree/query db-ok user-query)))))
           (testing "values too low"
-            (let [db-too-low @(fluree/stage
+            (let [db-too-low @(fluree/update
                                db
                                {"@context" context
                                 "insert"
@@ -979,7 +979,7 @@
               (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/minExclusive of shape :ex/pshape1 - value 1 is less than exclusive minimum 1."
                      (ex-message db-too-low)))))
           (testing "values too high"
-            (let [db-too-high @(fluree/stage
+            (let [db-too-high @(fluree/update
                                 db
                                 {"@context" context
                                  "insert"
@@ -1005,7 +1005,7 @@
               (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/maxExclusive of shape :ex/pshape1 - value 100 is greater than exclusive maximum 100."
                      (ex-message db-too-high)))))))
       (testing "inclusive constraints"
-        (let [db @(fluree/stage
+        (let [db @(fluree/update
                    (fluree/db ledger)
                    {"@context" context
                     "insert"
@@ -1017,14 +1017,14 @@
                                        :sh/minInclusive 1
                                        :sh/maxInclusive 100}]}})]
           (testing "values at limit"
-            (let [db-ok  @(fluree/stage
+            (let [db-ok  @(fluree/update
                            db
                            {"@context" context
                             "insert"
                             {:id         :ex/brian
                              :type       :ex/User
                              :schema/age 1}})
-                  db-ok2 @(fluree/stage
+                  db-ok2 @(fluree/update
                            db-ok
                            {"@context" context
                             "insert"
@@ -1039,7 +1039,7 @@
                        :schema/age 1}]
                      @(fluree/query db-ok2 user-query)))))
           (testing "values below min"
-            (let [db-too-low @(fluree/stage
+            (let [db-too-low @(fluree/update
                                db
                                {"@context" context
                                 "insert"
@@ -1065,7 +1065,7 @@
               (is (= "Subject :ex/alice path [:schema/age] violates constraint :sh/minInclusive of shape :ex/pshape1 - value 0 is less than inclusive minimum 1."
                      (ex-message db-too-low)))))
           (testing "values above max"
-            (let [db-too-high @(fluree/stage
+            (let [db-too-high @(fluree/update
                                 db
                                 {"@context" context
                                  "insert"
@@ -1091,7 +1091,7 @@
               (is (= "Subject :ex/alice path [:schema/age] violates constraint :sh/maxInclusive of shape :ex/pshape1 - value 101 is greater than inclusive maximum 100."
                      (ex-message db-too-high)))))))
       (testing "non-numeric values"
-        (let [db         @(fluree/stage
+        (let [db         @(fluree/update
                            (fluree/db ledger)
                            {"@context" context
                             "insert"
@@ -1101,14 +1101,14 @@
                              :sh/property    [{:id              :ex/pshape1
                                                :sh/path         :schema/age
                                                :sh/minExclusive 0}]}})
-              db-subj-id @(fluree/stage
+              db-subj-id @(fluree/update
                            db
                            {"@context" context
                             "insert"
                             {:id         :ex/alice
                              :type       :ex/User
                              :schema/age :ex/brian}})
-              db-string  @(fluree/stage
+              db-string  @(fluree/update
                            db
                            {"@context" context
                             "insert"
@@ -1161,7 +1161,7 @@
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
-          db         @(fluree/stage
+          db         @(fluree/update
                        (fluree/db ledger)
                        {"@context" context
                         "insert"
@@ -1173,7 +1173,7 @@
                                            :sh/minLength 4
                                            :sh/maxLength 10}]}})]
       (testing "string is correct length"
-        (let [db-ok-str @(fluree/stage
+        (let [db-ok-str @(fluree/update
                           db
                           {"@context" context
                            "insert"
@@ -1185,7 +1185,7 @@
                    :schema/name "John"}]
                  @(fluree/query db-ok-str user-query)))))
       (testing "non-string literals are stringified and checked"
-        (let [db-ok-non-str @(fluree/stage
+        (let [db-ok-non-str @(fluree/update
                               db
                               {"@context" context
                                "insert"
@@ -1197,7 +1197,7 @@
                    :schema/name 12345}]
                  @(fluree/query db-ok-non-str user-query)))))
       (testing "string is too short"
-        (let [db-too-short-str @(fluree/stage
+        (let [db-too-short-str @(fluree/update
                                  db
                                  {"@context" context
                                   "insert"
@@ -1223,7 +1223,7 @@
           (is (= "Subject :ex/al path [:schema/name] violates constraint :sh/minLength of shape :ex/pshape1 - value \"Al\" has string length less than minimum length 4."
                  (ex-message db-too-short-str)))))
       (testing "string is too long"
-        (let [db-too-long-str @(fluree/stage
+        (let [db-too-long-str @(fluree/update
                                 db
                                 {"@context" context
                                  "insert"
@@ -1249,7 +1249,7 @@
           (is (= "Subject :ex/jean-claude path [:schema/name] violates constraint :sh/maxLength of shape :ex/pshape1 - value \"Jean-Claude\" has string length greater than maximum length 10."
                  (ex-message db-too-long-str)))))
       (testing "non-string literals are stringified"
-        (let [db-too-long-non-str @(fluree/stage
+        (let [db-too-long-non-str @(fluree/update
                                     db
                                     {"@context" context
                                      "insert"
@@ -1275,7 +1275,7 @@
           (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/maxLength of shape :ex/pshape1 - value \"12345678910\" has string length greater than maximum length 10."
                  (ex-message db-too-long-non-str)))))
       (testing "non-literal values violate"
-        (let [db-ref-value @(fluree/stage
+        (let [db-ref-value @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -1309,7 +1309,7 @@
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
-          db         @(fluree/stage
+          db         @(fluree/update
                        (fluree/db ledger)
                        {"@context" context
                         "insert"
@@ -1324,7 +1324,7 @@
                                            :sh/path    :ex/birthYear
                                            :sh/pattern "(19|20)[0-9][0-9]"}]}})]
       (testing "string matches pattern"
-        (let [db-ok-greeting @(fluree/stage
+        (let [db-ok-greeting @(fluree/update
                                db
                                {"@context" context
                                 "insert"
@@ -1336,7 +1336,7 @@
                    :ex/greeting "hello\nworld!"}]
                  @(fluree/query db-ok-greeting user-query)))))
       (testing "stringified literal matches pattern"
-        (let [db-ok-birthyear @(fluree/stage
+        (let [db-ok-birthyear @(fluree/update
                                 db
                                 {"@context" context
                                  "insert"
@@ -1348,7 +1348,7 @@
                    :ex/birthYear 1984}]
                  @(fluree/query db-ok-birthyear user-query)))))
       (testing "string does not match pattern"
-        (let [db-wrong-case-greeting @(fluree/stage
+        (let [db-wrong-case-greeting @(fluree/update
                                        db
                                        {"@context" context
                                         "insert"
@@ -1381,7 +1381,7 @@ WORLD!")
                       " does not match pattern \"hello   (.*?)world\" with :sh/flags s, x.")
                  (ex-message db-wrong-case-greeting)))))
       (testing "stringified literal does not match pattern"
-        (let [db-wrong-birth-year @(fluree/stage
+        (let [db-wrong-birth-year @(fluree/update
                                     db
                                     {"@context" context
                                      "insert"
@@ -1407,7 +1407,7 @@ WORLD!")
           (is (= "Subject :ex/alice path [:ex/birthYear] violates constraint :sh/pattern of shape :ex/pshape2 - value \"1776\" does not match pattern \"(19|20)[0-9][0-9]\"."
                  (ex-message db-wrong-birth-year)))))
       (testing "non-literal values automatically produce violation"
-        (let [db-ref-value @(fluree/stage
+        (let [db-ref-value @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -1440,25 +1440,25 @@ WORLD!")
                  {"ex" "http://example.com/ns/"}]
         db0     (fluree/db ledger)]
     (testing "language-in"
-      (let [db1 @(fluree/stage db0 {"@context" context
-                                    "insert"
-                                    {"@id"           "ex:langShape"
-                                     "type"          "sh:NodeShape"
-                                     "sh:targetNode" {"@id" "ex:a"}
-                                     "sh:property"   [{"id"            "ex:pshape1"
-                                                       "sh:path"       {"@id" "ex:label"}
-                                                       "sh:languageIn" ["en" "fr"]}]}})]
+      (let [db1 @(fluree/update db0 {"@context" context
+                                     "insert"
+                                     {"@id"           "ex:langShape"
+                                      "type"          "sh:NodeShape"
+                                      "sh:targetNode" {"@id" "ex:a"}
+                                      "sh:property"   [{"id"            "ex:pshape1"
+                                                        "sh:path"       {"@id" "ex:label"}
+                                                        "sh:languageIn" ["en" "fr"]}]}})]
         (testing "no error when language conforms"
-          (let [db2 @(fluree/stage db1 {"@context" context
-                                        "insert"
-                                        {"@id"      "ex:a"
-                                         "ex:label" {"@value" "foo" "@language" "en"}}})]
+          (let [db2 @(fluree/update db1 {"@context" context
+                                         "insert"
+                                         {"@id"      "ex:a"
+                                          "ex:label" {"@value" "foo" "@language" "en"}}})]
             (is (nil? (ex-data db2)))))
         (testing "error when disallowed language transacted"
-          (let [db2 @(fluree/stage db1 {"@context" context
-                                        "insert"
-                                        {"@id"      "ex:a"
-                                         "ex:label" {"@value" "foo" "@language" "cz"}}})]
+          (let [db2 @(fluree/update db1 {"@context" context
+                                         "insert"
+                                         {"@id"      "ex:a"
+                                          "ex:label" {"@value" "foo" "@language" "cz"}}})]
             (is (= {:status 422,
                     :error  :shacl/violation,
                     :report
@@ -1479,27 +1479,27 @@ WORLD!")
             (is (= "Subject ex:a path [\"ex:label\"] violates constraint sh:languageIn of shape ex:pshape1 - value \"foo\" does not have language tag in [\"en\" \"fr\"]."
                    (ex-message db2)))))))
     (testing "unique-lang"
-      (let [db1 @(fluree/stage db0 {"@context" context
-                                    "insert"
-                                    {"@id"           "ex:langShape"
-                                     "type"          "sh:NodeShape"
-                                     "sh:targetNode" {"@id" "ex:a"}
-                                     "sh:property"   [{"id"            "ex:pshape1"
-                                                       "sh:path"       {"@id" "ex:label"}
-                                                       "sh:uniqueLang" true}]}})]
+      (let [db1 @(fluree/update db0 {"@context" context
+                                     "insert"
+                                     {"@id"           "ex:langShape"
+                                      "type"          "sh:NodeShape"
+                                      "sh:targetNode" {"@id" "ex:a"}
+                                      "sh:property"   [{"id"            "ex:pshape1"
+                                                        "sh:path"       {"@id" "ex:label"}
+                                                        "sh:uniqueLang" true}]}})]
         (testing "no error when all langs unique"
-          (let [db2 @(fluree/stage db1 {"@context" context
-                                        "insert"
-                                        {"@id"      "ex:a"
-                                         "ex:label" [{"@value" "foo" "@language" "en"}
-                                                     {"@value" "feuou" "@language" "fr"}]}})]
+          (let [db2 @(fluree/update db1 {"@context" context
+                                         "insert"
+                                         {"@id"      "ex:a"
+                                          "ex:label" [{"@value" "foo" "@language" "en"}
+                                                      {"@value" "feuou" "@language" "fr"}]}})]
             (is (nil? (ex-data db2)))))
         (testing "error when a lang is repeated"
-          (let [db2 @(fluree/stage db1 {"@context" context
-                                        "insert"
-                                        {"@id"      "ex:a"
-                                         "ex:label" [{"@value" "foo" "@language" "en"}
-                                                     {"@value" "bar" "@language" "en"}]}})]
+          (let [db2 @(fluree/update db1 {"@context" context
+                                         "insert"
+                                         {"@id"      "ex:a"
+                                          "ex:label" [{"@value" "foo" "@language" "en"}
+                                                      {"@value" "bar" "@language" "en"}]}})]
             (is (= {:status 422,
                     :error  :shacl/violation,
                     :report
@@ -1527,7 +1527,7 @@ WORLD!")
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
-          db         @(fluree/stage
+          db         @(fluree/update
                        (fluree/db ledger)
                        {"@context" context
                         "insert"
@@ -1549,7 +1549,7 @@ WORLD!")
                                            :sh/path     :schema/email
                                            :sh/datatype :xsd/string}]}})]
       (testing "all constraints satisfied"
-        (let [db-ok @(fluree/stage
+        (let [db-ok @(fluree/update
                       db
                       {"@context" context
                        "insert"
@@ -1565,7 +1565,7 @@ WORLD!")
                    :schema/name  "John"}]
                  @(fluree/query db-ok user-query)))))
       (testing "one constraint violated"
-        (let [db-no-name @(fluree/stage
+        (let [db-no-name @(fluree/update
                            db
                            {"@context" context
                             "insert"
@@ -1592,7 +1592,7 @@ WORLD!")
           (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/minCount of shape :ex/pshape1 - count 0 is less than minimum count of 1."
                  (ex-message db-no-name)))))
       (testing "cardinality constraint violated"
-        (let [db-two-names @(fluree/stage
+        (let [db-two-names @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -1620,7 +1620,7 @@ WORLD!")
           (is (= "Subject :ex/john path [:schema/name] violates constraint :sh/maxCount of shape :ex/pshape1 - count 2 is greater than maximum count of 1."
                  (ex-message db-two-names)))))
       (testing "max constraint violated"
-        (let [db-too-old @(fluree/stage
+        (let [db-too-old @(fluree/update
                            db
                            {"@context" context
                             "insert"
@@ -1648,7 +1648,7 @@ WORLD!")
           (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/maxInclusive of shape :ex/pshape2 - value 140 is greater than inclusive maximum 130."
                  (ex-message db-too-old)))))
       (testing "second cardinality constraint violated"
-        (let [db-two-ages @(fluree/stage
+        (let [db-two-ages @(fluree/update
                             db
                             {"@context" context
                              "insert"
@@ -1676,7 +1676,7 @@ WORLD!")
           (is (= "Subject :ex/john path [:schema/age] violates constraint :sh/maxCount of shape :ex/pshape2 - count 2 is greater than maximum count of 1."
                  (ex-message db-two-ages)))))
       (testing "datatype constraint violated"
-        (let [db-num-email @(fluree/stage
+        (let [db-num-email @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -1709,23 +1709,23 @@ WORLD!")
         db0     (fluree/db ledger)]
     (testing "inverse path"
       (let [;; a valid Parent is anybody who is the object of a parent predicate
-            db1          @(fluree/stage db0 {"@context" context
-                                             "insert"   {"@type"          "sh:NodeShape"
-                                                         "id"             "ex:ParentShape"
-                                                         "sh:targetClass" {"@id" "ex:Parent"}
-                                                         "sh:property"    [{"id" "ex:pshape1"
-                                                                            "sh:path"     {"sh:inversePath" {"id" "ex:parent"}}
-                                                                            "sh:minCount" 1}]}})
-            valid-parent @(fluree/stage db1 {"@context" context
-                                             "insert"   {"id"          "ex:Luke"
-                                                         "schema:name" "Luke"
-                                                         "ex:parent"   {"id"          "ex:Anakin"
-                                                                        "type"        "ex:Parent"
-                                                                        "schema:name" "Anakin"}}})
-            invalid-pal  @(fluree/stage db1 {"@context" context
-                                             "insert"   {"id"          "ex:bad-parent"
-                                                         "type"        "ex:Parent"
-                                                         "schema:name" "Darth Vader"}})]
+            db1          @(fluree/update db0 {"@context" context
+                                              "insert"   {"@type"          "sh:NodeShape"
+                                                          "id"             "ex:ParentShape"
+                                                          "sh:targetClass" {"@id" "ex:Parent"}
+                                                          "sh:property"    [{"id" "ex:pshape1"
+                                                                             "sh:path"     {"sh:inversePath" {"id" "ex:parent"}}
+                                                                             "sh:minCount" 1}]}})
+            valid-parent @(fluree/update db1 {"@context" context
+                                              "insert"   {"id"          "ex:Luke"
+                                                          "schema:name" "Luke"
+                                                          "ex:parent"   {"id"          "ex:Anakin"
+                                                                         "type"        "ex:Parent"
+                                                                         "schema:name" "Anakin"}}})
+            invalid-pal  @(fluree/update db1 {"@context" context
+                                              "insert"   {"id"          "ex:bad-parent"
+                                                          "type"        "ex:Parent"
+                                                          "schema:name" "Darth Vader"}})]
         (is (= [{"id"          "ex:Luke",
                  "schema:name" "Luke",
                  "ex:parent"   {"id"          "ex:Anakin"
@@ -1754,25 +1754,25 @@ WORLD!")
                (ex-message invalid-pal)))))
     (testing "sequence paths"
       (let [;; a valid Pal is anybody who has a pal with a name
-            db1         @(fluree/stage db0 {"@context" context
-                                            "insert"   {"@type"          "sh:NodeShape"
-                                                        "sh:targetClass" {"@id" "ex:Pal"}
-                                                        "sh:property"
-                                                        [{"id" "ex:pshape1"
-                                                          "sh:path"
-                                                          {"@list" [{"id" "ex:pal"} {"id" "schema:name"}]}
-                                                          "sh:minCount" 1}]}})
-            valid-pal   @(fluree/stage db1 {"@context" context
-                                            "insert"   {"id"          "ex:good-pal"
-                                                        "type"        "ex:Pal"
-                                                        "schema:name" "J.D."
-                                                        "ex:pal"      [{"schema:name" "Turk"}
-                                                                       {"schema:name" "Rowdy"}]}})
-            invalid-pal @(fluree/stage db1 {"@context" context
-                                            "insert"   {"id"          "ex:bad-pal"
-                                                        "type"        "ex:Pal"
-                                                        "schema:name" "Darth Vader"
-                                                        "ex:pal"      {"ex:evil" "has no name"}}})]
+            db1         @(fluree/update db0 {"@context" context
+                                             "insert"   {"@type"          "sh:NodeShape"
+                                                         "sh:targetClass" {"@id" "ex:Pal"}
+                                                         "sh:property"
+                                                         [{"id" "ex:pshape1"
+                                                           "sh:path"
+                                                           {"@list" [{"id" "ex:pal"} {"id" "schema:name"}]}
+                                                           "sh:minCount" 1}]}})
+            valid-pal   @(fluree/update db1 {"@context" context
+                                             "insert"   {"id"          "ex:good-pal"
+                                                         "type"        "ex:Pal"
+                                                         "schema:name" "J.D."
+                                                         "ex:pal"      [{"schema:name" "Turk"}
+                                                                        {"schema:name" "Rowdy"}]}})
+            invalid-pal @(fluree/update db1 {"@context" context
+                                             "insert"   {"id"          "ex:bad-pal"
+                                                         "type"        "ex:Pal"
+                                                         "schema:name" "Darth Vader"
+                                                         "ex:pal"      {"ex:evil" "has no name"}}})]
         (is (= {"id"          "ex:good-pal"
                 "type"        "ex:Pal"
                 "schema:name" "J.D."
@@ -1801,31 +1801,31 @@ WORLD!")
         (is (= "Subject ex:bad-pal path [\"ex:pal\" \"schema:name\"] violates constraint sh:minCount of shape ex:pshape1 - count 0 is less than minimum count of 1."
                (ex-message invalid-pal)))))
     (testing "sequence paths"
-      (let [db1         @(fluree/stage db0 {"@context" context
-                                            "insert"   [{"@type"          "sh:NodeShape"
-                                                         "sh:targetClass" {"@id" "ex:Pal"}
-                                                         "sh:property"
-                                                         [{"id" "ex:pshape1"
-                                                           "sh:path"
-                                                           {"@list" [{"id" "ex:pal"} {"id" "ex:name"}]}
-                                                           "sh:minCount" 1}]}]})
-            valid-pal   @(fluree/stage db1 {"@context" context
-                                            "insert"   {"id"      "ex:jd"
-                                                        "type"    "ex:Pal"
-                                                        "ex:name" "J.D."
-                                                        "ex:pal"  [{"ex:name" "Turk"}
-                                                                   {"ex:name" "Rowdy"}]}})
+      (let [db1         @(fluree/update db0 {"@context" context
+                                             "insert"   [{"@type"          "sh:NodeShape"
+                                                          "sh:targetClass" {"@id" "ex:Pal"}
+                                                          "sh:property"
+                                                          [{"id" "ex:pshape1"
+                                                            "sh:path"
+                                                            {"@list" [{"id" "ex:pal"} {"id" "ex:name"}]}
+                                                            "sh:minCount" 1}]}]})
+            valid-pal   @(fluree/update db1 {"@context" context
+                                             "insert"   {"id"      "ex:jd"
+                                                         "type"    "ex:Pal"
+                                                         "ex:name" "J.D."
+                                                         "ex:pal"  [{"ex:name" "Turk"}
+                                                                    {"ex:name" "Rowdy"}]}})
 
-            invalid-pal @(fluree/stage db1 {"@context" context
-                                            "insert"   {"id"      "ex:jd"
-                                                        "type"    "ex:Pal"
-                                                        "ex:name" "J.D."
-                                                        "ex:pal"  [{"id" "ex:not-pal"
-                                                                    "ex:not-name" "noname"}
-                                                                   {"id" "ex:turk"
-                                                                    "ex:name" "Turk"}
-                                                                   {"id" "ex:rowdy"
-                                                                    "ex:name" "Rowdy"}]}})]
+            invalid-pal @(fluree/update db1 {"@context" context
+                                             "insert"   {"id"      "ex:jd"
+                                                         "type"    "ex:Pal"
+                                                         "ex:name" "J.D."
+                                                         "ex:pal"  [{"id" "ex:not-pal"
+                                                                     "ex:not-name" "noname"}
+                                                                    {"id" "ex:turk"
+                                                                     "ex:name" "Turk"}
+                                                                    {"id" "ex:rowdy"
+                                                                     "ex:name" "Rowdy"}]}})]
 
         (is (= {"id" "ex:jd",
                 "type" "ex:Pal",
@@ -1855,19 +1855,19 @@ WORLD!")
                (ex-message invalid-pal)))))
 
     (testing "predicate-path"
-      (let [db1 @(fluree/stage db0 {"@context" context
-                                    "insert" [{"@type" "sh:NodeShape"
-                                               "sh:targetClass" {"@id" "ex:Named"}
-                                               "sh:property"
-                                               [{"id" "ex:pshape1"
-                                                 "sh:path"
-                                                 {"@list" [{"id" "ex:name"}]}
-                                                 "sh:datatype" {"id" "xsd:string"}}]}]})
-            valid-named   @(fluree/stage db1 {"@context" context
-                                              "insert"   {"id"      "ex:good-pal"
-                                                          "type"    "ex:Named"
-                                                          "ex:name" {"@value" 123
-                                                                     "@type" "xsd:integer"}}})]
+      (let [db1 @(fluree/update db0 {"@context" context
+                                     "insert" [{"@type" "sh:NodeShape"
+                                                "sh:targetClass" {"@id" "ex:Named"}
+                                                "sh:property"
+                                                [{"id" "ex:pshape1"
+                                                  "sh:path"
+                                                  {"@list" [{"id" "ex:name"}]}
+                                                  "sh:datatype" {"id" "xsd:string"}}]}]})
+            valid-named   @(fluree/update db1 {"@context" context
+                                               "insert"   {"id"      "ex:good-pal"
+                                                           "type"    "ex:Named"
+                                                           "ex:name" {"@value" 123
+                                                                      "@type" "xsd:integer"}}})]
         (is (= {:status 422,
                 :error :shacl/violation,
                 :report
@@ -1887,32 +1887,32 @@ WORLD!")
                (ex-data valid-named)))))
     (testing "inverse sequence path"
       (let [;; a valid Princess is anybody who is the child of someone's queen
-            db1              @(fluree/stage db0 {"@context" context
-                                                 "insert"   {"@type"          "sh:NodeShape"
-                                                             "id"             "ex:PrincessShape"
-                                                             "sh:targetClass" {"@id" "ex:Princess"}
-                                                             "sh:property"    [{"id" "ex:pshape1"
-                                                                                "sh:path"
-                                                                                {"@list"
-                                                                                 [{"sh:inversePath"
-                                                                                   {"id" "ex:child"}}
-                                                                                  {"sh:inversePath"
-                                                                                   {"id" "ex:queen"}}]}
-                                                                                "sh:minCount" 1}]}})
-            valid-princess   @(fluree/stage db1 {"@context" context
-                                                 "insert"   {"id"          "ex:Pleb"
-                                                             "schema:name" "Pleb"
-                                                             "ex:queen"    {"id"          "ex:Buttercup"
-                                                                            "schema:name" "Buttercup"
-                                                                            "ex:child"    {"id"          "ex:Mork"
-                                                                                           "type"        "ex:Princess"
-                                                                                           "schema:name" "Mork"}}}})
-            invalid-princess @(fluree/stage db1 {"@context" context
-                                                 "insert"   {"id"          "ex:Pleb"
-                                                             "schema:name" "Pleb"
-                                                             "ex:child"    {"id"          "ex:Gerb"
-                                                                            "type"        "ex:Princess"
-                                                                            "schema:name" "Gerb"}}})]
+            db1              @(fluree/update db0 {"@context" context
+                                                  "insert"   {"@type"          "sh:NodeShape"
+                                                              "id"             "ex:PrincessShape"
+                                                              "sh:targetClass" {"@id" "ex:Princess"}
+                                                              "sh:property"    [{"id" "ex:pshape1"
+                                                                                 "sh:path"
+                                                                                 {"@list"
+                                                                                  [{"sh:inversePath"
+                                                                                    {"id" "ex:child"}}
+                                                                                   {"sh:inversePath"
+                                                                                    {"id" "ex:queen"}}]}
+                                                                                 "sh:minCount" 1}]}})
+            valid-princess   @(fluree/update db1 {"@context" context
+                                                  "insert"   {"id"          "ex:Pleb"
+                                                              "schema:name" "Pleb"
+                                                              "ex:queen"    {"id"          "ex:Buttercup"
+                                                                             "schema:name" "Buttercup"
+                                                                             "ex:child"    {"id"          "ex:Mork"
+                                                                                            "type"        "ex:Princess"
+                                                                                            "schema:name" "Mork"}}}})
+            invalid-princess @(fluree/update db1 {"@context" context
+                                                  "insert"   {"id"          "ex:Pleb"
+                                                              "schema:name" "Pleb"
+                                                              "ex:child"    {"id"          "ex:Gerb"
+                                                                             "type"        "ex:Princess"
+                                                                             "schema:name" "Gerb"}}})]
         (is (= [{"id" "ex:Mork", "type" "ex:Princess", "schema:name" "Mork"}]
                @(fluree/query valid-princess {"@context" context
                                               "select"   {"ex:Mork" ["*"]}})))
@@ -1942,74 +1942,74 @@ WORLD!")
         ledger  @(fluree/create conn "classtest")
         context test-utils/default-str-context
         db0     (fluree/db ledger)
-        db1     @(fluree/stage db0 {"@context" context
-                                    "insert"   [{"@type"          "sh:NodeShape"
-                                                 "sh:targetClass" {"@id" "https://example.com/Country"}
-                                                 "sh:property"
-                                                 [{"id"          "ex:pshape1"
-                                                   "sh:path"     {"@id" "https://example.com/name"}
-                                                   "sh:datatype" {"@id" "xsd:string"}
-                                                   "sh:minCount" 1
-                                                   "sh:maxCount" 1}]}
-                                                {"@type"          "sh:NodeShape"
-                                                 "sh:targetClass" {"@id" "https://example.com/Actor"}
-                                                 "sh:property"
-                                                 [{"id"             "ex:pshape2"
-                                                   "sh:path"        {"@id" "https://example.com/country"}
-                                                   "sh:class"       {"@id" "https://example.com/Country"}
-                                                   "sh:maxCount"    1
-                                                   "sh:description" "Birth country"}
-                                                  {"id"          "ex:pshape3"
-                                                   "sh:path"     {"@id" "https://example.com/name"}
-                                                   "sh:minCount" 1
-                                                   "sh:maxCount" 1
-                                                   "sh:datatype" {"@id" "xsd:string"}}]}]})
+        db1     @(fluree/update db0 {"@context" context
+                                     "insert"   [{"@type"          "sh:NodeShape"
+                                                  "sh:targetClass" {"@id" "https://example.com/Country"}
+                                                  "sh:property"
+                                                  [{"id"          "ex:pshape1"
+                                                    "sh:path"     {"@id" "https://example.com/name"}
+                                                    "sh:datatype" {"@id" "xsd:string"}
+                                                    "sh:minCount" 1
+                                                    "sh:maxCount" 1}]}
+                                                 {"@type"          "sh:NodeShape"
+                                                  "sh:targetClass" {"@id" "https://example.com/Actor"}
+                                                  "sh:property"
+                                                  [{"id"             "ex:pshape2"
+                                                    "sh:path"        {"@id" "https://example.com/country"}
+                                                    "sh:class"       {"@id" "https://example.com/Country"}
+                                                    "sh:maxCount"    1
+                                                    "sh:description" "Birth country"}
+                                                   {"id"          "ex:pshape3"
+                                                    "sh:path"     {"@id" "https://example.com/name"}
+                                                    "sh:minCount" 1
+                                                    "sh:maxCount" 1
+                                                    "sh:datatype" {"@id" "xsd:string"}}]}]})
         ;; valid inline type
 
         ;; valid node ref
 
         ;; invalid inline type
-        db4 @(fluree/stage db1 {"@context" context
-                                "insert"   {"@id"                         "https://example.com/Actor/1001"
-                                            "https://example.com/country" {"@id"                      "https://example.com/Country/Absurdistan"
-                                                                           "@type"                    "https://example.com/FakeCountry"
-                                                                           "https://example.com/name" "Absurdistan"}
-                                            "https://example.com/gender"  "Male"
-                                            "@type"                       "https://example.com/Actor"
-                                            "https://example.com/name"    "Not Real"}})
-        ;; invalid node ref type
-        db5 @(fluree/stage db1 {"@context" context
-                                "insert"   [{"@id"                      "https://example.com/Country/Absurdistan"
-                                             "@type"                    "https://example.com/FakeCountry"
-                                             "https://example.com/name" "Absurdistan"}
-                                            {"@id"                         "https://example.com/Actor/8675309"
-                                             "https://example.com/country" {"@id" "https://example.com/Country/Absurdistan"}
-                                             "https://example.com/gender"  "Female"
+        db4 @(fluree/update db1 {"@context" context
+                                 "insert"   {"@id"                         "https://example.com/Actor/1001"
+                                             "https://example.com/country" {"@id"                      "https://example.com/Country/Absurdistan"
+                                                                            "@type"                    "https://example.com/FakeCountry"
+                                                                            "https://example.com/name" "Absurdistan"}
+                                             "https://example.com/gender"  "Male"
                                              "@type"                       "https://example.com/Actor"
-                                             "https://example.com/name"    "Jenny Tutone"}]})]
+                                             "https://example.com/name"    "Not Real"}})
+        ;; invalid node ref type
+        db5 @(fluree/update db1 {"@context" context
+                                 "insert"   [{"@id"                      "https://example.com/Country/Absurdistan"
+                                              "@type"                    "https://example.com/FakeCountry"
+                                              "https://example.com/name" "Absurdistan"}
+                                             {"@id"                         "https://example.com/Actor/8675309"
+                                              "https://example.com/country" {"@id" "https://example.com/Country/Absurdistan"}
+                                              "https://example.com/gender"  "Female"
+                                              "@type"                       "https://example.com/Actor"
+                                              "https://example.com/name"    "Jenny Tutone"}]})]
     (testing "valid inline type"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert"   {"@id"                           "https://example.com/Actor/65731"
-                                                "https://example.com/country"   {"@id"                      "https://example.com/Country/AU"
-                                                                                 "@type"                    "https://example.com/Country"
-                                                                                 "https://example.com/name" "Oz"}
-                                                "https://example.com/gender"    "Male"
-                                                "https://example.com/character" ["Jake Sully" "Marcus Wright"]
-                                                "https://example.com/movie"     [{"@id" "https://example.com/Movie/19995"}
-                                                                                 {"@id" "https://example.com/Movie/534"}]
-                                                "@type"                         "https://example.com/Actor"
-                                                "https://example.com/name"      "Sam Worthington"}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert"   {"@id"                           "https://example.com/Actor/65731"
+                                                 "https://example.com/country"   {"@id"                      "https://example.com/Country/AU"
+                                                                                  "@type"                    "https://example.com/Country"
+                                                                                  "https://example.com/name" "Oz"}
+                                                 "https://example.com/gender"    "Male"
+                                                 "https://example.com/character" ["Jake Sully" "Marcus Wright"]
+                                                 "https://example.com/movie"     [{"@id" "https://example.com/Movie/19995"}
+                                                                                  {"@id" "https://example.com/Movie/534"}]
+                                                 "@type"                         "https://example.com/Actor"
+                                                 "https://example.com/name"      "Sam Worthington"}})]
         (is (not (ex-data db2)))))
     (testing "valid node ref"
-      (let [db3 @(fluree/stage db1 {"@context" context
-                                    "insert"   [{"@id"                      "https://example.com/Country/US"
-                                                 "@type"                    "https://example.com/Country"
-                                                 "https://example.com/name" "United States of America"}
-                                                {"@id"                         "https://example.com/Actor/4242"
-                                                 "https://example.com/country" {"@id" "https://example.com/Country/US"}
-                                                 "https://example.com/gender"  "Female"
-                                                 "@type"                       "https://example.com/Actor"
-                                                 "https://example.com/name"    "Rindsey Rohan"}]})]
+      (let [db3 @(fluree/update db1 {"@context" context
+                                     "insert"   [{"@id"                      "https://example.com/Country/US"
+                                                  "@type"                    "https://example.com/Country"
+                                                  "https://example.com/name" "United States of America"}
+                                                 {"@id"                         "https://example.com/Actor/4242"
+                                                  "https://example.com/country" {"@id" "https://example.com/Country/US"}
+                                                  "https://example.com/gender"  "Female"
+                                                  "@type"                       "https://example.com/Actor"
+                                                  "https://example.com/name"    "Rindsey Rohan"}]})]
         (is (not (ex-data db3)))))
     (is (= {:status 422,
             :error  :shacl/violation,
@@ -2056,16 +2056,16 @@ WORLD!")
           ledger  @(fluree/create conn "shacl-in-test")
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db0     (fluree/db ledger)
-          db1     @(fluree/stage db0 {"@context" context
-                                      "insert"   [{"type"           ["sh:NodeShape"]
-                                                   "sh:targetClass" {"id" "ex:Pony"}
-                                                   "sh:property"    [{"id"      "ex:pshape1"
-                                                                      "sh:path" {"id" "ex:color"}
-                                                                      "sh:in"   '("cyan" "magenta")}]}]})
-          db2     @(fluree/stage db1 {"@context" context
-                                      "insert"   {"id"       "ex:YellowPony"
-                                                  "type"     "ex:Pony"
-                                                  "ex:color" "yellow"}})]
+          db1     @(fluree/update db0 {"@context" context
+                                       "insert"   [{"type"           ["sh:NodeShape"]
+                                                    "sh:targetClass" {"id" "ex:Pony"}
+                                                    "sh:property"    [{"id"      "ex:pshape1"
+                                                                       "sh:path" {"id" "ex:color"}
+                                                                       "sh:in"   '("cyan" "magenta")}]}]})
+          db2     @(fluree/update db1 {"@context" context
+                                       "insert"   {"id"       "ex:YellowPony"
+                                                   "type"     "ex:Pony"
+                                                   "ex:color" "yellow"}})]
       (is (= {:status 422,
               :error  :shacl/violation,
               :report
@@ -2090,29 +2090,29 @@ WORLD!")
           ledger  @(fluree/create conn "shacl-in-test")
           db0     (fluree/db ledger)
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-          db1     @(fluree/stage db0 {"@context" context
-                                      "insert"   [{"type"           ["sh:NodeShape"]
-                                                   "sh:targetClass" {"id" "ex:Pony"}
-                                                   "sh:property"    [{"id"      "ex:pshape1"
-                                                                      "sh:path" {"id" "ex:color"}
-                                                                      "sh:in"   '({"id" "ex:Pink"}
-                                                                                  {"id" "ex:Purple"})}]}]})
-          db2     @(fluree/stage db1 {"@context" context
-                                      "insert"   [{"id"   "ex:Pink"
-                                                   "type" "ex:color"}
-                                                  {"id"   "ex:Purple"
-                                                   "type" "ex:color"}
-                                                  {"id"   "ex:Green"
-                                                   "type" "ex:color"}
-                                                  {"id"       "ex:RainbowPony"
-                                                   "type"     "ex:Pony"
-                                                   "ex:color" [{"id" "ex:Pink"}
-                                                               {"id" "ex:Green"}]}]})
-          db3     @(fluree/stage db1 {"@context" context
-                                      "insert"   [{"id"       "ex:PastelPony"
-                                                   "type"     "ex:Pony"
-                                                   "ex:color" [{"id" "ex:Pink"}
-                                                               {"id" "ex:Purple"}]}]})]
+          db1     @(fluree/update db0 {"@context" context
+                                       "insert"   [{"type"           ["sh:NodeShape"]
+                                                    "sh:targetClass" {"id" "ex:Pony"}
+                                                    "sh:property"    [{"id"      "ex:pshape1"
+                                                                       "sh:path" {"id" "ex:color"}
+                                                                       "sh:in"   '({"id" "ex:Pink"}
+                                                                                   {"id" "ex:Purple"})}]}]})
+          db2     @(fluree/update db1 {"@context" context
+                                       "insert"   [{"id"   "ex:Pink"
+                                                    "type" "ex:color"}
+                                                   {"id"   "ex:Purple"
+                                                    "type" "ex:color"}
+                                                   {"id"   "ex:Green"
+                                                    "type" "ex:color"}
+                                                   {"id"       "ex:RainbowPony"
+                                                    "type"     "ex:Pony"
+                                                    "ex:color" [{"id" "ex:Pink"}
+                                                                {"id" "ex:Green"}]}]})
+          db3     @(fluree/update db1 {"@context" context
+                                       "insert"   [{"id"       "ex:PastelPony"
+                                                    "type"     "ex:Pony"
+                                                    "ex:color" [{"id" "ex:Pink"}
+                                                                {"id" "ex:Purple"}]}]})]
       (is (= {:status 422,
               :error  :shacl/violation,
               :report
@@ -2148,19 +2148,19 @@ WORLD!")
           ledger  @(fluree/create conn "shacl-in-test")
           db0     (fluree/db ledger)
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-          db1     @(fluree/stage db0 {"@context" context
-                                      "insert"   [{"type"           ["sh:NodeShape"]
-                                                   "sh:targetClass" {"id" "ex:Pony"}
-                                                   "sh:property"    [{"id"      "ex:pshape1"
-                                                                      "sh:path" {"id" "ex:color"}
-                                                                      "sh:in"   '({"id" "ex:Pink"}
-                                                                                  {"id" "ex:Purple"}
-                                                                                  "green")}]}]})
-          db2     @(fluree/stage db1 {"@context" context
-                                      "insert"   {"id"       "ex:RainbowPony"
-                                                  "type"     "ex:Pony"
-                                                  "ex:color" [{"id" "ex:Pink"}
-                                                              {"id" "ex:Green"}]}})]
+          db1     @(fluree/update db0 {"@context" context
+                                       "insert"   [{"type"           ["sh:NodeShape"]
+                                                    "sh:targetClass" {"id" "ex:Pony"}
+                                                    "sh:property"    [{"id"      "ex:pshape1"
+                                                                       "sh:path" {"id" "ex:color"}
+                                                                       "sh:in"   '({"id" "ex:Pink"}
+                                                                                   {"id" "ex:Purple"}
+                                                                                   "green")}]}]})
+          db2     @(fluree/update db1 {"@context" context
+                                       "insert"   {"id"       "ex:RainbowPony"
+                                                   "type"     "ex:Pony"
+                                                   "ex:color" [{"id" "ex:Pink"}
+                                                               {"id" "ex:Green"}]}})]
       (is (= {:status 422,
               :error  :shacl/violation,
               :report
@@ -2188,48 +2188,48 @@ WORLD!")
         db0     (fluree/db ledger)]
     (testing "subject and object of constrained predicate in the same txn"
       (testing "datatype constraint"
-        (let [db1                @(fluree/stage db0
-                                                {"@context" context
-                                                 "insert"
-                                                 {"@id"                "ex:friendShape"
-                                                  "type"               ["sh:NodeShape"]
-                                                  "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                                  "sh:property"        [{"id"          "ex:pshape1"
-                                                                         "sh:path"     {"@id" "ex:name"}
-                                                                         "sh:datatype" {"@id" "xsd:string"}}]}})
-              db-bad-friend-name @(fluree/stage db1
-                                                {"@context" context
-                                                 "insert"
-                                                 [{"id"        "ex:Alice"
-                                                   "ex:name"   "Alice"
-                                                   "type"      "ex:User"
-                                                   "ex:friend" {"@id" "ex:Bob"}}
-                                                  {"id"      "ex:Bob"
-                                                   "ex:name" 123
-                                                   "type"    "ex:User"}]})]
+        (let [db1                @(fluree/update db0
+                                                 {"@context" context
+                                                  "insert"
+                                                  {"@id"                "ex:friendShape"
+                                                   "type"               ["sh:NodeShape"]
+                                                   "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                                   "sh:property"        [{"id"          "ex:pshape1"
+                                                                          "sh:path"     {"@id" "ex:name"}
+                                                                          "sh:datatype" {"@id" "xsd:string"}}]}})
+              db-bad-friend-name @(fluree/update db1
+                                                 {"@context" context
+                                                  "insert"
+                                                  [{"id"        "ex:Alice"
+                                                    "ex:name"   "Alice"
+                                                    "type"      "ex:User"
+                                                    "ex:friend" {"@id" "ex:Bob"}}
+                                                   {"id"      "ex:Bob"
+                                                    "ex:name" 123
+                                                    "type"    "ex:User"}]})]
 
           (is (test-utils/shacl-error? db-bad-friend-name))))
       (testing "maxCount"
-        (let [db1           @(fluree/stage db0
-                                           {"@context" context
-                                            "insert"
-                                            {"@id"                "ex:friendShape"
-                                             "type"               ["sh:NodeShape"]
-                                             "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                             "sh:property"        [{"id"          "ex:pshape1"
-                                                                    "sh:path"     {"@id" "ex:ssn"}
-                                                                    "sh:maxCount" 1}]}})
-              db-excess-ssn @(fluree/stage db1
-                                           {"@context" context
-                                            "insert"
-                                            [{"id"        "ex:Alice"
-                                              "ex:name"   "Alice"
-                                              "type"      "ex:User"
-                                              "ex:friend" {"@id" "ex:Bob"}}
-                                             {"id"     "ex:Bob"
-                                              "ex:ssn" ["111-11-1111"
-                                                        "222-22-2222"]
-                                              "type"   "ex:User"}]})]
+        (let [db1           @(fluree/update db0
+                                            {"@context" context
+                                             "insert"
+                                             {"@id"                "ex:friendShape"
+                                              "type"               ["sh:NodeShape"]
+                                              "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                              "sh:property"        [{"id"          "ex:pshape1"
+                                                                     "sh:path"     {"@id" "ex:ssn"}
+                                                                     "sh:maxCount" 1}]}})
+              db-excess-ssn @(fluree/update db1
+                                            {"@context" context
+                                             "insert"
+                                             [{"id"        "ex:Alice"
+                                               "ex:name"   "Alice"
+                                               "type"      "ex:User"
+                                               "ex:friend" {"@id" "ex:Bob"}}
+                                              {"id"     "ex:Bob"
+                                               "ex:ssn" ["111-11-1111"
+                                                         "222-22-2222"]
+                                               "type"   "ex:User"}]})]
           (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
@@ -2249,22 +2249,22 @@ WORLD!")
           (is (= "Subject ex:Bob path [\"ex:ssn\"] violates constraint sh:maxCount of shape ex:pshape1 - count 2 is greater than maximum count of 1."
                  (ex-message db-excess-ssn)))))
       (testing "required properties"
-        (let [db1           @(fluree/stage db0
-                                           {"@context" context
-                                            "insert"
-                                            [{"@id"                "ex:friendShape"
-                                              "type"               ["sh:NodeShape"]
-                                              "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                              "sh:property"        [{"id"          "ex:pshape1"
-                                                                     "sh:path"     {"@id" "ex:ssn"}
-                                                                     "sh:minCount" 1}]}]})
-              db-just-alice @(fluree/stage db1
-                                           {"@context" context
-                                            "insert"
-                                            [{"id"        "ex:Alice"
-                                              "ex:name"   "Alice"
-                                              "type"      "ex:User"
-                                              "ex:friend" {"@id" "ex:Bob"}}]})]
+        (let [db1           @(fluree/update db0
+                                            {"@context" context
+                                             "insert"
+                                             [{"@id"                "ex:friendShape"
+                                               "type"               ["sh:NodeShape"]
+                                               "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                               "sh:property"        [{"id"          "ex:pshape1"
+                                                                      "sh:path"     {"@id" "ex:ssn"}
+                                                                      "sh:minCount" 1}]}]})
+              db-just-alice @(fluree/update db1
+                                            {"@context" context
+                                             "insert"
+                                             [{"id"        "ex:Alice"
+                                               "ex:name"   "Alice"
+                                               "type"      "ex:User"
+                                               "ex:friend" {"@id" "ex:Bob"}}]})]
           (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
@@ -2284,30 +2284,30 @@ WORLD!")
           (is (= "Subject ex:Bob path [\"ex:ssn\"] violates constraint sh:minCount of shape ex:pshape1 - count 0 is less than minimum count of 1."
                  (ex-message db-just-alice)))))
       (testing "combined with `sh:targetClass`"
-        (let [db1           @(fluree/stage db0
-                                           {"@context" context
-                                            "insert"
-                                            [{"@id"            "ex:UserShape"
-                                              "type"           ["sh:NodeShape"]
-                                              "sh:targetClass" {"@id" "ex:User"}
-                                              "sh:property"    [{"id"          "ex:pshape1"
-                                                                 "sh:path"     {"@id" "ex:ssn"}
-                                                                 "sh:maxCount" 1}]}
-                                             {"@id"                "ex:friendShape"
-                                              "type"               ["sh:NodeShape"]
-                                              "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                              "sh:property"        [{"id"          "ex:pshape2"
-                                                                     "sh:path"     {"@id" "ex:name"}
-                                                                     "sh:maxCount" 1}]}]})
-              db-bad-friend @(fluree/stage db1 {"@context" context
-                                                "insert"   [{"id"        "ex:Alice"
-                                                             "ex:name"   "Alice"
-                                                             "type"      "ex:User"
-                                                             "ex:friend" {"@id" "ex:Bob"}}
-                                                            {"id"      "ex:Bob"
-                                                             "ex:name" ["Bob" "Robert"]
-                                                             "ex:ssn"  "111-11-1111"
-                                                             "type"    "ex:User"}]})]
+        (let [db1           @(fluree/update db0
+                                            {"@context" context
+                                             "insert"
+                                             [{"@id"            "ex:UserShape"
+                                               "type"           ["sh:NodeShape"]
+                                               "sh:targetClass" {"@id" "ex:User"}
+                                               "sh:property"    [{"id"          "ex:pshape1"
+                                                                  "sh:path"     {"@id" "ex:ssn"}
+                                                                  "sh:maxCount" 1}]}
+                                              {"@id"                "ex:friendShape"
+                                               "type"               ["sh:NodeShape"]
+                                               "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                               "sh:property"        [{"id"          "ex:pshape2"
+                                                                      "sh:path"     {"@id" "ex:name"}
+                                                                      "sh:maxCount" 1}]}]})
+              db-bad-friend @(fluree/update db1 {"@context" context
+                                                 "insert"   [{"id"        "ex:Alice"
+                                                              "ex:name"   "Alice"
+                                                              "type"      "ex:User"
+                                                              "ex:friend" {"@id" "ex:Bob"}}
+                                                             {"id"      "ex:Bob"
+                                                              "ex:name" ["Bob" "Robert"]
+                                                              "ex:ssn"  "111-11-1111"
+                                                              "type"    "ex:User"}]})]
           (is (= {:status 422,
                   :error  :shacl/violation,
                   :report
@@ -2328,25 +2328,25 @@ WORLD!")
                  (ex-message db-bad-friend)))))
       (testing "separate txns"
         (testing "maxCount"
-          (let [db1                    @(fluree/stage db0
-                                                      {"@context" context
-                                                       "insert"
-                                                       [{"@id"                "ex:friendShape"
-                                                         "type"               ["sh:NodeShape"]
-                                                         "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                                         "sh:property"        [{"id"          "ex:pshape1"
-                                                                                "sh:path"     {"@id" "ex:ssn"}
-                                                                                "sh:maxCount" 1}]}]})
-                db2                    @(fluree/stage db1 {"@context" context
-                                                           "insert"   [{"id"     "ex:Bob"
-                                                                        "ex:ssn" ["111-11-1111" "222-22-2222"]
-                                                                        "type"   "ex:User"}]})
-                db-db-forbidden-friend @(fluree/stage db2
-                                                      {"@context" context
-                                                       "insert"
-                                                       {"id"        "ex:Alice"
-                                                        "type"      "ex:User"
-                                                        "ex:friend" {"@id" "ex:Bob"}}})]
+          (let [db1                    @(fluree/update db0
+                                                       {"@context" context
+                                                        "insert"
+                                                        [{"@id"                "ex:friendShape"
+                                                          "type"               ["sh:NodeShape"]
+                                                          "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                                          "sh:property"        [{"id"          "ex:pshape1"
+                                                                                 "sh:path"     {"@id" "ex:ssn"}
+                                                                                 "sh:maxCount" 1}]}]})
+                db2                    @(fluree/update db1 {"@context" context
+                                                            "insert"   [{"id"     "ex:Bob"
+                                                                         "ex:ssn" ["111-11-1111" "222-22-2222"]
+                                                                         "type"   "ex:User"}]})
+                db-db-forbidden-friend @(fluree/update db2
+                                                       {"@context" context
+                                                        "insert"
+                                                        {"id"        "ex:Alice"
+                                                         "type"      "ex:User"
+                                                         "ex:friend" {"@id" "ex:Bob"}}})]
 
             (is (= {:status 422,
                     :error  :shacl/violation,
@@ -2366,31 +2366,31 @@ WORLD!")
                    (ex-data db-db-forbidden-friend)))
             (is (= "Subject ex:Bob path [\"ex:ssn\"] violates constraint sh:maxCount of shape ex:pshape1 - count 2 is greater than maximum count of 1."
                    (ex-message db-db-forbidden-friend))))
-          (let [db1           @(fluree/stage db0
-                                             {"@context" context
-                                              "insert"
-                                              [{"@id"                "ex:friendShape"
-                                                "type"               ["sh:NodeShape"]
-                                                "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                                "sh:property"        [{"id"          "ex:pshape1"
-                                                                       "sh:path"     {"@id" "ex:ssn"}
-                                                                       "sh:maxCount" 1}]}]})
-                db2           @(fluree/stage db1
-                                             {"@context" context
-                                              "insert"
-                                              [{"id"        "ex:Alice"
-                                                "ex:name"   "Alice"
-                                                "type"      "ex:User"
-                                                "ex:friend" {"@id" "ex:Bob"}}
-                                               {"id"      "ex:Bob"
-                                                "ex:name" "Bob"
-                                                "type"    "ex:User"}]})
-                db-excess-ssn @(fluree/stage db2
-                                             {"@context" context
-                                              "insert"
-                                              {"id"     "ex:Bob"
-                                               "ex:ssn" ["111-11-1111"
-                                                         "222-22-2222"]}})]
+          (let [db1           @(fluree/update db0
+                                              {"@context" context
+                                               "insert"
+                                               [{"@id"                "ex:friendShape"
+                                                 "type"               ["sh:NodeShape"]
+                                                 "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                                 "sh:property"        [{"id"          "ex:pshape1"
+                                                                        "sh:path"     {"@id" "ex:ssn"}
+                                                                        "sh:maxCount" 1}]}]})
+                db2           @(fluree/update db1
+                                              {"@context" context
+                                               "insert"
+                                               [{"id"        "ex:Alice"
+                                                 "ex:name"   "Alice"
+                                                 "type"      "ex:User"
+                                                 "ex:friend" {"@id" "ex:Bob"}}
+                                                {"id"      "ex:Bob"
+                                                 "ex:name" "Bob"
+                                                 "type"    "ex:User"}]})
+                db-excess-ssn @(fluree/update db2
+                                              {"@context" context
+                                               "insert"
+                                               {"id"     "ex:Bob"
+                                                "ex:ssn" ["111-11-1111"
+                                                          "222-22-2222"]}})]
             (is (= {:status 422,
                     :error  :shacl/violation,
                     :report
@@ -2410,26 +2410,26 @@ WORLD!")
             (is (= "Subject ex:Bob path [\"ex:ssn\"] violates constraint sh:maxCount of shape ex:pshape1 - count 2 is greater than maximum count of 1."
                    (ex-message db-excess-ssn)))))
         (testing "datatype"
-          (let [db1 @(fluree/stage db0
-                                   {"@context" context
-                                    "insert"   {"@id"                "ex:friendShape"
-                                                "type"               ["sh:NodeShape"]
-                                                "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                                "sh:property"        [{"id"          "ex:pshape1"
-                                                                       "sh:path"     {"@id" "ex:name"}
-                                                                       "sh:datatype" {"@id" "xsd:string"}}]}})
+          (let [db1 @(fluree/update db0
+                                    {"@context" context
+                                     "insert"   {"@id"                "ex:friendShape"
+                                                 "type"               ["sh:NodeShape"]
+                                                 "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                                 "sh:property"        [{"id"          "ex:pshape1"
+                                                                        "sh:path"     {"@id" "ex:name"}
+                                                                        "sh:datatype" {"@id" "xsd:string"}}]}})
 
             ;; need to specify type in order to avoid sh:datatype coercion
-                db2                 @(fluree/stage db1 {"@context" context
-                                                        "insert"   {"id"      "ex:Bob"
-                                                                    "ex:name" {"@type" "xsd:integer" "@value" 123}
-                                                                    "type"    "ex:User"}})
-                db-forbidden-friend @(fluree/stage db2
-                                                   {"@context" context
-                                                    "insert"
-                                                    {"id"        "ex:Alice"
-                                                     "type"      "ex:User"
-                                                     "ex:friend" {"@id" "ex:Bob"}}})]
+                db2                 @(fluree/update db1 {"@context" context
+                                                         "insert"   {"id"      "ex:Bob"
+                                                                     "ex:name" {"@type" "xsd:integer" "@value" 123}
+                                                                     "type"    "ex:User"}})
+                db-forbidden-friend @(fluree/update db2
+                                                    {"@context" context
+                                                     "insert"
+                                                     {"id"        "ex:Alice"
+                                                      "type"      "ex:User"
+                                                      "ex:friend" {"@id" "ex:Bob"}}})]
             (is (= {:status 422,
                     :error  :shacl/violation,
                     :report
@@ -2457,28 +2457,28 @@ WORLD!")
           db0     (fluree/db ledger)
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
 
-          db1            @(fluree/stage db0 {"@context" context
-                                             "insert"   [{"id"          "ex:AddressShape"
-                                                          "type"        "sh:NodeShape"
-                                                          "sh:property" [{"id"          "ex:pshape1"
-                                                                          "sh:path"     {"id" "ex:postalCode"}
-                                                                          "sh:maxCount" 1}]}
-                                                         {"id"             "ex:PersonShape"
-                                                          "type"           "sh:NodeShape"
-                                                          "sh:targetClass" {"id" "ex:Person"}
-                                                          "sh:property"    [{"id"          "ex:pshape2"
-                                                                             "sh:path"     {"id" "ex:address"}
-                                                                             "sh:node"     {"id" "ex:AddressShape"}
-                                                                             "sh:minCount" 1}]}]})
-          valid-person   @(fluree/stage db1 {"@context" context
-                                             "insert"   {"id"         "ex:Bob"
-                                                         "type"       "ex:Person"
-                                                         "ex:address" {"ex:postalCode" "12345"}}})
-          invalid-person @(fluree/stage db1 {"@context" context
-                                             "insert"   {"id"         "ex:Reto"
-                                                         "type"       "ex:Person"
-                                                         "ex:address" {"id"            "ex:1"
-                                                                       "ex:postalCode" ["12345" "45678"]}}})]
+          db1            @(fluree/update db0 {"@context" context
+                                              "insert"   [{"id"          "ex:AddressShape"
+                                                           "type"        "sh:NodeShape"
+                                                           "sh:property" [{"id"          "ex:pshape1"
+                                                                           "sh:path"     {"id" "ex:postalCode"}
+                                                                           "sh:maxCount" 1}]}
+                                                          {"id"             "ex:PersonShape"
+                                                           "type"           "sh:NodeShape"
+                                                           "sh:targetClass" {"id" "ex:Person"}
+                                                           "sh:property"    [{"id"          "ex:pshape2"
+                                                                              "sh:path"     {"id" "ex:address"}
+                                                                              "sh:node"     {"id" "ex:AddressShape"}
+                                                                              "sh:minCount" 1}]}]})
+          valid-person   @(fluree/update db1 {"@context" context
+                                              "insert"   {"id"         "ex:Bob"
+                                                          "type"       "ex:Person"
+                                                          "ex:address" {"ex:postalCode" "12345"}}})
+          invalid-person @(fluree/update db1 {"@context" context
+                                              "insert"   {"id"         "ex:Reto"
+                                                          "type"       "ex:Person"
+                                                          "ex:address" {"id"            "ex:1"
+                                                                        "ex:postalCode" ["12345" "45678"]}}})]
       (is (= [{"id"         "ex:Bob",
                "type"       "ex:Person",
                "ex:address" {"ex:postalCode" "12345"}}]
@@ -2509,33 +2509,33 @@ WORLD!")
           ledger      @(fluree/create conn "shape-constaints")
           db0         (fluree/db ledger)
           context     [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-          db1         @(fluree/stage db0 {"@context" context
-                                          "insert"   [{"id"             "ex:KidShape"
-                                                       "type"           "sh:NodeShape"
-                                                       "sh:targetClass" {"id" "ex:Kid"}
-                                                       "sh:property"
-                                                       [{"id"                     "ex:pshape1"
-                                                         "sh:path"                {"id" "ex:parent"}
-                                                         "sh:minCount"            2
-                                                         "sh:maxCount"            2
-                                                         "sh:qualifiedValueShape" {"id"         "ex:qshape1"
-                                                                                   "sh:path"    {"id" "ex:gender"}
-                                                                                   "sh:pattern" "female"}
-                                                         "sh:qualifiedMinCount"   1}]}
-                                                      {"id"        "ex:Bob"
-                                                       "ex:gender" "male"}
-                                                      {"id"        "ex:Jane"
-                                                       "ex:gender" "female"}]})
-          valid-kid   @(fluree/stage db1 {"@context" context
-                                          "insert"   {"id"        "ex:ValidKid"
-                                                      "type"      "ex:Kid"
-                                                      "ex:parent" [{"id" "ex:Bob"} {"id" "ex:Jane"}]}})
-          invalid-kid @(fluree/stage db1 {"@context" context
-                                          "insert"   {"id"        "ex:InvalidKid"
-                                                      "type"      "ex:Kid"
-                                                      "ex:parent" [{"id" "ex:Bob"}
-                                                                   {"id"        "ex:Zorba"
-                                                                    "ex:gender" "alien"}]}})]
+          db1         @(fluree/update db0 {"@context" context
+                                           "insert"   [{"id"             "ex:KidShape"
+                                                        "type"           "sh:NodeShape"
+                                                        "sh:targetClass" {"id" "ex:Kid"}
+                                                        "sh:property"
+                                                        [{"id"                     "ex:pshape1"
+                                                          "sh:path"                {"id" "ex:parent"}
+                                                          "sh:minCount"            2
+                                                          "sh:maxCount"            2
+                                                          "sh:qualifiedValueShape" {"id"         "ex:qshape1"
+                                                                                    "sh:path"    {"id" "ex:gender"}
+                                                                                    "sh:pattern" "female"}
+                                                          "sh:qualifiedMinCount"   1}]}
+                                                       {"id"        "ex:Bob"
+                                                        "ex:gender" "male"}
+                                                       {"id"        "ex:Jane"
+                                                        "ex:gender" "female"}]})
+          valid-kid   @(fluree/update db1 {"@context" context
+                                           "insert"   {"id"        "ex:ValidKid"
+                                                       "type"      "ex:Kid"
+                                                       "ex:parent" [{"id" "ex:Bob"} {"id" "ex:Jane"}]}})
+          invalid-kid @(fluree/update db1 {"@context" context
+                                           "insert"   {"id"        "ex:InvalidKid"
+                                                       "type"      "ex:Kid"
+                                                       "ex:parent" [{"id" "ex:Bob"}
+                                                                    {"id"        "ex:Zorba"
+                                                                     "ex:gender" "alien"}]}})]
       (is (= {"id"        "ex:ValidKid"
               "type"      "ex:Kid"
               "ex:parent" [{"id" "ex:Bob"}
@@ -2569,39 +2569,39 @@ WORLD!")
           db0    (fluree/db ledger)
 
           context     [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-          db1         @(fluree/stage db0 {"@context" context
-                                          "insert"   [{"id"             "ex:KidShape"
-                                                       "type"           "sh:NodeShape"
-                                                       "sh:targetClass" {"id" "ex:Kid"}
-                                                       "sh:property"
-                                                       [{"id"                   "ex:pshape1"
-                                                         "sh:path"              {"id" "ex:parent"}
-                                                         "sh:minCount"          2
-                                                         "sh:maxCount"          2
-                                                         "sh:qualifiedValueShape"
-                                                         {"id"          "ex:ParentShape"
-                                                          "type"        "sh:NodeShape"
-                                                          "sh:property" {"sh:path"    {"id" "ex:gender"}
-                                                                         "sh:pattern" "female"}}
-                                                         "sh:qualifiedMinCount" 1}]}
-                                                      {"id"        "ex:Mom"
-                                                       "type"      "ex:Parent"
-                                                       "ex:gender" "female"}
-                                                      {"id"        "ex:Dad"
-                                                       "type"      "ex:Parent"
-                                                       "ex:gender" "male"}]})
-          valid-kid   @(fluree/stage db1 {"@context" context
-                                          "insert"   {"id"        "ex:ValidKid"
-                                                      "type"      "ex:Kid"
-                                                      "ex:parent" [{"id" "ex:Mom"} {"id" "ex:Dad"}]}})
-          invalid-kid @(fluree/stage db1 {"@context" context
-                                          "insert"   {"id"        "ex:InvalidKid"
-                                                      "type"      "ex:Kid"
-                                                      "ex:parent" [{"id"        "ex:Bob"
-                                                                    "ex:gender" "male"}
-                                                                   {"id"        "ex:Zorba"
-                                                                    "type"      "ex:Parent"
-                                                                    "ex:gender" "alien"}]}})]
+          db1         @(fluree/update db0 {"@context" context
+                                           "insert"   [{"id"             "ex:KidShape"
+                                                        "type"           "sh:NodeShape"
+                                                        "sh:targetClass" {"id" "ex:Kid"}
+                                                        "sh:property"
+                                                        [{"id"                   "ex:pshape1"
+                                                          "sh:path"              {"id" "ex:parent"}
+                                                          "sh:minCount"          2
+                                                          "sh:maxCount"          2
+                                                          "sh:qualifiedValueShape"
+                                                          {"id"          "ex:ParentShape"
+                                                           "type"        "sh:NodeShape"
+                                                           "sh:property" {"sh:path"    {"id" "ex:gender"}
+                                                                          "sh:pattern" "female"}}
+                                                          "sh:qualifiedMinCount" 1}]}
+                                                       {"id"        "ex:Mom"
+                                                        "type"      "ex:Parent"
+                                                        "ex:gender" "female"}
+                                                       {"id"        "ex:Dad"
+                                                        "type"      "ex:Parent"
+                                                        "ex:gender" "male"}]})
+          valid-kid   @(fluree/update db1 {"@context" context
+                                           "insert"   {"id"        "ex:ValidKid"
+                                                       "type"      "ex:Kid"
+                                                       "ex:parent" [{"id" "ex:Mom"} {"id" "ex:Dad"}]}})
+          invalid-kid @(fluree/update db1 {"@context" context
+                                           "insert"   {"id"        "ex:InvalidKid"
+                                                       "type"      "ex:Kid"
+                                                       "ex:parent" [{"id"        "ex:Bob"
+                                                                     "ex:gender" "male"}
+                                                                    {"id"        "ex:Zorba"
+                                                                     "type"      "ex:Parent"
+                                                                     "ex:gender" "alien"}]}})]
       (is (= [{"id"        "ex:ValidKid"
                "type"      "ex:Kid"
                "ex:parent" [{"id" "ex:Dad"}
@@ -2633,51 +2633,51 @@ WORLD!")
           db0    (fluree/db ledger)
 
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-          db1     @(fluree/stage db0 {"@context" context
-                                      "insert"
-                                      [{"id"      "ex:Digit"
-                                        "ex:name" "Toe"}
-                                       {"id"             "ex:HandShape"
-                                        "type"           "sh:NodeShape"
-                                        "sh:targetClass" {"id" "ex:Hand"}
-                                        "sh:property"
-                                        [{"id"          "ex:pshape1"
-                                          "sh:path"     {"id" "ex:digit"}
-                                          "sh:maxCount" 5}
-                                         {"id"                              "ex:pshape2"
-                                          "sh:path"                         {"id" "ex:digit"}
-                                          "sh:qualifiedValueShape"          {"id"          "ex:thumbshape"
-                                                                             "sh:path"     {"id" "ex:name"}
-                                                                             "sh:hasValue" "Thumb"}
-                                          "sh:qualifiedMinCount"            1
-                                          "sh:qualifiedMaxCount"            1
-                                          "sh:qualifiedValueShapesDisjoint" true}
-                                         {"id"                              "ex:pshape3"
-                                          "sh:path"                         {"id" "ex:digit"}
-                                          "sh:qualifiedValueShape"          {"id"          "ex:fingershape"
-                                                                             "sh:path"     {"id" "ex:name"}
-                                                                             "sh:hasValue" "Finger"}
-                                          "sh:qualifiedMinCount"            4
-                                          "sh:qualifiedMaxCount"            4
-                                          "sh:qualifiedValueShapesDisjoint" true}]}]})
+          db1     @(fluree/update db0 {"@context" context
+                                       "insert"
+                                       [{"id"      "ex:Digit"
+                                         "ex:name" "Toe"}
+                                        {"id"             "ex:HandShape"
+                                         "type"           "sh:NodeShape"
+                                         "sh:targetClass" {"id" "ex:Hand"}
+                                         "sh:property"
+                                         [{"id"          "ex:pshape1"
+                                           "sh:path"     {"id" "ex:digit"}
+                                           "sh:maxCount" 5}
+                                          {"id"                              "ex:pshape2"
+                                           "sh:path"                         {"id" "ex:digit"}
+                                           "sh:qualifiedValueShape"          {"id"          "ex:thumbshape"
+                                                                              "sh:path"     {"id" "ex:name"}
+                                                                              "sh:hasValue" "Thumb"}
+                                           "sh:qualifiedMinCount"            1
+                                           "sh:qualifiedMaxCount"            1
+                                           "sh:qualifiedValueShapesDisjoint" true}
+                                          {"id"                              "ex:pshape3"
+                                           "sh:path"                         {"id" "ex:digit"}
+                                           "sh:qualifiedValueShape"          {"id"          "ex:fingershape"
+                                                                              "sh:path"     {"id" "ex:name"}
+                                                                              "sh:hasValue" "Finger"}
+                                           "sh:qualifiedMinCount"            4
+                                           "sh:qualifiedMaxCount"            4
+                                           "sh:qualifiedValueShapesDisjoint" true}]}]})
 
-          valid-hand   @(fluree/stage db1 {"@context" context
-                                           "insert"   {"id"       "ex:ValidHand"
-                                                       "type"     "ex:Hand"
-                                                       "ex:digit" [{"id" "ex:thumb" "ex:name" "Thumb"}
-                                                                   {"id" "ex:finger1" "ex:name" "Finger"}
-                                                                   {"id" "ex:finger2" "ex:name" "Finger"}
-                                                                   {"id" "ex:finger3" "ex:name" "Finger"}
-                                                                   {"id" "ex:finger4" "ex:name" "Finger"}]}})
-          invalid-hand @(fluree/stage db1 {"@context" context
-                                           "insert"   {"id"       "ex:InvalidHand"
-                                                       "type"     "ex:Hand"
-                                                       "ex:digit" [{"id" "ex:thumb" "ex:name" "Thumb"}
-                                                                   {"id" "ex:finger1" "ex:name" "Finger"}
-                                                                   {"id" "ex:finger2" "ex:name" "Finger"}
-                                                                   {"id" "ex:finger3" "ex:name" "Finger"}
-                                                                   {"id"      "ex:finger4andthumb"
-                                                                    "ex:name" ["Finger" "Thumb"]}]}})]
+          valid-hand   @(fluree/update db1 {"@context" context
+                                            "insert"   {"id"       "ex:ValidHand"
+                                                        "type"     "ex:Hand"
+                                                        "ex:digit" [{"id" "ex:thumb" "ex:name" "Thumb"}
+                                                                    {"id" "ex:finger1" "ex:name" "Finger"}
+                                                                    {"id" "ex:finger2" "ex:name" "Finger"}
+                                                                    {"id" "ex:finger3" "ex:name" "Finger"}
+                                                                    {"id" "ex:finger4" "ex:name" "Finger"}]}})
+          invalid-hand @(fluree/update db1 {"@context" context
+                                            "insert"   {"id"       "ex:InvalidHand"
+                                                        "type"     "ex:Hand"
+                                                        "ex:digit" [{"id" "ex:thumb" "ex:name" "Thumb"}
+                                                                    {"id" "ex:finger1" "ex:name" "Finger"}
+                                                                    {"id" "ex:finger2" "ex:name" "Finger"}
+                                                                    {"id" "ex:finger3" "ex:name" "Finger"}
+                                                                    {"id"      "ex:finger4andthumb"
+                                                                     "ex:name" ["Finger" "Thumb"]}]}})]
       (is (= [{"id"   "ex:ValidHand",
                "type" "ex:Hand",
                "ex:digit"
@@ -2726,30 +2726,30 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
 
         ;; sh:node constraint needs to query the db, requiring fuel for validation
-        db1            @(fluree/stage db0 {"@context" context
-                                           "insert"   [{"id"          "ex:AddressShape"
-                                                        "type"        "sh:NodeShape"
-                                                        "sh:property" [{"id"          "ex:pshape1"
-                                                                        "sh:path"     {"id" "ex:postalCode"}
-                                                                        "sh:maxCount" 1}]}
-                                                       {"id"             "ex:PersonShape"
-                                                        "type"           "sh:NodeShape"
-                                                        "sh:targetClass" {"id" "ex:Person"}
-                                                        "sh:property"    [{"id"          "ex:pshape2"
-                                                                           "sh:path"     {"id" "ex:address"}
-                                                                           "sh:node"     {"id" "ex:AddressShape"}
-                                                                           "sh:minCount" 1}]}]})
-        valid-person   @(fluree/stage db1 {"@context" context
-                                           "insert"   {"id"         "ex:Bob"
-                                                       "type"       "ex:Person"
-                                                       "ex:address" {"ex:postalCode" "12345"}}
-                                           "opts"     {"meta" true}})
-        invalid-person @(fluree/stage db1 {"@context" context
-                                           "insert"   {"id"         "ex:Reto"
-                                                       "type"       "ex:Person"
-                                                       "ex:address" {"id"            "ex:1"
-                                                                     "ex:postalCode" ["12345" "45678"]}}
-                                           "opts"     {"meta" true}})]
+        db1            @(fluree/update db0 {"@context" context
+                                            "insert"   [{"id"          "ex:AddressShape"
+                                                         "type"        "sh:NodeShape"
+                                                         "sh:property" [{"id"          "ex:pshape1"
+                                                                         "sh:path"     {"id" "ex:postalCode"}
+                                                                         "sh:maxCount" 1}]}
+                                                        {"id"             "ex:PersonShape"
+                                                         "type"           "sh:NodeShape"
+                                                         "sh:targetClass" {"id" "ex:Person"}
+                                                         "sh:property"    [{"id"          "ex:pshape2"
+                                                                            "sh:path"     {"id" "ex:address"}
+                                                                            "sh:node"     {"id" "ex:AddressShape"}
+                                                                            "sh:minCount" 1}]}]})
+        valid-person   @(fluree/update db1 {"@context" context
+                                            "insert"   {"id"         "ex:Bob"
+                                                        "type"       "ex:Person"
+                                                        "ex:address" {"ex:postalCode" "12345"}}
+                                            "opts"     {"meta" true}})
+        invalid-person @(fluree/update db1 {"@context" context
+                                            "insert"   {"id"         "ex:Reto"
+                                                        "type"       "ex:Person"
+                                                        "ex:address" {"id"            "ex:1"
+                                                                      "ex:postalCode" ["12345" "45678"]}}
+                                            "opts"     {"meta" true}})]
     (is (= 9
            (:fuel valid-person)))
     (is (= 13
@@ -2761,26 +2761,26 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
         db0     (fluree/db ledger)]
     (testing "shacl-objects-of-test"
-      (let [db1                 @(fluree/stage db0
-                                               {"@context" context
-                                                "insert"
-                                                {"@id"                "ex:friendShape"
-                                                 "type"               ["sh:NodeShape"]
-                                                 "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                                 "sh:property"        [{"id"          "ex:pshape1"
-                                                                        "sh:path"     {"@id" "ex:name"}
-                                                                        "sh:datatype" {"@id" "xsd:string"}}]}})
+      (let [db1                 @(fluree/update db0
+                                                {"@context" context
+                                                 "insert"
+                                                 {"@id"                "ex:friendShape"
+                                                  "type"               ["sh:NodeShape"]
+                                                  "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                                  "sh:property"        [{"id"          "ex:pshape1"
+                                                                         "sh:path"     {"@id" "ex:name"}
+                                                                         "sh:datatype" {"@id" "xsd:string"}}]}})
             ;; need to specify type in order to avoid sh:datatype coercion
-            db2                 @(fluree/stage db1 {"@context" context
-                                                    "insert"   {"id"      "ex:Bob"
-                                                                "ex:name" {"@type" "xsd:integer" "@value" 123}
-                                                                "type"    "ex:User"}})
-            db-forbidden-friend @(fluree/stage db2
-                                               {"@context" context
-                                                "insert"
-                                                {"id"        "ex:Alice"
-                                                 "type"      "ex:User"
-                                                 "ex:friend" {"@id" "ex:Bob"}}})]
+            db2                 @(fluree/update db1 {"@context" context
+                                                     "insert"   {"id"      "ex:Bob"
+                                                                 "ex:name" {"@type" "xsd:integer" "@value" 123}
+                                                                 "type"    "ex:User"}})
+            db-forbidden-friend @(fluree/update db2
+                                                {"@context" context
+                                                 "insert"
+                                                 {"id"        "ex:Alice"
+                                                  "type"      "ex:User"
+                                                  "ex:friend" {"@id" "ex:Bob"}}})]
         (is (= {:status 422,
                 :error  :shacl/violation,
                 :report
@@ -2801,30 +2801,30 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
         (is (= "Subject ex:Bob path [\"ex:name\"] violates constraint sh:datatype of shape ex:pshape1 - the following values do not have expected datatype xsd:string: 123."
                (ex-message db-forbidden-friend)))))
     (testing "shape constraints"
-      (let [db1            @(fluree/stage db0 {"@context" context
-                                               "insert"
-                                               [{"id"          "ex:CoolShape"
-                                                 "type"        "sh:NodeShape"
-                                                 "sh:property" [{"id"          "ex:pshape1"
-                                                                 "sh:path"     {"id" "ex:isCool"}
-                                                                 "sh:hasValue" true
-                                                                 "sh:minCount" 1}]}
-                                                {"id"             "ex:PersonShape"
-                                                 "type"           "sh:NodeShape"
-                                                 "sh:targetClass" {"id" "ex:Person"}
-                                                 "sh:property"    [{"id"          "ex:pshape2"
-                                                                    "sh:path"     {"id" "ex:cool"}
-                                                                    "sh:node"     {"id" "ex:CoolShape"}
-                                                                    "sh:minCount" 1}]}]})
-            valid-person   @(fluree/stage db1 {"@context" context
-                                               "insert"   {"id"      "ex:Bob"
-                                                           "type"    "ex:Person"
-                                                           "ex:cool" {"ex:isCool" true}}})
-            invalid-person @(fluree/stage db1 {"@context" context
-                                               "insert"   {"id"      "ex:Reto"
-                                                           "type"    "ex:Person"
-                                                           "ex:cool" {"id"        "ex:1"
-                                                                      "ex:isCool" false}}})]
+      (let [db1            @(fluree/update db0 {"@context" context
+                                                "insert"
+                                                [{"id"          "ex:CoolShape"
+                                                  "type"        "sh:NodeShape"
+                                                  "sh:property" [{"id"          "ex:pshape1"
+                                                                  "sh:path"     {"id" "ex:isCool"}
+                                                                  "sh:hasValue" true
+                                                                  "sh:minCount" 1}]}
+                                                 {"id"             "ex:PersonShape"
+                                                  "type"           "sh:NodeShape"
+                                                  "sh:targetClass" {"id" "ex:Person"}
+                                                  "sh:property"    [{"id"          "ex:pshape2"
+                                                                     "sh:path"     {"id" "ex:cool"}
+                                                                     "sh:node"     {"id" "ex:CoolShape"}
+                                                                     "sh:minCount" 1}]}]})
+            valid-person   @(fluree/update db1 {"@context" context
+                                                "insert"   {"id"      "ex:Bob"
+                                                            "type"    "ex:Person"
+                                                            "ex:cool" {"ex:isCool" true}}})
+            invalid-person @(fluree/update db1 {"@context" context
+                                                "insert"   {"id"      "ex:Reto"
+                                                            "type"    "ex:Person"
+                                                            "ex:cool" {"id"        "ex:1"
+                                                                       "ex:isCool" false}}})]
         (is (= [{"id"      "ex:Bob",
                  "type"    "ex:Person",
                  "ex:cool" {"ex:isCool" true}}]
@@ -2850,25 +2850,25 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
         (is (= "Subject ex:Reto path [\"ex:cool\"] violates constraint sh:node of shape ex:pshape2 - node ex:1 does not conform to shapes [\"ex:CoolShape\"]."
                (ex-message invalid-person)))))
     (testing "extended path constraints"
-      (let [db1            @(fluree/stage db0 {"@context" context
-                                               "insert"   {"id"             "ex:PersonShape"
-                                                           "type"           "sh:NodeShape"
-                                                           "sh:targetClass" {"id" "ex:Person"}
-                                                           "sh:property"    [{"id"          "ex:pshape1"
-                                                                              "sh:path"
-                                                                              {"@list" [{"id" "ex:cool"}
-                                                                                        {"id" "ex:dude"}]}
-                                                                              "sh:nodeKind" {"id" "sh:BlankNode"}
-                                                                              "sh:minCount" 1}]}})
-            valid-person   @(fluree/stage db1 {"@context" context
-                                               "insert"   {"id"      "ex:Bob"
-                                                           "type"    "ex:Person"
-                                                           "ex:cool" {"ex:dude" {"ex:isBlank" true}}}})
-            invalid-person @(fluree/stage db1 {"@context" context
-                                               "insert"   {"id"      "ex:Reto"
-                                                           "type"    "ex:Person"
-                                                           "ex:cool" {"ex:dude" {"id"         "ex:Dude"
-                                                                                 "ex:isBlank" false}}}})]
+      (let [db1            @(fluree/update db0 {"@context" context
+                                                "insert"   {"id"             "ex:PersonShape"
+                                                            "type"           "sh:NodeShape"
+                                                            "sh:targetClass" {"id" "ex:Person"}
+                                                            "sh:property"    [{"id"          "ex:pshape1"
+                                                                               "sh:path"
+                                                                               {"@list" [{"id" "ex:cool"}
+                                                                                         {"id" "ex:dude"}]}
+                                                                               "sh:nodeKind" {"id" "sh:BlankNode"}
+                                                                               "sh:minCount" 1}]}})
+            valid-person   @(fluree/update db1 {"@context" context
+                                                "insert"   {"id"      "ex:Bob"
+                                                            "type"    "ex:Person"
+                                                            "ex:cool" {"ex:dude" {"ex:isBlank" true}}}})
+            invalid-person @(fluree/update db1 {"@context" context
+                                                "insert"   {"id"      "ex:Reto"
+                                                            "type"    "ex:Person"
+                                                            "ex:cool" {"ex:dude" {"id"         "ex:Dude"
+                                                                                  "ex:isBlank" false}}}})]
         (is (= [{"id"      "ex:Bob",
                  "type"    "ex:Person",
                  "ex:cool" {"ex:dude" {"ex:isBlank" true}}}]
@@ -2900,17 +2900,17 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
         db0     (fluree/db ledger)]
     (testing "severity"
       (testing "no severity specified defaults to sh:Violation"
-        (let [db1 @(fluree/stage db0 {"@context" context
-                                      "insert"
-                                      {"@id"           "ex:friendShape"
-                                       "type"          ["sh:NodeShape"]
-                                       "sh:targetNode" {"@id" "ex:a"}
-                                       "sh:property"   [{"sh:path"      {"@id" "ex:name"}
-                                                         "sh:maxLength" 3}]}})
-              db2 @(fluree/stage db1 {"@context" context
-                                      "insert"
-                                      {"@id"     "ex:a"
-                                       "ex:name" "John"}})]
+        (let [db1 @(fluree/update db0 {"@context" context
+                                       "insert"
+                                       {"@id"           "ex:friendShape"
+                                        "type"          ["sh:NodeShape"]
+                                        "sh:targetNode" {"@id" "ex:a"}
+                                        "sh:property"   [{"sh:path"      {"@id" "ex:name"}
+                                                          "sh:maxLength" 3}]}})
+              db2 @(fluree/update db1 {"@context" context
+                                       "insert"
+                                       {"@id"     "ex:a"
+                                        "ex:name" "John"}})]
           (is (= "sh:Violation"
                  (-> (ex-data db2)
                      :report
@@ -2918,18 +2918,18 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                      (get 0)
                      (get "sh:resultSeverity"))))))
       (testing "severity specified on shape overrides default severity"
-        (let [db1 @(fluree/stage db0 {"@context" context
-                                      "insert"
-                                      {"@id"           "ex:friendShape"
-                                       "type"          ["sh:NodeShape"]
-                                       "sh:targetNode" {"@id" "ex:a"}
-                                       "sh:property"   [{"sh:path"      {"@id" "ex:name"}
-                                                         "sh:severity"  {"@id" "ex:EXTREME"}
-                                                         "sh:maxLength" 3}]}})
-              db2 @(fluree/stage db1 {"@context" context
-                                      "insert"
-                                      {"@id"     "ex:a"
-                                       "ex:name" "John"}})]
+        (let [db1 @(fluree/update db0 {"@context" context
+                                       "insert"
+                                       {"@id"           "ex:friendShape"
+                                        "type"          ["sh:NodeShape"]
+                                        "sh:targetNode" {"@id" "ex:a"}
+                                        "sh:property"   [{"sh:path"      {"@id" "ex:name"}
+                                                          "sh:severity"  {"@id" "ex:EXTREME"}
+                                                          "sh:maxLength" 3}]}})
+              db2 @(fluree/update db1 {"@context" context
+                                       "insert"
+                                       {"@id"     "ex:a"
+                                        "ex:name" "John"}})]
           (is (= "ex:EXTREME"
                  (-> (ex-data db2)
                      :report
@@ -2938,16 +2938,16 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                      (get "sh:resultSeverity")))))))
     (testing "message"
       (testing "no sh:message specified on shape defaults to implementation-specific message"
-        (let [db1 @(fluree/stage db0 {"@context" context
-                                      "insert"
-                                      {"@id"           "ex:friendShape"
-                                       "type"          ["sh:NodeShape"]
-                                       "sh:targetNode" {"@id" "ex:a"}
-                                       "sh:property"   [{"sh:path"      {"@id" "ex:name"}
-                                                         "sh:maxLength" 3}]}})
-              db2 @(fluree/stage db1 {"@context" context
-                                      "insert" {"@id" "ex:a"
-                                                "ex:name" "John"}})]
+        (let [db1 @(fluree/update db0 {"@context" context
+                                       "insert"
+                                       {"@id"           "ex:friendShape"
+                                        "type"          ["sh:NodeShape"]
+                                        "sh:targetNode" {"@id" "ex:a"}
+                                        "sh:property"   [{"sh:path"      {"@id" "ex:name"}
+                                                          "sh:maxLength" 3}]}})
+              db2 @(fluree/update db1 {"@context" context
+                                       "insert" {"@id" "ex:a"
+                                                 "ex:name" "John"}})]
           ;; implementation-specific default resultMessage
           (is (= "value \"John\" has string length greater than maximum length 3"
                  (-> (ex-data db2)
@@ -2956,18 +2956,18 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
                      (get 0)
                      (get "sh:resultMessage"))))))
       (testing "custom sh:message on shape overrides implmentation-specific message"
-        (let [db1 @(fluree/stage db0 {"@context" context
-                                      "insert"
-                                      {"@id"           "ex:friendShape"
-                                       "type"          ["sh:NodeShape"]
-                                       "sh:targetNode" {"@id" "ex:a"}
-                                       "sh:property"   [{"sh:path"      {"@id" "ex:name"}
-                                                         "sh:message"  "THIS NAME IS TOO LONG"
-                                                         "sh:maxLength" 3}]}})
-              db2 @(fluree/stage db1 {"@context" context
-                                      "insert"
-                                      {"@id"     "ex:a"
-                                       "ex:name" "John"}})]
+        (let [db1 @(fluree/update db0 {"@context" context
+                                       "insert"
+                                       {"@id"           "ex:friendShape"
+                                        "type"          ["sh:NodeShape"]
+                                        "sh:targetNode" {"@id" "ex:a"}
+                                        "sh:property"   [{"sh:path"      {"@id" "ex:name"}
+                                                          "sh:message"  "THIS NAME IS TOO LONG"
+                                                          "sh:maxLength" 3}]}})
+              db2 @(fluree/update db1 {"@context" context
+                                       "insert"
+                                       {"@id"     "ex:a"
+                                        "ex:name" "John"}})]
           (is (= "THIS NAME IS TOO LONG"
                  (-> (ex-data db2)
                      :report
@@ -2981,21 +2981,21 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
         db0     (fluree/db ledger)
 
-        db1 @(fluree/stage db0 {"@context" context
-                                "insert"
-                                {"type"                "sh:NodeShape"
-                                 "sh:targetSubjectsOf" {"@id" "ex:myProperty"}
-                                 "sh:property"         [{"sh:path"     {"@id" "ex:myProperty"}
-                                                         "sh:maxCount" 1}]}})]
+        db1 @(fluree/update db0 {"@context" context
+                                 "insert"
+                                 {"type"                "sh:NodeShape"
+                                  "sh:targetSubjectsOf" {"@id" "ex:myProperty"}
+                                  "sh:property"         [{"sh:path"     {"@id" "ex:myProperty"}
+                                                          "sh:maxCount" 1}]}})]
     (testing "valid target with no violations passes validation"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert" {"id" "ex:valid"
-                                              "ex:myProperty" "A"}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert" {"id" "ex:valid"
+                                               "ex:myProperty" "A"}})]
         (is (nil? (ex-data db2)))))
     (testing "invalid target produces validation errors"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert" {"id" "ex:invalid"
-                                              "ex:myProperty" ["A" "B"]}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert" {"id" "ex:invalid"
+                                               "ex:myProperty" ["A" "B"]}})]
         (is (= 422
                (:status (ex-data db2))))))))
 
@@ -3005,21 +3005,21 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
         db0     (fluree/db ledger)
 
-        db1 @(fluree/stage db0 {"@context" context
-                                "insert"
-                                {"type"          "sh:NodeShape"
-                                 "sh:targetNode" [{"@id" "ex:nodeA"} {"@id" "ex:nodeB"}]
-                                 "sh:property"   [{"sh:path"     {"@id" "ex:letter"}
-                                                   "sh:maxCount" 1}]}})]
+        db1 @(fluree/update db0 {"@context" context
+                                 "insert"
+                                 {"type"          "sh:NodeShape"
+                                  "sh:targetNode" [{"@id" "ex:nodeA"} {"@id" "ex:nodeB"}]
+                                  "sh:property"   [{"sh:path"     {"@id" "ex:letter"}
+                                                    "sh:maxCount" 1}]}})]
     (testing "valid target with no violations passes validation"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert"   {"id"        "ex:nodeA"
-                                                "ex:letter" "A"}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert"   {"id"        "ex:nodeA"
+                                                 "ex:letter" "A"}})]
         (is (nil? (ex-data db2)))))
     (testing "invalid target produces validation erros"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert"   {"id"        "ex:nodeB"
-                                                "ex:letter" ["A" "B"]}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert"   {"id"        "ex:nodeB"
+                                                 "ex:letter" ["A" "B"]}})]
         (is (= 422
                (:status (ex-data db2))))))))
 
@@ -3029,29 +3029,29 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
         db0 (fluree/db ledger)
 
-        db1 @(fluree/stage db0 {"@context" context
-                                "insert"
-                                {"type" "sh:NodeShape"
-                                 "sh:targetClass" {"@id" "ex:Alt"}
-                                 "sh:property" [{"id" "ex:pshape1"
-                                                 "sh:path" {"sh:alternativePath"
-                                                            [{"@id" "ex:property1"} {"@id" "ex:property2"}]}
-                                                 "sh:minCount" 2}]}})]
+        db1 @(fluree/update db0 {"@context" context
+                                 "insert"
+                                 {"type" "sh:NodeShape"
+                                  "sh:targetClass" {"@id" "ex:Alt"}
+                                  "sh:property" [{"id" "ex:pshape1"
+                                                  "sh:path" {"sh:alternativePath"
+                                                             [{"@id" "ex:property1"} {"@id" "ex:property2"}]}
+                                                  "sh:minCount" 2}]}})]
     (testing "constraint is satisfied when constrained by sh:alternativePath"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert"
-                                    {"id" "ex:valid"
-                                     "type" "ex:Alt"
-                                     "ex:property1" "One"
-                                     "ex:property2" "Two"}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert"
+                                     {"id" "ex:valid"
+                                      "type" "ex:Alt"
+                                      "ex:property1" "One"
+                                      "ex:property2" "Two"}})]
         (is (nil? (ex-data db2)))))
     (testing "constraint is violated when constrained by sh:alternativePath"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert"
-                                    {"id" "ex:invalid"
-                                     "type" "ex:Alt"
-                                     "ex:property1" "One"
-                                     "ex:property3" "Three"}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert"
+                                     {"id" "ex:invalid"
+                                      "type" "ex:Alt"
+                                      "ex:property1" "One"
+                                      "ex:property3" "Three"}})]
         (is (= {:status 422,
                 :error :shacl/violation,
                 :report
@@ -3078,118 +3078,118 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
         db0 (fluree/db ledger)]
     (testing "targetClass"
       (testing "with multiple targets"
-        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
-                                      "insert"
-                                      [{"@type" "sh:NodeShape",
-                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
-                                                        "sh:maxCount" 1,
-                                                        "sh:path" {"@id" "ex:term"}}],
-                                        "sh:targetClass" [{"@id" "ex:Assertion"} {"@id" "ex:Fact"}]}]})]
-          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@type" "ex:Assertion" "ex:term" 123}})))
-          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@type" "ex:Fact" "ex:term" 123}})))))
+        (let [db1 @(fluree/update db0 {"@context" test-utils/default-str-context
+                                       "insert"
+                                       [{"@type" "sh:NodeShape",
+                                         "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                         "sh:maxCount" 1,
+                                                         "sh:path" {"@id" "ex:term"}}],
+                                         "sh:targetClass" [{"@id" "ex:Assertion"} {"@id" "ex:Fact"}]}]})]
+          (is (test-utils/shacl-error? @(fluree/update db1 {"insert" {"@type" "ex:Assertion" "ex:term" 123}})))
+          (is (test-utils/shacl-error? @(fluree/update db1 {"insert" {"@type" "ex:Fact" "ex:term" 123}})))))
       (testing "with extra data"
-        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
-                                      "insert"
-                                      [{"@type" "sh:NodeShape",
-                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
-                                                        "sh:maxCount" 1,
-                                                        "sh:path" {"@id" "ex:term"}}],
-                                        "sh:targetClass" {"@id" "ex:Assertion" "ex:extra" "data"}}]})]
-          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@type" "ex:Assertion" "ex:term" 123}}))))))
+        (let [db1 @(fluree/update db0 {"@context" test-utils/default-str-context
+                                       "insert"
+                                       [{"@type" "sh:NodeShape",
+                                         "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                         "sh:maxCount" 1,
+                                                         "sh:path" {"@id" "ex:term"}}],
+                                         "sh:targetClass" {"@id" "ex:Assertion" "ex:extra" "data"}}]})]
+          (is (test-utils/shacl-error? @(fluree/update db1 {"insert" {"@type" "ex:Assertion" "ex:term" 123}}))))))
     (testing "targetNode"
       (testing "with multiple targets"
-        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
-                                      "insert"
-                                      [{"@type" "sh:NodeShape",
-                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
-                                                        "sh:maxCount" 1,
-                                                        "sh:path" {"@id" "ex:term"}}],
-                                        "sh:targetNode" [{"@id" "ex:foo"}
-                                                         {"@id" "ex:bar"}]}]})]
-          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:foo" "ex:term" 123}})))
-          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:bar" "ex:term" 123}})))))
+        (let [db1 @(fluree/update db0 {"@context" test-utils/default-str-context
+                                       "insert"
+                                       [{"@type" "sh:NodeShape",
+                                         "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                         "sh:maxCount" 1,
+                                                         "sh:path" {"@id" "ex:term"}}],
+                                         "sh:targetNode" [{"@id" "ex:foo"}
+                                                          {"@id" "ex:bar"}]}]})]
+          (is (test-utils/shacl-error? @(fluree/update db1 {"insert" {"@id" "ex:foo" "ex:term" 123}})))
+          (is (test-utils/shacl-error? @(fluree/update db1 {"insert" {"@id" "ex:bar" "ex:term" 123}})))))
       (testing "with extra data"
-        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
-                                      "insert"
-                                      [{"@type" "sh:NodeShape",
-                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
-                                                        "sh:maxCount" 1,
-                                                        "sh:path" {"@id" "ex:term"}}],
-                                        "sh:targetNode" {"@id" "ex:foo" "ex:extra" "data"}}]})]
-          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:foo" "ex:term" 123}}))))))
+        (let [db1 @(fluree/update db0 {"@context" test-utils/default-str-context
+                                       "insert"
+                                       [{"@type" "sh:NodeShape",
+                                         "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                         "sh:maxCount" 1,
+                                                         "sh:path" {"@id" "ex:term"}}],
+                                         "sh:targetNode" {"@id" "ex:foo" "ex:extra" "data"}}]})]
+          (is (test-utils/shacl-error? @(fluree/update db1 {"insert" {"@id" "ex:foo" "ex:term" 123}}))))))
     (testing "targetObjectsOf"
       (testing "with multiple targets"
-        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
-                                      "insert"
-                                      [{"@type" "sh:NodeShape",
-                                        "sh:datatype" {"@id" "xsd:string"},
-                                        "sh:targetObjectsOf" [{"@id" "ex:foo"}
-                                                              {"@id" "ex:bar"}]}]})]
-          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:me" "ex:foo" 123}})))
-          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:me" "ex:bar" 123}})))))
+        (let [db1 @(fluree/update db0 {"@context" test-utils/default-str-context
+                                       "insert"
+                                       [{"@type" "sh:NodeShape",
+                                         "sh:datatype" {"@id" "xsd:string"},
+                                         "sh:targetObjectsOf" [{"@id" "ex:foo"}
+                                                               {"@id" "ex:bar"}]}]})]
+          (is (test-utils/shacl-error? @(fluree/update db1 {"insert" {"@id" "ex:me" "ex:foo" 123}})))
+          (is (test-utils/shacl-error? @(fluree/update db1 {"insert" {"@id" "ex:me" "ex:bar" 123}})))))
       (testing "with extra data"
-        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
-                                      "insert"
-                                      [{"@type" "sh:NodeShape",
-                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
-                                                        "sh:maxCount" 1,
-                                                        "sh:path" {"@id" "ex:term"}}],
-                                        "sh:targetObjectsOf" {"@id" "ex:foo" "@type" "rdf:Property"}}]})]
-          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@context" test-utils/default-str-context
-                                                                     "@graph"   [{"@id" "ex:me"
-                                                                                  "ex:foo" {"@id" "ex:you"}}
-                                                                                 {"@id" "ex:you"
-                                                                                  "ex:term" ["hello", "there"]}]}}))))))
+        (let [db1 @(fluree/update db0 {"@context" test-utils/default-str-context
+                                       "insert"
+                                       [{"@type" "sh:NodeShape",
+                                         "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                         "sh:maxCount" 1,
+                                                         "sh:path" {"@id" "ex:term"}}],
+                                         "sh:targetObjectsOf" {"@id" "ex:foo" "@type" "rdf:Property"}}]})]
+          (is (test-utils/shacl-error? @(fluree/update db1 {"insert" {"@context" test-utils/default-str-context
+                                                                      "@graph"   [{"@id" "ex:me"
+                                                                                   "ex:foo" {"@id" "ex:you"}}
+                                                                                  {"@id" "ex:you"
+                                                                                   "ex:term" ["hello", "there"]}]}}))))))
     (testing "targetSubjectsof"
       (testing "with multiple targets"
-        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
-                                      "insert"
-                                      [{"@type" "sh:NodeShape",
-                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
-                                                        "sh:maxCount" 1,
-                                                        "sh:path" {"@id" "ex:term"}}],
-                                        "sh:targetSubjectsOf" [{"@id" "ex:foo"}
-                                                               {"@id" "ex:bar"}]}]})]
-          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:me" "ex:foo" "foo" "ex:term" 123}})))
-          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:me" "ex:bar" "bar" "ex:term" 123}})))))
+        (let [db1 @(fluree/update db0 {"@context" test-utils/default-str-context
+                                       "insert"
+                                       [{"@type" "sh:NodeShape",
+                                         "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                         "sh:maxCount" 1,
+                                                         "sh:path" {"@id" "ex:term"}}],
+                                         "sh:targetSubjectsOf" [{"@id" "ex:foo"}
+                                                                {"@id" "ex:bar"}]}]})]
+          (is (test-utils/shacl-error? @(fluree/update db1 {"insert" {"@id" "ex:me" "ex:foo" "foo" "ex:term" 123}})))
+          (is (test-utils/shacl-error? @(fluree/update db1 {"insert" {"@id" "ex:me" "ex:bar" "bar" "ex:term" 123}})))))
       (testing "with extra data"
-        (let [db1 @(fluree/stage db0 {"@context" test-utils/default-str-context
-                                      "insert"
-                                      [{"@type" "sh:NodeShape",
-                                        "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
-                                                        "sh:maxCount" 1,
-                                                        "sh:path" {"@id" "ex:term"}}],
-                                        "sh:targetSubjectsOf" {"@id" "ex:foo" "ex:extra" "data"}}]})]
-          (is (test-utils/shacl-error? @(fluree/stage db1 {"insert" {"@id" "ex:me" "ex:foo" "foo" "ex:term" 123}}))))))))
+        (let [db1 @(fluree/update db0 {"@context" test-utils/default-str-context
+                                       "insert"
+                                       [{"@type" "sh:NodeShape",
+                                         "sh:property" [{"sh:datatype" {"@id" "xsd:string"},
+                                                         "sh:maxCount" 1,
+                                                         "sh:path" {"@id" "ex:term"}}],
+                                         "sh:targetSubjectsOf" {"@id" "ex:foo" "ex:extra" "data"}}]})]
+          (is (test-utils/shacl-error? @(fluree/update db1 {"insert" {"@id" "ex:me" "ex:foo" "foo" "ex:term" 123}}))))))))
 
 (deftest path-segment-handling
   (let [conn @(fluree/connect-memory)
         ledger @(fluree/create conn "shacl-pp")
         db0  (fluree/db ledger)
-        db1 @(fluree/stage db0 {"@context" {"ex" "http://example.org/",
-                                            "schema" "http://schema.org/",
-                                            "sh" "http://www.w3.org/ns/shacl#",
-                                            "rdf" "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
-                                "ledger" "test-shacl",
+        db1 @(fluree/update db0 {"@context" {"ex" "http://example.org/",
+                                             "schema" "http://schema.org/",
+                                             "sh" "http://www.w3.org/ns/shacl#",
+                                             "rdf" "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
+                                 "ledger" "test-shacl",
                                 ;; insert a predicate with some metadata (description)
-                                "insert" [{"@id" "schema:name", "ex:description" "This property is the name."}]})
-        db2 @(fluree/stage db1 {"@context" {"ex" "http://example.org/",
-                                            "schema" "http://schema.org/",
-                                            "sh" "http://www.w3.org/ns/shacl#"},
-                                "ledger" "test-shacl",
-                                "insert" {"@id" "ex:UserShape",
-                                          "@type" ["sh:NodeShape"],
-                                          "sh:targetClass" {"@id" "ex:User"},
+                                 "insert" [{"@id" "schema:name", "ex:description" "This property is the name."}]})
+        db2 @(fluree/update db1 {"@context" {"ex" "http://example.org/",
+                                             "schema" "http://schema.org/",
+                                             "sh" "http://www.w3.org/ns/shacl#"},
+                                 "ledger" "test-shacl",
+                                 "insert" {"@id" "ex:UserShape",
+                                           "@type" ["sh:NodeShape"],
+                                           "sh:targetClass" {"@id" "ex:User"},
                                           ;; sh:path references a predicate that has additional data on it
-                                          "sh:property" [{"sh:path" {"@id" "schema:name"},
-                                                          "sh:hasValue" {"@id" "ex:Fred"}}]}})
-        db3 @(fluree/stage db2 {"@context" {"ex" "http://example.org/",
-                                            "schema" "http://schema.org/"},
-                                "ledger" "test-shacl",
-                                "insert" {"@id" "ex:dolly",
-                                          "@type" ["ex:User"],
-                                          "schema:age" 77,
-                                          "schema:name" {"@id" "ex:Fred"}}})]
+                                           "sh:property" [{"sh:path" {"@id" "schema:name"},
+                                                           "sh:hasValue" {"@id" "ex:Fred"}}]}})
+        db3 @(fluree/update db2 {"@context" {"ex" "http://example.org/",
+                                             "schema" "http://schema.org/"},
+                                 "ledger" "test-shacl",
+                                 "insert" {"@id" "ex:dolly",
+                                           "@type" ["ex:User"],
+                                           "schema:age" 77,
+                                           "schema:name" {"@id" "ex:Fred"}}})]
     (testing "shape that exercises path with additional data does not error"
       (is (= [{"@id" "ex:dolly"
                "@type" "ex:User",

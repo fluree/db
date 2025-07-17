@@ -42,19 +42,19 @@
   (testing "owl equality semantics tests eq-sym and eq-trans"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base @(fluree/stage (fluree/db ledger)
-                                 {"@context" {"ex" "http://example.org/"}
-                                  "insert"   [{"@id"        "ex:carol"
-                                               "ex:zipCode" 60657}
-                                              {"@id"        "ex:carol-lynn"
-                                               "ex:zipCode" 12345}]})]
+          db-base @(fluree/update (fluree/db ledger)
+                                  {"@context" {"ex" "http://example.org/"}
+                                   "insert"   [{"@id"        "ex:carol"
+                                                "ex:zipCode" 60657}
+                                               {"@id"        "ex:carol-lynn"
+                                                "ex:zipCode" 12345}]})]
       (testing "Testing explicit owl:sameAs declaration"
-        (let [db-same     @(fluree/stage db-base
-                                         {"@context" {"ex"   "http://example.org/"
-                                                      "owl"  "http://www.w3.org/2002/07/owl#"
-                                                      "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                          "insert"   {"@id"        "ex:carol"
-                                                      "owl:sameAs" {"@id" "ex:carol-lynn"}}})
+        (let [db-same     @(fluree/update db-base
+                                          {"@context" {"ex"   "http://example.org/"
+                                                       "owl"  "http://www.w3.org/2002/07/owl#"
+                                                       "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                           "insert"   {"@id"        "ex:carol"
+                                                       "owl:sameAs" {"@id" "ex:carol-lynn"}}})
 
               db-reasoned @(fluree/reason db-same :owl2rl)]
 
@@ -87,16 +87,16 @@
 
       (testing "Testing owl:sameAs transitivity (eq-trans)"
         (let [ledger      @(fluree/create conn "reasoner/eq-trans" nil)
-              db-same     @(fluree/stage (fluree/db ledger)
-                                         {"@context" {"ex"   "http://example.org/"
-                                                      "owl"  "http://www.w3.org/2002/07/owl#"
-                                                      "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                          "insert"   [{"@id"        "ex:carol1"
-                                                       "owl:sameAs" {"@id" "ex:carol2"}}
-                                                      {"@id"        "ex:carol2"
-                                                       "owl:sameAs" {"@id" "ex:carol3"}}
-                                                      {"@id"        "ex:carol3"
-                                                       "owl:sameAs" {"@id" "ex:carol4"}}]})
+              db-same     @(fluree/update (fluree/db ledger)
+                                          {"@context" {"ex"   "http://example.org/"
+                                                       "owl"  "http://www.w3.org/2002/07/owl#"
+                                                       "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                           "insert"   [{"@id"        "ex:carol1"
+                                                        "owl:sameAs" {"@id" "ex:carol2"}}
+                                                       {"@id"        "ex:carol2"
+                                                        "owl:sameAs" {"@id" "ex:carol3"}}
+                                                       {"@id"        "ex:carol3"
+                                                        "owl:sameAs" {"@id" "ex:carol4"}}]})
               db-reasoned @(fluree/reason db-same :owl2rl)]
 
           (is (= (list "ex:carol1" "ex:carol2" "ex:carol3" "ex:carol4")
@@ -123,30 +123,30 @@
       ;; and for now eq-rep-p is not supported. It would act like owl:equivalentProperty
       (testing "Testing owl:sameAs (eq-rep-s, eq-rep-o)"
         (let [ledger        @(fluree/create conn "reasoner/eq-rep" nil)
-              db-same       @(fluree/stage (fluree/db ledger)
-                                           {"@context" {"ex"   "http://example.org/"
-                                                        "owl"  "http://www.w3.org/2002/07/owl#"
-                                                        "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                            "insert"   [{"@id"        "ex:carol1"
-                                                         "ex:name"    "Carol1"
-                                                         "ex:age"     72
+              db-same       @(fluree/update (fluree/db ledger)
+                                            {"@context" {"ex"   "http://example.org/"
+                                                         "owl"  "http://www.w3.org/2002/07/owl#"
+                                                         "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                             "insert"   [{"@id"        "ex:carol1"
+                                                          "ex:name"    "Carol1"
+                                                          "ex:age"     72
                                                          ;; make ex:carol1 sameAs ex:carol2, ex:carol2 sameAs ex:carol1
-                                                         "owl:sameAs" {"@id" "ex:carol2"}
+                                                          "owl:sameAs" {"@id" "ex:carol2"}
                                                          ;; note ex:friend is one of sameAs values, so will expand
-                                                         "ex:friend"  {"@id" "ex:carol3"}}
-                                                        {"@id"        "ex:carol2"
-                                                         "ex:name"    "Carol2"
-                                                         "ex:favFood" {"@id" "ex:pizza"}
+                                                          "ex:friend"  {"@id" "ex:carol3"}}
+                                                         {"@id"        "ex:carol2"
+                                                          "ex:name"    "Carol2"
+                                                          "ex:favFood" {"@id" "ex:pizza"}
                                                          ;; make ex:carol2 sameAs ex:carol3, ex:carol3 sameAs ex:carol2
-                                                         "owl:sameAs" {"@id" "ex:carol3"}}
-                                                        {"@id"        "ex:carol3"
-                                                         "ex:name"    "Carol3"
-                                                         "ex:favFood" {"@id" "ex:pizza"}
+                                                          "owl:sameAs" {"@id" "ex:carol3"}}
+                                                         {"@id"        "ex:carol3"
+                                                          "ex:name"    "Carol3"
+                                                          "ex:favFood" {"@id" "ex:pizza"}
                                                          ;; make ex:carol3 sameAs ex:carol4, ex:carol4 sameAs ex:carol3
-                                                         "owl:sameAs" {"@id" "ex:carol4"}}
-                                                        {"@id"       "ex:carol4"
-                                                         "ex:name"   "Carol4"
-                                                         "ex:favNum" 42}]})
+                                                          "owl:sameAs" {"@id" "ex:carol4"}}
+                                                         {"@id"       "ex:carol4"
+                                                          "ex:name"   "Carol4"
+                                                          "ex:favNum" 42}]})
               db-reasoned   @(fluree/reason db-same :owl2rl)
               merged-result {"@id"        nil
                              "ex:name"    ["Carol1" "Carol2" "Carol3" "Carol4"]
@@ -191,7 +191,7 @@
   (testing "rdfs:domain and rdfs:range tests"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base @(fluree/stage (fluree/db ledger) reasoning-db-data)]
+          db-base @(fluree/update (fluree/db ledger) reasoning-db-data)]
 
       (testing "Testing rdfs:domain - rule: prp-dom"
         (let [db-prp-dom @(fluree/reason
@@ -287,12 +287,12 @@
   (testing "owl:FunctionalProperty tests"
     (let [conn        (test-utils/create-conn)
           ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/stage (fluree/db ledger)
-                                     {"@context" {"ex" "http://example.org/"}
-                                      "insert"   [{"@id"       "ex:brian"
-                                                   "ex:mother" [{"@id" "ex:carol"} {"@id" "ex:carol2"}]}
-                                                  {"@id"       "ex:ralph"
-                                                   "ex:mother" [{"@id" "ex:anne"} {"@id" "ex:anne2"}]}]})
+          db-base     @(fluree/update (fluree/db ledger)
+                                      {"@context" {"ex" "http://example.org/"}
+                                       "insert"   [{"@id"       "ex:brian"
+                                                    "ex:mother" [{"@id" "ex:carol"} {"@id" "ex:carol2"}]}
+                                                   {"@id"       "ex:ralph"
+                                                    "ex:mother" [{"@id" "ex:anne"} {"@id" "ex:anne2"}]}]})
           db-reasoned @(fluree/reason
                         db-base :owl2rl
                         [{"@context" {"ex"  "http://example.org/"
@@ -344,16 +344,16 @@
   (testing "owl:InverseFunctionalProperty tests"
     (let [conn        (test-utils/create-conn)
           ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/stage (fluree/db ledger)
-                                     {"@context" {"ex" "http://example.org/"}
-                                      "insert"   [{"@id"      "ex:brian"
-                                                   "ex:email" "brian@example.org"}
-                                                  {"@id"      "ex:brian2"
-                                                   "ex:email" "brian@example.org"}
-                                                  {"@id"      "ex:ralph"
-                                                   "ex:email" "ralph@example.org"}
-                                                  {"@id"      "ex:ralph2"
-                                                   "ex:email" "ralph@example.org"}]})
+          db-base     @(fluree/update (fluree/db ledger)
+                                      {"@context" {"ex" "http://example.org/"}
+                                       "insert"   [{"@id"      "ex:brian"
+                                                    "ex:email" "brian@example.org"}
+                                                   {"@id"      "ex:brian2"
+                                                    "ex:email" "brian@example.org"}
+                                                   {"@id"      "ex:ralph"
+                                                    "ex:email" "ralph@example.org"}
+                                                   {"@id"      "ex:ralph2"
+                                                    "ex:email" "ralph@example.org"}]})
           db-reasoned @(fluree/reason
                         db-base :owl2rl
                         [{"@context" {"ex"  "http://example.org/"
@@ -385,15 +385,15 @@
   (testing "owl:SymetricProperty tests"
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base @(fluree/stage (fluree/db ledger) reasoning-db-data)]
+          db-base @(fluree/update (fluree/db ledger) reasoning-db-data)]
 
       (testing "Testing owl:SymetricProperty - rule: prp-symp"
-        (let [db-livesWith @(fluree/stage db-base
-                                          {"@context" {"ex"   "http://example.org/"
-                                                       "owl"  "http://www.w3.org/2002/07/owl#"
-                                                       "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                           "insert"   {"@id"          "ex:person-a"
-                                                       "ex:livesWith" {"@id" "ex:person-b"}}})
+        (let [db-livesWith @(fluree/update db-base
+                                           {"@context" {"ex"   "http://example.org/"
+                                                        "owl"  "http://www.w3.org/2002/07/owl#"
+                                                        "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                            "insert"   {"@id"          "ex:person-a"
+                                                        "ex:livesWith" {"@id" "ex:person-b"}}})
 
               db-prp-symp  @(fluree/reason
                              db-livesWith :owl2rl
@@ -415,17 +415,17 @@
   (testing "owl:TransitiveProperty tests  - rule: prp-trp"
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base      @(fluree/stage (fluree/db ledger) reasoning-db-data)
-          db-livesWith @(fluree/stage db-base
-                                      {"@context" {"ex"   "http://example.org/"
-                                                   "owl"  "http://www.w3.org/2002/07/owl#"
-                                                   "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
-                                       "insert"   [{"@id"          "ex:person-a"
-                                                    "ex:livesWith" {"@id" "ex:person-b"}}
-                                                   {"@id"          "ex:person-b"
-                                                    "ex:livesWith" {"@id" "ex:person-c"}}
-                                                   {"@id"          "ex:person-c"
-                                                    "ex:livesWith" {"@id" "ex:person-d"}}]})
+          db-base      @(fluree/update (fluree/db ledger) reasoning-db-data)
+          db-livesWith @(fluree/update db-base
+                                       {"@context" {"ex"   "http://example.org/"
+                                                    "owl"  "http://www.w3.org/2002/07/owl#"
+                                                    "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                                        "insert"   [{"@id"          "ex:person-a"
+                                                     "ex:livesWith" {"@id" "ex:person-b"}}
+                                                    {"@id"          "ex:person-b"
+                                                     "ex:livesWith" {"@id" "ex:person-c"}}
+                                                    {"@id"          "ex:person-c"
+                                                     "ex:livesWith" {"@id" "ex:person-d"}}]})
 
           db-prp-trp   @(fluree/reason
                          db-livesWith :owl2rl
@@ -448,11 +448,11 @@
   (testing "rdfs:subPropertyOf tests  - rule: prp-spo1"
     (let [conn        (test-utils/create-conn)
           ledger      @(fluree/create conn "reasoner/owl2rl-rdfs-subPropertyOf" nil)
-          db-base     @(fluree/stage (fluree/db ledger)
-                                     {"@context" {"ex" "http://example.org/"}
-                                      "insert"   [{"@id"       "ex:bob"
-                                                   "ex:mother" {"@id" "ex:alice-mom"}
-                                                   "ex:father" {"@id" "ex:greg-dad"}}]})
+          db-base     @(fluree/update (fluree/db ledger)
+                                      {"@context" {"ex" "http://example.org/"}
+                                       "insert"   [{"@id"       "ex:bob"
+                                                    "ex:mother" {"@id" "ex:alice-mom"}
+                                                    "ex:father" {"@id" "ex:greg-dad"}}]})
           db-reasoned @(fluree/reason
                         db-base :owl2rl
                         [{"@context"           {"ex"   "http://example.org/"
@@ -481,16 +481,16 @@
   (testing "owl:propertyChainAxiom tests  - rule: prp-spo2"
     (let [conn        (test-utils/create-conn)
           ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/stage (fluree/db ledger)
-                                     {"@context" {"ex" "http://example.org/"}
-                                      "insert"   [{"@id"       "ex:person-a"
-                                                   "ex:parents" [{"@id" "ex:mom"} {"@id" "ex:dad"}]}
-                                                  {"@id"       "ex:mom"
-                                                   "ex:parents" [{"@id" "ex:mom-mom"} {"@id" "ex:mom-dad"}]}
-                                                  {"@id"       "ex:dad"
-                                                   "ex:parents" [{"@id" "ex:dad-mom"} {"@id" "ex:dad-dad"}]}
-                                                  {"@id"       "ex:mom-mom"
-                                                   "ex:parents" [{"@id" "ex:mom-mom-mom"} {"@id" "ex:mom-mom-dad"}]}]})
+          db-base     @(fluree/update (fluree/db ledger)
+                                      {"@context" {"ex" "http://example.org/"}
+                                       "insert"   [{"@id"       "ex:person-a"
+                                                    "ex:parents" [{"@id" "ex:mom"} {"@id" "ex:dad"}]}
+                                                   {"@id"       "ex:mom"
+                                                    "ex:parents" [{"@id" "ex:mom-mom"} {"@id" "ex:mom-dad"}]}
+                                                   {"@id"       "ex:dad"
+                                                    "ex:parents" [{"@id" "ex:dad-mom"} {"@id" "ex:dad-dad"}]}
+                                                   {"@id"       "ex:mom-mom"
+                                                    "ex:parents" [{"@id" "ex:mom-mom-mom"} {"@id" "ex:mom-mom-dad"}]}]})
           db-reasoned @(fluree/reason
                         db-base :owl2rl
                         [{"@context"               {"ex"  "http://example.org/"
@@ -534,14 +534,14 @@
   (testing "owl:inverseOf tests"
     (let [conn        (test-utils/create-conn)
           ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/stage (fluree/db ledger)
-                                     {"@context" {"ex" "http://example.org/"}
-                                      "insert"   [{"@id"       "ex:son"
-                                                   "ex:parents" [{"@id" "ex:mom"} {"@id" "ex:dad"}]}
-                                                  {"@id"       "ex:mom"
-                                                   "ex:parents" [{"@id" "ex:mom-mom"} {"@id" "ex:mom-dad"}]}
-                                                  {"@id"      "ex:alice"
-                                                   "ex:child" {"@id" "ex:bob"}}]})
+          db-base     @(fluree/update (fluree/db ledger)
+                                      {"@context" {"ex" "http://example.org/"}
+                                       "insert"   [{"@id"       "ex:son"
+                                                    "ex:parents" [{"@id" "ex:mom"} {"@id" "ex:dad"}]}
+                                                   {"@id"       "ex:mom"
+                                                    "ex:parents" [{"@id" "ex:mom-mom"} {"@id" "ex:mom-dad"}]}
+                                                   {"@id"      "ex:alice"
+                                                    "ex:child" {"@id" "ex:bob"}}]})
 
           db-reasoned @(fluree/reason db-base :owl2rl
                                       [{"@context"      {"ex"   "http://example.org/"
@@ -579,38 +579,38 @@
   (testing "owl:hasKey tests"
     (let [conn        (test-utils/create-conn)
           ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/stage (fluree/db ledger)
-                                     {"@context" {"ex" "http://example.org/"}
-                                      "insert"   [{"@id"                "ex:brian"
-                                                   "@type"              ["ex:RegisteredPatient"]
-                                                   "ex:hasWaitingListN" "123-45-6789"}
-                                                  {"@id"                "ex:brian2"
-                                                   "@type"              ["ex:RegisteredPatient"]
-                                                   "ex:hasWaitingListN" "123-45-6789"}
-                                                  {"@id"                "ex:bob"
-                                                   "@type"              ["ex:RegisteredPatient"]
-                                                   "ex:hasWaitingListN" "444-44-4444"}
+          db-base     @(fluree/update (fluree/db ledger)
+                                      {"@context" {"ex" "http://example.org/"}
+                                       "insert"   [{"@id"                "ex:brian"
+                                                    "@type"              ["ex:RegisteredPatient"]
+                                                    "ex:hasWaitingListN" "123-45-6789"}
+                                                   {"@id"                "ex:brian2"
+                                                    "@type"              ["ex:RegisteredPatient"]
+                                                    "ex:hasWaitingListN" "123-45-6789"}
+                                                   {"@id"                "ex:bob"
+                                                    "@type"              ["ex:RegisteredPatient"]
+                                                    "ex:hasWaitingListN" "444-44-4444"}
 
-                                                  {"@id"            "ex:t1"
-                                                   "@type"          ["ex:Transplantation"]
-                                                   "ex:donorId"     {"@id" "ex:brian"}
-                                                   "ex:recipientId" {"@id" "ex:alice"}
-                                                   "ex:ofOrgan"     "liver"}
-                                                  {"@id"            "ex:t2"
-                                                   "@type"          ["ex:Transplantation"]
-                                                   "ex:donorId"     {"@id" "ex:brian"}
-                                                   "ex:recipientId" {"@id" "ex:alice"}
-                                                   "ex:ofOrgan"     "liver"}
-                                                  {"@id"            "ex:t3"
-                                                   "@type"          ["ex:Transplantation"]
-                                                   "ex:donorId"     {"@id" "ex:brian"}
-                                                   "ex:recipientId" {"@id" "ex:alice"}
-                                                   "ex:ofOrgan"     "heart"}
-                                                  {"@id"            "ex:t4"
-                                                   "@type"          ["ex:Transplantation"]
-                                                   "ex:donorId"     {"@id" "ex:bob"}
-                                                   "ex:recipientId" {"@id" "ex:alice"}
-                                                   "ex:ofOrgan"     "liver"}]})
+                                                   {"@id"            "ex:t1"
+                                                    "@type"          ["ex:Transplantation"]
+                                                    "ex:donorId"     {"@id" "ex:brian"}
+                                                    "ex:recipientId" {"@id" "ex:alice"}
+                                                    "ex:ofOrgan"     "liver"}
+                                                   {"@id"            "ex:t2"
+                                                    "@type"          ["ex:Transplantation"]
+                                                    "ex:donorId"     {"@id" "ex:brian"}
+                                                    "ex:recipientId" {"@id" "ex:alice"}
+                                                    "ex:ofOrgan"     "liver"}
+                                                   {"@id"            "ex:t3"
+                                                    "@type"          ["ex:Transplantation"]
+                                                    "ex:donorId"     {"@id" "ex:brian"}
+                                                    "ex:recipientId" {"@id" "ex:alice"}
+                                                    "ex:ofOrgan"     "heart"}
+                                                   {"@id"            "ex:t4"
+                                                    "@type"          ["ex:Transplantation"]
+                                                    "ex:donorId"     {"@id" "ex:bob"}
+                                                    "ex:recipientId" {"@id" "ex:alice"}
+                                                    "ex:ofOrgan"     "liver"}]})
 
           db-reasoned @(fluree/reason db-base :owl2rl
                                       [{"@context"   {"ex"  "http://example.org/"

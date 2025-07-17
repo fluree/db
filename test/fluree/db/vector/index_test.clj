@@ -9,7 +9,7 @@
   (testing "Some vectors on a property can be flat-rank scored"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "vector-search")
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
@@ -85,7 +85,7 @@
   (testing "Vector results can join with additional properties"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "vector-search-add-props")
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
@@ -125,7 +125,7 @@
   (testing "Initial 'solutions' before the search call will produce multiple search results"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "vector-search-bindings")
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"

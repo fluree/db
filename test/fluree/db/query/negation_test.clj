@@ -12,18 +12,18 @@
                      test-utils/default-str-context
                      {"ex" "http://example.com/"}]
             db0     (fluree/db ledger)
-            db1     @(fluree/stage db0 {"@context" context
-                                        "insert"   [{"@id"           "ex:alice"
-                                                     "@type"         "ex:Person"
-                                                     "ex:nickname"   "Ali"
-                                                     "ex:givenName"  "Alice"
-                                                     "ex:familyName" "Smith"}
-                                                    {"@id"           "ex:bob"
-                                                     "ex:givenName"  "Bob"
-                                                     "ex:familyName" "Jones"}
-                                                    {"@id"           "ex:carol"
-                                                     "ex:givenName"  "Carol"
-                                                     "ex:familyName" "Smith"}]})]
+            db1     @(fluree/update db0 {"@context" context
+                                         "insert"   [{"@id"           "ex:alice"
+                                                      "@type"         "ex:Person"
+                                                      "ex:nickname"   "Ali"
+                                                      "ex:givenName"  "Alice"
+                                                      "ex:familyName" "Smith"}
+                                                     {"@id"           "ex:bob"
+                                                      "ex:givenName"  "Bob"
+                                                      "ex:familyName" "Jones"}
+                                                     {"@id"           "ex:carol"
+                                                      "ex:givenName"  "Carol"
+                                                      "ex:familyName" "Smith"}]})]
         (testing "checking for existence of a pattern"
           (testing "when the pattern is present in the data"
             (is (= [["ex:alice"]]
@@ -108,12 +108,12 @@
 
         (testing "checking the difference between negation methods in inner filters"
           (testing "for an existing ledger with various data"
-            (let [db1 @(fluree/stage db0 {"insert" [{"@id" "ex:a"
-                                                     "ex:p" 1
-                                                     "ex:q" [1 2]}
-                                                    {"@id" "ex:b"
-                                                     "ex:p" 3.0
-                                                     "ex:q" [4.0 5.0]}]})]
+            (let [db1 @(fluree/update db0 {"insert" [{"@id" "ex:a"
+                                                      "ex:p" 1
+                                                      "ex:q" [1 2]}
+                                                     {"@id" "ex:b"
+                                                      "ex:p" 3.0
+                                                      "ex:q" [4.0 5.0]}]})]
               (testing "where the filter is inside a not-exists pattern"
                 (is (= [["ex:b" 3.0]]
                        @(fluree/query db1 {"where" [{"@id" "?x" "ex:p" "?p"}

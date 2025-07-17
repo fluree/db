@@ -7,7 +7,7 @@
   (testing "Subclass queries work."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/subclass")
-          db1    @(fluree/stage
+          db1    @(fluree/update
                    (fluree/db ledger)
                    {"insert"
                     {"@context"                  "https://schema.org"
@@ -24,7 +24,7 @@
                                                             "@type" "Person"
                                                             "name"  "Douglas Adams"}}}})
           ;; add CreativeWork class
-          db2    @(fluree/stage
+          db2    @(fluree/update
                    db1
                    {"insert"
                     {"@context"        {"schema" "http://schema.org/"
@@ -37,7 +37,7 @@
                      "schema:source"   {"@id" "http://www.w3.org/wiki/WebSchemas/SchemaDotOrgSources#source_rNews"}}})
 
           ;; Make Book and Movie subclasses of CreativeWork
-          db3 @(fluree/stage
+          db3 @(fluree/update
                 db2
                 {"insert"
                  {"@context" {"schema" "http://schema.org/"
@@ -71,7 +71,7 @@
           ledger      @(fluree/create conn ledger-name)
           db0         (fluree/db ledger)
           context     test-utils/default-str-context
-          db1         @(fluree/stage
+          db1         @(fluree/update
                         db0
                         {"@context" context
                          "insert"
@@ -87,7 +87,7 @@
                           {"@id"         "ex:andrew"
                            "@type"       "schema:Person",
                            "schema:name" "Andrew Johnson"}]})
-          db2         @(fluree/stage
+          db2         @(fluree/update
                         db1
                         {"@context" context
                          "insert"
@@ -120,7 +120,7 @@
           ledger      @(fluree/create conn ledger-name)
           db0         (fluree/db ledger)
           context     test-utils/default-str-context
-          db1         @(fluree/stage
+          db1         @(fluree/update
                         db0
                         {"@context" context
                          "insert"
@@ -136,7 +136,7 @@
                           {"@id"         "ex:andrew"
                            "@type"       "schema:Person",
                            "schema:name" "Andrew Johnson"}]})
-          db2         @(fluree/stage
+          db2         @(fluree/update
                         db1
                         {"@context" context
                          "insert"
@@ -170,7 +170,7 @@
           ledger-name "subclass-nested-stage-test"
           ledger      @(fluree/create conn ledger-name)
           db0         (fluree/db ledger)
-          db1         @(fluree/stage
+          db1         @(fluree/update
                         db0
                         {"@context" {"ex" "http://example.org/"}
                          "insert"   [{"@id"     "ex:brian"
@@ -182,13 +182,13 @@
                                      {"@id"     "ex:alice"
                                       "@type"   "ex:Human"
                                       "ex:name" "Alice"}]})
-          db2         @(fluree/stage
+          db2         @(fluree/update
                         db1
                         {"@context" {"ex"   "http://example.org/"
                                      "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
                          "insert"   [{"@id"             "ex:Person"
                                       "rdfs:subClassOf" {"@id" "ex:Human"}}]})
-          db3         @(fluree/stage
+          db3         @(fluree/update
                         db2
                         {"@context" {"ex"   "http://example.org/"
                                      "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}

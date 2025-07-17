@@ -2,7 +2,9 @@
 
 ## Overview
 
-Fluree DB supports Amazon S3 as a storage backend for ledger data, commits, and indexes. This guide covers configuration, usage, and production deployment of S3 storage.
+Fluree DB supports Amazon S3 as a storage backend for ledger data, commits, and
+indexes. This guide covers configuration, usage, and production deployment of S3
+storage.
 
 ## Configuration
 
@@ -31,11 +33,14 @@ Fluree DB supports Amazon S3 as a storage backend for ledger data, commits, and 
 | Field | Required | Description | Example |
 |-------|----------|-------------|---------|
 | `s3Bucket` | Yes | S3 bucket name | `"fluree-production-data"` |
-| `s3Endpoint` | **Yes** | S3 endpoint URL | `"https://s3.us-east-1.amazonaws.com"` |
+| `s3Endpoint` | **Yes** | S3 endpoint URL | `"https://s3.us-
+east-1.amazonaws.com"` |
 | `s3Prefix` | No | Key prefix for all objects | `"ledgers"` |
-| `addressIdentifier` | No | Unique identifier for this storage instance | `"prod-s3"` |
+| `addressIdentifier` | No | Unique identifier for this storage instance |
+`"prod-s3"` |
 
-> **Note**: As of the latest version, `s3Endpoint` is a required parameter. The API will throw a validation error if not provided.
+> **Note**: As of the latest version, `s3Endpoint` is a required parameter. The
+API will throw a validation error if not provided.
 
 ### Complete System Configuration
 
@@ -160,7 +165,8 @@ Fluree uses the AWS SDK's default credential chain:
 - `(storage/identifiers store)` - Get storage identifier set
 
 ### Configuration Schema
-See `fluree.db.connection.vocab` for complete configuration vocabulary definitions.
+See `fluree.db.connection.vocab` for complete configuration vocabulary
+definitions.
 
 ## Production Considerations
 
@@ -253,7 +259,8 @@ See `fluree.db.connection.vocab` for complete configuration vocabulary definitio
 **Solutions**:
 - This was a known bug fixed in recent versions
 - Ensure you're using the latest version with the index loading fix
-- The issue was caused by improper address resolution in S3Store's `-read-json` method
+- The issue was caused by improper address resolution in S3Store's `-read-json`
+    method
 - If still experiencing issues, verify fluree addresses are properly formatted
 
 #### 6. connect-s3 API Validation Errors
@@ -289,7 +296,8 @@ The S3 implementation satisfies all required storage protocols:
 #### S3 File Structure
 - Ledger metadata: `<prefix>/<ledger-name>.json`
 - Commit files: `<prefix>/<ledger-name>/commit/<hash>.json`
-- Index files: `<prefix>/<ledger-name>/index/{root,post,spot,tspo,opst}/<hash>.json`
+- Index files: `<prefix>/<ledger-
+    name>/index/{root,post,spot,tspo,opst}/<hash>.json`
 
 ## Testing and Development
 
@@ -400,7 +408,8 @@ clojure -M:dev:cljtest -e "(require 'fluree.db.storage.s3-indexing-test) (clojur
 <logger name="f.db.nameservice.storage" level="INFO"/>
 ```
 
-> **Note**: S3 tests now use proper logging via `fluree.db.util.log` instead of `println` for better control over log levels.
+> **Note**: S3 tests now use proper logging via `fluree.db.util.log` instead of
+`println` for better control over log levels.
 
 #### Manual S3 Operations
 ```clojure

@@ -193,7 +193,7 @@
 (defn triples->map
   "Turns triples from same subject (@id) originating from
   raw inserts that might exist in reasoning graph (e.g. owl:sameAs)
-  into fluree/stage standard format."
+  into fluree/update standard format."
   [id triples]
   (reduce
    (fn [acc [_ p v]]
@@ -205,7 +205,7 @@
    triples))
 
 (defn inserts-by-rule
-  "Creates fluree/stage insert statements for each individual rule that created
+  "Creates fluree/update insert statements for each individual rule that created
   triples. This is only used for raw inserts that are triggered from the reasoning
   graph (e.g. owl:sameAs)"
   [inserts]

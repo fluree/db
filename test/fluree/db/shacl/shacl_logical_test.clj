@@ -11,7 +11,7 @@
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
-          db         @(fluree/stage
+          db         @(fluree/update
                        (fluree/db ledger)
                        {"@context" context
                         "insert"
@@ -30,7 +30,7 @@
                                            :sh/maxCount 1
                                            :sh/datatype :xsd/string}]}})]
       (testing "no violations"
-        (let [db-ok      @(fluree/stage
+        (let [db-ok      @(fluree/update
                            db
                            {"@context" context
                             "insert"
@@ -46,7 +46,7 @@
                  ok-results)
               (str "unexpected query result: " (pr-str ok-results)))))
       (testing "not equal"
-        (let [db-company-name @(fluree/stage
+        (let [db-company-name @(fluree/update
                                 db
                                 {"@context" context
                                  "insert"
@@ -71,7 +71,7 @@
           (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape1."
                  (ex-message db-company-name)))))
       (testing "conforms to minCount"
-        (let [db-two-names @(fluree/stage
+        (let [db-two-names @(fluree/update
                              db
                              {"@context" context
                               "insert"
@@ -96,7 +96,7 @@
           (is (= "Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape1."
                  (ex-message db-two-names)))))
       (testing "conforms to equals"
-        (let [db-callsign-name @(fluree/stage
+        (let [db-callsign-name @(fluree/update
                                  db
                                  {"@context" context
                                   "insert"
@@ -128,7 +128,7 @@
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
-          db         @(fluree/stage
+          db         @(fluree/update
                        (fluree/db ledger)
                        {"@context" context
                         "insert"
@@ -147,7 +147,7 @@
                                            :sh/maxCount 1
                                            :sh/datatype :xsd/integer}]}})
 
-          db-two-probs @(fluree/stage
+          db-two-probs @(fluree/update
                          db
                          {"@context" context
                           "insert"
@@ -158,7 +158,7 @@
                            :schema/age      900
                            :schema/favNums  [4 8 15 16 23 42]}})]
       (testing "no violations"
-        (let [db-ok      @(fluree/stage
+        (let [db-ok      @(fluree/update
                            db
                            {"@context" context
                             "insert"
@@ -178,7 +178,7 @@
                  ok-results)
               (str "unexpected query result: " (pr-str ok-results)))))
       (testing "conforms to min and max"
-        (let [db-too-old @(fluree/stage
+        (let [db-too-old @(fluree/update
                            db
                            {"@context" context
                             "insert"
@@ -212,7 +212,7 @@
 Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape2."
                  (ex-message db-too-old)))))
       (testing "conforms to max exclusive"
-        (let [db-too-low @(fluree/stage
+        (let [db-too-low @(fluree/update
                            db
                            {"@context" context
                             "insert"
@@ -271,7 +271,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
-          db         @(fluree/stage
+          db         @(fluree/update
                        (fluree/db ledger)
                        {"@context" context
                         "insert"
@@ -288,7 +288,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                                            :sh/path    :ex/greeting
                                            :sh/pattern "hello.*"}]}})]
       (testing "no constraint violations"
-        (let [db-ok @(fluree/stage
+        (let [db-ok @(fluree/update
                       db
                       {"@context" context
                        "insert"
@@ -304,7 +304,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                    :ex/tag      1}]
                  @(fluree/query db-ok user-query)))))
       (testing "name conforms"
-        (let [db-name-too-short @(fluree/stage
+        (let [db-name-too-short @(fluree/update
                                   db
                                   {"@context" context
                                    "insert"
@@ -344,7 +344,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
 Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape3."
                  (ex-message db-name-too-short)))))
       (testing "tag conforms"
-        (let [db-tag-too-long @(fluree/stage
+        (let [db-tag-too-long @(fluree/update
                                 db
                                 {"@context" context
                                  "insert"
@@ -384,7 +384,7 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
 Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john conforms to shape :ex/pshape3."
                  (ex-message db-tag-too-long)))))
       (testing "greeting conforms"
-        (let [db-greeting-incorrect @(fluree/stage
+        (let [db-greeting-incorrect @(fluree/update
                                       db
                                       {"@context" context
                                        "insert"
@@ -429,31 +429,31 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
         ledger  @(fluree/create conn "shacl-and")
         context [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
         db0     (fluree/db ledger)
-        db1     @(fluree/stage db0 {"@context" context
-                                    "insert"
-                                    {"@id" "ex:andShape"
-                                     "@type" "sh:NodeShape"
-                                     "sh:targetNode" {"@id" "ex:a"}
-                                     "sh:and" [{"id" "ex:pshape1"
-                                                "sh:path" {"@id" "ex:width"}
-                                                "sh:minCount" 1}
-                                               {"id" "ex:pshape2"
-                                                "sh:path" {"@id" "ex:width"}
-                                                "sh:datatype" {"@id" "xsd:integer"}}
-                                               {"id" "ex:pshape3"
-                                                "sh:path" {"@id" "ex:height"}
-                                                "sh:minCount" 1}
-                                               {"id" "ex:pshape4"
-                                                "sh:path" {"@id" "ex:height"}
-                                                "sh:datatype" {"@id" "xsd:integer"}}]}})]
+        db1     @(fluree/update db0 {"@context" context
+                                     "insert"
+                                     {"@id" "ex:andShape"
+                                      "@type" "sh:NodeShape"
+                                      "sh:targetNode" {"@id" "ex:a"}
+                                      "sh:and" [{"id" "ex:pshape1"
+                                                 "sh:path" {"@id" "ex:width"}
+                                                 "sh:minCount" 1}
+                                                {"id" "ex:pshape2"
+                                                 "sh:path" {"@id" "ex:width"}
+                                                 "sh:datatype" {"@id" "xsd:integer"}}
+                                                {"id" "ex:pshape3"
+                                                 "sh:path" {"@id" "ex:height"}
+                                                 "sh:minCount" 1}
+                                                {"id" "ex:pshape4"
+                                                 "sh:path" {"@id" "ex:height"}
+                                                 "sh:datatype" {"@id" "xsd:integer"}}]}})]
     (testing "conforms to all shapes"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert" {"@id" "ex:a" "ex:height" 3 "ex:width" 4}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert" {"@id" "ex:a" "ex:height" 3 "ex:width" 4}})]
         (is (nil? (ex-data db2)))))
 
     (testing "conforms to only two shapes"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert" {"@id" "ex:a" "ex:height" 3}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert" {"@id" "ex:a" "ex:height" 3}})]
         (is (= {:status 422,
                 :error :shacl/violation,
                 :report
@@ -477,31 +477,31 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
         ledger  @(fluree/create conn "shacl-or")
         context [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
         db0     (fluree/db ledger)
-        db1     @(fluree/stage db0 {"@context" context
-                                    "insert"
-                                    {"@id" "ex:orShape"
-                                     "@type" "sh:NodeShape"
-                                     "sh:targetClass" {"@id" "ex:Dimensional"}
-                                     "sh:or" [{"id" "ex:pshape1"
-                                               "sh:path" {"@id" "ex:height"}
-                                               "sh:minCount" 1
-                                               "sh:datatype" {"@id" "xsd:integer"}}
-                                              {"id" "ex:pshape2"
-                                               "sh:path" {"@id" "ex:width"}
-                                               "sh:minCount" 1
-                                               "sh:datatype" {"@id" "xsd:integer"}}
-                                              {"id" "ex:pshape3"
-                                               "sh:path" {"@id" "ex:depth"}
-                                               "sh:minCount" 1
-                                               "sh:datatype" {"@id" "xsd:integer"}}]}})]
+        db1     @(fluree/update db0 {"@context" context
+                                     "insert"
+                                     {"@id" "ex:orShape"
+                                      "@type" "sh:NodeShape"
+                                      "sh:targetClass" {"@id" "ex:Dimensional"}
+                                      "sh:or" [{"id" "ex:pshape1"
+                                                "sh:path" {"@id" "ex:height"}
+                                                "sh:minCount" 1
+                                                "sh:datatype" {"@id" "xsd:integer"}}
+                                               {"id" "ex:pshape2"
+                                                "sh:path" {"@id" "ex:width"}
+                                                "sh:minCount" 1
+                                                "sh:datatype" {"@id" "xsd:integer"}}
+                                               {"id" "ex:pshape3"
+                                                "sh:path" {"@id" "ex:depth"}
+                                                "sh:minCount" 1
+                                                "sh:datatype" {"@id" "xsd:integer"}}]}})]
     (testing "conforms to one shape"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert" {"@id" "ex:1" "@type" "ex:Dimensional" "ex:height" 8}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert" {"@id" "ex:1" "@type" "ex:Dimensional" "ex:height" 8}})]
         (is (nil? (ex-data db2)))))
 
     (testing "conforms to no shapes"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert" {"@id" "ex:2" "@type" "ex:Dimensional" "ex:bigness" "yup it's big"}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert" {"@id" "ex:2" "@type" "ex:Dimensional" "ex:bigness" "yup it's big"}})]
         (is (= {:status 422,
                 :error :shacl/violation,
                 :report
@@ -524,30 +524,30 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
         ledger  @(fluree/create conn "shacl-or")
         context [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
         db0     (fluree/db ledger)
-        db1     @(fluree/stage db0 {"@context" context
-                                    "insert"
-                                    {"@id"           "ex:orShape"
-                                     "@type"         "sh:NodeShape"
-                                     "sh:targetNode" {"@id" "ex:Named"}
-                                     "sh:xone"       [{"@id" "ex:one-part"
-                                                       "sh:property"
-                                                       {"sh:path"     {"@id" "ex:fullName"}
-                                                        "sh:minCount" 1}}
-                                                      {"@id" "ex:two-parts"
-                                                       "sh:property"
-                                                       [{"sh:path"     {"@id" "ex:firstName"}
-                                                         "sh:minCount" 1}
-                                                        {"sh:path"     {"@id" "ex:lastName"}
-                                                         "sh:minCount" 1}]}]}})]
+        db1     @(fluree/update db0 {"@context" context
+                                     "insert"
+                                     {"@id"           "ex:orShape"
+                                      "@type"         "sh:NodeShape"
+                                      "sh:targetNode" {"@id" "ex:Named"}
+                                      "sh:xone"       [{"@id" "ex:one-part"
+                                                        "sh:property"
+                                                        {"sh:path"     {"@id" "ex:fullName"}
+                                                         "sh:minCount" 1}}
+                                                       {"@id" "ex:two-parts"
+                                                        "sh:property"
+                                                        [{"sh:path"     {"@id" "ex:firstName"}
+                                                          "sh:minCount" 1}
+                                                         {"sh:path"     {"@id" "ex:lastName"}
+                                                          "sh:minCount" 1}]}]}})]
     (testing "conforms to one shape"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert"   {"@id"         "ex:Named"
-                                                "ex:fullName" "George Washington"}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert"   {"@id"         "ex:Named"
+                                                 "ex:fullName" "George Washington"}})]
         (is (nil? (ex-data db2)))))
 
     (testing "conforms to no shapes"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert"   {"@id" "ex:Named" "ex:nickname" "Father G"}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert"   {"@id" "ex:Named" "ex:nickname" "Father G"}})]
         (is (= {:status 422,
                 :error :shacl/violation,
                 :report
@@ -566,11 +566,11 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
                (ex-message db2)))))
 
     (testing "conforms to more than one shapes"
-      (let [db2 @(fluree/stage db1 {"@context" context
-                                    "insert"   {"@id"          "ex:Named"
-                                                "ex:fullName"  "George Washington"
-                                                "ex:firstName" "George"
-                                                "ex:lastName"  "Washington"}})]
+      (let [db2 @(fluree/update db1 {"@context" context
+                                     "insert"   {"@id"          "ex:Named"
+                                                 "ex:fullName"  "George Washington"
+                                                 "ex:firstName" "George"
+                                                 "ex:lastName"  "Washington"}})]
         (is (= {:status 422,
                 :error :shacl/violation,
                 :report
