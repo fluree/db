@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y wget curl gnupg2 software-properties-co
 ENV CHROME_BIN=/usr/bin/chromium
 
 # Add node PPA to get newer versions
-RUN curl -sL https://deb.nodesource.com/setup_16.x | bash -
+RUN curl -sL https://deb.nodesource.com/setup_20.x | bash -
 RUN apt-get update && apt-get install -y nodejs build-essential
 
 COPY deps.edn Makefile ./

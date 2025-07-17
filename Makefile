@@ -103,7 +103,7 @@ cljs-node-test: node_modules package-lock.json
 	npx shadow-cljs release node-test
 
 nodejs-test: out/fluree-node-sdk.js
-	cd test/nodejs && npm install && node --experimental-vm-modules node_modules/jest/bin/jest.js
+	cd test/nodejs && npm install && npm test
 
 browser-test: out/fluree-browser-sdk.js
 	cd test/browser && npm install && CI=true npm test
