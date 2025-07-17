@@ -41,6 +41,12 @@
             {:keys [select]} (sparql/->fql query)]
         (is (= ["(as (count ?friends) ?friends)"]
                select))))
+    (testing "COUNT(*)"
+      (let [query "SELECT (COUNT(*) AS ?friends)
+                   WHERE {?friends person:friendsWith \"jdoe\".}"
+            {:keys [select]} (sparql/->fql query)]
+        (is (= ["(as (count *) ?friends)"]
+               select))))
     (testing "COUNT DISTINCT"
       (let [query "SELECT (COUNT(DISTINCT ?handle) AS ?handles)
                    WHERE {?person person:handle ?handle.}"
@@ -1980,6 +1986,31 @@
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"numFavs"
+                          {"value" "1",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
+         (testing "COUNT(*) query works"
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (COUNT(*) AS ?count)
+                          WHERE {?person person:favNums ?favNums.}
+                          GROUP BY ?person"]
+             (testing "output :fql"
+               (is (= [[7] [4] [1]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["count"]},
+                       "results"
+                       {"bindings"
+                        [{"count"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"count"
+                          {"value" "4",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"count"
                           {"value" "1",
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
