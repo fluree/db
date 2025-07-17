@@ -27,6 +27,10 @@ package-lock.json node_modules: package.json
 
 out/fluree-node-sdk.js: package.json package-lock.json node_modules deps.edn src/deps.cljs shadow-cljs.edn $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
 	npx shadow-cljs release fluree-node-sdk && cp out/nodejs/fluree-node-sdk.js out/fluree-node-sdk.js
+	@if [ ! -f out/nodejs/package.json ]; then \
+		echo '{"name": "@fluree/fluree-node-sdk", "version": "3.0.0-alpha2", "main": "fluree-node-sdk.js"}' > out/nodejs/package.json; \
+		echo "Created missing out/nodejs/package.json"; \
+	fi
 
 nodejs: out/fluree-node-sdk.js
 
@@ -105,7 +109,10 @@ cljs-node-test: node_modules package-lock.json
 nodejs-test: out/fluree-node-sdk.js
 	@echo "Checking if SDK files exist..."
 	@ls -la out/nodejs/fluree-node-sdk.js || echo "WARNING: out/nodejs/fluree-node-sdk.js not found"
+	@ls -la out/nodejs/package.json || echo "WARNING: out/nodejs/package.json not found"
 	@ls -la out/fluree-node-sdk.js || echo "WARNING: out/fluree-node-sdk.js not found"
+	@echo "Contents of out/nodejs/package.json:"
+	@cat out/nodejs/package.json || echo "ERROR: Could not read out/nodejs/package.json"
 	cd test/nodejs && npm install && npm test
 
 browser-test: out/fluree-browser-sdk.js
