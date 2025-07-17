@@ -823,7 +823,6 @@
       (throw (ex-info "Cannot apply count to wildcard without using group-by."
                       {:status 400 :error :db/invalid-query})))))
 
-
 (def soln-sym 'solution)
 
 (defn bind-variables
@@ -831,8 +830,8 @@
   (into `[~context-var ~ctx]
         (mapcat (fn [var]
                   `[mch# ~(if (= var count-star-sym)
-                           `(find-grouped-val ~soln-sym)
-                           `(get ~soln-sym (quote ~var)))
+                            `(find-grouped-val ~soln-sym)
+                            `(get ~soln-sym (quote ~var)))
                     ;; convert match to TypedValue
                     ~var (if (= ::group/grouping (where/get-datatype-iri mch#))
                            (mapv where/mch->typed-val (where/get-binding mch#))
