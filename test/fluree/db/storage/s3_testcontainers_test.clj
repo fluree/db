@@ -104,14 +104,14 @@
               (is (some? ledger) "Ledger should be created")
 
               ;; Test basic operations
-              (let [db @(fluree/stage (fluree/db ledger)
-                                      {"@context" {"ex" "http://example.org/ns/"}
-                                       "insert" [{"@id" "ex:alice"
-                                                  "@type" "ex:Person"
-                                                  "ex:name" "Alice"}
-                                                 {"@id" "ex:bob"
-                                                  "@type" "ex:Person"
-                                                  "ex:name" "Bob"}]})
+              (let [db @(fluree/update (fluree/db ledger)
+                                       {"@context" {"ex" "http://example.org/ns/"}
+                                        "insert" [{"@id" "ex:alice"
+                                                   "@type" "ex:Person"
+                                                   "ex:name" "Alice"}
+                                                  {"@id" "ex:bob"
+                                                   "@type" "ex:Person"
+                                                   "ex:name" "Bob"}]})
 
                     ;; Commit the data
                     committed-db @(fluree/commit! ledger db)
@@ -181,13 +181,13 @@
                   ledger @(fluree/create conn ledger-id)
 
                   ;; Add enough data to trigger indexing
-                  db1 @(fluree/stage (fluree/db ledger)
-                                     {"@context" {"ex" "http://example.org/ns/"}
-                                      "insert" (for [i (range 50)]
-                                                 {"@id" (str "ex:person" i)
-                                                  "@type" "ex:Person"
-                                                  "ex:name" (str "Person " i)
-                                                  "ex:age" i})})
+                  db1 @(fluree/update (fluree/db ledger)
+                                      {"@context" {"ex" "http://example.org/ns/"}
+                                       "insert" (for [i (range 50)]
+                                                  {"@id" (str "ex:person" i)
+                                                   "@type" "ex:Person"
+                                                   "ex:name" (str "Person " i)
+                                                   "ex:age" i})})
 
                   ;; Commit to trigger indexing and query to verify data
                   db2 @(fluree/commit! ledger db1)

@@ -1300,25 +1300,8 @@
         db0 (fluree/db ledger)]
     (testing "valid annotations"
       (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
-        (let [db1 (->> @(fluree/stage db0 {"@context" context
-                                           "insert"   [{"@id"         "ex:betty"
-                                                        "@type"       "ex:Yeti"
-                                                        "schema:name" "Betty"
-                                                        "schema:age"  55}]})
-                       (fluree/commit! ledger)
-                       (deref))
-
-              db2 (->> @(fluree/stage db1 {"@context" context
-                                           "insert"   [{"@id"         "ex:freddy"
-                                                        "@type"       "ex:Yeti"
-                                                        "schema:name" "Freddy"
-                                                        "schema:age"  1002}]}
-                                      {:annotation {"ex:originator" "opts" "ex:data" "ok"}})
-                       (fluree/commit! ledger)
-                       (deref))
-
-              _db3 (->> @(fluree/stage db2 {"@context" context
-                                            "insert"   [{"@id"         "ex:letty"
+        (let [db1 (->> @(fluree/update db0 {"@context" context
+                                            "insert"   [{"@id"         "ex:betty"
                                                          "@type"       "ex:Yeti"
                                                          "schema:name" "Betty"
                                                          "schema:age"  55}]})
@@ -1338,8 +1321,8 @@
                                              "insert"   [{"@id"         "ex:letty"
                                                           "@type"       "ex:Yeti"
                                                           "schema:name" "Leticia"
-                                                          "schema:age"  38}]
-                                             "opts"     {"annotation" {"ex:originator" "txn" "ex:data" "ok"}}})
+                                                          "schema:age"  38}]}
+                                        {:annotation {"ex:originator" "txn" "ex:data" "ok"}})
                         (fluree/commit! ledger)
                         (deref))]
           (testing "annotations in commit-details"

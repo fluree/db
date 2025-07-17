@@ -591,15 +591,15 @@
 (deftest bnode-variables-test
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "test/bnodes")
-        db     @(fluree/stage (fluree/db ledger)
-                              {"@context" {"ex" "http://example.org/"}
-                               "insert"
-                               [{"@id"    "ex:a",
-                                 "@type"  "ex:Thing",
-                                 "ex:foo" "_bar"}
-                                {"@id"    "ex:b",
-                                 "@type"  "ex:Thing",
-                                 "ex:foo" "_foo"}]})]
+        db     @(fluree/update (fluree/db ledger)
+                               {"@context" {"ex" "http://example.org/"}
+                                "insert"
+                                [{"@id"    "ex:a",
+                                  "@type"  "ex:Thing",
+                                  "ex:foo" "_bar"}
+                                 {"@id"    "ex:b",
+                                  "@type"  "ex:Thing",
+                                  "ex:foo" "_foo"}]})]
     (testing "_ prefix is a literal value"
       (is (= ["ex:b"]
              @(fluree/query db {"@context" {"ex" "http://example.org/"}
