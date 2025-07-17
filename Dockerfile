@@ -21,6 +21,9 @@ COPY . ./
 
 RUN make jar
 
+# Pre-build JavaScript SDKs to ensure dependencies are downloaded
+RUN make out/fluree-node-sdk.js out/fluree-browser-sdk.js
+
 # Create a user to own the fluree code
 RUN groupadd fluree && useradd --no-log-init -g fluree -m fluree
 
