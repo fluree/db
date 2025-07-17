@@ -686,13 +686,13 @@ Always define clear namespace prefixes and use consistent URIs across your data:
 
 ### 2. SHACL Design Patterns
 - Use SHACL for data validation
-- Define reusable shapes with `sh:node`
+- Define reusable shapes with type sh:NodeShape
 - Leverage SPARQL-based constraints for complex validation rules
 
 ### 3. Reasoning Performance
 - Apply reasoning selectively using graph patterns
 - Pre-compute common inferences
-- Use property paths in SPARQL instead of reasoning when possible
+- Use property paths in SPARQL when possible, noting that support is limited to sequences of predicate/inverse path segments and single segments of one-or-more, zero-or-more, or zero-or-one paths (negated paths not supported)
 
 ### 4. Cross-Database Query Guidelines
 - Use descriptive ledger names for clarity in FROM clauses
