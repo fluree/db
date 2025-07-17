@@ -101,4 +101,15 @@
                  @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]
                                     :where ['{:id ?s :ex/favNums ?favNums}]
                                     :group-by '?s
-                                    :select ['?s '(groupconcat ?favNums ", ")]}))))))))
+                                    :select ['?s '(groupconcat ?favNums ", ")]})))))
+      (testing "with multiple variables"
+        (let [qry {:context  [{"schema" "http://schema.org/" "ex" "http://example.org/ns/"}]
+                   :select   '["?adult" "?gender" "?name"]
+                   :where    '[{"@id" "?s" "schema:name" "?name" "schema:age" "?age"}
+                               [:bind "?adult" "(if (>= ?age 18) \"adult\" \"minor\")"]
+                               [:bind "?gender" "(if (= ?name \"Alice\") \"female\" \"male\")"]]
+                   :groupBy ["?adult" "?gender"]}]
+          (is (= [["adult" "female" ["Alice"]]
+                  ["adult" "male" ["Brian" "Cam"]]
+                  ["minor" "male" ["Liam"]]]
+                 @(fluree/query db qry))))))))
