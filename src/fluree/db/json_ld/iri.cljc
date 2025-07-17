@@ -10,7 +10,7 @@
 
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const f-idx-ns "https://ns.flur.ee/index#")
-(def ^:const f-did-ns "did:fluree:")
+(def ^:const f-did-ns "did:key:")
 (def ^:const f-commit-256-ns "fluree:commit:sha256:")
 (def ^:const fdb-256-ns "fluree:db:sha256:")
 (def ^:const f-mem-ns "fluree:memory://")

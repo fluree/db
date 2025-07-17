@@ -1,4 +1,4 @@
-FROM clojure:temurin-11-tools-deps-1.11.1.1165-bullseye-slim
+FROM clojure:temurin-17-tools-deps-1.11.1.1165-bullseye-slim
 
 RUN mkdir -p /usr/src/flureedb
 WORKDIR /usr/src/flureedb
@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y wget curl gnupg2 software-properties-co
 ENV CHROME_BIN=/usr/bin/chromium
 
 # Add node PPA to get newer versions
-RUN curl -sL https://deb.nodesource.com/setup_16.x | bash -
+RUN curl -sL https://deb.nodesource.com/setup_20.x | bash -
 RUN apt-get update && apt-get install -y nodejs build-essential
 
 COPY deps.edn Makefile ./
@@ -31,5 +31,8 @@ RUN mv /root/.m2 /home/fluree/.m2 && chown -R fluree.fluree /home/fluree/.m2
 
 RUN chown -R fluree.fluree .
 USER fluree
+
+# Pre-build JavaScript SDKs as fluree user to ensure proper permissions
+RUN make out/fluree-node-sdk.js out/fluree-browser-sdk.js
 
 ENTRYPOINT []

@@ -12,6 +12,11 @@ module.exports = function (config) {
     client: {
       args: ["shadow.test.karma.init"],
       singleRun: true
-    }
+    },
+    // Increase timeout to 5 minutes for debugging
+    browserDisconnectTimeout: 300000, // 5 minutes
+    browserNoActivityTimeout: 300000, // 5 minutes
+    captureTimeout: 300000, // 5 minutes
+    pingTimeout: 300000 // 5 minutes
   })
 };

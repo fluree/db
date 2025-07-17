@@ -22,9 +22,9 @@ async function go() {
          skos: "http://www.w3.org/2008/05/skos#",
          f: "https://ns.flur.ee/ledger#"},
        did: {
-         id: "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
-         "public": "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca",
-         "private": "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"}}});
+         id: "did:key:z6Mkr7FKHaSJWkPhdQxAHW2CNs3JsdLUmdB7Dx29HDKi5KLp",
+         "public": "ad2bcd5da964c2515682636f497ff17d461e36d941319b3450743bd533590775",
+         "private": "87c2538c8bf728a07710bc217f5eb0a826d576aea212fb440f91c5d15e6dab3e"}}});
 
   const ledger = await flureenjs.jldCreate(conn, "dan/test1");
 

@@ -4,17 +4,17 @@
             [fluree.db.util :as util]))
 
 (def burt
-  {:id    "did:fluree:TfE2Frz2qkMjnCNJM5yPv7B8gq5Xhk5bqkm"
-   :private "400b74559de3b55c71a9c971c971f58c5f3cd76f47b23db66f5d28616b064ba3",
-   :public "021335916bd127c4b60dcb28aa1357c2d57f265cdc2e3c5b68f33a5ee428cce056"})
+  {:id    "did:key:z6MkjMMe1dHZ5Q8DxoFQpXCjhZvqswMva3WvLGUKAAabsBxr"
+   :private "4048a60cbc9eb74814808f2b67897eea4b1f01d46c166b7c4d2be7902602a66a",
+   :public "48c74639952b16d838cd2853f92c18e6c4bc9c34279599c40b2162798887dc5f"})
 (def arnold
-  {:id "did:fluree:TfGz2CczSKvzCmKTTpTtwhrPzsymLTAnorq"
-   :private "18521804b92a769e05285485ad9c5552dd699ad8b653dbb735f78b6c3e70234c",
-   :public "02ce3b41f98c4d8ff9d1466d39b4eeaf8d325cc1c0a45185647cf8a9b545d4559e"})
+  {:id "did:key:z6MkotdZEDchBwi6wVUmeDSQ97wBXnxabmorRrXPKpJFtwvc"
+   :private "a1093d046aa4982aae8668bcc276d0d14f7c7c80787e24046db774f3cc686dfb",
+   :public "8c39066e2a21d17752380c7e5a70d0670b193dc4118e5fc976c45363f2d5c6f5"})
 (def charles
-  {:id    "did:fluree:Tf5g1aNMuamUWW8hMSks9YsYTNSmGQBYCK1"
-   :private "7804d4c1ef6f22087bd81d030c6377f6065a831627351fd9e99d845fdfd5bcd2",
-   :public "02e1495d9a165732684fd17c074e99a7e236e8db90252380ec3160ecdd1a38a5ed"})
+  {:id    "did:key:z6MkqKMP8Hf71HrEgNsZp7EaPyxZZQRrgGaDxWA3bCLyzTfP"
+   :private "6f097986028c319cc3a8386aa90b620f97f0e774d03e8bec2ab23a969c2e010f",
+   :public "a169f1aeb13649e317b714078b7a429bbe5059ea43a7a781c159dcb375b78962"})
 
 (def wishlist-create {"@context"     {"a" "http://a.co/"
                                       "f" "https://ns.flur.ee/ledger#"}

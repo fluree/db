@@ -13,9 +13,9 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (def jws-header
-  "The JWS header for a secp256k1 signing key."
-  ;; https://github.com/decentralized-identity/EcdsaSecp256k1RecoverySignature2020
-  {"alg"  "ES256K-R"
+  "The JWS header for an Ed25519 signing key."
+  ;; https://w3c-ccg.github.io/lds-ed25519-2018/
+  {"alg"  "EdDSA"
    "b64"  false
    "crit" ["b64"]})
 
@@ -47,7 +47,7 @@
 (defn create-proof
   "Given the sha256 hash of the canonicalized credential-subject, create a proof for it."
   [credential-subject-hash did-key signing-key]
-  {"type"               "EcdsaSecp256k1RecoverySignature2020"
+  {"type"               "Ed25519Signature2018"
    "created"            (util/current-time-iso)
    "verificationMethod" did-key
    "proofPurpose"       "assertionMethod"
@@ -94,8 +94,7 @@
 
             proof-did     (get-in credential ["proof" "verificationMethod"])
             pubkey        (did/decode-did-key proof-did)
-            id            (crypto/account-id-from-public pubkey)
-            auth-did      (did/auth-id->did id)]
+            auth-did      proof-did]
         (when (not= jws-header-json header)
           (throw (ex-info "Unsupported jws header in credential."
                           {:status 400
@@ -118,8 +117,7 @@
                                      (throw (ex-info (str "Invalid JWS: " jws)
                                                      {:status 400
                                                       :error  :db/invalid-credential})))
-        id                       (crypto/account-id-from-public pubkey)
-        auth-did                 (did/auth-id->did id)]
+        auth-did                 (crypto/did-key-from-public pubkey)]
     {:subject payload :did auth-did}))
 
 (defn jws?

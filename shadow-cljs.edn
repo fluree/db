@@ -11,8 +11,7 @@
    :js-options      {:resolve {"fs"      false
                                "path"    false
                                "process" false
-                               "buffer"  false
-                               "crypto"  false}}
+                               "buffer"  false}}
    :modules         {:fluree-browser-sdk {:exports {default fluree.sdk.browser/fluree-browser-sdk}}}
    :build-hooks     [(shadow.cljs.build-report/hook)]
    :devtools        {:watch-dir "dev/browser"}}
@@ -21,7 +20,21 @@
   {:target           :node-library
    :output-to        "out/nodejs/fluree-node-sdk.js"
    :closure-defines  {fluree.db.platform/BROWSER false}
-   :compiler-options {:optimizations :simple}
+   :compiler-options {:optimizations :simple
+                      :infer-externs true
+                      :source-map false}
+   :js-options       {:js-provider :shadow
+                      :keep-native-requires true
+                      :keep-as-require #{"fs" "path" "crypto" "stream" "util" "http" "https" "url" 
+                                         "querystring" "zlib" "buffer" "events" "net" "tls" 
+                                         "dgram" "dns" "os" "child_process" "cluster" "readline"
+                                         "repl" "tty" "v8" "vm" "assert" "console" "constants"
+                                         "domain" "punycode" "string_decoder" "timers" "module"
+                                         "process" "worker_threads" "diagnostics_channel" "stream/web"
+                                         "perf_hooks" "inspector" "async_hooks" "fs/promises"
+                                         "util/types" "stream/promises" "crypto/promises" "path/posix" "path/win32"}
+                      :resolve {"rdf-canonize-native" false
+                                "undici" false}}
    :exports          {:commit            fluree.sdk.node/commit
                       :connect           fluree.sdk.node/connect
                       :connectMemory     fluree.sdk.node/connectMemory
@@ -43,8 +56,7 @@
    :js-options      {:resolve {"fs"      false
                                "path"    false
                                "process" false
-                               "buffer"  false
-                               "crypto"  false}}
+                               "buffer"  false}}
    :modules
    {:fluree-webworker {:entries [fluree.sdk.webworker]
                        :init-fn fluree.sdk.webworker/init}}
@@ -55,17 +67,24 @@
    :output-to        "out/nodejs-test/node-tests.js"
    :autorun          true
    :closure-defines  {fluree.db.platform/BROWSER false}
-   :compiler-options {:optimizations :simple}}
+   :compiler-options {:infer-externs true
+                      :optimizations :simple}}
 
   :browser-test ; runs the cljs tests in the browser via karma
   {:target           :karma
    :output-to        "out/browser-test/browser-tests.js"
    :closure-defines  {fluree.db.platform/BROWSER true
                       cljs.core/*global*         "window"}
-   :compiler-options {:pretty-print true
-                      :pseudo-names true}
-   :js-options       {:resolve {"fs"      false
+   :compiler-options {:optimizations :simple
+                      :pretty-print true
+                      :source-map true
+                      :output-feature-set :es-next}
+   :js-options       {:js-provider :shadow
+                      :resolve {"fs"      false
                                 "path"    false
                                 "process" false
                                 "buffer"  false
-                                "crypto"  false}}}}}
+                                "crypto"  false
+                                "@peculiar/webcrypto" false
+                                "axios"   false
+                                "ws"      false}}}}}

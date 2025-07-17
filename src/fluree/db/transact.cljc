@@ -123,7 +123,7 @@
                      (-> ledger :did :private))
         did*     (or (some-> private* did/private->did)
                      did
-                     (:did ledger))]
+                     (-> ledger :did :id))]
     (assoc opts :did did*, :private private*)))
 
 (defn parse-data-helpers
@@ -183,8 +183,13 @@
   [commit-storage alias {:keys [did private]} commit]
   (go-try
     (let [commit-jsonld (commit-data/->json-ld commit)
-          signed-commit (if did
-                          (<? (credential/generate commit-jsonld private (:id did)))
+          ;; For credential/generate, we need a DID map with public key
+          did-map (when (and did private)
+                    (if (map? did)
+                      did
+                      (did/private->did-map private)))
+          signed-commit (if did-map
+                          (<? (credential/generate commit-jsonld private did-map))
                           commit-jsonld)
           commit-res    (<? (commit-storage/write-jsonld commit-storage alias signed-commit))
 

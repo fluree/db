@@ -326,15 +326,16 @@
                                :address ""
                                :v commit-version
                                :data data-commit
-                               :time time))]
-    (cond-> commit
-      txn-id (assoc :txn txn-id)
-      author (assoc :author author)
-      issuer (assoc :issuer {:id issuer})
-      prev-commit (assoc :previous prev-commit)
-      message (assoc :message message)
-      annotation (assoc :annotation annotation)
-      tag (assoc :tag tag))))
+                               :time time))
+        result (cond-> commit
+                 txn-id (assoc :txn txn-id)
+                 author (assoc :author author)
+                 issuer (assoc :issuer {:id issuer})
+                 prev-commit (assoc :previous prev-commit)
+                 message (assoc :message message)
+                 annotation (assoc :annotation annotation)
+                 tag (assoc :tag tag))]
+    result))
 
 (defn ref?
   [f]
@@ -447,8 +448,12 @@
       (:id previous)
       (conj (flake/create commit-sid const/$_previous (iri/encode-iri db (:id previous)) const/$id t true nil))
 
-      (:id issuer)
-      (conj (flake/create commit-sid const/$_commit:signer (iri/encode-iri db (:id issuer)) const/$id t true nil))
+      issuer
+      (conj (flake/create commit-sid const/$_commit:signer
+                          (iri/encode-iri db (if (string? issuer)
+                                               issuer
+                                               (:id issuer)))
+                          const/$id t true nil))
 
       message
       (conj (flake/create commit-sid const/$_commit:message message const/$xsd:string t true nil))

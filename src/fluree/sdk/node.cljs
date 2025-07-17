@@ -1,13 +1,7 @@
 (ns fluree.sdk.node
-  (:require ["@peculiar/webcrypto" :refer [Crypto]]
-            [cljs.nodejs :as node-js]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [fluree.db.api :as fluree]
             [fluree.db.util.log :as log]))
-
-(set! js/crypto (Crypto.))
-
-(node-js/enable-util-print!)
 
 (defn ^:export connect
   [opts]
