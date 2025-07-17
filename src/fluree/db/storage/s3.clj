@@ -14,6 +14,12 @@
 
 (def method-name "s3")
 
+(defn create-aws-client
+  "Creates an AWS S3 client with the given options. 
+   This function exists to facilitate testing with with-redefs."
+  [aws-opts]
+  (aws/client aws-opts))
+
 (defn handle-s3-response
   [resp]
   (if (:cognitect.anomalies/category resp)
@@ -166,5 +172,5 @@
                                           p))})
                              ;; Already a map
                              endpoint-override)))
-         client   (aws/client aws-opts)]
+         client   (create-aws-client aws-opts)]
      (->S3Store identifier client bucket prefix))))

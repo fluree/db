@@ -5,7 +5,6 @@
         org.clojars.mmb90/cljs-cache     {:mvn/version "0.1.4"}
         org.clojure/data.avl             {:mvn/version "0.2.0"}
         environ/environ                  {:mvn/version "1.2.0"}
-        byte-streams/byte-streams        {:mvn/version "0.2.4"}
         metosin/malli                    {:mvn/version "0.17.0"}
         nano-id/nano-id                  {:mvn/version "1.1.0"}
         integrant/integrant              {:mvn/version "0.10.0"}
@@ -22,7 +21,6 @@
 
         ;; http
         http-kit/http-kit {:mvn/version "2.8.0"}
-        hato/hato         {:mvn/version "1.0.0"}
 
         ;; parsing / serialization
         com.fluree/json-ld                  {:mvn/version "1.0.1"}
@@ -63,17 +61,35 @@
    :extra-deps  {lambdaisland/kaocha                   {:mvn/version "1.91.1392"}
                  org.clojure/test.check                {:mvn/version "1.1.1"}
                  com.gfredericks/test.chuck            {:mvn/version "0.2.13"}
-                 babashka/fs                           {:mvn/version "0.5.20"}}
+                 babashka/fs                           {:mvn/version "0.5.20"}
+                 clj-test-containers/clj-test-containers {:mvn/version "0.7.4"}
+                 org.testcontainers/testcontainers     {:mvn/version "1.19.3"}
+                 org.testcontainers/localstack         {:mvn/version "1.19.3"}}
    :exec-fn     kaocha.runner/exec-fn
-   :exec-args   {:kaocha.filter/skip-meta [:pending]}}
+   :exec-args   {:kaocha.filter/skip-meta [:pending :docker]}}
 
   :pending-tests
   {:extra-paths ["test" "dev-resources" "test-resources"]
    :extra-deps  {lambdaisland/kaocha                   {:mvn/version "1.91.1392"}
                  org.clojure/test.check                {:mvn/version "1.1.1"}
-                 babashka/fs                           {:mvn/version "0.5.20"}}
+                 babashka/fs                           {:mvn/version "0.5.20"}
+                 clj-test-containers/clj-test-containers {:mvn/version "0.7.4"}
+                 org.testcontainers/testcontainers     {:mvn/version "1.19.3"}
+                 org.testcontainers/localstack         {:mvn/version "1.19.3"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/focus-meta [:pending]}}
+
+  :docker-tests
+  {:extra-paths ["test" "dev-resources" "test-resources"]
+   :extra-deps  {lambdaisland/kaocha                   {:mvn/version "1.91.1392"}
+                 org.clojure/test.check                {:mvn/version "1.1.1"}
+                 com.gfredericks/test.chuck            {:mvn/version "0.2.13"}
+                 babashka/fs                           {:mvn/version "0.5.20"}
+                 clj-test-containers/clj-test-containers {:mvn/version "0.7.4"}
+                 org.testcontainers/testcontainers     {:mvn/version "1.19.3"}
+                 org.testcontainers/localstack         {:mvn/version "1.19.3"}}
+   :exec-fn     kaocha.runner/exec-fn
+   :exec-args   {:kaocha.filter/focus-meta [:docker]}}
 
   :cljstest
   {:extra-paths ["test" "dev-resources"]}

@@ -7,7 +7,7 @@
             [clojure.core.async :as async]
             [fluree.db.did :as did]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util :as util]))
 
 (def kp
   {:public  "03b160698617e3b4cd621afd96c0591e33824cb9753ab2f1dace567884b4e242b0"
@@ -49,7 +49,7 @@
 
 #?(:clj
    (deftest credential-test
-     (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
+     (with-redefs [fluree.db.util/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
        (testing "generate"
          (let [cred (async/<!! (cred/generate example-cred-subject (:private auth)))]
            (is (= example-credential
@@ -76,7 +76,7 @@
    (deftest generate
      (t/async done
               (async/go
-                (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
+                (with-redefs [fluree.db.util/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
                   (let [cred (async/<! (cred/generate example-cred-subject (:private auth)))]
                     (is (= example-credential
                            cred))
@@ -86,7 +86,7 @@
    (deftest verify-correct-signature
      (t/async done
               (async/go
-                (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
+                (with-redefs [fluree.db.util/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
                   (let [cljs-result (async/<! (cred/verify example-credential))
                         clj-result  (async/<! (cred/verify (assoc-in example-credential ["proof" "jws"] clj-generated-jws)))]
                     (is (= {:subject example-cred-subject :did example-issuer} cljs-result))
@@ -97,7 +97,7 @@
    (deftest verify-incorrect-signature
      (t/async done
               (async/go
-                (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
+                (with-redefs [fluree.db.util/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
                   (let [wrong-cred (assoc example-credential "credentialSubject" {"@context" {"a" "http://a.com/"} "a:foo" "DIFFERENT!"})]
                     (is (= "Verification failed, invalid credential."
                            (.-message (async/<! (cred/verify wrong-cred)))))
@@ -106,7 +106,7 @@
    (deftest verify-non-credential
      (t/async done
               (async/go
-                (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
+                (with-redefs [fluree.db.util/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
                   (let [non-cred example-cred-subject]
                     (is (util/exception? (async/<! (cred/verify non-cred))))
                     (done)))))))

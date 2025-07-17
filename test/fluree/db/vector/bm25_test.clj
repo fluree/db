@@ -4,7 +4,7 @@
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util :as util]))
 
 (defn full-text-search
   "Performs a full text search and returns a couple attributes joined from the db

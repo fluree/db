@@ -3,7 +3,7 @@
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util :as util]))
 
 (deftest query-with-numeric-t-value-test
   (testing "only gets results from that t"

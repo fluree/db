@@ -7,7 +7,7 @@
             [fluree.db.query.exec.where :as exec-where]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.parse :as parse]
-            [fluree.db.util.core :as util]
+            [fluree.db.util :as util]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))

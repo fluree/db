@@ -1,7 +1,7 @@
 (ns fluree.db.query.fql.syntax
   (:require [camel-snake-kebab.core :as csk]
             [clojure.edn :as edn]
-            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util :refer [try* catch*]]
             [fluree.db.util.docs :as docs]
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]

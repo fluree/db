@@ -5,7 +5,7 @@
             [fluree.db.api :as fluree]
             [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
-            [fluree.db.util.core :as util]
+            [fluree.db.util :as util]
             [fluree.db.util.json :as json]))
 
 (deftest ^:integration history-query-test
@@ -267,7 +267,7 @@
                                           :t       {:from 2}}))))))))
 
 (deftest ^:integration ^:kaocha/pending commit-details-test
-  (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
+  (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn      (test-utils/create-conn)
           ledger-id "committest"
           context   [test-utils/default-context {:ex "http://example.org/ns/"}]
@@ -595,7 +595,7 @@
                         history-with-commits)))))))))
 
 (deftest ^:kaocha/pending loaded-mem-ledger-history-test
-  (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
+  (with-redefs [fluree.db.util/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
     (testing "history commit details on a loaded memory ledger"
       (let [ledger-name   "loaded-history-mem"
             conn          @(fluree/connect-memory)
@@ -792,7 +792,7 @@
                                              :t              {:from 3}})))))))
 
 (deftest loaded-file-ledger-history-test
-  (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
+  (with-redefs [fluree.db.util/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
     (testing "history commit details on a loaded file ledger"
       (with-temp-dir [storage-path {}]
         (let [ledger-name "loaded-history-file"
@@ -898,7 +898,7 @@
                                                :t              {:from 3}}))))))))
 
 (deftest ^:integration author-and-txn-id
-  (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
+  (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn         @(fluree/connect-memory)
           ledger-name  "authortest"
           ledger       @(fluree/create conn ledger-name)
@@ -959,7 +959,7 @@
                               (select-keys ["f:author" "f:txn" "f:data"]))))))))))
 
 (deftest ^:integration ^:kaocha/pending include-api
-  (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
+  (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn         @(fluree/connect-memory)
           ledger-name  "authortest"
           ledger       @(fluree/create conn ledger-name)
@@ -1299,9 +1299,26 @@
 
         db0 (fluree/db ledger)]
     (testing "valid annotations"
-      (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
-        (let [db1 (->> @(fluree/update db0 {"@context" context
-                                            "insert"   [{"@id"         "ex:betty"
+      (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
+        (let [db1 (->> @(fluree/stage db0 {"@context" context
+                                           "insert"   [{"@id"         "ex:betty"
+                                                        "@type"       "ex:Yeti"
+                                                        "schema:name" "Betty"
+                                                        "schema:age"  55}]})
+                       (fluree/commit! ledger)
+                       (deref))
+
+              db2 (->> @(fluree/stage db1 {"@context" context
+                                           "insert"   [{"@id"         "ex:freddy"
+                                                        "@type"       "ex:Yeti"
+                                                        "schema:name" "Freddy"
+                                                        "schema:age"  1002}]}
+                                      {:annotation {"ex:originator" "opts" "ex:data" "ok"}})
+                       (fluree/commit! ledger)
+                       (deref))
+
+              _db3 (->> @(fluree/stage db2 {"@context" context
+                                            "insert"   [{"@id"         "ex:letty"
                                                          "@type"       "ex:Yeti"
                                                          "schema:name" "Betty"
                                                          "schema:age"  55}]})

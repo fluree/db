@@ -2,7 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :refer [exception?]]))
+            [fluree.db.util :refer [exception?]]))
 
 (def context-edn
   {:id     "@id"

@@ -14,7 +14,7 @@
             [fluree.db.storage.file :as file-storage]
             [fluree.db.storage.ipfs :as ipfs-storage]
             [fluree.db.storage.memory :as memory-storage]
-            [fluree.db.util.core :as util :refer [get-id get-first get-first-value]]
+            [fluree.db.util :as util :refer [get-id get-first get-first-value]]
             [integrant.core :as ig]))
 
 (derive :fluree.db.storage/file :fluree.db/content-storage)
@@ -157,9 +157,10 @@
 
 (defmethod ig/init-key :fluree.db.storage/file
   [_ config]
-  (let [identifier (config/get-first-string config conn-vocab/address-identifier)
-        root-path  (config/get-first-string config conn-vocab/file-path)]
-    (file-storage/open identifier root-path)))
+  (let [identifier     (config/get-first-string config conn-vocab/address-identifier)
+        root-path      (config/get-first-string config conn-vocab/file-path)
+        aes256-key     (config/get-first-string config conn-vocab/aes256-key)]
+    (file-storage/open identifier root-path aes256-key)))
 
 (defmethod ig/init-key :fluree.db.storage/memory
   [_ config]

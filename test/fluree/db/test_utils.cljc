@@ -5,7 +5,7 @@
             [clojure.string :as str]
             [fluree.db.api :as fluree]
             [fluree.db.did :as did]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
 (def default-context

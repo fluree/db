@@ -6,13 +6,12 @@
                  [fluree.db.util.log :as log]
                  [fluree.db.flake :as flake]]
                 :cljs
-                [[fluree.db.util.core :as util]
+                [[fluree.db.util :as util]
                  [goog.object :as gobject]])
             [fluree.db.util.bytes :as butil])
   #?(:clj
      (:import (fluree.db.flake Flake)
-              (java.io ByteArrayInputStream)
-              (byte_streams InputStream)
+              (java.io ByteArrayInputStream InputStream)
               (com.fasterxml.jackson.core JsonGenerator))))
 
 #?(:clj (set! *warn-on-reflection* true))

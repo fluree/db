@@ -2,7 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util :as util]))
 
 (deftest stable-hashes-test
   (with-redefs [util/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
