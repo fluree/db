@@ -10,6 +10,16 @@
   ([cmp x y & more]
    (reduce (partial max-by cmp) (conj more x y))))
 
+(defn max-reducing-fn
+  [cmp]
+  (fn
+    ([] nil)
+    ([current-max] current-max)
+    ([current-max x]
+     (if current-max
+       (max-by cmp current-max x)
+       x))))
+
 (defn max-key-by
   [cmp key-fn & xs]
-  (transduce (map key-fn) (partial max-by cmp) xs))
+  (transduce (map key-fn) (max-reducing-fn cmp) xs))
