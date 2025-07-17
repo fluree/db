@@ -10,15 +10,16 @@
             [fluree.db.util.log :as log :include-macros true]))
 
 (def comparators
-  "Map of default index comparators for the four index types"
+  "Map of default index comparators for the five index types"
   (array-map ;; when using futures, can base other calcs on :spot (e.g. size), so ensure comes first
    :spot flake/cmp-flakes-spot
+   :psot flake/cmp-flakes-psot
    :post flake/cmp-flakes-post
    :opst flake/cmp-flakes-opst
    :tspo flake/cmp-flakes-block))
 
 (def types
-  "The four possible index orderings based on the subject, predicate, object,
+  "The five possible index orderings based on the subject, predicate, object,
   and transaction flake attributes"
   (-> comparators keys vec))
 

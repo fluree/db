@@ -410,15 +410,17 @@
                                 (util/get-first-value const/iri-address))]
       (when index-address
         (log/debug "Dropping index" index-address)
-        (let [{:keys [spot opst post tspo]} (<? (storage/read-json storage index-address true))
+        (let [{:keys [spot psot opst post tspo]} (<? (storage/read-json storage index-address true))
 
               garbage-ch (garbage/clean-garbage* index-catalog index-address 0)
               spot-ch    (drop-index-nodes storage (:id spot))
+              psot-ch    (drop-index-nodes storage (:id psot))
               post-ch    (drop-index-nodes storage (:id post))
               tspo-ch    (drop-index-nodes storage (:id tspo))
               opst-ch    (drop-index-nodes storage (:id opst))]
           (<? garbage-ch)
           (<? spot-ch)
+          (<? psot-ch)
           (<? post-ch)
           (<? tspo-ch)
           (<? opst-ch)
