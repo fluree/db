@@ -51,7 +51,7 @@ and serialization.
                          ex:CompanyA a schema:Organization ;
                                      schema:name \"Company A\" ;
                                      schema:employee ex:alice, ex:bob ."
-                        {"format" "turtle"}))
+                        {:format :turtle}))
 
 ;; Commit the changes
 @(fluree/commit! ledger db)
@@ -73,7 +73,7 @@ and serialization.
                            geo:lat 39.781 ;
                            geo:long -89.650
                          ] ."
-                        {"format" "turtle"}))
+                        {:format :turtle}))
 ```
 
 ## SPARQL Queries
@@ -94,7 +94,7 @@ Fluree supports SPARQL 1.1 Query Language for complex graph pattern matching.
                                       schema:email ?email .
                             }
                             ORDER BY ?name"
-                           {"format" :sparql}))
+                           {:format :sparql}))
 ```
 
 ### SPARQL with OPTIONAL and FILTER
@@ -112,7 +112,7 @@ Fluree supports SPARQL 1.1 Query Language for complex graph pattern matching.
                               OPTIONAL { ?person schema:email ?email }
                               FILTER (!BOUND(?age) || ?age >= 18)
                             }"
-                           {"format" :sparql}))
+                           {:format :sparql}))
 ```
 
 ### SPARQL Aggregation
@@ -131,7 +131,7 @@ Fluree supports SPARQL 1.1 Query Language for complex graph pattern matching.
                             }
                             GROUP BY ?company
                             HAVING (COUNT(?employee) > 1)"
-                           {"format" :sparql}))
+                           {:format :sparql}))
 ```
 
 ### SPARQL CONSTRUCT
@@ -148,7 +148,7 @@ Fluree supports SPARQL 1.1 Query Language for complex graph pattern matching.
                                 WHERE {
                                   ?person foaf:knows ?friend .
                                 }"
-                               {"format" :sparql}))
+                               {:format :sparql}))
 ```
 
 ## SPARQL UPDATE
@@ -170,7 +170,7 @@ Fluree supports SPARQL 1.1 Update operations for data modification.
                                      foaf:age 28 ;
                                      schema:email \"charlie@example.org\" .
                          }"
-                        {"format" :sparql}))
+                        {:format :sparql}))
 
 ;; Or insert and commit atomically
 @(fluree/update! ledger
@@ -182,7 +182,7 @@ Fluree supports SPARQL 1.1 Update operations for data modification.
                              ex:david a foaf:Person ;
                                      foaf:name \"David\" .
                            }"}
-                 {"format" :sparql})
+                 {:format :sparql})
 ```
 
 ### DELETE DATA
@@ -196,7 +196,7 @@ Fluree supports SPARQL 1.1 Update operations for data modification.
                          DELETE DATA {
                            ex:alice foaf:age 30 .
                          }"
-                        {"format" :sparql}))
+                        {:format :sparql}))
 ```
 
 ### DELETE WHERE
@@ -210,7 +210,7 @@ Fluree supports SPARQL 1.1 Update operations for data modification.
                            ?person foaf:age ?age .
                            FILTER (?age < 18)
                          }"
-                        {"format" :sparql}))
+                        {:format :sparql}))
 ```
 
 ### DELETE/INSERT WHERE
@@ -227,7 +227,7 @@ Fluree supports SPARQL 1.1 Update operations for data modification.
                          WHERE {
                            ?person foaf:givenName \"Bill\" .
                          }"
-                        {"format" :sparql}))
+                        {:format :sparql}))
 ```
 
 ### SPARQL UPDATE with USING
@@ -244,7 +244,7 @@ Fluree supports SPARQL 1.1 Update operations for data modification.
                            ?person foaf:age ?age .
                            FILTER (?age >= 65)
                          }"
-                        {"format" :sparql}))
+                        {:format :sparql}))
 ```
 
 ### Notes on SPARQL UPDATE Support
@@ -253,10 +253,11 @@ Fluree supports SPARQL 1.1 Update operations for data modification.
     DELETE WHERE, DELETE/INSERT WHERE
 - The WITH clause is supported for specifying the target graph
 - The USING clause is supported (limited to one USING clause per update)
+- An UPDATE operation can only create triples for a single graph, using WITH or a single USING clause
 - USING NAMED is not supported
 - Updates can be staged with `fluree/update` or committed atomically with
     `fluree/update!`
-- Use the `{"format" :sparql}` option to indicate SPARQL UPDATE syntax
+- Use the `{:format :sparql}` option to indicate SPARQL UPDATE syntax
 
 ## SHACL Validation
 
@@ -298,7 +299,7 @@ Fluree supports W3C SHACL (Shapes Constraint Language) for data validation.
      ] .")
 
 ;; Insert the SHACL shape
-(def db-with-shapes @(fluree/insert db person-shape {"format" "turtle"}))
+(def db-with-shapes @(fluree/insert db person-shape {:format :turtle}))
 ```
 
 ### Advanced SHACL Constraints
@@ -381,7 +382,7 @@ Fluree includes an OWL2-RL reasoner for inferring new facts from ontologies.
                  rdfs:range xsd:string .")
 
 ;; Insert the ontology
-(def db-with-ontology @(fluree/insert db ontology {"format" "turtle"}))
+(def db-with-ontology @(fluree/insert db ontology {:format :turtle}))
 
 ;; Apply OWL reasoning
 (def reasoned-db @(fluree/reason db-with-ontology :owl2rl))
@@ -412,7 +413,7 @@ Fluree includes an OWL2-RL reasoner for inferring new facts from ontologies.
                                              foaf:name \"Charlie\" ;
                                              ex:reportsTo ex:bob ;
                                              ex:employeeId \"EMP002\" ."
-                                  {"format" "turtle"}))
+                                  {:format :turtle}))
 
 ;; Apply reasoning
 (def reasoned @(fluree/reason db-with-data :owl2rl))
@@ -428,7 +429,7 @@ Fluree includes an OWL2-RL reasoner for inferring new facts from ontologies.
                               ?manager foaf:name ?managerName .
                             }
                             ORDER BY ?employee"
-                           {"format" :sparql}))
+                           {:format :sparql}))
 ;; This will show that Charlie reports to both Bob (direct) and Alice (inferred)
 ```
 
@@ -470,7 +471,7 @@ FROM NAMED clauses.
                                  ex:bob a foaf:Person ;
                                        foaf:name \"Bob\" ;
                                        ex:expertise \"Database Systems\" ."
-                                {"format" "turtle"}))
+                                {:format :turtle}))
 
 ;; Insert data into projects ledger
 (def projects-db @(fluree/insert! projects-ledger (fluree/db projects-ledger)
@@ -481,7 +482,7 @@ FROM NAMED clauses.
                                               schema:name \"AI Research\" ;
                                               ex:lead ex:alice ;
                                               ex:member ex:bob ."
-                                  {"format" "turtle"}))
+                                  {:format :turtle}))
 
 ;; Query across both ledgers using FROM
 (def cross-ledger-results
@@ -499,7 +500,7 @@ FROM NAMED clauses.
                     ?project ex:member ?person ;
                             schema:name ?projectName .
                   }"
-                 {"format" :sparql}))
+                 {:format :sparql}))
 ```
 
 ### Using FROM NAMED for Graph-Specific Queries
@@ -519,7 +520,7 @@ FROM NAMED clauses.
                       ?person foaf:name ?name .
                     }
                   }"
-                 {"format" :sparql}))
+                 {:format :sparql}))
 ```
 
 ## Access Control with Fluree Policies
@@ -606,9 +607,9 @@ through its native policy system using JSON-LD queries.
          schema:affiliation \"MIT\" .")
     
     ;; Insert all data
-    (let [db1 @(fluree/insert (fluree/db ledger) shapes {"format" "turtle"})
-          db2 @(fluree/insert db1 ontology {"format" "turtle"})
-          db3 @(fluree/insert db2 data {"format" "turtle"})]
+    (let [db1 @(fluree/insert (fluree/db ledger) shapes {:format :turtle})
+          db2 @(fluree/insert db1 ontology {:format :turtle})
+          db3 @(fluree/insert db2 data {:format :turtle})]
       @(fluree/commit! ledger db3))
     
     ;; Apply reasoning
@@ -626,7 +627,7 @@ through its native policy system using JSON-LD queries.
                                schema:author ?author .
                       ?type rdfs:subClassOf* ex:Article .
                     }"
-                   {"format" :sparql})))
+                   {:format :sparql})))
 ```
 
 ### Example 2: Temporal Semantic Web Data
@@ -645,7 +646,7 @@ through its native policy system using JSON-LD queries.
                                  ex:project1 a ex:Project ;
                                             ex:status \"active\" ;
                                             ex:lead ex:alice ."
-                                {"format" "turtle"}))
+                                {:format :turtle}))
     
     ;; Update status
     (Thread/sleep 1000)
@@ -653,7 +654,7 @@ through its native policy system using JSON-LD queries.
                                 "@prefix ex: <http://example.org/> .
                                  
                                  ex:project1 ex:status \"completed\" ."
-                                {"format" "turtle"}))
+                                {:format :turtle}))
     
     ;; Query history with SPARQL
     @(fluree/query (fluree/db ledger)
@@ -668,7 +669,7 @@ through its native policy system using JSON-LD queries.
                       ?commit f:time ?time .
                     }
                     ORDER BY ?time"
-                   {"format" :sparql})))
+                   {:format :sparql})))
 ```
 
 ## Best Practices
