@@ -103,6 +103,9 @@ cljs-node-test: node_modules package-lock.json
 	npx shadow-cljs release node-test
 
 nodejs-test: out/fluree-node-sdk.js
+	@echo "Checking if SDK files exist..."
+	@ls -la out/nodejs/fluree-node-sdk.js || echo "WARNING: out/nodejs/fluree-node-sdk.js not found"
+	@ls -la out/fluree-node-sdk.js || echo "WARNING: out/fluree-node-sdk.js not found"
 	cd test/nodejs && npm install && npm test
 
 browser-test: out/fluree-browser-sdk.js
