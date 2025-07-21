@@ -326,16 +326,15 @@
                                :address ""
                                :v commit-version
                                :data data-commit
-                               :time time))
-        result (cond-> commit
-                 txn-id (assoc :txn txn-id)
-                 author (assoc :author author)
-                 issuer (assoc :issuer {:id issuer})
-                 prev-commit (assoc :previous prev-commit)
-                 message (assoc :message message)
-                 annotation (assoc :annotation annotation)
-                 tag (assoc :tag tag))]
-    result))
+                               :time time))]
+    (cond-> commit
+      txn-id (assoc :txn txn-id)
+      author (assoc :author author)
+      issuer (assoc :issuer {:id issuer})
+      prev-commit (assoc :previous prev-commit)
+      message (assoc :message message)
+      annotation (assoc :annotation annotation)
+      tag (assoc :tag tag))))
 
 (defn ref?
   [f]
