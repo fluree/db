@@ -102,7 +102,8 @@
                               url
                               (or error (ex-info "error response"
                                                  response)))))
-                          (let [data (try (cond-> (slurp body)
+                          (let [data (try (cond-> body
+                                            (bytes? body) slurp
                                             json? (json/parse keywordize-keys))
                                           (catch Exception e
                                             ;; don't throw, as `data` will get exception and put on response-chan
