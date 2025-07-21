@@ -27,27 +27,25 @@
 
 (defn private->did
   [private-key]
-  (let [acct-id (crypto/account-id-from-private private-key)]
-    (str "did:fluree:" acct-id)))
+  (let [acct-id (crypto/account-id-from-private private-key {:output-format :multibase})]
+    (str "did:key:" acct-id)))
 
 (defn private->did-map
   "Returns a complete did map from a private key."
   [private-key]
-  (let [public  (crypto/pub-key-from-private private-key)
-        auth-id (crypto/account-id-from-public public)
-        did-id  (auth-id->did auth-id)]
+  (let [public (crypto/public-key-from-private private-key)
+        did-id (crypto/did-key-from-public public)]
     (did-map did-id public private-key)))
 
 ;; https://github.com/multiformats/multicodec/blob/master/table.csv
-(def secp256k1-pub
-  "The multicodec prefix for a secp256k1 public key."
-  "e7")
+(def ed25519-pub
+  "The multicodec prefix for an Ed25519 public key."
+  "ed01")
 
 (defn encode-did-key
-  "Encodes a secp256k1 public key as a base58 multibase did:key."
+  "Encodes an Ed25519 public key as a base58 multibase did:key."
   [pubkey]
-  (let [pubkey-header secp256k1-pub]
-    (str "did:key:z" (base58/encode (alphabase/hex->bytes (str pubkey-header pubkey))))))
+  (crypto/did-key-from-public pubkey))
 
 ;; https://github.com/multiformats/multibase/blob/master/multibase.csv
 (def base58btc
@@ -56,7 +54,7 @@
 
 (defn decode-did-key
   "Return the hex encoded public key from a did:key, or nil if it is not a properly
-  encoded secp256k1 public key."
+  encoded Ed25519 public key."
   [did]
   (let [[_ _ multibase-value] (str/split did #":")
         prefix                (str (first multibase-value))
@@ -66,9 +64,9 @@
                                                 {:value multibase-value
                                                  :prefix prefix})))
         multicodec            (alphabase/bytes->hex (base58/decode base-key))
-        pubkey-header         (subs multicodec 0 2)
-        pubkey                (subs multicodec 2)]
-    (when (not= pubkey-header secp256k1-pub)
+        pubkey-header         (subs multicodec 0 4)
+        pubkey                (subs multicodec 4)]
+    (when (not= pubkey-header ed25519-pub)
       (throw (ex-info (str "The multicodec header " (pr-str pubkey-header) " does not map to a supported multicodec encoding.")
                       {:value multicodec
                        :header pubkey-header})))
