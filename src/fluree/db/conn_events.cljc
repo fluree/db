@@ -1,6 +1,6 @@
 (ns fluree.db.conn-events
   (:require [clojure.core.async :as async]
-            [fluree.db.util :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))

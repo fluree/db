@@ -1,18 +1,16 @@
 (ns fluree.db.util.xhttp
   (:refer-clojure :exclude [get])
   (:require #?@(:clj [[org.httpkit.client :as http]
-                      [byte-streams :as bs]
-                      [hato.websocket :as ws]])
+                      [fluree.db.util.websocket :as jws]])
             #?@(:cljs [["axios" :as axios]
                        ["ws" :as NodeWebSocket]
                        [fluree.db.platform :as platform]
                        [clojure.string :as str]])
             [clojure.core.async :as async]
-            [fluree.db.util :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true])
-  (:import #?@(:clj  ((org.httpkit.client TimeoutException)
-                      (java.nio HeapCharBuffer)))))
+  (:import #?@(:clj  ((org.httpkit.client TimeoutException)))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -104,7 +102,8 @@
                               url
                               (or error (ex-info "error response"
                                                  response)))))
-                          (let [data (try (cond-> (bs/to-string body)
+                          (let [data (try (cond-> body
+                                            (bytes? body) slurp
                                             json? (json/parse keywordize-keys))
                                           (catch Exception e
                                             ;; don't throw, as `data` will get exception and put on response-chan
@@ -192,9 +191,9 @@
                        (throw-if-timeout response)
                        (async/put! response-chan
                                    (case output-format
-                                     (:text :json)    (bs/to-string body)
-                                     (:edn :wikidata) (-> body bs/to-string json/parse)
-                                     (bs/to-byte-array body)))))))
+                                     (:text :json)    (slurp body)
+                                     (:edn :wikidata) (-> body slurp json/parse)
+                                     body))))))
        :cljs (-> axios
                  (.request (clj->js {:url     url
                                      :method  "get"
@@ -247,13 +246,13 @@
   Status code info:
   https://www.rfc-editor.org/rfc/rfc6455.html#section-7.1.5"
   ([ws]
-   #?(:clj  (ws/close! ws)
+   #?(:clj  (jws/close! ws)
       :cljs (.close ws)))
   ([ws reason-kw]
-   (let [code   (get-in ws-close-status-codes [reason-kw :code] 1000)
-         reason (get-in ws-close-status-codes [reason-kw :reason] "Normal closure")]
-     #?(:clj  (ws/close! ws code reason)
-        :cljs (.close ws code reason)))))
+   #?(:clj  (jws/close! ws reason-kw)
+      :cljs (let [code   (get-in ws-close-status-codes [reason-kw :code] 1000)
+                  reason (get-in ws-close-status-codes [reason-kw :reason] "Normal closure")]
+              (.close ws code reason)))))
 
 (defn socket-publish-loop
   "Sends messages out as they appear on pub-chan.
@@ -275,14 +274,15 @@
                                 [(json/stringify {"action" "ping"}) nil]
                                 val)]
           (try*
-            #?(:clj  (ws/send! ws msg)
+            #?(:clj  @(jws/send-text! ws msg)
                :cljs (.send ws msg))
             (when resp-chan
               (async/put! resp-chan true)
               (async/close! resp-chan))
             (catch* e
               (log/error e "Error sending websocket message:" msg)
-              (async/put! resp-chan false)))
+              (when resp-chan
+                (async/put! resp-chan false))))
           (recur))))))
 
 (declare try-socket)
@@ -306,42 +306,11 @@
 (defn try-socket
   [url msg-in msg-out timeout close-fn]
   #?(:clj
-     (let [resp-chan (async/promise-chan)
-           ws-config {:connect-timeout timeout
-                      :on-close        (fn [_ status reason]
-                                         (log/debug "Websocket closed; status:" status
-                                                    "reason:" reason)
-                                         (if (abnormal-socket-close? status)
-                                           (do
-                                             (log/info "Abnormal websocket closure, attempting to re-establish connection.")
-                                             (retry-socket url msg-in msg-out timeout close-fn))
-                                           (close-fn)))
-                      :headers         nil
-                      :on-open         (fn [_]
-                                         (log/debug "Websocket opened"))
-                      :on-error        (fn [_ e]
-                                         (log/error e "Websocket error")
-                                         (close-fn)
-                                         (when-not (nil? e) (async/put! resp-chan e)))
-                      :on-message      (fn [_ msg last?]
-                                         (async/put! msg-in [:on-message (.toString ^HeapCharBuffer msg) last?]))
-                      :on-ping         (fn [ws msg]
-                                         (async/put! msg-in [:on-ping msg])
-                                         (ws/pong! ws msg))
-                      :on-pong         (fn [_ msg]
-                                         (async/put! msg-in [:on-pong msg]))}]
-
-       ;; launch websocket connection in background
-       (future
-         (let [ws (try @(ws/websocket url ws-config)
-                       (catch Exception e e))]
-           (when-not (util/exception? ws)
-             (socket-publish-loop ws msg-out))
-           (async/put! resp-chan ws)
-           (async/close! resp-chan)))
-
-       ;; response chan will have websocket or exception
-       resp-chan)
+     ;; Use Java 11 HttpClient WebSocket implementation
+     (jws/websocket url {:msg-in msg-in
+                         :msg-out msg-out
+                         :connect-timeout timeout
+                         :close-fn close-fn})
 
      :cljs
      (let [resp-chan    (async/promise-chan)

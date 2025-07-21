@@ -36,11 +36,11 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
   const conn = await flureenjs.connectMemory({
     defaults: {
       identity: {
-        id: "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
+        id: "did:key:z6Mkr7FKHaSJWkPhdQxAHW2CNs3JsdLUmdB7Dx29HDKi5KLp",
         public:
-          "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca",
+          "ad2bcd5da964c2515682636f497ff17d461e36d941319b3450743bd533590775",
         private:
-          "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c",
+          "87c2538c8bf728a07710bc217f5eb0a826d576aea212fb440f91c5d15e6dab3e",
       },
     },
   });

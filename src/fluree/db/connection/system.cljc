@@ -1,6 +1,8 @@
 (ns fluree.db.connection.system
   (:require #?(:clj  [fluree.db.storage.s3 :as s3-storage]
                :cljs [fluree.db.storage.localstorage :as localstorage-store])
+            #?(:clj [fluree.db.storage.file :as file-storage])
+            [fluree.crypto :as crypto]
             [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]
             [fluree.db.connection.config :as config]
@@ -11,15 +13,14 @@
             [fluree.db.remote-system :as remote-system]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
-            [fluree.db.storage.file :as file-storage]
             [fluree.db.storage.ipfs :as ipfs-storage]
             [fluree.db.storage.memory :as memory-storage]
             [fluree.db.util :as util :refer [get-id get-first get-first-value]]
             [integrant.core :as ig]))
 
-(derive :fluree.db.storage/file :fluree.db/content-storage)
-(derive :fluree.db.storage/file :fluree.db/byte-storage)
-(derive :fluree.db.storage/file :fluree.db/json-archive)
+#?(:clj (derive :fluree.db.storage/file :fluree.db/content-storage))
+#?(:clj (derive :fluree.db.storage/file :fluree.db/byte-storage))
+#?(:clj (derive :fluree.db.storage/file :fluree.db/json-archive))
 
 (derive :fluree.db.storage/memory :fluree.db/content-storage)
 (derive :fluree.db.storage/memory :fluree.db/byte-storage)
@@ -155,11 +156,13 @@
   [_ max-mb]
   (-> max-mb cache/memory->cache-size cache/create-lru-cache atom))
 
-(defmethod ig/init-key :fluree.db.storage/file
-  [_ config]
-  (let [identifier (config/get-first-string config conn-vocab/address-identifier)
-        root-path  (config/get-first-string config conn-vocab/file-path)]
-    (file-storage/open identifier root-path)))
+#?(:clj
+   (defmethod ig/init-key :fluree.db.storage/file
+     [_ config]
+     (let [identifier     (config/get-first-string config conn-vocab/address-identifier)
+           root-path      (config/get-first-string config conn-vocab/file-path)
+           aes256-key     (config/get-first-string config conn-vocab/aes256-key)]
+       (file-storage/open identifier root-path aes256-key))))
 
 (defmethod ig/init-key :fluree.db.storage/memory
   [_ config]
@@ -219,9 +222,16 @@
 (defn parse-identity
   [defaults]
   (when-let [identity (get-first defaults conn-vocab/identity)]
-    {:id      (get-id identity)
-     :public  (config/get-first-string identity conn-vocab/public-key)
-     :private (config/get-first-string identity conn-vocab/private-key)}))
+    (let [public-key  (config/get-first-string identity conn-vocab/public-key)
+          private-key (config/get-first-string identity conn-vocab/private-key)
+          ;; Derive public key from private key if public key is missing
+          public-key* (if (and (nil? public-key) private-key)
+                        (crypto/public-key-from-private private-key)
+                        public-key)
+          result {:id      (get-id identity)
+                  :public  public-key*
+                  :private private-key}]
+      result)))
 
 (defn parse-index-options
   [defaults]
