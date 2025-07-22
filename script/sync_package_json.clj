@@ -1,19 +1,17 @@
 (ns sync-package-json
-  (:require [clojure.edn :as edn]
-            [cheshire.core :as json]))
+  (:require [jsonista.core :as j]))
 
 (defn js-deps
   []
-  (-> "package.json" slurp (json/parse-string true) :dependencies))
+  (-> "package.json" slurp (j/read-value (j/object-mapper {:decode-key-fn true})) :dependencies))
 
 (defn run
   [& args]
   (let [version (first args)
         target-package-json-file (second args)
-        target-package-json (-> target-package-json-file slurp (json/parse-string true))
+        target-package-json (-> target-package-json-file slurp (j/read-value (j/object-mapper {:decode-key-fn true})))
         write-package-json #(spit target-package-json-file %)
-        pretty-printer (json/create-pretty-printer
-                         json/default-pretty-print-options)
+        pretty-mapper (j/object-mapper {:pretty true})
         sync-js-deps? (and (> 2 (count args)) (= "--node" (nth args 2)))
         sync-js-deps #(if sync-js-deps?
                         (assoc % :dependencies (js-deps))
@@ -22,5 +20,5 @@
     (-> target-package-json
         (assoc :version version)
         sync-js-deps
-        (json/generate-string {:pretty pretty-printer})
+        (j/write-value-as-string pretty-mapper)
         write-package-json)))

@@ -23,7 +23,7 @@
         com.fluree/json-ld {:git/url "https://github.com/fluree/json-ld.git"
                             :git/sha "7dd4df7a49215b32e5141f7dbbcc365008295a9c"}
         com.fluree/alphabase                {:mvn/version "3.3.0"}
-        cheshire/cheshire                   {:mvn/version "5.13.0"}
+        metosin/jsonista                    {:mvn/version "0.3.13"}
         camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.3"}
         org.clojure/data.xml                {:mvn/version "0.2.0-alpha9"}
         instaparse/instaparse               {:mvn/version "1.5.0"}
