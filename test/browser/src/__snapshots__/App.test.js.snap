@@ -12,6 +12,12 @@ exports[`lists flureedb fns 1`] = `
       connect
     </li>
     <li>
+      connectLocalStorage
+    </li>
+    <li>
+      connectMemory
+    </li>
+    <li>
       create
     </li>
     <li>
