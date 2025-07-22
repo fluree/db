@@ -1,7 +1,8 @@
 (ns fluree.db.query.exec.eval
   (:refer-clojure :exclude [compile rand concat replace max min
                             #?(:clj ratio?) #?@(:cljs [uuid -count divide])])
-  (:require [clojure.math :as math]
+  (:require #?@(:clj [[sci.core :as sci]])
+            [clojure.math :as math]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :as walk :refer [postwalk]]
@@ -14,8 +15,7 @@
             [fluree.db.util :as util]
             [fluree.db.util.log :as log]
             [fluree.db.vector.scoring :as score]
-            [fluree.json-ld :as json-ld]
-            #?@(:clj [[sci.core :as sci]]))
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.time LocalDateTime OffsetDateTime LocalDate OffsetTime LocalTime
                               ZoneId ZoneOffset))))
 
