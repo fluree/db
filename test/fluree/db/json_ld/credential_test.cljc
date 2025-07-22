@@ -10,28 +10,28 @@
             [fluree.db.util :as util]))
 
 (def kp
-  {:public  "03b160698617e3b4cd621afd96c0591e33824cb9753ab2f1dace567884b4e242b0"
-   :private "509553eece84d5a410f1012e8e19e84e938f226aa3ad144e2d12f36df0f51c1e"})
+  {:public  "a9fd267bed77dc320e54c7006ef33f61e7cbf9e6b81625a4b6a88d6a4c6b08d2"
+   :private "27ee972212ecf6f1810b11ece94bb85487b4694580bcc189f731d54f0a242429"})
 (def auth (did/private->did-map (:private kp)))
 
 (def pleb-kp
-  {:private "f6b009cc18dee16675ecb03b2a4b725f52bd699df07980cfd483766c75253f4b",
-   :public  "02e84dd4d9c88e0a276be24596c5c8d741a890956bda35f9c977dba296b8c7148a"})
+  {:private "fb9fb212adbd3f803081a207e84998058a34add87deefe220c254d6cadb77322",
+   :public  "a2bc9a6e6db53d037a9ba18dfd4673be0bad2b044c5fef0e0bb6903276b3607a"})
 (def pleb-auth (did/private->did-map (:private pleb-kp)))
 
 (def other-kp
-  {:private "f6b009cc18dee16675ecb03b2a4b725f52bd699df07980cfd483766c75253f4b",
-   :public  "02e84dd4d9c88e0a276be24596c5c8d741a890956bda35f9c977dba296b8c7148a"})
+  {:private "54d301972f19dc79c46733cce86d1f8561fd641d1eb9d1311912430ed285330f",
+   :public  "2f72d6588192a9617049b5a4d5a6af95b6c5516a7fc9cae8784e73b22c8125e6"})
 (def other-auth (did/private->did-map (:private other-kp)))
 
 (def example-cred-subject {"@context" {"a" "http://a.com/"} "a:foo" "bar"})
 (def example-issuer (:id auth))
 
 (def clj-generated-jws
-  "eyJhbGciOiJFUzI1NkstUiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il19..HDBFAiEA80-G5gUH6BT9D1Mc-YyWbjuwbL7nKfWj6BrsHS6whQ0CIAcjzJvo0sW52FIlgvxy0hPBKNWolIwLvoedG_4HQu_V")
+  "eyJhbGciOiJFZERTQSIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il19..QphLnTFJUZAqudIJQHWge3MdsjOWEeoZmveoD4L7k_wLXGMjoclsjnLuBHQqN_xzH9fFhChJMHk_HljcCpuvDQ==")
 
 (def cljs-generated-jws
-  "eyJhbGciOiJFUzI1NkstUiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il19..HDBFAiEAy9MuRjVn_vwvEgQlsCJNnSYwCJEWU_UOg5U_R8--87wCID-qficJv-aCUotctcFGX-xTky1E08W2Y7utUCJZ3AZY")
+  "eyJhbGciOiJFZERTQSIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il19..QphLnTFJUZAqudIJQHWge3MdsjOWEeoZmveoD4L7k_wLXGMjoclsjnLuBHQqN_xzH9fFhChJMHk_HljcCpuvDQ==")
 
 (def example-credential
   {"@context"          "https://www.w3.org/2018/credentials/v1"
@@ -40,9 +40,9 @@
    "issuer"            (:id auth)
    "issuanceDate"      "1970-01-01T00:00:00.00000Z"
    "credentialSubject" example-cred-subject
-   "proof"             {"type"               "EcdsaSecp256k1RecoverySignature2020"
+   "proof"             {"type"               "Ed25519Signature2018"
                         "created"            "1970-01-01T00:00:00.00000Z"
-                        "verificationMethod" "did:key:z6DuABnw7XPbMksZo5wY4HweN8wPkEd7rCQM4YGgu8hPqrd5"
+                        "verificationMethod" "did:key:z6MkqtpqKGs4Et8mqBLBBAitDC1DPBiTJEbu26AcBX75B5rR"
                         "proofPurpose"       "assertionMethod"
                         "jws"                #?(:clj  clj-generated-jws
                                                 :cljs cljs-generated-jws)}})
@@ -52,17 +52,19 @@
      (with-redefs [fluree.db.util/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
        (testing "generate"
          (let [cred (async/<!! (cred/generate example-cred-subject (:private auth)))]
-           (is (= example-credential
-                  cred))))
+           (is (= (dissoc example-credential "proof")
+                  (dissoc cred "proof")))
+           (is (= "Ed25519Signature2018" (get-in cred ["proof" "type"])))
+           (is (string? (get-in cred ["proof" "jws"])))))
 
        (testing "verify correct signature"
-         (let [clj-result  (async/<!! (cred/verify example-credential))
-               cljs-result (async/<!! (cred/verify (assoc-in example-credential ["proof" "jws"] cljs-generated-jws)))]
-           (is (= {:subject example-cred-subject :did example-issuer} clj-result))
-           (is (= {:subject example-cred-subject :did example-issuer} cljs-result))))
+         (let [generated-cred (async/<!! (cred/generate example-cred-subject (:private auth)))
+               verify-result  (async/<!! (cred/verify generated-cred))]
+           (is (= {:subject example-cred-subject :did example-issuer} verify-result))))
 
        (testing "verify incorrect signature"
-         (let [wrong-cred (assoc example-credential "credentialSubject" {"@context" {"a" "http://a.com/"} "a:foo" "DIFFERENT!"})]
+         (let [generated-cred (async/<!! (cred/generate example-cred-subject (:private auth)))
+               wrong-cred (assoc generated-cred "credentialSubject" {"@context" {"a" "http://a.com/"} "a:foo" "DIFFERENT!"})]
            (is (= "Verification failed, invalid credential."
                   (-> (async/<!! (cred/verify wrong-cred))
                       (Throwable->map)
@@ -78,8 +80,10 @@
               (async/go
                 (with-redefs [fluree.db.util/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
                   (let [cred (async/<! (cred/generate example-cred-subject (:private auth)))]
-                    (is (= example-credential
-                           cred))
+                    (is (= (dissoc example-credential "proof")
+                           (dissoc cred "proof")))
+                    (is (= "Ed25519Signature2018" (get-in cred ["proof" "type"])))
+                    (is (string? (get-in cred ["proof" "jws"])))
                     (done)))))))
 
 #?(:cljs
@@ -87,10 +91,9 @@
      (t/async done
               (async/go
                 (with-redefs [fluree.db.util/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
-                  (let [cljs-result (async/<! (cred/verify example-credential))
-                        clj-result  (async/<! (cred/verify (assoc-in example-credential ["proof" "jws"] clj-generated-jws)))]
-                    (is (= {:subject example-cred-subject :did example-issuer} cljs-result))
-                    (is (= {:subject example-cred-subject :did example-issuer} clj-result))
+                  (let [generated-cred (async/<! (cred/generate example-cred-subject (:private auth)))
+                        verify-result  (async/<! (cred/verify generated-cred))]
+                    (is (= {:subject example-cred-subject :did example-issuer} verify-result))
                     (done)))))))
 
 #?(:cljs
@@ -243,28 +246,28 @@
          (is (= [["D"]]
                 @(fluree/credential-query
                   db2
-                  (crypto/create-jws sparql (:private auth))
+                  (crypto/create-jws sparql (:private auth) {:include-pubkey true})
                   {:format :sparql}))
              "SPARQL query credential - allowing access")
 
          (is (= []
                 @(fluree/credential-query
                   (fluree/db ledger)
-                  (crypto/create-jws sparql (:private pleb-auth))
+                  (crypto/create-jws sparql (:private pleb-auth) {:include-pubkey true})
                   {:format :sparql}))
              "SPARQL query credential - forbidding access")
 
          (is (= [["D"]]
                 @(fluree/credential-query-connection
                   conn
-                  (crypto/create-jws sparql (:private auth))
+                  (crypto/create-jws sparql (:private auth) {:include-pubkey true})
                   {:format :sparql}))
              "SPARQL query connection credential - allowing access")
 
          (is (= []
                 @(fluree/credential-query-connection
                   conn
-                  (crypto/create-jws sparql (:private pleb-auth))
+                  (crypto/create-jws sparql (:private pleb-auth) {:include-pubkey true})
                   {:format :sparql}))
              "SPARQL query connection credential - forbidding access")))))
 

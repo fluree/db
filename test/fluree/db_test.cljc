@@ -242,7 +242,7 @@
                                    :schema/name "John"
                                    :type        :ex/User,
                                    :schema/ssn  "888-88-8888"}
-                                  {:id      "did:fluree:123"
+                                  {:id      "did:key:z6MkqpTi7zUDy5nnSfpLf7SPGsepMNJAxRiH1jbCZbuaZoEz"
                                    :ex/user :ex/alice
                                    :f/role  :ex/userRole}]})
                  db+policy    @(fluree/update
@@ -502,7 +502,7 @@
                                  :schema/name "John"
                                  :type        :ex/User,
                                  :schema/ssn  "888-88-8888"}
-                                {:id      "did:fluree:123"
+                                {:id      "did:key:z6MkqpTi7zUDy5nnSfpLf7SPGsepMNJAxRiH1jbCZbuaZoEz"
                                  :ex/user :ex/alice
                                  :f/role  :ex/userRole}]})
                db+policy    @(fluree/update

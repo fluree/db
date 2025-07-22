@@ -904,7 +904,7 @@
           ledger       @(fluree/create conn ledger-name)
           context      [test-utils/default-str-context {"ex" "http://example.org/ns/"
                                                         "f"  "https://ns.flur.ee/ledger#"}]
-          root-privkey "89e0ab9ac36fb82b172890c89e9e231224264c7c757d58cfd8fcd6f3d4442199"
+          root-privkey "aa543a7aaaf45df4a17362956900e0094fcdb3a1fc1ebd36252a748533a995df"
           root-did     (:id (did/private->did-map root-privkey))
 
           db0  (fluree/db ledger)
@@ -936,20 +936,22 @@
                                                  (json/stringify {"@context" context
                                                                   "ledger"   ledger-name
                                                                   "insert"   {"ex:foo" 3}})
-                                                 root-privkey))
+                                                 root-privkey
+                                                 {:include-pubkey true}))
 
           _db4 @(fluree/credential-update! conn (crypto/create-jws
                                                  (json/stringify {"@context" context
                                                                   "ledger"   ledger-name
                                                                   "insert"   {"ex:foo" 5}})
-                                                 root-privkey))]
+                                                 root-privkey
+                                                 {:include-pubkey true}))]
       (is (= [{"f:data" {"f:t" 1}}
-              {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+              {"f:author" "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH",
                "f:data"   {"f:t" 2},
-               "f:txn"    "fluree:memory://byfkd5sj5lwq3aaxgbqkwoteakwjqqjrrvsrbhl7eirp3aizykj3"}
-              {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+               "f:txn"    "fluree:memory://b7klwiffbe7gvuc6zr7tcokrt7qjvjleh4pqp2fzmrbuwv6dfal5"}
+              {"f:author" "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH",
                "f:data"   {"f:t" 3},
-               "f:txn"    "fluree:memory://bsb5zixq25bktdvwtzbquwgvjii6cv4mi7mu3zbpu562oa77y5nq"}]
+               "f:txn"    "fluree:memory://b27lppnkq7qmmfeclpk6c44vui4b72qj25es7t6tsskw74d74qqj"}]
              (->> @(fluree/history ledger {:context        context
                                            :commit-details true
                                            :t              {:from 1 :to :latest}})
@@ -965,7 +967,7 @@
           ledger       @(fluree/create conn ledger-name)
           context      [test-utils/default-str-context {"ex" "http://example.org/ns/"
                                                         "f"  "https://ns.flur.ee/ledger#"}]
-          root-privkey "89e0ab9ac36fb82b172890c89e9e231224264c7c757d58cfd8fcd6f3d4442199"
+          root-privkey "aa543a7aaaf45df4a17362956900e0094fcdb3a1fc1ebd36252a748533a995df"
           root-did     (:id (did/private->did-map root-privkey))
 
           db0  (fluree/db ledger)
@@ -1033,7 +1035,7 @@
                               "id"         test-utils/db-id?}}}
               {"f:commit"
                {"f:alias"    "authortest",
-                "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                "f:author"   "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH",
                 "f:time"     720000,
                 "f:txn"      test-utils/address?
                 "f:previous" {"id" test-utils/commit-id?}
@@ -1049,7 +1051,7 @@
                               "id"         test-utils/db-id?}}}
               {"f:commit"
                {"f:alias"    "authortest",
-                "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                "f:author"   "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH",
                 "f:time"     720000,
                 "f:txn"      test-utils/address?
                 "f:previous" {"id" test-utils/commit-id?},
@@ -1069,7 +1071,7 @@
 
       (testing ":data returns just the asserts and retracts"
         (is (pred-match? [{"f:data" {"f:t"       1
-                                     "f:assert"  [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
+                                     "f:assert"  [{"id"            "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH"
                                                    "f:policyClass" {"id" "ex:RootPolicy"}}
                                                   {"type"        "ex:Yeti",
                                                    "schema:age"  55,
@@ -1117,7 +1119,7 @@
                             "id"         test-utils/db-id?}},
                "f:data"   {"f:t"       1,
                            "f:assert"
-                           [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
+                           [{"id"            "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH"
                              "f:policyClass" {"id" "ex:RootPolicy"}}
                             {"type"        "ex:Yeti",
                              "schema:age"  55,
@@ -1138,7 +1140,7 @@
                            "f:retract" []}}
               {"f:txn"    jws1
                "f:commit" {"f:alias"    "authortest",
-                           "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                           "f:author"   "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH",
                            "f:time"     720000,
                            "f:txn"      test-utils/address?
                            "f:previous" {"id" test-utils/commit-id?},
@@ -1158,7 +1160,7 @@
                            "f:retract" []}}
               {"f:txn"    jws2
                "f:commit" {"f:alias"    "authortest",
-                           "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                           "f:author"   "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH",
                            "f:time"     720000,
                            "f:txn"      test-utils/address?
                            "f:previous" {"id" test-utils/commit-id?},
@@ -1207,7 +1209,7 @@
                              "id"         test-utils/db-id?}},
                "f:data"    {"f:t"       1,
                             "f:assert"
-                            [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
+                            [{"id"            "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH"
                               "f:policyClass" {"id" "ex:RootPolicy"}}
                              {"type"        "ex:Yeti",
                               "schema:age"  55,
@@ -1258,7 +1260,7 @@
                              "id"         test-utils/db-id?}}
                "f:data"    {"f:t"       1,
                             "f:assert"
-                            [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
+                            [{"id"            "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH"
                               "f:policyClass" {"id" "ex:RootPolicy"}}
                              {"type"        "ex:Yeti",
                               "schema:age"  55,

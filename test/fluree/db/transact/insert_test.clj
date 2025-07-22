@@ -9,8 +9,8 @@
           ledger @(fluree/create conn "tx/insert")
           db     @(fluree/insert
                    (fluree/db ledger)
-                   {"@context" [test-utils/default-str-context
-                                {"ex" "http://example.org/ns/"}]
+                   {"@context" {"ex" "http://example.org/ns/"
+                                "schema" "http://schema.org/"}
                     "@graph"   [{"id"         "ex:alice",
                                  "type"        "ex:User",
                                  "schema:name" "Alice"
@@ -21,8 +21,8 @@
                                  "schema:age"  22}]})]
       (is (= ["Alice" "Bob"]
              @(fluree/query db
-                            {"@context" [test-utils/default-str-context
-                                         {"ex" "http://example.org/ns/"}]
+                            {"@context" {"ex" "http://example.org/ns/"
+                                         "schema" "http://schema.org/"}
                              "select" "?name"
                              "where"  {"schema:name" "?name"}})))
       "Inserted data should be retrievable."))

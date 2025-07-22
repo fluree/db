@@ -447,8 +447,12 @@
       (:id previous)
       (conj (flake/create commit-sid const/$_previous (iri/encode-iri db (:id previous)) const/$id t true nil))
 
-      (:id issuer)
-      (conj (flake/create commit-sid const/$_commit:signer (iri/encode-iri db (:id issuer)) const/$id t true nil))
+      issuer
+      (conj (flake/create commit-sid const/$_commit:signer
+                          (iri/encode-iri db (if (string? issuer)
+                                               issuer
+                                               (:id issuer)))
+                          const/$id t true nil))
 
       message
       (conj (flake/create commit-sid const/$_commit:message message const/$xsd:string t true nil))

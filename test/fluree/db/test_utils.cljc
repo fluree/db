@@ -233,7 +233,7 @@
   "[0-9a-fA-F]")
 
 (def did-regex
-  (re-pattern (str "did:fluree:" base58-pattern "{35}")))
+  (re-pattern (str "did:key:z" base58-pattern "+")))
 
 (defn did?
   [s]

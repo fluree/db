@@ -150,7 +150,20 @@
       (let [resp (<? (read-s3-data client bucket prefix path))]
         (when (not= resp ::not-found)
           (when-let [body (:Body resp)]
-            (.getBytes ^String body)))))))
+            (.getBytes ^String body))))))
+
+  storage/EraseableStore
+  (delete [_ address]
+    (go-try
+      (let [path (storage/get-local-path address)
+            ch (async/promise-chan (map handle-s3-response))
+            req {:op :DeleteObject
+                 :ch ch
+                 :request {:Bucket bucket
+                           :Key (str prefix "/" path)}}]
+        (log/debug "Deleting S3 object:" {:bucket bucket :key (str prefix "/" path)})
+        (aws/invoke-async client req)
+        (<? ch)))))
 
 (defn open
   ([bucket prefix]
