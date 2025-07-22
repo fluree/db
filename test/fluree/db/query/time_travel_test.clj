@@ -51,7 +51,7 @@
                                                   #'util/current-time-iso
                                                   (fn [] start-iso)}
                                    (fn []
-                                     (let [db1 @(fluree/stage
+                                     (let [db1 @(fluree/update
                                                  (fluree/db ledger)
                                                  {"@context" [test-utils/default-context
                                                               {:ex "http://example.org/ns/"}]
@@ -62,7 +62,7 @@
                                                   #'util/current-time-iso
                                                   (fn [] three-loaded-iso)}
                                    (fn []
-                                     (let [db2 @(fluree/stage
+                                     (let [db2 @(fluree/update
                                                  (fluree/db ledger)
                                                  {"@context" [test-utils/default-context
                                                               {:ex "http://example.org/ns/"}]
@@ -73,7 +73,7 @@
                                                   #'util/current-time-iso
                                                   (fn [] all-loaded-iso)}
                                    (fn []
-                                     (let [db3 @(fluree/stage
+                                     (let [db3 @(fluree/update
                                                  (fluree/db ledger)
                                                  {"@context" [test-utils/default-context
                                                               {:ex "http://example.org/ns/"}]
@@ -128,18 +128,18 @@
                                                            {"@id"   "ex:foo"
                                                             "ex:p2" "t1"}]}))
           _        (with-redefs [util/current-time-iso (fn [] t2)]
-                     @(fluree/transact! conn {"@context" context
-                                              "ledger"   "test/time1"
-                                              "insert"   [{"@id"     "ex:time-test"
-                                                           "ex:time" 2}]}))
+                     @(fluree/update! conn {"@context" context
+                                            "ledger"   "test/time1"
+                                            "insert"   [{"@id"     "ex:time-test"
+                                                         "ex:time" 2}]}))
           _        (with-redefs [util/current-time-iso (fn [] t2)]
-                     @(fluree/transact! conn
-                                        {"@context" context
-                                         "ledger"   "test/time2"
-                                         "insert"   [{"@id"   "ex:time-test"
-                                                      "ex:p1" "value2"}
-                                                     {"@id"   "ex:foo"
-                                                      "ex:p2" "t2"}]}))]
+                     @(fluree/update! conn
+                                      {"@context" context
+                                       "ledger"   "test/time2"
+                                       "insert"   [{"@id"   "ex:time-test"
+                                                    "ex:p1" "value2"}
+                                                   {"@id"   "ex:foo"
+                                                    "ex:p2" "t2"}]}))]
       (testing "Single ledger"
         (let [q {:context context
                  :from    "test/time1"

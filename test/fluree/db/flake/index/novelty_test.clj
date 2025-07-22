@@ -14,7 +14,7 @@
                                                        :reindex-max-bytes 10000000}}})
             context (merge test-utils/default-str-context {"ex" "http://example.org/ns/"})
             ledger  @(fluree/create conn "index/datetimes")
-            db      @(fluree/stage
+            db      @(fluree/update
                       (fluree/db ledger)
                       {"@context" context
                        "insert"

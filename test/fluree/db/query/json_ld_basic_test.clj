@@ -159,13 +159,13 @@
           movies  (test-utils/load-movies conn)
           context [test-utils/default-context {:ex "http://example.org/ns/"}]]
       (testing "define @list container in context"
-        (let [db        @(fluree/stage (fluree/db movies)
-                                       {"@context" context
-                                        "insert"
-                                        {:context {:id      "@id"
-                                                   :ex/list {"@container" "@list"}}
-                                         :id      "list-test"
-                                         :ex/list [42 2 88 1]}})
+        (let [db        @(fluree/update (fluree/db movies)
+                                        {"@context" context
+                                         "insert"
+                                         {:context {:id      "@id"
+                                                    :ex/list {"@container" "@list"}}
+                                          :id      "list-test"
+                                          :ex/list [42 2 88 1]}})
               query-res @(fluree/query db {:context   context
                                            :selectOne {"list-test" [:*]}})]
           (is (= {:id      "list-test"
@@ -173,12 +173,12 @@
                  query-res)
               "Order of query result is different from transaction.")))
       (testing "define @list directly on subject"
-        (let [db        @(fluree/stage (fluree/db movies)
-                                       {"@context" context
-                                        "insert"
-                                        {:context {:id "@id"}
-                                         :id      "list-test2"
-                                         :ex/list {"@list" [42 2 88 1]}}})
+        (let [db        @(fluree/update (fluree/db movies)
+                                        {"@context" context
+                                         "insert"
+                                         {:context {:id "@id"}
+                                          :id      "list-test2"
+                                          :ex/list {"@list" [42 2 88 1]}}})
               query-res @(fluree/query db {:context   context,
                                            :selectOne {"list-test2" [:*]}})]
           (is (= {:id      "list-test2"
@@ -190,7 +190,7 @@
   (let [conn    (test-utils/create-conn)
         ledger  @(fluree/create conn "query/simple-subject-crawl")
         context [test-utils/default-context {:ex "http://example.org/ns/"}]
-        db      @(fluree/stage
+        db      @(fluree/update
                   (fluree/db ledger)
                   {"@context" context
                    "insert"
@@ -375,13 +375,13 @@
     (let [conn   (test-utils/create-conn)
           alias  "faux-compact-iri-query"
           ledger @(fluree/create conn alias)
-          db0    @(fluree/stage (fluree/db ledger)
-                                {"@context" test-utils/default-str-context
-                                 "insert"
-                                 [{"id"      "foo"
-                                   "ex:name" "Foo"}
-                                  {"id"      "foaf:bar"
-                                   "ex:name" "Bar"}]})
+          db0    @(fluree/update (fluree/db ledger)
+                                 {"@context" test-utils/default-str-context
+                                  "insert"
+                                  [{"id"      "foo"
+                                    "ex:name" "Foo"}
+                                   {"id"      "foaf:bar"
+                                    "ex:name" "Bar"}]})
           _      @(fluree/commit! ledger db0)
           db1    (->> alias (fluree/load conn) deref fluree/db)]
 
