@@ -731,238 +731,212 @@
      (let [;; Separate macros from functions
            macro-symbols #{'coalesce 'as '-and '-or 'iri '-if 'if}
 
-        ;; Build eval namespace, excluding macros for now
+           ;; Define macro replacements once
+           -if-fn (fn [test then else] (if (:value test) then else))
+           as-fn (fn [expr _alias] expr)
+           -and-fn (fn [& args]
+                     (reduce (fn [result x]
+                               (if (:value result) x result))
+                             (where/->typed-val true)
+                             args))
+           -or-fn (fn [& args]
+                    (reduce (fn [result x]
+                              (if (:value result) result x))
+                            (where/->typed-val nil)
+                            args))
+
+           ;; Build eval namespace, excluding macros for now
            eval-ns-fns (reduce (fn [acc [k v]]
                                  (if (contains? macro-symbols k)
                                    acc
                                    (try
                                      (if-let [resolved-var (resolve v)]
-                                    ;; Use both the short name and the qualified name
                                        (let [short-name (symbol (name k))
-                                             qualified-name (symbol (name v))]
+                                             qualified-name (symbol (name v))
+                                             var-val @resolved-var]
                                          (-> acc
-                                             (assoc short-name @resolved-var)
-                                             (assoc qualified-name @resolved-var)))
+                                             (assoc short-name var-val)
+                                             (assoc qualified-name var-val)))
                                        acc)
                                      (catch #?(:clj Exception :cljs :default) _
-                                    ;; If we can't resolve (e.g., it's a macro), skip it
+                                       ;; If we can't resolve (e.g., it's a macro), skip it
                                        acc))))
                                {}
                                qualified-symbols)
 
-        ;; Add special function
-           eval-ns-fns (assoc eval-ns-fns '->typed-val where/->typed-val)
+           ;; Add special functions and macro replacements
+           eval-ns-fns (-> eval-ns-fns
+                           (assoc '->typed-val where/->typed-val
+                                  'compare* compare*
+                                  ;; Macro replacements
+                                  '-if -if-fn
+                                  'if -if-fn
+                                  'as as-fn
+                                  'fluree.db.query.exec.eval/as as-fn
+                                  '-and -and-fn
+                                  'and -and-fn
+                                  '-or -or-fn
+                                  'or -or-fn))
 
-        ;; Add macro replacements as functions
-        ;; -if: (if (:value test) then else)
-           eval-ns-fns (assoc eval-ns-fns
-                              '-if (fn [test then else]
-                                     (if (:value test) then else))
-                              'if (fn [test then else]
-                                    (if (:value test) then else))
-                          ;; as is likely just an identity function for aliasing
-                              'as (fn [expr _alias] expr)
-                              'fluree.db.query.exec.eval/as (fn [expr _alias] expr)
-                          ;; -and and -or as functions
-                              '-and (fn [& args]
-                                      (reduce (fn [result x]
-                                                (if (:value result)
-                                                  x
-                                                  result))
-                                              (where/->typed-val true)
-                                              args))
-                              'and (fn [& args]
-                                     (reduce (fn [result x]
-                                               (if (:value result)
-                                                 x
-                                                 result))
-                                             (where/->typed-val true)
-                                             args))
-                              '-or (fn [& args]
-                                     (reduce (fn [result x]
-                                               (if (:value result)
-                                                 result
-                                                 x))
-                                             (where/->typed-val nil)
-                                             args))
-                              'or (fn [& args]
-                                    (reduce (fn [result x]
-                                              (if (:value result)
-                                                result
-                                                x))
-                                            (where/->typed-val nil)
-                                            args))
-                          ;; Add compare* for comparison operators
-                              'compare* compare*)
-
-        ;; Add json-ld/expand-iri function
-           json-ld-fns {'expand-iri json-ld/expand-iri}
-
-        ;; -and and -or can't be added directly as they're macros
-        ;; We'll handle them separately if needed
-
-        ;; Build where namespace with required functions
+           ;; Build other namespaces
            where-ns-fns {'->typed-val where/->typed-val
                          'get-datatype-iri where/get-datatype-iri
                          'get-binding where/get-binding
                          'variable? where/variable?
                          'mch->typed-val where/mch->typed-val}
 
-        ;; Build constants namespace
+           json-ld-fns {'expand-iri json-ld/expand-iri}
+
            const-ns {'iri-id const/iri-id
-                  ;; '_default const/iri-default  ; not defined in constants
-                     '_id const/iri-id
-                  ;; '_predicate const/iri-p      ; not defined in constants
-                  ;; '_object const/iri-o         ; not defined in constants
-                     }
+                     '_id const/iri-id}
 
-        ;; Core functions needed
-           core-fns {'instance? instance?
-                     'boolean? boolean?
-                     'string? string?
-                     'number? number?
-                     'keyword? keyword?
-                     'int? int?
-                     'pos-int? pos-int?
-                     'nat-int? nat-int?
-                     'map? map?
-                     'vector? vector?
-                     'sequential? sequential?
-                     'list? list?
-                     'set? set?
-                     'coll? coll?
-                     'fn? fn?
-                     'nil? nil?
-                     'some? some?
-                     'contains? contains?
-                     'empty? empty?
-                     'not-empty not-empty
-                     'every? every?
-                     'some some
-                     'filter filter
-                     'remove remove
-                     'first first
-                     'second second
-                     'rest rest
-                     'next next
-                     'last last
-                     'butlast butlast
-                     'take take
-                     'drop drop
-                     'take-while take-while
-                     'drop-while drop-while
-                     'nth nth
-                     'count count
-                     'get get
-                     'get-in get-in
-                     'assoc assoc
-                     'dissoc dissoc
-                     'update update
-                     'keys keys
-                     'vals vals
-                     'merge merge
-                     'select-keys select-keys
-                     'into into
-                     'conj conj
-                     'concat concat
-                     'mapv mapv
-                     'reduce reduce
-                     'partition partition
-                     'group-by group-by
-                     'sort sort
-                     'sort-by sort-by
-                     'reverse reverse
-                     'distinct distinct
-                     'flatten flatten
-                     'zipmap zipmap
-                     'frequencies frequencies
-                     'range range
-                     'repeat repeat
-                     'repeatedly repeatedly
-                     'iterate iterate
-                     'cycle cycle
-                     'interleave interleave
-                     'interpose interpose
-                     'str str
-                     'subs subs
-                     'format #?(:clj format :cljs str)
-                     're-find re-find
-                     're-matches re-matches
-                     're-pattern re-pattern
-                     're-seq re-seq
-                     'inc inc
-                     'dec dec
-                     '+ +
-                     '- -
-                     '* *
-                     '/ /
-                     'quot quot
-                     'rem rem
-                     'mod mod
-                     'abs abs
-                     'max max
-                     'min min
-                     'rand rand
-                     'rand-int rand-int
-                     'compare compare
-                     '= =
-                     'not= not=
-                     '< <
-                     '> >
-                     '<= <=
-                     '>= >=
-                     'zero? zero?
-                     'pos? pos?
-                     'neg? neg?
-                     'even? even?
-                     'odd? odd?
-                     'true? true?
-                     'false? false?
-                     'identity identity
-                     'constantly constantly
-                     'comp comp
-                     'complement complement
-                     'partial partial
-                     'memoize memoize
-                     'atom atom
-                     'deref deref
-                     'reset! reset!
-                     'swap! swap!
-                     'compare-and-set! compare-and-set!
-                     'meta meta
-                     'with-meta with-meta
-                     'name name
-                     'namespace namespace
-                     'symbol symbol
-                     'keyword keyword
-                     'apply apply
-                     'pr-str pr-str
-                     'prn-str prn-str
-                     'println println
-                     'print print
-                     'newline newline}
+           ;; Core functions - more efficient to define as a static map
+           core-fns '{instance? instance?
+                      boolean? boolean?
+                      string? string?
+                      number? number?
+                      keyword? keyword?
+                      int? int?
+                      pos-int? pos-int?
+                      nat-int? nat-int?
+                      map? map?
+                      vector? vector?
+                      sequential? sequential?
+                      list? list?
+                      set? set?
+                      coll? coll?
+                      fn? fn?
+                      nil? nil?
+                      some? some?
+                      contains? contains?
+                      empty? empty?
+                      not-empty not-empty
+                      every? every?
+                      some some
+                      filter filter
+                      remove remove
+                      first first
+                      second second
+                      rest rest
+                      next next
+                      last last
+                      butlast butlast
+                      take take
+                      drop drop
+                      take-while take-while
+                      drop-while drop-while
+                      nth nth
+                      count count
+                      get get
+                      get-in get-in
+                      assoc assoc
+                      dissoc dissoc
+                      update update
+                      keys keys
+                      vals vals
+                      merge merge
+                      select-keys select-keys
+                      into into
+                      conj conj
+                      concat concat
+                      mapv mapv
+                      reduce reduce
+                      partition partition
+                      group-by group-by
+                      sort sort
+                      sort-by sort-by
+                      reverse reverse
+                      distinct distinct
+                      flatten flatten
+                      zipmap zipmap
+                      frequencies frequencies
+                      range range
+                      repeat repeat
+                      repeatedly repeatedly
+                      iterate iterate
+                      cycle cycle
+                      interleave interleave
+                      interpose interpose
+                      str str
+                      subs subs
+                      re-find re-find
+                      re-matches re-matches
+                      re-pattern re-pattern
+                      re-seq re-seq
+                      inc inc
+                      dec dec
+                      + +
+                      - -
+                      * *
+                      / /
+                      quot quot
+                      rem rem
+                      mod mod
+                      abs abs
+                      max max
+                      min min
+                      rand rand
+                      rand-int rand-int
+                      compare compare
+                      = =
+                      not= not=
+                      < <
+                      > >
+                      <= <=
+                      >= >=
+                      zero? zero?
+                      pos? pos?
+                      neg? neg?
+                      even? even?
+                      odd? odd?
+                      true? true?
+                      false? false?
+                      identity identity
+                      constantly constantly
+                      comp comp
+                      complement complement
+                      partial partial
+                      memoize memoize
+                      atom atom
+                      deref deref
+                      reset! reset!
+                      swap! swap!
+                      compare-and-set! compare-and-set!
+                      meta meta
+                      with-meta with-meta
+                      name name
+                      namespace namespace
+                      symbol symbol
+                      keyword keyword
+                      apply apply
+                      pr-str pr-str
+                      prn-str prn-str
+                      println println
+                      print print
+                      newline newline}
 
-           user-ns-fns (merge eval-ns-fns
-                              {'fluree.db.query.exec.eval/-and (fn [& args]
-                                                                 (reduce (fn [result x]
-                                                                           (if (:value result)
-                                                                             x
-                                                                             result))
-                                                                         (where/->typed-val true)
-                                                                         args))
-                               'fluree.db.query.exec.eval/-or (fn [& args]
-                                                                (reduce (fn [result x]
-                                                                          (if (:value result)
-                                                                            result
-                                                                            x))
-                                                                        (where/->typed-val nil)
-                                                                        args))})]
+           ;; Resolve core functions
+           resolved-core-fns (reduce (fn [acc [k v]]
+                                       (if-let [resolved (resolve v)]
+                                         (assoc acc k @resolved)
+                                         acc))
+                                     {}
+                                     core-fns)
+
+           ;; Add platform-specific functions
+           resolved-core-fns (assoc resolved-core-fns
+                                    'format #?(:clj format :cljs str))
+
+           ;; Build user namespace by merging eval namespace with qualified -and/-or
+           user-ns-fns (assoc eval-ns-fns
+                              'fluree.db.query.exec.eval/-and -and-fn
+                              'fluree.db.query.exec.eval/-or -or-fn)]
 
        (sci/init {:namespaces {'fluree.db.query.exec.eval eval-ns-fns
                                'fluree.db.query.exec.where where-ns-fns
                                'fluree.json-ld json-ld-fns
                                'fluree.db.constants const-ns
-                               'clojure.core core-fns
+                               'clojure.core resolved-core-fns
                                'user user-ns-fns}
                   :bindings {;; Make constants available
                              'fluree.db.constants/iri-id const/iri-id}}))))
