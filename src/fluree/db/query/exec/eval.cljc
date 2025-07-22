@@ -1,9 +1,7 @@
 (ns fluree.db.query.exec.eval
   (:refer-clojure :exclude [compile rand concat replace max min
                             #?(:clj ratio?) #?@(:cljs [uuid -count divide])])
-  (:require #?(:clj [fluree.db.util.graalvm :as graalvm])
-            #?@(:clj [[sci.core :as sci]])
-            [clojure.math :as math]
+  (:require [clojure.math :as math]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :as walk :refer [postwalk]]
@@ -16,7 +14,8 @@
             [fluree.db.util :as util]
             [fluree.db.util.log :as log]
             [fluree.db.vector.scoring :as score]
-            [fluree.json-ld :as json-ld])
+            [fluree.json-ld :as json-ld]
+            #?@(:clj [[sci.core :as sci]]))
   #?(:clj (:import (java.time LocalDateTime OffsetDateTime LocalDate OffsetTime LocalTime
                               ZoneId ZoneOffset))))
 
@@ -954,7 +953,7 @@
       Decision is made at compile time based on graalvm-build? check.
       For GraalVM builds, uses a singleton SCI context for better performance."
      [form]
-     (graalvm/if-graalvm
+     (if-graalvm
       ;; GraalVM branch - use singleton SCI context
       `(sci/eval-form @sci-context-singleton ~form)
       ;; JVM branch - use direct eval
