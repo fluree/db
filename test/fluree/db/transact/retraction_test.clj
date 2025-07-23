@@ -7,7 +7,7 @@
   (testing "Retractions of individual properties and entire subjects."
     (let [conn           (test-utils/create-conn)
           ledger         @(fluree/create conn "tx/retract")
-          db             @(fluree/stage
+          db             @(fluree/update
                            (fluree/db ledger)
                            {"insert"
                             {:context [test-utils/default-context
@@ -25,7 +25,7 @@
                                         :schema/name "Jane"
                                         :schema/age  30}]}})
           ;; retract Alice's age attribute
-          db-age-retract @(fluree/stage
+          db-age-retract @(fluree/update
                            db
                            {"delete"
                             {:context    [test-utils/default-context
@@ -48,7 +48,7 @@
                              "ex:items2" {"@container" "@list"}}]
           q1               {:context context
                             :select  {"ex:list-test" ["*"]}}
-          db               @(fluree/stage
+          db               @(fluree/update
                              (fluree/db ledger)
                              {"@context" context
                               "insert"
@@ -57,7 +57,7 @@
                                                       "three"]}
                                 "ex:items2" ["four" "five" "six" "seven"]}]})
           before-retract   @(fluree/query db q1)
-          db-after-retract @(fluree/stage
+          db-after-retract @(fluree/update
                              db
                              {"@context" context
                               "delete"   {"id"        "ex:list-test"

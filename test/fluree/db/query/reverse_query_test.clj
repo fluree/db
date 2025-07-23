@@ -9,7 +9,7 @@
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "query/reverse")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
-          db      @(fluree/stage
+          db      @(fluree/update
                     (fluree/db ledger)
                     {"@context" context
                      "insert"
@@ -57,21 +57,21 @@
         ledger @(fluree/create conn "reverse")
         db0    (fluree/db ledger)
 
-        db1 @(fluree/stage db0 {"@context" {"ex" "http://example.org/ns/"}
-                                "insert"   [{"@id"      "ex:dad"
-                                             "@type"    "ex:Person"
-                                             "ex:name"  "Dad"
-                                             "ex:child" {"@id" "ex:kid"}}
-                                            {"@id"      "ex:mom"
-                                             "@type"    "ex:Person"
-                                             "ex:name"  "Mom"
-                                             "ex:child" {"@id" "ex:kid"}}
-                                            {"@id"     "ex:kid"
-                                             "@type"   "ex:Person"
-                                             "ex:name" "Kiddo"}
-                                            {"@id"        "ex:school"
-                                             "@type"      "ex:Organization"
-                                             "ex:student" "ex:kid"}]})]
+        db1 @(fluree/update db0 {"@context" {"ex" "http://example.org/ns/"}
+                                 "insert"   [{"@id"      "ex:dad"
+                                              "@type"    "ex:Person"
+                                              "ex:name"  "Dad"
+                                              "ex:child" {"@id" "ex:kid"}}
+                                             {"@id"      "ex:mom"
+                                              "@type"    "ex:Person"
+                                              "ex:name"  "Mom"
+                                              "ex:child" {"@id" "ex:kid"}}
+                                             {"@id"     "ex:kid"
+                                              "@type"   "ex:Person"
+                                              "ex:name" "Kiddo"}
+                                             {"@id"        "ex:school"
+                                              "@type"      "ex:Organization"
+                                              "ex:student" "ex:kid"}]})]
     (testing "select clause"
       (is (= {"@id"     "ex:kid",
               "@type"   "ex:Person"
