@@ -163,7 +163,17 @@
                            :Key (str prefix "/" path)}}]
         (log/debug "Deleting S3 object:" {:bucket bucket :key (str prefix "/" path)})
         (aws/invoke-async client req)
-        (<? ch)))))
+        (<? ch))))
+
+  storage/ListableStore
+  (list-paths [_ path-prefix]
+    (go-try
+      ;; Use existing s3-list function to list objects with the prefix
+      (let [results (<? (s3-list client bucket prefix path-prefix))]
+        ;; Filter for .json files and return relative paths
+        (->> results
+             (filter #(str/ends-with? % ".json"))
+             vec)))))
 
 (defn open
   ([bucket prefix]

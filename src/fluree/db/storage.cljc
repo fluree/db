@@ -113,6 +113,9 @@
 (defprotocol EraseableStore
   (delete [store address] "Remove value associated with `address` from the store."))
 
+(defprotocol ListableStore
+  (list-paths [store prefix] "Returns a sequence of paths that start with the given prefix."))
+
 (defn content-write-json
   [store path data]
   (go-try

@@ -5,7 +5,8 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.json :as json]))
+            [fluree.db.util.json :as json]
+            [fluree.db.util.log :as log]))
 
 (defn local-filename
   ([ledger-alias]
@@ -23,7 +24,7 @@
   "Generates nameservice metadata map for JSON storage using new minimal format"
   [ledger-alias branch commit-address t index-address]
   (let [branch (or branch "main")]
-    (cond-> {"@context"     {"f" iri/fluree-context-url}
+    (cond-> {"@context"     {"f" iri/f-ns}
              "@id"          (str ledger-alias "@" branch)
              "@type"        ["f:Database" "f:PhysicalDatabase"]
              "f:ledger"     {"@id" ledger-alias}
@@ -81,7 +82,31 @@
     (-> (storage/get-local-path ledger-address)
         (str/split #"/")
         (->> (drop-last 2) ; branch-name, head
-             (str/join "/")))))
+             (str/join "/"))))
+
+  (all-records [_]
+    (go-try
+      ;; Use the ListableStore protocol to list all nameservice files
+      (if (satisfies? storage/ListableStore store)
+        (let [ns-paths (<? (storage/list-paths store "ns@v1"))]
+          ;; Read each nameservice file and parse its content
+          (loop [remaining-paths ns-paths
+                 records []]
+            (if-let [path (first remaining-paths)]
+              (let [file-content (<? (storage/read-bytes store path))]
+                (if file-content
+                  (let [content-str (if (string? file-content)
+                                      file-content
+                                      #?(:clj (String. ^bytes file-content)
+                                         :cljs (js/String.fromCharCode.apply nil file-content)))
+                        record (json/parse content-str false)]
+                    (recur (rest remaining-paths) (conj records record)))
+                  (recur (rest remaining-paths) records)))
+              records)))
+        ;; Fallback for stores that don't support ListableStore
+        (do
+          (log/warn "Storage backend does not support ListableStore protocol - nameservice queries not available")
+          [])))))
 
 (defn start
   [store]
