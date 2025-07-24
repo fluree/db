@@ -69,7 +69,10 @@
       (ipfs/read ipfs-endpoint address)))
   (alias [_ ledger-address]
     (let [[_ _ alias] (address-parts ledger-address)]
-      alias)))
+      alias))
+  (all-records [_]
+    ;; IPNS doesn't support listing all records
+    (go-try [])))
 
 (defn initialize
   [ipfs-endpoint ipns-key]
