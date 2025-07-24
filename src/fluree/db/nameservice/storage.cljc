@@ -37,26 +37,37 @@
 (defrecord StorageNameService [store]
   nameservice/Publisher
   (publish [_ data]
-    (let [;; Extract data from compact JSON-LD format (both genesis and regular commits now use this)
-          ledger-alias   (get data "alias")
-          branch         (or (get data "branch")
-                             (when (and (string? ledger-alias)
-                                        (str/includes? ledger-alias "@"))
-                               (subs ledger-alias (inc (str/last-index-of ledger-alias "@"))))
-                             "main")
-          commit-address (get data "address")
-          t-value        (get-in data ["data" "t"])
-          index-address  (get-in data ["index" "address"])
-          ns-metadata    (ns-record ledger-alias branch commit-address t-value index-address)
-          record-bytes   (json/stringify-UTF8 ns-metadata)
-          filename       (local-filename ledger-alias branch)]
-      (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :branch branch :filename filename})
-      (let [res (storage/write-bytes store filename record-bytes)]
-        (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :branch branch :filename filename})
-        res)))
+    (if (= (get data "type") "virtual-graph")
+      ;; Handle virtual graph records
+      (let [record-bytes (get data "bytes")
+            filename     (get data "filename")]
+        (log/debug "nameservice.storage/publish virtual-graph" {:filename filename})
+        (storage/write-bytes store filename record-bytes))
+      ;; Handle regular commit records
+      (let [;; Extract data from compact JSON-LD format (both genesis and regular commits now use this)
+            ledger-alias   (get data "alias")
+            branch         (or (get data "branch")
+                               (when (and (string? ledger-alias)
+                                          (str/includes? ledger-alias "@"))
+                                 (subs ledger-alias (inc (str/last-index-of ledger-alias "@"))))
+                               "main")
+            commit-address (get data "address")
+            t-value        (get-in data ["data" "t"])
+            index-address  (get-in data ["index" "address"])
+            ns-metadata    (ns-record ledger-alias branch commit-address t-value index-address)
+            record-bytes   (json/stringify-UTF8 ns-metadata)
+            filename       (local-filename ledger-alias branch)]
+        (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :branch branch :filename filename})
+        (let [res (storage/write-bytes store filename record-bytes)]
+          (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :branch branch :filename filename})
+          res))))
 
-  (retract [_ ledger-alias]
-    (let [filename (local-filename ledger-alias)
+  (retract [_ target]
+    (let [filename (if (string? target)
+                     ;; Legacy: ledger-alias string
+                     (local-filename target)
+                     ;; New: filename directly for virtual graphs
+                     target)
           address  (-> store
                        storage/location
                        (storage/build-address filename))]

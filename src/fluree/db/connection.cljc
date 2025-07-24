@@ -122,6 +122,11 @@
   [{:keys [primary-publisher secondary-publishers] :as _conn}]
   (cons primary-publisher secondary-publishers))
 
+(defn primary-publisher
+  "Returns the primary nameservice publisher for the connection"
+  [{:keys [primary-publisher] :as _conn}]
+  primary-publisher)
+
 (defn publications
   [conn]
   (:remote-systems conn))

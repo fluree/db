@@ -11,6 +11,7 @@
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice.query :as ns-query]
+            [fluree.db.nameservice.virtual-graph :as ns-vg]
             [fluree.db.query.api :as query-api]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.range :as query-range]
@@ -253,6 +254,58 @@
       (log/info "Creating ledger" ledger-alias)
       (let [ledger (<? (connection/create-ledger conn ledger-alias opts))]
         (ledger/current-db ledger))))))
+
+(defn create-virtual-graph
+  "Creates a new virtual graph in the nameservice.
+
+  Parameters:
+    conn - Connection object
+    config - Virtual graph configuration map:
+      :ledger - Ledger alias this VG belongs to
+      :alias - Virtual graph alias (e.g. \"articleSearch\")
+      :type - Virtual graph type (e.g. :bm25)
+      :config - Type-specific configuration
+      :dependencies - (optional) List of ledger dependencies
+
+  For BM25 virtual graphs, config should include:
+    :stemmer - Stemmer identifier (e.g. \"snowballStemmer-en\")
+    :stopwords - Stopwords identifier (e.g. \"stopwords-en\")
+    :query - FQL query defining documents to index
+
+  Returns promise resolving to virtual graph ID."
+  [conn {:keys [ledger alias type config dependencies] :as vg-config}]
+  (validate-connection conn)
+  (promise-wrap
+   (go-try
+     (when-not ledger
+       (throw (ex-info "Virtual graph requires :ledger alias" {:error :db/invalid-config})))
+     (when-not alias
+       (throw (ex-info "Virtual graph requires :alias" {:error :db/invalid-config})))
+     (when-not type
+       (throw (ex-info "Virtual graph requires :type" {:error :db/invalid-config})))
+     
+     (let [ledger-alias (if (keyword? ledger) (name ledger) ledger)
+           vg-alias (if (keyword? alias) (name alias) alias)
+           vg-type (case type
+                     :bm25 "fidx:BM25"
+                     (throw (ex-info (str "Unknown virtual graph type: " type) {:error :db/invalid-config})))
+           dependencies (or dependencies [(str ledger-alias "@main")])
+           publisher (connection/primary-publisher conn)
+           full-config {:ledger-alias ledger-alias
+                        :vg-alias vg-alias
+                        :vg-type vg-type
+                        :config config
+                        :dependencies dependencies}]
+       
+       ;; Check if virtual graph already exists
+       (when (<? (ns-vg/virtual-graph-exists? publisher ledger-alias vg-alias))
+         (throw (ex-info (str "Virtual graph already exists: " ledger-alias "##" vg-alias)
+                         {:error :db/invalid-config})))
+       
+       ;; Publish to nameservice
+       (<? (ns-vg/publish-virtual-graph publisher full-config))
+       
+       (str ledger-alias "##" vg-alias)))))
 
 (defn alias->address
   "Resolves a ledger alias to its address.
