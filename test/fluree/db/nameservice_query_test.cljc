@@ -1,7 +1,7 @@
 (ns fluree.db.nameservice-query-test
-  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj [babashka.fs :refer [with-temp-dir]])
+            #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing]])
-            [babashka.fs :refer [with-temp-dir]]
             [fluree.db.api :as api]
             [fluree.db.json-ld.iri :as iri]))
 
@@ -107,31 +107,32 @@
           ;; Clean up connection
           @(api/disconnect conn))))))
 
-(deftest nameservice-query-file-storage-test
-  (testing "Nameservice query with file storage"
-    (with-temp-dir [storage-path {}]
-      (let [conn @(api/connect-file {:storage-path (str storage-path)})]
-        (try
+#?(:clj
+   (deftest nameservice-query-file-storage-test
+     (testing "Nameservice query with file storage"
+       (with-temp-dir [storage-path {}]
+         (let [conn @(api/connect-file {:storage-path (str storage-path)})]
+           (try
           ;; Create a ledger with file storage
-          @(api/create conn "file-ledger" {})
-          @(api/insert! conn "file-ledger"
-                        {"@context" {"test" "http://example.org/test#"}
-                         "@graph" [{"@id" "test:file-person"
-                                    "@type" "Person"
-                                    "name" "File User"}]})
+             @(api/create conn "file-ledger" {})
+             @(api/insert! conn "file-ledger"
+                           {"@context" {"test" "http://example.org/test#"}
+                            "@graph" [{"@id" "test:file-person"
+                                       "@type" "Person"
+                                       "name" "File User"}]})
 
           ;; Query the file-based nameservice
-          (let [query {"@context" {"f" iri/f-ns}
-                       "select" ["?ledger" "?t"]
-                       "where" [{"@id" "?ns"
-                                 "f:ledger" "?ledger"
-                                 "f:t" "?t"}]}
-                result @(api/query-nameservice conn query {})]
-            (is (>= (count result) 1) "Should find file-based ledger")
+             (let [query {"@context" {"f" iri/f-ns}
+                          "select" ["?ledger" "?t"]
+                          "where" [{"@id" "?ns"
+                                    "f:ledger" "?ledger"
+                                    "f:t" "?t"}]}
+                   result @(api/query-nameservice conn query {})]
+               (is (>= (count result) 1) "Should find file-based ledger")
 
             ;; Verify we found our file ledger
-            (let [file-ledger-result (filter #(= (first %) "file-ledger") result)]
-              (is (= (count file-ledger-result) 1) "Should find file-ledger")))
+               (let [file-ledger-result (filter #(= (first %) "file-ledger") result)]
+                 (is (= (count file-ledger-result) 1) "Should find file-ledger")))
 
-          (finally
-            @(api/disconnect conn)))))))
+             (finally
+               @(api/disconnect conn))))))))
