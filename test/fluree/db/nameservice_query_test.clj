@@ -1,49 +1,48 @@
 (ns fluree.db.nameservice-query-test
-  (:require #?(:clj [babashka.fs :refer [with-temp-dir]])
-            #?(:clj [clojure.test :refer [deftest is testing]]
-               :cljs [cljs.test :refer [deftest is testing]])
-            [fluree.db.api :as api]
+  (:require [babashka.fs :refer [with-temp-dir]]
+            [clojure.test :refer [deftest is testing]]
+            [fluree.db.api :as fluree]
             [fluree.db.json-ld.iri :as iri]))
 
 (deftest nameservice-query-test
   (testing "Nameservice query functionality"
-    (let [conn @(api/connect-memory {})]
+    (let [conn @(fluree/connect-memory {})]
       (try
         ;; Create multiple ledgers with some data
         (testing "Create ledgers and insert data"
           ;; Create first ledger with some data
-          @(api/create conn "ledger-one" {})
-          @(api/insert! conn "ledger-one"
-                        {"@context" {"test" "http://example.org/test#"}
-                         "@graph" [{"@id" "test:person1"
-                                    "@type" "Person"
-                                    "name" "Alice"}]})
+          @(fluree/create conn "ledger-one" {})
+          @(fluree/insert! conn "ledger-one"
+                           {"@context" {"test" "http://example.org/test#"}
+                            "@graph" [{"@id" "test:person1"
+                                       "@type" "Person"
+                                       "name" "Alice"}]})
 
           ;; Create second ledger with different data
-          @(api/create conn "ledger-two" {})
-          @(api/insert! conn "ledger-two"
-                        {"@context" {"test" "http://example.org/test#"}
-                         "@graph" [{"@id" "test:person2"
-                                    "@type" "Person"
-                                    "name" "Bob"}]})
+          @(fluree/create conn "ledger-two" {})
+          @(fluree/insert! conn "ledger-two"
+                           {"@context" {"test" "http://example.org/test#"}
+                            "@graph" [{"@id" "test:person2"
+                                       "@type" "Person"
+                                       "name" "Bob"}]})
 
           ;; Create third ledger with more data (multiple commits)
-          @(api/create conn "ledger-three" {})
-          @(api/insert! conn "ledger-three"
-                        {"@context" {"test" "http://example.org/test#"}
-                         "@graph" [{"@id" "test:person3"
-                                    "@type" "Person"
-                                    "name" "Charlie"}]})
-          @(api/insert! conn "ledger-three"
-                        {"@context" {"test" "http://example.org/test#"}
-                         "@graph" [{"@id" "test:person4"
-                                    "@type" "Person"
-                                    "name" "David"}]}))
+          @(fluree/create conn "ledger-three" {})
+          @(fluree/insert! conn "ledger-three"
+                           {"@context" {"test" "http://example.org/test#"}
+                            "@graph" [{"@id" "test:person3"
+                                       "@type" "Person"
+                                       "name" "Charlie"}]})
+          @(fluree/insert! conn "ledger-three"
+                           {"@context" {"test" "http://example.org/test#"}
+                            "@graph" [{"@id" "test:person4"
+                                       "@type" "Person"
+                                       "name" "David"}]}))
 
         (testing "Query all nameservice records"
           (let [query {"select" ["?s" "?p" "?o"]
                        "where" [{"@id" "?s" "?p" "?o"}]}
-                result @(api/query-nameservice conn query {})]
+                result @(fluree/query-nameservice conn query {})]
             ;; Should have data from all ledgers plus temporary ledger metadata
             (is (> (count result) 10) "Should have multiple records")
 
@@ -58,7 +57,7 @@
                        "select" {"?ns" ["f:ledger" "f:branch" "f:t"]}
                        "where" [{"@id" "?ns"
                                  "@type" "f:Database"}]}
-                result @(api/query-nameservice conn query {})]
+                result @(fluree/query-nameservice conn query {})]
             ;; Should return information about our ledgers
             (is (>= (count result) 3) "Should find at least 3 database records")))
 
@@ -68,7 +67,7 @@
                        "where" [{"@id" "?ns"
                                  "f:ledger" "?ledger"
                                  "f:branch" "main"}]}
-                result @(api/query-nameservice conn query {})]
+                result @(fluree/query-nameservice conn query {})]
             ;; Should find our ledgers on main branch
             (is (>= (count result) 3) "Should find ledgers on main branch")
 
@@ -84,7 +83,7 @@
                        "where" [{"@id" "?ns"
                                  "f:ledger" "?ledger"
                                  "f:t" "?t"}]}
-                result @(api/query-nameservice conn query {})]
+                result @(fluree/query-nameservice conn query {})]
             (is (>= (count result) 3) "Should find t values for ledgers")
 
             ;; Check that ledger-three has a higher t value
@@ -100,39 +99,37 @@
                        "where" [{"@id" "?ns"
                                  "f:ledger" "?ledger"
                                  "f:branch" "nonexistent-branch"}]}
-                result @(api/query-nameservice conn query {})]
+                result @(fluree/query-nameservice conn query {})]
             (is (= (count result) 0) "Should return no results for nonexistent branch")))
 
         (finally
           ;; Clean up connection
-          @(api/disconnect conn))))))
+          @(fluree/disconnect conn))))))
 
-#?(:clj
-   (deftest nameservice-query-file-storage-test
-     (testing "Nameservice query with file storage"
-       (with-temp-dir [storage-path {}]
-         (let [conn @(api/connect-file {:storage-path (str storage-path)})]
-           (try
+(deftest nameservice-query-file-storage-test
+  (testing "Nameservice query with file storage"
+    (with-temp-dir [storage-path {}]
+      (let [conn @(fluree/connect-file {:storage-path (str storage-path)})]
           ;; Create a ledger with file storage
-             @(api/create conn "file-ledger" {})
-             @(api/insert! conn "file-ledger"
-                           {"@context" {"test" "http://example.org/test#"}
-                            "@graph" [{"@id" "test:file-person"
-                                       "@type" "Person"
-                                       "name" "File User"}]})
+        @(fluree/create conn "file-ledger" {})
+        @(fluree/insert! conn "file-ledger"
+                         {"@context" {"test" "http://example.org/test#"}
+                          "@graph" [{"@id" "test:file-person"
+                                     "@type" "Person"
+                                     "name" "File User"}]})
 
           ;; Query the file-based nameservice
-             (let [query {"@context" {"f" iri/f-ns}
-                          "select" ["?ledger" "?t"]
-                          "where" [{"@id" "?ns"
-                                    "f:ledger" "?ledger"
-                                    "f:t" "?t"}]}
-                   result @(api/query-nameservice conn query {})]
-               (is (>= (count result) 1) "Should find file-based ledger")
+        (let [query {"@context" {"f" iri/f-ns}
+                     "select" ["?ledger" "?t"]
+                     "where" [{"@id" "?ns"
+                               "f:ledger" "?ledger"
+                               "f:t" "?t"}]}
+              result @(fluree/query-nameservice conn query {})]
+          (is (>= (count result) 1) "Should find file-based ledger")
 
             ;; Verify we found our file ledger
-               (let [file-ledger-result (filter #(= (first %) "file-ledger") result)]
-                 (is (= (count file-ledger-result) 1) "Should find file-ledger")))
+          (let [file-ledger-result (filter #(= (first %) "file-ledger") result)]
+            (is (= (count file-ledger-result) 1) "Should find file-ledger")))
 
-             (finally
-               @(api/disconnect conn))))))))
+        (finally
+          @(fluree/disconnect conn))))))
