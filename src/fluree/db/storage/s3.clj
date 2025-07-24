@@ -169,9 +169,15 @@
   (list-paths [_ path-prefix]
     (go-try
       ;; Use existing s3-list function to list objects with the prefix
-      (let [results (<? (s3-list client bucket prefix path-prefix))]
+      (let [results-ch (s3-list client bucket prefix path-prefix)
+            all-results (loop [acc []]
+                          (let [batch (<! results-ch)]
+                            (if batch
+                              (let [contents (:Contents batch)]
+                                (recur (into acc (map :Key contents))))
+                              acc)))]
         ;; Filter for .json files and return relative paths
-        (->> results
+        (->> all-results
              (filter #(str/ends-with? % ".json"))
              vec)))))
 

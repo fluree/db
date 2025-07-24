@@ -5,8 +5,7 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.json :as json]))
 
 (defn local-filename
   ([ledger-alias]
@@ -88,9 +87,8 @@
     (go-try
       ;; Use the ListableStore protocol to list all nameservice files
       (if (satisfies? storage/ListableStore store)
-        (let [ns-paths (<? (storage/list-paths store "ns@v1"))]
-          ;; Read each nameservice file and parse its content
-          (loop [remaining-paths ns-paths
+        (if-let [list-paths-result (storage/list-paths store "ns@v1")]
+          (loop [remaining-paths (<? list-paths-result)
                  records []]
             (if-let [path (first remaining-paths)]
               (let [file-content (<? (storage/read-bytes store path))]
@@ -102,10 +100,11 @@
                         record (json/parse content-str false)]
                     (recur (rest remaining-paths) (conj records record)))
                   (recur (rest remaining-paths) records)))
-              records)))
+              records))
+          [])
         ;; Fallback for stores that don't support ListableStore
         (do
-          (log/warn "Storage backend does not support ListableStore protocol - nameservice queries not available")
+          (println "Storage backend does not support ListableStore protocol")
           [])))))
 
 (defn start

@@ -1,11 +1,11 @@
 (ns fluree.db.nameservice.query
-  (:require [fluree.db.connection :as connection]
+  (:require [fluree.db.api.transact :as transact-api]
+            [fluree.db.connection :as connection]
             [fluree.db.connection.config :as config]
             [fluree.db.connection.system :as system]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.query.api :as query-api]
-            [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
 
@@ -43,7 +43,7 @@
         (let [;; Convert records to insert format
               insert-data {"@graph" nameservice-records}
               ;; Insert all records using transact API
-              updated-db (<? (transact/stage db nil insert-data {}))]
+              updated-db (<? (transact-api/insert db insert-data nil))]
           ;; Return the system map, connection and updated database
           {:system-map system-map
            :connection conn
@@ -51,7 +51,6 @@
            :db updated-db})
         ;; No records to insert, return empty ledger
         {:system-map system-map
-         
          :connection conn
          :ledger temp-ledger
          :db db}))))
@@ -69,7 +68,7 @@
       (try
         ;; Execute the query using query-api
         (let [result (<? (query-api/query db query opts))]
-          ;; Clean up system
+            ;; Clean up system
           (system/terminate system-map)
           result)
         (catch #?(:clj Exception :cljs js/Error) e
