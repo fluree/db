@@ -47,8 +47,8 @@
   #?(:clj
      (let [root-file (io/file root-path)]
        (->> (file-seq root-file)
-            (filter #(.isFile %))
-            (map #(.getPath %))
+            (filter #(.isFile ^java.io.File %))
+            (map #(.getPath ^java.io.File %))
             (filter #(and (str/ends-with? % ".json")
                           (not (str/includes? % "/ns@v1/"))
                           (not (str/includes? % "/commit/"))
