@@ -130,6 +130,4 @@
             ;; Verify we found our file ledger
           (let [file-ledger-result (filter #(= (first %) "file-ledger") result)]
             (is (= (count file-ledger-result) 1) "Should find file-ledger")))
-
-        (finally
-          @(fluree/disconnect conn))))))
+        @(fluree/disconnect conn)))))
