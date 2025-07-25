@@ -9,11 +9,11 @@
    - Specific test: clojure -M:cljtest -m kaocha.runner --focus fluree.db.storage.s3-testcontainers-test
    
    These tests can be included in a weekly CI/CD job using the :docker-tests alias."
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [cognitect.aws.client.api :as aws]
-            [cognitect.aws.credentials :as credentials]
+  (:require [clojure.core.async :refer [<!!]]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [fluree.db.api :as fluree]
-            [fluree.db.storage.s3 :as s3])
+            [fluree.db.storage.s3 :as s3]
+            [fluree.db.util.xhttp :as xhttp])
   (:import [org.testcontainers.containers.localstack LocalStackContainer]
            [org.testcontainers.containers.localstack LocalStackContainer$Service]
            [org.testcontainers.utility DockerImageName]))
@@ -35,61 +35,51 @@
   (when-let [^LocalStackContainer container (:container container-info)]
     (.stop container)))
 
+(defn create-s3-bucket
+  "Create a bucket in LocalStack S3"
+  [bucket-name endpoint]
+  (.println System/out (str "Attempting to create bucket: " bucket-name " at endpoint: " endpoint))
+  (try
+    ;; For LocalStack, we need to use the direct endpoint without the bucket in hostname
+    (let [url (str endpoint "/" bucket-name)
+          response @(xhttp/put url "" {:headers {"Content-Type" "application/xml"}})]
+      (.println System/out (str "Created bucket " bucket-name " Response status: " (:status response))))
+    (catch Exception e
+      (.println System/out (str "Failed to create bucket " bucket-name ": " (.getMessage e) " - " (pr-str e))))))
+
 (defn localstack-fixture [f]
   ;; Set up AWS credentials as system properties
   (System/setProperty "aws.accessKeyId" "test")
-  (System/setProperty "aws.secretAccessKey" "test")
+  (System/setProperty "aws.secretKey" "test")
   (System/setProperty "aws.region" "us-east-1")
 
   (let [container-info (start-localstack-container)]
     (try
       (binding [*localstack-container* (:container container-info)
                 *s3-endpoint* (str (:endpoint container-info))]
+        (.println System/out (str "LocalStack endpoint: " *s3-endpoint*))
+        ;; Wait a moment for LocalStack to be fully ready
+        (Thread/sleep 2000)
+        ;; Create test buckets
+        (.println System/out "Creating buckets...")
+        (create-s3-bucket "fluree-test" *s3-endpoint*)
+        (create-s3-bucket "fluree-indexing-test" *s3-endpoint*)
+        (.println System/out "Buckets created, running tests...")
         (f))
       (finally
         (stop-localstack-container container-info)))))
 
 (use-fixtures :once localstack-fixture)
 
-(defn create-s3-client []
-  (let [endpoint-url (java.net.URL. *s3-endpoint*)]
-    (aws/client {:api :s3
-                 :credentials-provider (reify cognitect.aws.credentials/CredentialsProvider
-                                         (fetch [_] {:aws/access-key-id "test"
-                                                     :aws/secret-access-key "test"}))
-                 :endpoint-override {:protocol (keyword (.getProtocol endpoint-url))
-                                     :hostname (.getHost endpoint-url)
-                                     :port (.getPort endpoint-url)}})))
-
 (deftest ^:integration ^:docker s3-testcontainers-basic-test
   (testing "Basic S3 operations with testcontainers"
-    (let [bucket "fluree-test"
-          client (create-s3-client)]
+    (let [bucket "fluree-test"]
 
-      ;; Create bucket
-      (let [create-resp (aws/invoke client {:op :CreateBucket
-                                            :request {:Bucket bucket}})]
-        (println "Create bucket response:" create-resp))
-
-      ;; Verify bucket exists
-      (let [buckets-resp (aws/invoke client {:op :ListBuckets})
-            bucket-names (set (map :Name (:Buckets buckets-resp)))]
-        (println "List buckets response:" buckets-resp)
-        (println "Bucket names:" bucket-names)
-        (is (contains? bucket-names bucket) "Bucket should be created"))
-
-      ;; Test Fluree connection with mocked AWS client
-      (with-redefs [s3/create-aws-client
-                    (fn [aws-opts]
-                      (let [endpoint-url (java.net.URL. *s3-endpoint*)]
-                        (aws/client
-                         (assoc aws-opts
-                                :credentials-provider (reify credentials/CredentialsProvider
-                                                        (fetch [_] {:aws/access-key-id "test"
-                                                                    :aws/secret-access-key "test"}))
-                                :endpoint-override {:protocol (keyword (.getProtocol endpoint-url))
-                                                    :hostname (.getHost endpoint-url)
-                                                    :port (.getPort endpoint-url)}))))]
+      ;; Test Fluree connection with LocalStack endpoint override
+      (with-redefs [s3/build-s3-url
+                    (fn [bucket _region path]
+                      ;; Override to use LocalStack endpoint instead of AWS
+                      (str *s3-endpoint* "/" bucket "/" path))]
         (let [conn @(fluree/connect-s3 {:s3-bucket bucket
                                         :s3-prefix "test"
                                         :s3-endpoint *s3-endpoint*
@@ -150,25 +140,13 @@
 
 (deftest ^:integration ^:docker s3-testcontainers-indexing-test
   (testing "S3 storage with indexing using testcontainers"
-    (let [bucket "fluree-indexing-test"
-          client (create-s3-client)]
+    (let [bucket "fluree-indexing-test"]
 
-      ;; Create bucket
-      (aws/invoke client {:op :CreateBucket
-                          :request {:Bucket bucket}})
-
-      ;; Connect with indexing configuration using mocked AWS client
-      (with-redefs [s3/create-aws-client
-                    (fn [aws-opts]
-                      (let [endpoint-url (java.net.URL. *s3-endpoint*)]
-                        (aws/client
-                         (assoc aws-opts
-                                :credentials-provider (reify credentials/CredentialsProvider
-                                                        (fetch [_] {:aws/access-key-id "test"
-                                                                    :aws/secret-access-key "test"}))
-                                :endpoint-override {:protocol (keyword (.getProtocol endpoint-url))
-                                                    :hostname (.getHost endpoint-url)
-                                                    :port (.getPort endpoint-url)}))))]
+      ;; Connect with indexing configuration using LocalStack endpoint override
+      (with-redefs [s3/build-s3-url
+                    (fn [bucket _region path]
+                      ;; Override to use LocalStack endpoint instead of AWS
+                      (str *s3-endpoint* "/" bucket "/" path))]
         (let [conn @(fluree/connect-s3 {:s3-bucket bucket
                                         :s3-prefix "indexing"
                                         :s3-endpoint *s3-endpoint*
@@ -196,10 +174,10 @@
                                                "select" "(count ?s)"
                                                "where" {"@id" "?s"
                                                         "@type" "ex:Person"}})
-                  ;; Verify index files were created in S3
-                  objects-resp (aws/invoke client {:op :ListObjectsV2
-                                                   :request {:Bucket bucket
-                                                             :Prefix "indexing/"}})
+                  ;; Verify index files were created in S3 using our s3-list
+                  store (s3/->S3Store nil (s3/get-credentials) bucket "us-east-1" "indexing")
+                  list-ch (s3/s3-list store "")
+                  objects-resp (<!! list-ch)
                   object-keys (map :Key (:Contents objects-resp))]
 
               (is (= [50] count-result) "Should have 50 persons")

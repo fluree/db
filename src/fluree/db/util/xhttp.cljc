@@ -10,7 +10,7 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true])
   #?(:clj
-     (:import (java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse HttpResponse$BodyHandlers)
+     (:import (java.net.http HttpClient HttpRequest HttpRequest$Builder HttpRequest$BodyPublishers HttpResponse HttpResponse$BodyHandlers)
               (java.net URI)
               (java.time Duration)
               (java.util.concurrent TimeoutException))))
@@ -102,9 +102,11 @@
            (let [builder (-> (HttpRequest/newBuilder)
                              (.uri (URI/create url))
                              (.timeout (Duration/ofMillis request-timeout))
-                             (.POST (HttpRequest$BodyPublishers/ofString (if multipart?
-                                                                           (throw (ex-info "Multipart not yet supported in native HTTP client" {:url url}))
-                                                                           message))))]
+                             (.POST (if multipart?
+                                      (throw (ex-info "Multipart not yet supported in native HTTP client" {:url url}))
+                                      (if (bytes? message)
+                                        (HttpRequest$BodyPublishers/ofByteArray message)
+                                        (HttpRequest$BodyPublishers/ofString message)))))]
              ;; Add headers
              (doseq [[k v] headers*]
                (.header builder k v))
@@ -116,9 +118,8 @@
                    body (.body response)]
                (if (< 299 status)
                  (async/put! response-chan
-                             (format-error-response url
-                                                    (ex-info "HTTP error response"
-                                                             {:status status :body body})))
+                             (ex-info (str "HTTP error response: " body)
+                                      {:status status :body body :url url}))
                  (let [data (try (cond-> body
                                    json? (json/parse keywordize-keys))
                                  (catch Exception e
@@ -209,9 +210,8 @@
                                 :error   :db/invalid-query}]
                      (async/put! response-chan error))
                    (async/put! response-chan
-                               (format-error-response url
-                                                      (ex-info "HTTP error response"
-                                                               {:status status :body body}))))
+                               (ex-info (str "HTTP error response: " body)
+                                        {:status status :body body :url url})))
                  (async/put! response-chan
                              (case output-format
                                (:text :json)    body
@@ -250,6 +250,100 @@
                           (assoc :output-format :json))
                 (:body opts) (assoc :body (json/stringify (:body opts))))]
     (get url opts*)))
+
+(defn put
+  "http PUT request"
+  [url body opts]
+  (let [{:keys [request-timeout headers]
+         :or {request-timeout 5000}} opts
+        response-chan (async/chan)]
+    #?(:clj
+       (async/go
+         (try
+           (let [builder (-> (HttpRequest/newBuilder)
+                             (.uri (URI/create url))
+                             (.timeout (Duration/ofMillis request-timeout))
+                             (.PUT (if (bytes? body)
+                                     (HttpRequest$BodyPublishers/ofByteArray body)
+                                     (HttpRequest$BodyPublishers/ofString body))))
+                 builder (reduce-kv (fn [^HttpRequest$Builder b k v]
+                                      (.header b k v))
+                                    builder
+                                    headers)
+                 request (.build ^HttpRequest$Builder builder)
+                 ^HttpClient client @http-client
+                 ^HttpResponse response (.send client request (HttpResponse$BodyHandlers/ofString))
+                 status (.statusCode response)
+                 body-resp (.body response)]
+             (if (< 299 status)
+               (async/put! response-chan
+                           (ex-info (str "HTTP error response: " body-resp)
+                                    {:status status :body body-resp :url url}))
+               (async/put! response-chan body-resp)))
+           (catch TimeoutException e
+             (async/put! response-chan
+                         (format-error-response url e)))
+           (catch Exception e
+             (async/put! response-chan
+                         (format-error-response url e)))))
+       :cljs (-> axios
+                 (.request (clj->js {:url url
+                                     :method "put"
+                                     :data body
+                                     :timeout request-timeout
+                                     :headers headers}))
+                 (.then (fn [resp]
+                          (let [data (:data (js->clj resp :keywordize-keys true))]
+                            (async/put! response-chan data))))
+                 (.catch (fn [err]
+                           (async/put! response-chan (format-error-response url err))))))
+    response-chan))
+
+(defn delete
+  "http DELETE request"
+  [url opts]
+  (let [{:keys [request-timeout headers]
+         :or {request-timeout 5000}} opts
+        response-chan (async/chan)]
+    #?(:clj
+       (async/go
+         (try
+           (let [builder (-> (HttpRequest/newBuilder)
+                             (.uri (URI/create url))
+                             (.timeout (Duration/ofMillis request-timeout))
+                             (.DELETE))
+                 builder (reduce-kv (fn [^HttpRequest$Builder b k v]
+                                      (.header b k v))
+                                    builder
+                                    headers)
+                 request (.build ^HttpRequest$Builder builder)
+                 ^HttpClient client @http-client
+                 ^HttpResponse response (.send client request (HttpResponse$BodyHandlers/ofString))
+                 status (.statusCode response)
+                 body (.body response)]
+             (if (< 299 status)
+               (async/put! response-chan
+                           (format-error-response url
+                                                  (ex-info "HTTP error response"
+                                                           {:status status :body body})))
+               (async/put! response-chan body)))
+           (catch TimeoutException e
+             (async/put! response-chan
+                         (format-error-response url e)))
+           (catch Exception e
+             (async/put! response-chan
+                         (format-error-response url e)))))
+       :cljs (-> axios
+                 (.request (clj->js {:url url
+                                     :method "delete"
+                                     :timeout request-timeout
+                                     :headers headers}))
+                 (.then (fn [resp]
+                          (let [data (:data (js->clj resp :keywordize-keys true))]
+                            (async/put! response-chan data))))
+                 (.catch (fn [err]
+                           (async/put! response-chan (format-error-response url err))))))
+    response-chan))
 
 (def ws-close-status-codes
   {:normal-close {:code 1000 :reason "Normal closure"}
