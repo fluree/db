@@ -6,6 +6,7 @@
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.ledger :as ledger]
+            [fluree.db.nameservice.virtual-graph :as ns-vg]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.history :as history]
@@ -16,7 +17,8 @@
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph.nameservice-loader :as vg-loader]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -190,19 +192,59 @@
                  parse-t-val)]
       [alias nil])))
 
+(defn- extract-primary-ledger-name
+  "Extracts the primary ledger name from a collection of dependencies.
+  Looks for the first dependency with a ledger reference pattern (e.g., 'mydb@main')
+  and returns just the ledger name part (e.g., 'mydb')."
+  [dependencies]
+  (some->> dependencies
+           (map #(get % "@id"))
+           (filter #(re-matches #"^[^#]+@\w+$" %))  ; Match ledger@branch pattern
+           first
+           (re-find #"^([^@]+)@")                    ; Extract ledger name before @
+           second))
+
+(defn load-virtual-graph
+  "Loads a virtual graph from nameservice and returns it as a DB-like object."
+  [conn vg-name]
+  (go-try
+    (let [primary-publisher (connection/primary-publisher conn)
+          vg-record (<? (ns-vg/get-virtual-graph primary-publisher vg-name))]
+      (if (= :not-found vg-record)
+        ;; Not a virtual graph, return nil
+        nil
+        ;; This is a virtual graph - need to instantiate it
+        ;; For now, we need to get a ledger to associate with the VG
+        ;; In the future, VGs could be completely independent
+        (let [dependencies (get vg-record "f:dependencies")
+              ;; Find first ledger dependency
+              primary-ledger (extract-primary-ledger-name dependencies)]
+          (if primary-ledger
+            (let [ledger (<? (connection/load-ledger-alias conn primary-ledger))
+                  db (ledger/current-db ledger)]
+              ;; Load the VG directly using the nameservice
+              (<? (vg-loader/load-virtual-graph-from-nameservice db primary-publisher vg-name)))
+            (throw (ex-info (str "Virtual graph has no ledger dependencies: " vg-name)
+                            {:status 400 :error :db/invalid-configuration}))))))))
+
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
   (go-try
     (try*
-      (let [[alias explicit-t] (extract-query-string-t alias)
-            ledger       (<? (connection/load-ledger-alias conn alias))
-            db           (ledger/current-db ledger)
-            t*           (or explicit-t t)
-            query*       (assoc sanitized-query :t t*)]
-        (<? (restrict-db db tracker query* conn)))
+      ;; First try to load as virtual graph
+      (if-let [vg (<? (load-virtual-graph conn alias))]
+        ;; Virtual graphs don't need restrict-db as they handle their own restrictions
+        vg
+        ;; Not a virtual graph, load as regular ledger
+        (let [[alias explicit-t] (extract-query-string-t alias)
+              ledger       (<? (connection/load-ledger-alias conn alias))
+              db           (ledger/current-db ledger)
+              t*           (or explicit-t t)
+              query*       (assoc sanitized-query :t t*)]
+          (<? (restrict-db db tracker query* conn))))
       (catch* e
         (throw (contextualize-ledger-400-error
-                (str "Error loading ledger " alias ": ")
+                (str "Error loading resource " alias ": ")
                 e))))))
 
 (defn load-aliases
@@ -220,7 +262,7 @@
     (loop [[alias & r] aliases
            db-map      {}]
       (if alias
-       ;; TODO: allow restricting federated dataset components individually by t
+        ;; TODO: allow restricting federated dataset components individually by t
         (let [db      (<? (load-alias conn tracker alias sanitized-query))
               db-map* (assoc db-map alias db)]
           (recur r db-map*))

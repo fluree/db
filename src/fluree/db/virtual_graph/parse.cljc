@@ -151,8 +151,9 @@
   Note the property dependencies cannot be turned into encoded IRIs
   (internal format) yet, because the namespaces used in the query may
   not yet exist if this index was created before data."
-  [{:keys [query] :as bm25-opts} db-vol]
-  (let [parsed-query  (-> (parse-query query)
+  [bm25-opts db-vol]
+  (let [query (or (get bm25-opts "query") (:query bm25-opts))
+        parsed-query  (-> (parse-query query)
                           (ensure-select-subgraph))
         ;; TODO - ultimately we want a property dependency chain, so when the properties change we can
         ;; TODO - trace up the chain to the node(s) that depend on them and update the index accordingly

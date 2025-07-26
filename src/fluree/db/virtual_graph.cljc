@@ -8,7 +8,28 @@
 
 (defn vg-type-name
   [vg]
-  (-> vg :type first iri/get-name str/lower-case))
+  (let [vg-type (:type vg)]
+    (cond
+      ;; Handle SID type (old format)
+      (and (vector? vg-type) (iri/sid? (first vg-type)))
+      (-> vg-type first iri/get-name str/lower-case)
+
+      ;; Handle string array type from nameservice
+      (and (vector? vg-type) (string? (first vg-type)))
+      (let [type-str (->> vg-type
+                          (filter #(str/starts-with? % "fidx:"))
+                          first)]
+        (when type-str
+          (-> type-str (str/split #":") second str/lower-case)))
+
+      ;; Handle single string type
+      (string? vg-type)
+      (if (str/includes? vg-type ":")
+        (-> vg-type (str/split #":") second str/lower-case)
+        (str/lower-case vg-type))
+
+      :else
+      (throw (ex-info "Unknown VG type format" {:type vg-type})))))
 
 (defn vg-type-kw
   [vg]
@@ -18,9 +39,11 @@
   (fn [_index-catalog vg]
     (vg-type-kw vg)))
 
-(defn storage-path
-  [vg-type db-alias vg-alias]
-  (str/join "/" [db-alias (name vg-type) vg-alias]))
+(defn vg-storage-path
+  "Returns the storage path for a virtual graph that is independent of any ledger.
+  Path structure: virtual-graphs/{vg-name}/{type}/"
+  [vg-type vg-name]
+  (str/join "/" ["virtual-graphs" vg-name (name vg-type)]))
 
 (defmulti read-vg
   (fn [_index-catalog storage-meta]

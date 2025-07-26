@@ -76,13 +76,6 @@
      (throw (ex-info "Creating BM25 indexes not supported in cljs"
                      {:status 400, :error :db/invalid-index}))))
 
-(defn load-virtual-graph
-  [db alias]
-  (or (get-in db [:vg alias])
-      (throw (ex-info (str "Virtual graph requested: " alias " does not exist for the db.")
-                      {:status 400
-                       :error  :db/invalid-query}))))
-
 (defn update-vgs
   "Accepts a db that contains virtual graphs, and
   kicks a potential update to each of them with the

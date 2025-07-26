@@ -203,11 +203,6 @@
   [match]
   (select-keys match [::iri ::val ::datatype-iri ::sids]))
 
-(defn virtual-graph?
-  "Returns true if named graph alias is a virtual graph (e.g. vector index)."
-  [graph-alias]
-  (str/starts-with? graph-alias "##"))
-
 (defn ->pattern
   "Build a new non-tuple match pattern of type `typ`."
   [typ data]

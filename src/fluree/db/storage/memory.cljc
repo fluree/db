@@ -3,7 +3,8 @@
             [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.db.storage :as storage]
-            [fluree.db.util.json :as json]))
+            [fluree.db.util.json :as json]
+            [fluree.db.util.log :as log]))
 
 (def method-name "memory")
 
@@ -58,6 +59,7 @@
   storage/ByteStore
   (write-bytes [_ path bytes]
     (go
+      (log/debug "Memory store writing to path:" path "bytes length:" (count bytes))
       (swap! contents assoc path bytes)))
 
   (read-bytes [_ path]
@@ -68,11 +70,18 @@
   (list-paths-recursive [_ prefix]
     ;; Memory storage already stores flat paths, so recursive is the same as regular listing
     (go
-      (->> @contents
-           keys
-           (filter #(and (str/starts-with? % prefix)
-                         (str/ends-with? % ".json")))
-           vec))))
+      ;; Filter keys in contents that start with the prefix and end with .json
+      ;; AND are in the immediate directory (no additional slashes after prefix)
+      (let [all-keys (keys @contents)
+            prefix-with-slash (if (str/ends-with? prefix "/") prefix (str prefix "/"))]
+        (->> all-keys
+             (filter (fn [path]
+                       (and (str/starts-with? path prefix-with-slash)
+                            (str/ends-with? path ".json")
+                                                      ;; Check that there are no additional slashes after the prefix
+                            (let [relative-path (subs path (count prefix-with-slash))]
+                              (not (str/includes? relative-path "/"))))))
+             vec)))))
 
 (defn open
   ([]

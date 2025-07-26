@@ -1,10 +1,52 @@
 (ns fluree.db.vector.bm25-test
-  (:require [babashka.fs :refer [with-temp-dir]]
-            [clojure.core.async :as async]
+  (:require [clojure.core.async :as async]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
-            [fluree.db.util :as util]))
+            [fluree.db.test-utils :as test-utils]))
+
+(deftest ^:integration basic-connection-test
+  (testing "Basic connection and ledger operations work"
+    (let [conn   (test-utils/create-conn)]
+      (testing "connection creation succeeds"
+        (is (some? conn)))
+
+      (testing "ledger creation succeeds"
+        (let [ledger @(fluree/create conn "test-basic")]
+          (is (some? ledger))))
+
+      (testing "data insertion succeeds"
+        (let [db @(fluree/insert! conn "test-basic"
+                                  {"@context" {"ex" "http://example.org/"}
+                                   "@graph" [{"@id" "ex:article1"
+                                              "@type" "ex:Article"
+                                              "ex:title" "Test Article"}]})]
+          (is (some? db)))))))
+
+(deftest ^:integration bm25-creation-test
+  (testing "Basic virtual graph creation test"
+    (let [conn   (test-utils/create-conn)
+          _ledger @(fluree/create conn "bm25-creation")
+          _db     @(fluree/insert! conn "bm25-creation"
+                                   {"@context" {"ex" "http://example.org/"}
+                                    "@graph" [{"@id" "ex:article1"
+                                               "@type" "ex:Article"
+                                               "ex:title" "Introduction to Fluree"
+                                               "ex:content" "Fluree is a semantic graph database"}]})
+          ;; Create VG using new API
+          vg-result @(fluree/create-virtual-graph
+                      conn
+                      {:name "creation-test-index"
+                       :type :bm25
+                       :config {:ledgers ["bm25-creation"]
+                                :query {"@context" {"ex" "http://example.org/"}
+                                        "where" [{"@id" "?x"
+                                                  "@type" "ex:Article"}]
+                                        "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})]
+
+      (println "RESULT: " vg-result)
+      (testing "virtual graph creation succeeds"
+        (is (some? vg-result))
+        (is (= "creation-test-index" vg-result))))))
 
 (defn full-text-search
   "Performs a full text search and returns a couple attributes joined from the db
@@ -49,6 +91,7 @@
          (do
            (Thread/sleep 100)
            (recur conn-settings ledger-name (inc retry-count))))))))
+<<<<<<< HEAD
 
 (deftest ^:integration bm25-index-search
   (testing "Creating and using a bm25 index after inserting data"
@@ -516,3 +559,5 @@
           (is (= expected-result
                  (full-text-search db2-l "Apples for snacks for John"))
               "db returned from (fluree/load ...) had issues"))))))
+=======
+>>>>>>> b963a392c (Refactor virtual graph storage and fix critical bugs)

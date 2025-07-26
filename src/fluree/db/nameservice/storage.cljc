@@ -5,6 +5,7 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
 
@@ -104,9 +105,7 @@
                 (if file-content
                   (let [content-str (if (string? file-content)
                                       file-content
-                                      #?(:clj (let [^bytes bytes-content file-content]
-                                                (String. bytes-content "UTF-8"))
-                                         :cljs (js/String.fromCharCode.apply nil file-content)))
+                                      (bytes/UTF8->string file-content))
                         record (json/parse content-str false)]
                     (recur (rest remaining-paths) (conj records record)))
                   (recur (rest remaining-paths) records)))
@@ -114,7 +113,7 @@
           [])
         ;; Fallback for stores that don't support ListableStore
         (do
-          (log/warn "Storage backend does not support RecursiveListableStore protocol")
+          (log/debug "Storage backend does not support ListableStore protocol")
           [])))))
 
 (defn start

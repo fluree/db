@@ -11,8 +11,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.track :as track]
             [fluree.db.util :as util]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.virtual-graph.index-graph :as vg]))
+            [fluree.db.util.async :refer [<? go-try]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -83,6 +82,7 @@
                      result
                      [@db-vol result]))))))
 
+;; Virtual graphs are now created through the nameservice API, not transactions
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
@@ -97,8 +97,7 @@
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
                            (commit-data/add-tt-id)
-                           (vocab/hydrate-schema add)
-                           (vg/check-virtual-graph add remove))]
+                           (vocab/hydrate-schema add))]
       {:add       add
        :remove    remove
        :db-after  db-after

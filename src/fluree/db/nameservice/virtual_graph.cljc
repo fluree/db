@@ -1,10 +1,6 @@
 (ns fluree.db.nameservice.virtual-graph
-  (:require [clojure.string :as str]
-            [fluree.db.flake.commit-data :as commit-data]
-            [fluree.db.json-ld.iri :as iri]
+  (:require [fluree.db.json-ld.iri :as iri]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.nameservice.storage :as ns-storage]
-            [fluree.db.util :as util]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
@@ -13,34 +9,33 @@
 
 (defn vg-filename
   "Returns the nameservice filename for a virtual graph"
-  [ledger-alias vg-alias]
-  (str "ns@v1/" ledger-alias "##" vg-alias ".json"))
+  [vg-name]
+  (str "ns@v1/" vg-name ".json"))
 
 (defn vg-record
   "Generates a virtual graph nameservice record"
-  [{:keys [ledger-alias vg-alias vg-type config dependencies status]
+  [{:keys [vg-name vg-type config dependencies status]
     :or {status "ready"}}]
-  (let [vg-id (str ledger-alias "##" vg-alias)]
-    {"@context" {"f" iri/f-ns
-                 "fidx" "https://ns.flur.ee/index#"}
-     "@id" vg-id
-     "@type" (cond-> ["f:VirtualGraphDatabase"]
-               vg-type (conj vg-type))
-     "f:ledger" {"@id" ledger-alias}
-     "f:virtualGraph" vg-alias
-     "f:status" status
-     "f:dependencies" (mapv (fn [dep] {"@id" dep}) dependencies)
-     "fidx:config" {"@type" "@json"
-                    "@value" config}}))
+  {"@context" {"f" iri/f-ns
+               "fidx" "https://ns.flur.ee/index#"}
+   "@id" vg-name
+   "@type" (cond-> ["f:VirtualGraphDatabase"]
+             vg-type (conj vg-type))
+   "f:name" vg-name
+   "f:status" status
+   "f:dependencies" (mapv (fn [dep] {"@id" dep}) dependencies)
+   "fidx:config" {"@type" "@json"
+                  "@value" config}})
 
 (defn publish-virtual-graph
   "Publishes a virtual graph configuration to the nameservice"
-  [publisher {:keys [ledger-alias] :as vg-config}]
+  [publisher vg-config]
   (go-try
     (let [vg-record (vg-record vg-config)
           record-bytes (json/stringify-UTF8 vg-record)
-          filename (vg-filename ledger-alias (:vg-alias vg-config))]
-      (<? (nameservice/publish publisher 
+          filename (vg-filename (:vg-name vg-config))]
+      (log/debug "Published virtual graph successfully:" (:vg-name vg-config))
+      (<? (nameservice/publish publisher
                                {"type" "virtual-graph"
                                 "record" vg-record
                                 "filename" filename
@@ -48,9 +43,9 @@
 
 (defn retract-virtual-graph
   "Removes a virtual graph from the nameservice"
-  [publisher ledger-alias vg-alias]
+  [publisher vg-name]
   (go-try
-    (let [filename (vg-filename ledger-alias vg-alias)]
+    (let [filename (vg-filename vg-name)]
       (<? (nameservice/retract publisher filename)))))
 
 (defn parse-vg-id
@@ -62,29 +57,24 @@
      :vg-alias vg}))
 
 (defn list-virtual-graphs
-  "Lists all virtual graphs for a given ledger from the nameservice"
-  [nameservice ledger-alias]
+  "Lists all virtual graphs from the nameservice"
+  [nameservice]
   (go-try
-    (let [all-records (<? (nameservice/all-records nameservice))
-          prefix (str ledger-alias "##")]
-      (->> all-records
-           (filter #(str/starts-with? (get % "@id") prefix))
-           (filter #(some #{"f:VirtualGraphDatabase"} (get % "@type")))))))
+    (->> (<? (nameservice/all-records nameservice))
+         (filter #(some #{"f:VirtualGraphDatabase"} (get % "@type"))))))
 
 (defn get-virtual-graph
   "Retrieves a specific virtual graph record from the nameservice"
-  [nameservice ledger-alias vg-alias]
+  [nameservice vg-name]
   (go-try
-    (let [vg-id (str ledger-alias "##" vg-alias)
-          all-records (<? (nameservice/all-records nameservice))]
-      (or (->> all-records
-               (filter #(= (get % "@id") vg-id))
-               first)
-          :not-found))))
+    (or (->> (<? (nameservice/all-records nameservice))
+             (filter #(= (get % "@id") vg-name))
+             first)
+        :not-found)))
 
 (defn virtual-graph-exists?
   "Checks if a virtual graph exists in the nameservice"
-  [nameservice ledger-alias vg-alias]
+  [nameservice vg-name]
   (go-try
-    (let [vg (<? (get-virtual-graph nameservice ledger-alias vg-alias))]
+    (let [vg (<? (get-virtual-graph nameservice vg-name))]
       (not= :not-found vg))))
