@@ -313,12 +313,10 @@
             index-address  (get-in ns-record ["f:index" "@id"])
 
             ;; Load full commit from disk
+            _              (log/debug "Attempting to load from address:" address)
             commit         (<? (commit-storage/load-commit-with-metadata commit-catalog
                                                                          commit-address
                                                                          index-address))
-
-            _              (log/debug "Attempting to load from address:" address
-                                      "with commit:" commit)
             expanded-commit (json-ld/expand commit)
             ledger-alias    (commit->ledger-alias conn address expanded-commit)
             branch          (-> expanded-commit

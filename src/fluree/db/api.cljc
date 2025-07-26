@@ -682,11 +682,10 @@
    (promise-wrap
     (go-try
       ;; Get the nameservice from the connection's primary publisher
-      (let [primary-publisher (:primary-publisher conn)]
-        (if primary-publisher
-          (<? (ns-query/query-nameservice primary-publisher query opts))
-          (throw (ex-info "No nameservice available for querying"
-                          {:status 400 :error :db/no-nameservice}))))))))
+      (if-some [primary-publisher (:primary-publisher conn)]
+        (<? (ns-query/query-nameservice primary-publisher query opts))
+        (throw (ex-info "No nameservice available for querying"
+                        {:status 400 :error :db/no-nameservice})))))))
 
 (defn history
   "Queries the history of entities across commits.
