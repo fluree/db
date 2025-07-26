@@ -4,8 +4,8 @@
             [fluree.db.serde.protocol :as serde]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.log :as log]
             [fluree.db.virtual-graph :as vg]
-            [fluree.db.virtual-graph.bm25.index :as bm25]
             [fluree.db.virtual-graph.bm25.stemmer :as stemmer]
             [fluree.db.virtual-graph.bm25.stopwords :as stopwords]
             [fluree.db.virtual-graph.parse :as parse]))
@@ -91,7 +91,12 @@
       (select-keys [:k1 :b :index-state :initialized :genesis-t :t :alias :db-alias
                     :query :namespace-codes :property-deps :type :lang :id :vg-name])
       (update :index-state state-data)
-      (update :type (partial mapv iri/serialize-sid))
+      ;; Type can be either SIDs or strings, handle both
+      (update :type (fn [type-val]
+                      (if (and (vector? type-val)
+                               (string? (first type-val)))
+                        type-val  ; Already strings, keep as-is
+                        (mapv iri/serialize-sid type-val))))
       (update :property-deps (partial map iri/serialize-sid))))
 
 (defn get-property-sids
@@ -119,21 +124,29 @@
         (update :k1 coerce-double))))
 
 (defmethod vg/write-vg :bm25
-  [{:keys [storage serializer] :as _index-catalog} {:keys [alias db-alias] :as vg}]
+  [{:keys [storage serializer] :as _index-catalog} {:keys [vg-name alias] :as vg}]
   (go-try
     (let [data            (vg-data vg)
           serialized-data (serde/-serialize-bm25 serializer data)
-          path            (vg/storage-path :bm25 db-alias (vg/trim-alias-ref alias))
+          ;; Use vg-name if available (new style), otherwise fall back to alias
+          vg-identifier   (or vg-name (vg/trim-alias-ref alias))
+          path            (vg/vg-storage-path :bm25 vg-identifier)
           write-res       (<? (storage/content-write-json storage path serialized-data))]
+      (log/debug "BM25 write-vg - write result:" write-res)
       (assoc write-res :type "bm25"))))
 
 (defmethod vg/read-vg :bm25
   [{:keys [storage serializer] :as _index-catalog} {:keys [address] :as _vg-meta}]
   (go-try
     (if-let [serialized-data (<? (storage/read-json storage address false))]
-      (-> (serde/-deserialize-bm25 serializer serialized-data)
-          reify-bm25
-          bm25/map->BM25-VirtualGraph)
+      (let [bm25-data (-> (serde/-deserialize-bm25 serializer serialized-data)
+                          reify-bm25)
+            ;; Dynamic lookup to avoid circular dependency
+            map->BM25-VirtualGraph (ns-resolve 'fluree.db.virtual-graph.bm25.index
+                                               'map->BM25-VirtualGraph)]
+        (if map->BM25-VirtualGraph
+          (map->BM25-VirtualGraph bm25-data)
+          (throw (ex-info "BM25 index namespace not loaded" {}))))
       (throw (ex-info (str "Could not load bm25 index at address: "
                            address ".")
                       {:status 400, :error :db/unavailable})))))

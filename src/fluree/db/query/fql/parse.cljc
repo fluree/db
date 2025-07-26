@@ -558,21 +558,10 @@
   [[_ patterns] vars context]
   [(where/->pattern :minus (parse-where-clause patterns vars context))])
 
-;; TODO: This function is only necessary because ledger aliases might not be
-;; valid IRIs but virtual graph aliases are. We should require that all ledger
-;; aliases/graph names be IRIs.
-(defn parse-graph-string
-  [graph context]
-  (when (string? graph)
-    (let [expanded (json-ld/expand-iri graph context)]
-      (if (where/virtual-graph? expanded)
-        expanded
-        graph))))
-
 (defmethod parse-pattern :graph
   [[_ graph where] vars context]
   (let [graph* (or (parse-variable graph)
-                   (parse-graph-string graph context))
+                   graph)
         where* (parse-where-clause where vars context)]
     [(where/->pattern :graph [graph* where*])]))
 

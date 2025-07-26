@@ -1,6 +1,7 @@
 (ns fluree.db.api
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.core.async :as async :refer [go <!]]
+            [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.connection :as connection :refer [connection?]]
@@ -20,6 +21,7 @@
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph.nameservice-loader :as vg-loader]
             [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge load range exists? update drop]))
 
@@ -234,6 +236,8 @@
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
    (validate-connection conn)
+   (when (and (string? ledger-alias) (str/includes? ledger-alias "@"))
+     (throw (ex-info "Ledger alias cannot contain '@' symbol" {:error :db/invalid-config :alias ledger-alias})))
    (promise-wrap
     (do
       (log/info "Creating ledger" ledger-alias)
@@ -245,8 +249,7 @@
   Parameters:
     conn - Connection object
     config - Virtual graph configuration map:
-      :ledger - Ledger alias this VG belongs to
-      :alias - Virtual graph alias (e.g. \"articleSearch\")
+      :name - Virtual graph name (any unique identifier)
       :type - Virtual graph type (e.g. :bm25)
       :config - Type-specific configuration
       :dependencies - (optional) List of ledger dependencies
@@ -255,41 +258,49 @@
     :stemmer - Stemmer identifier (e.g. \"snowballStemmer-en\")
     :stopwords - Stopwords identifier (e.g. \"stopwords-en\")
     :query - FQL query defining documents to index
+    :ledgers - List of ledger aliases to index from
 
-  Returns promise resolving to virtual graph ID."
-  [conn {:keys [ledger alias type config dependencies] :as vg-config}]
+  Returns promise resolving to virtual graph name."
+  [conn {:keys [name type config dependencies]}]
   (validate-connection conn)
   (promise-wrap
    (go-try
-     (when-not ledger
-       (throw (ex-info "Virtual graph requires :ledger alias" {:error :db/invalid-config})))
-     (when-not alias
-       (throw (ex-info "Virtual graph requires :alias" {:error :db/invalid-config})))
+     (when-not name
+       (throw (ex-info "Virtual graph requires :name" {:error :db/invalid-config})))
      (when-not type
        (throw (ex-info "Virtual graph requires :type" {:error :db/invalid-config})))
-     
-     (let [ledger-alias (if (keyword? ledger) (name ledger) ledger)
-           vg-alias (if (keyword? alias) (name alias) alias)
+     (when (and (string? name) (str/includes? name "@"))
+       (throw (ex-info "Virtual graph name cannot contain '@' symbol" {:error :db/invalid-config :name name})))
+
+     (let [vg-name (if (keyword? name) (clojure.core/name name) name)
            vg-type (case type
                      :bm25 "fidx:BM25"
                      (throw (ex-info (str "Unknown virtual graph type: " type) {:error :db/invalid-config})))
-           dependencies (or dependencies [(str ledger-alias "@main")])
+           ledgers (get-in config [:ledgers] [])
+           dependencies (or dependencies (mapv #(str % "@main") ledgers))
            publisher (connection/primary-publisher conn)
-           full-config {:ledger-alias ledger-alias
-                        :vg-alias vg-alias
+           full-config {:vg-name vg-name
                         :vg-type vg-type
                         :config config
                         :dependencies dependencies}]
-       
+
        ;; Check if virtual graph already exists
-       (when (<? (ns-vg/virtual-graph-exists? publisher ledger-alias vg-alias))
-         (throw (ex-info (str "Virtual graph already exists: " ledger-alias "##" vg-alias)
+       (when (<? (ns-vg/virtual-graph-exists? publisher vg-name))
+         (throw (ex-info (str "Virtual graph already exists: " vg-name)
                          {:error :db/invalid-config})))
-       
+
        ;; Publish to nameservice
        (<? (ns-vg/publish-virtual-graph publisher full-config))
-       
-       (str ledger-alias "##" vg-alias)))))
+
+       ;; Load and initialize the virtual graph
+       (log/debug "Loading and initializing virtual graph:" vg-name)
+       (doseq [ledger-alias ledgers]
+         (when-let [ledger (<? (connection/load-ledger-alias conn ledger-alias))]
+           (let [db (ledger/current-db ledger)]
+             (<? (vg-loader/load-virtual-graph-from-nameservice db publisher vg-name))
+             (log/debug "Successfully initialized virtual graph:" vg-name "for ledger:" ledger-alias))))
+
+       vg-name))))
 
 (defn alias->address
   "Resolves a ledger alias to its address.
