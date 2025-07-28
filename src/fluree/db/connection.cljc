@@ -3,6 +3,7 @@
   (:require [clojure.core.async :as async :refer [<! go go-loop]]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
+            [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.flake.commit-data :as commit-data]
@@ -457,3 +458,41 @@
   [conn address data]
   (let [clg (-> conn :index-catalog :storage)]
     (storage/write-catalog-bytes clg address data)))
+
+(defn trigger-ledger-index
+  "Manually triggers indexing for a ledger/branch.
+   
+   Options:
+   - :branch - Branch name (defaults to main branch)
+   - :block? - If true, waits for indexing to complete
+   - :timeout - Max wait time in ms when blocking (default 300000 / 5 minutes)
+   
+   Returns a promise that resolves to:
+   - If :block? is false: {:status :queued}
+   - If :block? is true: {:status :success :db <indexed-db>} or {:status :error :error <error>}"
+  [conn ledger-alias opts]
+  (go-try
+    (let [{:keys [branch block? timeout]
+           :or {timeout 300000}} opts
+          ;; Use the proper ledger loading mechanism that handles both cached and uncached cases
+          ledger (<? (load-ledger-alias conn ledger-alias))]
+      (if-not ledger
+        (throw (ex-info (str "Ledger does not exist: " ledger-alias)
+                        {:status 404 :error :db/invalid-ledger}))
+        (let [current-db (ledger/current-db ledger branch)
+              index-queue (-> ledger
+                              (ledger/get-branch-meta branch)
+                              :index-queue)]
+          (if block?
+            ;; Blocking mode - wait for completion
+            (let [complete-ch (async/chan 1)
+                  timeout-ch (async/timeout timeout)]
+              (branch/enqueue-index! index-queue current-db nil complete-ch)
+              (async/alt!
+                complete-ch ([result] result)
+                timeout-ch {:status :error
+                            :error (ex-info "Indexing timeout" {:timeout timeout})}))
+            ;; Non-blocking mode - just enqueue
+            (do
+              (branch/enqueue-index! index-queue current-db nil)
+              {:status :queued})))))))

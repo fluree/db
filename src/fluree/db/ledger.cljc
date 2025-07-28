@@ -117,7 +117,7 @@
           ::newer)))))
 
 (defrecord Ledger [id address alias did state cache commit-catalog
-                   index-catalog reasoner primary-publisher secondary-publishers])
+                   index-catalog reasoner primary-publisher secondary-publishers indexing-opts])
 
 (defn initial-state
   [branches current-branch]
@@ -143,7 +143,8 @@
                   :primary-publisher    primary-publisher
                   :secondary-publishers secondary-publishers
                   :cache                (atom {})
-                  :reasoner             #{}})))
+                  :reasoner             #{}
+                  :indexing-opts        indexing-opts})))
 
 (defn normalize-alias
   "For a ledger alias, removes any preceding '/' or '#' if exists."
