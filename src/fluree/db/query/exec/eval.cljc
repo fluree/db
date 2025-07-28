@@ -1,7 +1,8 @@
 (ns fluree.db.query.exec.eval
   (:refer-clojure :exclude [compile rand concat replace max min
                             #?(:clj ratio?) #?@(:cljs [uuid -count divide])])
-  (:require [clojure.math :as math]
+  (:require #?@(:clj [[sci.core :as sci]])
+            [clojure.math :as math]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :as walk :refer [postwalk]]
@@ -706,6 +707,267 @@
     cosineSimilarity  fluree.db.query.exec.eval/cosineSimilarity
     euclidianDistance fluree.db.query.exec.eval/euclideanDistance})
 
+;;; =============================================================================
+;;; SCI (Small Clojure Interpreter) Support for GraalVM
+;;; =============================================================================
+;;; This section contains all SCI-related code used for evaluating Clojure forms
+;;; in GraalVM native images where regular eval is not available.
+
+(defn graalvm-build?
+  "Returns true if building for GraalVM. 
+   Checks for environment variable or system property set during build."
+  []
+  #?(:clj (or (System/getenv "FLUREE_GRAALVM_BUILD")
+              (System/getProperty "fluree.graalvm.build"))
+     :cljs false))
+
+(defmacro if-graalvm
+  "Compile-time conditional for GraalVM-specific code.
+   Uses graalvm-branch when building for GraalVM, else-branch otherwise."
+  [graalvm-branch else-branch]
+  (if (graalvm-build?)
+    graalvm-branch
+    else-branch))
+
+;; SCI context for GraalVM-compatible code evaluation
+#?(:clj
+   (defn create-sci-context []
+     (let [;; Separate macros from functions
+           macro-symbols #{'coalesce 'as '-and '-or 'iri '-if 'if}
+
+           ;; Define macro replacements once
+           -if-fn (fn [test then else] (if (:value test) then else))
+           as-fn (fn [expr _alias] expr)
+           -and-fn (fn [& args]
+                     (reduce (fn [result x]
+                               (if (:value result) x result))
+                             (where/->typed-val true)
+                             args))
+           -or-fn (fn [& args]
+                    (reduce (fn [result x]
+                              (if (:value result) result x))
+                            (where/->typed-val nil)
+                            args))
+
+           ;; Build eval namespace, excluding macros for now
+           eval-ns-fns (reduce (fn [acc [k v]]
+                                 (if (contains? macro-symbols k)
+                                   acc
+                                   (try
+                                     (if-let [resolved-var (resolve v)]
+                                       (let [short-name (symbol (name k))
+                                             qualified-name (symbol (name v))
+                                             var-val @resolved-var]
+                                         (-> acc
+                                             (assoc short-name var-val)
+                                             (assoc qualified-name var-val)))
+                                       acc)
+                                     (catch #?(:clj Exception :cljs :default) _
+                                       ;; If we can't resolve (e.g., it's a macro), skip it
+                                       acc))))
+                               {}
+                               qualified-symbols)
+
+           ;; Add special functions and macro replacements
+           eval-ns-fns (-> eval-ns-fns
+                           (assoc '->typed-val where/->typed-val
+                                  'compare* compare*
+                                  ;; Macro replacements
+                                  '-if -if-fn
+                                  'if -if-fn
+                                  'as as-fn
+                                  'fluree.db.query.exec.eval/as as-fn
+                                  '-and -and-fn
+                                  'and -and-fn
+                                  '-or -or-fn
+                                  'or -or-fn))
+
+           ;; Build other namespaces
+           where-ns-fns {'->typed-val where/->typed-val
+                         'get-datatype-iri where/get-datatype-iri
+                         'get-binding where/get-binding
+                         'variable? where/variable?
+                         'mch->typed-val where/mch->typed-val}
+
+           json-ld-fns {'expand-iri json-ld/expand-iri}
+
+           const-ns {'iri-id const/iri-id
+                     '_id const/iri-id}
+
+           ;; Core functions - more efficient to define as a static map
+           core-fns '{instance? instance?
+                      boolean? boolean?
+                      string? string?
+                      number? number?
+                      keyword? keyword?
+                      int? int?
+                      pos-int? pos-int?
+                      nat-int? nat-int?
+                      map? map?
+                      vector? vector?
+                      sequential? sequential?
+                      list? list?
+                      set? set?
+                      coll? coll?
+                      fn? fn?
+                      nil? nil?
+                      some? some?
+                      contains? contains?
+                      empty? empty?
+                      not-empty not-empty
+                      every? every?
+                      some some
+                      filter filter
+                      remove remove
+                      first first
+                      second second
+                      rest rest
+                      next next
+                      last last
+                      butlast butlast
+                      take take
+                      drop drop
+                      take-while take-while
+                      drop-while drop-while
+                      nth nth
+                      count count
+                      get get
+                      get-in get-in
+                      assoc assoc
+                      dissoc dissoc
+                      update update
+                      keys keys
+                      vals vals
+                      merge merge
+                      select-keys select-keys
+                      into into
+                      conj conj
+                      concat concat
+                      mapv mapv
+                      reduce reduce
+                      partition partition
+                      group-by group-by
+                      sort sort
+                      sort-by sort-by
+                      reverse reverse
+                      distinct distinct
+                      flatten flatten
+                      zipmap zipmap
+                      frequencies frequencies
+                      range range
+                      repeat repeat
+                      repeatedly repeatedly
+                      iterate iterate
+                      cycle cycle
+                      interleave interleave
+                      interpose interpose
+                      str str
+                      subs subs
+                      re-find re-find
+                      re-matches re-matches
+                      re-pattern re-pattern
+                      re-seq re-seq
+                      inc inc
+                      dec dec
+                      + +
+                      - -
+                      * *
+                      / /
+                      quot quot
+                      rem rem
+                      mod mod
+                      abs abs
+                      max max
+                      min min
+                      rand rand
+                      rand-int rand-int
+                      compare compare
+                      = =
+                      not= not=
+                      < <
+                      > >
+                      <= <=
+                      >= >=
+                      zero? zero?
+                      pos? pos?
+                      neg? neg?
+                      even? even?
+                      odd? odd?
+                      true? true?
+                      false? false?
+                      identity identity
+                      constantly constantly
+                      comp comp
+                      complement complement
+                      partial partial
+                      memoize memoize
+                      atom atom
+                      deref deref
+                      reset! reset!
+                      swap! swap!
+                      compare-and-set! compare-and-set!
+                      meta meta
+                      with-meta with-meta
+                      name name
+                      namespace namespace
+                      symbol symbol
+                      keyword keyword
+                      apply apply
+                      pr-str pr-str
+                      prn-str prn-str
+                      println println
+                      print print
+                      newline newline}
+
+           ;; Resolve core functions
+           resolved-core-fns (reduce (fn [acc [k v]]
+                                       (if-let [resolved (resolve v)]
+                                         (assoc acc k @resolved)
+                                         acc))
+                                     {}
+                                     core-fns)
+
+           ;; Add platform-specific functions
+           resolved-core-fns (assoc resolved-core-fns
+                                    'format #?(:clj format :cljs str))
+
+           ;; Build user namespace by merging eval namespace with qualified -and/-or
+           user-ns-fns (assoc eval-ns-fns
+                              'fluree.db.query.exec.eval/-and -and-fn
+                              'fluree.db.query.exec.eval/-or -or-fn)]
+
+       (sci/init {:namespaces {'fluree.db.query.exec.eval eval-ns-fns
+                               'fluree.db.query.exec.where where-ns-fns
+                               'fluree.json-ld json-ld-fns
+                               'fluree.db.constants const-ns
+                               'clojure.core resolved-core-fns
+                               'user user-ns-fns}
+                  :bindings {;; Make constants available
+                             'fluree.db.constants/iri-id const/iri-id}}))))
+
+;; Singleton SCI context - created once and reused
+;; Defined unconditionally but only used in GraalVM builds
+#?(:clj
+   (defonce ^:private sci-context-singleton
+     (delay (create-sci-context))))
+
+;; Macro for conditional evaluation based on build target
+#?(:clj
+   (defmacro eval-form
+     "Evaluates a form using either eval (JVM) or SCI (GraalVM).
+      Decision is made at compile time based on graalvm-build? check.
+      For GraalVM builds, uses a singleton SCI context for better performance."
+     [form]
+     (if-graalvm
+      ;; GraalVM branch - use singleton SCI context
+      `(sci/eval-form @sci-context-singleton ~form)
+      ;; JVM branch - use direct eval
+      `(eval ~form))))
+
+;;; =============================================================================
+;;; Query Compilation Support
+;;; =============================================================================
+
 (def allowed-aggregate-fns
   '#{avg ceil count count-star count-distinct distinct floor groupconcat
      median max min rand sample sample1 stddev str sum variance})
@@ -838,10 +1100,35 @@
                            (where/mch->typed-val mch#))]))
         var-syms))
 
+#?(:clj
+   (defmacro parse-qualified-code
+     "Parses qualified code, applying GraalVM-specific transformations when needed.
+      For GraalVM builds, expands iri macro calls to their full form since SCI
+      doesn't support runtime macro expansion. Decision is made at compile time."
+     [code count-star-sym ctx allow-aggregates?]
+     (if (graalvm-build?)
+       ;; GraalVM/SCI build - coerce then expand iri macro calls
+       `(let [qualified-code# (coerce ~count-star-sym ~allow-aggregates? ~ctx ~code)]
+          (walk/postwalk
+           (fn [form#]
+             (if (and (seq? form#)
+                      (= 'fluree.db.query.exec.eval/iri (first form#))
+                      (= 2 (count form#)))
+               ;; Replace (fluree.db.query.exec.eval/iri x) with the expanded form
+               `(fluree.db.query.exec.where/->typed-val
+                 (fluree.json-ld/expand-iri
+                  (:value ~(second form#))
+                  ~'$-CONTEXT)
+                 fluree.db.constants/iri-id)
+               form#))
+           qualified-code#))
+       ;; Regular JVM build - just coerce
+       `(coerce ~count-star-sym ~allow-aggregates? ~ctx ~code))))
+
 (defn compile*
   [code ctx allow-aggregates?]
   (let [count-star-sym (gensym "?$-STAR")
-        qualified-code (coerce count-star-sym allow-aggregates? ctx code)
+        qualified-code (parse-qualified-code code count-star-sym ctx allow-aggregates?)
         vars           (variables qualified-code)
         bdg            (bind-variables count-star-sym vars ctx)]
     `(fn [~soln-sym]
@@ -853,14 +1140,17 @@
   ([code ctx allow-aggregates?]
    (let [fn-code (compile* code ctx allow-aggregates?)]
      (log/trace "compiled fn:" fn-code)
-     (eval fn-code))))
+     #?(:clj (eval-form fn-code)
+        :cljs (throw (ex-info "eval not supported in ClojureScript" {:code fn-code}))))))
 
 (defn compile-filter
   [code var ctx]
   (let [f        (compile code ctx)
-        soln-sym 'solution]
-    (eval `(fn [~soln-sym ~var]
-             (-> ~soln-sym
-                 (assoc (quote ~var) ~var)
-                 ~f
-                 :value)))))
+        soln-sym 'solution
+        filter-fn-code `(fn [~soln-sym ~var]
+                          (-> ~soln-sym
+                              (assoc (quote ~var) ~var)
+                              ~f
+                              :value))]
+    #?(:clj (eval-form filter-fn-code)
+       :cljs (throw (ex-info "eval not supported in ClojureScript" {:code filter-fn-code})))))

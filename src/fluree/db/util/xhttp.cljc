@@ -1,21 +1,38 @@
 (ns fluree.db.util.xhttp
   (:refer-clojure :exclude [get])
-  (:require #?@(:clj [[org.httpkit.client :as http]
-                      [fluree.db.util.websocket :as jws]])
+  (:require #?(:cljs [clojure.string :as str])
+            #?@(:clj [[fluree.db.util.websocket :as jws]])
             #?@(:cljs [["axios" :as axios]
                        ["ws" :as NodeWebSocket]
-                       [fluree.db.platform :as platform]
-                       [clojure.string :as str]])
+                       [fluree.db.platform :as platform]])
             [clojure.core.async :as async]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true])
-  (:import #?@(:clj  ((org.httpkit.client TimeoutException)))))
+  #?(:clj
+     (:import (java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse HttpResponse$BodyHandlers)
+              (java.net URI)
+              (java.time Duration)
+              (java.util.concurrent TimeoutException))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 ;; allow large websocket frames of ~10mb
 #?(:clj (System/setProperty "org.asynchttpclient.webSocketMaxFrameSize" "10000000"))
+
+#?(:clj
+   (defn create-http-client
+     "Creates a new HTTP client instance. For GraalVM compatibility, this is a function
+      rather than a top-level def to avoid initialization at build time."
+     []
+     (-> (HttpClient/newBuilder)
+         (.connectTimeout (Duration/ofSeconds 10))
+         (.build))))
+
+#?(:clj
+   (def http-client
+     "Delay that creates HTTP client on first use for GraalVM compatibility"
+     (delay (create-http-client))))
 
 (defn format-error-response
   [url e]
@@ -62,14 +79,9 @@
                status (assoc :status status)))))
 
 #?(:clj
-   (defn throw-if-timeout [response]
-     (if (= TimeoutException (some-> response
-                                     :error
-                                     :error/via
-                                     first
-                                     :type))
-       (throw (TimeoutException. (-> response :error :error/cause)))
-       response)))
+   (defn throw-if-timeout [error]
+     (when (instance? TimeoutException error)
+       (throw error))))
 
 (defn post
   "Posts pre-formatted message (e.g. already stringified JSON)."
@@ -85,35 +97,42 @@
                         json? (assoc "Content-Type" "application/json")
                         token (assoc "Authorization" (str "Bearer " token)))]
     #?(:clj
-       (let [base-req (if multipart? ;; multipart requests need to be sent in special map structure
-                        message
-                        {:body message})]
-         (http/post url (assoc base-req :headers headers*
-                               :timeout request-timeout)
-                    (fn [{:keys [error status body] :as response}]
-                      (try ;; TODO - throw-if-timeout will throw but uncaught as `post` fn returns response-chan - adding a 'try/catch' for now
-                        ;; TODO - ideally throw-if-timeout should be part of the format-error-response fn to put ex on response-chan and can remove outer try/catch
-                        (if (or error (< 299 status))
-                          (do
-                            (throw-if-timeout response)
-                            (async/put!
-                             response-chan
-                             (format-error-response
-                              url
-                              (or error (ex-info "error response"
-                                                 response)))))
-                          (let [data (try (cond-> body
-                                            (bytes? body) slurp
-                                            json? (json/parse keywordize-keys))
-                                          (catch Exception e
-                                            ;; don't throw, as `data` will get exception and put on response-chan
-                                            (ex-info (str "JSON parsing error for xhttp post request to: " url
-                                                          " with error message: " (ex-message e))
-                                                     {:status 400 :error :db/invalid-json}
-                                                     e)))]
-                            (async/put! response-chan data)))
-                        (catch Exception e
-                          (async/put! response-chan e))))))
+       (async/go
+         (try
+           (let [builder (-> (HttpRequest/newBuilder)
+                             (.uri (URI/create url))
+                             (.timeout (Duration/ofMillis request-timeout))
+                             (.POST (HttpRequest$BodyPublishers/ofString (if multipart?
+                                                                           (throw (ex-info "Multipart not yet supported in native HTTP client" {:url url}))
+                                                                           message))))]
+             ;; Add headers
+             (doseq [[k v] headers*]
+               (.header builder k v))
+
+             (let [request (.build builder)
+                   ^HttpClient client @http-client
+                   ^HttpResponse response (.send client request (HttpResponse$BodyHandlers/ofString))
+                   status (.statusCode response)
+                   body (.body response)]
+               (if (< 299 status)
+                 (async/put! response-chan
+                             (format-error-response url
+                                                    (ex-info "HTTP error response"
+                                                             {:status status :body body})))
+                 (let [data (try (cond-> body
+                                   json? (json/parse keywordize-keys))
+                                 (catch Exception e
+                                   (ex-info (str "JSON parsing error for xhttp post request to: " url
+                                                 " with error message: " (ex-message e))
+                                            {:status 400 :error :db/invalid-json}
+                                            e)))]
+                   (async/put! response-chan data)))))
+           (catch TimeoutException e
+             (async/put! response-chan
+                         (format-error-response url e)))
+           (catch Exception e
+             (async/put! response-chan
+                         (format-error-response url e)))))
        :cljs
        (let [req {:url     url
                   :method  "post"
@@ -164,36 +183,46 @@
                         headers (merge headers)
                         token   (assoc "Authorization" (str "Bearer " token)))]
     #?(:clj
-       (http/get url (util/without-nils
-                      {:headers headers
-                       :timeout request-timeout
-                       :body    (:body opts)})
-                 (fn [{:keys [error status body] :as response}]
-                   (if (or error (< 299 status))
-                     (if (= :wikidata output-format)
-                       (let [err-body (-> error ex-data :body)
-                             res'     (cond
-                                        (= (type err-body) java.io.ByteArrayInputStream)
-                                        (slurp err-body)
+       (async/go
+         (try
+           (let [builder (-> (HttpRequest/newBuilder)
+                             (.uri (URI/create url))
+                             (.timeout (Duration/ofMillis request-timeout))
+                             (.GET))]
+             ;; Add headers
+             (doseq [[k v] headers]
+               (.header builder k v))
 
-                                        :else
-                                        err-body)
-                             error {:status  (or (-> error ex-data :status) 400)
-                                    :message (str res')
-                                    :error   :db/invalid-query}]
-                         (async/put! response-chan error))
-                       (async/put! response-chan
-                                   (format-error-response
-                                    url
-                                    (or error (ex-info "error response"
-                                                       response)))))
-                     (do
-                       (throw-if-timeout response)
-                       (async/put! response-chan
-                                   (case output-format
-                                     (:text :json)    (slurp body)
-                                     (:edn :wikidata) (-> body slurp json/parse)
-                                     body))))))
+             ;; Add body if provided (for GET with body)
+             (when-let [body (:body opts)]
+               (.method builder "GET" (HttpRequest$BodyPublishers/ofString body)))
+
+             (let [request (.build builder)
+                   ^HttpClient client @http-client
+                   ^HttpResponse response (.send client request (HttpResponse$BodyHandlers/ofString))
+                   status (.statusCode response)
+                   body (.body response)]
+               (if (< 299 status)
+                 (if (= :wikidata output-format)
+                   (let [error {:status  status
+                                :message body
+                                :error   :db/invalid-query}]
+                     (async/put! response-chan error))
+                   (async/put! response-chan
+                               (format-error-response url
+                                                      (ex-info "HTTP error response"
+                                                               {:status status :body body}))))
+                 (async/put! response-chan
+                             (case output-format
+                               (:text :json)    body
+                               (:edn :wikidata) (json/parse body)
+                               body)))))
+           (catch TimeoutException e
+             (async/put! response-chan
+                         (format-error-response url e)))
+           (catch Exception e
+             (async/put! response-chan
+                         (format-error-response url e)))))
        :cljs (-> axios
                  (.request (clj->js {:url     url
                                      :method  "get"

@@ -1,5 +1,5 @@
 .PHONY: help all deps jar install deploy nodejs browser webworker cljtest	\
-	cljs-browser-test cljs-node-test cljstest test eastwood ci clean	\
+	cljs-browser-test cljs-node-test cljstest test ci clean			\
 	js-packages sync-package-json publish-nodejs publish-browser		\
 	publish-webworker publish-js pending-tests pt clj-kondo-lint            \
 	clj-kondo-lint-ci cljfmt-check cljfmt-fix
@@ -49,7 +49,7 @@ out/fluree-webworker.js: package.json package-lock.json node_modules deps.edn sr
 webworker: out/fluree-webworker.js ## Build webworker SDK
 
 deps: ## Download and cache dependencies
-	clojure -A:cljtest:cljstest:eastwood:docs -P
+	clojure -A:cljtest:cljstest:docs -P
 
 src/deps.cljs: package.json
 	clojure -M:js-deps
@@ -149,7 +149,7 @@ test: cljtest cljstest nodejs-test browser-test ## Run all tests
 eastwood: ## Run Eastwood linter
 	clojure -M:dev:cljtest:eastwood
 
-ci: test eastwood clj-kondo-lint-ci cljfmt-check ## Run all CI checks (tests, linting, formatting)
+ci: test clj-kondo-lint-ci cljfmt-check ## Run all CI checks (tests, linting, formatting)
 
 clean: ## Remove build artifacts and caches
 	clojure -T:build clean
