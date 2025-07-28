@@ -95,7 +95,8 @@
                 (if file-content
                   (let [content-str (if (string? file-content)
                                       file-content
-                                      #?(:clj (String. ^"[B" file-content "UTF-8")
+                                      #?(:clj (let [^bytes bytes-content file-content]
+                                                (String. bytes-content "UTF-8"))
                                          :cljs (js/String.fromCharCode.apply nil file-content)))
                         record (json/parse content-str false)]
                     (recur (rest remaining-paths) (conj records record)))
