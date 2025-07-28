@@ -20,16 +20,16 @@
 (def method-name "s3")
 
 ;; AWS Signature V4 constants
-(def algorithm "AWS4-HMAC-SHA256")
-(def service "s3")
+(def aws-signing-algorithm "AWS4-HMAC-SHA256")
+(def aws-service "s3")
 (def aws4-request "aws4_request")
 
 ;; Date formatters for AWS
-(def amz-date-formatter
+(def ^DateTimeFormatter amz-date-formatter
   (.withZone (DateTimeFormatter/ofPattern "yyyyMMdd'T'HHmmss'Z'")
              ZoneOffset/UTC))
 
-(def date-stamp-formatter
+(def ^DateTimeFormatter date-stamp-formatter
   (.withZone (DateTimeFormatter/ofPattern "yyyyMMdd")
              ZoneOffset/UTC))
 
@@ -84,9 +84,7 @@
 (defn canonical-uri
   "Create canonical URI for AWS signature"
   [path]
-  (if (empty? path)
-    "/"
-    (str "/" path)))
+  (str "/" path))
 
 (defn canonical-query-string
   "Create canonical query string for AWS signature"
@@ -118,28 +116,28 @@
 (defn create-canonical-request
   "Create the canonical request for AWS Signature V4"
   [method uri query-params headers payload-hash]
-  (str method "\n"
-       uri "\n"
-       (or query-params "") "\n"
-       (canonical-headers headers) "\n"
-       (signed-headers headers) "\n"
-       payload-hash))
+  (str/join "\n" [method
+                  uri
+                  (or query-params "")
+                  (canonical-headers headers)
+                  (signed-headers headers)
+                  payload-hash]))
 
 (defn create-string-to-sign
   "Create the string to sign for AWS Signature V4"
   [amz-date credential-scope canonical-request-hash]
-  (str algorithm "\n"
-       amz-date "\n"
-       credential-scope "\n"
-       canonical-request-hash))
+  (str/join "\n" [aws-signing-algorithm
+                  amz-date
+                  credential-scope
+                  canonical-request-hash]))
 
 (defn sign-request
   "Sign an S3 request using AWS Signature V4"
   [{:keys [method path headers payload region bucket credentials query-params]}]
   (let [{:keys [access-key secret-key session-token]} credentials
         now (Instant/now)
-        amz-date (.format ^DateTimeFormatter amz-date-formatter now)
-        date-stamp (.format ^DateTimeFormatter date-stamp-formatter now)
+        amz-date (.format amz-date-formatter now)
+        date-stamp (.format date-stamp-formatter now)
         payload-hash (if payload
                        (if (bytes? payload)
                          (crypto/sha2-256 payload :hex)
@@ -167,19 +165,19 @@
                        payload-hash)
 
         ;; Create string to sign
-        credential-scope (str date-stamp "/" region "/" service "/" aws4-request)
+        credential-scope (str date-stamp "/" region "/" aws-service "/" aws4-request)
         string-to-sign (create-string-to-sign
                         amz-date
                         credential-scope
                         (sha256-hex canonical-req))
 
         ;; Calculate signature
-        signing-key (get-signature-key secret-key date-stamp region service)
+        signing-key (get-signature-key secret-key date-stamp region aws-service)
         signature (-> (hmac-sha256 signing-key string-to-sign)
                       (alphabase/base-to-base :bytes :hex))
 
         ;; Create authorization header
-        authorization (str algorithm " "
+        authorization (str aws-signing-algorithm " "
                            "Credential=" access-key "/" credential-scope ", "
                            "SignedHeaders=" (signed-headers headers-for-signing) ", "
                            "Signature=" signature)]
@@ -248,42 +246,42 @@
   (let [{:keys [credentials bucket region prefix]} client
         ch (async/promise-chan)
         full-path (str prefix "/" path)]
-    (go
-      (try
-        (let [response (<? (s3-request {:method "PUT"
-                                        :bucket bucket
-                                        :region region
-                                        :path full-path
-                                        :body data
-                                        :credentials credentials}))]
-          (>! ch response))
-        (catch Exception e
-          (>! ch e))))
+    (async/pipe (s3-request {:method "PUT"
+                             :bucket bucket
+                             :region region
+                             :path full-path
+                             :body data
+                             :credentials credentials})
+                ch)
     ch))
+
+(defn- tag-matches?
+  "Check if an XML element's tag matches the given name, ignoring namespace"
+  [tag-name elem]
+  (and (:tag elem)
+       (= tag-name (name (:tag elem)))))
+
+(defn- get-xml-text
+  "Get text content of first matching XML element, ignoring namespace"
+  [tag-name elements]
+  (some (fn [element]
+          (when (tag-matches? tag-name element)
+            (first (:content element))))
+        elements))
 
 (defn parse-list-objects-response
   "Parse XML response from S3 ListObjectsV2"
   [xml-str]
   (let [parsed (xml/parse-str xml-str)
-        contents (xml-seq parsed)
-        ;; Helper to get text content regardless of namespace
-        get-text (fn [tag-name elements]
-                   (first (for [x elements
-                                :when (and (:tag x)
-                                           (= tag-name (name (:tag x))))]
-                            (first (:content x)))))
-        ;; Helper to check tag name ignoring namespace
-        tag-matches? (fn [tag-name elem]
-                       (and (:tag elem)
-                            (= tag-name (name (:tag elem)))))]
-    {:truncated? (= "true" (get-text "IsTruncated" contents))
-     :continuation-token (get-text "NextContinuationToken" contents)
-     :objects (for [x contents
-                    :when (tag-matches? "Contents" x)]
-                (let [obj-content (:content x)]
-                  {:key (get-text "Key" obj-content)
-                   :size (get-text "Size" obj-content)
-                   :last-modified (get-text "LastModified" obj-content)}))}))
+        contents (xml-seq parsed)]
+    {:IsTruncated (= "true" (get-xml-text "IsTruncated" contents))
+     :NextContinuationToken (get-xml-text "NextContinuationToken" contents)
+     :Contents (for [x contents
+                     :when (tag-matches? "Contents" x)]
+                 (let [obj-content (:content x)]
+                   {:Key (get-xml-text "Key" obj-content)
+                    :Size (get-xml-text "Size" obj-content)
+                    :LastModified (get-xml-text "LastModified" obj-content)}))}))
 
 (defn s3-list*
   "List objects in S3 with optional continuation token"
@@ -307,11 +305,9 @@
                                          :credentials credentials
                                          :query-params query-params}))
                parsed (parse-list-objects-response response)]
-           (>! ch {:IsTruncated (:truncated? parsed)
-                   :NextContinuationToken (:continuation-token parsed)
-                   :Contents (mapv (fn [obj]
-                                     {:Key (:key obj)})
-                                   (:objects parsed))}))
+           (>! ch (update parsed :Contents
+                          (fn [contents]
+                            (mapv #(select-keys % [:Key]) contents)))))
          (catch Exception e
            (>! ch e))))
      ch)))

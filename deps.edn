@@ -120,7 +120,10 @@
                  ;;       positives on "UnsupportedOperationException empty is
                  ;;       not supported on Flake" when using the #Flake data
                  ;;       reader - WSM 2023-02-01
-                 :exclude-linters [:implicit-dependencies]}]}
+                 :exclude-linters [:implicit-dependencies]
+                 ;; Exclude IPFS namespace due to Clojure 1.12.1 compatibility issues
+                 :exclude-namespaces [fluree.db.storage.ipfs
+                                      fluree.db.storage.file]}]}
 
   :ancient
   {:extra-deps {com.github.liquidz/antq {:mvn/version "RELEASE"}}
