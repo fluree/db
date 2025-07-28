@@ -60,6 +60,8 @@
    "AVG"       "avg"
    "GROUP_CONCAT" "groupconcat"})
 
+(defmethod parse-term :Wildcard [_] "*")
+
 (defmethod parse-term :Aggregate
   ;; Aggregate ::= 'COUNT' WS <'('> WS 'DISTINCT'? WS ( '*' | Expression ) WS <')'> WS
   ;; | 'SUM' WS <'('> WS 'DISTINCT'? Expression <')'>

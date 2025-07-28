@@ -83,6 +83,10 @@
 
 (defn -count
   [coll]
+  (where/->typed-val (count (keep :value coll))))
+
+(defn count-star
+  [coll]
   (where/->typed-val (count coll)))
 
 (defn groupconcat
@@ -644,6 +648,7 @@
     contains       fluree.db.query.exec.eval/contains
     count-distinct fluree.db.query.exec.eval/count-distinct
     count          fluree.db.query.exec.eval/-count
+    count-star     fluree.db.query.exec.eval/count-star
     datatype       fluree.db.query.exec.eval/datatype
     equal          fluree.db.query.exec.eval/typed-equal
     floor          fluree.db.query.exec.eval/floor
@@ -964,7 +969,7 @@
 ;;; =============================================================================
 
 (def allowed-aggregate-fns
-  '#{avg ceil count count-distinct distinct floor groupconcat
+  '#{avg ceil count count-star count-distinct distinct floor groupconcat
      median max min rand sample sample1 stddev str sum variance})
 
 (def allowed-scalar-fns
@@ -1028,16 +1033,23 @@
         (throw (ex-info err-msg
                         {:status 400, :error :db/invalid-query}))))))
 
+(defn check-for-count-star
+  [[f first-arg & r :as fn-expr] count-star-sym]
+  (if (= '[count * nil] [f first-arg r])
+    (list 'count-star count-star-sym)
+    fn-expr))
+
 (defn coerce
-  [allow-aggregates? ctx x]
+  [count-star-sym allow-aggregates? ctx x]
   (cond
     ;; set literal (for "in")
     (vector? x)
-    (mapv (partial coerce allow-aggregates? ctx) x)
+    (mapv (partial coerce count-star-sym allow-aggregates? ctx) x)
 
     ;; function expression
     (sequential? x)
-    (map (partial coerce allow-aggregates? ctx) x)
+    (->> (check-for-count-star x count-star-sym)
+         (map (partial coerce count-star-sym allow-aggregates? ctx)))
 
     ;; value map
     (map? x)
@@ -1061,11 +1073,27 @@
     :else
     x))
 
+(defn find-grouped-val
+  "Used for (count *). In an aggregate, the ::group/grouping matches will all have the
+  same number of matches as a value, so we just take the first one."
+  [solution]
+  (loop [[mch & r] (vals solution)]
+    (if mch
+      (if (= (::where/datatype-iri mch) :fluree.db.query.exec.group/grouping)
+        mch
+        (recur r))
+      (throw (ex-info "Cannot apply count to wildcard without using group-by."
+                      {:status 400 :error :db/invalid-query})))))
+
+(def soln-sym 'solution)
+
 (defn bind-variables
-  [soln-sym var-syms ctx]
+  [count-star-sym var-syms ctx]
   (into `[~context-var ~ctx]
         (mapcat (fn [var]
-                  `[mch# (get ~soln-sym (quote ~var))
+                  `[mch# ~(if (= var count-star-sym)
+                            `(find-grouped-val ~soln-sym)
+                            `(get ~soln-sym (quote ~var)))
                     ;; convert match to TypedValue
                     ~var (if (= ::group/grouping (where/get-datatype-iri mch#))
                            (mapv where/mch->typed-val (where/get-binding mch#))
@@ -1077,10 +1105,10 @@
      "Parses qualified code, applying GraalVM-specific transformations when needed.
       For GraalVM builds, expands iri macro calls to their full form since SCI
       doesn't support runtime macro expansion. Decision is made at compile time."
-     [code ctx allow-aggregates?]
+     [code count-star-sym ctx allow-aggregates?]
      (if (graalvm-build?)
        ;; GraalVM/SCI build - coerce then expand iri macro calls
-       `(let [qualified-code# (coerce ~allow-aggregates? ~ctx ~code)]
+       `(let [qualified-code# (coerce ~count-star-sym ~allow-aggregates? ~ctx ~code)]
           (walk/postwalk
            (fn [form#]
              (if (and (seq? form#)
@@ -1095,14 +1123,14 @@
                form#))
            qualified-code#))
        ;; Regular JVM build - just coerce
-       `(coerce ~allow-aggregates? ~ctx ~code))))
+       `(coerce ~count-star-sym ~allow-aggregates? ~ctx ~code))))
 
 (defn compile*
   [code ctx allow-aggregates?]
-  (let [qualified-code (parse-qualified-code code ctx allow-aggregates?)
+  (let [count-star-sym (gensym "?$-STAR")
+        qualified-code (parse-qualified-code code count-star-sym ctx allow-aggregates?)
         vars           (variables qualified-code)
-        soln-sym       'solution
-        bdg            (bind-variables soln-sym vars ctx)]
+        bdg            (bind-variables count-star-sym vars ctx)]
     `(fn [~soln-sym]
        (let ~bdg
          ~qualified-code))))
