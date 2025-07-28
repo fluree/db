@@ -1,6 +1,6 @@
 (ns fluree.db.util.json
   (:require #?@(:clj
-                [[jsonista.core :as j]
+                [[jsonista.core :as json]
                  [fluree.db.util.log :as log]
                  [fluree.db.flake :as flake]]
                 :cljs
@@ -17,7 +17,7 @@
 ;; Custom object mapper for Fluree that handles Flakes, byte arrays, and BigDecimals
 #?(:clj
    (def object-mapper
-     (j/object-mapper
+     (json/object-mapper
       {:decode-key-fn true   ; keywordize keys
        :encode-key-fn true   ; use default key encoding
        :bigdecimals true     ; use BigDecimals for numbers
@@ -37,7 +37,7 @@
 #?(:clj
    (def object-mapper-no-bigdecimal-string
      "Object mapper that encodes BigDecimals as numbers instead of strings"
-     (j/object-mapper
+     (json/object-mapper
       {:decode-key-fn true
        :encode-key-fn true
        :bigdecimals true
@@ -97,9 +97,9 @@
                     ;; Use custom mapper or create one without keywordization if needed
                     mapper (if keywordize-keys?
                              object-mapper
-                             (j/object-mapper {:decode-key-fn false
-                                               :bigdecimals true}))]
-                (j/read-value json-str mapper))
+                             (json/object-mapper {:decode-key-fn false
+                                                  :bigdecimals true}))]
+                (json/read-value json-str mapper))
               (catch Exception e
                 (log/error e (str "Exception JSON-parsing: " x))
                 (throw e)))
@@ -116,9 +116,9 @@
 
 (defn stringify
   [x]
-  #?(:clj  (j/write-value-as-string x (if *encode-bigdecimal-as-string*
-                                        object-mapper
-                                        object-mapper-no-bigdecimal-string))
+  #?(:clj  (json/write-value-as-string x (if *encode-bigdecimal-as-string*
+                                           object-mapper
+                                           object-mapper-no-bigdecimal-string))
      :cljs (js/JSON.stringify (clj->js x))))
 
 (defn stringify-UTF8
