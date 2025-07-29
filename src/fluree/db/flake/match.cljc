@@ -229,7 +229,10 @@
 
 (defn match-properties
   [db tracker solution triples error-ch]
-  (let [triples* (map (partial where/compute-sids db) triples)]
+  (let [triples* (->> triples
+                      (map (fn [triple]
+                             (where/assign-matched-values triple solution)))
+                      (map (partial where/compute-sids db)))]
     (if (every? some? triples*)
       (let [property-ranges (->> triples*
                                  (map (fn [triple]
