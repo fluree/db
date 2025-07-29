@@ -115,17 +115,16 @@
   (let [oid                     (iri/encode-iri db o-iri)
         pid                     (iri/encode-iri db p-iri)
         [start-flake end-flake] (flake-bounds db :opst [oid pid])
-        flake-xf                (if-let [track-fuel (track/track-fuel! tracker error-ch)]
-                                  (comp track-fuel
-                                        (map flake/s))
-                                  (map flake/s))
-        range-opts              {:to-t        t
-                                 :start-flake start-flake
-                                 :end-flake   end-flake
-                                 :flake-xf    flake-xf}
-        sid-xf                  (map (partial format-reference db reverse-spec))]
+        flake-xf                (track/track-fuel! tracker error-ch)
+        range-opts              (cond-> {:to-t        t
+                                         :start-flake start-flake
+                                         :end-flake   end-flake}
+                                  flake-xf (assoc :flake-xf flake-xf))
+        sid-xf                  (comp cat
+                                      (map flake/s)
+                                      (map (partial format-reference db reverse-spec)))]
     (->> (query-range/resolve-flake-slices db tracker :opst error-ch range-opts)
-         (async/transduce (comp cat sid-xf)
+         (async/transduce sid-xf
                           (completing conj
                                       (fn [result]
                                         [as (util/unwrap-singleton as context result)]))
