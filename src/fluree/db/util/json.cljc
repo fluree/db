@@ -1,8 +1,6 @@
 (ns fluree.db.util.json
   (:require #?@(:clj
-                [[cheshire.core :as cjson]
-                 [cheshire.generate :refer [add-encoder encode-seq remove-encoder]]
-                 [cheshire.parse :as cparse]
+                [[jsonista.core :as json]
                  [fluree.db.util.log :as log]
                  [fluree.db.flake :as flake]]
                 :cljs
@@ -16,19 +14,52 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-#?(:clj (add-encoder Flake encode-seq))
+;; Custom object mapper for Fluree that handles Flakes, byte arrays, and BigDecimals
+#?(:clj
+   (def object-mapper
+     (json/object-mapper
+      {:decode-key-fn true   ; keywordize keys
+       :encode-key-fn true   ; use default key encoding
+       :bigdecimals true     ; use BigDecimals for numbers
+       :encoders {Flake (fn [^Flake flake ^JsonGenerator gen]
+                          (.writeStartArray gen)
+                          (doseq [v flake]
+                            (.writeObject gen v))
+                          (.writeEndArray gen))
+                  (class (byte-array 0)) (fn [^bytes ba ^JsonGenerator gen]
+                                           (.writeStartArray gen)
+                                           (doseq [b ba]
+                                             (.writeNumber gen (int b)))
+                                           (.writeEndArray gen))
+                  java.math.BigDecimal (fn [^java.math.BigDecimal n ^JsonGenerator gen]
+                                         (.writeString gen (str n)))}})))
 
-#?(:clj (add-encoder (Class/forName "[B") encode-seq))
+#?(:clj
+   (def object-mapper-no-bigdecimal-string
+     "Object mapper that encodes BigDecimals as numbers instead of strings"
+     (json/object-mapper
+      {:decode-key-fn true
+       :encode-key-fn true
+       :bigdecimals true
+       :encoders {Flake (fn [^Flake flake ^JsonGenerator gen]
+                          (.writeStartArray gen)
+                          (doseq [v flake]
+                            (.writeObject gen v))
+                          (.writeEndArray gen))
+                  (class (byte-array 0)) (fn [^bytes ba ^JsonGenerator gen]
+                                           (.writeStartArray gen)
+                                           (doseq [b ba]
+                                             (.writeNumber gen (int b)))
+                                           (.writeEndArray gen))}})))
+
+#?(:clj
+   (def ^:dynamic *encode-bigdecimal-as-string* true))
 
 #?(:clj
    (defn encode-BigDecimal-as-string
-     "Turns on/off json-encoding of a java.math.Bigdecimal as a string"
+     "Turns on/off json-encoding of a java.math.BigDecimal as a string"
      [enable]
-     (if enable
-       (add-encoder java.math.BigDecimal
-                    (fn [n ^JsonGenerator jsonGenerator]
-                      (.writeString jsonGenerator (str n))))
-       (remove-encoder java.math.BigDecimal))))
+     (alter-var-root #'*encode-bigdecimal-as-string* (constantly enable))))
 
 ;;https://purelyfunctional.tv/mini-guide/json-serialization-api-clojure/
 #?(:cljs
@@ -57,19 +88,18 @@
   ([x] (parse x true))
   ([x keywordize-keys?]
    #?(:clj  (try
-              (-> (cond (string? x) x
-                        (bytes? x) (butil/UTF8->string x)
-                        (instance? ByteArrayInputStream x) (slurp x)
-                        (instance? InputStream x) (slurp x)
-                        :else (throw (ex-info (str "json parse error, unknown input type: " (pr-str (type x)))
-                                              {:status 500 :error :db/unexpected-error})))
-                  ;; set binding parameter to decode BigDecimals
-                  ;; without truncation.  Unfortunately, this causes
-                  ;; all floating point and doubles to be designated
-                  ;; as BigDecimals.
-                  (as-> x'
-                        (binding [cparse/*use-bigdecimals?* true]
-                          (cjson/decode x' keywordize-keys?))))
+              (let [json-str (cond (string? x) x
+                                   (bytes? x) (butil/UTF8->string x)
+                                   (instance? ByteArrayInputStream x) (slurp x)
+                                   (instance? InputStream x) (slurp x)
+                                   :else (throw (ex-info (str "json parse error, unknown input type: " (pr-str (type x)))
+                                                         {:status 500 :error :db/unexpected-error})))
+                    ;; Use custom mapper or create one without keywordization if needed
+                    mapper (if keywordize-keys?
+                             object-mapper
+                             (json/object-mapper {:decode-key-fn false
+                                                  :bigdecimals true}))]
+                (json/read-value json-str mapper))
               (catch Exception e
                 (log/error e (str "Exception JSON-parsing: " x))
                 (throw e)))
@@ -86,7 +116,9 @@
 
 (defn stringify
   [x]
-  #?(:clj  (cjson/encode x)
+  #?(:clj  (json/write-value-as-string x (if *encode-bigdecimal-as-string*
+                                           object-mapper
+                                           object-mapper-no-bigdecimal-string))
      :cljs (js/JSON.stringify (clj->js x))))
 
 (defn stringify-UTF8

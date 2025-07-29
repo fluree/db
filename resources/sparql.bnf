@@ -205,7 +205,8 @@ StrReplaceExpression    ::=   <'REPLACE'> <'('> Expression <','> Expression <','
 ExistsFunc    ::=   <'EXISTS'> GroupGraphPattern
 NotExistsFunc   ::=   <'NOT'> WS <'EXISTS'> GroupGraphPattern
 Separator ::= ( <';'> WS <('SEPARATOR' | 'separator')> WS <'='> String )
-Aggregate   ::=     'COUNT' WS <'('> WS 'DISTINCT'? WS ( '*' | Expression ) WS <')'> WS
+Wildcard ::= <'*'>
+Aggregate ::= 'COUNT' WS <'('> WS 'DISTINCT'? WS ( Wildcard | Expression ) WS <')'> WS
 | 'SUM' WS <'('> WS 'DISTINCT'? Expression <')'>
 | 'MIN' <'('>  WS 'DISTINCT'? Expression <')'>
 | 'MAX' <'('>  WS 'DISTINCT'? Expression <')'>

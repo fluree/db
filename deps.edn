@@ -1,13 +1,13 @@
-{:deps {org.clojure/clojure              {:mvn/version "1.11.4"}
+{:deps {org.clojure/clojure              {:mvn/version "1.12.1"}
         org.clojure/clojurescript        {:mvn/version "1.11.132"}
-        org.clojure/core.async           {:mvn/version "1.6.681"}
+        org.clojure/core.async           {:mvn/version "1.8.741"}
         org.clojure/core.cache           {:mvn/version "1.1.234"}
         org.clojars.mmb90/cljs-cache     {:mvn/version "0.1.4"}
         org.clojure/data.avl             {:mvn/version "0.2.0"}
         environ/environ                  {:mvn/version "1.2.0"}
         metosin/malli                    {:mvn/version "0.17.0"}
         nano-id/nano-id                  {:mvn/version "1.1.0"}
-        integrant/integrant              {:mvn/version "0.10.0"}
+        integrant/integrant              {:mvn/version "0.13.1"}
         com.widdindustries/time-literals {:mvn/version "0.1.10"}
 
         ;; logging
@@ -19,14 +19,11 @@
         net.mikera/vectorz-clj              {:mvn/version "0.48.0"}
         com.github.rholder/snowball-stemmer {:mvn/version "1.3.0.581.1"}
 
-        ;; http
-        http-kit/http-kit {:mvn/version "2.8.0"}
-
         ;; parsing / serialization
         com.fluree/json-ld {:git/url "https://github.com/fluree/json-ld.git"
-                            :git/sha "6a07ba03bea19fec2d5970dd51da084c9b903789"}
+                            :git/sha "7dd4df7a49215b32e5141f7dbbcc365008295a9c"}
         com.fluree/alphabase                {:mvn/version "3.3.0"}
-        cheshire/cheshire                   {:mvn/version "5.13.0"}
+        metosin/jsonista                    {:mvn/version "0.3.13"}
         camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.3"}
         org.clojure/data.xml                {:mvn/version "0.2.0-alpha9"}
         instaparse/instaparse               {:mvn/version "1.5.0"}
@@ -34,13 +31,11 @@
 
         ;; cryptography
         com.fluree/crypto {:git/url "https://github.com/fluree/fluree.crypto.git"
-                           :git/sha "aefa358f0b37dc9366e7c8c6ca1bf796735b99e9"}
+                           :git/sha "cd92370b7c49aac78720833f520787dcebe86b9e"}
         org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
-        ;; storage
-        com.cognitect.aws/api       {:mvn/version "0.8.741"}
-        com.cognitect.aws/endpoints {:mvn/version "871.2.32.2"}
-        com.cognitect.aws/s3        {:mvn/version "871.2.32.2"}}
+        ;; SCI for GraalVM-compatible code evaluation
+        org.babashka/sci {:mvn/version "0.10.47"}}
 
  :paths ["src" "resources" "target/classes"]
 
@@ -125,7 +120,10 @@
                  ;;       positives on "UnsupportedOperationException empty is
                  ;;       not supported on Flake" when using the #Flake data
                  ;;       reader - WSM 2023-02-01
-                 :exclude-linters [:implicit-dependencies]}]}
+                 :exclude-linters [:implicit-dependencies]
+                 ;; Exclude IPFS namespace due to Clojure 1.12.1 compatibility issues
+                 :exclude-namespaces [fluree.db.storage.ipfs
+                                      fluree.db.storage.file]}]}
 
   :ancient
   {:extra-deps {com.github.liquidz/antq {:mvn/version "RELEASE"}}
@@ -133,4 +131,8 @@
 
   :clj-kondo
   {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2024.05.24"}}
-   :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
+   :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}
+
+  :graalvm
+  {:extra-deps {com.github.clj-easy/graal-build-time {:mvn/version "1.0.5"}}
+   :extra-paths ["graalvm"]}}}
