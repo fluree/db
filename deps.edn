@@ -35,12 +35,7 @@
         org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
         ;; SCI for GraalVM-compatible code evaluation
-        org.babashka/sci {:mvn/version "0.10.47"}
-
-        ;; storage
-        com.cognitect.aws/api       {:mvn/version "0.8.741"}
-        com.cognitect.aws/endpoints {:mvn/version "871.2.32.2"}
-        com.cognitect.aws/s3        {:mvn/version "871.2.32.2"}}
+        org.babashka/sci {:mvn/version "0.10.47"}}
 
  :paths ["src" "resources" "target/classes"]
 
@@ -125,7 +120,10 @@
                  ;;       positives on "UnsupportedOperationException empty is
                  ;;       not supported on Flake" when using the #Flake data
                  ;;       reader - WSM 2023-02-01
-                 :exclude-linters [:implicit-dependencies]}]}
+                 :exclude-linters [:implicit-dependencies]
+                 ;; Exclude IPFS namespace due to Clojure 1.12.1 compatibility issues
+                 :exclude-namespaces [fluree.db.storage.ipfs
+                                      fluree.db.storage.file]}]}
 
   :ancient
   {:extra-deps {com.github.liquidz/antq {:mvn/version "RELEASE"}}
