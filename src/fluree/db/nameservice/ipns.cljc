@@ -71,7 +71,7 @@
     (let [[_ _ alias] (address-parts ledger-address)]
       alias))
   (all-records [_]
-    ;; IPNS doesn't support listing all records
+    ;; TODO - add support for listing all records in IPNS
     (go-try [])))
 
 (defn initialize

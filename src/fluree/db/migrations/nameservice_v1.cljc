@@ -21,6 +21,9 @@
   - Old files only deleted after successful migration
   - Logging for monitoring and debugging"
   (:require #?(:clj [clojure.java.io :as io])
+            #?@(:cljs [[fluree.db.platform :as platform]
+                       ["fs" :as node-fs]
+                       ["path" :as node-path]])
             [clojure.string :as str]
             [fluree.db.nameservice.storage :as ns-storage]
             [fluree.db.storage :as storage]
@@ -55,7 +58,28 @@
                           (not (str/includes? % "/index/"))
                           (not (str/includes? % "/txn/"))))))
      :cljs
-     (throw (ex-info "Migration not supported in ClojureScript" {:path root-path}))))
+     (if platform/BROWSER
+       (throw (ex-info "Migration not supported in browser" {:path root-path}))
+       ;; Node.js implementation
+       (let [find-files (fn find-files [dir acc]
+                          (let [entries (node-fs/readdirSync dir #js {:withFileTypes true})]
+                            (reduce (fn [acc entry]
+                                      (let [entry-name (.-name entry)
+                                            full-path (node-path/join dir entry-name)]
+                                        (cond
+                                          (.isDirectory entry)
+                                          (if (not (contains? #{"ns@v1" "commit" "index" "txn"} entry-name))
+                                            (find-files full-path acc)
+                                            acc)
+
+                                          (and (.isFile entry)
+                                               (str/ends-with? entry-name ".json"))
+                                          (conj acc full-path)
+
+                                          :else acc)))
+                                    acc
+                                    (js->clj entries))))]
+         (find-files root-path [])))))
 
 (defn find-old-nameservice-files
   "Find old nameservice files in ledger directories - handles both root level and nested paths"
@@ -66,14 +90,17 @@
           all-json-files (find-json-files-recursively root-path)
           ;; Filter to only nameservice files (those that match ledger naming pattern)
           ;; clj-kondo false positive - ledger-path is used in the clj branch  
-          ns-files #_{:clj-kondo/ignore [:unused-binding]}
+          ns-files
           (filter (fn [path]
                     (let [relative-path (str/replace path (str root-path "/") "")
-                                   ;; Remove .json extension
-                          ledger-path (str/replace relative-path #"\.json$" "")]
-                               ;; Check if corresponding ledger directory exists
-                      #?(:clj (.exists (io/file (str root-path "/" ledger-path)))
-                         :cljs false)))
+                          ;; Remove .json extension
+                          ledger-path (str/replace relative-path #"\.json$" "")
+                          ledger-full-path (str root-path "/" ledger-path)]
+                      ;; Check if corresponding ledger directory exists
+                      #?(:clj (.exists (io/file ledger-full-path))
+                         :cljs (if platform/BROWSER
+                                 false
+                                 (node-fs/existsSync ledger-full-path)))))
                   all-json-files)]
       (mapv (fn [full-path]
               (let [relative-path (str/replace full-path (str root-path "/") "")

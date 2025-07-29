@@ -33,14 +33,6 @@
              "f:status"     "ready"}
       index-address (assoc "f:index" {"@id" index-address}))))
 
-(defn get-commit
-  "Returns the minimal nameservice record."
-  ([record]
-   (get-commit record nil))
-  ([record _branch]
-   ;; Always return the record itself for new format
-   record))
-
 (defrecord StorageNameService [store]
   nameservice/Publisher
   (publish [_ data]
@@ -72,9 +64,7 @@
             branch                  (or branch "main")
             filename                (local-filename alias branch)]
         (when-let [record-bytes (<? (storage/read-bytes store filename))]
-          (let [record (json/parse record-bytes false)]
-            ;; Use get-commit to handle both new and legacy formats
-            (get-commit record branch))))))
+          (json/parse record-bytes false)))))
 
   (alias [_ ledger-address]
     ;; TODO: need to validate that the branch doesn't have a slash?

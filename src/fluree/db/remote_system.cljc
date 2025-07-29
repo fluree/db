@@ -139,7 +139,7 @@
   (alias [_ ledger-address]
     ledger-address)
   (all-records [_]
-    ;; Remote systems don't support querying all records
+    ;; TODO - add querying all records in remote system
     (go-try []))
 
   nameservice/Publication
