@@ -178,7 +178,7 @@
                   store (s3/->S3Store nil (s3/get-credentials) bucket "us-east-1" "indexing")
                   list-ch (s3/s3-list store "")
                   objects-resp (<!! list-ch)
-                  object-keys (map :Key (:Contents objects-resp))]
+                  object-keys (map :key (:contents objects-resp))]
 
               (is (= [50] count-result) "Should have 50 persons")
               (is (pos? (count object-keys)) "Should have objects in S3")

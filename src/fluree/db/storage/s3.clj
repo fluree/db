@@ -252,8 +252,7 @@
                              :path full-path
                              :body data
                              :credentials credentials})
-                ch)
-    ch))
+                ch)))
 
 (defn- tag-matches?
   "Check if an XML element's tag matches the given name, ignoring namespace"
@@ -274,14 +273,14 @@
   [xml-str]
   (let [parsed (xml/parse-str xml-str)
         contents (xml-seq parsed)]
-    {:IsTruncated (= "true" (get-xml-text "IsTruncated" contents))
-     :NextContinuationToken (get-xml-text "NextContinuationToken" contents)
-     :Contents (for [x contents
+    {:truncated? (= "true" (get-xml-text "IsTruncated" contents))
+     :next-continuation-token (get-xml-text "NextContinuationToken" contents)
+     :contents (for [x contents
                      :when (tag-matches? "Contents" x)]
                  (let [obj-content (:content x)]
-                   {:Key (get-xml-text "Key" obj-content)
-                    :Size (get-xml-text "Size" obj-content)
-                    :LastModified (get-xml-text "LastModified" obj-content)}))}))
+                   {:key (get-xml-text "Key" obj-content)
+                    :size (get-xml-text "Size" obj-content)
+                    :last-modified (get-xml-text "LastModified" obj-content)}))}))
 
 (defn s3-list*
   "List objects in S3 with optional continuation token"
@@ -305,9 +304,9 @@
                                          :credentials credentials
                                          :query-params query-params}))
                parsed (parse-list-objects-response response)]
-           (>! ch (update parsed :Contents
+           (>! ch (update parsed :contents
                           (fn [contents]
-                            (mapv #(select-keys % [:Key]) contents)))))
+                            (mapv #(select-keys % [:key]) contents)))))
          (catch Exception e
            (>! ch e))))
      ch)))
@@ -319,9 +318,9 @@
     (go-loop [continuation-token nil]
       (let [results (<! (s3-list* client path continuation-token))]
         (>! ch results)
-        (if (and (:IsTruncated results)
-                 (:NextContinuationToken results))
-          (recur (:NextContinuationToken results))
+        (if (and (:truncated? results)
+                 (:next-continuation-token results))
+          (recur (:next-continuation-token results))
           (async/close! ch))))
     ch))
 
