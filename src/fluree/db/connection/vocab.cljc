@@ -16,6 +16,9 @@
 (def connection-type
   (system-iri "Connection"))
 
+(def config-type
+  (system-iri "Configuration"))
+
 (def storage-type
   (system-iri "Storage"))
 
