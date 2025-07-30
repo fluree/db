@@ -26,6 +26,16 @@
   [node]
   (type? node conn-vocab/connection-type))
 
+(defn connection-config?
+  [node]
+  (or (type? node conn-vocab/config-type)
+      (and (not (contains? node :type))
+           (or (contains? node conn-vocab/primary-publisher)
+               (contains? node conn-vocab/secondary-publishers)
+               (contains? node conn-vocab/commit-storage)
+               (contains? node conn-vocab/index-storage)
+               (contains? node conn-vocab/parallelism)))))
+
 (defn system?
   [node]
   (type? node conn-vocab/system-type))
@@ -127,12 +137,16 @@
           (get-first-value k)
           get-boolean))
 
+(derive :fluree.db/connection :fluree.db/abstract-connection)
+(derive :fluree.db/connection-config :fluree.db/abstract-connection)
+
 (defn derive-node-id
   [node]
   (let [id (get-id node)]
     (cond
       (config-value? node)        (derive id :fluree.db/config-value)
       (connection? node)          (derive id :fluree.db/connection)
+      (connection-config? node)   (derive id :fluree.db/connection-config)
       (system? node)              (derive id :fluree.db/remote-system)
       (memory-storage? node)      (derive id :fluree.db.storage/memory)
       (file-storage? node)        (derive id :fluree.db.storage/file)

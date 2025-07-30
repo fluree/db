@@ -75,7 +75,7 @@
                (assoc m id (convert-node-references node)))
              {} cfg))
 
-(defmethod ig/expand-key :fluree.db/connection
+(defmethod ig/expand-key :fluree.db/abstract-connection
   [k config]
   (let [cache-max-mb   (config/get-first-integer config conn-vocab/cache-max-mb)
         commit-storage (get config conn-vocab/commit-storage)
