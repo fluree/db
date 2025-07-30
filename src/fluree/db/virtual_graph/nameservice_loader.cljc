@@ -4,6 +4,7 @@
    [fluree.db.nameservice.virtual-graph :as ns-vg]
    [fluree.db.util.async :refer [<? go-try]]
    [fluree.db.util.json :as json]
+   [fluree.db.util.log :as log]
    [fluree.db.virtual-graph :as vg]
    [fluree.db.virtual-graph.parse :as vg-parse]))
 
@@ -55,6 +56,7 @@
 (defn create-vg-instance
   "Creates a virtual graph instance from configuration"
   [db vg-config]
+  (log/debug "Creating VG instance for config:" vg-config)
   (let [{:keys [type config alias vg-name]} vg-config
         vg-opts (-> config
                     (assoc :alias alias
@@ -63,6 +65,7 @@
                            :type type
                            :genesis-t (:t db))
                     (update "query" vg-parse/select-one->select))]
+    (log/debug "VG opts prepared:" vg-opts "Dispatching to type:" type)
     (create-vg-impl db vg-opts vg-config)))
 
 (defn load-virtual-graph-from-nameservice
@@ -70,17 +73,26 @@
   This is called when a query references a virtual graph that isn't already loaded."
   [db nameservice vg-name]
   (go-try
+    (log/debug "Loading virtual graph from nameservice:" vg-name)
     ;; First check if VG is already loaded
     (if-let [existing-vg (get-in db [:vg vg-name])]
-      existing-vg
+      (do
+        (log/debug "Virtual graph already loaded:" vg-name)
+        existing-vg)
       ;; Load from nameservice
-      (let [vg-record (<? (load-vg-config-from-nameservice nameservice vg-name))
-            vg-config (vg-record->config vg-record)
-            vg-instance (create-vg-instance db vg-config)
-            ;; Initialize the VG with current db state
-            initialized-vg (<? (vg/initialize vg-instance db))]
-        ;; Return the initialized VG instance directly
-        initialized-vg))))
+      (do
+        (log/debug "Loading VG config from nameservice...")
+        (let [vg-record (<? (load-vg-config-from-nameservice nameservice vg-name))
+              _ (log/debug "VG record loaded:" vg-record)
+              vg-config (vg-record->config vg-record)
+              _ (log/debug "VG config parsed:" vg-config)
+              vg-instance (create-vg-instance db vg-config)
+              _ (log/debug "VG instance created, initializing...")
+              ;; Initialize the VG with current db state
+              initialized-vg (<? (vg/initialize vg-instance db))]
+          (log/debug "VG initialized successfully")
+          ;; Return the initialized VG instance directly
+          initialized-vg)))))
 
 ;; Register BM25 implementation
 #?(:clj

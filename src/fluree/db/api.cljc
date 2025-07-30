@@ -12,7 +12,6 @@
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice.query :as ns-query]
-            [fluree.db.nameservice.virtual-graph :as ns-vg]
             [fluree.db.query.api :as query-api]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.range :as query-range]
@@ -21,7 +20,7 @@
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.log :as log]
-            [fluree.db.virtual-graph.nameservice-loader :as vg-loader]
+            [fluree.db.virtual-graph.create :as vg-create]
             [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge load range exists? update drop]))
 
@@ -277,46 +276,10 @@
     :ledgers - List of ledger aliases to index from
 
   Returns promise resolving to virtual graph name."
-  [conn {:keys [name type config dependencies]}]
+  [conn config]
   (validate-connection conn)
   (promise-wrap
-   (go-try
-     (when-not name
-       (throw (ex-info "Virtual graph requires :name" {:error :db/invalid-config})))
-     (when-not type
-       (throw (ex-info "Virtual graph requires :type" {:error :db/invalid-config})))
-     (when (and (string? name) (str/includes? name "@"))
-       (throw (ex-info "Virtual graph name cannot contain '@' symbol" {:error :db/invalid-config :name name})))
-
-     (let [vg-name (if (keyword? name) (clojure.core/name name) name)
-           vg-type (case type
-                     :bm25 "fidx:BM25"
-                     (throw (ex-info (str "Unknown virtual graph type: " type) {:error :db/invalid-config})))
-           ledgers (get-in config [:ledgers] [])
-           dependencies (or dependencies (mapv #(str % "@main") ledgers))
-           publisher (connection/primary-publisher conn)
-           full-config {:vg-name vg-name
-                        :vg-type vg-type
-                        :config config
-                        :dependencies dependencies}]
-
-       ;; Check if virtual graph already exists
-       (when (<? (ns-vg/virtual-graph-exists? publisher vg-name))
-         (throw (ex-info (str "Virtual graph already exists: " vg-name)
-                         {:error :db/invalid-config})))
-
-       ;; Publish to nameservice
-       (<? (ns-vg/publish-virtual-graph publisher full-config))
-
-       ;; Load and initialize the virtual graph
-       (log/debug "Loading and initializing virtual graph:" vg-name)
-       (doseq [ledger-alias ledgers]
-         (when-let [ledger (<? (connection/load-ledger-alias conn ledger-alias))]
-           (let [db (ledger/current-db ledger)]
-             (<? (vg-loader/load-virtual-graph-from-nameservice db publisher vg-name))
-             (log/debug "Successfully initialized virtual graph:" vg-name "for ledger:" ledger-alias))))
-
-       vg-name))))
+   (vg-create/create conn config)))
 
 (defn alias->address
   "Resolves a ledger alias to its address.

@@ -70,18 +70,11 @@
   (list-paths-recursive [_ prefix]
     ;; Memory storage already stores flat paths, so recursive is the same as regular listing
     (go
-      ;; Filter keys in contents that start with the prefix and end with .json
-      ;; AND are in the immediate directory (no additional slashes after prefix)
-      (let [all-keys (keys @contents)
-            prefix-with-slash (if (str/ends-with? prefix "/") prefix (str prefix "/"))]
-        (->> all-keys
-             (filter (fn [path]
-                       (and (str/starts-with? path prefix-with-slash)
-                            (str/ends-with? path ".json")
-                                                      ;; Check that there are no additional slashes after the prefix
-                            (let [relative-path (subs path (count prefix-with-slash))]
-                              (not (str/includes? relative-path "/"))))))
-             vec)))))
+      (->> @contents
+           keys
+           (filter #(and (str/starts-with? % prefix)
+                         (str/ends-with? % ".json")))
+           vec))))
 
 (defn open
   ([]

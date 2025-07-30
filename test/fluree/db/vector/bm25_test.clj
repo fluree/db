@@ -1,68 +1,37 @@
 (ns fluree.db.vector.bm25-test
-  (:require [clojure.core.async :as async]
-            [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]))
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.util.log :as log]))
 
-(deftest ^:integration basic-connection-test
-  (testing "Basic connection and ledger operations work"
-    (let [conn   (test-utils/create-conn)]
-      (testing "connection creation succeeds"
-        (is (some? conn)))
-
-      (testing "ledger creation succeeds"
-        (let [ledger @(fluree/create conn "test-basic")]
-          (is (some? ledger))))
-
-      (testing "data insertion succeeds"
-        (let [db @(fluree/insert! conn "test-basic"
-                                  {"@context" {"ex" "http://example.org/"}
-                                   "@graph" [{"@id" "ex:article1"
-                                              "@type" "ex:Article"
-                                              "ex:title" "Test Article"}]})]
-          (is (some? db)))))))
-
-(deftest ^:integration bm25-creation-test
-  (testing "Basic virtual graph creation test"
+(deftest ^:integration bm25-basic-functionality-test
+  (testing "Basic BM25 virtual graph functionality"
     (let [conn   (test-utils/create-conn)
-          _ledger @(fluree/create conn "bm25-creation")
-          _db     @(fluree/insert! conn "bm25-creation"
+          _ledger @(fluree/create conn "bm25-basic")
+          _db     @(fluree/insert! conn "bm25-basic"
                                    {"@context" {"ex" "http://example.org/"}
-                                    "@graph" [{"@id" "ex:article1"
-                                               "@type" "ex:Article"
+                                    "@graph" [{"@id" "ex:doc1"
+                                               "@type" "ex:Document"
                                                "ex:title" "Introduction to Fluree"
                                                "ex:content" "Fluree is a semantic graph database"}]})
-          ;; Create VG using new API
-          vg-result @(fluree/create-virtual-graph
-                      conn
-                      {:name "creation-test-index"
-                       :type :bm25
-                       :config {:ledgers ["bm25-creation"]
-                                :query {"@context" {"ex" "http://example.org/"}
-                                        "where" [{"@id" "?x"
-                                                  "@type" "ex:Article"}]
-                                        "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})]
+          ;; Create VG
+          vg-name @(fluree/create-virtual-graph
+                    conn
+                    {:name "basic-search"
+                     :type :bm25
+                     :config {:ledgers ["bm25-basic"]
+                              :query {"@context" {"ex" "http://example.org/"}
+                                      "where" [{"@id" "?x"
+                                                "@type" "ex:Document"}]
+                                      "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})]
 
-      (println "RESULT: " vg-result)
       (testing "virtual graph creation succeeds"
-        (is (some? vg-result))
-        (is (= "creation-test-index" vg-result))))))
+        (is (= "basic-search" vg-name)))
 
-(defn full-text-search
-  "Performs a full text search and returns a couple attributes joined from the db
-  for use of tests below"
-  [db search-term]
-  @(fluree/query db {"@context" {"ex"   "http://example.org/ns/"
-                                 "fidx" "https://ns.flur.ee/index#"}
-                     "select"   ["?x", "?score", "?title"]
-                     "where"    [["graph" "##articleSearch" {"fidx:target" search-term
-                                                             "fidx:limit"  10,
-                                                             "fidx:sync"   true,
-                                                             "fidx:result" {"@id"        "?x"
-                                                                            "fidx:score" "?score"}}]
-                                 {"@id"      "?x"
-                                  "ex:title" "?title"}]}))
+      ;; Wait for indexing
+      (Thread/sleep 5000)
 
+ 
 (defn has-index?
   [db]
   (-> db :stats :indexed pos-int?))
@@ -560,4 +529,20 @@
                  (full-text-search db2-l "Apples for snacks for John"))
               "db returned from (fluree/load ...) had issues"))))))
 =======
->>>>>>> b963a392c (Refactor virtual graph storage and fix critical bugs)
+      (testing "search functionality"
+        (let [results @(fluree/query-connection conn
+                                                {"@context" {"idx" "https://ns.flur.ee/index#"}
+                                                 "from" ["basic-search"]
+                                                 "where" [{"@id" "?x"
+                                                           "idx:target" "fluree"
+                                                           "idx:limit" 10
+                                                           "idx:result" {"idx:id" "?doc"
+                                                                         "idx:score" "?score"}}]
+                                                 "select" ["?doc" "?score"]})]
+          (println "Search results:" results)
+          (is (seq results) "Should return search results")
+          (when (seq results)
+            (println "First result:" (first results))
+            (is (= "http://example.org/doc1" (ffirst results)) "Should find the document")
+            (is (number? (second (first results))) "Should have numeric score")))))))
+>>>>>>> 8d8c66b41 (Remove FlatRank virtual graph support and refactor BM25 API)
