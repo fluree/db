@@ -1,5 +1,6 @@
 (ns fluree.db.connection.config
   (:require [clojure.string :as str]
+            [fluree.crypto :as crypto]
             [fluree.db.connection.vocab :as conn-vocab]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util :as util :refer [get-id get-first get-first-value
@@ -306,3 +307,50 @@
                (map derive-fn)
                (map (juxt get-id identity)))
          (standardize cfg))))
+
+(defn parse-identity
+  [defaults]
+  (when-let [identity (get-first defaults conn-vocab/identity)]
+    (let [public-key  (get-first-string identity conn-vocab/public-key)
+          private-key (get-first-string identity conn-vocab/private-key)
+          ;; Derive public key from private key if public key is missing
+          public-key* (if (and (nil? public-key) private-key)
+                        (crypto/public-key-from-private private-key)
+                        public-key)
+          result {:id      (get-id identity)
+                  :public  public-key*
+                  :private private-key}]
+      result)))
+
+(defn parse-index-options
+  [defaults]
+  (when-let [index-options (get-first defaults conn-vocab/index-options)]
+    {:reindex-min-bytes (get-first-long index-options conn-vocab/reindex-min-bytes)
+     :reindex-max-bytes (get-first-long index-options conn-vocab/reindex-max-bytes)
+     :max-old-indexes   (get-first-integer index-options conn-vocab/max-old-indexes)}))
+
+(defn parse-defaults
+  [config]
+  (when-let [defaults (get-first config conn-vocab/defaults)]
+    (let [identity      (parse-identity defaults)
+          index-options (parse-index-options defaults)]
+      (cond-> nil
+        identity      (assoc :identity identity)
+        index-options (assoc :indexing index-options)))))
+
+(defn parse-connection-map
+  [{:keys [cache commit-catalog index-catalog serializer] :as config}]
+  (let [parallelism          (get-first-integer config conn-vocab/parallelism)
+        primary-publisher    (get-first config conn-vocab/primary-publisher)
+        secondary-publishers (get config conn-vocab/secondary-publishers)
+        remote-systems       (get config conn-vocab/remote-systems)
+        defaults             (parse-defaults config)]
+    {:parallelism          parallelism
+     :cache                cache
+     :commit-catalog       commit-catalog
+     :index-catalog        index-catalog
+     :primary-publisher    primary-publisher
+     :secondary-publishers secondary-publishers
+     :remote-systems       remote-systems
+     :serializer           serializer
+     :defaults             defaults}))
