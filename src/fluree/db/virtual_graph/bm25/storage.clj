@@ -89,7 +89,7 @@
   [vg]
   (-> vg
       (select-keys [:k1 :b :index-state :initialized :genesis-t :t :alias :db-alias
-                    :query :namespace-codes :property-deps :type :lang :id :vg-name])
+                    :query :namespace-codes :namespaces :property-deps :type :lang :id :vg-name])
       (update :index-state state-data)
       ;; Type can be either SIDs or strings, handle both
       (update :type (fn [type-val]
@@ -107,9 +107,10 @@
         props))
 
 (defn reify-bm25
-  [{:keys [lang query namespace-codes] :as vg-data}]
+  [{:keys [lang query namespace-codes namespaces] :as vg-data}]
   (let [parsed-query (parse/parse-query query)
-        namespaces   (map-invert namespace-codes)
+        ;; Use provided namespaces if available, otherwise invert namespace-codes
+        namespaces   (or namespaces (map-invert namespace-codes))
         query-props  (parse/get-query-props parsed-query)
         property-deps (get-property-sids namespaces query-props)]
     (-> vg-data
@@ -124,13 +125,11 @@
         (update :k1 coerce-double))))
 
 (defmethod vg/write-vg :bm25
-  [{:keys [storage serializer] :as _index-catalog} {:keys [vg-name alias] :as vg}]
+  [{:keys [storage serializer] :as _index-catalog} {:keys [vg-name] :as vg}]
   (go-try
     (let [data            (vg-data vg)
           serialized-data (serde/-serialize-bm25 serializer data)
-          ;; Use vg-name if available (new style), otherwise fall back to alias
-          vg-identifier   (or vg-name (vg/trim-alias-ref alias))
-          path            (vg/vg-storage-path :bm25 vg-identifier)
+          path            (vg/vg-storage-path :bm25 vg-name)
           write-res       (<? (storage/content-write-json storage path serialized-data))]
       (log/debug "BM25 write-vg - write result:" write-res)
       (assoc write-res :type "bm25"))))

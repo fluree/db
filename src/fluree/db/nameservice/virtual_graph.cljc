@@ -48,14 +48,6 @@
     (let [filename (vg-filename vg-name)]
       (<? (nameservice/retract publisher filename)))))
 
-(defn parse-vg-id
-  "Parses a virtual graph ID into its components.
-  Returns {:ledger-alias :vg-alias} or nil if invalid."
-  [vg-id]
-  (when-let [[_ ledger vg] (re-matches #"^(.+?)##(.+)$" vg-id)]
-    {:ledger-alias ledger
-     :vg-alias vg}))
-
 (defn list-virtual-graphs
   "Lists all virtual graphs from the nameservice"
   [nameservice]

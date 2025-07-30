@@ -48,12 +48,3 @@
 (defmulti read-vg
   (fn [_index-catalog storage-meta]
     (-> storage-meta :type keyword)))
-
-(defn trim-alias-ref
-  "Virtual graph aliases are prefixed by `##` to indicate they are relative virtual graphs.
-
-  When writing a virtual graph to storage, etc. we need to remove the `##` prefix to get the actual alias."
-  [vg-alias]
-  (if (str/starts-with? vg-alias "##")
-    (subs vg-alias 2)
-    vg-alias))

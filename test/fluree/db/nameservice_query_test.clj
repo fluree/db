@@ -110,24 +110,27 @@
   (testing "Nameservice query with file storage"
     (with-temp-dir [storage-path {}]
       (let [conn @(fluree/connect-file {:storage-path (str storage-path)})]
+        (try
           ;; Create a ledger with file storage
-        @(fluree/create conn "file-ledger" {})
-        @(fluree/insert! conn "file-ledger"
-                         {"@context" {"test" "http://example.org/test#"}
-                          "@graph" [{"@id" "test:file-person"
-                                     "@type" "Person"
-                                     "name" "File User"}]})
+          @(fluree/create conn "file-ledger" {})
+          @(fluree/insert! conn "file-ledger"
+                           {"@context" {"test" "http://example.org/test#"}
+                            "@graph" [{"@id" "test:file-person"
+                                      "@type" "Person"
+                                      "name" "File User"}]})
 
           ;; Query the file-based nameservice
-        (let [query {"@context" {"f" iri/f-ns}
-                     "select" ["?ledger" "?t"]
-                     "where" [{"@id" "?ns"
-                               "f:ledger" "?ledger"
-                               "f:t" "?t"}]}
-              result @(fluree/query-nameservice conn query {})]
-          (is (>= (count result) 1) "Should find file-based ledger")
+          (let [query {"@context" {"f" iri/f-ns}
+                       "select" ["?ledger" "?t"]
+                       "where" [{"@id" "?ns"
+                                 "f:ledger" "?ledger"
+                                 "f:t" "?t"}]}
+                result @(fluree/query-nameservice conn query {})]
+            (is (>= (count result) 1) "Should find file-based ledger")
 
             ;; Verify we found our file ledger
-          (let [file-ledger-result (filter #(= (first %) "file-ledger") result)]
-            (is (= (count file-ledger-result) 1) "Should find file-ledger")))
-        @(fluree/disconnect conn)))))
+            (let [file-ledger-result (filter #(= (first %) "file-ledger") result)]
+              (is (= (count file-ledger-result) 1) "Should find file-ledger")))
+
+          (finally
+            @(fluree/disconnect conn)))))))

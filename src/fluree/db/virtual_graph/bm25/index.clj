@@ -261,11 +261,16 @@
   (initialize [this source-db]
     (go
       (let [initialized-bm25 (bm25-initialize this source-db)
-            catalog (:index-catalog initialized-bm25)]
-        (when catalog
+            {:keys [index-state index-catalog]} initialized-bm25
+            ;; Wait for the async indexing to complete
+            pending-ch (get @index-state :pending-ch)]
+        (when pending-ch
+          (<! pending-ch))
+        ;; Now write to storage
+        (when index-catalog
           (try
-            (let [write-result (<! (vg/write-vg catalog initialized-bm25))]
-              (log/info "Successfully wrote initial BM25 index to storage, result:" write-result))
+            (<! (vg/write-vg index-catalog initialized-bm25))
+            (log/debug "Successfully wrote initial BM25 index to storage")
             (catch Exception e
               (log/error e "Failed to write initial BM25 index to storage"))))
         initialized-bm25)))
@@ -319,7 +324,6 @@
 ;; TODO - VG - drop index
 (defn new-bm25-index
   [{:keys [namespaces namespace-codes alias index-catalog] :as db} index-flakes vg-opts]
-  (log/info "Creating BM25 index with db keys:" (keys db))
   (-> (idx-flakes->opts index-flakes)
       (merge vg-opts)
       ;; index-state held as atom, as we need -match-triple, etc. to hold both

@@ -7,7 +7,7 @@
 
 (deftest create-virtual-graph-test
   (testing "Creating a BM25 virtual graph via API"
-    (let [conn @(fluree/connect-memory {}) 
+    (let [conn @(fluree/connect-memory {})
           _ledger @(fluree/create conn "test-vg")]
 
       ;; Insert some test data
