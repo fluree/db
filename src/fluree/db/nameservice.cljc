@@ -15,7 +15,9 @@
     and other metadata")
   (alias [nameservice ledger-address]
     "Given a ledger address, returns ledger's default alias name else nil, if
-    not avail"))
+    not avail")
+  (all-records [nameservice]
+    "Returns a channel containing all nameservice records for building in-memory query ledger"))
 
 (defprotocol Publisher
   (publish [publisher commit-jsonld]

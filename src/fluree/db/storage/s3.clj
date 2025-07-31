@@ -382,7 +382,23 @@
                          :bucket bucket
                          :region region
                          :path full-path
-                         :credentials credentials}))))))
+                         :credentials credentials})))))
+
+  storage/ListableStore
+  (list-paths [this path-prefix]
+    (go-try
+      ;; Use existing s3-list function to list objects with the prefix
+      (let [results-ch (s3-list this path-prefix)
+            all-results (loop [acc []]
+                          (let [batch (<! results-ch)]
+                            (if batch
+                              (let [contents (:contents batch)]
+                                (recur (into acc (map :key contents))))
+                              acc)))]
+        ;; Filter for .json files and return relative paths
+        (->> all-results
+             (filter #(str/ends-with? % ".json"))
+             vec)))))
 
 (defn open
   "Open an S3 store using direct HTTP implementation"
