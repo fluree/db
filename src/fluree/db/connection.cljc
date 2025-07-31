@@ -462,50 +462,82 @@
           (<? (storage/delete storage index-address))))
       :index-dropped)))
 
-(defn drop-ledger
-  [conn alias]
+(defn- check-ledger-dependencies
+  "Checks if ledger has dependent virtual graphs"
+  [primary-pub ledger-alias]
+  (when primary-pub
+    ;; For now, check with alias@main as default branch
+    (let [ledger-with-branch (str ledger-alias "@main")]
+      (ns-storage/check-vg-dependencies primary-pub ledger-with-branch))))
+
+(defn- throw-if-has-dependencies
+  "Throws exception if ledger has dependent virtual graphs"
+  [alias dependent-vgs]
+  (when (seq dependent-vgs)
+    (throw (ex-info (str "Cannot delete ledger '" alias
+                         "' - it has dependent virtual graphs: "
+                         (str/join ", " dependent-vgs)
+                         ". Delete the virtual graphs first.")
+                    {:status 400
+                     :error :db/ledger-has-dependencies
+                     :ledger alias
+                     :dependent-vgs dependent-vgs}))))
+
+(defn- get-branch-commit-info
+  "Retrieves branch commit and index addresses from nameservice record"
+  [ns-record]
+  {:branch         (get ns-record "f:branch" "main")
+   :commit-address (get-in ns-record ["f:commit" "@id"])
+   :index-address  (get-in ns-record ["f:index" "@id"])})
+
+(defn- load-latest-commit
+  "Loads and expands the latest commit if it exists"
+  [conn commit-address index-address]
   (go-try
-    (let [alias (if (fluree-address? alias)
-                  (nameservice/address-path alias)
-                  alias)
-            ;; Check for VG dependencies before deletion
-          primary-pub (:primary-publisher conn)
-            ;; For now, check with alias@main as default branch
-            ;; TODO: Should check all branches for dependencies
-          ledger-with-branch (str alias "@main")
-          dependent-vgs (when primary-pub
-                          (ns-storage/check-vg-dependencies primary-pub ledger-with-branch))]
-        ;; Throw error if there are dependent virtual graphs
-      (when (seq dependent-vgs)
-        (throw (ex-info (str "Cannot delete ledger '" alias
-                             "' - it has dependent virtual graphs: "
-                             (str/join ", " dependent-vgs)
-                             ". Delete the virtual graphs first.")
-                        {:status 400
-                         :error :db/ledger-has-dependencies
-                         :ledger alias
-                         :dependent-vgs dependent-vgs})))
+    (when commit-address
+      (let [commit (<? (commit-storage/load-commit-with-metadata
+                        (:commit-catalog conn)
+                        commit-address
+                        index-address))]
+        (when commit
+          (json-ld/expand commit))))))
+
+(defn- drop-ledger-artifacts
+  "Drops all artifacts (index and commit) for a ledger"
+  [conn latest-commit]
+  (when latest-commit
+    (drop-index-artifacts conn latest-commit)
+    (drop-commit-artifacts conn latest-commit)))
+
+(defn- drop-ledger-from-publisher
+  "Drops a single ledger from a specific publisher"
+  [conn publisher alias]
+  (go-try
+    (let [ledger-addr  (<? (nameservice/publishing-address publisher alias))
+          ns-record    (<? (nameservice/lookup publisher ledger-addr))
+          {:keys [branch commit-address index-address]} (get-branch-commit-info ns-record)
+          latest-commit (<? (load-latest-commit conn commit-address index-address))]
+      (log/debug "Dropping ledger" ledger-addr)
+      (drop-ledger-artifacts conn latest-commit)
+      (<? (nameservice/retract publisher (str alias "@" branch))))))
+
+(defn drop-ledger
+  "Drops a ledger and all its associated data from all publishers"
+  [conn alias-or-address]
+  (go-try
+    (let [alias         (if (fluree-address? alias-or-address)
+                          (nameservice/address-path alias-or-address)
+                          alias-or-address)
+          primary-pub   (:primary-publisher conn)
+          dependent-vgs (check-ledger-dependencies primary-pub alias)]
+
+      (throw-if-has-dependencies alias dependent-vgs)
 
       (loop [[publisher & r] (publishers conn)]
         (when publisher
-          (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
-                ns-record     (<? (nameservice/lookup publisher ledger-addr))
-                branch        (get ns-record "f:branch" "main")
-                commit-address (get-in ns-record ["f:commit" "@id"])
-                index-address  (get-in ns-record ["f:index" "@id"])
-                latest-commit  (when commit-address
-                                 (let [commit (<? (commit-storage/load-commit-with-metadata
-                                                   (:commit-catalog conn)
-                                                   commit-address
-                                                   index-address))]
-                                   (when commit
-                                     (json-ld/expand commit))))]
-            (log/debug "Dropping ledger" ledger-addr)
-            (when latest-commit
-              (drop-index-artifacts conn latest-commit)
-              (drop-commit-artifacts conn latest-commit))
-            (<? (nameservice/retract publisher (str alias "@" branch)))
-            (recur r))))
+          (<? (drop-ledger-from-publisher conn publisher alias))
+          (recur r)))
+
       (log/debug "Dropped ledger" alias)
       :dropped)))
 
