@@ -3,6 +3,7 @@
   (:require [clojure.string :as str]
             [fluree.db.connection :as connection]
             [fluree.db.ledger :as ledger]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.nameservice.virtual-graph :as ns-vg]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.virtual-graph.nameservice-loader :as vg-loader]))
@@ -79,12 +80,15 @@
         loaded))))
 
 (defn- initialize-bm25-for-ledgers
-  "Initializes the BM25 virtual graph for all dependent ledgers."
+  "Initializes the BM25 virtual graph for all dependent ledgers.
+   Returns the loaded virtual graph instance."
   [loaded-ledgers publisher vg-name]
   (go-try
-    (doseq [[_alias ledger] loaded-ledgers]
-      (let [db (ledger/current-db ledger)]
-        (<? (vg-loader/load-virtual-graph-from-nameservice db publisher vg-name))))))
+    ;; Since we only support single ledger for now, we can return the VG directly
+    (let [[_alias ledger] (first loaded-ledgers)
+          db (ledger/current-db ledger)
+          vg (<? (vg-loader/load-virtual-graph-from-nameservice db publisher vg-name))]
+      vg)))
 
 (defmethod create-vg :bm25
   [conn vg-config]
@@ -106,12 +110,10 @@
       (let [loaded-ledgers (<? (load-and-validate-ledgers conn ledger-aliases))]
 
         ;; Publish to nameservice only after ledgers are validated
-        (<? (ns-vg/publish-virtual-graph publisher full-config))
+        (<? (nameservice/publish publisher full-config))
 
-        ;; Initialize the virtual graph with pre-loaded ledgers
-        (<? (initialize-bm25-for-ledgers loaded-ledgers publisher vg-name))
-
-        vg-name))))
+        ;; Initialize the virtual graph with pre-loaded ledgers and return the VG instance
+        (<? (initialize-bm25-for-ledgers loaded-ledgers publisher vg-name))))))
 
 ;; Default implementation for unknown types
 (defmethod create-vg :default

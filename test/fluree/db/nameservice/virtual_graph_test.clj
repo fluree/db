@@ -21,17 +21,18 @@
                                    "ex:content" "Learn about complex queries"}]})
 
       (testing "Create BM25 virtual graph"
-        (let [vg-name @(fluree/create-virtual-graph
-                        conn
-                        {:name "article-search"
-                         :type :bm25
-                         :config {:stemmer "snowballStemmer-en"
-                                  :stopwords "stopwords-en"
-                                  :ledgers ["test-vg"]
-                                  :query {"@context" {"ex" "http://example.org/ns/"}
-                                          "where" [{"@id" "?x"
-                                                    "@type" "ex:Article"}]
-                                          "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})]
+        (let [vg-obj @(fluree/create-virtual-graph
+                       conn
+                       {:name "article-search"
+                        :type :bm25
+                        :config {:stemmer "snowballStemmer-en"
+                                 :stopwords "stopwords-en"
+                                 :ledgers ["test-vg"]
+                                 :query {"@context" {"ex" "http://example.org/ns/"}
+                                         "where" [{"@id" "?x"
+                                                   "@type" "ex:Article"}]
+                                         "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})
+              vg-name (:vg-name vg-obj)]
           (is (= "article-search" vg-name))
 
           ;; Verify the virtual graph exists

@@ -1,8 +1,10 @@
 (ns fluree.db.vector.bm25-federated-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.core.async :refer [<!!]]
+            [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph :as vg]))
 
 (deftest ^:integration bm25-federated-query-test
   (testing "Federated queries with ledger and virtual graph using graph syntax"
@@ -38,21 +40,22 @@
                                            "lib:name" "John Doe"}]})
 
           ;; Create BM25 virtual graph
-          vg-name @(fluree/create-virtual-graph
-                    conn
-                    {:name "book-search"
-                     :type :bm25
-                     :config {:ledgers ["library"]
-                              :query {"@context" {"lib" "http://library.org/"}
-                                      "where" [{"@id" "?x"
-                                                "@type" "lib:Book"}]
-                                      "select" {"?x" ["@id" "lib:title" "lib:content"]}}}})]
+          vg-obj @(fluree/create-virtual-graph
+                   conn
+                   {:name "book-search"
+                    :type :bm25
+                    :config {:ledgers ["library"]
+                             :query {"@context" {"lib" "http://library.org/"}
+                                     "where" [{"@id" "?x"
+                                               "@type" "lib:Book"}]
+                                     "select" {"?x" ["@id" "lib:title" "lib:content"]}}}})
+          vg-name (:vg-name vg-obj)]
 
       (testing "virtual graph created"
         (is (= "book-search" vg-name)))
 
-      ;; Allow time for indexing
-      (Thread/sleep 2000)
+      ;; Wait for initial indexing
+      (<!! (vg/sync vg-obj nil))
 
       (testing "federated query combining search results with ledger data"
         (let [results @(fluree/query-connection

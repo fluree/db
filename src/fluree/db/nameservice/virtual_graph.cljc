@@ -1,52 +1,22 @@
 (ns fluree.db.nameservice.virtual-graph
-  (:require [fluree.db.json-ld.iri :as iri]
-            [fluree.db.nameservice :as nameservice]
+  (:require [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn vg-filename
-  "Returns the nameservice filename for a virtual graph"
-  [vg-name]
-  (str "ns@v1/" vg-name ".json"))
-
-(defn vg-record
-  "Generates a virtual graph nameservice record"
-  [{:keys [vg-name vg-type config dependencies status]
-    :or {status "ready"}}]
-  {"@context" {"f" iri/f-ns
-               "fidx" "https://ns.flur.ee/index#"}
-   "@id" vg-name
-   "@type" (cond-> ["f:VirtualGraphDatabase"]
-             vg-type (conj vg-type))
-   "f:name" vg-name
-   "f:status" status
-   "f:dependencies" (mapv (fn [dep] {"@id" dep}) dependencies)
-   "fidx:config" {"@type" "@json"
-                  "@value" config}})
-
 (defn publish-virtual-graph
   "Publishes a virtual graph configuration to the nameservice"
-  [publisher vg-config]
+  [publisher vg-record]
   (go-try
-    (let [vg-record (vg-record vg-config)
-          record-bytes (json/stringify-UTF8 vg-record)
-          filename (vg-filename (:vg-name vg-config))]
-      (log/debug "Published virtual graph successfully:" (:vg-name vg-config))
-      (<? (nameservice/publish publisher
-                               {"type" "virtual-graph"
-                                "record" vg-record
-                                "filename" filename
-                                "bytes" record-bytes})))))
+    (log/debug "Publishing virtual graph:" (:vg-name vg-record))
+    (<? (nameservice/publish publisher vg-record))))
 
 (defn retract-virtual-graph
   "Removes a virtual graph from the nameservice"
   [publisher vg-name]
   (go-try
-    (let [filename (vg-filename vg-name)]
-      (<? (nameservice/retract publisher filename)))))
+    (<? (nameservice/retract publisher vg-name))))
 
 (defn list-virtual-graphs
   "Lists all virtual graphs from the nameservice"

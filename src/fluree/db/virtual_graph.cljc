@@ -1,10 +1,22 @@
 (ns fluree.db.virtual-graph
+  (:refer-clojure :exclude [sync])
   (:require [clojure.string :as str]
             [fluree.db.json-ld.iri :as iri]))
 
 (defprotocol UpdatableVirtualGraph
   (upsert [this source-db new-flakes remove-flakes] "Updates the virtual graph with the provided flakes. Returns async chan with new updated VirtualGraph or exception.")
   (initialize [this source-db] "Initialize a new virtual graph based on the provided db - returns promise chan of eventual result"))
+
+(defprotocol SyncableVirtualGraph
+  (sync [this as-of] [this as-of opts]
+    "Waits for the virtual graph to complete any pending indexing operations.
+     Returns a promise-chan that resolves when the VG is fully synced.
+     
+     Parameters:
+       as-of - Transaction 't' value to sync to, or nil to sync to latest known
+     
+     Options:
+       :timeout - Maximum time to wait in milliseconds (default 10000)"))
 
 (defn vg-type-name
   [vg]

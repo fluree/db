@@ -1,8 +1,10 @@
 (ns fluree.db.vector.bm25-memory-test
-  (:require [clojure.string :as str]
+  (:require [clojure.core.async :refer [<!!]]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph :as vg]))
 
 (deftest ^:integration bm25-memory-search-test
   (testing "BM25 virtual graph creation and search with memory storage"
@@ -26,21 +28,22 @@
                                            "ex:content" "How Fluree integrates blockchain technology with databases"}]})
 
           ;; Create BM25 virtual graph
-          vg-name @(fluree/create-virtual-graph
-                    conn
-                    {:name "doc-search"
-                     :type :bm25
-                     :config {:ledgers ["docs"]
-                              :query {"@context" {"ex" "http://example.org/"}
-                                      "where" [{"@id" "?x"
-                                                "@type" "ex:Article"}]
-                                      "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})]
+          vg-obj @(fluree/create-virtual-graph
+                   conn
+                   {:name "doc-search"
+                    :type :bm25
+                    :config {:ledgers ["docs"]
+                             :query {"@context" {"ex" "http://example.org/"}
+                                     "where" [{"@id" "?x"
+                                               "@type" "ex:Article"}]
+                                     "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})
+          vg-name (:vg-name vg-obj)]
 
       (testing "virtual graph creation returns correct name"
         (is (= "doc-search" vg-name)))
 
-      ;; Allow time for BM25 index building
-      (Thread/sleep 2000)
+      ;; Wait for initial indexing using sync method
+      (<!! (vg/sync vg-obj nil))
 
       (testing "direct virtual graph query for search"
         (let [search-results @(fluree/query-connection

@@ -35,18 +35,17 @@
              "f:status"     "ready"}
       index-address (assoc "f:index" {"@id" index-address}))))
 
-(defrecord StorageNameService [store]
+(defrecord StorageNameService [store vg-state]
   nameservice/Publisher
   (publish [_ data]
     (if (= (get data "type") "virtual-graph")
-      ;; Handle virtual graph records
+      ;; Handle virtual graph records (already JSON-LD bytes + filename provided)
       (let [record-bytes (get data "bytes")
             filename     (get data "filename")]
         (log/debug "nameservice.storage/publish virtual-graph" {:filename filename})
         (storage/write-bytes store filename record-bytes))
       ;; Handle regular commit records
-      (let [;; Extract data from compact JSON-LD format (both genesis and regular commits now use this)
-            ledger-alias   (get data "alias")
+      (let [ledger-alias   (get data "alias")
             branch         (or (get data "branch")
                                (when (and (string? ledger-alias)
                                           (str/includes? ledger-alias "@"))
@@ -63,16 +62,105 @@
           (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :branch branch :filename filename})
           res))))
 
-  (retract [_ target]
-    (let [filename (if (string? target)
-                     ;; Legacy: ledger-alias string
-                     (local-filename target)
-                     ;; New: filename directly for virtual graphs
-                     target)
-          address  (-> store
-                       storage/location
-                       (storage/build-address filename))]
-      (storage/delete store address)))
+(defn get-commit
+  "Returns the minimal nameservice record."
+  ([record]
+   (get-commit record nil))
+  ([record _branch]
+   ;; Always return the record itself for new format
+   record))
+
+;; Virtual Graph Dependency Tracking Functions
+
+(defn is-virtual-graph-record?
+  "Checks if a nameservice record is a virtual graph"
+  [record]
+  (some #{"f:VirtualGraphDatabase"} (get record "@type" [])))
+
+(defn extract-vg-dependencies
+  "Extracts ledger dependencies from a VG record"
+  [vg-record]
+  (mapv #(get % "@id") (get vg-record "f:dependencies" [])))
+
+(defn check-vg-dependencies
+  "Returns set of VG names that depend on the ledger, or empty set if none"
+  [publisher ledger-alias]
+  (get-in @(:vg-state publisher) [:dependencies ledger-alias] #{}))
+
+(defn register-dependencies
+  [publisher json-ld]
+  (let [vg-name (get json-ld "f:name")
+        dependencies (extract-vg-dependencies json-ld)]
+    (log/debug "Registering VG dependencies for" vg-name ":" dependencies)
+    (swap! (:vg-state publisher)
+           (fn [state]
+             (reduce (fn [s dep-ledger]
+                       (update-in s [:dependencies dep-ledger]
+                                  (fnil conj #{}) vg-name))
+                     state
+                     dependencies)))))
+
+(defn initialize-vg-dependencies
+  "Scans all virtual graph records at startup to build dependency map"
+  [publisher]
+  (go-try
+    (let [all-records (<? (nameservice/all-records publisher))
+          vg-records (filter is-virtual-graph-record? all-records)]
+
+      (log/debug "Initializing VG dependencies from" (count vg-records) "virtual graph records")
+
+      (doseq [vg-record vg-records]
+        (<? (register-dependencies publisher vg-record)))
+
+      (log/debug "VG dependency initialization complete. Dependencies:"
+                 (:dependencies @(:vg-state publisher))))))
+
+(defn unregister-vg-dependencies
+  "Remove dependencies for a deleted virtual graph."
+  [publisher vg-name]
+  (log/debug "Unregistering VG dependencies for" vg-name)
+  (swap! (:vg-state publisher)
+         update :dependencies
+         (fn [deps]
+           (reduce-kv (fn [m ledger vgs]
+                        (let [updated-vgs (disj vgs vg-name)]
+                          (if (empty? updated-vgs)
+                            (dissoc m ledger)
+                            (assoc m ledger updated-vgs))))
+                      {}
+                      deps))))
+
+(defrecord StorageNameService [store vg-state]
+  nameservice/Publisher
+  (publish [this record]
+    (go-try
+      (let [filename (if-let [vg-name (:vg-name record)]
+                       (local-filename vg-name)
+                       (local-filename (str (get record "alias") "@" (get record "branch"))))
+            json-ld (record->json-ld record)
+            result (->> json-ld
+                        json/stringify-UTF8
+                        (storage/write-bytes store filename)
+                        <?)]
+        (log/debug "Nameservice published:" filename)
+        (when (is-virtual-graph-record? json-ld)
+          ;; If this is a virtual graph, register dependencies
+          (register-dependencies this json-ld))
+        result)))
+
+  (retract [this target]
+    (go-try
+      (let [;; Check if target is a ledger (contains @) or VG (no @)
+            ledger? (str/includes? target "@")
+            address (-> store
+                        storage/location
+                        (storage/build-address (local-filename target)))]
+
+        ;; If this is a VG, unregister dependencies first
+        (when-not ledger?
+          (unregister-vg-dependencies this target))
+
+        (<? (storage/delete store address)))))
 
   (publishing-address [_ ledger-alias]
     (go (publishing-address* store ledger-alias)))
@@ -81,8 +169,7 @@
   (lookup [_ ledger-address]
     (go-try
       (let [{:keys [alias branch]} (nameservice/resolve-address (storage/location store) ledger-address nil)
-            branch                  (or branch "main")
-            filename                (local-filename alias branch)]
+            filename                (local-filename (str alias "@" branch))]
         (when-let [record-bytes (<? (storage/read-bytes store filename))]
           (json/parse record-bytes false)))))
 
@@ -118,4 +205,8 @@
 
 (defn start
   [store]
-  (->StorageNameService store))
+  (let [publisher (->StorageNameService store (atom {}))]
+    ;; Initialize VG dependencies from existing records asynchronously (fire and forget)
+    (go-try
+      (<? (initialize-vg-dependencies publisher)))
+    publisher))

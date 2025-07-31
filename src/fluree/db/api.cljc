@@ -275,7 +275,9 @@
     :query - FQL query defining documents to index
     :ledgers - List of ledger aliases to index from
 
-  Returns promise resolving to virtual graph name."
+  Returns promise resolving to virtual graph database object that supports:
+    - query operations via query-connection
+    - sync method to wait for indexing completion"
   [conn config]
   (validate-connection conn)
   (promise-wrap
