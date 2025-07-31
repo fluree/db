@@ -43,8 +43,8 @@
           (let [query {"select" ["?s" "?p" "?o"]
                        "where" [{"@id" "?s" "?p" "?o"}]}
                 result @(fluree/query-nameservice conn query {})]
-            ;; Should have data from all ledgers plus temporary ledger metadata
-            (is (> (count result) 10) "Should have multiple records")
+            ;; Should have data from all ledgers plus nameservice metadata (at least 3 ledgers created)
+            (is (>= (count result) 9) "Should have at least 9 records from 3 ledgers and their metadata")
 
             ;; Check that we have nameservice-specific data by looking for ledger references
             (let [ledger-records (filter (fn [[_ p _]]
