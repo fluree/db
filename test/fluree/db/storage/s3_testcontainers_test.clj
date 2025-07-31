@@ -10,8 +10,8 @@
    
    These tests can be included in a weekly CI/CD job using the :docker-tests alias."
   (:require [clojure.core.async :refer [<!!]]
-            [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.java.shell :as shell]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [fluree.db.api :as fluree]
             [fluree.db.storage.s3 :as s3]
             [fluree.db.util.xhttp :as xhttp])
@@ -148,7 +148,7 @@
                     ;; Check that paths don't have double slashes
                     (is (not-any? #(re-find #"//" %) object-keys)
                         "Paths should not contain double slashes")
-                    
+
                     ;; Use AWS CLI to list bucket contents
                     (println "\nAWS CLI S3 listing:")
                     (let [aws-cmd (str "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test "
@@ -221,7 +221,7 @@
 
               (is (some #(re-find #"index" %) object-keys)
                   "Should have index files")
-              
+
               ;; Use AWS CLI to list bucket contents
               (println "\nAWS CLI S3 listing for indexing test:")
               (let [aws-cmd (str "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test "
