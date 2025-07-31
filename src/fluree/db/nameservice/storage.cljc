@@ -119,7 +119,7 @@
                           (if (empty? updated-vgs)
                             (dissoc m ledger)
                             (assoc m ledger updated-vgs))))
-                      {}
+                      deps  ;; Start with existing deps, not empty map!
                       deps))))
 
 (defrecord StorageNameService [store vg-state]
@@ -176,20 +176,17 @@
     (go-try
       ;; Use the ListableStore protocol to list all nameservice files
       (if (satisfies? storage/ListableStore store)
-        (if-let [list-paths-result (storage/list-paths store "ns@v1")]
-          (loop [remaining-paths (<? list-paths-result)
-                 records []]
-            (if-let [path (first remaining-paths)]
-              (let [file-content (<? (storage/read-bytes store path))]
-                (if file-content
-                  (let [content-str (if (string? file-content)
-                                      file-content
-                                      (bytes/UTF8->string file-content))
-                        record (json/parse content-str false)]
-                    (recur (rest remaining-paths) (conj records record)))
-                  (recur (rest remaining-paths) records)))
-              records))
-          [])
+        (loop [remaining-paths (<? (storage/list-paths store "ns@v1"))
+               records []]
+          (if-let [path (first remaining-paths)]
+            (if-let [file-content (<? (storage/read-bytes store path))]
+              (let [content-str (if (string? file-content)
+                                  file-content
+                                  (bytes/UTF8->string file-content))
+                    record (json/parse content-str false)]
+                (recur (rest remaining-paths) (conj records record)))
+              (recur (rest remaining-paths) records))
+            records))
         ;; Fallback for stores that don't support ListableStore
         (do
           (log/debug "Storage backend does not support ListableStore protocol")
