@@ -21,6 +21,7 @@
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph.create :as vg-create]
+            [fluree.db.virtual-graph.drop :as vg-drop]
             [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge load range exists? update drop]))
 
@@ -307,6 +308,21 @@
   [conn ledger-alias]
   (promise-wrap
    (connection/drop-ledger conn ledger-alias)))
+
+(defn drop-virtual-graph
+  "Deletes a virtual graph and its associated data.
+  
+  Parameters:
+    conn - Connection object
+    vg-name - Virtual graph name
+  
+  Removes the virtual graph from nameservice, cleans up all index files,
+  and unregisters any dependencies. Returns a promise that resolves when
+  deletion is complete."
+  [conn vg-name]
+  (validate-connection conn)
+  (promise-wrap
+   (vg-drop/drop-virtual-graph conn vg-name)))
 
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
