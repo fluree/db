@@ -138,6 +138,9 @@
     (remote-lookup system-state ledger-address))
   (alias [_ ledger-address]
     ledger-address)
+  (all-records [_]
+    ;; TODO - add querying all records in remote system
+    (go-try []))
 
   nameservice/Publication
   (subscribe [_ ledger-alias]

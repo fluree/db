@@ -41,6 +41,12 @@
             {:keys [select]} (sparql/->fql query)]
         (is (= ["(as (count ?friends) ?friends)"]
                select))))
+    (testing "COUNT(*)"
+      (let [query "SELECT (COUNT(*) AS ?friends)
+                   WHERE {?friends person:friendsWith \"jdoe\".}"
+            {:keys [select]} (sparql/->fql query)]
+        (is (= ["(as (count *) ?friends)"]
+               select))))
     (testing "COUNT DISTINCT"
       (let [query "SELECT (COUNT(DISTINCT ?handle) AS ?handles)
                    WHERE {?person person:handle ?handle.}"
@@ -1073,7 +1079,7 @@
               (go
                 (let [conn   (<! (test-utils/create-conn))
                       ledger (<p! (fluree/create conn "people"))
-                      db     (<p! (fluree/stage (fluree/db ledger) txn {:format :sparql}))]
+                      db     (<p! (fluree/update (fluree/db ledger) txn {:format :sparql}))]
                   (testing "basic query works"
                     (let [query   "PREFIX person: <http://example.org/Person#>
                                     SELECT ?person ?fullName
@@ -1087,7 +1093,7 @@
        :clj
        (let [conn   @(fluree/connect-memory)
              ledger @(fluree/create conn "people")
-             db     @(fluree/stage (fluree/db ledger) txn {:format :sparql})]
+             db     @(fluree/update (fluree/db ledger) txn {:format :sparql})]
          (testing "basic query works"
            (let [query "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?fullName
@@ -1984,6 +1990,31 @@
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
+         (testing "COUNT(*) query works"
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (COUNT(*) AS ?count)
+                          WHERE {?person person:favNums ?favNums.}
+                          GROUP BY ?person"]
+             (testing "output :fql"
+               (is (= [[7] [4] [1]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["count"]},
+                       "results"
+                       {"bindings"
+                        [{"count"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"count"
+                          {"value" "4",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"count"
+                          {"value" "1",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "SAMPLE query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (SAMPLE(?favNums) AS ?favNum)
@@ -2118,9 +2149,9 @@
                            "type"                          "http://example.org/Book"
                            "http://example.org/book/title" "The Hitchhiker's Guide to the Galaxy"}]]
            (testing "BASE IRI gets prefixed onto relative IRIs"
-             (let [book-db @(fluree/stage db {"@context" [test-utils/default-str-context
-                                                          {"person" "http://example.org/Person#"}]
-                                              "insert" book-data})
+             (let [book-db @(fluree/update db {"@context" [test-utils/default-str-context
+                                                           {"person" "http://example.org/Person#"}]
+                                               "insert" book-data})
                    query   "BASE <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book <title> ?title.}"
@@ -2129,9 +2160,9 @@
                        ["2" "The Hitchhiker's Guide to the Galaxy"]]
                       results))))
            (testing "PREFIX declarations go into the context"
-             (let [book-db @(fluree/stage db {"@context" [test-utils/default-str-context
-                                                          {"person" "http://example.org/Person#"}]
-                                              "insert" book-data})
+             (let [book-db @(fluree/update db {"@context" [test-utils/default-str-context
+                                                           {"person" "http://example.org/Person#"}]
+                                               "insert" book-data})
                    query   "PREFIX book: <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book book:title ?title.}"

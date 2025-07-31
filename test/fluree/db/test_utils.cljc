@@ -1,5 +1,5 @@
 (ns fluree.db.test-utils
-  (:require #?(:clj [cognitect.aws.client.api :as aws])
+  (:require #?(:clj [fluree.db.storage.s3 :as s3])
             #?@(:cljs [[clojure.core.async.interop :refer [<p!]]
                        [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]])
             [clojure.string :as str]
@@ -156,8 +156,8 @@
   [conn]
   (let [ledger @(fluree/create conn "test/movies")]
     (doseq [movie movies]
-      (let [staged @(fluree/stage (fluree/db ledger) {"@context" default-str-context
-                                                      "insert" movie})]
+      (let [staged @(fluree/update (fluree/db ledger) {"@context" default-str-context
+                                                       "insert" movie})]
         @(fluree/commit! ledger staged
                          {:message (str "Commit " (get movie "name"))
                           :push?   true})))
@@ -168,9 +168,9 @@
   (#?(:clj do, :cljs go)
     (let [ledger-p (fluree/create conn "test/people")
           ledger   #?(:clj @ledger-p :cljs (<p! ledger-p))
-          staged-p (fluree/stage (fluree/db ledger) {"@context" [default-context
-                                                                 {:ex "http://example.org/ns/"}]
-                                                     "insert" people})
+          staged-p (fluree/update (fluree/db ledger) {"@context" [default-context
+                                                                  {:ex "http://example.org/ns/"}]
+                                                      "insert" people})
           staged   #?(:clj @staged-p, :cljs (<p! staged-p))
           commit-p (fluree/commit! ledger staged {:message "Adding people"
                                                   :push? true})]
@@ -338,15 +338,10 @@
 
 #?(:clj
    (defn s3-available?
-     "Check if LocalStack S3 is available at localhost:4566"
+     "Check if S3 is available (using AWS credentials)"
      []
      (try
-       (let [client (aws/client {:api :s3
-                                 :endpoint-override {:protocol :http
-                                                     :hostname "localhost"
-                                                     :port 4566}})
-             future-result (future (aws/invoke client {:op :ListBuckets}))
-             result (deref future-result 2000 :timeout)]  ; 2 second timeout
-         (not= result :timeout))
+       (let [credentials (s3/get-credentials)]
+         (boolean credentials))
        (catch Exception _
          false))))

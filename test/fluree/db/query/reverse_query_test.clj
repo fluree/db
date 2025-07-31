@@ -9,7 +9,7 @@
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "query/reverse")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
-          db      @(fluree/stage
+          db      @(fluree/update
                     (fluree/db ledger)
                     {"@context" context
                      "insert"
@@ -57,21 +57,21 @@
         ledger @(fluree/create conn "reverse")
         db0    (fluree/db ledger)
 
-        db1 @(fluree/stage db0 {"@context" {"ex" "http://example.org/ns/"}
-                                "insert"   [{"@id"      "ex:dad"
-                                             "@type"    "ex:Person"
-                                             "ex:name"  "Dad"
-                                             "ex:child" {"@id" "ex:kid"}}
-                                            {"@id"      "ex:mom"
-                                             "@type"    "ex:Person"
-                                             "ex:name"  "Mom"
-                                             "ex:child" {"@id" "ex:kid"}}
-                                            {"@id"     "ex:kid"
-                                             "@type"   "ex:Person"
-                                             "ex:name" "Kiddo"}
-                                            {"@id"        "ex:school"
-                                             "@type"      "ex:Organization"
-                                             "ex:student" "ex:kid"}]})]
+        db1 @(fluree/update db0 {"@context" {"ex" "http://example.org/ns/"}
+                                 "insert"   [{"@id"      "ex:dad"
+                                              "@type"    "ex:Person"
+                                              "ex:name"  "Dad"
+                                              "ex:child" {"@id" "ex:kid"}}
+                                             {"@id"      "ex:mom"
+                                              "@type"    "ex:Person"
+                                              "ex:name"  "Mom"
+                                              "ex:child" {"@id" "ex:kid"}}
+                                             {"@id"     "ex:kid"
+                                              "@type"   "ex:Person"
+                                              "ex:name" "Kiddo"}
+                                             {"@id"        "ex:school"
+                                              "@type"      "ex:Organization"
+                                              "ex:student" "ex:kid"}]})]
     (testing "select clause"
       (is (= {"@id"     "ex:kid",
               "@type"   "ex:Person"
@@ -104,3 +104,41 @@
              (set @(fluree/query db1 {"@context"       {"ex" "http://example.org/ns/"}
                                       "where"          {"@id" "?x" "@type" "?class"}
                                       "selectDistinct" "?class"})))))))
+
+(deftest ^:integration reverse-subject-crawl-with-policy
+  (let [conn   @(fluree/connect-memory)
+        ledger @(fluree/create conn "reverse")
+        db0    (fluree/db ledger)
+
+        db1 @(fluree/update db0 {"@context" {"ex" "http://example.org/ns/"}
+                                 "insert"   [{"@id"      "ex:dad"
+                                              "@type"    "ex:Person"
+                                              "ex:name"  "Dad"
+                                              "ex:child" {"@id" "ex:kid"}}
+                                             {"@id"      "ex:mom"
+                                              "@type"    "ex:Person"
+                                              "ex:name"  "Mom"
+                                              "ex:child" {"@id" "ex:kid"}}
+                                             {"@id"     "ex:kid"
+                                              "@type"   "ex:Person"
+                                              "ex:name" "Kiddo"}
+                                             {"@id"        "ex:school"
+                                              "@type"      "ex:Organization"
+                                              "ex:student" "ex:kid"}]})
+        db2 @(fluree/wrap-policy db1 {"@context" {"ex" "http://example.org/ns/"
+                                                  "f" "https://ns.flur.ee/ledger#"}
+                                      "@type" "ex:PolicyGroup/1"
+                                      "f:action" {"@id" "f:view"}
+                                      "f:query" {"@type" "@json" "@value" {}}})]
+    (is (= [{"parent"
+             [{"@type" "ex:Person",
+               "ex:child" {"@id" "ex:kid"},
+               "ex:name" "Dad",
+               "@id" "ex:dad"}
+              {"@type" "ex:Person",
+               "ex:child" {"@id" "ex:kid"},
+               "ex:name" "Mom",
+               "@id" "ex:mom"}]}]
+           @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"
+                                           "parent" {"@reverse" "ex:child"}}
+                               "select" {"ex:kid" [{"parent" ["*"]}]}})))))

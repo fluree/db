@@ -1,14 +1,12 @@
 (ns fluree.db.util.json-test
   (:require #?@(:clj  [[clojure.test :refer [deftest is testing]]
-                       [cheshire.core :as cjson]
                        [fluree.db.util.bytes :as u-bytes]
                        [fluree.db.util.json :as json]]
                 :cljs [[cljs.test :refer-macros [deftest is testing]]]))
   #?(:clj
      (:import (java.io ByteArrayInputStream)
               (java.math BigDecimal)
-              (java.lang Double Float Integer)
-              (clojure.lang PersistentArrayMap))))
+              (java.lang Double Float Integer))))
 
 ;; Clojure-specific
 #?(:clj
@@ -21,7 +19,7 @@
 
 ;; General Comments
 ;; all java.lang.Float, java.lang.Double and java.math.BigDecimal values
-;; are parsed as BigDecimals when cheshire's use-bigdecimals? is true.
+;; are parsed as BigDecimals when jsonista's bigdecimals option is true.
 ;; Fluree engine handles this by looking up the schema & coercing the
 ;; input value into the appropriate type.
 ;; ----------
@@ -42,10 +40,10 @@
                      :bdv  (bigdec 1.8333333333333332593184650249895639717578887939453125)
                      :biv  (bigint 1.8374872394873333e+89)
                      :iv   (int 72356)}
-                 x' (-> x (cjson/encode) (string->stream))
+                 x' (-> x (json/stringify) (string->stream))
                  x* (json/parse x')]
              (is (instance? ByteArrayInputStream x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (string? (:bdv x*)))
              (is (number? (:fv x*)))
              (is (= (:name x) (:name x*)))
@@ -60,10 +58,10 @@
                      :fv   Float/MIN_VALUE
                      :dv   Double/MIN_VALUE
                      :iv   Integer/MIN_VALUE}
-                 x' (-> x (cjson/encode) (string->stream))
+                 x' (-> x (json/stringify) (string->stream))
                  x* (json/parse x')]
              (is (instance? ByteArrayInputStream x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (= (:name x) (:name x*)))
              (is (= (:fv x) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
@@ -74,10 +72,10 @@
                      :fv   Float/MAX_VALUE
                      :dv   Double/MAX_VALUE
                      :iv   Integer/MAX_VALUE}
-                 x' (-> x (cjson/encode) (string->stream))
+                 x' (-> x (json/stringify) (string->stream))
                  x* (json/parse x')]
              (is (instance? ByteArrayInputStream x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (= (:name x) (:name x*)))
              (is (= (:fv x) (.floatValue ^BigDecimal (:fv x*))))
              (is (= (:dv x) (-> x* :dv double)))
@@ -94,7 +92,7 @@
                  x' (json/stringify x)
                  x* (json/parse x')]
              (is (string? x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (string? (:bdv x*)))
              (is (number? (:fv x*)))
              (is (= (:name x) (:name x*)))
@@ -112,7 +110,7 @@
                  x' (json/stringify x)
                  x* (json/parse x')]
              (is (string? x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (= (:name x) (:name x*)))
              (is (= (:fv x) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
@@ -126,7 +124,7 @@
                  x' (json/stringify x)
                  x* (json/parse x')]
              (is (string? x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (= (:name x) (:name x*)))
              (is (= (:fv x) (.floatValue ^BigDecimal (:fv x*))))
              (is (= (:dv x) (-> x* :dv double)))
@@ -140,10 +138,10 @@
                      :bdv  (bigdec 1.8333333333333332593184650249895639717578887939453125)
                      :biv  (bigint 1.8374872394873333e+89)
                      :iv   (int 72356)}
-                 x' (-> x cjson/encode u-bytes/string->UTF8)
+                 x' (-> x json/stringify u-bytes/string->UTF8)
                  x* (json/parse x')]
              (is (bytes? x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (string? (:bdv x*)))
              (is (number? (:fv x*)))
              (is (= (:name x) (:name x*)))
@@ -158,10 +156,10 @@
                      :fv   Float/MIN_VALUE
                      :dv   Double/MIN_VALUE
                      :iv   Integer/MIN_VALUE}
-                 x' (-> x cjson/encode u-bytes/string->UTF8)
+                 x' (-> x json/stringify u-bytes/string->UTF8)
                  x* (json/parse x')]
              (is (bytes? x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (= (:name x) (:name x*)))
              (is (= (:fv x) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
@@ -172,10 +170,10 @@
                      :fv   Float/MAX_VALUE
                      :dv   Double/MAX_VALUE
                      :iv   Integer/MAX_VALUE}
-                 x' (-> x cjson/encode u-bytes/string->UTF8)
+                 x' (-> x json/stringify u-bytes/string->UTF8)
                  x* (json/parse x')]
              (is (bytes? x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (= (:name x) (:name x*)))
              (is (= (:fv x) (.floatValue ^BigDecimal (:fv x*))))
              (is (= (:dv x) (-> x* :dv double)))
@@ -191,10 +189,10 @@
                      :bdv  (bigdec 1.8333333333333332593184650249895639717578887939453125)
                      :biv  (bigint 1.8374872394873333e+89)
                      :iv   (int 72356)}
-                 x' (-> x (cjson/encode) (string->stream))
+                 x' (-> x (json/stringify) (string->stream))
                  x* (json/parse x')]
              (is (instance? ByteArrayInputStream x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (number? (:bdv x*)))
              (is (number? (:fv x*)))
              (is (= (:name x) (:name x*)))
@@ -209,10 +207,10 @@
                      :fv   Float/MIN_VALUE
                      :dv   Double/MIN_VALUE
                      :iv   Integer/MIN_VALUE}
-                 x' (-> x (cjson/encode) (string->stream))
+                 x' (-> x (json/stringify) (string->stream))
                  x* (json/parse x')]
              (is (instance? ByteArrayInputStream x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (= (:name x) (:name x*)))
              (is (= (:fv x) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
@@ -223,10 +221,10 @@
                      :fv   Float/MAX_VALUE
                      :dv   Double/MAX_VALUE
                      :iv   Integer/MAX_VALUE}
-                 x' (-> x (cjson/encode) (string->stream))
+                 x' (-> x (json/stringify) (string->stream))
                  x* (json/parse x')]
              (is (instance? ByteArrayInputStream x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (= (:name x) (:name x*)))
              (is (= (:fv x) (.floatValue ^BigDecimal (:fv x*))))
              (is (= (:dv x) (-> x* :dv double)))
@@ -243,7 +241,7 @@
                  x' (json/stringify x)
                  x* (json/parse x')]
              (is (string? x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (number? (:bdv x*)))
              (is (number? (:fv x*)))
              (is (= (:name x) (:name x*)))
@@ -261,7 +259,7 @@
                  x' (json/stringify x)
                  x* (json/parse x')]
              (is (string? x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (= (:name x) (:name x*)))
              (is (= (:fv x) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
@@ -275,7 +273,7 @@
                  x' (json/stringify x)
                  x* (json/parse x')]
              (is (string? x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (= (:name x) (:name x*)))
              (is (= (:fv x) (.floatValue ^BigDecimal (:fv x*))))
              (is (= (:dv x) (-> x* :dv double)))
@@ -289,10 +287,10 @@
                      :bdv  (bigdec 1.8333333333333332593184650249895639717578887939453125)
                      :biv  (bigint 1.8374872394873333e+89)
                      :iv   (int 72356)}
-                 x' (-> x cjson/encode u-bytes/string->UTF8)
+                 x' (-> x json/stringify u-bytes/string->UTF8)
                  x* (json/parse x')]
              (is (bytes? x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (number? (:bdv x*)))
              (is (number? (:fv x*)))
              (is (= (:name x) (:name x*)))
@@ -307,10 +305,10 @@
                      :fv   Float/MIN_VALUE
                      :dv   Double/MIN_VALUE
                      :iv   Integer/MIN_VALUE}
-                 x' (-> x cjson/encode u-bytes/string->UTF8)
+                 x' (-> x json/stringify u-bytes/string->UTF8)
                  x* (json/parse x')]
              (is (bytes? x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (= (:name x) (:name x*)))
              (is (= (:fv x) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
@@ -321,10 +319,10 @@
                      :fv   Float/MAX_VALUE
                      :dv   Double/MAX_VALUE
                      :iv   Integer/MAX_VALUE}
-                 x' (-> x cjson/encode u-bytes/string->UTF8)
+                 x' (-> x json/stringify u-bytes/string->UTF8)
                  x* (json/parse x')]
              (is (bytes? x'))
-             (is (instance? PersistentArrayMap x*))
+             (is (map? x*))
              (is (= (:name x) (:name x*)))
              (is (= (:fv x) (.floatValue ^BigDecimal (:fv x*))))
              (is (= (:dv x) (-> x* :dv double)))
