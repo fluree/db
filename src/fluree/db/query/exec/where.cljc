@@ -448,10 +448,14 @@
   from the spot index when scanned, and this is necessary because the `p` value
   is `nil`."
   [db idx s p o o-fn]
-  (if (and (#{:spot} idx)
-           (nil? p)
-           s
-           o)
+  (if (or (and (#{:spot} idx)
+               (nil? p)
+               s
+               o)
+          (and (#{:psot} idx)
+               (nil? s)
+               p
+               o))
     (let [match-fn (fn [mch]
                      (when-let [v (or (get-value mch)
                                       (get-sid mch db))]
