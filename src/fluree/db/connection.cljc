@@ -460,39 +460,28 @@
     (storage/write-catalog-bytes clg address data)))
 
 (defn trigger-ledger-index
-  "Manually triggers indexing for a ledger/branch.
+  "Manually triggers indexing for a ledger/branch and waits for completion.
    
    Options:
    - :branch - Branch name (defaults to main branch)
-   - :block? - If true, waits for indexing to complete
-   - :timeout - Max wait time in ms when blocking (default 300000 / 5 minutes)
+   - :timeout - Max wait time in ms (default 300000 / 5 minutes)
    
-   Returns a promise that resolves to:
-   - If :block? is false: {:status :queued}
-   - If :block? is true: {:status :success :db <indexed-db>} or {:status :error :error <error>}"
+   Returns the indexed database object or throws an exception on failure/timeout."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [branch block? timeout]
+    (let [{:keys [branch timeout]
            :or {timeout 300000}} opts
-          ;; Use the proper ledger loading mechanism that handles both cached and uncached cases
-          ledger (<? (load-ledger-alias conn ledger-alias))]
-      (if-not ledger
-        (throw (ex-info (str "Ledger does not exist: " ledger-alias)
-                        {:status 404 :error :db/invalid-ledger}))
-        (let [current-db (ledger/current-db ledger branch)
-              index-queue (-> ledger
-                              (ledger/get-branch-meta branch)
-                              :index-queue)]
-          (if block?
-            ;; Blocking mode - wait for completion
-            (let [complete-ch (async/chan 1)
-                  timeout-ch (async/timeout timeout)]
-              (branch/enqueue-index! index-queue current-db nil complete-ch)
-              (async/alt!
-                complete-ch ([result] result)
-                timeout-ch {:status :error
-                            :error (ex-info "Indexing timeout" {:timeout timeout})}))
-            ;; Non-blocking mode - just enqueue
-            (do
-              (branch/enqueue-index! index-queue current-db nil)
-              {:status :queued})))))))
+          ledger (<? (load-ledger-alias conn ledger-alias))
+          current-db (ledger/current-db ledger branch)
+          index-queue (-> ledger
+                          (ledger/get-branch-meta branch)
+                          :index-queue)
+          complete-ch (async/chan 1)
+          timeout-ch (async/timeout timeout)]
+      (branch/enqueue-index! index-queue current-db nil complete-ch)
+      (async/alt!
+        complete-ch ([result] result)
+        timeout-ch (ex-info "Indexing wait timeout, but assume indexing is proceeding in the background."
+                            {:status 408
+                             :error :db/timeout
+                             :timeout timeout})))))
