@@ -13,7 +13,7 @@
             [fluree.db.util :as util]))
 
 (deftest exists?-test
-  (testing "returns false before committing data to a ledger"
+  (testing "returns false before creation, true after"
     #?(:clj
        (let [conn         (test-utils/create-conn)
              ledger-alias "testledger"
@@ -28,7 +28,9 @@
                                              :type         :schema/Person
                                              :schema/fname "Me"}]})
              check3       @(fluree/exists? conn ledger-alias)]
-         (is (every? false? [check1 check2 check3])))))
+         (is (false? check1))
+         (is (true? check2))
+         (is (true? check3)))))
   (testing "returns true after committing data to a ledger"
     #?(:clj
        (let [conn         (test-utils/create-conn)
@@ -1080,10 +1082,10 @@
          ;; wait for everything to be written
          (Thread/sleep 1000)
          (testing "before drop"
-           (is (= ["destined-for-drop" "destined-for-drop.json"]
+           (is (= ["destined-for-drop" "ns@v1"]
                   (sort (async/<!! (fs/list-files primary-path)))))
-           (is (= ["destined-for-drop.json"]
-                  (async/<!! (fs/list-files secondary-path))))
+           (is (= ["destined-for-drop@main.json"]
+                  (async/<!! (fs/list-files (str secondary-path "/ns@v1")))))
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
            ;; only store txns when signed
@@ -1115,10 +1117,10 @@
          (Thread/sleep 1000)
          (testing "after drop"
            ;; directories are not removed
-           (is (= ["destined-for-drop"]
-                  (async/<!! (fs/list-files primary-path))))
+           (is (= ["destined-for-drop" "ns@v1"]
+                  (sort (async/<!! (fs/list-files primary-path)))))
            (is (= []
-                  (async/<!! (fs/list-files secondary-path))))
+                  (async/<!! (fs/list-files (str secondary-path "/ns@v1")))))
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
            (is (= ["garbage" "opst" "post" "psot" "root" "spot" "tspo"]

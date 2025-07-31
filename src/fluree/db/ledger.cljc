@@ -6,6 +6,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.transact :as flake.transact]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.util :as util :refer [get-first get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
@@ -164,6 +165,12 @@
           ;; internal-only opt used for migrating ledgers without genesis commits
           init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit
-                              commit-catalog alias branch publish-addresses init-time))]
+                              commit-catalog alias branch publish-addresses init-time))
+          ;; Publish genesis commit to nameservice - convert expanded to compact format first
+          _              (when primary-publisher
+                           (let [;; Convert expanded genesis commit to compact JSON-LD format
+                                 commit-map (commit-data/json-ld->map genesis-commit nil)
+                                 compact-commit (commit-data/->json-ld commit-map)]
+                             (<? (nameservice/publish primary-publisher compact-commit))))]
       (instantiate ledger-alias* primary-address branch commit-catalog index-catalog
                    primary-publisher secondary-publishers indexing did genesis-commit))))

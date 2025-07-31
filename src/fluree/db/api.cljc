@@ -10,6 +10,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.ledger :as ledger]
+            [fluree.db.nameservice.query :as ns-query]
             [fluree.db.query.api :as query-api]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.range :as query-range]
@@ -661,6 +662,30 @@
                                               (<? (cred/verify cred-query)))]
         (log/debug "Credential query connection with identity: " identity " and query: " query)
         @(query-connection conn query (assoc opts :identity identity)))))))
+
+(defn query-nameservice
+  "Executes a query against all nameservice records.
+
+  Parameters:
+    conn - Connection object
+    query - Query map in JSON-LD format
+    opts - (optional) Options map
+
+  Creates a temporary in-memory ledger from all nameservice records and
+  executes the query against it. Useful for queries like 'find all branches
+  for ledger xyz' or 'find all ledgers where t=42'.
+
+  Returns promise resolving to query results."
+  ([conn query] (query-nameservice conn query {}))
+  ([conn query opts]
+   (validate-connection conn)
+   (promise-wrap
+    (go-try
+      ;; Get the nameservice from the connection's primary publisher
+      (if-some [primary-publisher (:primary-publisher conn)]
+        (<? (ns-query/query-nameservice primary-publisher query opts))
+        (throw (ex-info "No nameservice available for querying"
+                        {:status 400 :error :db/no-nameservice})))))))
 
 (defn history
   "Queries the history of entities across commits.

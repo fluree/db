@@ -97,6 +97,21 @@
                                       (str (subs (str commit) 0 500) "...")
                                       (str commit))})))))
 
+(defn load-commit-with-metadata
+  "Loads commit from disk and merges nameservice metadata (address, index)"
+  [storage commit-address index-address]
+  (go-try
+    (when-let [commit-data (<? (storage/read-json storage commit-address))]
+      (let [addr-key-path (if (contains? commit-data "credentialSubject")
+                            ["credentialSubject" "address"]
+                            ["address"])
+            index-key-path (if (contains? commit-data "credentialSubject")
+                             ["credentialSubject" "index" "address"]
+                             ["index" "address"])]
+        (-> commit-data
+            (assoc-in addr-key-path commit-address)
+            (cond-> index-address (assoc-in index-key-path index-address)))))))
+
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
   First commit will be t value of `from-t` and increment from there."

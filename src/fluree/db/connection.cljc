@@ -307,21 +307,28 @@
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn}
    ledger-chan address]
   (go-try
-    (if-let [commit (<? (lookup-commit conn address))]
-      (do (log/debug "Attempting to load from address:" address
-                     "with commit:" commit)
-          (let [expanded-commit (json-ld/expand commit)
-                ledger-alias    (commit->ledger-alias conn address expanded-commit)
-                branch          (-> expanded-commit
-                                    (get-first-value const/iri-branch)
-                                    (or (throw-missing-branch address ledger-alias)))
+    (if-let [ns-record (<? (lookup-commit conn address))]
+      (let [;; Extract minimal data from nameservice
+            commit-address (get-in ns-record ["f:commit" "@id"])
+            index-address  (get-in ns-record ["f:index" "@id"])
 
-                {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
-                ledger (ledger/instantiate ledger-alias address branch commit-catalog index-catalog
-                                           primary-publisher secondary-publishers indexing did expanded-commit)]
-            (ns-subscribe/subscribe-ledger conn ledger-alias)
-            (async/put! ledger-chan ledger)
-            ledger))
+            ;; Load full commit from disk
+            _              (log/debug "Attempting to load from address:" address)
+            commit         (<? (commit-storage/load-commit-with-metadata commit-catalog
+                                                                         commit-address
+                                                                         index-address))
+            expanded-commit (json-ld/expand commit)
+            ledger-alias    (commit->ledger-alias conn address expanded-commit)
+            branch          (-> expanded-commit
+                                (get-first-value const/iri-branch)
+                                (or (throw-missing-branch address ledger-alias)))
+
+            {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
+            ledger (ledger/instantiate ledger-alias address branch commit-catalog index-catalog
+                                       primary-publisher secondary-publishers indexing did expanded-commit)]
+        (ns-subscribe/subscribe-ledger conn ledger-alias)
+        (async/put! ledger-chan ledger)
+        ledger)
       (throw (ex-info (str "Unable to load. No record of ledger at address: " address " exists.")
                       {:status 404, :error :db/unkown-address})))))
 
@@ -437,11 +444,20 @@
         (loop [[publisher & r] (publishers conn)]
           (when publisher
             (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
-                  latest-commit (-> (<? (nameservice/lookup publisher ledger-addr))
-                                    json-ld/expand)]
+                  ns-record     (<? (nameservice/lookup publisher ledger-addr))
+                  commit-address (get-in ns-record ["f:commit" "@id"])
+                  index-address  (get-in ns-record ["f:index" "@id"])
+                  latest-commit  (when commit-address
+                                   (let [commit (<? (commit-storage/load-commit-with-metadata
+                                                     (:commit-catalog conn)
+                                                     commit-address
+                                                     index-address))]
+                                     (when commit
+                                       (json-ld/expand commit))))]
               (log/debug "Dropping ledger" ledger-addr)
-              (drop-index-artifacts conn latest-commit)
-              (drop-commit-artifacts conn latest-commit)
+              (when latest-commit
+                (drop-index-artifacts conn latest-commit)
+                (drop-commit-artifacts conn latest-commit))
               (<? (nameservice/retract publisher alias))
               (recur r))))
         (log/debug "Dropped ledger" alias)
