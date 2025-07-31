@@ -118,8 +118,8 @@
           @(fluree/insert! conn "file-ledger"
                            {"@context" {"test" "http://example.org/test#"}
                             "@graph" [{"@id" "test:file-person"
-                                      "@type" "Person"
-                                      "name" "File User"}]})
+                                       "@type" "Person"
+                                       "name" "File User"}]})
 
           ;; Query the file-based nameservice
           (let [query {"@context" {"f" iri/f-ns}
