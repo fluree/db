@@ -10,14 +10,14 @@
   [s]
   (str system-ns s))
 
+(def config-type
+  (system-iri "Configuration"))
+
 (def config-val-type
   (system-iri "ConfigurationValue"))
 
 (def connection-type
   (system-iri "Connection"))
-
-(def config-type
-  (system-iri "Configuration"))
 
 (def storage-type
   (system-iri "Storage"))
@@ -117,3 +117,6 @@
 
 (def connection
   (system-iri "connection"))
+
+(def connection-config
+  (system-iri "connectionConfig"))
