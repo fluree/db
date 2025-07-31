@@ -275,6 +275,45 @@
               (log/error e "Failed to write initial BM25 index to storage"))))
         initialized-bm25)))
 
+  vg/SyncableVirtualGraph
+  (sync [this as-of]
+    (vg/sync this as-of {}))
+  (sync [this as-of {:keys [timeout] :or {timeout 10000}}]
+    (go
+      (let [{:keys [pending-ch]} @index-state
+            target-t (or as-of t)]  ;; Use current t if as-of is nil
+        (cond
+          ;; If we're already at or past the requested t, we're synced
+          (>= t target-t)
+          this
+
+          ;; If there's a pending update, wait for it with timeout
+          pending-ch
+          (let [timeout-ch (async/timeout timeout)
+                [v ch] (alts! [pending-ch timeout-ch])]
+            (if (= ch timeout-ch)
+              (throw (ex-info (str "Timeout waiting for BM25 index sync. "
+                                   (percent-complete-str index-state))
+                              {:status 504
+                               :error :db/timeout
+                               :vg-name vg-name
+                               :target-t target-t
+                               :current-t t}))
+              ;; Successfully synced, return updated VG
+              (assoc this :index-state (atom {:index v
+                                              :pending-ch nil
+                                              :pending-status nil})
+                     :t target-t)))
+
+          ;; No pending update and we're not at target t
+          :else
+          (throw (ex-info "BM25 index not yet updated to requested transaction"
+                          {:status 409
+                           :error :db/index-behind
+                           :vg-name vg-name
+                           :target-t target-t
+                           :current-t t}))))))
+
   where/Matcher
   (-match-triple [_ _tracker solution triple _error-ch]
     (vg-parse/match-search-triple solution triple))

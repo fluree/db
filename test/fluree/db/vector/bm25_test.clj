@@ -1,8 +1,9 @@
 (ns fluree.db.vector.bm25-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.core.async :refer [<!!]]
+            [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.log :as log]))
+            [fluree.db.virtual-graph :as vg]))
 
 (deftest ^:integration bm25-basic-functionality-test
   (testing "Basic BM25 virtual graph functionality"
@@ -15,21 +16,22 @@
                                                "ex:title" "Introduction to Fluree"
                                                "ex:content" "Fluree is a semantic graph database"}]})
           ;; Create VG
-          vg-name @(fluree/create-virtual-graph
-                    conn
-                    {:name "basic-search"
-                     :type :bm25
-                     :config {:ledgers ["bm25-basic"]
-                              :query {"@context" {"ex" "http://example.org/"}
-                                      "where" [{"@id" "?x"
-                                                "@type" "ex:Document"}]
-                                      "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})]
+          vg-obj @(fluree/create-virtual-graph
+                   conn
+                   {:name "basic-search"
+                    :type :bm25
+                    :config {:ledgers ["bm25-basic"]
+                             :query {"@context" {"ex" "http://example.org/"}
+                                     "where" [{"@id" "?x"
+                                               "@type" "ex:Document"}]
+                                     "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})
+          vg-name (:vg-name vg-obj)]
 
       (testing "virtual graph creation succeeds"
         (is (= "basic-search" vg-name)))
 
       ;; Wait for indexing
-      (Thread/sleep 5000)
+      (<!! (vg/sync vg-obj nil))
 
       (testing "search functionality"
         (let [results @(fluree/query-connection conn
