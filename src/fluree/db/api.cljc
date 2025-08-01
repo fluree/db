@@ -831,3 +831,31 @@
   ([db opts]
    (let [grouping (:group-by opts)]
      (reasoner/reasoned-facts db grouping))))
+
+(defn trigger-index
+  "Manually triggers indexing for a ledger and waits for completion.
+  
+  This is useful for external indexing processes (e.g., AWS Lambda) that need
+  to ensure a ledger is indexed without creating new transactions.
+  
+  Parameters:
+    conn - Database connection
+    ledger-alias - The alias/name of the ledger to index
+    opts - (optional) Options map:
+      :branch - Branch name (defaults to main branch)
+      :timeout - Max wait time in ms (default 300000 / 5 minutes)
+  
+  Returns a promise that resolves to the indexed database object.
+  Throws an exception if indexing fails or times out.
+  
+  Example:
+    ;; Trigger indexing and wait for completion
+    (let [indexed-db @(trigger-index conn \"my-ledger\")]
+      ;; Use indexed-db...
+      )"
+  ([conn ledger-alias]
+   (trigger-index conn ledger-alias nil))
+  ([conn ledger-alias opts]
+   (validate-connection conn)
+   (promise-wrap
+    (connection/trigger-ledger-index conn ledger-alias opts))))
