@@ -88,7 +88,7 @@
 (defn write-db-root
   [{:keys [storage serializer] :as index-catalog} db garbage-addr]
   (go-try
-    (let [{:keys [alias schema t stats spot post opst tspo vg commit namespace-codes
+    (let [{:keys [alias schema t stats spot psot post opst tspo vg commit namespace-codes
                   reindex-min-bytes reindex-max-bytes max-old-indexes]}
           db
 
@@ -101,6 +101,7 @@
                                  :schema          (vocab/serialize-schema schema)
                                  :stats           (select-keys stats [:flakes :size])
                                  :spot            (child-data spot)
+                                 :psot            (child-data psot)
                                  :post            (child-data post)
                                  :opst            (child-data opst)
                                  :tspo            (child-data tspo)

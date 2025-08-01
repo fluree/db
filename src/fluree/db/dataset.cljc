@@ -79,6 +79,16 @@
         (where/-match-class active-graph tracker solution triple error-ch))
       where/nil-channel))
 
+  (-match-properties [ds tracker solution triples error-ch]
+    (if-let [active-graph (get-active-graph ds)]
+      (if (sequential? active-graph)
+        (->> active-graph
+             (map (fn [db]
+                    (where/-match-properties db tracker solution triples error-ch)))
+             async/merge)
+        (where/-match-properties active-graph tracker solution triples error-ch))
+      where/nil-channel))
+
   (-activate-alias [ds alias]
     (go-try
       (activate ds alias)))
