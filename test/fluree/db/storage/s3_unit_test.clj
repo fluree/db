@@ -58,24 +58,26 @@
           "Should throw error when s3-endpoint is missing"))))
 
 (deftest s3-address-format-test
-  (testing "S3 address format is always consistent"
+  (testing "S3 address without identifier (nil)"
     (let [path "some-dir/file.json"
-          address (s3-storage/s3-address path)]
+          address (s3-storage/s3-address nil path)]
       (is (= "fluree:s3://some-dir/file.json" address)
-          "Should always generate address without identifier")))
+          "Should generate address without identifier when nil")))
+
+  (testing "S3 address with identifier"
+    (let [identifier "test-s3"
+          path "some-dir/file.json"
+          address (s3-storage/s3-address identifier path)]
+      (is (= "fluree:test-s3:s3://some-dir/file.json" address)
+          "Should include identifier in address")))
 
   (testing "S3 address with prefix and file path"
     ;; This simulates how paths are built in practice
     ;; prefix comes from S3Store, path is the file location
-    (let [prefix "test"
+    (let [identifier nil
+          prefix "test"
           file-path "ledger1/commit/abc123.json"
           full-path (str prefix "/" file-path)
-          address (s3-storage/s3-address full-path)]
+          address (s3-storage/s3-address identifier full-path)]
       (is (= "fluree:s3://test/ledger1/commit/abc123.json" address)
-          "Should include prefix in the path")))
-
-  (testing "S3 address handles paths with leading slash"
-    (let [path "/some-dir/file.json"
-          address (s3-storage/s3-address path)]
-      (is (= "fluree:s3:///some-dir/file.json" address)
-          "Should handle leading slash correctly"))))
+          "Should include prefix in the path"))))

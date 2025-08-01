@@ -323,8 +323,8 @@
     ch))
 
 (defn s3-address
-  [path]
-  (storage/build-fluree-address nil method-name path))
+  [identifier path]
+  (storage/build-fluree-address identifier method-name path))
 
 (defrecord S3Store [identifier credentials bucket region prefix]
   storage/Addressable
@@ -358,7 +358,7 @@
           {:hash hash
            :path path
            :size (count bytes)
-           :address (s3-address path)}))))
+           :address (s3-address identifier path)}))))
 
   storage/ByteStore
   (write-bytes [this path bytes]
