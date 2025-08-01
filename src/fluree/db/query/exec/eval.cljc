@@ -951,17 +951,18 @@
    (defonce ^:private sci-context-singleton
      (delay (create-sci-context))))
 
-;; Macro for conditional evaluation based on build target
+;; Enhanced eval-form that accepts context for GraalVM builds
 #?(:clj
-   (defmacro eval-form
-     "Evaluates a form using either eval (JVM) or SCI (GraalVM).
-      Decision is made at compile time based on graalvm-build? check.
-      For GraalVM builds, uses a singleton SCI context for better performance."
-     [form]
+   (defmacro eval-form-with-context
+     "Evaluates a form with additional context bindings for GraalVM builds.
+      For JVM builds, ignores the context and uses regular eval."
+     [form ctx]
      (if-graalvm
-      ;; GraalVM branch - use singleton SCI context
-      `(sci/eval-form @sci-context-singleton ~form)
-      ;; JVM branch - use direct eval
+      ;; GraalVM branch - create context with $-CONTEXT binding
+      `(let [ctx-with-bindings# (sci/merge-opts @sci-context-singleton
+                                                {:bindings {'$-CONTEXT ~ctx}})]
+         (sci/eval-form ctx-with-bindings# ~form))
+      ;; JVM branch - use direct eval, ignoring context
       `(eval ~form))))
 
 ;;; =============================================================================
@@ -994,7 +995,10 @@
      str-lang str-dt bnode
 
      ;; vector scoring fns
-     dotProduct cosineSimilarity euclidianDistance})
+     dotProduct cosineSimilarity euclidianDistance
+
+     ;; internal helper fns - needed for testing and some query constructs
+     ->typed-val})
 
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))
@@ -1140,7 +1144,7 @@
   ([code ctx allow-aggregates?]
    (let [fn-code (compile* code ctx allow-aggregates?)]
      (log/trace "compiled fn:" fn-code)
-     #?(:clj (eval-form fn-code)
+     #?(:clj (eval-form-with-context fn-code ctx)
         :cljs (throw (ex-info "eval not supported in ClojureScript" {:code fn-code}))))))
 
 (defn compile-filter
@@ -1152,5 +1156,5 @@
                               (assoc (quote ~var) ~var)
                               ~f
                               :value))]
-    #?(:clj (eval-form filter-fn-code)
+    #?(:clj (eval-form-with-context filter-fn-code ctx)
        :cljs (throw (ex-info "eval not supported in ClojureScript" {:code filter-fn-code})))))
