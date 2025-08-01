@@ -81,9 +81,16 @@
       (str/replace "*" "%2A")
       (str/replace "%7E" "~")))
 
+(defn encode-s3-path
+  "Encode S3 path segments individually to match S3's automatic encoding"
+  [path]
+  (let [segments (str/split path #"/")]
+    (str/join "/" (map url-encode segments))))
+
 (defn canonical-uri
   "Create canonical URI for AWS signature"
   [path]
+  ;; Path must already be encoded when passed to this function
   (str "/" path))
 
 (defn canonical-query-string
@@ -195,15 +202,17 @@
     :or {method "GET"
          headers {}}}]
   (go-try
-    (let [query-string (canonical-query-string query-params)
-          url (str (build-s3-url bucket region path)
+    (let [;; Encode path segments for both URL and signature to match S3's encoding
+          encoded-path (encode-s3-path path)
+          query-string (canonical-query-string query-params)
+          url (str (build-s3-url bucket region encoded-path)
                    (when query-string (str "?" query-string)))
           headers-with-content-type (if (and (= method "PUT") body)
                                       (assoc headers "Content-Type" "application/octet-stream")
                                       headers)
           signed-headers (sign-request
                           {:method method
-                           :path path
+                           :path encoded-path  ;; Use encoded path for signature
                            :headers headers-with-content-type
                            :payload body
                            :region region
@@ -225,7 +234,7 @@
   [client path]
   (let [{:keys [credentials bucket region prefix]} client
         ch (async/promise-chan)
-        full-path (str prefix "/" path)]
+        full-path (str prefix path)]
     (go
       (try
         (let [response (<? (s3-request {:method "GET"
@@ -245,7 +254,7 @@
   [client path data]
   (let [{:keys [credentials bucket region prefix]} client
         ch (async/promise-chan)
-        full-path (str prefix "/" path)]
+        full-path (str prefix path)]
     (async/pipe (s3-request {:method "PUT"
                              :bucket bucket
                              :region region
@@ -289,9 +298,7 @@
   ([client path continuation-token]
    (let [{:keys [credentials bucket region prefix]} client
          ch (async/promise-chan)
-         full-path (if (empty? prefix)
-                     path
-                     (str prefix "/" path))]
+         full-path (str prefix path)]
      (go
        (try
          (let [query-params (cond-> {"list-type" "2"}
@@ -325,13 +332,13 @@
     ch))
 
 (defn s3-address
-  [identifier s3-bucket s3-prefix path]
-  (storage/build-fluree-address identifier method-name path [s3-bucket s3-prefix]))
+  [identifier path]
+  (storage/build-fluree-address identifier method-name path))
 
 (defrecord S3Store [identifier credentials bucket region prefix]
   storage/Addressable
   (location [_]
-    (storage/build-location storage/fluree-namespace identifier method-name [bucket prefix]))
+    (storage/build-location storage/fluree-namespace identifier method-name))
 
   storage/Identifiable
   (identifiers [_]
@@ -360,7 +367,7 @@
           {:hash hash
            :path path
            :size (count bytes)
-           :address (s3-address identifier bucket prefix path)}))))
+           :address (s3-address identifier path)}))))
 
   storage/ByteStore
   (write-bytes [this path bytes]
@@ -377,7 +384,7 @@
   (delete [_ address]
     (go-try
       (let [path (storage/get-local-path address)
-            full-path (str prefix "/" path)]
+            full-path (str prefix path)]
         (<? (s3-request {:method "DELETE"
                          :bucket bucket
                          :region region
@@ -410,7 +417,12 @@
    (let [region (or (System/getenv "AWS_REGION")
                     (System/getenv "AWS_DEFAULT_REGION")
                     "us-east-1")
-         credentials (get-credentials)]
+         credentials (get-credentials)
+         ;; Normalize prefix to always end with / (unless empty)
+         normalized-prefix (when (and prefix (not (str/blank? prefix)))
+                             (if (str/ends-with? prefix "/")
+                               prefix
+                               (str prefix "/")))]
      (when-not credentials
        (throw (ex-info "AWS credentials not found"
                        {:error :s3/missing-credentials
@@ -418,4 +430,4 @@
      ;; Note: endpoint-override can be handled via with-redefs of build-s3-url in tests
      (when endpoint-override
        (log/warn "endpoint-override provided - can be handled via with-redefs of build-s3-url in tests"))
-     (->S3Store identifier credentials bucket region prefix))))
+     (->S3Store identifier credentials bucket region normalized-prefix))))
