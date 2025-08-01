@@ -149,8 +149,8 @@
   "Returns updated bm25 index map after adding item to it"
   [{:keys [avg-length item-count terms dimensions vectors] :as index} stemmer stopwords id item]
   (try
-    (let [item-terms     (-> (extract-text item)
-                             (parse-sentence stemmer stopwords))
+    (let [extracted-text (extract-text item)
+          item-terms     (parse-sentence extracted-text stemmer stopwords)
           doc-len        (count item-terms)]
       (if (pos? doc-len) ;; empty strings will have no indexing data
         (let [[avg-length* item-count*] (update-avg-len avg-length item-count doc-len)

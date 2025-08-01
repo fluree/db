@@ -1,4 +1,4 @@
-(ns fluree.db.vector.search-test
+(ns fluree.db.vector.flatrank-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.constants :as const]
@@ -157,3 +157,106 @@
                   ["ex:bart" 0.68 [0.2, 0.9]]
                   ["ex:homer" 0.72 [0.6, 0.5]]]
                  results)))))))
+
+(deftest ^:integration vector-search-with-limit
+  (testing "Vector search with sorting and limit"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "vector-search-limit")
+          db     @(fluree/update
+                   (fluree/db ledger)
+                   {"@context" {"ex" "http://example.org/ns/"}
+                    "insert"
+                    [{"@id"     "ex:homer"
+                      "ex:name" "Homer"
+                      "ex:xVec" {"@value" [0.6, 0.5]
+                                 "@type"  const/iri-vector}}
+                     {"@id"     "ex:marge"
+                      "ex:name" "Marge"
+                      "ex:xVec" {"@value" [0.9, 0.8]
+                                 "@type"  const/iri-vector}}
+                     {"@id"     "ex:lisa"
+                      "ex:name" "Lisa"
+                      "ex:xVec" {"@value" [0.7, 0.7]
+                                 "@type"  const/iri-vector}}
+                     {"@id"     "ex:bart"
+                      "ex:name" "Bart"
+                      "ex:xVec" {"@value" [0.1, 0.9]
+                                 "@type"  const/iri-vector}}
+                     {"@id"     "ex:maggie"
+                      "ex:name" "Maggie"
+                      "ex:xVec" {"@value" [0.2, 0.3]
+                                 "@type"  const/iri-vector}}]})]
+
+      (testing "Top 3 results by score"
+        (let [query   {"@context" {"ex" "http://example.org/ns/"}
+                       "select"   ["?x" "?name" "?score"]
+                       "values"   ["?targetVec" [{"@value" [0.8, 0.7]
+                                                  "@type"  const/iri-vector}]]
+                       "where"    [{"@id"     "?x"
+                                    "ex:name" "?name"
+                                    "ex:xVec" "?vec"}
+                                   ["bind" "?score" "(dotProduct ?vec ?targetVec)"]]
+                       "orderBy"  "(desc ?score)"
+                       "limit"    3}
+              results @(fluree/query db query)]
+          (is (= 3 (count results)) "Should return exactly 3 results")
+          (is (= [["ex:marge" "Marge" 1.28]
+                  ["ex:lisa" "Lisa" 1.0499999999999998]
+                  ["ex:homer" "Homer" 0.83]]
+                 results)
+              "Should return top 3 scores in descending order"))))))
+
+(deftest ^:integration vector-search-multi-targets
+  (testing "Vector search with multiple target vectors using values"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "vector-search-multi-targets")
+          db     @(fluree/update
+                   (fluree/db ledger)
+                   {"@context" {"ex" "http://example.org/ns/"}
+                    "insert"
+                    [{"@id"     "ex:homer"
+                      "ex:xVec" {"@value" [0.6, 0.5]
+                                 "@type"  const/iri-vector}}
+                     {"@id"     "ex:bart"
+                      "ex:xVec" {"@value" [0.1, 0.9]
+                                 "@type"  const/iri-vector}}
+                     {"@id"     "ex:lisa"
+                      "ex:xVec" {"@value" [0.3, 0.1]
+                                 "@type"  const/iri-vector}}]})]
+
+      (testing "Multiple target vectors produce multiple searches"
+        (let [query   {"@context" {"ex" "http://example.org/ns/"}
+                       "select"   ["?x" "?targetVec" "?score" "?vec"]
+                       "values"   ["?targetVec" [{"@value" [0.7, 0.6]
+                                                  "@type"  const/iri-vector}
+                                                 {"@value" [0.1, 0.8]
+                                                  "@type"  const/iri-vector}]]
+                       "where"    [{"@id"     "?x"
+                                    "ex:xVec" "?vec"}
+                                   ["bind" "?score" "(dotProduct ?vec ?targetVec)"]]
+                       "orderBy"  ["?targetVec" "(desc ?score)"]}
+              results @(fluree/query db query)]
+          (is (= 6 (count results)) "Should return 3 subjects × 2 target vectors = 6 results")
+          (is (= [["ex:bart" [0.1 0.8] 0.7300000000000001 [0.1 0.9]]
+                  ["ex:homer" [0.1 0.8] 0.46 [0.6 0.5]]
+                  ["ex:lisa" [0.1 0.8] 0.11000000000000001 [0.3 0.1]]
+                  ["ex:homer" [0.7 0.6] 0.72 [0.6 0.5]]
+                  ["ex:bart" [0.7 0.6] 0.61 [0.1 0.9]]
+                  ["ex:lisa" [0.7 0.6] 0.27 [0.3 0.1]]]
+                 results)
+              "Results grouped by target vector, then sorted by score desc")))
+
+      (testing "Cross-comparison of vectors from the dataset"
+        (let [query   {"@context" {"ex" "http://example.org/ns/"}
+                       "select"   ["?sourceId" "?targetId" "?score"]
+                       "where"    [{"@id"     "?sourceId"
+                                    "ex:xVec" "?sourceVec"}
+                                   {"@id"     "?targetId"
+                                    "ex:xVec" "?targetVec"}
+                                   ["bind" "?score" "(cosineSimilarity ?sourceVec ?targetVec)"]
+                                   ["filter" "(not= ?sourceId ?targetId)"]]
+                       "orderBy"  ["?sourceId" "(desc ?score)"]}
+              results @(fluree/query db query)]
+          (is (= 6 (count results)) "Each of 3 subjects compared to 2 others")
+          (is (every? #(not= (first %) (second %)) results)
+              "No self-comparisons due to filter"))))))

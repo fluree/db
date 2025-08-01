@@ -35,9 +35,7 @@
             [fluree.db.util :as util :refer [try* catch* get-first get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
-            [fluree.db.util.reasoner :as reasoner-util]
-            [fluree.db.virtual-graph.flat-rank :as flat-rank]
-            [fluree.db.virtual-graph.index-graph :as vg])
+            [fluree.db.util.reasoner :as reasoner-util])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -254,8 +252,7 @@
   (-> db
       (assoc :t t)
       (commit-data/update-novelty flakes)
-      (vocab/hydrate-schema flakes)
-      (vg/check-virtual-graph flakes nil)))
+      (vocab/hydrate-schema flakes)))
 
 (defn merge-commit
   "Process a new commit map, converts commit into flakes, updates respective
@@ -315,10 +312,8 @@
 
   (-activate-alias [db alias']
     (go-try
-      (cond
-        (= alias alias') db
-        (flat-rank/flatrank-alias? alias') (flat-rank/index-graph db alias')
-        (where/virtual-graph? alias') (vg/load-virtual-graph db alias'))))
+      (when (= alias alias')
+        db)))
 
   (-aliases [_]
     [alias])
@@ -445,7 +440,6 @@
      :post            (index/empty-branch ledger-alias post-cmp)
      :opst            (index/empty-branch ledger-alias opst-cmp)
      :tspo            (index/empty-branch ledger-alias tspo-cmp)
-     :vg              {}
      :stats           {:flakes 0, :size 0, :indexed 0}
      :namespaces      iri/default-namespaces
      :namespace-codes iri/default-namespace-codes

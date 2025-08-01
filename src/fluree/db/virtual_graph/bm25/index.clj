@@ -1,16 +1,18 @@
 (ns fluree.db.virtual-graph.bm25.index
   (:require [clojure.core.async :as async :refer [go alts! put! promise-chan <! >!]]
             [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util :as util :refer [try* catch*]]
+            [fluree.db.util :as util]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph :as vg]
             [fluree.db.virtual-graph.bm25.search :as bm25.search]
             [fluree.db.virtual-graph.bm25.stemmer :as stm]
             [fluree.db.virtual-graph.bm25.stopwords :as stopwords]
+            [fluree.db.virtual-graph.bm25.storage] ;; Load for multimethod registration
             [fluree.db.virtual-graph.bm25.update :as bm25.update]
             [fluree.db.virtual-graph.parse :as vg-parse])
   (:refer-clojure :exclude [assert]))
@@ -77,7 +79,7 @@
 (defn percent-complete-str
   [index-state]
   (let [{:keys [pending-status]} @index-state
-        [processed-n item-count] pending-status
+        [processed-n item-count] (or pending-status [0 0])
         percentage (when (and (pos-int? processed-n) (pos-int? item-count))
                      (int (* 100 (/ processed-n item-count))))]
     (cond
@@ -100,7 +102,7 @@
 (defn search
   [{:keys [stemmer stopwords k1 b index-state] :as bm25} solution error-ch out-ch]
   (go
-    (try*
+    (try
       (let [{::vg-parse/keys [target limit timeout] :as search-params} (vg-parse/get-search-params solution)
             _ (when-not target
                 (throw (ex-info "No search target for virtual graph. Did you forget @context in your query?"
@@ -133,7 +135,7 @@
              (vg-parse/limit-results limit)
              (vg-parse/process-sparse-results bm25 solution search-params)
              (async/onto-chan! out-ch)))
-      (catch* e
+      (catch Exception e
         (>! error-ch e)))))
 
 (defn bm25-upsert*
@@ -145,17 +147,30 @@
     ;; following go-block happens asynchronously in the background
     ;; TODO - VG - capture error conditions in async/<! or other opts below and resolve the response with an error.
     (go
-      (let [latest-index  (if pending-ch
-                            (<! pending-ch)
-                            index)
-            status-update (fn [status]
-                            (swap! new-index-state assoc :pending-status status))
-            new-index     (<! (bm25.update/upsert-items bm25 latest-index items-count items-ch status-update))]
-        ;; reset index state atom once index is complete, remove pending-ch
-        (swap! new-index-state (fn [idx-state]
-                                 (assoc idx-state :index new-index
-                                        :pending-ch nil)))
-        (>! new-pending-ch new-index)))
+      (try
+        (let [latest-index  (if pending-ch
+                              (<! pending-ch)
+                              index)
+              status-update (fn [status]
+                              (swap! new-index-state assoc :pending-status status))
+              new-index     (<! (bm25.update/upsert-items bm25 latest-index items-count items-ch status-update))
+              catalog       (:index-catalog bm25)]
+          ;; reset index state atom once index is complete, remove pending-ch
+          (swap! new-index-state (fn [idx-state]
+                                   (assoc idx-state :index new-index
+                                          :pending-ch nil)))
+          (log/debug "BM25 index update complete, writing to storage...")
+          ;; Persist the updated BM25 index to storage
+          (when catalog
+            (let [updated-bm25 (assoc bm25 :index-state new-index-state :t t)]
+              (log/debug "Writing BM25 index to storage for VG:" (:alias updated-bm25))
+              (try
+                (<! (vg/write-vg catalog updated-bm25))
+                (catch Exception e
+                  (log/error e "Failed to write BM25 index to storage")))))
+          (>! new-pending-ch new-index))
+        (catch Exception e
+          (log/error e "Error in BM25 index update"))))
 
     ;; new bm25 record returned to get attached to db
     (assoc bm25 :t t
@@ -230,9 +245,9 @@
 
 (defrecord BM25-VirtualGraph
            [stemmer stopwords k1 b index-state initialized genesis-t t
-            alias query parsed-query property-deps
+            alias vg-name query parsed-query property-deps
    ;; following taken from db - needs to be kept up to date with new db updates
-            db-alias namespaces namespace-codes]
+            db-alias namespaces namespace-codes index-catalog]
 
   iri/IRICodec
   (encode-iri [_ iri]
@@ -244,7 +259,60 @@
   (upsert [this source-db new-flakes remove-flakes]
     (bm25-upsert this source-db new-flakes remove-flakes))
   (initialize [this source-db]
-    (bm25-initialize this source-db))
+    (go
+      (let [initialized-bm25 (bm25-initialize this source-db)
+            {:keys [index-state index-catalog]} initialized-bm25
+            ;; Wait for the async indexing to complete
+            pending-ch (get @index-state :pending-ch)]
+        (when pending-ch
+          (<! pending-ch))
+        ;; Now write to storage
+        (when index-catalog
+          (try
+            (<! (vg/write-vg index-catalog initialized-bm25))
+            (log/debug "Successfully wrote initial BM25 index to storage")
+            (catch Exception e
+              (log/error e "Failed to write initial BM25 index to storage"))))
+        initialized-bm25)))
+
+  vg/SyncableVirtualGraph
+  (sync [this as-of]
+    (vg/sync this as-of {}))
+  (sync [this as-of {:keys [timeout] :or {timeout 10000}}]
+    (go
+      (let [{:keys [pending-ch]} @index-state
+            target-t (or as-of t)]  ;; Use current t if as-of is nil
+        (cond
+          ;; If we're already at or past the requested t, we're synced
+          (>= t target-t)
+          this
+
+          ;; If there's a pending update, wait for it with timeout
+          pending-ch
+          (let [timeout-ch (async/timeout timeout)
+                [v ch] (alts! [pending-ch timeout-ch])]
+            (if (= ch timeout-ch)
+              (throw (ex-info (str "Timeout waiting for BM25 index sync. "
+                                   (percent-complete-str index-state))
+                              {:status 504
+                               :error :db/timeout
+                               :vg-name vg-name
+                               :target-t target-t
+                               :current-t t}))
+              ;; Successfully synced, return updated VG
+              (assoc this :index-state (atom {:index v
+                                              :pending-ch nil
+                                              :pending-status nil})
+                     :t target-t)))
+
+          ;; No pending update and we're not at target t
+          :else
+          (throw (ex-info "BM25 index not yet updated to requested transaction"
+                          {:status 409
+                           :error :db/index-behind
+                           :vg-name vg-name
+                           :target-t target-t
+                           :current-t t}))))))
 
   where/Matcher
   (-match-triple [_ _tracker solution triple _error-ch]
@@ -259,15 +327,32 @@
   (-match-class [_ _tracker _solution _s-mch _error-ch]
     where/nil-channel)
 
-  ;; activate-alias should not be called on an index VG, return empty chan
-  (-activate-alias [_ _]
-    (let [ch (async/chan)]
-      (async/close! ch)
-      ch))
+  ;; activate-alias returns the VG itself when the alias matches
+  (-activate-alias [this alias']
+    (go
+      (when (= alias alias')
+        this)))
 
-  ;; return db-alias here, as it is used when encoding/decoding IRIs in the search function which is original db-dependent
+  ;; return the VG alias
   (-aliases [_]
-    [db-alias]))
+    [alias])
+
+  dbproto/IFlureeDb
+  (-query [_this _tracker _query]
+    ;; BM25 virtual graphs handle queries through the where/Matcher protocol
+    ;; This method should not be called directly on BM25 instances
+    (throw (ex-info "BM25 virtual graphs do not support direct query execution"
+                    {:status 400
+                     :error :db/unsupported-operation})))
+
+  (-class-ids [_this _tracker _subject-id]
+    ;; BM25 indexes don't store class information
+    (async/to-chan! []))
+
+  (-index-update [this _commit-index]
+    ;; BM25 indexes are updated through the UpdatableVirtualGraph protocol
+    ;; This is a no-op for compatibility
+    this))
 
 (defn bm25-iri?
   [idx-rdf-type]
@@ -277,7 +362,7 @@
 ;; TODO - VG - future feature - weighted properties
 ;; TODO - VG - drop index
 (defn new-bm25-index
-  [{:keys [namespaces namespace-codes alias] :as _db} index-flakes vg-opts]
+  [{:keys [namespaces namespace-codes alias index-catalog] :as db} index-flakes vg-opts]
   (-> (idx-flakes->opts index-flakes)
       (merge vg-opts)
       ;; index-state held as atom, as we need -match-triple, etc. to hold both
@@ -288,5 +373,8 @@
              :index-state (atom initialized-index)
              :namespaces namespaces
              :namespace-codes namespace-codes
-             :db-alias alias)
+             :db-alias alias
+             :index-catalog index-catalog
+             :vg-name (:vg-name vg-opts))
+      (vg-parse/parse-document-query (volatile! db))
       map->BM25-VirtualGraph))

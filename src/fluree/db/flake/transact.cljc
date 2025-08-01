@@ -11,8 +11,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.track :as track]
             [fluree.db.util :as util]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.virtual-graph.index-graph :as vg]))
+            [fluree.db.util.async :refer [<? go-try]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -83,18 +82,7 @@
                      result
                      [@db-vol result]))))))
 
-(defn create-virtual-graphs
-  "Creates a new virtual graph. If the virtual graph is invalid, an
-  exception will be thrown and the transaction will not complete."
-  [db add new-vgs]
-  (loop [[new-vg & r] new-vgs
-         db db]
-    (if new-vg
-      (let [vg-flakes (filter #(= (flake/s %) new-vg) add)
-            [db* alias vg-record] (vg/create db vg-flakes)]
-        ;; TODO - VG - ensure alias is not being used, throw if so
-        (recur r (assoc-in db* [:vg alias] vg-record)))
-      db)))
+;; Virtual graphs are now created through the nameservice API, not transactions
 
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
@@ -110,8 +98,7 @@
                                   :policy policy) ; re-apply policy to db-after
                            (commit-data/update-novelty add remove)
                            (commit-data/add-tt-id)
-                           (vocab/hydrate-schema add)
-                           (vg/check-virtual-graph add remove))]
+                           (vocab/hydrate-schema add))]
       {:add       add
        :remove    remove
        :db-after  db-after
