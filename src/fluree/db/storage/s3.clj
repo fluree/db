@@ -398,7 +398,13 @@
         ;; Filter for .json files and return relative paths
         (->> all-results
              (filter #(str/ends-with? % ".json"))
-             vec)))))
+             vec))))
+
+  storage/RecursiveListableStore
+  (list-paths-recursive [this path-prefix]
+    ;; S3 list already supports recursive listing with prefix
+    ;; So we can reuse the same implementation as list-paths
+    (storage/list-paths this path-prefix)))
 
 (defn open
   "Open an S3 store using direct HTTP implementation"

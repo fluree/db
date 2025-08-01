@@ -1,5 +1,10 @@
 (ns fluree.db.storage.file
-  (:require [clojure.string :as str]
+  (:require #?(:clj [clojure.java.io :as io])
+            #?@(:cljs [[fluree.db.platform :as platform]
+                       ["fs" :as node-fs]
+                       ["path" :as node-path]])
+            [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.crypto.aes :as aes]
             [fluree.db.storage :as storage]
@@ -7,6 +12,8 @@
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.filesystem :as fs]
             [fluree.db.util.json :as json]))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (def method-name "file")
 
@@ -22,6 +29,33 @@
 (defn file-address
   [identifier path]
   (storage/build-fluree-address identifier method-name path))
+
+(defn list-files-recursive
+  "Recursively list all files (not directories) under a directory. Returns a channel with the results."
+  [dir]
+  #?(:clj
+     (async/thread
+       (let [^java.io.File dir-file (io/file dir)]
+         (when (.exists dir-file)
+           (->> (file-seq dir-file)
+                (filter #(.isFile ^java.io.File %))
+                (map #(.getPath ^java.io.File %))))))
+     :cljs
+     (async/go
+       (if platform/BROWSER
+         (throw (ex-info "Recursive file listing not supported in browser environment" {}))
+         ;; Node.js implementation
+         (let [find-files (fn find-files [current-dir acc]
+                            (let [entries (node-fs/readdirSync current-dir #js {:withFileTypes true})]
+                              (reduce (fn [acc entry]
+                                        (let [entry-name (.-name entry)
+                                              full-path (node-path/join current-dir entry-name)]
+                                          (if (.isDirectory entry)
+                                            (find-files full-path acc)
+                                            (conj acc full-path))))
+                                      acc
+                                      entries)))]
+           (find-files dir []))))))
 
 (defrecord FileStore [identifier root encryption-key]
   storage/Addressable
@@ -94,6 +128,19 @@
                 json-files (filter #(str/ends-with? % ".json") files)]
             (map #(str prefix "/" %) json-files))
           ;; Directory doesn't exist, return empty sequence
+          []))))
+
+  storage/RecursiveListableStore
+  (list-paths-recursive [_ prefix]
+    (go-try
+      (let [prefix-path (full-path root prefix)]
+        (if (<? (fs/exists? prefix-path))
+          (let [all-files (<? (list-files-recursive prefix-path))
+                base-path (str (fs/local-path root) "/")
+                relative-files (map #(str/replace % base-path "") all-files)
+                ;; Filter for .json files only
+                json-files (filter #(str/ends-with? % ".json") relative-files)]
+            json-files)
           [])))))
 
 (defn open

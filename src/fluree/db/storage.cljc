@@ -116,6 +116,10 @@
 (defprotocol ListableStore
   (list-paths [store prefix] "Returns a sequence of paths that start with the given prefix."))
 
+(defprotocol RecursiveListableStore
+  (list-paths-recursive [store prefix]
+    "Recursively returns all file paths that start with the given prefix. Excludes directories."))
+
 (defn content-write-json
   [store path data]
   (go-try
