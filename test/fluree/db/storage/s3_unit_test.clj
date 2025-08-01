@@ -81,3 +81,15 @@
           address (s3-storage/s3-address identifier full-path)]
       (is (= "fluree:s3://test/ledger1/commit/abc123.json" address)
           "Should include prefix in the path"))))
+
+(deftest s3-path-encoding-test
+  (testing "S3 path encoding handles special characters correctly"
+    (let [path-with-at "ns@v1/test-ledger@main.json"
+          encoded (s3-storage/encode-s3-path path-with-at)]
+      (is (= "ns%40v1/test-ledger%40main.json" encoded)
+          "Should encode @ characters to %40"))
+
+    (let [path-normal "bucket/prefix/file.json"
+          encoded (s3-storage/encode-s3-path path-normal)]
+      (is (= "bucket/prefix/file.json" encoded)
+          "Should not change paths without special characters"))))

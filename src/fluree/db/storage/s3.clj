@@ -81,9 +81,16 @@
       (str/replace "*" "%2A")
       (str/replace "%7E" "~")))
 
+(defn encode-s3-path
+  "Encode S3 path segments individually to match S3's automatic encoding"
+  [path]
+  (let [segments (str/split path #"/")]
+    (str/join "/" (map url-encode segments))))
+
 (defn canonical-uri
   "Create canonical URI for AWS signature"
   [path]
+  ;; Path must already be encoded when passed to this function
   (str "/" path))
 
 (defn canonical-query-string
@@ -195,15 +202,17 @@
     :or {method "GET"
          headers {}}}]
   (go-try
-    (let [query-string (canonical-query-string query-params)
-          url (str (build-s3-url bucket region path)
+    (let [;; Encode path segments for both URL and signature to match S3's encoding
+          encoded-path (encode-s3-path path)
+          query-string (canonical-query-string query-params)
+          url (str (build-s3-url bucket region encoded-path)
                    (when query-string (str "?" query-string)))
           headers-with-content-type (if (and (= method "PUT") body)
                                       (assoc headers "Content-Type" "application/octet-stream")
                                       headers)
           signed-headers (sign-request
                           {:method method
-                           :path path
+                           :path encoded-path  ;; Use encoded path for signature
                            :headers headers-with-content-type
                            :payload body
                            :region region
