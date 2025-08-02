@@ -792,7 +792,36 @@
            json-ld-fns {'expand-iri json-ld/expand-iri}
 
            const-ns {'iri-id const/iri-id
-                     '_id const/iri-id}
+                     '_id const/iri-id
+                     ;; String datatypes needed for comparisons
+                     'iri-string const/iri-string
+                     'iri-anyURI const/iri-anyURI
+                     'iri-xsd-normalizedString const/iri-xsd-normalizedString
+                     'iri-lang-string const/iri-lang-string
+                     'iri-xsd-token const/iri-xsd-token
+                     ;; Numeric datatypes
+                     'iri-xsd-decimal const/iri-xsd-decimal
+                     'iri-xsd-double const/iri-xsd-double
+                     'iri-xsd-integer const/iri-xsd-integer
+                     'iri-long const/iri-long
+                     'iri-xsd-int const/iri-xsd-int
+                     'iri-xsd-byte const/iri-xsd-byte
+                     'iri-xsd-short const/iri-xsd-short
+                     'iri-xsd-float const/iri-xsd-float
+                     'iri-xsd-unsignedLong const/iri-xsd-unsignedLong
+                     'iri-xsd-unsignedInt const/iri-xsd-unsignedInt
+                     'iri-xsd-unsignedShort const/iri-xsd-unsignedShort
+                     'iri-xsd-positiveInteger const/iri-xsd-positiveInteger
+                     'iri-xsd-nonPositiveInteger const/iri-xsd-nonPositiveInteger
+                     'iri-xsd-negativeInteger const/iri-xsd-negativeInteger
+                     'iri-xsd-nonNegativeInteger const/iri-xsd-nonNegativeInteger
+                     ;; Time datatypes
+                     'iri-xsd-dateTime const/iri-xsd-dateTime
+                     'iri-xsd-date const/iri-xsd-date
+                     ;; Boolean datatype
+                     'iri-xsd-boolean const/iri-xsd-boolean
+                     ;; RDF type
+                     'iri-rdf-type const/iri-rdf-type}
 
            ;; Core functions - more efficient to define as a static map
            core-fns '{instance? instance?
@@ -951,17 +980,18 @@
    (defonce ^:private sci-context-singleton
      (delay (create-sci-context))))
 
-;; Macro for conditional evaluation based on build target
+;; Enhanced eval-form that accepts context for GraalVM builds
 #?(:clj
-   (defmacro eval-form
-     "Evaluates a form using either eval (JVM) or SCI (GraalVM).
-      Decision is made at compile time based on graalvm-build? check.
-      For GraalVM builds, uses a singleton SCI context for better performance."
-     [form]
+   (defmacro eval-form-with-context
+     "Evaluates a form with additional context bindings for GraalVM builds.
+      For JVM builds, ignores the context and uses regular eval."
+     [form ctx]
      (if-graalvm
-      ;; GraalVM branch - use singleton SCI context
-      `(sci/eval-form @sci-context-singleton ~form)
-      ;; JVM branch - use direct eval
+      ;; GraalVM branch - create context with $-CONTEXT binding
+      `(let [ctx-with-bindings# (sci/merge-opts @sci-context-singleton
+                                                {:bindings {'$-CONTEXT ~ctx}})]
+         (sci/eval-form ctx-with-bindings# ~form))
+      ;; JVM branch - use direct eval, ignoring context
       `(eval ~form))))
 
 ;;; =============================================================================
@@ -994,7 +1024,10 @@
      str-lang str-dt bnode
 
      ;; vector scoring fns
-     dotProduct cosineSimilarity euclidianDistance})
+     dotProduct cosineSimilarity euclidianDistance
+
+     ;; internal helper fns - needed for testing and some query constructs
+     ->typed-val})
 
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))
@@ -1140,7 +1173,7 @@
   ([code ctx allow-aggregates?]
    (let [fn-code (compile* code ctx allow-aggregates?)]
      (log/trace "compiled fn:" fn-code)
-     #?(:clj (eval-form fn-code)
+     #?(:clj (eval-form-with-context fn-code ctx)
         :cljs (throw (ex-info "eval not supported in ClojureScript" {:code fn-code}))))))
 
 (defn compile-filter
@@ -1152,5 +1185,5 @@
                               (assoc (quote ~var) ~var)
                               ~f
                               :value))]
-    #?(:clj (eval-form filter-fn-code)
+    #?(:clj (eval-form-with-context filter-fn-code ctx)
        :cljs (throw (ex-info "eval not supported in ClojureScript" {:code filter-fn-code})))))
