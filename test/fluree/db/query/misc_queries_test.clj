@@ -1,5 +1,6 @@
 (ns fluree.db.query.misc-queries-test
   (:require [babashka.fs :refer [with-temp-dir]]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
@@ -390,3 +391,175 @@
              "name" "Freddy"}]
            @(fluree/query db1 {"@context" {"@base" "https://flur.ee/"}
                                "select" {"freddy" ["*"]}})))))
+
+(deftest ^:integration simple-where-select-test
+  (testing "Simple where clause with select ?s and limit"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "where-select-test")
+          db     @(fluree/update (fluree/db ledger)
+                                 {"@context" [test-utils/default-context
+                                              {:ex "http://example.org/ns/"}]
+                                  "insert"   [{:id :ex/alice :ex/name "Alice" :ex/age 30}
+                                              {:id :ex/bob :ex/name "Bob" :ex/age 25}
+                                              {:id :ex/charlie :ex/name "Charlie" :ex/age 35}]})]
+
+      ;; Test the basic query - select any subject with limit 1
+      (let [result @(fluree/query db {"select" "?s"
+                                      "where"  {"@id" "?s"}
+                                      "limit"  1})]
+        (is (= 1 (count result))
+            "Should return exactly one result due to limit")
+        (is (string? (first result))
+            "Should return a string IRI")
+        (is (= "http://example.org/ns/alice" (first result))
+            "Should return alice as it comes first alphabetically"))
+
+      ;; Test with context
+      (let [result @(fluree/query db {"@context" [test-utils/default-context
+                                                  {:ex "http://example.org/ns/"}]
+                                      "select"   "?s"
+                                      "where"    {"@id" "?s"}
+                                      "limit"    1})]
+        (is (= 1 (count result))
+            "Should return exactly one result due to limit")
+        (is (keyword? (first result))
+            "Should return a keyword with context")
+        (is (= :ex/alice (first result))
+            "Should return :ex/alice as it comes first alphabetically"))
+
+      ;; Test without limit to verify all subjects are found
+      (let [result @(fluree/query db {"@context" [test-utils/default-context
+                                                  {:ex "http://example.org/ns/"}]
+                                      "select"   "?s"
+                                      "where"    {"@id" "?s"}})]
+        (is (= 3 (count result))
+            "Should return all three subjects without limit")
+        (is (= #{:ex/alice :ex/bob :ex/charlie} (set result))
+            "Should return all inserted subjects")))))
+
+(deftest ^:integration sci-datatype-filter-test
+  (testing "SCI evaluation of datatype and iri functions in filter expressions"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "sci-datatype-test")
+          ;; Insert some test data with string values
+          db     @(fluree/update (fluree/db ledger)
+                                 {"@context" {"ex" "http://example.org/"}
+                                  "insert"   [{"@id" "ex:existingOrNewData"
+                                               "ex:name" "Test Data"
+                                               "ex:description" "A test entity"}
+                                              {"@id" "ex:newData"
+                                               "ex:label" "New Data"
+                                               "ex:comment" "First new item"}
+                                              {"@id" "ex:newData2"
+                                               "ex:title" "Second Item"
+                                               "ex:note" "Another test"}
+                                              {"@id" "ex:newData3"
+                                               "ex:name" "Third Item"}
+                                              {"@id" "ex:newData5"
+                                               "ex:description" "Fifth Item"}
+                                              {"@id" "ex:newData6"
+                                               "ex:label" "Sixth Item"
+                                               "ex:comment" "Last item"}]})]
+
+      ;; Test the complex query with values, datatype bind, and filter
+      (let [query {"values" ["?s"
+                             [{"@type" "@id", "@value" "http://example.org/existingOrNewData"}
+                              {"@type" "@id", "@value" "http://example.org/newData"}
+                              {"@type" "@id", "@value" "http://example.org/newData2"}
+                              {"@type" "@id", "@value" "http://example.org/newData3"}
+                              {"@type" "@id", "@value" "http://example.org/newData5"}
+                              {"@type" "@id", "@value" "http://example.org/newData6"}]]
+                   "select" ["?s" "?property" "?value"]
+                   "groupBy" ["?s" "?property"]
+                   "where" [{"@id" "?s"
+                             "?property" "?value"}
+                            ["bind" "?dt" "(datatype ?value)"]
+                            ["filter" "(or (= ?dt \"http://www.w3.org/2001/XMLSchema#string\") (= ?property (iri \"@type\")))"]]
+                   "@context" {"ex" "http://example.org/"}}
+            result @(fluree/query db query)]
+
+        ;; Verify we got results
+        (is (pos? (count result))
+            "Should return results for string properties")
+
+        ;; All results should have string values or be @type predicates
+        ;; Note: groupBy wraps values in arrays
+        (is (every? #(let [value (nth % 2)]
+                       (or (and (vector? value)
+                                (= 1 (count value))
+                                (string? (first value)))
+                           (= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" (nth % 1))))
+                    result)
+            "All values should be strings (wrapped in arrays due to groupBy) or the property should be rdf:type")
+
+        ;; Check that we're getting results for our test subjects
+        (let [subjects (set (map first result))]
+          (is (some #(str/ends-with? % "existingOrNewData") subjects)
+              "Should include existingOrNewData in results")
+          (is (some #(str/ends-with? % "newData") subjects)
+              "Should include newData in results"))
+
+        ;; Verify the datatype function and filter worked by checking we only get string values
+        (let [property-values (filter #(not= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" (nth % 1)) result)]
+          (is (every? #(let [value (nth % 2)]
+                         (and (vector? value)
+                              (= 1 (count value))
+                              (string? (first value))))
+                      property-values)
+              "All non-type property values should be strings (wrapped in arrays due to groupBy)")))
+
+      ;; Also test without the values clause to ensure general filtering works
+      (let [query-no-values {"select" ["?s" "?property" "?value"]
+                             "where" [{"@id" "?s"
+                                       "?property" "?value"}
+                                      ["bind" "?dt" "(datatype ?value)"]
+                                      ["filter" "(= ?dt \"http://www.w3.org/2001/XMLSchema#string\")"]]
+                             "@context" {"ex" "http://example.org/"}}
+            result @(fluree/query db query-no-values)]
+
+        (is (pos? (count result))
+            "Should return results for string filter without values clause")
+
+        (is (every? #(string? (nth % 2)) result)
+            "All values should be strings when filtering by string datatype")))))
+
+(deftest ^:integration sci-datatype-filter-explicit-test
+  (testing "Explicit SCI evaluation of datatype and iri functions"
+    ;; Note: This test should be run with FLUREE_GRAALVM_BUILD=true environment variable
+    ;; to force SCI evaluation. The macros are expanded at compile time, so setting
+    ;; the property at runtime won't affect the code paths.
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "sci-explicit-test")
+          db     @(fluree/update (fluree/db ledger)
+                                 {"@context" {"ex" "http://example.org/"}
+                                  "insert"   [{"@id" "ex:testData"
+                                               "ex:name" "Test String"
+                                               "ex:age" 42}]})]
+
+      ;; Test the filter with datatype comparison
+      (let [query {"select" ["?s" "?p" "?o"]
+                   "where" [{"@id" "?s"
+                             "?p" "?o"}
+                            ["bind" "?dt" "(datatype ?o)"]
+                            ["filter" "(= ?dt \"http://www.w3.org/2001/XMLSchema#string\")"]]
+                   "@context" {"ex" "http://example.org/"}}
+            result @(fluree/query db query)
+            ;; Test with iri function
+            query-with-iri {"select" ["?s" "?p"]
+                            "where" [{"@id" "?s"
+                                      "?p" "?o"}
+                                     ["filter" "(= ?p (iri \"ex:name\"))"]]
+                            "@context" {"ex" "http://example.org/"}}
+            result-iri @(fluree/query db query-with-iri)]
+
+        (is (= 1 (count result))
+            "Should find exactly one string property")
+
+        (is (= ["ex:testData" "ex:name" "Test String"] (first result))
+            "Should return the string property, not the integer")
+
+        (is (= 1 (count result-iri))
+            "Should find the property using iri function")
+
+        (is (= ["ex:testData" "ex:name"] (first result-iri))
+            "Should match the ex:name property")))))
