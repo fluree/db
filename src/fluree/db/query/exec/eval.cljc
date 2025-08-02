@@ -792,7 +792,36 @@
            json-ld-fns {'expand-iri json-ld/expand-iri}
 
            const-ns {'iri-id const/iri-id
-                     '_id const/iri-id}
+                     '_id const/iri-id
+                     ;; String datatypes needed for comparisons
+                     'iri-string const/iri-string
+                     'iri-anyURI const/iri-anyURI
+                     'iri-xsd-normalizedString const/iri-xsd-normalizedString
+                     'iri-lang-string const/iri-lang-string
+                     'iri-xsd-token const/iri-xsd-token
+                     ;; Numeric datatypes
+                     'iri-xsd-decimal const/iri-xsd-decimal
+                     'iri-xsd-double const/iri-xsd-double
+                     'iri-xsd-integer const/iri-xsd-integer
+                     'iri-long const/iri-long
+                     'iri-xsd-int const/iri-xsd-int
+                     'iri-xsd-byte const/iri-xsd-byte
+                     'iri-xsd-short const/iri-xsd-short
+                     'iri-xsd-float const/iri-xsd-float
+                     'iri-xsd-unsignedLong const/iri-xsd-unsignedLong
+                     'iri-xsd-unsignedInt const/iri-xsd-unsignedInt
+                     'iri-xsd-unsignedShort const/iri-xsd-unsignedShort
+                     'iri-xsd-positiveInteger const/iri-xsd-positiveInteger
+                     'iri-xsd-nonPositiveInteger const/iri-xsd-nonPositiveInteger
+                     'iri-xsd-negativeInteger const/iri-xsd-negativeInteger
+                     'iri-xsd-nonNegativeInteger const/iri-xsd-nonNegativeInteger
+                     ;; Time datatypes
+                     'iri-xsd-dateTime const/iri-xsd-dateTime
+                     'iri-xsd-date const/iri-xsd-date
+                     ;; Boolean datatype
+                     'iri-xsd-boolean const/iri-xsd-boolean
+                     ;; RDF type
+                     'iri-rdf-type const/iri-rdf-type}
 
            ;; Core functions - more efficient to define as a static map
            core-fns '{instance? instance?
