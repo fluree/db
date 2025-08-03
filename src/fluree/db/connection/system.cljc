@@ -1,6 +1,7 @@
 (ns fluree.db.connection.system
   (:require #?(:clj  [fluree.db.storage.s3 :as s3-storage]
                :cljs [fluree.db.storage.localstorage :as localstorage-store])
+            #?(:clj [fluree.db.migrations.nameservice-v1 :as ns-migration])
             #?(:clj [fluree.db.storage.file :as file-storage])
             [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]
@@ -160,8 +161,11 @@
      [_ config]
      (let [identifier     (config/get-first-string config conn-vocab/address-identifier)
            root-path      (config/get-first-string config conn-vocab/file-path)
-           aes256-key     (config/get-first-string config conn-vocab/aes256-key)]
-       (file-storage/open identifier root-path aes256-key))))
+           aes256-key     (config/get-first-string config conn-vocab/aes256-key)
+           file-store     (file-storage/open identifier root-path aes256-key)]
+       ;; Run nameservice migration if needed - fire and forget for now
+       (ns-migration/run-migration-if-needed file-store)
+       file-store)))
 
 (defmethod ig/init-key :fluree.db.storage/memory
   [_ config]
