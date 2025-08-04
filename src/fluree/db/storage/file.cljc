@@ -116,20 +116,6 @@
         (full-path path)
         (fs/read-file encryption-key)))
 
-  storage/ListableStore
-  (list-paths [_ prefix]
-    (go-try
-      (let [prefix-path (full-path root prefix)]
-        ;; Check if prefix directory exists
-        (if (<? (fs/exists? prefix-path))
-          ;; Use filesystem list-files to get all files in directory
-          (let [files (<? (fs/list-files prefix-path))
-                ;; Filter for .json files and return relative paths
-                json-files (filter #(str/ends-with? % ".json") files)]
-            (map #(str prefix "/" %) json-files))
-          ;; Directory doesn't exist, return empty sequence
-          []))))
-
   storage/RecursiveListableStore
   (list-paths-recursive [_ prefix]
     (go-try
