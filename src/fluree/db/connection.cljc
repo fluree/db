@@ -3,7 +3,6 @@
   (:require [clojure.core.async :as async :refer [<! go go-loop]]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
-            [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.flake.commit-data :as commit-data]
@@ -472,13 +471,8 @@
     (let [{:keys [branch timeout]
            :or {timeout 300000}} opts
           ledger (<? (load-ledger-alias conn ledger-alias))
-          current-db (ledger/current-db ledger branch)
-          index-queue (-> ledger
-                          (ledger/get-branch-meta branch)
-                          :index-queue)
-          complete-ch (async/chan 1)
+          complete-ch (ledger/trigger-index! ledger branch)
           timeout-ch (async/timeout timeout)]
-      (branch/enqueue-index! index-queue current-db nil complete-ch)
       (async/alt!
         complete-ch ([result] result)
         timeout-ch (ex-info "Indexing wait timeout, but assume indexing is proceeding in the background."

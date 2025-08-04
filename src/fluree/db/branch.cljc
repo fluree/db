@@ -213,3 +213,17 @@
   "Returns current db from branch data"
   [{:keys [state] :as _branch-map}]
   (:current-db @state))
+
+(defn trigger-index!
+  "Manually triggers indexing for this branch's current db.
+   Returns immediately with complete-ch that will receive result when indexing completes.
+   The complete-ch parameter is optional - if not provided, a new channel is created."
+  ([branch-map]
+   (trigger-index! branch-map nil nil))
+  ([branch-map index-files-ch]
+   (trigger-index! branch-map index-files-ch nil))
+  ([{:keys [index-queue] :as branch-map} index-files-ch complete-ch]
+   (let [complete-ch (or complete-ch (async/chan 1))
+         current-db (current-db branch-map)]
+     (enqueue-index! index-queue current-db index-files-ch complete-ch)
+     complete-ch)))

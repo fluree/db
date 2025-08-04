@@ -168,3 +168,16 @@
                               commit-catalog alias branch publish-addresses init-time))]
       (instantiate ledger-alias* primary-address branch commit-catalog index-catalog
                    primary-publisher secondary-publishers indexing did genesis-commit))))
+
+(defn trigger-index!
+  "Manually triggers indexing for a ledger on the specified branch.
+   Uses the current db for that branch. Returns a channel that will receive
+   the result when indexing completes.
+   
+   Options:
+   - branch: Branch name (defaults to main branch if not specified)"
+  ([ledger]
+   (trigger-index! ledger nil))
+  ([ledger branch]
+   (let [branch-meta (get-branch-meta ledger branch)]
+     (branch/trigger-index! branch-meta))))
