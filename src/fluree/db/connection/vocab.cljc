@@ -10,6 +10,9 @@
   [s]
   (str system-ns s))
 
+(def config-type
+  (system-iri "Configuration"))
+
 (def config-val-type
   (system-iri "ConfigurationValue"))
 
@@ -114,3 +117,6 @@
 
 (def connection
   (system-iri "connection"))
+
+(def connection-config
+  (system-iri "connectionConfig"))
