@@ -534,32 +534,31 @@
                                  {"@context" {"ex" "http://example.org/"}
                                   "insert"   [{"@id" "ex:testData"
                                                "ex:name" "Test String"
-                                               "ex:age" 42}]})]
+                                               "ex:age" 42}]})
+          ;; Test the filter with datatype comparison
+          query {"select" ["?s" "?p" "?o"]
+                 "where" [{"@id" "?s"
+                           "?p" "?o"}
+                          ["bind" "?dt" "(datatype ?o)"]
+                          ["filter" "(= ?dt \"http://www.w3.org/2001/XMLSchema#string\")"]]
+                 "@context" {"ex" "http://example.org/"}}
+          result @(fluree/query db query)
+          ;; Test with iri function
+          query-with-iri {"select" ["?s" "?p"]
+                          "where" [{"@id" "?s"
+                                    "?p" "?o"}
+                                   ["filter" "(= ?p (iri \"ex:name\"))"]]
+                          "@context" {"ex" "http://example.org/"}}
+          result-iri @(fluree/query db query-with-iri)]
 
-      ;; Test the filter with datatype comparison
-      (let [query {"select" ["?s" "?p" "?o"]
-                   "where" [{"@id" "?s"
-                             "?p" "?o"}
-                            ["bind" "?dt" "(datatype ?o)"]
-                            ["filter" "(= ?dt \"http://www.w3.org/2001/XMLSchema#string\")"]]
-                   "@context" {"ex" "http://example.org/"}}
-            result @(fluree/query db query)
-            ;; Test with iri function
-            query-with-iri {"select" ["?s" "?p"]
-                            "where" [{"@id" "?s"
-                                      "?p" "?o"}
-                                     ["filter" "(= ?p (iri \"ex:name\"))"]]
-                            "@context" {"ex" "http://example.org/"}}
-            result-iri @(fluree/query db query-with-iri)]
+      (is (= 1 (count result))
+          "Should find exactly one string property")
 
-        (is (= 1 (count result))
-            "Should find exactly one string property")
+      (is (= ["ex:testData" "ex:name" "Test String"] (first result))
+          "Should return the string property, not the integer")
 
-        (is (= ["ex:testData" "ex:name" "Test String"] (first result))
-            "Should return the string property, not the integer")
+      (is (= 1 (count result-iri))
+          "Should find the property using iri function")
 
-        (is (= 1 (count result-iri))
-            "Should find the property using iri function")
-
-        (is (= ["ex:testData" "ex:name"] (first result-iri))
-            "Should match the ex:name property")))))
+      (is (= ["ex:testData" "ex:name"] (first result-iri))
+          "Should match the ex:name property"))))
