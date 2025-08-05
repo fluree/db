@@ -643,6 +643,14 @@
             (with-constraint ds tracker pattern error-ch solution-ch))
           solution-ch patterns))
 
+(defn match-triples
+  [ds tracker triples error-ch solution]
+  (let [[triple & r] triples
+        ;; get initial solution channel from first triple
+        solution-ch  (match-pattern ds tracker solution triple error-ch)]
+    ;; refine solution channel with subsequent triples
+    (with-constraints ds tracker r error-ch solution-ch)))
+
 (defn subquery?
   [pattern]
   (and (sequential? pattern)

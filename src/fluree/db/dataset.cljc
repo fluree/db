@@ -82,11 +82,7 @@
   (-match-properties [ds tracker solution triples error-ch]
     (if-let [active-graph (get-active-graph ds)]
       (if (sequential? active-graph)
-        (let [[triple & r] triples
-              ;; get initial solution channel from first triple
-              solution-ch (where/match-pattern ds tracker solution triple error-ch)]
-          ;; refine solution channel with subsequent triples
-          (where/with-constraints ds tracker r error-ch solution-ch))
+        (where/match-triples ds tracker solution triples error-ch)
         (where/-match-properties active-graph tracker solution triples error-ch))
       where/nil-channel))
 
