@@ -271,11 +271,23 @@
        (<? (publish-commit ledger commit-jsonld))
 
        (if (track/track-txn? opts)
-         (-> write-result
-             (select-keys [:address :hash :size])
-             (assoc :ledger-id ledger-alias
-                    :t t
-                    :db db*))
+         (let [indexing-disabled? (-> ledger
+                                      (ledger/get-branch-meta branch)
+                                      :indexing-opts
+                                      :indexing-disabled)
+               index-t (commit-data/index-t commit-map)
+               novelty-size (get-in db* [:novelty :size] 0)
+               reindex-min-bytes (:reindex-min-bytes db*)
+               indexing-needed? (>= novelty-size reindex-min-bytes)]
+           (-> write-result
+               (select-keys [:address :hash :size])
+               (assoc :ledger-id ledger-alias
+                      :t t
+                      :db db*
+                      :indexing-needed indexing-needed?
+                      :index-t index-t
+                      :indexing-disabled indexing-disabled?
+                      :novelty-size novelty-size)))
          db*)))))
 
 (defn transact-ledger!

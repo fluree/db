@@ -350,7 +350,7 @@
   (index [db changes-ch]
     (if (novelty/min-novelty? db)
       (novelty/refresh db changes-ch max-old-indexes)
-      (go)))
+      (go db)))
 
   TimeTravel
   (datetime->t [db datetime]

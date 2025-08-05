@@ -112,5 +112,8 @@
 (def max-old-indexes
   (system-iri "maxOldIndexes"))
 
+(def indexing-disabled
+  (system-iri "indexingDisabled"))
+
 (def connection
   (system-iri "connection"))

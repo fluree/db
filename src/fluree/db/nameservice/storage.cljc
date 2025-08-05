@@ -5,7 +5,8 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.json :as json]))
+            [fluree.db.util.json :as json]
+            [fluree.db.util.log :as log]))
 
 (defn local-filename
   ([ledger-alias]
@@ -75,9 +76,9 @@
 
   (all-records [_]
     (go-try
-      ;; Use the ListableStore protocol to list all nameservice files
-      (if (satisfies? storage/ListableStore store)
-        (if-let [list-paths-result (storage/list-paths store "ns@v1")]
+      ;; Use recursive listing to support ledger names with '/' characters
+      (if (satisfies? storage/RecursiveListableStore store)
+        (if-let [list-paths-result (storage/list-paths-recursive store "ns@v1")]
           (loop [remaining-paths (<? list-paths-result)
                  records []]
             (if-let [path (first remaining-paths)]
@@ -95,7 +96,7 @@
           [])
         ;; Fallback for stores that don't support ListableStore
         (do
-          (println "Storage backend does not support ListableStore protocol")
+          (log/warn "Storage backend does not support RecursiveListableStore protocol")
           [])))))
 
 (defn start
