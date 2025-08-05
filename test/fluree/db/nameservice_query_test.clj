@@ -1,5 +1,7 @@
 (ns fluree.db.nameservice-query-test
   (:require [babashka.fs :refer [with-temp-dir]]
+            [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.json-ld.iri :as iri]))
@@ -131,3 +133,83 @@
           (let [file-ledger-result (filter #(= (first %) "file-ledger") result)]
             (is (= (count file-ledger-result) 1) "Should find file-ledger")))
         @(fluree/disconnect conn)))))
+
+(deftest nameservice-slash-ledger-names-test
+  (testing "Nameservice with ledger names containing '/' characters"
+    (with-temp-dir [storage-path {}]
+      (let [conn @(fluree/connect-file {:storage-path (str storage-path)})]
+        (try
+          ;; Create ledgers with '/' in their names
+          (testing "Create ledgers with slash in names"
+            @(fluree/create conn "tenant1/customers" {})
+            @(fluree/create conn "tenant1/products" {})
+            @(fluree/create conn "tenant2/orders" {})
+
+            ;; Insert some data
+            @(fluree/insert! conn "tenant1/customers"
+                             {"@context" {"test" "http://example.org/test#"}
+                              "@graph" [{"@id" "test:customer1"
+                                         "@type" "Customer"
+                                         "name" "ACME Corp"}]})
+
+            @(fluree/insert! conn "tenant1/products"
+                             {"@context" {"test" "http://example.org/test#"}
+                              "@graph" [{"@id" "test:product1"
+                                         "@type" "Product"
+                                         "name" "Widget"}]})
+
+            @(fluree/insert! conn "tenant2/orders"
+                             {"@context" {"test" "http://example.org/test#"}
+                              "@graph" [{"@id" "test:order1"
+                                         "@type" "Order"
+                                         "total" 100}]}))
+
+          (testing "Query all nameservice records with slash-named ledgers"
+            (let [query {"@context" {"f" iri/f-ns}
+                         "select" ["?ledger"]
+                         "where" [{"@id" "?ns"
+                                   "f:ledger" "?ledger"}]}
+                  result @(fluree/query-nameservice conn query {})]
+              ;; Should find all three ledgers with slashes
+              (is (>= (count result) 3) "Should find at least 3 ledgers")
+
+              ;; Check that we have the expected ledger names
+              (let [ledger-names (set (map first result))]
+                (is (contains? ledger-names "tenant1/customers") "Should find tenant1/customers")
+                (is (contains? ledger-names "tenant1/products") "Should find tenant1/products")
+                (is (contains? ledger-names "tenant2/orders") "Should find tenant2/orders"))))
+
+          (testing "Query specific tenant ledgers"
+            ;; Query for tenant1 ledgers by prefix
+            (let [query {"@context" {"f" iri/f-ns}
+                         "select" ["?ledger"]
+                         "where" [{"@id" "?ns"
+                                   "f:ledger" "?ledger"}]}
+                  all-results @(fluree/query-nameservice conn query {})
+                  ;; Filter for tenant1 ledgers
+                  tenant1-results (filter #(str/starts-with? (first %) "tenant1/") all-results)]
+              (is (= (count tenant1-results) 2) "Should find 2 tenant1 ledgers")
+
+              (let [ledger-names (set (map first tenant1-results))]
+                (is (= ledger-names #{"tenant1/customers" "tenant1/products"})
+                    "Should find only tenant1 ledgers"))))
+
+          (testing "Verify file system structure"
+            ;; Check that subdirectories were created correctly
+            (let [ns-dir (io/file (str storage-path) "ns@v1")
+                  tenant1-dir (io/file ns-dir "tenant1")
+                  tenant2-dir (io/file ns-dir "tenant2")]
+              (is (.exists ns-dir) "ns@v1 directory should exist")
+              (is (.exists tenant1-dir) "tenant1 subdirectory should exist")
+              (is (.exists tenant2-dir) "tenant2 subdirectory should exist")
+
+              ;; Check for nameservice files
+              (let [customer-file (io/file ns-dir "tenant1/customers@main.json")
+                    products-file (io/file ns-dir "tenant1/products@main.json")
+                    orders-file (io/file ns-dir "tenant2/orders@main.json")]
+                (is (.exists customer-file) "Customer nameservice file should exist")
+                (is (.exists products-file) "Products nameservice file should exist")
+                (is (.exists orders-file) "Orders nameservice file should exist"))))
+
+          (finally
+            @(fluree/disconnect conn)))))))

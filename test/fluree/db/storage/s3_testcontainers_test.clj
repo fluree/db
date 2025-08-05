@@ -10,6 +10,7 @@
    
    These tests can be included in a weekly CI/CD job using the :docker-tests alias."
   (:require [clojure.core.async :refer [<!!]]
+            [clojure.java.shell :as shell]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [fluree.db.api :as fluree]
             [fluree.db.storage.s3 :as s3]
@@ -133,6 +134,31 @@
                                                               "@type" "ex:Person"
                                                               "ex:name" "?name"}})]
                   (is (= results reload-results) "Reloaded data should match")
+
+                  ;; Check S3 object paths
+                  (let [store (s3/->S3Store nil (s3/get-credentials) bucket "us-east-1" "test")
+                        list-ch (s3/s3-list store "")
+                        objects-resp (<!! list-ch)
+                        object-keys (map :key (:contents objects-resp))]
+                    (println "\nBasic Test S3 Object Keys:")
+                    (doseq [key object-keys]
+                      (println "  " key))
+                    (println)
+
+                    ;; Check that paths don't have double slashes
+                    (is (not-any? #(re-find #"//" %) object-keys)
+                        "Paths should not contain double slashes")
+
+                    ;; Use AWS CLI to list bucket contents
+                    (println "\nAWS CLI S3 listing:")
+                    (let [aws-cmd (str "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test "
+                                       "aws --endpoint-url=" *s3-endpoint* " "
+                                       "s3 ls s3://" bucket "/ --recursive")
+                          result (shell/sh "sh" "-c" aws-cmd)]
+                      (println (:out result))
+                      (when-not (zero? (:exit result))
+                        (println "Error:" (:err result)))))
+
                   @(fluree/disconnect fresh-conn))))
 
             (finally
@@ -182,8 +208,29 @@
 
               (is (= [50] count-result) "Should have 50 persons")
               (is (pos? (count object-keys)) "Should have objects in S3")
+
+              ;; Print out the S3 object keys to verify path format
+              (println "\nS3 Object Keys:")
+              (doseq [key object-keys]
+                (println "  " key))
+              (println)
+
+              ;; Check that paths don't have double slashes
+              (is (not-any? #(re-find #"//" %) object-keys)
+                  "Paths should not contain double slashes")
+
               (is (some #(re-find #"index" %) object-keys)
-                  "Should have index files"))
+                  "Should have index files")
+
+              ;; Use AWS CLI to list bucket contents
+              (println "\nAWS CLI S3 listing for indexing test:")
+              (let [aws-cmd (str "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test "
+                                 "aws --endpoint-url=" *s3-endpoint* " "
+                                 "s3 ls s3://" bucket "/ --recursive")
+                    result (clojure.java.shell/sh "sh" "-c" aws-cmd)]
+                (println (:out result))
+                (when-not (zero? (:exit result))
+                  (println "Error:" (:err result)))))
 
             (finally
               @(fluree/disconnect conn))))))))
