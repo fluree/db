@@ -6,9 +6,9 @@
 (deftest subclass-test
   (testing "Subclass queries work."
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/subclass")
+          db0    @(fluree/create conn "query/subclass")
           db1    @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"insert"
                     {"@context"                  "https://schema.org"
                      "id"                        "https://www.wikidata.org/wiki/Q836821"
@@ -68,8 +68,7 @@
   (testing "issue core/48"
     (let [conn        (test-utils/create-conn)
           ledger-name "subclass-inferencing-test"
-          ledger      @(fluree/create conn ledger-name)
-          db0         (fluree/db ledger)
+          db0         @(fluree/create conn ledger-name)
           context     test-utils/default-str-context
           db1         @(fluree/update
                         db0
@@ -117,8 +116,7 @@
   (testing "issue core/48"
     (let [conn        (test-utils/create-conn)
           ledger-name "subclass-inferencing-test"
-          ledger      @(fluree/create conn ledger-name)
-          db0         (fluree/db ledger)
+          db0         @(fluree/create conn ledger-name)
           context     test-utils/default-str-context
           db1         @(fluree/update
                         db0
@@ -146,8 +144,8 @@
                            "rdfs:subClassOf" {"@id" "ex:Humanoid"}}
                           {"@id"             "schema:Person"
                            "rdfs:subClassOf" {"@id" "ex:Humanoid"}}]})
-          _db3        @(fluree/commit! ledger db2)
-          db4         (-> conn (test-utils/retry-load ledger-name 100) fluree/db)]
+          _db3        @(fluree/commit! conn ledger-name db2)
+          db4         (test-utils/retry-load conn ledger-name 100)]
       (is (= #{{"id"          "ex:freddy"
                 "type"        "ex:Yeti"
                 "schema:name" "Freddy"}
@@ -168,8 +166,7 @@
   (testing "Multiple subClassOf dependencies which rely on each other staged independently"
     (let [conn        (test-utils/create-conn)
           ledger-name "subclass-nested-stage-test"
-          ledger      @(fluree/create conn ledger-name)
-          db0         (fluree/db ledger)
+          db0         @(fluree/create conn ledger-name)
           db1         @(fluree/update
                         db0
                         {"@context" {"ex" "http://example.org/"}

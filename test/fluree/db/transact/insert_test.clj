@@ -6,9 +6,9 @@
 (deftest ^:integration insert-data
   (testing "Inserting data into a ledger"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "tx/insert")
+          db0 @(fluree/create conn "tx/insert")
           db     @(fluree/insert
-                   (fluree/db ledger)
+                   db0
                    {"@context" {"ex" "http://example.org/ns/"
                                 "schema" "http://schema.org/"}
                     "@graph"   [{"id"         "ex:alice",
@@ -29,9 +29,9 @@
 
   (testing "Inserting data into a ledger using EDN keywords"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "tx/insert-edn-keywords")
+          db0 @(fluree/create conn "tx/insert-edn-keywords")
           db     @(fluree/insert
-                   (fluree/db ledger)
+                   db0
                    {:context [test-utils/default-context
                               {:ex "http://example.org/ns/"}]
                     :graph   [{:id          :ex/alice,
@@ -52,8 +52,8 @@
 
   (testing "Insert and commit data"
     (let [conn    @(fluree/connect-memory)
-          _ledger @(fluree/create-with-txn conn {"ledger" "tx/insert"
-                                                 "insert" {"@id" "ex:foo" "ex:bar" 3}})
+          _db0 @(fluree/create-with-txn conn {"ledger" "tx/insert"
+                                              "insert" {"@id" "ex:foo" "ex:bar" 3}})
           db     @(fluree/insert!
                    conn
                    "tx/insert"

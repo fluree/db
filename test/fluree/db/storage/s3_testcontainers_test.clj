@@ -91,11 +91,11 @@
 
             ;; Test ledger creation
             (let [ledger-id "testcontainers-test"
-                  ledger @(fluree/create conn ledger-id)]
-              (is (some? ledger) "Ledger should be created")
+                  db0 @(fluree/create conn ledger-id)]
+              (is (some? db0) "Ledger should be created")
 
               ;; Test basic operations
-              (let [db @(fluree/update (fluree/db ledger)
+              (let [db @(fluree/update db0
                                        {"@context" {"ex" "http://example.org/ns/"}
                                         "insert" [{"@id" "ex:alice"
                                                    "@type" "ex:Person"
@@ -105,7 +105,7 @@
                                                    "ex:name" "Bob"}]})
 
                     ;; Commit the data
-                    committed-db @(fluree/commit! ledger db)
+                    committed-db @(fluree/commit! conn ledger-id db)
                     ;; Query the data
                     results @(fluree/query committed-db
                                            {"@context" {"ex" "http://example.org/ns/"}
@@ -182,10 +182,10 @@
                                                               :reindex-max-bytes 10000}}})]
           (try
             (let [ledger-id "indexing-test"
-                  ledger @(fluree/create conn ledger-id)
+                  db0 @(fluree/create conn ledger-id)
 
                   ;; Add enough data to trigger indexing
-                  db1 @(fluree/update (fluree/db ledger)
+                  db1 @(fluree/update db0
                                       {"@context" {"ex" "http://example.org/ns/"}
                                        "insert" (for [i (range 50)]
                                                   {"@id" (str "ex:person" i)
@@ -194,7 +194,7 @@
                                                    "ex:age" i})})
 
                   ;; Commit to trigger indexing and query to verify data
-                  db2 @(fluree/commit! ledger db1)
+                  db2 @(fluree/commit! conn ledger-id db1)
                   count-result @(fluree/query db2
                                               {"@context" {"ex" "http://example.org/ns/"}
                                                "select" "(count ?s)"

@@ -41,8 +41,8 @@
 (deftest ^:integration equality-tests
   (testing "owl equality semantics tests eq-sym and eq-trans"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base @(fluree/update db0
                                   {"@context" {"ex" "http://example.org/"}
                                    "insert"   [{"@id"        "ex:carol"
                                                 "ex:zipCode" 60657}
@@ -87,7 +87,7 @@
 
       (testing "Testing owl:sameAs transitivity (eq-trans)"
         (let [ledger      @(fluree/create conn "reasoner/eq-trans" nil)
-              db-same     @(fluree/update (fluree/db ledger)
+              db-same     @(fluree/update db0
                                           {"@context" {"ex"   "http://example.org/"
                                                        "owl"  "http://www.w3.org/2002/07/owl#"
                                                        "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
@@ -123,7 +123,7 @@
       ;; and for now eq-rep-p is not supported. It would act like owl:equivalentProperty
       (testing "Testing owl:sameAs (eq-rep-s, eq-rep-o)"
         (let [ledger        @(fluree/create conn "reasoner/eq-rep" nil)
-              db-same       @(fluree/update (fluree/db ledger)
+              db-same       @(fluree/update db0
                                             {"@context" {"ex"   "http://example.org/"
                                                          "owl"  "http://www.w3.org/2002/07/owl#"
                                                          "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
@@ -190,8 +190,8 @@
 (deftest ^:integration domain-and-range
   (testing "rdfs:domain and rdfs:range tests"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base @(fluree/update (fluree/db ledger) reasoning-db-data)]
+          db0 @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base @(fluree/update db0 reasoning-db-data)]
 
       (testing "Testing rdfs:domain - rule: prp-dom"
         (let [db-prp-dom @(fluree/reason
@@ -286,8 +286,8 @@
 (deftest ^:integration functional-properties
   (testing "owl:FunctionalProperty tests"
     (let [conn        (test-utils/create-conn)
-          ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base     @(fluree/update db0
                                       {"@context" {"ex" "http://example.org/"}
                                        "insert"   [{"@id"       "ex:brian"
                                                     "ex:mother" [{"@id" "ex:carol"} {"@id" "ex:carol2"}]}
@@ -343,8 +343,8 @@
 (deftest ^:integration inverse-functional-properties
   (testing "owl:InverseFunctionalProperty tests"
     (let [conn        (test-utils/create-conn)
-          ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base     @(fluree/update db0
                                       {"@context" {"ex" "http://example.org/"}
                                        "insert"   [{"@id"      "ex:brian"
                                                     "ex:email" "brian@example.org"}
@@ -384,8 +384,8 @@
 (deftest ^:integration symetric-properties
   (testing "owl:SymetricProperty tests"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base @(fluree/update (fluree/db ledger) reasoning-db-data)]
+          db0 @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base @(fluree/update db0 reasoning-db-data)]
 
       (testing "Testing owl:SymetricProperty - rule: prp-symp"
         (let [db-livesWith @(fluree/update db-base
@@ -414,8 +414,8 @@
 (deftest ^:integration transitive-properties
   (testing "owl:TransitiveProperty tests  - rule: prp-trp"
     (let [conn         (test-utils/create-conn)
-          ledger       @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base      @(fluree/update (fluree/db ledger) reasoning-db-data)
+          db0 @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base      @(fluree/update db0 reasoning-db-data)
           db-livesWith @(fluree/update db-base
                                        {"@context" {"ex"   "http://example.org/"
                                                     "owl"  "http://www.w3.org/2002/07/owl#"
@@ -447,8 +447,8 @@
 (deftest ^:integration owl2rl-rdfs-subPropertyOf
   (testing "rdfs:subPropertyOf tests  - rule: prp-spo1"
     (let [conn        (test-utils/create-conn)
-          ledger      @(fluree/create conn "reasoner/owl2rl-rdfs-subPropertyOf" nil)
-          db-base     @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/owl2rl-rdfs-subPropertyOf" nil)
+          db-base     @(fluree/update db0
                                       {"@context" {"ex" "http://example.org/"}
                                        "insert"   [{"@id"       "ex:bob"
                                                     "ex:mother" {"@id" "ex:alice-mom"}
@@ -480,8 +480,8 @@
 (deftest ^:integration prop-chain-axiom
   (testing "owl:propertyChainAxiom tests  - rule: prp-spo2"
     (let [conn        (test-utils/create-conn)
-          ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base     @(fluree/update db0
                                       {"@context" {"ex" "http://example.org/"}
                                        "insert"   [{"@id"       "ex:person-a"
                                                     "ex:parents" [{"@id" "ex:mom"} {"@id" "ex:dad"}]}
@@ -533,8 +533,8 @@
 (deftest ^:integration inverseOf-properties
   (testing "owl:inverseOf tests"
     (let [conn        (test-utils/create-conn)
-          ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base     @(fluree/update db0
                                       {"@context" {"ex" "http://example.org/"}
                                        "insert"   [{"@id"       "ex:son"
                                                     "ex:parents" [{"@id" "ex:mom"} {"@id" "ex:dad"}]}
@@ -578,8 +578,8 @@
 (deftest ^:integration hasKey-properties
   (testing "owl:hasKey tests"
     (let [conn        (test-utils/create-conn)
-          ledger      @(fluree/create conn "reasoner/basic-owl" nil)
-          db-base     @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/basic-owl" nil)
+          db-base     @(fluree/update db0
                                       {"@context" {"ex" "http://example.org/"}
                                        "insert"   [{"@id"                "ex:brian"
                                                     "@type"              ["ex:RegisteredPatient"]

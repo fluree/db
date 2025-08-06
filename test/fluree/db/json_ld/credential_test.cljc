@@ -171,7 +171,7 @@
 
            db2 @(fluree/credential-update! conn (async/<!! (cred/generate mdfn (:private auth))))
 
-           ledger @(fluree/load conn ledger-id)
+           db0 @(fluree/load conn ledger-id)
 
            query {"@context" context
                   "select"   {(:id auth) ["*"]}}]
@@ -193,7 +193,7 @@
 
        (is (= []
               @(fluree/credential-query
-                (fluree/db ledger)
+                db0
                 (async/<!! (cred/generate query (:private pleb-auth)))))
            "query credential w/ policy forbidding access")
 
@@ -225,7 +225,7 @@
                 "f:assert"  [{"ct:name" "D", "ct:favnums" [4 5 6], "id" (:id auth)}],
                 "f:retract" [{"ct:name" "Daniel", "ct:favnums" 1, "id" (:id auth)}]}]
               @(fluree/credential-history
-                ledger
+                conn ledger-id
                 (async/<!! (cred/generate {:context context
                                            :history (:id auth)
                                            :t       {:from 1}}
@@ -233,7 +233,7 @@
            "history query credential - allowing access")
        (is (= []
               @(fluree/credential-history
-                ledger
+                conn ledger-id
                 (async/<!! (cred/generate {:history (:id auth)
                                            :t       {:from 1}}
                                           (:private pleb-auth)))))
@@ -252,7 +252,7 @@
 
          (is (= []
                 @(fluree/credential-query
-                  (fluree/db ledger)
+                  db0
                   (crypto/create-jws sparql (:private pleb-auth) {:include-pubkey true})
                   {:format :sparql}))
              "SPARQL query credential - forbidding access")

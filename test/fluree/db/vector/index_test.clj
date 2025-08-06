@@ -8,9 +8,9 @@
 (deftest ^:integration vector-index-search
   (testing "Some vectors on a property can be flat-rank scored"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "vector-search")
+          db0 @(fluree/create conn "vector-search")
           db     @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
                     [{"@id"     "ex:homer"
@@ -84,9 +84,9 @@
 (deftest ^:integration vector-index-search-extra
   (testing "Vector results can join with additional properties"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "vector-search-add-props")
+          db0 @(fluree/create conn "vector-search-add-props")
           db     @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
                     [{"@id"      "ex:homer"
@@ -124,9 +124,9 @@
 (deftest ^:integration vector-index-multi-bindings
   (testing "Initial 'solutions' before the search call will produce multiple search results"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "vector-search-bindings")
+          db0 @(fluree/create conn "vector-search-bindings")
           db     @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
                     [{"@id"     "ex:homer"

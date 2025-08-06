@@ -14,8 +14,8 @@
 (deftest ^:integration deleting-data
   (testing "Deletions of entire subjects."
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "tx/delete")
-          db     @(fluree/update (fluree/db ledger)
+          db0    @(fluree/create conn "tx/delete")
+          db     @(fluree/update db0
                                  {"@context" [test-utils/default-context
                                               {:ex "http://example.org/ns/"}]
                                   "insert"
@@ -159,8 +159,7 @@
 
 (deftest transaction-functions
   (let [conn   @(fluree/connect-memory)
-        ledger @(fluree/create conn "functions")
-        db1    (fluree/db ledger)]
+        db1    @(fluree/create conn "functions")]
 
     (testing "hash functions"
       (with-redefs [eval/now const-now]
@@ -547,7 +546,7 @@
 (deftest ^:integration subject-object-scan-deletions
   (let [conn      @(fluree/connect-memory)
         ledger-id "test/love"
-        ledger    @(fluree/create conn ledger-id)
+        db0       @(fluree/create conn ledger-id)
         context   {"id"     "@id",
                    "type"   "@type",
                    "ex"     "http://example.org/",
@@ -556,7 +555,7 @@
                    "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
                    "schema" "http://schema.org/",
                    "xsd"    "http://www.w3.org/2001/XMLSchema#"}
-        love      @(fluree/update (fluree/db ledger)
+        love      @(fluree/update db0
                                   {"@context" context
                                    "insert"
                                    [{"@id"                "ex:fluree",
@@ -569,7 +568,7 @@
                                      "@type"              "ex:Monster",
                                      "schema:description" "We ❤️ Human Blood"}]}
                                   {})
-        db1       @(fluree/commit! ledger love)]
+        db1       @(fluree/commit! conn ledger-id love)]
     (testing "before deletion"
       (let [q       {:context context
                      :select  '[?s ?p ?o]
@@ -592,7 +591,7 @@
                                      "schema:description" ?o
                                      ?p                   ?o}
                         "delete"   '{"id" "?s", "?p" "?o"}})
-      (let [db2     (fluree/db @(fluree/load conn ledger-id))
+      (let [db2     @(fluree/load conn ledger-id)
             q       {:context context
                      :select '[?s ?p ?o]
                      :where  '{"id"                 ?s
@@ -607,8 +606,7 @@
   (testing "issue https://github.com/fluree/core/issues/49 stays fixed"
     (let [conn        (test-utils/create-conn)
           ledger-name "rando-txn"
-          ledger      @(fluree/create conn "rando-txn")
-          db0         (fluree/db ledger)
+          db0         @(fluree/create conn "rando-txn")
           db1         @(fluree/update
                         db0
                         {"@context" test-utils/default-str-context
@@ -642,8 +640,7 @@
 (deftest ^:integration updates-only-on-existence
   (testing "Updating data with iri values bindings"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "update-without-insert")
-          db0    (fluree/db ledger)
+          db0    @(fluree/create conn "update-without-insert")
           db1    @(fluree/update db0
                                  {"@context" [test-utils/default-context
                                               {:ex "http://example.org/ns/"}]

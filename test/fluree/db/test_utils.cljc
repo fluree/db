@@ -154,28 +154,32 @@
 
 (defn load-movies
   [conn]
-  (let [ledger @(fluree/create conn "test/movies")]
-    (doseq [movie movies]
-      (let [staged @(fluree/update (fluree/db ledger) {"@context" default-str-context
-                                                       "insert" movie})]
-        @(fluree/commit! ledger staged
-                         {:message (str "Commit " (get movie "name"))
-                          :push?   true})))
-    ledger))
+  (let [ledger-id "test/movies"
+        db0       @(fluree/create conn ledger-id)]
+    (loop [db db0
+           [movie & rest] movies]
+      (if movie
+        (let [staged @(fluree/update db {"@context" default-str-context
+                                         "insert" movie})
+              committed @(fluree/commit! conn ledger-id staged
+                                         {:message (str "Commit " (get movie "name"))
+                                          :push?   true})]
+          (recur committed rest))
+        db))))
 
 (defn load-people
   [conn]
   (#?(:clj do, :cljs go)
-    (let [ledger-p (fluree/create conn "test/people")
-          ledger   #?(:clj @ledger-p :cljs (<p! ledger-p))
-          staged-p (fluree/update (fluree/db ledger) {"@context" [default-context
-                                                                  {:ex "http://example.org/ns/"}]
-                                                      "insert" people})
+    (let [ledger-id "test/people"
+          db0      #?(:clj @(fluree/create conn ledger-id) :cljs (<p! (fluree/create conn ledger-id)))
+          staged-p (fluree/update db0 {"@context" [default-context
+                                                   {:ex "http://example.org/ns/"}]
+                                       "insert" people})
           staged   #?(:clj @staged-p, :cljs (<p! staged-p))
-          commit-p (fluree/commit! ledger staged {:message "Adding people"
-                                                  :push? true})]
+          commit-p (fluree/commit! conn ledger-id staged {:message "Adding people"
+                                                          :push? true})]
       #?(:clj @commit-p, :cljs (<p! commit-p))
-      ledger)))
+      ledger-id)))
 
 (defn retry-promise-wrapped
   "Retries a fn that when deref'd might return a Throwable. Intended for
@@ -207,16 +211,16 @@
   (retry-promise-wrapped #(fluree/load conn ledger-alias) max-attempts))
 
 (defn load-to-t
-  "Retries loading a ledger until it gets a db whose t value is equal to or
+  "Retries loading until it gets a db whose t value is equal to or
   greater than the given t arg or max-attempts is reached."
   [conn ledger-alias t max-attempts]
   (let [attempts-per-batch (/ max-attempts 10)]
     (loop [attempts-left (- max-attempts attempts-per-batch)]
-      (let [ledger (retry-load conn ledger-alias attempts-per-batch)
-            db-t   (-> ledger fluree/db :t)]
+      (let [db (retry-load conn ledger-alias attempts-per-batch)
+            db-t   (-> db :t)]
         (if (and (< db-t t) (pos-int? attempts-left))
           (recur (- attempts-left attempts-per-batch))
-          ledger)))))
+          db)))))
 
 (defn retry-exists?
   "Retry calling exists? until it returns true or max-attempts."
