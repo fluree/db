@@ -929,7 +929,7 @@
                                                       "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
                                                       "f:query"  {"@type"  "@json"
                                                                   "@value" {}}}]})
-                    (fluree/commit! conn ledger-name)
+                    (fluree/commit! conn)
                     (deref))
 
           _db3 @(fluree/credential-update! conn (crypto/create-jws
@@ -992,7 +992,7 @@
                                                       "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
                                                       "f:query"  {"@type"  "@json"
                                                                   "@value" {}}}]})
-                    (fluree/commit! conn ledger-name)
+                    (fluree/commit! conn)
                     (deref))
 
           jws1 (crypto/create-jws
@@ -1307,7 +1307,7 @@
                                                          "@type"       "ex:Yeti"
                                                          "schema:name" "Betty"
                                                          "schema:age"  55}]})
-                       (fluree/commit! conn ledger-name)
+                       (fluree/commit! conn)
                        (deref))
 
               db2 (->> @(fluree/update db1 {"@context" context
@@ -1316,7 +1316,7 @@
                                                          "schema:name" "Freddy"
                                                          "schema:age"  1002}]}
                                        {:annotation {"ex:originator" "opts" "ex:data" "ok"}})
-                       (fluree/commit! conn ledger-name)
+                       (fluree/commit! conn)
                        (deref))
 
               _db3 (->> @(fluree/update db2 {"@context" context
@@ -1325,7 +1325,7 @@
                                                           "schema:name" "Leticia"
                                                           "schema:age"  38}]}
                                         {:annotation {"ex:originator" "txn" "ex:data" "ok"}})
-                        (fluree/commit! conn ledger-name)
+                        (fluree/commit! conn)
                         (deref))]
           (testing "annotations in commit-details"
             (is (pred-match? [{}

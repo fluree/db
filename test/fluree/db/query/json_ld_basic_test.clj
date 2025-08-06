@@ -381,7 +381,7 @@
                                     "ex:name" "Foo"}
                                    {"id"      "foaf:bar"
                                     "ex:name" "Bar"}]})
-          _      @(fluree/commit! conn alias db0)
+          _      @(fluree/commit! conn db0)
           db1    @(fluree/load conn alias)]
 
       (is (= [["foaf:bar" "Bar"] ["foo" "Foo"]]

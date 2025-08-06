@@ -488,7 +488,7 @@
                                    {:id      :ex/bart
                                     :ex/name "Bart"
                                     :ex/age  "forever 10"}]})
-          db1*   @(fluree/commit! conn "people" db1)
+          db1*   @(fluree/commit! conn db1)
           db2    @(fluree/update db1* {"@context" [test-utils/default-context
                                                    {:ex    "http://example.org/ns/"
                                                     :value "@value"
@@ -499,7 +499,7 @@
                                         {:id            :ex/bart
                                          :ex/dad        {:id :ex/homer}
                                          :ex/occupation "Getting into mischief"}]})
-          db2*   @(fluree/commit! conn "people" db2)
+          db2*   @(fluree/commit! conn db2)
           db3    @(fluree/update db2* {"@context" [test-utils/default-context
                                                    {:ex    "http://example.org/ns/"
                                                     :value "@value"
@@ -509,7 +509,7 @@
                                          :ex/son {:id :ex/bart}}
                                         {:id     :ex/bart
                                          :ex/mom {:id :ex/marge}}]})
-          db3*   @(fluree/commit! conn "people" db3)]
+          db3*   @(fluree/commit! conn db3)]
       (testing "using a specific t"
         (let [query   {:context [test-utils/default-context
                                  {:ex    "http://example.org/ns/"

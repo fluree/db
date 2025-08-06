@@ -78,8 +78,8 @@
                                   {:id               :ex/brian
                                    :ex/favCoffeeShop [:wiki/Q37158
                                                       "Clemmons Coffee"]}})
-          _db    @(fluree/commit! conn "tx/mixed-dts" db)
-          loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
+          db-c   @(fluree/commit! conn db)
+          loaded (test-utils/retry-load conn (:alias db-c) 100)
           db     loaded
           query  {:context [test-utils/default-context
                             {:ex "http://example.org/ns/"}]
@@ -98,8 +98,8 @@
                                   {:id :ex/wes
                                    :ex/aFewOfMyFavoriteThings
                                    {"@list" [2011 "jabalí"]}}})
-          _db    @(fluree/commit! conn "tx/mixed-dts" db)
-          loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
+          db-c   @(fluree/commit! conn db)
+          loaded (test-utils/retry-load conn (:alias db-c) 100)
           db     loaded
           query  {:context [test-utils/default-context
                             {:ex "http://example.org/ns/"}]
@@ -118,8 +118,8 @@
                                   {:id               :ex/brian
                                    :ex/favCoffeeShop [:wiki/Q37158
                                                       "Clemmons Coffee"]}})
-          _db    @(fluree/commit! conn "tx/mixed-dts" db)
-          loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
+          db-c   @(fluree/commit! conn db)
+          loaded (test-utils/retry-load conn (:alias db-c) 100)
           db     loaded
           query  {:context [test-utils/default-context
                             {:ex "http://example.org/ns/"}]
@@ -138,8 +138,8 @@
                                   {:id :ex/wes
                                    :ex/aFewOfMyFavoriteThings
                                    {"@list" [2011 "jabalí"]}}})
-          _db    @(fluree/commit! conn "tx/mixed-dts" db)
-          loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
+          db-c   @(fluree/commit! conn db)
+          loaded (test-utils/retry-load conn (:alias db-c) 100)
           db     loaded
           query  {:context [test-utils/default-context
                             {:ex "http://example.org/ns/"}]
@@ -242,7 +242,7 @@
                                                     {"ex" "https://example.com/"}]
                                         "insert"   shacl})
             _       (assert (not (util/exception? db0)))
-            db1     @(fluree/commit! conn "movies2" db0)
+            db1     @(fluree/commit! conn db0)
             _       (assert (not (util/exception? db1)))
             db2     @(fluree/update db0 {"@context" [test-utils/default-str-context
                                                      {"ex"        "https://example.com/"
@@ -272,7 +272,7 @@
                                      "insert"
                                      {:id   :ex/firstTransaction
                                       :type :ex/Nothing}})
-        _           @(fluree/commit! conn ledger-name db)
+        _           @(fluree/commit! conn db)
         user-query  {:context [context {:ex "http://example.org/ns/"}]
                      :select  '{?s [:*]}
                      :where   '{:id ?s, :type :ex/User}}]
@@ -503,7 +503,7 @@
                                              "schema:name" "Freddy",
                                              "schema:age"  8}})
 
-        _      @(fluree/commit! conn "sh-datatype" db2)
+        _      @(fluree/commit! conn db2)
         loaded @(fluree/load conn ledger-id)
 
         db3 @(fluree/update loaded {"@context" context,

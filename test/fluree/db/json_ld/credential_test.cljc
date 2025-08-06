@@ -120,7 +120,7 @@
            ledger-id "credentialtest"
            context   (merge test-utils/default-str-context
                             {"ct" "ledger:credentialtest/"})
-           db0       @(fluree/create-with-txn conn {"@context" context
+           _         @(fluree/create-with-txn conn {"@context" context
                                                     "ledger"   ledger-id
                                                     "insert"   {"@id" "ct:open" "ct:foo" "bar"}})
 

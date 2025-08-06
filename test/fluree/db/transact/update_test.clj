@@ -568,7 +568,7 @@
                                      "@type"              "ex:Monster",
                                      "schema:description" "We ❤️ Human Blood"}]}
                                   {})
-        db1       @(fluree/commit! conn ledger-id love)]
+        db1       @(fluree/commit! conn love)]
     (testing "before deletion"
       (let [q       {:context context
                      :select  '[?s ?p ?o]

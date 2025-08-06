@@ -24,7 +24,7 @@
                                 "ex:age"   25}]}
           updated-db @(fluree/update db0 txn)
           ;; Commit with metadata to test enhanced response
-          result  @(fluree/commit! conn "test-indexing" updated-db {:meta true})]
+          result  @(fluree/commit! conn updated-db {:meta true})]
 
       (testing "Trigger index API can be called"
         ;; Just test that the API can be called without errors
@@ -60,7 +60,7 @@
                                 "ex:email" (str "person" i "@example.com")
                                 "ex:description" (str "This is person number " i " with some additional text to increase data size")}]}
               updated @(fluree/update @(fluree/db conn "test-blocking-index") txn)]
-          @(fluree/commit! conn "test-blocking-index" updated)))
+          @(fluree/commit! conn updated)))
 
       ;; Get initial state
       (let [initial-db @(fluree/db conn "test-blocking-index")
@@ -110,7 +110,7 @@
                                 "ex:email" (str "person" i "@example.com")
                                 "ex:description" (apply str (repeat 100 (str "Text for person " i " ")))}]}
               db  @(fluree/update @(fluree/db conn "test-no-auto-index") txn)]
-          @(fluree/commit! conn "test-no-auto-index" db)))
+          @(fluree/commit! conn db)))
 
       (testing "No automatic indexing occurred"
         (let [final-db @(fluree/db conn "test-no-auto-index")
@@ -135,7 +135,7 @@
                                 "ex:name"  (str "Person " i)
                                 "ex:age"   (+ 20 i)}]}
               db  @(fluree/update @(fluree/db conn "test-branch-update") txn)]
-          @(fluree/commit! conn "test-branch-update" db)))
+          @(fluree/commit! conn db)))
 
       (testing "Before indexing"
         (let [db-before @(fluree/db conn "test-branch-update")]
@@ -175,7 +175,7 @@
                                   "ex:name"  (str "Person " i)
                                   "ex:age"   (+ 20 i)}]}
                 db  @(fluree/update @(fluree/db conn "test-file-indexing") txn)]
-            @(fluree/commit! conn "test-file-indexing" db)))
+            @(fluree/commit! conn db)))
 
         (testing "Before indexing"
           (let [db-before @(fluree/db conn "test-file-indexing")]

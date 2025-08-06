@@ -455,7 +455,7 @@
                                                                            "ex:author" "?author"}]
                                                               "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
 
-              db2-c           @(fluree/commit! conn ledger-name db2)
+              db2-c           @(fluree/commit! conn db2)
               _               (Thread/sleep 1000) ;; wait for index to complete and write new NS record - ideally replace with a force load
               db2-l           (db-with-index {:storage-path (str storage-path)} ledger-name)
               expected-result [["ex:hobby-article" 0.741011563872269 "This is an article about hobbies"]
@@ -504,7 +504,7 @@
                                                                            "ex:author" "?author"}]
                                                               "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
 
-              db2-c           @(fluree/commit! conn ledger-name db2)
+              db2-c           @(fluree/commit! conn db2)
               conn2           @(fluree/connect-file {:storage-path (str storage-path)})
               loaded          @(fluree/load conn2 ledger-name)
               db2-l           loaded

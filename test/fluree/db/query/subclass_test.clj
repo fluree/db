@@ -144,7 +144,7 @@
                            "rdfs:subClassOf" {"@id" "ex:Humanoid"}}
                           {"@id"             "schema:Person"
                            "rdfs:subClassOf" {"@id" "ex:Humanoid"}}]})
-          _db3        @(fluree/commit! conn ledger-name db2)
+          _db3        @(fluree/commit! conn db2)
           db4         (test-utils/retry-load conn ledger-name 100)]
       (is (= #{{"id"          "ex:freddy"
                 "type"        "ex:Yeti"

@@ -12,9 +12,8 @@
         db           @(fluree/update @(fluree/db conn ledger-alias) {"@context" [test-utils/default-context
                                                                                  {:ex "http://example.org/ns/"}]
                                                                      "insert"   [{:id :ex/dan :ex/x 1}
-                                                                                 {:id :ex/wes :ex/x 2}]})]
-
-    @(fluree/commit! conn ledger-alias db)
+                                                                                 {:id :ex/wes :ex/x 2}]})
+        db           @(fluree/commit! conn db)]
 
     (testing "current query"
       (is (= [{:id   :ex/dan
@@ -167,7 +166,7 @@
                                   :select  {'?s ["*"]}
                                   :where   {:id '?s, '?p '?o}}))
             "Every triple should be returned.")
-        (let [db*    @(fluree/commit! conn "query/everything" db)
+        (let [db*    @(fluree/commit! conn db)
               result @(fluree/query db* {:context [test-utils/default-context
                                                    {:ex "http://example.org/ns/"}]
                                          :select  ['?s '?p '?o]
@@ -368,7 +367,7 @@
           tx     {"insert" {"@id" "ex:1" "ex:foo" 30}}
           db1    @(fluree/update db0 tx)
           ;; advance the `t`
-          db2    @(fluree/commit! conn "dup-flakes" db1)
+          db2    @(fluree/commit! conn db1)
           db3    @(fluree/update db2 tx)]
       (testing "do not become multicardinal result values"
         (is (= [{"ex:foo" 30, "@id" "ex:1"}]

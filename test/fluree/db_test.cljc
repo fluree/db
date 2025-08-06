@@ -43,7 +43,7 @@
                                            [{:id           :f/me
                                              :type         :schema/Person
                                              :schema/fname "Me"}]})]
-         @(fluree/commit! conn ledger-alias db)
+         @(fluree/commit! conn db)
          (is (test-utils/retry-exists? conn ledger-alias 100))
          (is (not @(fluree/exists? conn "notaledger"))))
 
@@ -60,7 +60,7 @@
                                                         [{:id           :f/me
                                                           :type         :schema/Person
                                                           :schema/fname "Me"}]}))]
-                  (<p! (fluree/commit! conn ledger-alias db))
+                  (<p! (fluree/commit! conn db))
                   (is (test-utils/retry-exists? conn ledger-alias 100))
                   (is (not (<p! (fluree/exists? conn "notaledger"))))
                   (done)))))))
@@ -93,7 +93,7 @@
                                  :schema/age   34
                                  :ex/favNums   5
                                  :ex/friend    :ex/brian}]})
-               db        @(fluree/commit! conn ledger-alias db)
+               db        @(fluree/commit! conn db)
                db        @(fluree/update
                            db
                            {"@context" ["https://ns.flur.ee"
@@ -102,7 +102,7 @@
                             "insert"
                             {:id         :ex/brian
                              :ex/favNums 7}})
-               db        @(fluree/commit! conn ledger-alias db)
+               db        @(fluree/commit! conn db)
                target-t  (:t db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
                loaded-db (test-utils/load-to-t conn ledger-alias target-t 100)]
@@ -140,7 +140,7 @@
                                  :schema/age   34
                                  :ex/favNums   [5 10]
                                  :ex/friend    [:ex/brian :ex/alice]}]})
-               db        @(fluree/commit! conn ledger-alias db)
+               db        @(fluree/commit! conn db)
                db        @(fluree/update
                            db
                            ;; test a multi-cardinality retraction
@@ -150,7 +150,7 @@
                             "insert"
                             [{:id         :ex/alice
                               :ex/favNums [42 76 9]}]})
-               db        @(fluree/commit! conn ledger-alias db)
+               db        @(fluree/commit! conn db)
                target-t  (:t db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
                loaded-db (test-utils/load-to-t conn ledger-alias target-t 100)]
@@ -178,7 +178,7 @@
                query        {:context {:ex "http://example.com/"}
                              :select  {:ex/Andrew [:*]}}
                res1         @(fluree/query db query)
-               _            @(fluree/commit! conn ledger-alias db)
+               _            @(fluree/commit! conn db)
                loaded-db    (test-utils/retry-load conn ledger-alias 100)
                res2         @(fluree/query loaded-db query)]
            (is (= res1 res2)))))
@@ -203,7 +203,7 @@
                                  :ex/numList {:list [7 8 9 10]}}
                                 {:id   :ex/john,
                                  :type :ex/User}]})
-               db           @(fluree/commit! conn ledger-alias db)
+               db           @(fluree/commit! conn db)
                target-t     (:t db)
                loaded-db    (test-utils/load-to-t conn ledger-alias target-t 100)]
            (is (= target-t (:t loaded-db)))
@@ -264,7 +264,7 @@
                                        :f/action     [:f/view]
                                        :f/equals
                                        {:list [:f/$identity :ex/user]}}]}]}]})
-                 db+policy    @(fluree/commit! conn ledger-alias db+policy)
+                 db+policy    @(fluree/commit! conn db+policy)
                  target-t     (:t db+policy)
                  loaded-db    (test-utils/load-to-t conn ledger-alias target-t
                                                     100)]
@@ -319,7 +319,7 @@
                                                  "@value" "12:42:00Z"}
                            "ex:localTime"       {"@type"  "xsd:time"
                                                  "@value" "12:42:00"}}]})
-               _db-commit @(fluree/commit! conn ledger-alias db)
+               _db-commit @(fluree/commit! conn db)
                loaded     (test-utils/retry-load conn ledger-alias 100)
                q          {"@context" [test-utils/default-str-context
                                        {"ex" "http://example.org/ns/"}]
@@ -354,7 +354,7 @@
                                :schema/age   34
                                :ex/favNums   5
                                :ex/friend    :ex/brian}]})
-             db        @(fluree/commit! conn ledger-alias db)
+             db        @(fluree/commit! conn db)
              db        @(fluree/update
                          db
                          {"@context" ["https://ns.flur.ee"
@@ -363,7 +363,7 @@
                           "insert"
                           {:id         :ex/brian
                            :ex/favNums 7}})
-             db        @(fluree/commit! conn ledger-alias db)
+             db        @(fluree/commit! conn db)
              target-t  (:t db)
              ;; TODO: Replace this w/ :syncTo equivalent once we have it
              loaded-db (test-utils/load-to-t conn ledger-alias target-t 100)]
@@ -400,7 +400,7 @@
                                :schema/age   34
                                :ex/favNums   [5 10]
                                :ex/friend    [:ex/brian :ex/alice]}]})
-             db        @(fluree/commit! conn ledger-alias db)
+             db        @(fluree/commit! conn db)
              db        @(fluree/update
                          db
                          ;; test a multi-cardinality retraction
@@ -410,7 +410,7 @@
                           "insert"
                           [{:id         :ex/alice
                             :ex/favNums [42 76 9]}]})
-             db        @(fluree/commit! conn ledger-alias db)
+             db        @(fluree/commit! conn db)
              target-t  (:t db)
              ;; TODO: Replace this w/ :syncTo equivalent once we have it
              loaded-db (test-utils/load-to-t conn ledger-alias target-t 100)]
@@ -437,7 +437,7 @@
              query        {:context {:ex "http://example.com/"}
                            :select  '{:ex/Andrew [:*]}}
              res1         @(fluree/query db query)
-             _            @(fluree/commit! conn ledger-alias db)
+             _            @(fluree/commit! conn db)
              loaded-db    (test-utils/retry-load conn ledger-alias 100)
              res2         @(fluree/query loaded-db query)]
          (is (= res1 res2))))
@@ -460,7 +460,7 @@
                                :ex/numList {:list [7 8 9 10]}}
                               {:id   :ex/john,
                                :type :ex/User}]})
-             db           @(fluree/commit! conn ledger-alias db)
+             db           @(fluree/commit! conn db)
              target-t     (:t db)
              loaded-db    (test-utils/load-to-t conn ledger-alias target-t 100)]
          (is (= target-t (:t loaded-db)))
@@ -516,7 +516,7 @@
                                                              :f/targetRole :ex/userRole
                                                              :f/action     [:f/view]
                                                              :f/equals     {:list [:f/$identity :ex/user]}}]}]}]})
-               db+policy    @(fluree/commit! conn ledger-alias db+policy)
+               db+policy    @(fluree/commit! conn db+policy)
                target-t     (:t db+policy)
                loaded-db    (test-utils/load-to-t conn ledger-alias target-t 100)]
            (is (= target-t (:t loaded-db)))
@@ -624,7 +624,7 @@
                                           {:ex "http://example.org/ns/"}]
                                 :select  '{?s [:id]}
                                 :where   '{:id ?s, :schema/description ?description}}
-             _                 @(fluree/commit! conn ledger-alias db1)
+             _                 @(fluree/commit! conn db1)
              loaded-db1        (test-utils/retry-load conn ledger-alias 100)
              db2               @(fluree/update
                                  loaded-db1
@@ -633,7 +633,7 @@
                                               {:ex "http://example.org/ns/"}]
                                   "where"    {:id :ex/mosquitos, "?p" "?o"}
                                   "delete"   {:id :ex/mosquitos, "?p" "?o"}})
-             _                 @(fluree/commit! conn ledger-alias db2)
+             _                 @(fluree/commit! conn db2)
              loaded-db2        (test-utils/retry-load conn ledger-alias 100)]
          (is (= [{:id :ex/fluree} {:id :ex/w3c} {:id :ex/kittens}]
                 @(fluree/query loaded-db2 description-query))
@@ -647,7 +647,7 @@
                              "where"    {:id   "?s"
                                          :type :schema/Organization
                                          "?p"  "?o"}})
-               _          @(fluree/commit! conn ledger-alias db3)
+               _          @(fluree/commit! conn db3)
                loaded-db3 (test-utils/retry-load conn ledger-alias 100)]
            (is (= [{:id :ex/kittens}]
                   @(fluree/query loaded-db3 description-query))
@@ -913,7 +913,7 @@
                                                 {"@id" "ex:letty", "ex:firstName" "Leticia"}
                                                 {"@id" "ex:betty", "ex:firstName" "Betty"}]})
 
-           _committed @(fluree/commit! conn ledger-id db7)]
+           _committed @(fluree/commit! conn db7)]
        (is (= #{"AP" "Dan" "KP" "NP"}
               (into #{} @(fluree/query db1 {"@context" [test-utils/default-str-context
                                                         {"ex" "ns:ex/"}]
@@ -1054,13 +1054,13 @@
              tx2      {"insert" [{"@id" "ex:foo" "ex:num2" (range 1000)}]}
              tx3      {"insert" [{"@id" "ex:foo" "ex:num3" (range 1000)}]}
              _db1     (->> @(fluree/update db0 tx1 {:raw-txn tx1})
-                           (fluree/commit! conn alias)
+                           (fluree/commit! conn)
                            deref)
              _db2     (->> @(fluree/update @(fluree/db conn alias) tx2 {:raw-txn tx2})
-                           (fluree/commit! conn alias)
+                           (fluree/commit! conn)
                            deref)
              _db3     (->> @(fluree/update @(fluree/db conn alias) tx3 {:raw-txn tx3})
-                           (fluree/commit! conn alias)
+                           (fluree/commit! conn)
                            deref)
              tx-count 3]
          ;; wait for everything to be written

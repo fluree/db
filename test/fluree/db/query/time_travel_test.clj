@@ -56,7 +56,7 @@
                                                  {"@context" [test-utils/default-context
                                                               {:ex "http://example.org/ns/"}]
                                                   "insert"   (first test-utils/movies)})]
-                                       @(fluree/commit! conn ledger-id db1))))
+                                       @(fluree/commit! conn db1))))
           db2                    (with-redefs-fn {#'util/current-time-millis
                                                   (fn [] three-loaded-millis)
                                                   #'util/current-time-iso
@@ -67,8 +67,8 @@
                                                  {"@context" [test-utils/default-context
                                                               {:ex "http://example.org/ns/"}]
                                                   "insert"   (second test-utils/movies)})]
-                                       @(fluree/commit! conn ledger-id db2))))
-          db3                    (with-redefs-fn {#'util/current-time-millis
+                                       @(fluree/commit! conn db2))))
+          _                      (with-redefs-fn {#'util/current-time-millis
                                                   (fn [] all-loaded-millis)
                                                   #'util/current-time-iso
                                                   (fn [] all-loaded-iso)}
@@ -78,7 +78,7 @@
                                                  {"@context" [test-utils/default-context
                                                               {:ex "http://example.org/ns/"}]
                                                   "insert"   (nth test-utils/movies 2)})]
-                                       @(fluree/commit! conn ledger-id db3))))
+                                       @(fluree/commit! conn db3))))
           db                     @(fluree/db conn ledger-id)
           base-query             {:context test-utils/default-context
                                   :select  '{?s [:*]}

@@ -27,7 +27,7 @@
                       :schema/name  "Jane"
                       :schema/email "jane@flur.ee"
                       :schema/age   30}]})
-          db1    @(fluree/commit! conn "stable-commit-id" db0)]
+          db1    @(fluree/commit! conn db0)]
       (testing "stable commit id"
         (is (= "fluree:commit:sha256:bbdainpfs7v2pg2yj76uzpybdfdldvvt5idlbasisuhwlrxbiqhii"
                (get-in db1 [:commit :id]))))

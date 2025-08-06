@@ -86,7 +86,7 @@
               "ex:carol-lynn should be deemed the same as ex:carol")))
 
       (testing "Testing owl:sameAs transitivity (eq-trans)"
-        (let [ledger      @(fluree/create conn "reasoner/eq-trans" nil)
+        (let [_           @(fluree/create conn "reasoner/eq-trans" nil)
               db-same     @(fluree/update db0
                                           {"@context" {"ex"   "http://example.org/"
                                                        "owl"  "http://www.w3.org/2002/07/owl#"
@@ -122,7 +122,7 @@
       ;; Most documentation recommends not using owl:sameAs for properties
       ;; and for now eq-rep-p is not supported. It would act like owl:equivalentProperty
       (testing "Testing owl:sameAs (eq-rep-s, eq-rep-o)"
-        (let [ledger        @(fluree/create conn "reasoner/eq-rep" nil)
+        (let [_             @(fluree/create conn "reasoner/eq-rep" nil)
               db-same       @(fluree/update db0
                                             {"@context" {"ex"   "http://example.org/"
                                                          "owl"  "http://www.w3.org/2002/07/owl#"

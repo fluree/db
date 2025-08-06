@@ -36,7 +36,7 @@
                                                "@value" "12:42:00"}}]})
             ;; Create a channel to track indexing completion
             index-ch   (async/chan 10)
-            _db-commit @(fluree/commit! conn ledger-id db {:index-files-ch index-ch})
+            _db-commit @(fluree/commit! conn db {:index-files-ch index-ch})
             ;; Wait for index completion (root file is written last)
             _          (loop []
                          (when-let [msg (<!! index-ch)]

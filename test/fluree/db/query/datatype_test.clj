@@ -273,7 +273,7 @@
                     [{"@id"     "ex:alice"
                       "ex:name" "Alice"
                       "ex:age"  30}]})
-          db1*   @(fluree/commit! conn "t-test" db1)
+          db1*   @(fluree/commit! conn db1)
           ;; Second transaction
           db2    @(fluree/update
                    db1*
@@ -281,7 +281,7 @@
                     "insert"
                     [{"@id"      "ex:alice"
                       "ex:hobby" "Reading"}]})
-          db2*   @(fluree/commit! conn "t-test" db2)
+          db2*   @(fluree/commit! conn db2)
           ;; Third transaction
           db3    @(fluree/update
                    db2*
@@ -289,7 +289,7 @@
                     "insert"
                     [{"@id"     "ex:alice"
                       "ex:city" "Boston"}]})
-          db3*   @(fluree/commit! conn "t-test" db3)]
+          db3*   @(fluree/commit! conn db3)]
       (testing "binding transaction number to a variable"
         (let [query {"@context" {"ex" "http://example.org/ns/"}
                      "select"  ["?p" "?o" "?t"]

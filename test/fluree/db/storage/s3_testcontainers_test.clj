@@ -105,7 +105,7 @@
                                                    "ex:name" "Bob"}]})
 
                     ;; Commit the data
-                    committed-db @(fluree/commit! conn ledger-id db)
+                    committed-db @(fluree/commit! conn db)
                     ;; Query the data
                     results @(fluree/query committed-db
                                            {"@context" {"ex" "http://example.org/ns/"}
@@ -125,8 +125,7 @@
                                                       :s3-endpoint *s3-endpoint*
                                                       :cache-max-mb 50
                                                       :parallelism 1})
-                      reloaded @(fluree/load fresh-conn ledger-id)
-                      reloaded-db (fluree/db reloaded)
+                      reloaded-db @(fluree/load fresh-conn ledger-id)
                       reload-results @(fluree/query reloaded-db
                                                     {"@context" {"ex" "http://example.org/ns/"}
                                                      "select" ["?s" "?name"]
@@ -194,7 +193,7 @@
                                                    "ex:age" i})})
 
                   ;; Commit to trigger indexing and query to verify data
-                  db2 @(fluree/commit! conn ledger-id db1)
+                  db2 @(fluree/commit! conn db1)
                   count-result @(fluree/query db2
                                               {"@context" {"ex" "http://example.org/ns/"}
                                                "select" "(count ?s)"

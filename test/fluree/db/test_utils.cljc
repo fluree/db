@@ -161,7 +161,7 @@
       (if movie
         (let [staged @(fluree/update db {"@context" default-str-context
                                          "insert" movie})
-              committed @(fluree/commit! conn ledger-id staged
+              committed @(fluree/commit! conn staged
                                          {:message (str "Commit " (get movie "name"))
                                           :push?   true})]
           (recur committed rest))
@@ -176,8 +176,8 @@
                                                    {:ex "http://example.org/ns/"}]
                                        "insert" people})
           staged   #?(:clj @staged-p, :cljs (<p! staged-p))
-          commit-p (fluree/commit! conn ledger-id staged {:message "Adding people"
-                                                          :push? true})]
+          commit-p (fluree/commit! conn staged {:message "Adding people"
+                                                :push? true})]
       #?(:clj @commit-p, :cljs (<p! commit-p))
       ledger-id)))
 
@@ -216,11 +216,29 @@
   [conn ledger-alias t max-attempts]
   (let [attempts-per-batch (/ max-attempts 10)]
     (loop [attempts-left (- max-attempts attempts-per-batch)]
-      (let [db (retry-load conn ledger-alias attempts-per-batch)
-            db-t   (-> db :t)]
-        (if (and (< db-t t) (pos-int? attempts-left))
-          (recur (- attempts-left attempts-per-batch))
-          db)))))
+      (let [db (retry-load conn ledger-alias attempts-per-batch)]
+        (cond
+          (util/exception? db)
+          (throw db)
+
+          (nil? db)
+          (throw (ex-info (str "Failed to load ledger: " ledger-alias)
+                          {:status 404
+                           :error :db/ledger-not-found}))
+
+          :else
+          (let [db-t (-> db :t)]
+            (cond
+              (nil? db-t)
+              (throw (ex-info (str "Database has nil :t value. Database keys: " (keys db))
+                              {:status 500
+                               :error :db/invalid-database}))
+
+              (and (< db-t t) (pos-int? attempts-left))
+              (recur (- attempts-left attempts-per-batch))
+
+              :else
+              db)))))))
 
 (defn retry-exists?
   "Retry calling exists? until it returns true or max-attempts."
