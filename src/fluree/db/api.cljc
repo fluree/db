@@ -78,6 +78,11 @@
    (go-try
      (-> conn ::system-map system/terminate))))
 
+(defn- ledger?
+  "Returns true if x is a ledger object"
+  [x]
+  (instance? fluree.db.ledger.Ledger x))
+
 (defn convert-config-key
   [[k v]]
   (if (#{:id :type} k)
@@ -221,6 +226,7 @@
 
 (defn create
   "Creates a new ledger with an initial empty commit at t=0.
+  Returns a promise that resolves to the initial database.
 
   Parameters:
     conn - Connection object
@@ -234,9 +240,10 @@
   ([conn ledger-alias opts]
    (validate-connection conn)
    (promise-wrap
-    (do
+    (go-try
       (log/info "Creating ledger" ledger-alias)
-      (connection/create-ledger conn ledger-alias opts)))))
+      (let [ledger (<? (connection/create-ledger conn ledger-alias opts))]
+        (ledger/current-db ledger))))))
 
 (defn alias->address
   "Resolves a ledger alias to its address.
@@ -248,11 +255,13 @@
 
 (defn load
   "Loads an existing ledger by alias or address.
-  Returns a promise that resolves to the ledger object."
+  Returns a promise that resolves to the latest database."
   [conn alias-or-address]
   (validate-connection conn)
   (promise-wrap
-   (connection/load-ledger conn alias-or-address)))
+   (go-try
+     (let [ledger (<? (connection/load-ledger conn alias-or-address))]
+       (ledger/current-db ledger)))))
 
 (defn drop
   "Deletes a ledger and its associated data.
@@ -364,18 +373,39 @@
   "Persists a staged database as a new immutable version in the ledger.
 
   Parameters:
+    conn - Connection object
+    ledger-id - Ledger alias or address
+    db - Staged database with changes
+    opts - (optional) Options map
+
+  OR (legacy):
     ledger - Ledger object
     db - Staged database with changes
     opts - (optional) Options map
 
   Creates a new commit and notifies the nameservice of the new version.
   Returns promise resolving to the committed database."
-  ([ledger db]
+  ([conn-or-ledger db]
+   (if (ledger? conn-or-ledger)
+     ;; Legacy: (commit! ledger db)
+     (promise-wrap
+      (transact/commit! conn-or-ledger db {}))
+     ;; New: (commit! conn ledger-id db) - db is actually ledger-id
+     (commit! conn-or-ledger db nil {})))
+  ([conn-or-ledger ledger-id-or-db db-or-opts]
+   (if (ledger? conn-or-ledger)
+     ;; Legacy: (commit! ledger db opts)
+     (promise-wrap
+      (transact/commit! conn-or-ledger ledger-id-or-db db-or-opts))
+     ;; New: (commit! conn ledger-id db opts) - opts defaults to {}
+     (commit! conn-or-ledger ledger-id-or-db db-or-opts {})))
+  ([conn ledger-id db opts]
+   ;; New 4-arity version
+   (validate-connection conn)
    (promise-wrap
-    (transact/commit! ledger db {})))
-  ([ledger db opts]
-   (promise-wrap
-    (transact/commit! ledger db opts))))
+    (go-try
+      (let [ledger (<? (connection/load-ledger conn ledger-id))]
+        (<? (transact/commit! ledger db opts)))))))
 
 (defn ^:deprecated transact!
   "Deprecated: Use `update!` instead.
@@ -498,19 +528,63 @@
   "Returns current status of a ledger branch.
 
   Parameters:
+    conn - Connection object
+    ledger-id - Ledger alias or address
+    branch - (optional) Branch name (default: current branch)
+
+  OR (legacy):
     ledger - Ledger object
     branch - (optional) Branch name (default: current branch)
 
   Returns status map with commit and index information."
-  ([ledger] (ledger/status ledger))
-  ([ledger branch] (ledger/status ledger branch)))
+  ([conn-or-ledger]
+   (if (ledger? conn-or-ledger)
+     ;; Legacy: (status ledger)
+     (ledger/status conn-or-ledger)
+     (throw (ex-info "status requires at least conn and ledger-id arguments"
+                     {:status 400 :error :db/invalid-arguments}))))
+  ([conn-or-ledger ledger-id-or-branch]
+   (if (ledger? conn-or-ledger)
+     ;; Legacy: (status ledger branch)
+     (ledger/status conn-or-ledger ledger-id-or-branch)
+     ;; New: (status conn ledger-id)
+     (promise-wrap
+      (go-try
+        (let [ledger (<? (connection/load-ledger conn-or-ledger ledger-id-or-branch))]
+          (ledger/status ledger))))))
+  ([conn ledger-id branch]
+   ;; New 3-arity version
+   (validate-connection conn)
+   (promise-wrap
+    (go-try
+      (let [ledger (<? (connection/load-ledger conn ledger-id))]
+        (ledger/status ledger branch))))))
 
 ;; db operations
 
 (defn db
-  "Returns the current database value from a ledger."
-  [ledger]
-  (ledger/current-db ledger))
+  "Returns the current database value from a ledger.
+  
+  Parameters:
+    conn - Connection object
+    ledger-id - Ledger alias or address
+    
+  OR (legacy):
+    ledger - Ledger object
+    
+  Returns the current database value."
+  ([conn-or-ledger]
+   (if (ledger? conn-or-ledger)
+     ;; Legacy: (db ledger)
+     (ledger/current-db conn-or-ledger)
+     (throw (ex-info "db requires at least conn and ledger-id arguments"
+                     {:status 400 :error :db/invalid-arguments}))))
+  ([conn ledger-id]
+   (validate-connection conn)
+   (promise-wrap
+    (go-try
+      (let [ledger (<? (connection/load-ledger conn ledger-id))]
+        (ledger/current-db ledger))))))
 
 (defn wrap-policy
   "Applies policy restrictions to a database.
@@ -691,35 +765,82 @@
   "Queries the history of entities across commits.
 
   Parameters:
-    ledger - Ledger object
+    conn - Connection object
+    ledger-id - Ledger alias or address
     query - Query map with:
       'history' - Subject IRI or pattern
       't' - Specific time or {'from': t1, 'to': t2}
       'commit-details' - Include commit metadata (default: false)
     opts - (optional) Options map
 
+  OR (legacy):
+    ledger - Ledger object
+    query - Query map
+    opts - (optional) Options map
+
   Returns promise resolving to historical flakes."
-  ([ledger query]
-   (history ledger query nil))
-  ([ledger query override-opts]
+  ([conn-or-ledger query]
+   (if (ledger? conn-or-ledger)
+     ;; Legacy: (history ledger query)
+     (promise-wrap
+      (query-api/history conn-or-ledger query nil))
+     ;; New: (history conn ledger-id query) - need 3 args minimum
+     (throw (ex-info "history requires at least conn, ledger-id, and query arguments"
+                     {:status 400 :error :db/invalid-arguments}))))
+  ([conn-or-ledger ledger-id-or-query query-or-opts]
+   (if (ledger? conn-or-ledger)
+     ;; Legacy: (history ledger query opts)
+     (promise-wrap
+      (query-api/history conn-or-ledger ledger-id-or-query query-or-opts))
+     ;; New: (history conn ledger-id query)
+     (history conn-or-ledger ledger-id-or-query query-or-opts nil)))
+  ([conn ledger-id query override-opts]
+   ;; New 4-arity version
+   (validate-connection conn)
    (promise-wrap
-    (query-api/history ledger query override-opts))))
+    (go-try
+      (let [ledger (<? (connection/load-ledger conn ledger-id))]
+        (<? (query-api/history ledger query override-opts)))))))
 
 (defn credential-history
   "Executes a history query using a verifiable credential.
 
   Parameters:
+    conn - Connection object
+    ledger-id - Ledger alias or address
+    cred-query - Verifiable credential containing history query
+    opts - (optional) Options map
+
+  OR (legacy):
     ledger - Ledger object
     cred-query - Verifiable credential containing history query
     opts - (optional) Options map
 
   Verifies credential and applies identity-based policies.
   Returns promise resolving to historical data."
-  ([ledger cred-query] (credential-history ledger cred-query {}))
-  ([ledger cred-query override-opts]
+  ([conn-or-ledger cred-query]
+   (if (ledger? conn-or-ledger)
+     ;; Legacy: (credential-history ledger cred-query)
+     (credential-history conn-or-ledger cred-query {})
+     ;; New: need at least 3 args
+     (throw (ex-info "credential-history requires at least conn, ledger-id, and cred-query arguments"
+                     {:status 400 :error :db/invalid-arguments}))))
+  ([conn-or-ledger ledger-id-or-cred-query cred-query-or-opts]
+   (if (ledger? conn-or-ledger)
+     ;; Legacy: (credential-history ledger cred-query opts)
+     (promise-wrap
+      (go-try
+        (let [{query :subject, identity :did} (<? (cred/verify ledger-id-or-cred-query))]
+          (<? (query-api/history conn-or-ledger query (assoc cred-query-or-opts :identity identity))))))
+     ;; New: (credential-history conn ledger-id cred-query)
+     (credential-history conn-or-ledger ledger-id-or-cred-query cred-query-or-opts {})))
+  ([conn ledger-id cred-query override-opts]
+   ;; New 4-arity version
+   (validate-connection conn)
    (promise-wrap
     (go-try
-      (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
+      (let [ledger (<? (connection/load-ledger conn ledger-id))
+            {query :subject, identity :did} (<? (cred/verify cred-query))]
         (<? (query-api/history ledger query (assoc override-opts :identity identity))))))))
 
 (defn range
