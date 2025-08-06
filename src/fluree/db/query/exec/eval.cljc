@@ -749,28 +749,23 @@
                             (where/->typed-val nil)
                             args))
 
-           ;; iri function for SCI - creates a proper function
+           ;; iri function for SCI
+           ;; This is the base two-parameter function
+           iri-fn-base (fn [input ctx]
+                         (let [value (if (map? input)
+                                       (:value input)
+                                       input)
+                               ;; Special handling for @type
+                               expanded (if (= "@type" value)
+                                          const/iri-rdf-type
+                                          (json-ld/expand-iri value ctx))]
+                           (where/->typed-val expanded const/iri-id)))
+           
+           ;; Default iri function that will be overridden in bindings
+           ;; This version throws to make it clear when context is missing
            iri-fn (fn [input]
-                    (let [value (if (map? input)
-                                  (:value input)
-                                  input)]
-                      ;; Handle some common constants that don't need context
-                      (cond
-                        (= "@type" value)
-                        (where/->typed-val const/iri-rdf-type const/iri-id)
-
-                        ;; If it's already a full IRI, just return it
-                        (str/starts-with? value "http")
-                        (where/->typed-val value const/iri-id)
-
-                        ;; For the test case, handle ex:name specifically
-                        (= "ex:name" value)
-                        (where/->typed-val "http://example.org/name" const/iri-id)
-
-                        ;; Otherwise, we need context but don't have it in SCI
-                        ;; For now, just return the value as-is
-                        :else
-                        (where/->typed-val value const/iri-id))))
+                    (throw (ex-info "iri function called without context - should be overridden in bindings" 
+                                    {:input input})))
 
            ;; Build eval namespace, excluding macros for now
            eval-ns-fns (reduce (fn [acc [k v]]
@@ -808,6 +803,8 @@
                                   '$-CONTEXT nil
                                   ;; Add where/->typed-val for iri expansion
                                   'where/->typed-val where/->typed-val
+                                  ;; Add the base iri function
+                                  'iri-fn-base iri-fn-base
                                   ;; iri function - will be overridden in bindings with context
                                   'iri iri-fn
                                   'fluree.db.query.exec.eval/iri iri-fn))
@@ -823,7 +820,6 @@
                         'json-ld/expand-iri json-ld/expand-iri}
 
            const-ns {'iri-id const/iri-id
-                     '_id const/iri-id
                      'const/iri-id const/iri-id
                      ;; String datatypes needed for comparisons
                      'iri-string const/iri-string
@@ -1015,6 +1011,29 @@
    (defonce ^:private sci-context-singleton
      (delay (create-sci-context))))
 
+
+;; GraalVM-specific evaluation function
+#?(:clj
+   (defn eval-graalvm-with-context
+     "Evaluates a form in SCI with context bindings for GraalVM builds."
+     [form ctx]
+     (let [;; Get the dynamic var from the SCI context namespaces
+           ;; Create a context-aware iri function that uses the dynamic var
+           iri-with-context (fn [input]
+                              (let [value (if (map? input)
+                                            (:value input)
+                                            input)
+                                    expanded (if (= "@type" value)
+                                               const/iri-rdf-type
+                                               (json-ld/expand-iri value ctx))]
+                                (where/->typed-val expanded const/iri-id)))
+           ;; Override iri bindings in SCI context with the context-aware version
+           ctx-with-bindings (sci/merge-opts @sci-context-singleton
+                                             {:bindings {'$-CONTEXT ctx
+                                                         'iri iri-with-context
+                                                         'fluree.db.query.exec.eval/iri iri-with-context}})]
+       (sci/eval-form ctx-with-bindings form))))
+
 ;; Enhanced eval-form that accepts context for GraalVM builds
 #?(:clj
    (defmacro eval-form-with-context
@@ -1022,10 +1041,8 @@
       For JVM builds, ignores the context and uses regular eval."
      [form ctx]
      (if-graalvm
-      ;; GraalVM branch - create context with $-CONTEXT binding
-      `(let [ctx-with-bindings# (sci/merge-opts @sci-context-singleton
-                                                {:bindings {'$-CONTEXT ~ctx}})]
-         (sci/eval-form ctx-with-bindings# ~form))
+      ;; GraalVM branch - use our dedicated function
+      `(eval-graalvm-with-context ~form ~ctx)
       ;; JVM branch - use direct eval, ignoring context
       `(eval ~form))))
 
@@ -1107,6 +1124,21 @@
     (list 'count-star count-star-sym)
     fn-expr))
 
+;; Helper function to transform iri calls to include context
+(defn transform-iri-calls
+  "Transforms (iri x) calls to (iri-fn-base x $-CONTEXT) for GraalVM builds."
+  [form]
+  (if-graalvm
+   (walk/postwalk
+    (fn [x]
+      (if (and (sequential? x)
+               (= 'iri (first x))
+               (= 2 (count x)))
+        `(iri-fn-base ~(second x) ~'$-CONTEXT)
+        x))
+    form)
+   form))
+
 (defn coerce
   [count-star-sym allow-aggregates? ctx x]
   (cond
@@ -1180,11 +1212,13 @@
   [code ctx allow-aggregates?]
   (let [count-star-sym (gensym "?$-STAR")
         qualified-code (parse-qualified-code code count-star-sym ctx allow-aggregates?)
+        ;; Transform iri calls for GraalVM
+        transformed-code (transform-iri-calls qualified-code)
         vars           (variables qualified-code)
         bdg            (bind-variables count-star-sym vars ctx)]
     `(fn [~soln-sym]
        (let ~bdg
-         ~qualified-code))))
+         ~transformed-code))))
 
 (defn compile
   ([code ctx] (compile code ctx true))
