@@ -912,12 +912,12 @@
 
   Example:
     ;; Trigger indexing and wait for completion
-    (let [indexed-db @(trigger-index conn \"my-ledger\")]
+    (let [indexed-db @(trigger-index conn "my-ledger")]
       ;; Use indexed-db...
       )
     
     ;; Trigger indexing for a specific branch
-    (let [indexed-db @(trigger-index conn \"my-ledger:main\")]
+    (let [indexed-db @(trigger-index conn "my-ledger:main")]
       ;; Use indexed-db...
       )"
   ([conn ledger-alias]
