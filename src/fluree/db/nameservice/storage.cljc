@@ -9,16 +9,15 @@
             [fluree.db.util.log :as log]))
 
 (defn local-filename
+  "Returns the local filename for a ledger's nameservice record.
+   If ledger-alias contains @branch, extracts it. Otherwise uses provided branch or 'main'."
   ([ledger-alias]
-   (local-filename ledger-alias "main"))
+   (if (str/includes? ledger-alias "@")
+     (let [[alias branch] (str/split ledger-alias #"@" 2)]
+       (local-filename alias branch))
+     (local-filename ledger-alias "main")))
   ([ledger-alias branch]
    (str "ns@v1/" ledger-alias "@" (or branch "main") ".json")))
-
-(defn publishing-address*
-  [store ledger-alias]
-  (-> store
-      storage/location
-      (storage/build-address ledger-alias)))
 
 (defn ns-record
   "Generates nameservice metadata map for JSON storage using new minimal format"
@@ -63,14 +62,16 @@
       (storage/delete store address)))
 
   (publishing-address [_ ledger-alias]
-    (go (publishing-address* store ledger-alias)))
+    ;; Just return the alias - lookup will handle branch extraction via local-filename
+    (go ledger-alias))
 
   nameservice/iNameService
   (lookup [_ ledger-address]
     (go-try
-      (let [{:keys [alias branch]} (nameservice/resolve-address (storage/location store) ledger-address nil)
-            branch                  (or branch "main")
-            filename                (local-filename alias branch)]
+      ;; ledger-address is just the alias (potentially with @branch)
+      (let [filename (local-filename ledger-address)]
+        (log/debug "StorageNameService lookup:" {:ledger-address ledger-address
+                                                 :filename filename})
         (when-let [record-bytes (<? (storage/read-bytes store filename))]
           (json/parse record-bytes false)))))
 
