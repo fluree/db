@@ -652,10 +652,12 @@
     datatype       fluree.db.query.exec.eval/datatype
     equal          fluree.db.query.exec.eval/typed-equal
     floor          fluree.db.query.exec.eval/floor
+    find-grouped-val fluree.db.query.exec.eval/find-grouped-val
     groupconcat    fluree.db.query.exec.eval/groupconcat
     if             fluree.db.query.exec.eval/-if
     in             fluree.db.query.exec.eval/in
     iri            fluree.db.query.exec.eval/iri
+    iri-fn-base    fluree.db.query.exec.eval/iri-fn-base
     is-iri         fluree.db.query.exec.eval/is-iri
     is-literal     fluree.db.query.exec.eval/is-literal
     lang           fluree.db.query.exec.eval/lang
@@ -752,6 +754,7 @@
            ;; iri function for SCI
            ;; This is the base two-parameter function
            iri-fn-base (fn [input ctx]
+                         (log/debug "iri-fn-base called with input:" input "ctx:" (some? ctx))
                          (let [value (if (map? input)
                                        (:value input)
                                        input)
@@ -760,11 +763,11 @@
                                           const/iri-rdf-type
                                           (json-ld/expand-iri value ctx))]
                            (where/->typed-val expanded const/iri-id)))
-           
+
            ;; Default iri function that will be overridden in bindings
            ;; This version throws to make it clear when context is missing
            iri-fn (fn [input]
-                    (throw (ex-info "iri function called without context - should be overridden in bindings" 
+                    (throw (ex-info "iri function called without context - should be overridden in bindings"
                                     {:input input})))
 
            ;; Build eval namespace, excluding macros for now
@@ -1011,7 +1014,6 @@
    (defonce ^:private sci-context-singleton
      (delay (create-sci-context))))
 
-
 ;; GraalVM-specific evaluation function
 #?(:clj
    (defn eval-graalvm-with-context
@@ -1079,7 +1081,7 @@
      dotProduct cosineSimilarity euclidianDistance
 
      ;; internal helper fns - needed for testing and some query constructs
-     ->typed-val})
+     ->typed-val iri-fn-base})
 
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))
@@ -1128,16 +1130,17 @@
 (defn transform-iri-calls
   "Transforms (iri x) calls to (iri-fn-base x $-CONTEXT) for GraalVM builds."
   [form]
-  (if-graalvm
-   (walk/postwalk
-    (fn [x]
-      (if (and (sequential? x)
-               (= 'iri (first x))
-               (= 2 (count x)))
-        `(iri-fn-base ~(second x) ~'$-CONTEXT)
-        x))
-    form)
-   form))
+  (if (graalvm-build?)
+    (walk/postwalk
+     (fn [x]
+       (if (and (sequential? x)
+                (or (= 'iri (first x))
+                    (= 'fluree.db.query.exec.eval/iri (first x)))
+                (= 2 (count x)))
+         `(iri-fn-base ~(second x) ~'$-CONTEXT)
+         x))
+     form)
+    form))
 
 (defn coerce
   [count-star-sym allow-aggregates? ctx x]

@@ -434,8 +434,8 @@
                                       "where"    {"@id" "?s"}})]
         (is (= 3 (count result))
             "Should return all three subjects without limit")
-        (is (= #{:ex/alice :ex/bob :ex/charlie} (set result))
-            "Should return all inserted subjects")))))
+        (is (= [:ex/alice :ex/bob :ex/charlie] result)
+            "Should return all inserted subjects in alphabetical order")))))
 
 (deftest ^:integration sci-datatype-filter-test
   (testing "SCI evaluation of datatype and iri functions in filter expressions"
@@ -478,17 +478,17 @@
                    "@context" {"ex" "http://example.org/"}}
             result @(fluree/query db query)]
 
-        ;; Verify we got results
-        (is (pos? (count result))
-            "Should return results for string properties")
+        ;; Verify we got the expected number of results
+        (is (= 10 (count result))
+            "Should return 10 string property results")
 
         ;; All results should have string values or be @type predicates
         ;; Note: groupBy wraps values in arrays
-        (is (every? #(let [value (nth % 2)]
+        (is (every? #(let [[_subject property value] %]
                        (or (and (vector? value)
                                 (= 1 (count value))
                                 (string? (first value)))
-                           (= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" (nth % 1))))
+                           (= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" property)))
                     result)
             "All values should be strings (wrapped in arrays due to groupBy) or the property should be rdf:type")
 
@@ -500,8 +500,9 @@
               "Should include newData in results"))
 
         ;; Verify the datatype function and filter worked by checking we only get string values
-        (let [property-values (filter #(not= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" (nth % 1)) result)]
-          (is (every? #(let [value (nth % 2)]
+        (let [property-values (filter #(let [[_subject property _value] %]
+                                         (not= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" property)) result)]
+          (is (every? #(let [[_subject _property value] %]
                          (and (vector? value)
                               (= 1 (count value))
                               (string? (first value))))
