@@ -1,6 +1,5 @@
 (ns fluree.db.query.misc-queries-test
   (:require [babashka.fs :refer [with-temp-dir]]
-            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
@@ -436,93 +435,6 @@
             "Should return all three subjects without limit")
         (is (= [:ex/alice :ex/bob :ex/charlie] result)
             "Should return all inserted subjects in alphabetical order")))))
-
-(deftest ^:integration sci-datatype-filter-test
-  (testing "SCI evaluation of datatype and iri functions in filter expressions"
-    (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "sci-datatype-test")
-          ;; Insert some test data with string values
-          db     @(fluree/update (fluree/db ledger)
-                                 {"@context" {"ex" "http://example.org/"}
-                                  "insert"   [{"@id" "ex:existingOrNewData"
-                                               "ex:name" "Test Data"
-                                               "ex:description" "A test entity"}
-                                              {"@id" "ex:newData"
-                                               "ex:label" "New Data"
-                                               "ex:comment" "First new item"}
-                                              {"@id" "ex:newData2"
-                                               "ex:title" "Second Item"
-                                               "ex:note" "Another test"}
-                                              {"@id" "ex:newData3"
-                                               "ex:name" "Third Item"}
-                                              {"@id" "ex:newData5"
-                                               "ex:description" "Fifth Item"}
-                                              {"@id" "ex:newData6"
-                                               "ex:label" "Sixth Item"
-                                               "ex:comment" "Last item"}]})]
-
-      ;; Test the complex query with values, datatype bind, and filter
-      (let [query {"values" ["?s"
-                             [{"@type" "@id", "@value" "http://example.org/existingOrNewData"}
-                              {"@type" "@id", "@value" "http://example.org/newData"}
-                              {"@type" "@id", "@value" "http://example.org/newData2"}
-                              {"@type" "@id", "@value" "http://example.org/newData3"}
-                              {"@type" "@id", "@value" "http://example.org/newData5"}
-                              {"@type" "@id", "@value" "http://example.org/newData6"}]]
-                   "select" ["?s" "?property" "?value"]
-                   "groupBy" ["?s" "?property"]
-                   "where" [{"@id" "?s"
-                             "?property" "?value"}
-                            ["bind" "?dt" "(datatype ?value)"]
-                            ["filter" "(or (= ?dt \"http://www.w3.org/2001/XMLSchema#string\") (= ?property (iri \"@type\")))"]]
-                   "@context" {"ex" "http://example.org/"}}
-            result @(fluree/query db query)]
-
-        ;; Verify we got the expected number of results
-        (is (= 10 (count result))
-            "Should return 10 string property results")
-
-        ;; All results should have string values or be @type predicates
-        ;; Note: groupBy wraps values in arrays
-        (is (every? #(let [[_subject property value] %]
-                       (or (and (vector? value)
-                                (= 1 (count value))
-                                (string? (first value)))
-                           (= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" property)))
-                    result)
-            "All values should be strings (wrapped in arrays due to groupBy) or the property should be rdf:type")
-
-        ;; Check that we're getting results for our test subjects
-        (let [subjects (set (map first result))]
-          (is (some #(str/ends-with? % "existingOrNewData") subjects)
-              "Should include existingOrNewData in results")
-          (is (some #(str/ends-with? % "newData") subjects)
-              "Should include newData in results"))
-
-        ;; Verify the datatype function and filter worked by checking we only get string values
-        (let [property-values (filter #(let [[_subject property _value] %]
-                                         (not= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" property)) result)]
-          (is (every? #(let [[_subject _property value] %]
-                         (and (vector? value)
-                              (= 1 (count value))
-                              (string? (first value))))
-                      property-values)
-              "All non-type property values should be strings (wrapped in arrays due to groupBy)")))
-
-      ;; Also test without the values clause to ensure general filtering works
-      (let [query-no-values {"select" ["?s" "?property" "?value"]
-                             "where" [{"@id" "?s"
-                                       "?property" "?value"}
-                                      ["bind" "?dt" "(datatype ?value)"]
-                                      ["filter" "(= ?dt \"http://www.w3.org/2001/XMLSchema#string\")"]]
-                             "@context" {"ex" "http://example.org/"}}
-            result @(fluree/query db query-no-values)]
-
-        (is (pos? (count result))
-            "Should return results for string filter without values clause")
-
-        (is (every? #(string? (nth % 2)) result)
-            "All values should be strings when filtering by string datatype")))))
 
 (deftest ^:integration sci-datatype-filter-explicit-test
   (testing "Explicit SCI evaluation of datatype and iri functions"

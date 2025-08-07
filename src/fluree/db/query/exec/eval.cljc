@@ -1019,8 +1019,7 @@
    (defn eval-graalvm-with-context
      "Evaluates a form in SCI with context bindings for GraalVM builds."
      [form ctx]
-     (let [;; Get the dynamic var from the SCI context namespaces
-           ;; Create a context-aware iri function that uses the dynamic var
+     (let [;; Create a context-aware iri function that uses the provided context
            iri-with-context (fn [input]
                               (let [value (if (map? input)
                                             (:value input)
@@ -1029,9 +1028,18 @@
                                                const/iri-rdf-type
                                                (json-ld/expand-iri value ctx))]
                                 (where/->typed-val expanded const/iri-id)))
-           ;; Override iri bindings in SCI context with the context-aware version
+           ;; Get the current namespaces from sci-context-singleton
+           current-namespaces (:namespaces @sci-context-singleton)
+           ;; Update the iri function in both namespaces to be safe
+           updated-namespaces (-> current-namespaces
+                                  (assoc-in ['fluree.db.query.exec.eval 'iri] iri-with-context)
+                                  (assoc-in ['fluree.db.query.exec.eval 'fluree.db.query.exec.eval/iri] iri-with-context)
+                                  (assoc-in ['user 'iri] iri-with-context)
+                                  (assoc-in ['user 'fluree.db.query.exec.eval/iri] iri-with-context))
+           ;; Create new SCI context with updated namespaces and bindings
            ctx-with-bindings (sci/merge-opts @sci-context-singleton
-                                             {:bindings {'$-CONTEXT ctx
+                                             {:namespaces updated-namespaces
+                                              :bindings {'$-CONTEXT ctx
                                                          'iri iri-with-context
                                                          'fluree.db.query.exec.eval/iri iri-with-context}})]
        (sci/eval-form ctx-with-bindings form))))
