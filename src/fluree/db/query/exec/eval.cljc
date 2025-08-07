@@ -1134,8 +1134,7 @@
     (walk/postwalk
      (fn [x]
        (if (and (sequential? x)
-                (or (= 'iri (first x))
-                    (= 'fluree.db.query.exec.eval/iri (first x)))
+                (= 'fluree.db.query.exec.eval/iri (first x))
                 (= 2 (count x)))
          `(iri-fn-base ~(second x) ~'$-CONTEXT)
          x))
