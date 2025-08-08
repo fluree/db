@@ -123,3 +123,34 @@
                                                        :ex/favColor  ?favColor
                                                        :schema/email ?email}]]}))
           "Multiple optional clauses should work as a left outer join between them"))))
+
+(deftest nested-optionals
+  (let [conn   @(fluree/connect-memory)
+        ledger @(fluree/create conn "optional-vars")
+        db0    (fluree/db ledger)
+        db1    @(fluree/insert db0 {"@context" {"ex" "http://example.com/"}
+                                    "@graph"
+                                    [{"@id" "ex:1"
+                                      "ex:lit" "literal1"
+                                      "ex:ref" {"@id" "ex:2"
+                                                "ex:lit" "literal2"
+                                                "ex:ref" {"@id" "ex:3"
+                                                          "ex:lit" "literal3"
+                                                          "ex:ref" {"@id" "ex:4"
+                                                                    "ex:lit" "literal4"
+                                                                    "ex:ref" {"@id" "ex:5"}}}}}]})]
+    (is (= [["ex:1" "ex:lit" "literal1" nil nil nil nil nil nil]
+            ["ex:1" "ex:ref" "ex:2" "ex:lit" "literal2" nil nil nil nil]
+            ["ex:1" "ex:ref" "ex:2" "ex:ref" "ex:3" "ex:lit" "literal3" nil nil]
+            ["ex:1" "ex:ref" "ex:2" "ex:ref" "ex:3" "ex:ref" "ex:4" "ex:lit" "literal4"]
+            ["ex:1" "ex:ref" "ex:2" "ex:ref" "ex:3" "ex:ref" "ex:4" "ex:ref" "ex:5"]]
+           @(fluree/query db1 {"@context" {"ex" "http://example.com/"}
+                               "where" [{"@id" "?s1" "ex:lit" "literal1"}
+                                        {"@id" "?s1" "?p1" "?o1"}
+                                        ["optional"
+                                         {"@id" "?o1" "?p2" "?o2"}
+                                         ["optional"
+                                          {"@id" "?o2" "?p3" "?o3"}
+                                          ["optional"
+                                           {"@id" "?o3" "?p4" "?o4"}]]]]
+                               "select" ["?s1" "?p1" "?o1" "?p2" "?o2" "?p3" "?o3" "?p4" "?o4"]})))))
