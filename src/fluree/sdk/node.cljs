@@ -1,13 +1,7 @@
 (ns fluree.sdk.node
-  (:require ["@peculiar/webcrypto" :refer [Crypto]]
-            [cljs.nodejs :as node-js]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [fluree.db.api :as fluree]
             [fluree.db.util.log :as log]))
-
-(set! js/crypto (Crypto.))
-
-(node-js/enable-util-print!)
 
 (defn ^:export connect
   [opts]
@@ -36,11 +30,11 @@
 
 (defn ^:export stage
   ([db json-ld]
-   (fluree/stage db (js->clj json-ld)))
+   (fluree/update db (js->clj json-ld)))
   ([db json-ld opts]
-   (fluree/stage db (js->clj json-ld)
-                 (-> opts
-                     (js->clj :keywordize-keys true)))))
+   (fluree/update db (js->clj json-ld)
+                  (-> opts
+                      (js->clj :keywordize-keys true)))))
 
 (defn ^:export commit
   ([ledger db] (fluree/commit! ledger db))

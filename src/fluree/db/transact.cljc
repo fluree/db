@@ -12,9 +12,9 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.track :as track]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
-            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
@@ -123,7 +123,7 @@
                      (-> ledger :did :private))
         did*     (or (some-> private* did/private->did)
                      did
-                     (:did ledger))]
+                     (-> ledger :did :id))]
     (assoc opts :did did*, :private private*)))
 
 (defn parse-data-helpers
@@ -183,8 +183,13 @@
   [commit-storage alias {:keys [did private]} commit]
   (go-try
     (let [commit-jsonld (commit-data/->json-ld commit)
-          signed-commit (if did
-                          (<? (credential/generate commit-jsonld private (:id did)))
+          ;; For credential/generate, we need a DID map with public key
+          did-map (when (and did private)
+                    (if (map? did)
+                      did
+                      (did/private->did-map private)))
+          signed-commit (if did-map
+                          (<? (credential/generate commit-jsonld private did-map))
                           commit-jsonld)
           commit-res    (<? (commit-storage/write-jsonld commit-storage alias signed-commit))
 
@@ -266,11 +271,23 @@
        (<? (publish-commit ledger commit-jsonld))
 
        (if (track/track-txn? opts)
-         (-> write-result
-             (select-keys [:address :hash :size])
-             (assoc :ledger-id ledger-alias
-                    :t t
-                    :db db*))
+         (let [indexing-disabled? (-> ledger
+                                      (ledger/get-branch-meta branch)
+                                      :indexing-opts
+                                      :indexing-disabled)
+               index-t (commit-data/index-t commit-map)
+               novelty-size (get-in db* [:novelty :size] 0)
+               reindex-min-bytes (:reindex-min-bytes db*)
+               indexing-needed? (>= novelty-size reindex-min-bytes)]
+           (-> write-result
+               (select-keys [:address :hash :size])
+               (assoc :ledger-id ledger-alias
+                      :t t
+                      :db db*
+                      :indexing-needed indexing-needed?
+                      :index-t index-t
+                      :indexing-disabled indexing-disabled?
+                      :novelty-size novelty-size)))
          db*)))))
 
 (defn transact-ledger!

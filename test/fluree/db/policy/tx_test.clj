@@ -3,7 +3,7 @@
             [fluree.db.api :as fluree]
             [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util :as util]))
 
 ;; TODO - test with multiple properties and classes on same policy
 
@@ -14,7 +14,7 @@
           root-did          (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did         (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           john-did          (:id (did/private->did-map "d0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c99"))
-          db                @(fluree/stage
+          db                @(fluree/update
                               (fluree/db ledger)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
@@ -63,7 +63,7 @@
 
           alice-params      ["?$identity" [{"@value" alice-did "@type" "@id"}]]
 
-          john-allowed      @(fluree/stage
+          john-allowed      @(fluree/update
                               @(fluree/wrap-policy db policy john-params)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
@@ -75,7 +75,7 @@
                                "insert"   {"@id"          "ex:john",
                                            "schema:email" "updatedEmail@flur.ee"}})
 
-          alice-not-allowed @(fluree/stage
+          alice-not-allowed @(fluree/update
                               @(fluree/wrap-policy db policy alice-params)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
@@ -101,7 +101,7 @@
           root-did          (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did         (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           john-did          (:id (did/private->did-map "d0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c99"))
-          db                @(fluree/stage
+          db                @(fluree/update
                               (fluree/db ledger)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
@@ -163,7 +163,7 @@
 
           alice-params      ["?$identity" [{"@value" alice-did "@type" "@id"}]]
 
-          john-allowed      @(fluree/stage
+          john-allowed      @(fluree/update
                               @(fluree/wrap-policy db policy john-params)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
@@ -174,7 +174,7 @@
                                            "schema:name" "?oldName"}
                                "insert"   {"@id"         "ex:widget",
                                            "schema:name" "Widget - Updated"}})
-          alice-not-allowed @(fluree/stage
+          alice-not-allowed @(fluree/update
                               @(fluree/wrap-policy db policy alice-params)
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
@@ -197,7 +197,7 @@
   (testing "A view-only policy should restrict all transactions"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "policy/view-only-tx-enforcement")
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"@context" {"ex"     "http://example.org/ns/"
                                 "schema" "http://schema.org/"}
@@ -213,7 +213,7 @@
                                    "f:action" [{"@id" "f:view"}]
                                    "f:query"  {"@type"  "@json"
                                                "@value" {}}})
-              no-policy-ex   @(fluree/stage
+              no-policy-ex   @(fluree/update
                                policy-wrapped
                                {"@context" {"ex"     "http://example.org/ns/"
                                             "schema" "http://schema.org/"
@@ -245,7 +245,7 @@
                                     "f:action" [{"@id" "f:view"}]
                                     "f:query"  {"@type"  "@json"
                                                 "@value" {}}}])
-              no-policy-ex   @(fluree/stage
+              no-policy-ex   @(fluree/update
                                policy-wrapped
                                {"@context" {"ex"     "http://example.org/ns/"
                                             "schema" "http://schema.org/"

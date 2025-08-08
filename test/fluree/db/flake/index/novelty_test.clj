@@ -1,19 +1,20 @@
 (ns fluree.db.flake.index.novelty-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [babashka.fs :refer [with-temp-dir]]
+            [clojure.core.async :as async :refer [<!! timeout]]
+            [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
-            [fluree.db.test-utils :as test-utils]
-            [test-with-files.tools :refer [with-tmp-dir]]))
+            [fluree.db.test-utils :as test-utils]))
 
 (deftest ^:integration index-datetimes-test
   (testing "Serialize and reread flakes with time types"
-    (with-tmp-dir storage-path
-      (let [conn    @(fluree/connect-file {:storage-path storage-path
+    (with-temp-dir [storage-path {}]
+      (let [conn    @(fluree/connect-file {:storage-path (str storage-path)
                                            :defaults
                                            {:indexing {:reindex-min-bytes 12
                                                        :reindex-max-bytes 10000000}}})
             context (merge test-utils/default-str-context {"ex" "http://example.org/ns/"})
             ledger  @(fluree/create conn "index/datetimes")
-            db      @(fluree/stage
+            db      @(fluree/update
                       (fluree/db ledger)
                       {"@context" context
                        "insert"
@@ -32,7 +33,16 @@
                                                "@value" "12:42:00Z"}
                          "ex:localTime"       {"@type"  "xsd:time"
                                                "@value" "12:42:00"}}]})
-            _db-commit @(fluree/commit! ledger db)
+            ;; Create a channel to track indexing completion
+            index-ch   (async/chan 10)
+            _db-commit @(fluree/commit! ledger db {:index-files-ch index-ch})
+            ;; Wait for index completion (root file is written last)
+            _          (loop []
+                         (when-let [msg (<!! index-ch)]
+                           (when-not (= :root (:file-type msg))
+                             (recur))))
+            ;; Small delay to ensure file handles are released
+            _          (<!! (timeout 100))
             loaded     (test-utils/retry-load conn (:alias ledger) 100)
             q          {"@context" context
                         "select"   {"?s" ["*"]}

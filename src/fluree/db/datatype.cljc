@@ -5,7 +5,7 @@
             [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.vector.scoring :as vector.score]

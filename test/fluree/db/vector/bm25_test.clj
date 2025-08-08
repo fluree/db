@@ -1,10 +1,10 @@
 (ns fluree.db.vector.bm25-test
-  (:require [clojure.core.async :as async]
+  (:require [babashka.fs :refer [with-temp-dir]]
+            [clojure.core.async :as async]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.util.core :as util]
-            [test-with-files.tools :refer [with-tmp-dir]]))
+            [fluree.db.util :as util]))
 
 (defn full-text-search
   "Performs a full text search and returns a couple attributes joined from the db
@@ -56,7 +56,7 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "bm25-search")
 
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
@@ -70,7 +70,7 @@
                       "ex:summary" "Hobbies include reading and hiking"}]})]
 
       (testing "with a select clause"
-        (let [db-r @(fluree/stage
+        (let [db-r @(fluree/update
                      db
                      {"insert"
                       {"@context"       {"f"    "https://ns.flur.ee/ledger#"
@@ -95,7 +95,7 @@
                  (full-text-search db-r "Apples for snacks for John")))))
 
       (testing "with a selectOne clause"
-        (let [db-r @(fluree/stage
+        (let [db-r @(fluree/update
                      db
                      {"insert"
                       {"@context"       {"f"    "https://ns.flur.ee/ledger#"
@@ -124,7 +124,7 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "bm25-search2")
 
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"insert"
                     {"@context"       {"f"    "https://ns.flur.ee/ledger#"
@@ -141,7 +141,7 @@
                                                  ;; a 'selectOne' wil get converted to a 'select' internally
                                                  "selectOne" {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
 
-          db-r   @(fluree/stage
+          db-r   @(fluree/update
                    db
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
@@ -163,7 +163,7 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "bm25-search3")
 
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"insert"
                     {"@context"       {"f"    "https://ns.flur.ee/ledger#"
@@ -179,7 +179,7 @@
                                                               "ex:author" "?author"}]
                                                  "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
 
-          db-r   @(fluree/stage
+          db-r   @(fluree/update
                    db
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
@@ -191,7 +191,7 @@
                       "ex:author"  "John Doe"
                       "ex:title"   "This is an article about hobbies"
                       "ex:summary" "Hobbies include reading and hiking"}]})
-          db-r2  @(fluree/stage
+          db-r2  @(fluree/update
                    db-r
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
@@ -203,7 +203,7 @@
                       "ex:author"  "Bob Oak"
                       "ex:title"   "Cryptocurrency news - bitcoin at all time high"
                       "ex:summary" "Various cryptocurrencies like bitcoin and ethereum are at all time highs"}]})
-          db-r3  @(fluree/stage
+          db-r3  @(fluree/update
                    db-r2
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
@@ -225,7 +225,7 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "bm25-item-updates")
 
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"insert"
                     {"@context"       {"f"    "https://ns.flur.ee/ledger#"
@@ -241,7 +241,7 @@
                                                               "ex:author" "?author"}]
                                                  "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
 
-          db-r   @(fluree/stage
+          db-r   @(fluree/update
                    db
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
@@ -254,7 +254,7 @@
                       "ex:title"   "This is an article about hobbies"
                       "ex:summary" "Hobbies include reading and hiking"}]})
 
-          db-r2  @(fluree/stage
+          db-r2  @(fluree/update
                    db-r
                    {"@context" {"ex" "http://example.org/ns/"}
                     "where"    {"@id"        "ex:food-article"
@@ -277,7 +277,7 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "bm25-retract")
 
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"insert"
                     {"@context"       {"f"    "https://ns.flur.ee/ledger#"
@@ -293,7 +293,7 @@
                                                               "ex:author" "?author"}]
                                                  "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
 
-          db-r   @(fluree/stage
+          db-r   @(fluree/update
                    db
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
@@ -306,7 +306,7 @@
                       "ex:title"   "This is an article about hobbies"
                       "ex:summary" "Hobbies include reading and hiking"}]})
 
-          db-r2  @(fluree/stage
+          db-r2  @(fluree/update
                    db-r
                    {"@context" {"ex" "http://example.org/ns/"}
                     "where"    {"@id" "ex:food-article"
@@ -320,7 +320,7 @@
       (testing "Score after adding and retracting article is same as score with just one article"
         (let [ledger2 @(fluree/create conn "bm25-retract-verify-same-score")
 
-              db2     @(fluree/stage
+              db2     @(fluree/update
                         (fluree/db ledger2)
                         {"insert"
                          {"@context"       {"f"    "https://ns.flur.ee/ledger#"
@@ -336,7 +336,7 @@
                                                                    "ex:author" "?author"}]
                                                       "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
 
-              db2-r   @(fluree/stage
+              db2-r   @(fluree/update
                         db2
                         {"@context" {"ex" "http://example.org/ns/"}
                          "insert"
@@ -353,7 +353,7 @@
           ledger @(fluree/create conn "bm25-search-exceptions")]
 
       (testing " the query has a subgraph selector in :select"
-        (let [ex-db @(fluree/stage
+        (let [ex-db @(fluree/update
                       (fluree/db ledger)
                       {"insert"
                        {"@context"       {"f"    "https://ns.flur.ee/ledger#"
@@ -374,7 +374,7 @@
                  (ex-message ex-db)))))
 
       (testing " the query subgraph selector must have @id as an element"
-        (let [ex-db @(fluree/stage
+        (let [ex-db @(fluree/update
                       (fluree/db ledger)
                       {"insert"
                        {"@context"       {"f"    "https://ns.flur.ee/ledger#"
@@ -395,7 +395,7 @@
                  (ex-message ex-db)))))
 
       (testing " the query subgraph selector cannot do a select '*'"
-        (let [ex-db @(fluree/stage
+        (let [ex-db @(fluree/update
                       (fluree/db ledger)
                       {"insert"
                        {"@context"       {"f"    "https://ns.flur.ee/ledger#"
@@ -416,16 +416,16 @@
                  (ex-message ex-db))))))))
 
 (deftest ^:integration bm25-search-persist
-  (with-tmp-dir storage-path
+  (with-temp-dir [storage-path {}]
     (testing "Loading bm25 from disk is identical to inital transactions"
 
       (testing "where an index was written"
-        (let [conn            @(fluree/connect-file {:storage-path storage-path
+        (let [conn            @(fluree/connect-file {:storage-path (str storage-path)
                                                      :defaults     {:indexing {:reindex-min-bytes 1e2 ;; be sure to generate an index
                                                                                :reindex-max-bytes 1e9}}})
               ledger-name     "bm25-search-persist-idx"
               ledger          @(fluree/create conn ledger-name)
-              db1             @(fluree/stage
+              db1             @(fluree/update
                                 (fluree/db ledger)
                                 {"@context" {"ex" "http://example.org/ns/"}
                                  "insert"
@@ -438,7 +438,7 @@
                                    "ex:title"   "This is an article about hobbies"
                                    "ex:summary" "Hobbies include reading and hiking"}]})
 
-              db2             @(fluree/stage
+              db2             @(fluree/update
                                 db1
                                 {"insert"
                                  {"@context"       {"f"    "https://ns.flur.ee/ledger#"
@@ -458,7 +458,7 @@
 
               db2-c           @(fluree/commit! ledger db2)
               _               (Thread/sleep 1000) ;; wait for index to complete and write new NS record - ideally replace with a force load
-              db2-l           (db-with-index {:storage-path storage-path} ledger-name)
+              db2-l           (db-with-index {:storage-path (str storage-path)} ledger-name)
               expected-result [["ex:hobby-article" 0.741011563872269 "This is an article about hobbies"]
                                ["ex:food-article" 0.6510910594922633 "This is one title of a document about food"]]]
           (is (= expected-result
@@ -469,12 +469,12 @@
               "db returned from (fluree/load ...) had issues")))
 
       (testing "Loading where an index was not written"
-        (let [conn            @(fluree/connect-file {:storage-path storage-path
+        (let [conn            @(fluree/connect-file {:storage-path (str storage-path)
                                                      :defaults     {:indexing {:reindex-min-bytes 1e8 ;; be sure *not* to generate an index
                                                                                :reindex-max-bytes 1e9}}})
               ledger-name     "bm25-search-persist-no-idx"
               ledger          @(fluree/create conn ledger-name)
-              db1             @(fluree/stage
+              db1             @(fluree/update
                                 (fluree/db ledger)
                                 {"@context" {"ex" "http://example.org/ns/"}
                                  "insert"
@@ -487,7 +487,7 @@
                                    "ex:title"   "This is an article about hobbies"
                                    "ex:summary" "Hobbies include reading and hiking"}]})
 
-              db2             @(fluree/stage
+              db2             @(fluree/update
                                 db1
                                 {"insert"
                                  {"@context"       {"f"    "https://ns.flur.ee/ledger#"
@@ -506,7 +506,7 @@
                                                               "select"   {"?x" ["@id" "ex:author" "ex:title" "ex:summary"]}}}}})
 
               db2-c           @(fluree/commit! ledger db2)
-              conn2           @(fluree/connect-file {:storage-path storage-path})
+              conn2           @(fluree/connect-file {:storage-path (str storage-path)})
               loaded          @(fluree/load conn2 ledger-name)
               db2-l           (fluree/db loaded)
               expected-result [["ex:hobby-article" 0.741011563872269 "This is an article about hobbies"]

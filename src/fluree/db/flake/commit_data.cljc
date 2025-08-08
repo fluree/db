@@ -8,7 +8,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.serde.json :as serde-json]
-            [fluree.db.util.core :as util :refer [get-first get-first-value try* catch*]]
+            [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]))
@@ -21,7 +21,7 @@
 
 (def json-ld-base-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
-  [["@context" "https://ns.flur.ee/ledger/v1"]
+  [["@context" iri/fluree-context-url]
    ["id" :id]
    ["v" :v]
    ["address" :address]
@@ -447,8 +447,12 @@
       (:id previous)
       (conj (flake/create commit-sid const/$_previous (iri/encode-iri db (:id previous)) const/$id t true nil))
 
-      (:id issuer)
-      (conj (flake/create commit-sid const/$_commit:signer (iri/encode-iri db (:id issuer)) const/$id t true nil))
+      issuer
+      (conj (flake/create commit-sid const/$_commit:signer
+                          (iri/encode-iri db (if (string? issuer)
+                                               issuer
+                                               (:id issuer)))
+                          const/$id t true nil))
 
       message
       (conj (flake/create commit-sid const/$_commit:message message const/$xsd:string t true nil))

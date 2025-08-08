@@ -27,7 +27,7 @@
 (defn bnode-variable?
   [x]
   (and (or (string? x) (symbol? x) (keyword? x))
-       (-> x name first (= \_))))
+       (->> x name (take 2) (= [\_ \:]))))
 
 (defn query-variable?
   [x]

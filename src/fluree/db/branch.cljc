@@ -6,8 +6,8 @@
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.nameservice :as nameservice]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<?]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld]))
 
@@ -121,23 +121,31 @@
   (let [buf   (async/sliding-buffer 1)
         queue (async/chan buf)]
     (go-loop [last-index-commit nil]
-      (when-let [{:keys [db index-files-ch]} (<! queue)]
-        (let [db* (use-latest-index db last-index-commit alias branch branch-state)]
-          (if-let [indexed-db (try* (<? (indexer/index db* index-files-ch)) ;; indexer/index always returns a FlakeDB (never AsyncDB)
-                                    (catch* e
-                                      (log/error e "Error updating index")))]
-            (let [[{prev-commit :commit} {indexed-commit :commit}]
-                  (swap-vals! branch-state update-index indexed-db)]
-              (when (not= prev-commit indexed-commit)
-                (let [commit-jsonld (commit-data/->json-ld indexed-commit)]
-                  (nameservice/publish-to-all commit-jsonld publishers)))
-              (recur indexed-commit))
+      (when-let [{:keys [db index-files-ch complete-ch]} (<! queue)]
+        (let [db* (use-latest-index db last-index-commit alias branch branch-state)
+              result (try*
+                       (let [indexed-db (<? (indexer/index db* index-files-ch)) ;; indexer/index always returns a FlakeDB (never AsyncDB)
+                             [{prev-commit :commit} {indexed-commit :commit}]
+                             (swap-vals! branch-state update-index indexed-db)]
+                         (when (not= prev-commit indexed-commit)
+                           (let [commit-jsonld (commit-data/->json-ld indexed-commit)]
+                             (nameservice/publish-to-all commit-jsonld publishers)))
+                         {:status :success, :db indexed-db, :commit indexed-commit})
+                       (catch* e
+                         (log/error e "Error updating index")
+                         {:status :error, :error e}))]
+          (when complete-ch
+            (async/put! complete-ch result))
+          (if (= :success (:status result))
+            (recur (:commit result))
             (recur last-index-commit)))))
     queue))
 
 (defn enqueue-index!
-  [idx-q db index-files-ch]
-  (async/put! idx-q {:db db, :index-files-ch index-files-ch}))
+  ([idx-q db index-files-ch]
+   (enqueue-index! idx-q db index-files-ch nil))
+  ([idx-q db index-files-ch complete-ch]
+   (async/put! idx-q {:db db, :index-files-ch index-files-ch, :complete-ch complete-ch})))
 
 (defn state-map
   "Returns a branch map for specified branch name at supplied commit"
@@ -150,10 +158,11 @@
          state      (atom {:commit     commit-map
                            :current-db initial-db})
          idx-q      (index-queue ledger-alias branch-name publishers state)]
-     {:name        branch-name
-      :alias       ledger-alias
-      :state       state
-      :index-queue idx-q})))
+     {:name          branch-name
+      :alias         ledger-alias
+      :state         state
+      :index-queue   idx-q
+      :indexing-opts indexing-opts})))
 
 (defn next-commit?
   [current-commit new-commit]
@@ -192,14 +201,29 @@
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
   should be the same at this point (just after committing the db). The ledger's latest
   't' should be the same (if just updating an index) or after the db's 't' value."
-  [{:keys [state index-queue] :as branch-map} new-db index-files-ch]
+  [{:keys [state index-queue indexing-opts] :as branch-map} new-db index-files-ch]
   (let [updated-db (-> state
                        (swap! update-commit (policy/root-db new-db))
                        :current-db)]
-    (enqueue-index! index-queue updated-db index-files-ch)
+    (when-not (:indexing-disabled indexing-opts)
+      (enqueue-index! index-queue updated-db index-files-ch))
     branch-map))
 
 (defn current-db
   "Returns current db from branch data"
   [{:keys [state] :as _branch-map}]
   (:current-db @state))
+
+(defn trigger-index!
+  "Manually triggers indexing for this branch's current db.
+   Returns immediately with complete-ch that will receive result when indexing completes.
+   The complete-ch parameter is optional - if not provided, a new channel is created."
+  ([branch-map]
+   (trigger-index! branch-map nil nil))
+  ([branch-map index-files-ch]
+   (trigger-index! branch-map index-files-ch nil))
+  ([{:keys [index-queue] :as branch-map} index-files-ch complete-ch]
+   (let [complete-ch (or complete-ch (async/chan 1))
+         current-db (current-db branch-map)]
+     (enqueue-index! index-queue current-db index-files-ch complete-ch)
+     complete-ch)))

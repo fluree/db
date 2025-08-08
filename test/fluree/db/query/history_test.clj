@@ -1,12 +1,12 @@
 (ns fluree.db.query.history-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [babashka.fs :refer [with-temp-dir]]
+            [clojure.test :refer [deftest is testing]]
             [fluree.crypto :as crypto]
             [fluree.db.api :as fluree]
             [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils :refer [pred-match?]]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.json :as json]
-            [test-with-files.tools :refer [with-tmp-dir]]))
+            [fluree.db.util :as util]
+            [fluree.db.util.json :as json]))
 
 (deftest ^:integration history-query-test
   (let [ts-primeval (util/current-time-iso)
@@ -26,47 +26,47 @@
                                                         {:id   :ex/dog
                                                          :ex/x "foo-1"
                                                          :ex/y "bar-1"}]})
-        db2  @(fluree/transact! conn {"@context" context
-                                      "ledger"   ledger-id
-                                      "delete"   {:id   :ex/dan
-                                                  :ex/x "foo-1"
-                                                  :ex/y "bar-1"}
-                                      "insert"   {:id   :ex/dan
-                                                  :ex/x "foo-2"
-                                                  :ex/y "bar-2"}})
+        db2  @(fluree/update! conn {"@context" context
+                                    "ledger"   ledger-id
+                                    "delete"   {:id   :ex/dan
+                                                :ex/x "foo-1"
+                                                :ex/y "bar-1"}
+                                    "insert"   {:id   :ex/dan
+                                                :ex/x "foo-2"
+                                                :ex/y "bar-2"}})
         ts2  (-> db2 :commit :time)
-        db3  @(fluree/transact! conn {"@context" context
-                                      "ledger"   ledger-id
-                                      "delete"   {:id   :ex/dan
-                                                  :ex/x "foo-2"
-                                                  :ex/y "bar-2"}
-                                      "insert"   {:id   :ex/dan
-                                                  :ex/x "foo-3"
-                                                  :ex/y "bar-3"}})
+        db3  @(fluree/update! conn {"@context" context
+                                    "ledger"   ledger-id
+                                    "delete"   {:id   :ex/dan
+                                                :ex/x "foo-2"
+                                                :ex/y "bar-2"}
+                                    "insert"   {:id   :ex/dan
+                                                :ex/x "foo-3"
+                                                :ex/y "bar-3"}})
 
         ts3    (-> db3 :commit :time)
-        _db4   @(fluree/transact! conn {"@context" context
-                                        "ledger"   ledger-id
-                                        "delete"   [{:id   :ex/cat
-                                                     :ex/x "foo-1"
-                                                     :ex/y "bar-1"}
-                                                    {:id   :ex/dog
-                                                     :ex/x "foo-1"
-                                                     :ex/y "bar-1"}]
-                                        "insert"   [{:id   :ex/cat
-                                                     :ex/x "foo-cat"
-                                                     :ex/y "bar-cat"}
-                                                    {:id   :ex/dog
-                                                     :ex/x "foo-dog"
-                                                     :ex/y "bar-dog"}]})
-        _db5   @(fluree/transact! conn {"@context" context
-                                        "ledger"   ledger-id
-                                        "delete"   {:id   :ex/dan
-                                                    :ex/x "foo-3"
-                                                    :ex/y "bar-3"}
-                                        "insert"   {:id   :ex/dan
-                                                    :ex/x "foo-cat"
-                                                    :ex/y "bar-cat"}})
+        _db4   @(fluree/update! conn {"@context" context
+                                      "ledger"   ledger-id
+                                      "delete"   [{:id   :ex/cat
+                                                   :ex/x "foo-1"
+                                                   :ex/y "bar-1"}
+                                                  {:id   :ex/dog
+                                                   :ex/x "foo-1"
+                                                   :ex/y "bar-1"}]
+                                      "insert"   [{:id   :ex/cat
+                                                   :ex/x "foo-cat"
+                                                   :ex/y "bar-cat"}
+                                                  {:id   :ex/dog
+                                                   :ex/x "foo-dog"
+                                                   :ex/y "bar-dog"}]})
+        _db5   @(fluree/update! conn {"@context" context
+                                      "ledger"   ledger-id
+                                      "delete"   {:id   :ex/dan
+                                                  :ex/x "foo-3"
+                                                  :ex/y "bar-3"}
+                                      "insert"   {:id   :ex/dan
+                                                  :ex/x "foo-cat"
+                                                  :ex/y "bar-cat"}})
         ledger @(fluree/load conn ledger-id)]
     (testing "subject history"
       (is (= [{:f/t       1
@@ -248,14 +248,14 @@
                                                   "insert"   [{:id   :ex/dan
                                                                :ex/x "foo-1"
                                                                :ex/y "bar-1"}]})
-            _db2   @(fluree/transact! conn {"@context" context
-                                            "ledger"   ledger-id
-                                            "delete"   {:id   :ex/dan
-                                                        :ex/x "foo-1"
-                                                        :ex/y "bar-1"}
-                                            "insert"   {:id   :ex/dan
-                                                        :ex/x "foo-2"
-                                                        :ex/y "bar-2"}})
+            _db2   @(fluree/update! conn {"@context" context
+                                          "ledger"   ledger-id
+                                          "delete"   {:id   :ex/dan
+                                                      :ex/x "foo-1"
+                                                      :ex/y "bar-1"}
+                                          "insert"   {:id   :ex/dan
+                                                      :ex/x "foo-2"
+                                                      :ex/y "bar-2"}})
             ledger @(fluree/load conn ledger-id)]
 
         (testing "no t-range cache collision"
@@ -267,7 +267,7 @@
                                           :t       {:from 2}}))))))))
 
 (deftest ^:integration ^:kaocha/pending commit-details-test
-  (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
+  (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn      (test-utils/create-conn)
           ledger-id "committest"
           context   [test-utils/default-context {:ex "http://example.org/ns/"}]
@@ -277,27 +277,27 @@
                                                 "insert"   {:id   :ex/alice
                                                             :ex/x "foo-1"
                                                             :ex/y "bar-1"}})
-          _db2   @(fluree/transact! conn {"@context" context
-                                          "ledger"   ledger-id
-                                          "insert"   {:id   :ex/alice
-                                                      :ex/x "foo-2"
-                                                      :ex/y "bar-2"}})
-          _db3   @(fluree/transact! conn {"@context" context
-                                          "ledger"   ledger-id
-                                          "insert"   {:id   :ex/alice
-                                                      :ex/x "foo-3"
-                                                      :ex/y "bar-3"}})
-          _db4   @(fluree/transact! conn {"@context" context
-                                          "ledger"   ledger-id
-                                          "insert"   {:id   :ex/cat
-                                                      :ex/x "foo-cat"
-                                                      :ex/y "bar-cat"}})
-          _db5   @(fluree/transact! conn {"@context" context
-                                          "ledger"   ledger-id
-                                          "insert"   {:id   :ex/alice
-                                                      :ex/x "foo-cat"
-                                                      :ex/y "bar-cat"}}
-                                    {:message "meow"})
+          _db2   @(fluree/update! conn {"@context" context
+                                        "ledger"   ledger-id
+                                        "insert"   {:id   :ex/alice
+                                                    :ex/x "foo-2"
+                                                    :ex/y "bar-2"}})
+          _db3   @(fluree/update! conn {"@context" context
+                                        "ledger"   ledger-id
+                                        "insert"   {:id   :ex/alice
+                                                    :ex/x "foo-3"
+                                                    :ex/y "bar-3"}})
+          _db4   @(fluree/update! conn {"@context" context
+                                        "ledger"   ledger-id
+                                        "insert"   {:id   :ex/cat
+                                                    :ex/x "foo-cat"
+                                                    :ex/y "bar-cat"}})
+          _db5   @(fluree/update! conn {"@context" context
+                                        "ledger"   ledger-id
+                                        "insert"   {:id   :ex/alice
+                                                    :ex/x "foo-cat"
+                                                    :ex/y "bar-cat"}}
+                                  {:message "meow"})
           ledger @(fluree/load conn ledger-id)]
 
       (testing "at time t"
@@ -595,7 +595,7 @@
                         history-with-commits)))))))))
 
 (deftest ^:kaocha/pending loaded-mem-ledger-history-test
-  (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
+  (with-redefs [fluree.db.util/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
     (testing "history commit details on a loaded memory ledger"
       (let [ledger-name   "loaded-history-mem"
             conn          @(fluree/connect-memory)
@@ -605,36 +605,36 @@
                                                          "insert"   {:id   :ex/alice
                                                                      :ex/x "foo-1"
                                                                      :ex/y "bar-1"}})
-            _             @(fluree/transact! conn {"@context" context
-                                                   "ledger"   ledger-name
-                                                   "delete"   {:id   :ex/alice
-                                                               :ex/x "foo-1"
-                                                               :ex/y "bar-1"}
-                                                   "insert"   {:id   :ex/alice
-                                                               :ex/x "foo-2"
-                                                               :ex/y "bar-2"}})
-            _             @(fluree/transact! conn {"@context" context
-                                                   "ledger"   ledger-name
-                                                   "delete"   {:id   :ex/alice
-                                                               :ex/x "foo-2"
-                                                               :ex/y "bar-2"}
-                                                   "insert"   {:id   :ex/alice
-                                                               :ex/x "foo-3"
-                                                               :ex/y "bar-3"}})
-            _             @(fluree/transact! conn {"@context" context
-                                                   "ledger"   ledger-name
-                                                   "insert"   {:id   :ex/cat
-                                                               :ex/x "foo-cat"
-                                                               :ex/y "bar-cat"}})
-            _             @(fluree/transact! conn {"@context" context
-                                                   "ledger"   ledger-name
-                                                   "delete"   {:id   :ex/alice
-                                                               :ex/x "foo-3"
-                                                               :ex/y "bar-3"}
-                                                   "insert"   {:id   :ex/alice
-                                                               :ex/x "foo-cat"
-                                                               :ex/y "bar-cat"}}
-                                             {:message "meow"})
+            _             @(fluree/update! conn {"@context" context
+                                                 "ledger"   ledger-name
+                                                 "delete"   {:id   :ex/alice
+                                                             :ex/x "foo-1"
+                                                             :ex/y "bar-1"}
+                                                 "insert"   {:id   :ex/alice
+                                                             :ex/x "foo-2"
+                                                             :ex/y "bar-2"}})
+            _             @(fluree/update! conn {"@context" context
+                                                 "ledger"   ledger-name
+                                                 "delete"   {:id   :ex/alice
+                                                             :ex/x "foo-2"
+                                                             :ex/y "bar-2"}
+                                                 "insert"   {:id   :ex/alice
+                                                             :ex/x "foo-3"
+                                                             :ex/y "bar-3"}})
+            _             @(fluree/update! conn {"@context" context
+                                                 "ledger"   ledger-name
+                                                 "insert"   {:id   :ex/cat
+                                                             :ex/x "foo-cat"
+                                                             :ex/y "bar-cat"}})
+            _             @(fluree/update! conn {"@context" context
+                                                 "ledger"   ledger-name
+                                                 "delete"   {:id   :ex/alice
+                                                             :ex/x "foo-3"
+                                                             :ex/y "bar-3"}
+                                                 "insert"   {:id   :ex/alice
+                                                             :ex/x "foo-cat"
+                                                             :ex/y "bar-cat"}}
+                                           {:message "meow"})
             loaded-ledger (test-utils/retry-load conn ledger-name 100)]
 
         (is (pred-match?
@@ -706,27 +706,27 @@
                                                          "insert"   {:id   :ex/alice
                                                                      :ex/x "foo-1"
                                                                      :ex/y "bar-1"}})
-            _             @(fluree/transact! conn {"@context" context
-                                                   "ledger"   ledger-name
-                                                   "insert"   {:id   :ex/alice
-                                                               :ex/x "foo-2"
-                                                               :ex/y "bar-2"}})
-            _             @(fluree/transact! conn {"@context" context
-                                                   "ledger"   ledger-name
-                                                   "insert"   {:id   :ex/alice
-                                                               :ex/x "foo-3"
-                                                               :ex/y "bar-3"}})
-            _             @(fluree/transact! conn {"@context" context
-                                                   "ledger"   ledger-name
-                                                   "insert"   {:id   :ex/cat
-                                                               :ex/x "foo-cat"
-                                                               :ex/y "bar-cat"}})
-            _             @(fluree/transact! conn {"@context" context
-                                                   "ledger"   ledger-name
-                                                   "insert"   {:id   :ex/alice
-                                                               :ex/x "foo-cat"
-                                                               :ex/y "bar-cat"}}
-                                             {:message "meow"})
+            _             @(fluree/update! conn {"@context" context
+                                                 "ledger"   ledger-name
+                                                 "insert"   {:id   :ex/alice
+                                                             :ex/x "foo-2"
+                                                             :ex/y "bar-2"}})
+            _             @(fluree/update! conn {"@context" context
+                                                 "ledger"   ledger-name
+                                                 "insert"   {:id   :ex/alice
+                                                             :ex/x "foo-3"
+                                                             :ex/y "bar-3"}})
+            _             @(fluree/update! conn {"@context" context
+                                                 "ledger"   ledger-name
+                                                 "insert"   {:id   :ex/cat
+                                                             :ex/x "foo-cat"
+                                                             :ex/y "bar-cat"}})
+            _             @(fluree/update! conn {"@context" context
+                                                 "ledger"   ledger-name
+                                                 "insert"   {:id   :ex/alice
+                                                             :ex/x "foo-cat"
+                                                             :ex/y "bar-cat"}}
+                                           {:message "meow"})
             loaded-ledger (test-utils/retry-load conn ledger-name 100)]
         (is (pred-match?
              [#:f{:assert  [{:ex/x "foo-3"
@@ -792,11 +792,11 @@
                                              :t              {:from 3}})))))))
 
 (deftest loaded-file-ledger-history-test
-  (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
+  (with-redefs [fluree.db.util/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
     (testing "history commit details on a loaded file ledger"
-      (with-tmp-dir storage-path
+      (with-temp-dir [storage-path {}]
         (let [ledger-name "loaded-history-file"
-              conn        @(fluree/connect-file {:storage-path storage-path
+              conn        @(fluree/connect-file {:storage-path (str storage-path)
                                                  :defaults     {:identity (did/private->did-map
                                                                            test-utils/default-private-key)}})
               context     [test-utils/default-context {:ex   "http://example.org/ns/"
@@ -807,36 +807,36 @@
                                                            "insert"   {:id   :ex/alice
                                                                        :ex/x "foo-1"
                                                                        :ex/y "bar-1"}})
-              _b            @(fluree/transact! conn {"@context" context
-                                                     "ledger"   ledger-name
-                                                     "delete"   {:id   :ex/alice
-                                                                 :ex/x "foo-1"
-                                                                 :ex/y "bar-1"}
-                                                     "insert"   {:id   :ex/alice
-                                                                 :ex/x "foo-2"
-                                                                 :ex/y "bar-2"}})
-              _c            @(fluree/transact! conn {"@context" context
-                                                     "ledger"   ledger-name
-                                                     "delete"   {:id   :ex/alice
-                                                                 :ex/x "foo-2"
-                                                                 :ex/y "bar-2"}
-                                                     "insert"   {:id   :ex/alice
-                                                                 :ex/x "foo-3"
-                                                                 :ex/y "bar-3"}})
-              _d            @(fluree/transact! conn {"@context" context
-                                                     "ledger"   ledger-name
-                                                     "insert"   {:id   :ex/cat
-                                                                 :ex/x "foo-cat"
-                                                                 :ex/y "bar-cat"}})
-              _e            @(fluree/transact! conn {"@context" context
-                                                     "ledger"   ledger-name
-                                                     "delete"   {:id   :ex/alice
-                                                                 :ex/x "foo-3"
-                                                                 :ex/y "bar-3"}
-                                                     "insert"   {:id   :ex/alice
-                                                                 :ex/x "foo-cat"
-                                                                 :ex/y "bar-cat"}}
-                                               {:message "meow"})
+              _b            @(fluree/update! conn {"@context" context
+                                                   "ledger"   ledger-name
+                                                   "delete"   {:id   :ex/alice
+                                                               :ex/x "foo-1"
+                                                               :ex/y "bar-1"}
+                                                   "insert"   {:id   :ex/alice
+                                                               :ex/x "foo-2"
+                                                               :ex/y "bar-2"}})
+              _c            @(fluree/update! conn {"@context" context
+                                                   "ledger"   ledger-name
+                                                   "delete"   {:id   :ex/alice
+                                                               :ex/x "foo-2"
+                                                               :ex/y "bar-2"}
+                                                   "insert"   {:id   :ex/alice
+                                                               :ex/x "foo-3"
+                                                               :ex/y "bar-3"}})
+              _d            @(fluree/update! conn {"@context" context
+                                                   "ledger"   ledger-name
+                                                   "insert"   {:id   :ex/cat
+                                                               :ex/x "foo-cat"
+                                                               :ex/y "bar-cat"}})
+              _e            @(fluree/update! conn {"@context" context
+                                                   "ledger"   ledger-name
+                                                   "delete"   {:id   :ex/alice
+                                                               :ex/x "foo-3"
+                                                               :ex/y "bar-3"}
+                                                   "insert"   {:id   :ex/alice
+                                                               :ex/x "foo-cat"
+                                                               :ex/y "bar-cat"}}
+                                             {:message "meow"})
               loaded-ledger (test-utils/retry-load conn ledger-name 100)]
           (is (pred-match?
                [#:f{:assert  [{:ex/x "foo-3"
@@ -898,58 +898,60 @@
                                                :t              {:from 3}}))))))))
 
 (deftest ^:integration author-and-txn-id
-  (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
+  (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn         @(fluree/connect-memory)
           ledger-name  "authortest"
           ledger       @(fluree/create conn ledger-name)
           context      [test-utils/default-str-context {"ex" "http://example.org/ns/"
                                                         "f"  "https://ns.flur.ee/ledger#"}]
-          root-privkey "89e0ab9ac36fb82b172890c89e9e231224264c7c757d58cfd8fcd6f3d4442199"
+          root-privkey "aa543a7aaaf45df4a17362956900e0094fcdb3a1fc1ebd36252a748533a995df"
           root-did     (:id (did/private->did-map root-privkey))
 
           db0  (fluree/db ledger)
-          db1  @(fluree/stage db0 {"@context" context
-                                   "insert"   [{"@id"         "ex:betty"
-                                                "@type"       "ex:Yeti"
-                                                "schema:name" "Betty"
-                                                "schema:age"  55}
-                                               {"@id"         "ex:freddy"
-                                                "@type"       "ex:Yeti"
-                                                "schema:name" "Freddy"
-                                                "schema:age"  1002}
-                                               {"@id"         "ex:letty"
-                                                "@type"       "ex:Yeti"
-                                                "schema:name" "Leticia"
-                                                "schema:age"  38}
-                                               {"@id"           root-did
-                                                "f:policyClass" [{"@id" "ex:RootPolicy"}]}]})
-          _db2 (->> @(fluree/stage db1 {"@context" context
-                                        "insert"   [{"@id"      "ex:defaultAllowViewModify"
-                                                     "@type"    ["f:AccessPolicy" "ex:RootPolicy"]
-                                                     "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
-                                                     "f:query"  {"@type"  "@json"
-                                                                 "@value" {}}}]})
+          db1  @(fluree/update db0 {"@context" context
+                                    "insert"   [{"@id"         "ex:betty"
+                                                 "@type"       "ex:Yeti"
+                                                 "schema:name" "Betty"
+                                                 "schema:age"  55}
+                                                {"@id"         "ex:freddy"
+                                                 "@type"       "ex:Yeti"
+                                                 "schema:name" "Freddy"
+                                                 "schema:age"  1002}
+                                                {"@id"         "ex:letty"
+                                                 "@type"       "ex:Yeti"
+                                                 "schema:name" "Leticia"
+                                                 "schema:age"  38}
+                                                {"@id"           root-did
+                                                 "f:policyClass" [{"@id" "ex:RootPolicy"}]}]})
+          _db2 (->> @(fluree/update db1 {"@context" context
+                                         "insert"   [{"@id"      "ex:defaultAllowViewModify"
+                                                      "@type"    ["f:AccessPolicy" "ex:RootPolicy"]
+                                                      "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
+                                                      "f:query"  {"@type"  "@json"
+                                                                  "@value" {}}}]})
                     (fluree/commit! ledger)
                     (deref))
 
-          _db3 @(fluree/credential-transact! conn (crypto/create-jws
-                                                   (json/stringify {"@context" context
-                                                                    "ledger"   ledger-name
-                                                                    "insert"   {"ex:foo" 3}})
-                                                   root-privkey))
+          _db3 @(fluree/credential-update! conn (crypto/create-jws
+                                                 (json/stringify {"@context" context
+                                                                  "ledger"   ledger-name
+                                                                  "insert"   {"ex:foo" 3}})
+                                                 root-privkey
+                                                 {:include-pubkey true}))
 
-          _db4 @(fluree/credential-transact! conn (crypto/create-jws
-                                                   (json/stringify {"@context" context
-                                                                    "ledger"   ledger-name
-                                                                    "insert"   {"ex:foo" 5}})
-                                                   root-privkey))]
+          _db4 @(fluree/credential-update! conn (crypto/create-jws
+                                                 (json/stringify {"@context" context
+                                                                  "ledger"   ledger-name
+                                                                  "insert"   {"ex:foo" 5}})
+                                                 root-privkey
+                                                 {:include-pubkey true}))]
       (is (= [{"f:data" {"f:t" 1}}
-              {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+              {"f:author" "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH",
                "f:data"   {"f:t" 2},
-               "f:txn"    "fluree:memory://byfkd5sj5lwq3aaxgbqkwoteakwjqqjrrvsrbhl7eirp3aizykj3"}
-              {"f:author" "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+               "f:txn"    "fluree:memory://b7klwiffbe7gvuc6zr7tcokrt7qjvjleh4pqp2fzmrbuwv6dfal5"}
+              {"f:author" "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH",
                "f:data"   {"f:t" 3},
-               "f:txn"    "fluree:memory://bsb5zixq25bktdvwtzbquwgvjii6cv4mi7mu3zbpu562oa77y5nq"}]
+               "f:txn"    "fluree:memory://b27lppnkq7qmmfeclpk6c44vui4b72qj25es7t6tsskw74d74qqj"}]
              (->> @(fluree/history ledger {:context        context
                                            :commit-details true
                                            :t              {:from 1 :to :latest}})
@@ -959,37 +961,37 @@
                               (select-keys ["f:author" "f:txn" "f:data"]))))))))))
 
 (deftest ^:integration ^:kaocha/pending include-api
-  (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
+  (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn         @(fluree/connect-memory)
           ledger-name  "authortest"
           ledger       @(fluree/create conn ledger-name)
           context      [test-utils/default-str-context {"ex" "http://example.org/ns/"
                                                         "f"  "https://ns.flur.ee/ledger#"}]
-          root-privkey "89e0ab9ac36fb82b172890c89e9e231224264c7c757d58cfd8fcd6f3d4442199"
+          root-privkey "aa543a7aaaf45df4a17362956900e0094fcdb3a1fc1ebd36252a748533a995df"
           root-did     (:id (did/private->did-map root-privkey))
 
           db0  (fluree/db ledger)
-          db1  @(fluree/stage db0 {"@context" context
-                                   "insert"   [{"@id"         "ex:betty"
-                                                "@type"       "ex:Yeti"
-                                                "schema:name" "Betty"
-                                                "schema:age"  55}
-                                               {"@id"         "ex:freddy"
-                                                "@type"       "ex:Yeti"
-                                                "schema:name" "Freddy"
-                                                "schema:age"  1002}
-                                               {"@id"         "ex:letty"
-                                                "@type"       "ex:Yeti"
-                                                "schema:name" "Leticia"
-                                                "schema:age"  38}
-                                               {"@id"           root-did
-                                                "f:policyClass" [{"@id" "ex:RootPolicy"}]}]})
-          _db2 (->> @(fluree/stage db1 {"@context" context
-                                        "insert"   [{"@id"      "ex:defaultAllowViewModify"
-                                                     "@type"    ["f:AccessPolicy" "ex:RootPolicy"]
-                                                     "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
-                                                     "f:query"  {"@type"  "@json"
-                                                                 "@value" {}}}]})
+          db1  @(fluree/update db0 {"@context" context
+                                    "insert"   [{"@id"         "ex:betty"
+                                                 "@type"       "ex:Yeti"
+                                                 "schema:name" "Betty"
+                                                 "schema:age"  55}
+                                                {"@id"         "ex:freddy"
+                                                 "@type"       "ex:Yeti"
+                                                 "schema:name" "Freddy"
+                                                 "schema:age"  1002}
+                                                {"@id"         "ex:letty"
+                                                 "@type"       "ex:Yeti"
+                                                 "schema:name" "Leticia"
+                                                 "schema:age"  38}
+                                                {"@id"           root-did
+                                                 "f:policyClass" [{"@id" "ex:RootPolicy"}]}]})
+          _db2 (->> @(fluree/update db1 {"@context" context
+                                         "insert"   [{"@id"      "ex:defaultAllowViewModify"
+                                                      "@type"    ["f:AccessPolicy" "ex:RootPolicy"]
+                                                      "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
+                                                      "f:query"  {"@type"  "@json"
+                                                                  "@value" {}}}]})
                     (fluree/commit! ledger)
                     (deref))
 
@@ -998,14 +1000,14 @@
                                  "ledger"   ledger-name
                                  "insert"   {"ex:foo" 3}})
                 root-privkey)
-          _db3 @(fluree/credential-transact! conn jws1)
+          _db3 @(fluree/credential-update! conn jws1)
 
           jws2 (crypto/create-jws
                 (json/stringify {"@context" context
                                  "ledger"   ledger-name
                                  "insert"   {"ex:foo" 5}})
                 root-privkey)
-          _db4 @(fluree/credential-transact! conn jws2)]
+          _db4 @(fluree/credential-update! conn jws2)]
 
       (testing ":txn returns the raw transaction"
         (is (= [{"f:txn" nil}
@@ -1033,7 +1035,7 @@
                               "id"         test-utils/db-id?}}}
               {"f:commit"
                {"f:alias"    "authortest",
-                "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                "f:author"   "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH",
                 "f:time"     720000,
                 "f:txn"      test-utils/address?
                 "f:previous" {"id" test-utils/commit-id?}
@@ -1049,7 +1051,7 @@
                               "id"         test-utils/db-id?}}}
               {"f:commit"
                {"f:alias"    "authortest",
-                "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                "f:author"   "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH",
                 "f:time"     720000,
                 "f:txn"      test-utils/address?
                 "f:previous" {"id" test-utils/commit-id?},
@@ -1069,7 +1071,7 @@
 
       (testing ":data returns just the asserts and retracts"
         (is (pred-match? [{"f:data" {"f:t"       1
-                                     "f:assert"  [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
+                                     "f:assert"  [{"id"            "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH"
                                                    "f:policyClass" {"id" "ex:RootPolicy"}}
                                                   {"type"        "ex:Yeti",
                                                    "schema:age"  55,
@@ -1117,7 +1119,7 @@
                             "id"         test-utils/db-id?}},
                "f:data"   {"f:t"       1,
                            "f:assert"
-                           [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
+                           [{"id"            "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH"
                              "f:policyClass" {"id" "ex:RootPolicy"}}
                             {"type"        "ex:Yeti",
                              "schema:age"  55,
@@ -1138,7 +1140,7 @@
                            "f:retract" []}}
               {"f:txn"    jws1
                "f:commit" {"f:alias"    "authortest",
-                           "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                           "f:author"   "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH",
                            "f:time"     720000,
                            "f:txn"      test-utils/address?
                            "f:previous" {"id" test-utils/commit-id?},
@@ -1158,7 +1160,7 @@
                            "f:retract" []}}
               {"f:txn"    jws2
                "f:commit" {"f:alias"    "authortest",
-                           "f:author"   "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb",
+                           "f:author"   "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH",
                            "f:time"     720000,
                            "f:txn"      test-utils/address?
                            "f:previous" {"id" test-utils/commit-id?},
@@ -1207,7 +1209,7 @@
                              "id"         test-utils/db-id?}},
                "f:data"    {"f:t"       1,
                             "f:assert"
-                            [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
+                            [{"id"            "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH"
                               "f:policyClass" {"id" "ex:RootPolicy"}}
                              {"type"        "ex:Yeti",
                               "schema:age"  55,
@@ -1258,7 +1260,7 @@
                              "id"         test-utils/db-id?}}
                "f:data"    {"f:t"       1,
                             "f:assert"
-                            [{"id"            "did:fluree:Tf8ziWxPPA511tcGtUHTLYihHSy2phNjrKb"
+                            [{"id"            "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH"
                               "f:policyClass" {"id" "ex:RootPolicy"}}
                              {"type"        "ex:Yeti",
                               "schema:age"  55,
@@ -1299,30 +1301,30 @@
 
         db0 (fluree/db ledger)]
     (testing "valid annotations"
-      (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
-        (let [db1 (->> @(fluree/stage db0 {"@context" context
-                                           "insert"   [{"@id"         "ex:betty"
-                                                        "@type"       "ex:Yeti"
-                                                        "schema:name" "Betty"
-                                                        "schema:age"  55}]})
-                       (fluree/commit! ledger)
-                       (deref))
-
-              db2 (->> @(fluree/stage db1 {"@context" context
-                                           "insert"   [{"@id"         "ex:freddy"
-                                                        "@type"       "ex:Yeti"
-                                                        "schema:name" "Freddy"
-                                                        "schema:age"  1002}]}
-                                      {:annotation {"ex:originator" "opts" "ex:data" "ok"}})
-                       (fluree/commit! ledger)
-                       (deref))
-
-              _db3 (->> @(fluree/stage db2 {"@context" context
-                                            "insert"   [{"@id"         "ex:letty"
+      (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
+        (let [db1 (->> @(fluree/update db0 {"@context" context
+                                            "insert"   [{"@id"         "ex:betty"
                                                          "@type"       "ex:Yeti"
-                                                         "schema:name" "Leticia"
-                                                         "schema:age"  38}]
-                                            "opts"     {"annotation" {"ex:originator" "txn" "ex:data" "ok"}}})
+                                                         "schema:name" "Betty"
+                                                         "schema:age"  55}]})
+                       (fluree/commit! ledger)
+                       (deref))
+
+              db2 (->> @(fluree/update db1 {"@context" context
+                                            "insert"   [{"@id"         "ex:freddy"
+                                                         "@type"       "ex:Yeti"
+                                                         "schema:name" "Freddy"
+                                                         "schema:age"  1002}]}
+                                       {:annotation {"ex:originator" "opts" "ex:data" "ok"}})
+                       (fluree/commit! ledger)
+                       (deref))
+
+              _db3 (->> @(fluree/update db2 {"@context" context
+                                             "insert"   [{"@id"         "ex:letty"
+                                                          "@type"       "ex:Yeti"
+                                                          "schema:name" "Leticia"
+                                                          "schema:age"  38}]}
+                                        {:annotation {"ex:originator" "txn" "ex:data" "ok"}})
                         (fluree/commit! ledger)
                         (deref))]
           (testing "annotations in commit-details"
@@ -1336,47 +1338,47 @@
 
       (testing "invalid annotations"
         (testing "only single annotation subject permitted"
-          (let [invalid2 @(fluree/stage db0 {"@context" context
-                                             "insert"   [{"@id"         "ex:betty"
-                                                          "@type"       "ex:Yeti"
-                                                          "schema:name" "Betty"
-                                                          "schema:age"  55}]}
-                                        {:annotation [{"ex:originator" "opts" "ex:multiple" true}
-                                                      {"ex:originator" "opts" "ex:invalid" true}]})]
+          (let [invalid2 @(fluree/update db0 {"@context" context
+                                              "insert"   [{"@id"         "ex:betty"
+                                                           "@type"       "ex:Yeti"
+                                                           "schema:name" "Betty"
+                                                           "schema:age"  55}]}
+                                         {:annotation [{"ex:originator" "opts" "ex:multiple" true}
+                                                       {"ex:originator" "opts" "ex:invalid" true}]})]
             (is (= "Commit annotation must only have a single subject." (ex-message invalid2)))))
 
         (testing "cannot specify id"
-          (let [invalid3 @(fluree/stage db0 {"@context" context
-                                             "insert"   [{"@id"         "ex:betty"
-                                                          "@type"       "ex:Yeti"
-                                                          "schema:name" "Betty"
-                                                          "schema:age"  55}]}
-                                        {:annotation [{"ex:originator" "opts" "@id" "invalid:subj"}]})]
+          (let [invalid3 @(fluree/update db0 {"@context" context
+                                              "insert"   [{"@id"         "ex:betty"
+                                                           "@type"       "ex:Yeti"
+                                                           "schema:name" "Betty"
+                                                           "schema:age"  55}]}
+                                         {:annotation [{"ex:originator" "opts" "@id" "invalid:subj"}]})]
             (is (= "Commit annotation cannot specify a subject identifier." (ex-message invalid3)))))
 
         (testing "annotation has no references"
-          (let [invalid4 @(fluree/stage db0 {"@context" context
-                                             "insert"   [{"@id"         "ex:betty"
-                                                          "@type"       "ex:Yeti"
-                                                          "schema:name" "Betty"
-                                                          "schema:age"  55}]}
-                                        {:annotation [{"ex:originator" "opts" "ex:friend" {"@id" "ex:betty"}}]})]
+          (let [invalid4 @(fluree/update db0 {"@context" context
+                                              "insert"   [{"@id"         "ex:betty"
+                                                           "@type"       "ex:Yeti"
+                                                           "schema:name" "Betty"
+                                                           "schema:age"  55}]}
+                                         {:annotation [{"ex:originator" "opts" "ex:friend" {"@id" "ex:betty"}}]})]
             (is (= "Commit annotation cannot reference other subjects." (ex-message invalid4))
                 "using id-map"))
-          (let [invalid4 @(fluree/stage db0 {"@context" context
-                                             "insert"   [{"@id"         "ex:betty"
-                                                          "@type"       "ex:Yeti"
-                                                          "schema:name" "Betty"
-                                                          "schema:age"  55}]}
-                                        {:annotation [{"ex:originator" "opts" "ex:friend"
-                                                       {"@type" "id" "@value" "ex:betty"}}]})]
+          (let [invalid4 @(fluree/update db0 {"@context" context
+                                              "insert"   [{"@id"         "ex:betty"
+                                                           "@type"       "ex:Yeti"
+                                                           "schema:name" "Betty"
+                                                           "schema:age"  55}]}
+                                         {:annotation [{"ex:originator" "opts" "ex:friend"
+                                                        {"@type" "id" "@value" "ex:betty"}}]})]
             (is (= "Commit annotation cannot reference other subjects." (ex-message invalid4))
                 "using value-map with type id"))
-          (let [invalid1 @(fluree/stage db0 {"@context" context
-                                             "insert"   [{"@id"         "ex:betty"
-                                                          "@type"       "ex:Yeti"
-                                                          "schema:name" "Betty"
-                                                          "schema:age"  55}]}
-                                        {:annotation {"ex:originator" "opts" "ex:nested" {"valid" false}}})]
+          (let [invalid1 @(fluree/update db0 {"@context" context
+                                              "insert"   [{"@id"         "ex:betty"
+                                                           "@type"       "ex:Yeti"
+                                                           "schema:name" "Betty"
+                                                           "schema:age"  55}]}
+                                         {:annotation {"ex:originator" "opts" "ex:nested" {"valid" false}}})]
             (is (= "Commit annotation cannot reference other subjects." (ex-message invalid1))
                 "using implicit blank node identifier")))))))

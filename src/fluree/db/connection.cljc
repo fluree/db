@@ -12,8 +12,8 @@
             [fluree.db.nameservice.sub :as ns-subscribe]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
+            [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
@@ -307,21 +307,28 @@
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn}
    ledger-chan address]
   (go-try
-    (if-let [commit (<? (lookup-commit conn address))]
-      (do (log/debug "Attempting to load from address:" address
-                     "with commit:" commit)
-          (let [expanded-commit (json-ld/expand commit)
-                ledger-alias    (commit->ledger-alias conn address expanded-commit)
-                branch          (-> expanded-commit
-                                    (get-first-value const/iri-branch)
-                                    (or (throw-missing-branch address ledger-alias)))
+    (if-let [ns-record (<? (lookup-commit conn address))]
+      (let [;; Extract minimal data from nameservice
+            commit-address (get-in ns-record ["f:commit" "@id"])
+            index-address  (get-in ns-record ["f:index" "@id"])
 
-                {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
-                ledger (ledger/instantiate ledger-alias address branch commit-catalog index-catalog
-                                           primary-publisher secondary-publishers indexing did expanded-commit)]
-            (ns-subscribe/subscribe-ledger conn ledger-alias)
-            (async/put! ledger-chan ledger)
-            ledger))
+            ;; Load full commit from disk
+            _              (log/debug "Attempting to load from address:" address)
+            commit         (<? (commit-storage/load-commit-with-metadata commit-catalog
+                                                                         commit-address
+                                                                         index-address))
+            expanded-commit (json-ld/expand commit)
+            ledger-alias    (commit->ledger-alias conn address expanded-commit)
+            branch          (-> expanded-commit
+                                (get-first-value const/iri-branch)
+                                (or (throw-missing-branch address ledger-alias)))
+
+            {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
+            ledger (ledger/instantiate ledger-alias address branch commit-catalog index-catalog
+                                       primary-publisher secondary-publishers indexing did expanded-commit)]
+        (ns-subscribe/subscribe-ledger conn ledger-alias)
+        (async/put! ledger-chan ledger)
+        ledger)
       (throw (ex-info (str "Unable to load. No record of ledger at address: " address " exists.")
                       {:status 404, :error :db/unkown-address})))))
 
@@ -435,20 +442,29 @@
         (loop [[publisher & r] (publishers conn)]
           (when publisher
             (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
-                  latest-commit (-> (<? (nameservice/lookup publisher ledger-addr))
-                                    json-ld/expand)]
-              (log/warn "Dropping ledger" ledger-addr)
-              (drop-index-artifacts conn latest-commit)
-              (drop-commit-artifacts conn latest-commit)
+                  ns-record     (<? (nameservice/lookup publisher ledger-addr))
+                  commit-address (get-in ns-record ["f:commit" "@id"])
+                  index-address  (get-in ns-record ["f:index" "@id"])
+                  latest-commit  (when commit-address
+                                   (let [commit (<? (commit-storage/load-commit-with-metadata
+                                                     (:commit-catalog conn)
+                                                     commit-address
+                                                     index-address))]
+                                     (when commit
+                                       (json-ld/expand commit))))]
+              (log/debug "Dropping ledger" ledger-addr)
+              (when latest-commit
+                (drop-index-artifacts conn latest-commit)
+                (drop-commit-artifacts conn latest-commit))
               (<? (nameservice/retract publisher alias))
               (recur r))))
-        (log/warn "Dropped ledger" alias)
+        (log/debug "Dropped ledger" alias)
         :dropped)
       (catch* e (log/debug e "Failed to complete ledger deletion")))))
 
 (defn resolve-txn
   "Reads a transaction from the commit catalog by address.
-   
+
    Used by fluree/server in consensus/events."
   [{:keys [commit-catalog] :as _conn} address]
   (storage/read-json commit-catalog address))
@@ -457,3 +473,25 @@
   [conn address data]
   (let [clg (-> conn :index-catalog :storage)]
     (storage/write-catalog-bytes clg address data)))
+
+(defn trigger-ledger-index
+  "Manually triggers indexing for a ledger/branch and waits for completion.
+   
+   Options:
+   - :branch - Branch name (defaults to main branch)
+   - :timeout - Max wait time in ms (default 300000 / 5 minutes)
+   
+   Returns the indexed database object or throws an exception on failure/timeout."
+  [conn ledger-alias opts]
+  (go-try
+    (let [{:keys [branch timeout]
+           :or {timeout 300000}} opts
+          ledger (<? (load-ledger-alias conn ledger-alias))
+          complete-ch (ledger/trigger-index! ledger branch)
+          timeout-ch (async/timeout timeout)]
+      (async/alt!
+        complete-ch ([result] result)
+        timeout-ch (ex-info "Indexing wait timeout, but assume indexing is proceeding in the background."
+                            {:status 408
+                             :error :db/timeout
+                             :timeout timeout})))))

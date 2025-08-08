@@ -1,5 +1,6 @@
 (ns fluree.db.storage.memory
   (:require [clojure.core.async :as async :refer [go]]
+            [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.db.storage :as storage]
             [fluree.db.util.json :as json]))
@@ -52,7 +53,17 @@
 
   (read-bytes [_ path]
     (go
-      (get @contents path))))
+      (get @contents path)))
+
+  storage/RecursiveListableStore
+  (list-paths-recursive [_ prefix]
+    ;; Memory storage already stores flat paths, so recursive is the same as regular listing
+    (go
+      (->> @contents
+           keys
+           (filter #(and (str/starts-with? % prefix)
+                         (str/ends-with? % ".json")))
+           vec))))
 
 (defn open
   ([]

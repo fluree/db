@@ -8,7 +8,7 @@
    [fluree.db.api :as fluree]
    [fluree.db.query.sparql :as sparql]
    [fluree.db.test-utils :as test-utils]
-   [fluree.db.util.core :as util :refer [try* catch*]]))
+   [fluree.db.util :as util :refer [try* catch*]]))
 
 (deftest parse-select
   (testing "basic SELECT"
@@ -40,6 +40,12 @@
                    WHERE {?friends person:friendsWith \"jdoe\".}"
             {:keys [select]} (sparql/->fql query)]
         (is (= ["(as (count ?friends) ?friends)"]
+               select))))
+    (testing "COUNT(*)"
+      (let [query "SELECT (COUNT(*) AS ?friends)
+                   WHERE {?friends person:friendsWith \"jdoe\".}"
+            {:keys [select]} (sparql/->fql query)]
+        (is (= ["(as (count *) ?friends)"]
                select))))
     (testing "COUNT DISTINCT"
       (let [query "SELECT (COUNT(DISTINCT ?handle) AS ?handles)
@@ -377,7 +383,7 @@
                         OPTIONAL {?person person:favNums ?num.}}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?person", "person:handle" "?handle"}
-              [:optional [{"@id" "?person", "person:favNums" "?num"}]]]
+              [:optional {"@id" "?person", "person:favNums" "?num"}]]
              where)))
     (testing "multi-clause"
       (let [query "SELECT ?person ?name ?handle ?favNums
@@ -387,8 +393,8 @@
             {:keys [where]} (sparql/->fql query)]
         (is (= [{"@id" "?person", "person:fullName" "?name"}
                 [:optional
-                 [{"@id" "?person", "person:handle" "?handle"}
-                  {"@id" "?person", "person:favNums" "?favNums"}]]]
+                 {"@id" "?person", "person:handle" "?handle"}
+                 {"@id" "?person", "person:favNums" "?favNums"}]]
                where))))
     (testing "OPTIONAL + FILTER"
       (let [query "SELECT ?handle ?num
@@ -398,8 +404,8 @@
             {:keys [where]} (sparql/->fql query)]
         (is (= [{"@id" "?person", "person:handle" "?handle"}
                 [:optional
-                 [{"@id" "?person", "person:favNums" "?num"}
-                  [:filter "(> ?num 10)"]]]]
+                 {"@id" "?person", "person:favNums" "?num"}
+                 [:filter "(> ?num 10)"]]]
                where)))))
   (testing "VALUES"
     (testing "pattern"
@@ -894,16 +900,53 @@
 
 (deftest parse-update
   (testing "insert data"
-    (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+    (testing "with basic triple patterns"
+      (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
                INSERT DATA
                  {
                    <http://example/book1> dc:title \"A new book\" ;
                                           dc:creator \"A.N.Other\" .
                  }"]
-      (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
-              :insert  [{"@id" "http://example/book1", "dc:title" "A new book"}
-                        {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
-             (sparql/->fql query)))))
+        (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
+                :insert  [{"@id" "http://example/book1", "dc:title" "A new book"}
+                          {"@id" "http://example/book1", "dc:creator" "A.N.Other"}]}
+               (sparql/->fql query)))))
+    (testing "with a graph pattern"
+      (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+                   INSERT DATA
+                     {
+                       GRAPH <ledger/graph1>
+                       {
+                         <http://example/book1> dc:title \"A new book\" .
+                         <http://example/book2> dc:creator \"A.N.Other\" .
+                       }
+                     }"]
+        (is (= {:context {"dc" "http://purl.org/dc/elements/1.1/"},
+                :ledger "ledger/graph1",
+                :insert
+                [{"@id" "http://example/book1", "dc:title" "A new book"}
+                 {"@id" "http://example/book2", "dc:creator" "A.N.Other"}]}
+               (sparql/->fql query)))))
+    (testing "with multiple graph patterns"
+      (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
+                   INSERT DATA
+                     {
+                       GRAPH <ledger/graph1>
+                       {
+                         <http://example/book1> dc:title \"A new book\" .
+                         <http://example/book2> dc:creator \"A.N.Other\" .
+                       }
+                       GRAPH <ledger/graph2>
+                       {
+                         <http://example/book3> dc:title \"A new book\" .
+                         <http://example/book4> dc:creator \"A.N.Other\" .
+                       }
+                     }"]
+        (is (= ["Multiple GRAPH declarations not supported in INSERT DATA."
+                {:status 400, :error :db/invalid-update}]
+               (try* (sparql/->fql query)
+                     (catch* e [(ex-message e)
+                                (ex-data e)])))))))
   (testing "delete-data"
     (let [query "PREFIX dc: <http://purl.org/dc/elements/1.1/>
                DELETE DATA
@@ -1025,7 +1068,7 @@
                        "ex:jdoe a ex:Person; person:handle \"jdoe\"; person:fullName \"Jane Doe\"; person:favNums 3, 7, 42, 99."
                        "ex:bbob a ex:Person; person:handle \"bbob\"; person:fullName \"Billy Bob\"; person:favNums 23."
                        "ex:jbob a ex:Person; person:handle \"jbob\"; person:fullName \"Jenny Bob\"; person:favNums 8, 6, 7, 5, 3, 0, 9."
-                       "ex:fbueller a ex:Person; person:handle \"dankeshön\"; person:fullName \"Ferris Bueller\"."
+                       "ex:fbueller a ex:Person; person:handle \"dankeshön\"; person:fullName \"Ferris Bueller\"; person:email \"fb@example.com\"."
                        "ex:alice foaf:givenname \"Alice\"; foaf:family_name \"Hacker\"."
                        "ex:bob foaf:firstname \"Bob\"; foaf:surname \"Hacker\"."
                        "ex:carol ex:catchphrase \"Heyyyy\"@en."
@@ -1036,7 +1079,7 @@
               (go
                 (let [conn   (<! (test-utils/create-conn))
                       ledger (<p! (fluree/create conn "people"))
-                      db     (<p! (fluree/stage (fluree/db ledger) txn {:format :sparql}))]
+                      db     (<p! (fluree/update (fluree/db ledger) txn {:format :sparql}))]
                   (testing "basic query works"
                     (let [query   "PREFIX person: <http://example.org/Person#>
                                     SELECT ?person ?fullName
@@ -1050,7 +1093,7 @@
        :clj
        (let [conn   @(fluree/connect-memory)
              ledger @(fluree/create conn "people")
-             db     @(fluree/stage (fluree/db ledger) txn {:format :sparql})]
+             db     @(fluree/update (fluree/db ledger) txn {:format :sparql})]
          (testing "basic query works"
            (let [query "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?fullName
@@ -1365,6 +1408,107 @@
                           {"value" "99",
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
+         (testing "basic query w/ multi-pattern OPTIONAL works"
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT ?person ?favNums ?email
+                          WHERE {?person person:handle ?handle.
+                                 OPTIONAL{?person person:favNums ?favNums.
+                                          ?person person:email ?email .}}"]
+             (testing "output :fql"
+               (is (= [["ex:bbob" 23 nil]
+                       ["ex:fbueller" nil "fb@example.com"]
+                       ["ex:jbob" 0 nil]
+                       ["ex:jbob" 3 nil]
+                       ["ex:jbob" 5 nil]
+                       ["ex:jbob" 6 nil]
+                       ["ex:jbob" 7 nil]
+                       ["ex:jbob" 8 nil]
+                       ["ex:jbob" 9 nil]
+                       ["ex:jdoe" 3 nil]
+                       ["ex:jdoe" 7 nil]
+                       ["ex:jdoe" 42 nil]
+                       ["ex:jdoe" 99 nil]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["email" "favNums" "person"]},
+                       "results"
+                       {"bindings"
+                        [{"person" {"type" "uri", "value" "ex:bbob"},
+                          "favNums"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "email" {"value" "", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:fbueller"},
+                          "favNums" {"value" "", "type" "literal"},
+                          "email" {"value" "fb@example.com", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "0",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "email" {"value" "", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "3",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "email" {"value" "", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "5",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "email" {"value" "", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "6",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "email" {"value" "", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "email" {"value" "", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "8",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "email" {"value" "", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:jbob"},
+                          "favNums"
+                          {"value" "9",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "email" {"value" "", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "favNums"
+                          {"value" "3",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "email" {"value" "", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "favNums"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "email" {"value" "", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "favNums"
+                          {"value" "42",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "email" {"value" "", "type" "literal"}}
+                         {"person" {"type" "uri", "value" "ex:jdoe"},
+                          "favNums"
+                          {"value" "99",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"},
+                          "email" {"value" "", "type" "literal"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "basic query w/ GROUP BY & OPTIONAL works"
            (let [query   "PREFIX person: <http://example.org/Person#>
@@ -1846,6 +1990,31 @@
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
+         (testing "COUNT(*) query works"
+           (let [query   "PREFIX person: <http://example.org/Person#>
+                          SELECT (COUNT(*) AS ?count)
+                          WHERE {?person person:favNums ?favNums.}
+                          GROUP BY ?person"]
+             (testing "output :fql"
+               (is (= [[7] [4] [1]]
+                      @(fluree/query db query {:format :sparql}))))
+             (testing "output :sparql"
+               (is (= {"head" {"vars" ["count"]},
+                       "results"
+                       {"bindings"
+                        [{"count"
+                          {"value" "7",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"count"
+                          {"value" "4",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"count"
+                          {"value" "1",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
+                      @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "SAMPLE query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
                           SELECT (SAMPLE(?favNums) AS ?favNum)
@@ -1980,9 +2149,9 @@
                            "type"                          "http://example.org/Book"
                            "http://example.org/book/title" "The Hitchhiker's Guide to the Galaxy"}]]
            (testing "BASE IRI gets prefixed onto relative IRIs"
-             (let [book-db @(fluree/stage db {"@context" [test-utils/default-str-context
-                                                          {"person" "http://example.org/Person#"}]
-                                              "insert" book-data})
+             (let [book-db @(fluree/update db {"@context" [test-utils/default-str-context
+                                                           {"person" "http://example.org/Person#"}]
+                                               "insert" book-data})
                    query   "BASE <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book <title> ?title.}"
@@ -1991,9 +2160,9 @@
                        ["2" "The Hitchhiker's Guide to the Galaxy"]]
                       results))))
            (testing "PREFIX declarations go into the context"
-             (let [book-db @(fluree/stage db {"@context" [test-utils/default-str-context
-                                                          {"person" "http://example.org/Person#"}]
-                                              "insert" book-data})
+             (let [book-db @(fluree/update db {"@context" [test-utils/default-str-context
+                                                           {"person" "http://example.org/Person#"}]
+                                               "insert" book-data})
                    query   "PREFIX book: <http://example.org/book/>
                             SELECT ?book ?title
                             WHERE {?book book:title ?title.}"

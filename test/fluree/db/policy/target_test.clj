@@ -1,20 +1,20 @@
 (ns fluree.db.policy.target-test
   (:require [clojure.test :as t :refer [deftest testing is]]
             [fluree.db.api :as fluree]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util :as util]))
 
 (def burt
-  {:id    "did:fluree:TfE2Frz2qkMjnCNJM5yPv7B8gq5Xhk5bqkm"
-   :private "400b74559de3b55c71a9c971c971f58c5f3cd76f47b23db66f5d28616b064ba3",
-   :public "021335916bd127c4b60dcb28aa1357c2d57f265cdc2e3c5b68f33a5ee428cce056"})
+  {:id    "did:key:z6MkjMMe1dHZ5Q8DxoFQpXCjhZvqswMva3WvLGUKAAabsBxr"
+   :private "4048a60cbc9eb74814808f2b67897eea4b1f01d46c166b7c4d2be7902602a66a",
+   :public "48c74639952b16d838cd2853f92c18e6c4bc9c34279599c40b2162798887dc5f"})
 (def arnold
-  {:id "did:fluree:TfGz2CczSKvzCmKTTpTtwhrPzsymLTAnorq"
-   :private "18521804b92a769e05285485ad9c5552dd699ad8b653dbb735f78b6c3e70234c",
-   :public "02ce3b41f98c4d8ff9d1466d39b4eeaf8d325cc1c0a45185647cf8a9b545d4559e"})
+  {:id "did:key:z6MkotdZEDchBwi6wVUmeDSQ97wBXnxabmorRrXPKpJFtwvc"
+   :private "a1093d046aa4982aae8668bcc276d0d14f7c7c80787e24046db774f3cc686dfb",
+   :public "8c39066e2a21d17752380c7e5a70d0670b193dc4118e5fc976c45363f2d5c6f5"})
 (def charles
-  {:id    "did:fluree:Tf5g1aNMuamUWW8hMSks9YsYTNSmGQBYCK1"
-   :private "7804d4c1ef6f22087bd81d030c6377f6065a831627351fd9e99d845fdfd5bcd2",
-   :public "02e1495d9a165732684fd17c074e99a7e236e8db90252380ec3160ecdd1a38a5ed"})
+  {:id    "did:key:z6MkqKMP8Hf71HrEgNsZp7EaPyxZZQRrgGaDxWA3bCLyzTfP"
+   :private "6f097986028c319cc3a8386aa90b620f97f0e774d03e8bec2ab23a969c2e010f",
+   :public "a169f1aeb13649e317b714078b7a429bbe5059ea43a7a781c159dcb375b78962"})
 
 (def wishlist-create {"@context"     {"a" "http://a.co/"
                                       "f" "https://ns.flur.ee/ledger#"}
@@ -106,27 +106,27 @@
   (let [conn   @(fluree/connect-memory)
         ledger @(fluree/create conn "policy/target")
         db0    (fluree/db ledger)
-        db1    @(fluree/stage db0 {"@context" {"a" "http://a.co/"}
-                                   "insert"
-                                   [{"@id"    (:id arnold)
-                                     "a:name" "Arnold"}
-                                    {"@id"    (:id burt)
-                                     "a:name" "Burt"}
-                                    {"@id"    (:id charles)
-                                     "a:name" "Chuck"}]})]
+        db1    @(fluree/update db0 {"@context" {"a" "http://a.co/"}
+                                    "insert"
+                                    [{"@id"    (:id arnold)
+                                      "a:name" "Arnold"}
+                                     {"@id"    (:id burt)
+                                      "a:name" "Burt"}
+                                     {"@id"    (:id charles)
+                                      "a:name" "Chuck"}]})]
     (testing "wishlist"
       (testing "not linked to user"
         (let [policy-db    @(fluree/wrap-policy db1 {"@graph" [wishlist-create wishlist-modify wishlist-view
                                                                item-create item-modify item-view available]}
                                                 ["?$identity" [{"@value" (:id charles) "@type" "@id"}]])
-              unauthorized @(fluree/stage policy-db {"@context" {"a" "http://a.co/"}
-                                                     "insert"
-                                                     {"@id" (:id burt)
-                                                      "a:wishlist"
-                                                      {"@id"       "a:burt-wish1"
-                                                       "a:name"    "Burt's Birthday"
-                                                       "a:summary" "My birthday wishlist"}}
-                                                     "opts"     {"meta" true}})]
+              unauthorized @(fluree/update policy-db {"@context" {"a" "http://a.co/"}
+                                                      "insert"
+                                                      {"@id" (:id burt)
+                                                       "a:wishlist"
+                                                       {"@id"       "a:burt-wish1"
+                                                        "a:name"    "Burt's Birthday"
+                                                        "a:summary" "My birthday wishlist"}}
+                                                      "opts"     {"meta" true}})]
           (is (= "User can only create a wishlist linked to their own identity."
                  (ex-message unauthorized)))
           (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 1, :allowed 0},
@@ -143,14 +143,14 @@
         (let [policy-db  @(fluree/wrap-policy db1 {"@graph" [wishlist-create wishlist-modify wishlist-view
                                                              item-create item-modify item-view available]}
                                               ["?$identity" [{"@value" (:id burt) "@type" "@id"}]])
-              txn-result @(fluree/stage policy-db {"@context" {"a" "http://a.co/"}
-                                                   "insert"
-                                                   {"@id" (:id burt)
-                                                    "a:wishlist"
-                                                    {"@id"       "a:burt-wish1"
-                                                     "a:name"    "Burt's Birthday"
-                                                     "a:summary" "My birthday wishlist"}}
-                                                   "opts"     {"meta" true}})
+              txn-result @(fluree/update policy-db {"@context" {"a" "http://a.co/"}
+                                                    "insert"
+                                                    {"@id" (:id burt)
+                                                     "a:wishlist"
+                                                     {"@id"       "a:burt-wish1"
+                                                      "a:name"    "Burt's Birthday"
+                                                      "a:summary" "My birthday wishlist"}}
+                                                    "opts"     {"meta" true}})
               authorized (:db txn-result)
               result     @(fluree/query authorized {"@context" {"a" "http://a.co/"}
                                                     "where"    [{"@id" (:id burt) "a:wishlist" "?wishlist"}]
@@ -180,26 +180,26 @@
           (is (= 1
                  (:fuel result))))))
     (testing "wishlist item"
-      (let [db2 @(fluree/stage db1 {"@context" {"a" "http://a.co/"}
-                                    "insert"
-                                    {"@id" (:id burt)
-                                     "a:wishlist"
-                                     {"@id"       "a:burt-wish1"
-                                      "a:name"    "Burt's Birthday"
-                                      "a:summary" "My birthday wishlist"}}})]
+      (let [db2 @(fluree/update db1 {"@context" {"a" "http://a.co/"}
+                                     "insert"
+                                     {"@id" (:id burt)
+                                      "a:wishlist"
+                                      {"@id"       "a:burt-wish1"
+                                       "a:name"    "Burt's Birthday"
+                                       "a:summary" "My birthday wishlist"}}})]
         (testing "not linked to owner"
           (let [policy-db    @(fluree/wrap-policy db2 {"@graph" [wishlist-create wishlist-view
                                                                  item-create item-modify item-view available]}
                                                   ["?$identity" [{"@value" (:id charles) "@type" "@id"}]])
-                unauthorized @(fluree/stage policy-db {"insert"
-                                                       {"@context" {"a" "http://a.co/"}
-                                                        "@id"      "a:burt-wish1"
-                                                        "a:item"   {"@id"           "a:burt-wish1-1"
-                                                                    "a:title"       "helicopter"
-                                                                    "a:description" "flying car, basically"
-                                                                    "a:rank"        1
-                                                                    "a:available"   true}}
-                                                       "opts" {"meta" true}})]
+                unauthorized @(fluree/update policy-db {"insert"
+                                                        {"@context" {"a" "http://a.co/"}
+                                                         "@id"      "a:burt-wish1"
+                                                         "a:item"   {"@id"           "a:burt-wish1-1"
+                                                                     "a:title"       "helicopter"
+                                                                     "a:description" "flying car, basically"
+                                                                     "a:rank"        1
+                                                                     "a:available"   true}}
+                                                        "opts" {"meta" true}})]
             (is (= "User can only create an item on their own wishlist."
                    (ex-message unauthorized)))
             (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 0, :allowed 0},
@@ -215,14 +215,14 @@
           (let [policy-db  @(fluree/wrap-policy db2 {"@graph" [wishlist-create wishlist-modify wishlist-view
                                                                item-create item-modify item-view available]}
                                                 ["?$identity" [{"@value" (:id burt) "@type" "@id"}]])
-                txn-result @(fluree/stage policy-db {"@context" {"a" "http://a.co/"}
-                                                     "insert"
-                                                     {"@id"    "a:burt-wish1"
-                                                      "a:item" {"@id"           "a:burt-wish1-1"
-                                                                "a:title"       "helicopter"
-                                                                "a:description" "flying car, basically"
-                                                                "a:rank"        1}}
-                                                     "opts"     {"meta" true}})
+                txn-result @(fluree/update policy-db {"@context" {"a" "http://a.co/"}
+                                                      "insert"
+                                                      {"@id"    "a:burt-wish1"
+                                                       "a:item" {"@id"           "a:burt-wish1-1"
+                                                                 "a:title"       "helicopter"
+                                                                 "a:description" "flying car, basically"
+                                                                 "a:rank"        1}}
+                                                      "opts"     {"meta" true}})
                 authorized (:db txn-result)
                 result     @(fluree/query authorized {"@context" {"a" "http://a.co/"}
                                                       "select"   {"a:burt-wish1-1" ["*"]}
@@ -253,32 +253,32 @@
             (is (= 3
                    (:fuel result)))))))
     (testing "item availability"
-      (let [db2 @(fluree/stage db1 {"@context" {"a" "http://a.co/"}
-                                    "insert"
-                                    {"@id" (:id burt)
-                                     "a:wishlist"
-                                     {"@id"       "a:burt-wish1"
-                                      "a:name"    "Burt's Birthday"
-                                      "a:summary" "My birthday wishlist"
-                                      "a:item"
-                                      [{"@id"           "a:burt-wish1-1"
-                                        "a:title"       "helicopter"
-                                        "a:description" "for enhanced mobility in the sky"
-                                        "a:rank"        1
-                                        "a:available"   true}
-                                       {"@id"           "a:burt-wish1-2"
-                                        "a:title"       "pogo stick"
-                                        "a:description" "for enhanced mobility on the ground"
-                                        "a:rank"        2
-                                        "a:available"   false}]}}})]
+      (let [db2 @(fluree/update db1 {"@context" {"a" "http://a.co/"}
+                                     "insert"
+                                     {"@id" (:id burt)
+                                      "a:wishlist"
+                                      {"@id"       "a:burt-wish1"
+                                       "a:name"    "Burt's Birthday"
+                                       "a:summary" "My birthday wishlist"
+                                       "a:item"
+                                       [{"@id"           "a:burt-wish1-1"
+                                         "a:title"       "helicopter"
+                                         "a:description" "for enhanced mobility in the sky"
+                                         "a:rank"        1
+                                         "a:available"   true}
+                                        {"@id"           "a:burt-wish1-2"
+                                         "a:title"       "pogo stick"
+                                         "a:description" "for enhanced mobility on the ground"
+                                         "a:rank"        2
+                                         "a:available"   false}]}}})]
         (testing "owners own item available status"
           (let [policy-db    @(fluree/wrap-policy db2 {"@graph" [wishlist-create wishlist-modify wishlist-view
                                                                  item-create item-modify item-view available]}
                                                   ["?$identity" [{"@value" (:id burt) "@type" "@id"}]])
-                unauthorized @(fluree/stage policy-db {"@context" {"a" "http://a.co/"}
-                                                       "retract"  {"@id" "a:burt-wish1-2" "a:available" false}
-                                                       "insert"   {"@id" "a:burt-wish1-2" "a:available" true}
-                                                       "opts"     {"meta" true}})]
+                unauthorized @(fluree/update policy-db {"@context" {"a" "http://a.co/"}
+                                                        "retract"  {"@id" "a:burt-wish1-2" "a:available" false}
+                                                        "insert"   {"@id" "a:burt-wish1-2" "a:available" true}
+                                                        "opts"     {"meta" true}})]
             (testing "cannot be modified by owner"
               (is (= "User cannot modify available status on their own items."
                      (ex-message unauthorized)))
@@ -314,9 +314,9 @@
           (let [policy-db  @(fluree/wrap-policy db2 {"@graph" [wishlist-create wishlist-modify wishlist-view
                                                                item-create item-modify item-view available]}
                                                 ["?$identity" [{"@value" (:id charles) "@type" "@id"}]])
-                authorized @(fluree/stage policy-db {"@context" {"a" "http://a.co/"}
-                                                     "retract"  {"@id" "a:burt-wish1-1" "a:available" true}
-                                                     "insert"   {"@id" "a:burt-wish1-1" "a:available" false}})]
+                authorized @(fluree/update policy-db {"@context" {"a" "http://a.co/"}
+                                                      "retract"  {"@id" "a:burt-wish1-1" "a:available" true}
+                                                      "insert"   {"@id" "a:burt-wish1-1" "a:available" false}})]
             (testing "can be modified by non-owner"
               (is (nil? (ex-message authorized))))
             (testing "can be viewed by non-owner"
@@ -373,35 +373,35 @@
          "f:query"          {"@type"  "@json"
                              "@value" {"where" [["filter" "(not= 1 1)"]]}}}
 
-        db1 @(fluree/stage db0 {"@context" {"ex" "http://example.org/ns/"
-                                            "f"  "https://ns.flur.ee/ledger#"}
-                                "insert"
-                                [{"@id"               "ex:data-0",
-                                  "@type"             "ex:Data",
-                                  "ex:classification" 0}
-                                 {"@id"                  "ex:data-1",
-                                  "@type"                "ex:Data",
-                                  "ex:classification"    1
-                                  "ex:secretProperty"    "secret 1"
-                                  "ex:secretPropertyTwo" "second secret 1"}
-                                 {"@id"                  "ex:data-2",
-                                  "@type"                "ex:Data",
-                                  "ex:classification"    2
-                                  "ex:secretProperty"    "secret 2"
-                                  "ex:secretPropertyTwo" "second secret 2"}
+        db1 @(fluree/update db0 {"@context" {"ex" "http://example.org/ns/"
+                                             "f"  "https://ns.flur.ee/ledger#"}
+                                 "insert"
+                                 [{"@id"               "ex:data-0",
+                                   "@type"             "ex:Data",
+                                   "ex:classification" 0}
+                                  {"@id"                  "ex:data-1",
+                                   "@type"                "ex:Data",
+                                   "ex:classification"    1
+                                   "ex:secretProperty"    "secret 1"
+                                   "ex:secretPropertyTwo" "second secret 1"}
+                                  {"@id"                  "ex:data-2",
+                                   "@type"                "ex:Data",
+                                   "ex:classification"    2
+                                   "ex:secretProperty"    "secret 2"
+                                   "ex:secretPropertyTwo" "second secret 2"}
                                  ;; note below is of class ex:Other, not ex:Data
-                                 {"@id"               "ex:other",
-                                  "@type"             "ex:Other",
-                                  "ex:classification" -99}
+                                  {"@id"               "ex:other",
+                                   "@type"             "ex:Other",
+                                   "ex:classification" -99}
                                  ;; a node that refers to items in ex:Data which, if
                                  ;; pulled in a graph crawl, should still be restricted
-                                 {"@id"          "ex:referred",
-                                  "@type"        "ex:Referrer",
-                                  "ex:referData" [{"@id" "ex:data-0"}
-                                                  {"@id" "ex:data-1"}
-                                                  {"@id" "ex:data-2"}]}
+                                  {"@id"          "ex:referred",
+                                   "@type"        "ex:Referrer",
+                                   "ex:referData" [{"@id" "ex:data-0"}
+                                                   {"@id" "ex:data-1"}
+                                                   {"@id" "ex:data-2"}]}
 
-                                 classification-policy double-property-policy]})]
+                                  classification-policy double-property-policy]})]
     (testing "without default allow"
       (is (= [{"@type"             "ex:Data"
                "ex:classification" 0
@@ -422,9 +422,9 @@
                                  "opts"     {"policyClass" "ex:UnclassPolicy"}}))
           "ex:Other class should not be restricted"))
     (testing "with default allow"
-      (let [db2 @(fluree/stage db1 {"@context" {"ex" "http://example.org/ns/"
-                                                "f"  "https://ns.flur.ee/ledger#"}
-                                    "insert"   [default-policy]})]
+      (let [db2 @(fluree/update db1 {"@context" {"ex" "http://example.org/ns/"
+                                                 "f"  "https://ns.flur.ee/ledger#"}
+                                     "insert"   [default-policy]})]
         (testing "using opts.policyClass"
           (is (= [{"@type"             "ex:Data"
                    "ex:classification" 0
@@ -491,14 +491,14 @@
     (let [conn   @(fluree/connect-memory)
           ledger @(fluree/create conn "policy/target-policy-exception")
           db0    (fluree/db ledger)
-          db1    @(fluree/stage db0 {"@context" {"a" "http://a.co/"}
-                                     "insert"
-                                     [{"@id"    (:id arnold)
-                                       "a:name" "Arnold"}
-                                      {"@id"    (:id burt)
-                                       "a:name" "Burt"}
-                                      {"@id"    (:id charles)
-                                       "a:name" "Chuck"}]})
+          db1    @(fluree/update db0 {"@context" {"a" "http://a.co/"}
+                                      "insert"
+                                      [{"@id"    (:id arnold)
+                                        "a:name" "Arnold"}
+                                       {"@id"    (:id burt)
+                                        "a:name" "Burt"}
+                                       {"@id"    (:id charles)
+                                        "a:name" "Chuck"}]})
           bad-policy [{"@context" {"ex" "http://example.org/ns/"
                                    "f"  "https://ns.flur.ee/ledger#"}
                        "@id"             "ex:badSubjectPolicy"

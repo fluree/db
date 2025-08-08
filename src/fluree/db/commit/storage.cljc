@@ -4,9 +4,9 @@
             [fluree.db.constants :as const]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.storage :as storage]
+            [fluree.db.util :as util :refer [get-first get-first-id
+                                             get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [get-first get-first-id
-                                                  get-first-value try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
@@ -97,6 +97,21 @@
                                       (str (subs (str commit) 0 500) "...")
                                       (str commit))})))))
 
+(defn load-commit-with-metadata
+  "Loads commit from disk and merges nameservice metadata (address, index)"
+  [storage commit-address index-address]
+  (go-try
+    (when-let [commit-data (<? (storage/read-json storage commit-address))]
+      (let [addr-key-path (if (contains? commit-data "credentialSubject")
+                            ["credentialSubject" "address"]
+                            ["address"])
+            index-key-path (if (contains? commit-data "credentialSubject")
+                             ["credentialSubject" "index" "address"]
+                             ["index" "address"])]
+        (-> commit-data
+            (assoc-in addr-key-path commit-address)
+            (cond-> index-address (assoc-in index-key-path index-address)))))))
+
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
   First commit will be t value of `from-t` and increment from there."
@@ -117,14 +132,11 @@
 
             (if (= from-t commit-t)
               (async/onto-chan! resp-ch commit-tuples*)
-              (let [verified-commit (try*
-                                      (<? (read-verified-commit storage prev-commit-addr))
-                                      (catch* e
-                                        (log/error e "Error tracing commits")
-                                        (>! error-ch e)))]
+              (when-let [verified-commit (<? (read-verified-commit storage prev-commit-addr))]
                 (recur verified-commit commit-t commit-tuples*)))))
         (catch* e
-          (>! resp-ch e)
+          (log/error e "Error tracing commits")
+          (>! error-ch e)
           (async/close! resp-ch))))
     resp-ch))
 

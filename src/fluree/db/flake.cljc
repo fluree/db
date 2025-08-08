@@ -4,7 +4,7 @@
             [clojure.data.avl :as avl]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.util.core :as util])
+            [fluree.db.util :as util])
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -497,23 +497,22 @@
   reference: https://www.javamex.com/tutorials/memory/string_memory_usage.shtml"
   [^Flake f]
   (let [o       (o f)
-        o-size  (#?@(:clj (util/case+)
-                     :cljs (condp =)) (dt f)
-                                      const/$xsd:string (* 2 (count o))
-                                      const/$id 30
-                                      const/$xsd:boolean 1
-                                      const/$xsd:long 8
-                                      const/$xsd:int 4
-                                      const/$xsd:short 2
-                                      const/$xsd:double 8
-                                      const/$xsd:float 4
-                                      const/$xsd:byte 1
+        o-size  (condp = (dt f)
+                  const/$xsd:string (* 2 (count o))
+                  const/$id 30
+                  const/$xsd:boolean 1
+                  const/$xsd:long 8
+                  const/$xsd:int 4
+                  const/$xsd:short 2
+                  const/$xsd:double 8
+                  const/$xsd:float 4
+                  const/$xsd:byte 1
                   ;; else
-                                      (if (number? o)
-                                        8
-                                        (if (string? o)
-                                          (* 2 (count o))
-                                          (* 2 (count (pr-str o))))))]
+                  (if (number? o)
+                    8
+                    (if (string? o)
+                      (* 2 (count o))
+                      (* 2 (count (pr-str o))))))]
     (cond-> (+ flake-size-base o-size)
       (m f) (* 2 (count (pr-str (m f)))))))
 

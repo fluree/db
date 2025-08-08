@@ -3,8 +3,8 @@
             [clojure.string :as str]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.util.xhttp :as xhttp]))
@@ -138,6 +138,9 @@
     (remote-lookup system-state ledger-address))
   (alias [_ ledger-address]
     ledger-address)
+  (all-records [_]
+    ;; TODO - add querying all records in remote system
+    (go-try []))
 
   nameservice/Publication
   (subscribe [_ ledger-alias]

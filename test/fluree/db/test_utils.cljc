@@ -1,10 +1,11 @@
 (ns fluree.db.test-utils
-  (:require #?@(:cljs [[clojure.core.async.interop :refer [<p!]]
+  (:require #?(:clj [fluree.db.storage.s3 :as s3])
+            #?@(:cljs [[clojure.core.async.interop :refer [<p!]]
                        [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]])
             [clojure.string :as str]
             [fluree.db.api :as fluree]
             [fluree.db.did :as did]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]))
 
 (def default-context
@@ -155,8 +156,8 @@
   [conn]
   (let [ledger @(fluree/create conn "test/movies")]
     (doseq [movie movies]
-      (let [staged @(fluree/stage (fluree/db ledger) {"@context" default-str-context
-                                                      "insert" movie})]
+      (let [staged @(fluree/update (fluree/db ledger) {"@context" default-str-context
+                                                       "insert" movie})]
         @(fluree/commit! ledger staged
                          {:message (str "Commit " (get movie "name"))
                           :push?   true})))
@@ -167,9 +168,9 @@
   (#?(:clj do, :cljs go)
     (let [ledger-p (fluree/create conn "test/people")
           ledger   #?(:clj @ledger-p :cljs (<p! ledger-p))
-          staged-p (fluree/stage (fluree/db ledger) {"@context" [default-context
-                                                                 {:ex "http://example.org/ns/"}]
-                                                     "insert" people})
+          staged-p (fluree/update (fluree/db ledger) {"@context" [default-context
+                                                                  {:ex "http://example.org/ns/"}]
+                                                      "insert" people})
           staged   #?(:clj @staged-p, :cljs (<p! staged-p))
           commit-p (fluree/commit! ledger staged {:message "Adding people"
                                                   :push? true})]
@@ -232,7 +233,7 @@
   "[0-9a-fA-F]")
 
 (def did-regex
-  (re-pattern (str "did:fluree:" base58-pattern "{35}")))
+  (re-pattern (str "did:key:z" base58-pattern "+")))
 
 (defn did?
   [s]
@@ -334,3 +335,13 @@
           :shacl/violation)
        (= (error-status x)
           422)))
+
+#?(:clj
+   (defn s3-available?
+     "Check if S3 is available (using AWS credentials)"
+     []
+     (try
+       (let [credentials (s3/get-credentials)]
+         (boolean credentials))
+       (catch Exception _
+         false))))

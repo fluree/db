@@ -7,7 +7,7 @@
   (testing "Simple compound queries."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/compounda")
-          db     @(fluree/stage
+          db     @(fluree/update
                    (fluree/db ledger)
                    {"@context" [test-utils/default-context
                                 {:ex "http://example.org/ns/"}]

@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fluree Browser SDK Demo</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <h1>🚀 Fluree Browser SDK Demo</h1>
+    
+    <div class="container">
+        <h2>Step 1: Initialize Connection & Ledger</h2>
+        <div class="step">
+            <span class="step-number">1.1</span> Create a connection to Fluree
+            <br><br>
+            <button id="connectMemoryBtn" onclick="createConnection('memory')">Create Memory Connection</button>
+            <button id="connectLocalStorageBtn" onclick="createConnection('localStorage')">Create LocalStorage Connection</button>
+            <div id="connectionStatus" class="status pending">Status: Not connected</div>
+        </div>
+        
+        <div class="step">
+            <span class="step-number">1.2</span> Create a new ledger
+            <br><br>
+            <button id="createLedgerBtn" onclick="createLedger()" disabled>Create Ledger</button>
+            <div id="ledgerStatus" class="status pending">Status: No ledger created</div>
+        </div>
+    </div>
+    
+    <div class="container">
+        <h2>Step 2: Insert JSON-LD Data</h2>
+        <div class="step">
+            <span class="step-number">2.1</span> Edit the JSON-LD data below and insert it into the ledger
+            <br><br>
+            <textarea id="jsonldData">{
+  "@context": {
+    "schema": "http://schema.org/",
+    "ex": "http://example.org/"
+  },
+  "insert": [
+    {
+      "@id": "ex:person1",
+      "@type": "schema:Person",
+      "schema:name": "Alice Johnson",
+      "schema:age": 30,
+      "schema:email": "alice@example.com",
+      "ex:department": "Engineering",
+      "ex:skills": ["JavaScript", "Python", "Machine Learning"]
+    },
+    {
+      "@id": "ex:person2", 
+      "@type": "schema:Person",
+      "schema:name": "Bob Smith",
+      "schema:age": 25,
+      "schema:email": "bob@example.com",
+      "ex:department": "Design",
+      "ex:skills": ["UI/UX", "Photoshop", "Figma"]
+    },
+    {
+      "@id": "ex:company",
+      "@type": "schema:Organization",
+      "schema:name": "Tech Corp",
+      "schema:url": "https://techcorp.com",
+      "ex:employees": [
+        {"@id": "ex:person1"},
+        {"@id": "ex:person2"}
+      ]
+    }
+  ]
+}</textarea>
+            <br>
+            <button id="insertBtn" onclick="insertData()" disabled>Insert Data</button>
+            <div id="insertStatus" class="status pending">Status: No data inserted</div>
+        </div>
+    </div>
+    
+    <div class="container">
+        <h2>Step 3: Query the Data</h2>
+        <div class="step">
+            <span class="step-number">3.1</span> Try different queries on the inserted data
+            <br><br>
+            
+            <button id="queryAllBtn" onclick="queryAllPeople()" disabled>Query All People</button>
+            <button id="queryCompanyBtn" onclick="queryCompany()" disabled>Query Company</button>
+            <button id="querySkillsBtn" onclick="queryBySkills()" disabled>Query by Skills</button>
+            <br><br>
+            
+            <strong>Custom Query:</strong>
+            <textarea id="customQuery">{
+  "@context": {
+    "schema": "http://schema.org/",
+    "ex": "http://example.org/"
+  },
+  "select": {"?person": ["*"]},
+  "where": {
+    "@id": "?person",
+    "@type": "schema:Person",
+    "schema:age": "?age"
+  }
+}</textarea>
+            <br>
+            <button id="customQueryBtn" onclick="executeCustomQuery()" disabled>Execute Custom Query</button>
+        </div>
+    </div>
+    
+    <div class="container">
+        <h2>Results</h2>
+        <div id="output" class="output">Ready to start...</div>
+    </div>
+
+    <script type="module" src="demo.js"></script>
+</body>
+</html>

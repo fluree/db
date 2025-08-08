@@ -43,6 +43,9 @@
 (def file-path
   (system-iri "filePath"))
 
+(def aes256-key
+  (system-iri "AES256Key"))
+
 (def s3-bucket
   (system-iri "s3Bucket"))
 
@@ -108,6 +111,9 @@
 
 (def max-old-indexes
   (system-iri "maxOldIndexes"))
+
+(def indexing-disabled
+  (system-iri "indexingDisabled"))
 
 (def connection
   (system-iri "connection"))

@@ -5,7 +5,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph :as vg]
             [fluree.db.virtual-graph.bm25.search :as bm25.search]

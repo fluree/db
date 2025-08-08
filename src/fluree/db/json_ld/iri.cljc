@@ -1,14 +1,16 @@
 (ns fluree.db.json-ld.iri
   (:require [clojure.set :refer [map-invert]]
             [clojure.string :as str]
-            [fluree.db.util.core :as util]
+            [fluree.db.util :as util]
             [nano-id.core :refer [nano-id]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(def ^:const fluree-context-url "https://ns.flur.ee/ledger/v1")
+
 (def ^:const f-ns "https://ns.flur.ee/ledger#")
 (def ^:const f-idx-ns "https://ns.flur.ee/index#")
-(def ^:const f-did-ns "did:fluree:")
+(def ^:const f-did-ns "did:key:")
 (def ^:const f-commit-256-ns "fluree:commit:sha256:")
 (def ^:const fdb-256-ns "fluree:db:sha256:")
 (def ^:const f-mem-ns "fluree:memory://")

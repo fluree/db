@@ -27,7 +27,7 @@
             (if (iri/sid? o)
               (iri/decode-sid db o)
               o))
-        r reasoned-rule?]
+        r (-> f meta :reasoned)]
     [s p o r]))
 
 (defn reasoned-facts

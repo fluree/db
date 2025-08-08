@@ -41,7 +41,7 @@
         db0     (fluree/db ledger)
         context {"person" "http://example.org/Person#"
                  "ex" "http://example.org/"}
-        db1     @(fluree/stage db0 {"@context" context "insert" people-data})]
+        db1     @(fluree/update db0 {"@context" context "insert" people-data})]
     (testing "basic"
       (is (= {"@context" {"person" "http://example.org/Person#", "ex" "http://example.org/"}
               "@graph"
