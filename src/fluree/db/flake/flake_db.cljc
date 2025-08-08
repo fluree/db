@@ -544,13 +544,21 @@
                          (<? (index-storage/read-db-root index-catalog address))
                          (genesis-root-map ledger-alias))
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
+           ;; Ensure commit map reflects loaded index t when an index address exists
+           commit-map* (if (get-in commit-map [:index :address])
+                         (update commit-map :index
+                                 (fn [idx]
+                                   (let [existing-data (:data idx)
+                                         updated-data  (assoc (or existing-data {}) :t (:t root-map))]
+                                     (assoc idx :data updated-data))))
+                         commit-map)
            indexed-db  (-> root-map
                            (add-reindex-thresholds indexing-opts)
                            (assoc :index-catalog index-catalog
                                   :commit-catalog commit-catalog
                                   :alias ledger-alias
                                   :branch branch
-                                  :commit commit-map
+                                  :commit commit-map*
                                   :tt-id nil
                                   :comparators index/comparators
                                   :staged nil
