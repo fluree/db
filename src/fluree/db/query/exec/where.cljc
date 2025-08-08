@@ -29,6 +29,10 @@
   (-> (unmatched-var var-sym)
       (assoc ::optional var-sym)))
 
+(defn get-optional
+  [match]
+  (::optional match))
+
 (defn match-value
   ([mch x]
    (assoc mch ::val x))
@@ -468,58 +472,66 @@
       [nil o-fn*])
     [o o-fn]))
 
+(defn comparable-iri?
+  "When matching against"
+  [x]
+  (or (iri/sid? x) (nil? x)))
+
+(defn unmatched-optional-vars?
+  [triple-pattern]
+  (not-empty (keep get-optional triple-pattern)))
+
 (defn resolve-flake-range
-  [{:keys [t] :as db} tracker error-ch [s-mch p-mch o-mch]]
+  [{:keys [t] :as db} tracker error-ch [s-mch p-mch o-mch :as triple-pattern]]
   (let [s    (or (get-sid s-mch db)
                  (get-value s-mch))
-        s-fn (::fn s-mch)
         p    (or (get-sid p-mch db)
                  (get-value p-mch))
-        p-fn (::fn p-mch)
-        o    (or (get-value o-mch)
-                 (get-sid o-mch db))
-        o-fn (::fn o-mch)
-        o-dt (some->> o-mch get-datatype-iri (iri/encode-iri db))
+        o    (or (get-sid o-mch db)
+                 (get-value o-mch))]
+    (if (or (unmatched-optional-vars? triple-pattern)
+            (not (comparable-iri? s))
+            (not (comparable-iri? p)))
+      ;; no flakes will ever match the given triple pattern
+      (async/onto-chan (async/chan) [])
 
-        idx         (try* (index/for-components s p o o-dt)
-                          (catch* e
-                            (log/error e "Error resolving flake range")
-                            (async/put! error-ch e)))
-        [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
-        start-flake (flake/create s p o* o-dt nil nil util/min-integer)
-        end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
-        track-fuel  (track/track-fuel! tracker error-ch)
-        subj-filter (when s-fn
-                      (filter (fn [f]
-                                (-> unmatched
-                                    (match-subject db f)
-                                    s-fn))))
-        pred-filter (when p-fn
-                      (filter (fn [f]
-                                (-> unmatched
-                                    (match-predicate db f)
-                                    p-fn))))
-        obj-filter  (when o-fn*
-                      (filter (fn [f]
-                                (-> unmatched
-                                    (match-object db f)
-                                    o-fn*))))
-        flake-xf    (->> [subj-filter pred-filter obj-filter track-fuel]
-                         (remove nil?)
-                         (apply comp))
-        opts        {:idx         idx
-                     :to-t        t
-                     :start-flake start-flake
-                     :end-flake   end-flake
-                     :flake-xf    flake-xf}]
-    (if (and (or (iri/sid? s) (nil? s))
-             (or (iri/sid? p) (nil? p))
-             ;; no unmatched optional vars allowed
-             (empty? (keep ::optional [s-mch p-mch o-mch])))
-      ;; check for matching flake
-      (query-range/resolve-flake-slices db tracker idx error-ch opts)
-      ;; cannot return any flakes
-      (async/onto-chan (async/chan) []))))
+      (let [s-fn (::fn s-mch)
+            p-fn (::fn p-mch)
+            o-fn (::fn o-mch)
+            o-dt (some->> o-mch get-datatype-iri (iri/encode-iri db))
+
+            idx         (try* (index/for-components s p o o-dt)
+                              (catch* e
+                                      (log/error e "Error resolving flake range")
+                                      (async/put! error-ch e)))
+            [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
+            start-flake (flake/create s p o* o-dt nil nil util/min-integer)
+            end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
+            track-fuel  (track/track-fuel! tracker error-ch)
+            subj-filter (when s-fn
+                          (filter (fn [f]
+                                    (-> unmatched
+                                        (match-subject db f)
+                                        s-fn))))
+            pred-filter (when p-fn
+                          (filter (fn [f]
+                                    (-> unmatched
+                                        (match-predicate db f)
+                                        p-fn))))
+            obj-filter  (when o-fn*
+                          (filter (fn [f]
+                                    (-> unmatched
+                                        (match-object db f)
+                                        o-fn*))))
+            flake-xf    (->> [subj-filter pred-filter obj-filter track-fuel]
+                             (remove nil?)
+                             (apply comp))
+            opts        {:idx         idx
+                         :to-t        t
+                         :start-flake start-flake
+                         :end-flake   end-flake
+                         :flake-xf    flake-xf}]
+        (query-range/resolve-flake-slices db tracker idx error-ch opts)))))
 
 (defn compute-sid
   [s-mch db]
