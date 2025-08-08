@@ -73,14 +73,21 @@
       (<? (transact! conn ledger-id parsed-txn)))))
 
 (defn update!
-  [conn txn override-opts]
-  (go-try
-    (let [{:keys [ledger-id] :as parsed-txn}
-          (-> txn
-              (parse/parse-sparql override-opts)
-              (parse/ensure-ledger)
-              (parse/parse-update-txn override-opts))]
-      (<? (transact! conn ledger-id parsed-txn)))))
+  ([conn txn override-opts]
+   (go-try
+     (let [{:keys [ledger-id] :as parsed-txn}
+           (-> txn
+               (parse/parse-sparql override-opts)
+               (parse/ensure-ledger)
+               (parse/parse-update-txn override-opts))]
+       (<? (transact! conn ledger-id parsed-txn)))))
+  ([conn ledger-id txn override-opts]
+   (go-try
+     (let [parsed-txn (-> txn
+                          (parse/parse-sparql override-opts)
+                          (parse/parse-update-txn override-opts)
+                          (assoc :ledger-id ledger-id))]
+       (<? (transact! conn ledger-id parsed-txn))))))
 
 (defn credential-transact!
   "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.
