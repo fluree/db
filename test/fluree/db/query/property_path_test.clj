@@ -4,8 +4,8 @@
 
 (deftest transitive-paths
   (let [conn   @(fluree/connect-memory)
-        ledger @(fluree/create conn "property/path")
-        db0    (fluree/db ledger)]
+        db0 @(fluree/create conn "property/path")
+        db0    db0]
     (testing "one+"
       (testing "no variables"
         (let [db1 @(fluree/update db0 {"insert"

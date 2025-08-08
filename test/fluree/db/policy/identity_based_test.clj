@@ -7,11 +7,11 @@
 (deftest ^:integration property-policy-query-identity
   (testing "Identity-based policy restrictions."
     (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "policy/property-policy-query-identity")
+          db0    @(fluree/create conn "policy/property-policy-query-identity")
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           db        @(fluree/update
-                      (fluree/db ledger)
+                      db0
                       {"@context" {"ex"     "http://example.org/ns/"
                                    "schema" "http://schema.org/"
                                    "f"      "https://ns.flur.ee/ledger#"}

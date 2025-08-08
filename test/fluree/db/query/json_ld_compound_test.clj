@@ -6,9 +6,9 @@
 (deftest ^:integration simple-compound-queries
   (testing "Simple compound queries."
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/compounda")
+          db0 @(fluree/create conn "query/compounda")
           db     @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" [test-utils/default-context
                                 {:ex "http://example.org/ns/"}]
                     "insert"

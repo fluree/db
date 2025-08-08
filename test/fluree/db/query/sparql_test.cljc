@@ -1078,8 +1078,8 @@
        (async done
               (go
                 (let [conn   (<! (test-utils/create-conn))
-                      ledger (<p! (fluree/create conn "people"))
-                      db     (<p! (fluree/update (fluree/db ledger) txn {:format :sparql}))]
+                      db0 (<p! (fluree/create conn "people"))
+                      db     (<p! (fluree/update db0 txn {:format :sparql}))]
                   (testing "basic query works"
                     (let [query   "PREFIX person: <http://example.org/Person#>
                                     SELECT ?person ?fullName
@@ -1092,8 +1092,8 @@
 
        :clj
        (let [conn   @(fluree/connect-memory)
-             ledger @(fluree/create conn "people")
-             db     @(fluree/update (fluree/db ledger) txn {:format :sparql})]
+             db0 @(fluree/create conn "people")
+             db     @(fluree/update db0 txn {:format :sparql})]
          (testing "basic query works"
            (let [query "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?fullName

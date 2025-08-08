@@ -7,9 +7,8 @@
 (deftest ^:integration equivalent-properties-test
   (testing "Equivalent properties"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "query/equivalent-properties")
-          db      (-> ledger
-                      (fluree/db)
+          db0 @(fluree/create conn "query/equivalent-properties")
+          db      (-> db0
                       (fluree/update {"@context" {"vocab1" "http://vocab1.example.org/"
                                                   "vocab2" "http://vocab2.example.org/"
                                                   "vocab3" "http://vocab3.example.fr/"
@@ -73,9 +72,8 @@
 (deftest ^:integration rdfs-subpropertyof-test
   (testing "Sub-properties - rdfs:subPropertyOf"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/rdfs-subpropertyof")
-          db     (-> ledger
-                     (fluree/db)
+          db0 @(fluree/create conn "query/rdfs-subpropertyof")
+          db     (-> db0
                      (fluree/update {"@context" {"ex"   "http://example.org/ns/"
                                                  "rdf"  "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
                                                  "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
@@ -145,8 +143,8 @@
 (deftest ^:integration subjects-as-predicates
   (testing "predicate iri-cache loookups"
     (let [conn    @(fluree/connect-memory)
-          ledger  @(fluree/create conn "propertypathstest")
-          db0     (fluree/db ledger)
+          db0 @(fluree/create conn "propertypathstest")
+          db0     db0
           context [test-utils/default-str-context {"ex" "http://example.com/"}]
           db1     @(fluree/update db0 {"@context" context
                                        "insert"   [{"@id"            "ex:unlabeled-pred"
@@ -218,10 +216,10 @@
           context   [test-utils/default-str-context
                      {"ex"  "http://example.com/"
                       "owl" "http://www.w3.org/2002/07/owl#"}]
-          ledger    @(fluree/create conn ledger-id)
-          _db0      (->> @(fluree/update (fluree/db ledger) {"@context" context
-                                                             "insert"   {"ex:new" true}})
-                         (fluree/commit! ledger)
+          db0 @(fluree/create conn ledger-id)
+          _db0      (->> @(fluree/update db0 {"@context" context
+                                              "insert"   {"ex:new" true}})
+                         (fluree/commit! conn ledger-id)
                          (deref))
 
           _db1 @(fluree/update!
@@ -249,7 +247,7 @@
                                       "ex:fool" false
                                       "ex:cool" true}]})
           loaded @(fluree/load conn ledger-id)
-          dbl    (fluree/db loaded)]
+          dbl    loaded]
       (testing "before load"
         (is (= [{"id" "ex:dan", "ex:givenName" "Dan"}
                 {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}]

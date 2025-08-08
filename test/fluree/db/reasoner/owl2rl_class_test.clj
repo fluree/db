@@ -8,8 +8,8 @@
 (deftest ^:integration rdfs-subclassof
   (testing "adding subClassOf declarations within the reasoning data set"
     (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "reasoner/owl-equiv" nil)
-          db-base   @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/owl-equiv" nil)
+          db-base   @(fluree/update db0
                                     {"@context" {"ex" "http://example.org/"}
                                      "insert"   [{"@id"     "ex:brian"
                                                   "@type"   "ex:Person"
@@ -64,8 +64,8 @@
 (deftest ^:integration owl-equivalent-class
   (testing "owl:equivalentClass test"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "reasoner/owl-equiv" nil)
-          db-base @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/owl-equiv" nil)
+          db-base @(fluree/update db0
                                   {"@context" {"ex" "http://example.org/"}
                                    "insert"   [{"@id"     "ex:brian"
                                                 "@type"   "ex:Person"
@@ -141,8 +141,8 @@
 (deftest ^:integration owl-restriction-has-value
   (testing "owl:Restriction hasValue test - cls-hv1, cls-hv2"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "reasoner/owl-cls-hv" nil)
-          db-base @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/owl-cls-hv" nil)
+          db-base @(fluree/update db0
                                   {"@context" {"ex" "http://example.org/"}
                                    "insert"   [{"@id"           "ex:alice"
                                                 "@type"         "ex:Person"
@@ -202,8 +202,8 @@
 (deftest ^:integration owl-restriction-some-values-from,
   (testing "owl:Restriction owl:someValuesFrom test - cls-svf1, cls-svf2"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "reasoner/owl-cls-svf" nil)
-          db-base @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/owl-cls-svf" nil)
+          db-base @(fluree/update db0
                                   {"@context" {"ex" "http://example.org/"}
                                    "insert"   [{"@id"   "ex:winery1"
                                                 "@type" "ex:Winery"}
@@ -287,8 +287,8 @@
 (deftest ^:integration owl-max-cardinality
   (testing "owl:maxCardinality test - rule cls-maxc2 (cls-maxc1 is 'false' and ignored)"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "reasoner/owl-max-card" nil)
-          db-base @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/owl-max-card" nil)
+          db-base @(fluree/update db0
                                   {"@context" {"ex" "http://example.org/"}
                                    "insert"   [{"@id"       "ex:brian"
                                                 "@type"     "ex:Person"
@@ -355,8 +355,8 @@
 (deftest ^:integration owl-max-qual-cardinality
   (testing "owl:maxQualifiedCardinality test - rules cls-maxqc3, cls-maxqc4"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "reasoner/owl-max-qual-card" nil)
-          db-base @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/owl-max-qual-card" nil)
+          db-base @(fluree/update db0
                                   {"@context" {"ex" "http://example.org/"}
                                    "insert"   [{"@id"       "ex:brian"
                                                 "@type"     "ex:Person"
@@ -467,8 +467,8 @@
 (deftest ^:integration owl-one-of
   (testing "owl:oneOf test - rule cls-oo"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "reasoner/owl-one-of" nil)
-          db-base @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/owl-one-of" nil)
+          db-base @(fluree/update db0
                                   {"@context" {"ex" "http://example.org/"}
                                    "insert"   [{"@id"      "ex:widget"
                                                 "ex:color" {"@id" "ex:Red"}}
@@ -539,8 +539,8 @@
 (deftest ^:integration owl-intersection-of
   (testing "owl:intersectionOf tests - rules cls-int1, cls-int2, scm-int"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "reasoner/owl-intersection" nil)
-          db-base @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/owl-intersection" nil)
+          db-base @(fluree/update db0
                                   {"@context" {"ex" "http://example.org/"}
                                    "insert"   [{"@id"   "ex:carol"
                                                 "@type" ["ex:Woman" "ex:Parent"]}
@@ -613,8 +613,8 @@
 (deftest ^:integration owl-union-of
   (testing "owl:unionOf tests - rules cls-uni, scm-uni"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "reasoner/owl-union" nil)
-          db-base @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/owl-union" nil)
+          db-base @(fluree/update db0
                                   {"@context" {"ex" "http://example.org/"}
                                    "insert"   [{"@id"   "ex:carol"
                                                 "@type" "ex:Mother"}

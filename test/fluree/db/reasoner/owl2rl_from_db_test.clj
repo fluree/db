@@ -5,8 +5,8 @@
 (deftest ^:integration owl-stored-in-host-db
   (testing "Testing nested owl restrictions coming from same db as data"
     (let [conn          (test-utils/create-conn)
-          ledger        @(fluree/create conn "reasoner/owl-in-db" nil)
-          db-base       @(fluree/update (fluree/db ledger)
+          db0 @(fluree/create conn "reasoner/owl-in-db" nil)
+          db-base       @(fluree/update db0
                                         {"@context" {"ex" "http://example.org/"}
                                          "insert"   [{"@id"   "ex:winery1"
                                                       "@type" "ex:Winery"}

@@ -67,7 +67,7 @@
                                       "insert"   {:id   :ex/dan
                                                   :ex/x "foo-cat"
                                                   :ex/y "bar-cat"}})
-        ledger @(fluree/load conn ledger-id)]
+        _      @(fluree/load conn ledger-id)]
     (testing "subject history"
       (is (= [{:f/t       1
                :f/assert  [{:id :ex/dan :ex/x "foo-1" :ex/y "bar-1"}]
@@ -81,9 +81,9 @@
               {:f/t       5
                :f/assert  [{:id :ex/dan :ex/x "foo-cat" :ex/y "bar-cat"}]
                :f/retract [{:id :ex/dan :ex/x "foo-3" :ex/y "bar-3"}]}]
-             @(fluree/history ledger {:context context
-                                      :history :ex/dan
-                                      :t       {:from 1}}))))
+             @(fluree/history conn ledger-id {:context context
+                                              :history :ex/dan
+                                              :t       {:from 1}}))))
     (testing "one-tuple flake history"
       (is (= [{:f/t       1
                :f/assert  [{:id :ex/dan :ex/x "foo-1" :ex/y "bar-1"}]
@@ -97,9 +97,9 @@
               {:f/t       5
                :f/assert  [{:ex/x "foo-cat" :ex/y "bar-cat" :id :ex/dan}]
                :f/retract [{:ex/x "foo-3" :ex/y "bar-3" :id :ex/dan}]}]
-             @(fluree/history ledger {:context context
-                                      :history [:ex/dan]
-                                      :t       {:from 1}}))))
+             @(fluree/history conn ledger-id {:context context
+                                              :history [:ex/dan]
+                                              :t       {:from 1}}))))
     (testing "two-tuple flake history"
       (is (= [{:f/t 1 :f/assert [{:ex/x "foo-1" :id :ex/dan}] :f/retract []}
               {:f/t       2
@@ -111,9 +111,9 @@
               {:f/t       5
                :f/assert  [{:ex/x "foo-cat" :id :ex/dan}]
                :f/retract [{:ex/x "foo-3" :id :ex/dan}]}]
-             @(fluree/history ledger {:context context
-                                      :history [:ex/dan :ex/x]
-                                      :t       {:from 1}})))
+             @(fluree/history conn ledger-id {:context context
+                                              :history [:ex/dan :ex/x]
+                                              :t       {:from 1}})))
 
       (is (= [{:f/t       1
                :f/assert  #{{:ex/x "foo-1" :id :ex/dog}
@@ -134,42 +134,42 @@
               {:f/t       5
                :f/assert  #{{:ex/x "foo-cat" :id :ex/dan}}
                :f/retract #{{:ex/x "foo-3" :id :ex/dan}}}]
-             (->> @(fluree/history ledger {:context context
-                                           :history [nil :ex/x]
-                                           :t       {:from 1}})
+             (->> @(fluree/history conn ledger-id {:context context
+                                                   :history [nil :ex/x]
+                                                   :t       {:from 1}})
                   (mapv #(-> % (update :f/assert set) (update :f/retract set)))))))
     (testing "three-tuple flake history"
       (is (= [{:f/t 4 :f/assert [{:ex/x "foo-cat" :id :ex/cat}] :f/retract []}
               {:f/t 5 :f/assert [{:ex/x "foo-cat" :id :ex/dan}] :f/retract []}]
-             @(fluree/history ledger {:context context
-                                      :history [nil :ex/x "foo-cat"]
-                                      :t       {:from 1}})))
+             @(fluree/history conn ledger-id {:context context
+                                              :history [nil :ex/x "foo-cat"]
+                                              :t       {:from 1}})))
       (is (= [{:f/t       2
                :f/assert  [{:ex/x "foo-2" :id :ex/dan}]
                :f/retract []}
               {:f/t       3
                :f/assert  []
                :f/retract [{:ex/x "foo-2" :id :ex/dan}]}]
-             @(fluree/history ledger {:context context
-                                      :history [nil :ex/x "foo-2"]
-                                      :t       {:from 1}})))
+             @(fluree/history conn ledger-id {:context context
+                                              :history [nil :ex/x "foo-2"]
+                                              :t       {:from 1}})))
       (is (= [{:f/t 5 :f/assert [{:ex/x "foo-cat" :id :ex/dan}] :f/retract []}]
-             @(fluree/history ledger {:context context
-                                      :history [:ex/dan :ex/x "foo-cat"]
-                                      :t       {:from 1}}))))
+             @(fluree/history conn ledger-id {:context context
+                                              :history [:ex/dan :ex/x "foo-cat"]
+                                              :t       {:from 1}}))))
 
     (testing "at-t"
       (let [expected [{:f/t       3
                        :f/assert  [{:ex/x "foo-3" :id :ex/dan}]
                        :f/retract [{:ex/x "foo-2" :id :ex/dan}]}]]
         (is (= expected
-               @(fluree/history ledger {:context context
-                                        :history [:ex/dan :ex/x]
-                                        :t       {:from 3 :to 3}})))
+               @(fluree/history conn ledger-id {:context context
+                                                :history [:ex/dan :ex/x]
+                                                :t       {:from 3 :to 3}})))
         (is (= expected
-               @(fluree/history ledger {:context context
-                                        :history [:ex/dan :ex/x]
-                                        :t       {:at 3}})))))
+               @(fluree/history conn ledger-id {:context context
+                                                :history [:ex/dan :ex/x]
+                                                :t       {:at 3}})))))
     (testing "from-t"
       (is (= [{:f/t       3
                :f/assert  [{:ex/x "foo-3" :id :ex/dan}]
@@ -177,9 +177,9 @@
               {:f/t       5
                :f/assert  [{:ex/x "foo-cat" :id :ex/dan}]
                :f/retract [{:ex/x "foo-3" :id :ex/dan}]}]
-             @(fluree/history ledger {:context context
-                                      :history [:ex/dan :ex/x]
-                                      :t       {:from 3}}))))
+             @(fluree/history conn ledger-id {:context context
+                                              :history [:ex/dan :ex/x]
+                                              :t       {:from 3}}))))
     (testing "to-t"
       (is (= [{:f/t       1
                :f/assert  [{:ex/x "foo-1" :id :ex/dan}]
@@ -190,9 +190,9 @@
               {:f/t       3
                :f/assert  [{:ex/x "foo-3" :id :ex/dan}]
                :f/retract [{:ex/x "foo-2" :id :ex/dan}]}]
-             @(fluree/history ledger {:context context
-                                      :history [:ex/dan :ex/x]
-                                      :t       {:to 3}}))))
+             @(fluree/history conn ledger-id {:context context
+                                              :history [:ex/dan :ex/x]
+                                              :t       {:to 3}}))))
     (testing "t-range"
       (is (= [{:f/t       2
                :f/assert  [{:ex/x "foo-2" :id :ex/dan}]
@@ -203,9 +203,9 @@
               {:f/t       4
                :f/assert  [{:ex/x "foo-cat" :id :ex/cat} {:ex/x "foo-dog" :id :ex/dog}]
                :f/retract [{:ex/x "foo-1" :id :ex/cat} {:ex/x "foo-1" :id :ex/dog}]}]
-             @(fluree/history ledger {:context context
-                                      :history [nil :ex/x]
-                                      :t       {:from 2 :to 4}}))))
+             @(fluree/history conn ledger-id {:context context
+                                              :history [nil :ex/x]
+                                              :t       {:from 2 :to 4}}))))
     (testing "datetime-t"
       (is (= [{:f/t       2
                :f/assert  [{:ex/x "foo-2" :id :ex/dan}]
@@ -213,28 +213,28 @@
               {:f/t       3
                :f/assert  [{:ex/x "foo-3" :id :ex/dan}]
                :f/retract [{:ex/x "foo-2" :id :ex/dan}]}]
-             @(fluree/history ledger {:context context
-                                      :history [nil :ex/x]
-                                      :t       {:from ts2 :to ts3}}))
+             @(fluree/history conn ledger-id {:context context
+                                              :history [nil :ex/x]
+                                              :t       {:from ts2 :to ts3}}))
           "does not include t 1 4 or 5")
       (is (= [{:f/t       5
                :f/assert  [{:ex/x "foo-cat" :id :ex/dan}]
                :f/retract [{:ex/x "foo-3" :id :ex/dan}]}]
-             @(fluree/history ledger {:context context
-                                      :history [:ex/dan :ex/x]
-                                      :t       {:from (util/current-time-iso)}}))
+             @(fluree/history conn ledger-id {:context context
+                                              :history [:ex/dan :ex/x]
+                                              :t       {:from (util/current-time-iso)}}))
           "timestamp translates to first t before ts")
 
       (is (= (str "There is no data as of " ts-primeval)
-             (-> @(fluree/history ledger {:context context
-                                          :history [:ex/dan :ex/x]
-                                          :t       {:from ts-primeval}})
+             (-> @(fluree/history conn ledger-id {:context context
+                                                  :history [:ex/dan :ex/x]
+                                                  :t       {:from ts-primeval}})
                  Throwable->map
                  :cause))))
 
     #_(testing "invalid query"
         (is (= "History query not properly formatted. Provided {:history []}"
-               (-> @(fluree/history ledger {:history []})
+               (-> @(fluree/history conn ledger-id {:history []})
                    Throwable->map
                    :cause))))
 
@@ -256,15 +256,15 @@
                                           "insert"   {:id   :ex/dan
                                                       :ex/x "foo-2"
                                                       :ex/y "bar-2"}})
-            ledger @(fluree/load conn ledger-id)]
+            _      @(fluree/load conn ledger-id)]
 
         (testing "no t-range cache collision"
           (is (= [{:f/t       2
                    :f/assert  [{:ex/x "foo-2" :ex/y "bar-2" :id :ex/dan}]
                    :f/retract [{:ex/x "foo-1" :ex/y "bar-1" :id :ex/dan}]}]
-                 @(fluree/history ledger {:context context
-                                          :history [:ex/dan]
-                                          :t       {:from 2}}))))))))
+                 @(fluree/history conn ledger-id {:context context
+                                                  :history [:ex/dan]
+                                                  :t       {:from 2}}))))))))
 
 (deftest ^:integration ^:kaocha/pending commit-details-test
   (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
@@ -298,7 +298,7 @@
                                                     :ex/x "foo-cat"
                                                     :ex/y "bar-cat"}}
                                   {:message "meow"})
-          ledger @(fluree/load conn ledger-id)]
+          _      @(fluree/load conn ledger-id)]
 
       (testing "at time t"
         (is (pred-match?
@@ -321,9 +321,9 @@
                           :f/time    720000
                           :f/v       1
                           :id        test-utils/commit-id?}}]
-             @(fluree/history ledger {:context        context
-                                      :commit-details true
-                                      :t              {:from 1 :to 1}})))
+             @(fluree/history conn ledger-id {:context        context
+                                              :commit-details true
+                                              :t              {:from 1 :to 1}})))
         (let [commit-5 {:f/commit {"https://www.w3.org/2018/credentials#issuer" {:id test-utils/did?}
                                    :f/address                                   test-utils/address?
                                    :f/alias                                     "committest"
@@ -364,18 +364,18 @@
                                    :id         test-utils/commit-id?}}]
           (is (pred-match?
                [commit-4 commit-5]
-               @(fluree/history ledger {:context        context
-                                        :commit-details true
-                                        :t              {:from 4 :to 5}})))
+               @(fluree/history conn ledger-id {:context        context
+                                                :commit-details true
+                                                :t              {:from 4 :to 5}})))
           (is (pred-match?
                [commit-5]
-               @(fluree/history ledger {:context        context
-                                        :commit-details true
-                                        :t              {:at :latest}})))))
+               @(fluree/history conn ledger-id {:context        context
+                                                :commit-details true
+                                                :t              {:at :latest}})))))
 
       (testing "time range"
         (let [[c2 c3 c4 :as response] @(fluree/history
-                                        ledger
+                                        conn ledger-id
                                         {:context        context
                                          :commit-details true
                                          :t              {:from 2 :to 4}})]
@@ -489,9 +489,9 @@
                           :f/time     720000
                           :f/v        1
                           :id         test-utils/commit-id?}}]
-             @(fluree/history ledger {:context        context
-                                      :commit-details true
-                                      :t              {:from 4}}))))
+             @(fluree/history conn ledger-id {:context        context
+                                              :commit-details true
+                                              :t              {:from 4}}))))
 
       (testing "time range to"
         (is (pred-match?
@@ -513,9 +513,9 @@
                           :f/time     720000
                           :f/v        1
                           :id         test-utils/commit-id?}}]
-             @(fluree/history ledger {:context        context
-                                      :commit-details true
-                                      :t              {:to 1}}))))
+             @(fluree/history conn ledger-id {:context        context
+                                              :commit-details true
+                                              :t              {:to 1}}))))
 
       (testing "history commit details"
         (is (pred-match?
@@ -574,16 +574,16 @@
                              :ex/y "bar-3"
                              :id   :ex/alice}]
                   :t       5}]
-             @(fluree/history ledger {:context        context
-                                      :history        :ex/alice
-                                      :commit-details true
-                                      :t              {:from 3}}))))
+             @(fluree/history conn ledger-id {:context        context
+                                              :history        :ex/alice
+                                              :commit-details true
+                                              :t              {:from 3}}))))
 
       (testing "multiple history results"
-        (let [history-with-commits @(fluree/history ledger {:context        context
-                                                            :history        :ex/alice
-                                                            :commit-details true
-                                                            :t              {:from 1 :to 5}})]
+        (let [history-with-commits @(fluree/history conn ledger-id {:context        context
+                                                                    :history        :ex/alice
+                                                                    :commit-details true
+                                                                    :t              {:from 1 :to 5}})]
           (testing "all `t`s with changes to subject are returned"
             (is (= [1 2 3 5]
                    (mapv :f/t history-with-commits))))
@@ -635,7 +635,7 @@
                                                              :ex/x "foo-cat"
                                                              :ex/y "bar-cat"}}
                                            {:message "meow"})
-            loaded-ledger (test-utils/retry-load conn ledger-name 100)]
+            _             (test-utils/retry-load conn ledger-name 100)]
 
         (is (pred-match?
              [#:f{:assert  [{:ex/x "foo-3"
@@ -691,10 +691,10 @@
                              :ex/y "bar-3"
                              :id   :ex/alice}]
                   :t       5}]
-             @(fluree/history loaded-ledger {:context        context
-                                             :history        :ex/alice
-                                             :commit-details true
-                                             :t              {:from 3}})))))
+             @(fluree/history conn ledger-name {:context        context
+                                                :history        :ex/alice
+                                                :commit-details true
+                                                :t              {:from 3}})))))
 
     (testing "history commit details on a loaded memory ledger w/ issuer"
       (let [ledger-name "loaded-history-mem-issuer"
@@ -727,7 +727,7 @@
                                                              :ex/x "foo-cat"
                                                              :ex/y "bar-cat"}}
                                            {:message "meow"})
-            loaded-ledger (test-utils/retry-load conn ledger-name 100)]
+            _             (test-utils/retry-load conn ledger-name 100)]
         (is (pred-match?
              [#:f{:assert  [{:ex/x "foo-3"
                              :ex/y "bar-3"
@@ -786,10 +786,10 @@
                              :ex/y "bar-3"
                              :id   :ex/alice}]
                   :t       5}]
-             @(fluree/history loaded-ledger {:context        context
-                                             :history        :ex/alice
-                                             :commit-details true
-                                             :t              {:from 3}})))))))
+             @(fluree/history conn ledger-name {:context        context
+                                                :history        :ex/alice
+                                                :commit-details true
+                                                :t              {:from 3}})))))))
 
 (deftest loaded-file-ledger-history-test
   (with-redefs [fluree.db.util/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
@@ -837,7 +837,7 @@
                                                                :ex/x "foo-cat"
                                                                :ex/y "bar-cat"}}
                                              {:message "meow"})
-              loaded-ledger (test-utils/retry-load conn ledger-name 100)]
+              _             (test-utils/retry-load conn ledger-name 100)]
           (is (pred-match?
                [#:f{:assert  [{:ex/x "foo-3"
                                :ex/y "bar-3"
@@ -892,22 +892,22 @@
                                :ex/y "bar-3"
                                :id   :ex/alice}]
                     :t       5}]
-               @(fluree/history loaded-ledger {:context        context
-                                               :history        :ex/alice
-                                               :commit-details true
-                                               :t              {:from 3}}))))))))
+               @(fluree/history conn ledger-name {:context        context
+                                                  :history        :ex/alice
+                                                  :commit-details true
+                                                  :t              {:from 3}}))))))))
 
 (deftest ^:integration author-and-txn-id
   (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn         @(fluree/connect-memory)
           ledger-name  "authortest"
-          ledger       @(fluree/create conn ledger-name)
+          _            @(fluree/create conn ledger-name)
           context      [test-utils/default-str-context {"ex" "http://example.org/ns/"
                                                         "f"  "https://ns.flur.ee/ledger#"}]
           root-privkey "aa543a7aaaf45df4a17362956900e0094fcdb3a1fc1ebd36252a748533a995df"
           root-did     (:id (did/private->did-map root-privkey))
 
-          db0  (fluree/db ledger)
+          db0  @(fluree/db conn ledger-name)
           db1  @(fluree/update db0 {"@context" context
                                     "insert"   [{"@id"         "ex:betty"
                                                  "@type"       "ex:Yeti"
@@ -929,7 +929,7 @@
                                                       "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
                                                       "f:query"  {"@type"  "@json"
                                                                   "@value" {}}}]})
-                    (fluree/commit! ledger)
+                    (fluree/commit! conn)
                     (deref))
 
           _db3 @(fluree/credential-update! conn (crypto/create-jws
@@ -952,9 +952,9 @@
               {"f:author" "did:key:z6MkpnKbLoFoSoAznjgwzjK3agNFki2T9y2BohSmrE2MAaqH",
                "f:data"   {"f:t" 3},
                "f:txn"    "fluree:memory://b27lppnkq7qmmfeclpk6c44vui4b72qj25es7t6tsskw74d74qqj"}]
-             (->> @(fluree/history ledger {:context        context
-                                           :commit-details true
-                                           :t              {:from 1 :to :latest}})
+             (->> @(fluree/history conn ledger-name {:context        context
+                                                     :commit-details true
+                                                     :t              {:from 1 :to :latest}})
                   (mapv (fn [c]
                           (-> (get c "f:commit")
                               (update "f:data" select-keys ["f:t"])
@@ -964,13 +964,13 @@
   (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn         @(fluree/connect-memory)
           ledger-name  "authortest"
-          ledger       @(fluree/create conn ledger-name)
+          _            @(fluree/create conn ledger-name)
           context      [test-utils/default-str-context {"ex" "http://example.org/ns/"
                                                         "f"  "https://ns.flur.ee/ledger#"}]
           root-privkey "aa543a7aaaf45df4a17362956900e0094fcdb3a1fc1ebd36252a748533a995df"
           root-did     (:id (did/private->did-map root-privkey))
 
-          db0  (fluree/db ledger)
+          db0  @(fluree/db conn ledger-name)
           db1  @(fluree/update db0 {"@context" context
                                     "insert"   [{"@id"         "ex:betty"
                                                  "@type"       "ex:Yeti"
@@ -992,7 +992,7 @@
                                                       "f:action" [{"@id" "f:view"}, {"@id" "f:modify"}]
                                                       "f:query"  {"@type"  "@json"
                                                                   "@value" {}}}]})
-                    (fluree/commit! ledger)
+                    (fluree/commit! conn)
                     (deref))
 
           jws1 (crypto/create-jws
@@ -1013,9 +1013,9 @@
         (is (= [{"f:txn" nil}
                 {"f:txn" jws1}
                 {"f:txn" jws2}]
-               @(fluree/history ledger {:context context
-                                        :txn     true
-                                        :t       {:from 1 :to :latest}}))))
+               @(fluree/history conn ledger-name {:context context
+                                                  :txn     true
+                                                  :t       {:from 1 :to :latest}}))))
 
       (testing ":commit returns just the commit wrapper"
         (is (pred-match?
@@ -1065,9 +1065,9 @@
                               "f:size"     pos-int?,
                               "f:t"        3,
                               "id"         test-utils/db-id?}}}]
-             @(fluree/history ledger {:context context
-                                      :commit  true
-                                      :t       {:from 1 :to :latest}}))))
+             @(fluree/history conn ledger-name {:context context
+                                                :commit  true
+                                                :t       {:from 1 :to :latest}}))))
 
       (testing ":data returns just the asserts and retracts"
         (is (pred-match? [{"f:data" {"f:t"       1
@@ -1096,9 +1096,9 @@
                           {"f:data" {"f:t"       3
                                      "f:assert"  [{"ex:foo" 5, "id" test-utils/blank-node-id?}],
                                      "f:retract" []}}]
-                         @(fluree/history ledger {:context context
-                                                  :data    true
-                                                  :t       {:from 1 :to :latest}}))))
+                         @(fluree/history conn ledger-name {:context context
+                                                            :data    true
+                                                            :t       {:from 1 :to :latest}}))))
 
       (testing ":commit :data :and txn can be composed together"
         (is (pred-match?
@@ -1178,11 +1178,11 @@
                "f:data"   {"f:t"       3
                            "f:assert"  [{"ex:foo" 5, "id" test-utils/blank-node-id?}],
                            "f:retract" []}}]
-             @(fluree/history ledger {:context context
-                                      :txn     true
-                                      :data    true
-                                      :commit  true
-                                      :t       {:from 1 :to :latest}}))))
+             @(fluree/history conn ledger-name {:context context
+                                                :txn     true
+                                                :data    true
+                                                :commit  true
+                                                :t       {:from 1 :to :latest}}))))
 
       (testing ":commit :data :and txn can be composed together with history"
         (is (pred-match?
@@ -1228,12 +1228,12 @@
                               "schema:name" "Leticia",
                               "id"          "ex:letty"}],
                             "f:retract" []}}]
-             @(fluree/history ledger {:context context
-                                      :history "ex:freddy"
-                                      :txn     true
-                                      :data    true
-                                      :commit  true
-                                      :t       {:from 1 :to :latest}}))))
+             @(fluree/history conn ledger-name {:context context
+                                                :history "ex:freddy"
+                                                :txn     true
+                                                :data    true
+                                                :commit  true
+                                                :t       {:from 1 :to :latest}}))))
 
       (testing ":commit :data :and txn can be composed together with commit-details"
         (is (pred-match?
@@ -1286,20 +1286,20 @@
                               "f:targetNode" {"id" "f:allNodes"},
                               "id"           "ex:rootPolicy"}],
                             "f:retract" []}}]
-             @(fluree/history ledger {:context context
-                                      :history "ex:freddy"
-                                      :txn     true
-                                      :data    true
-                                      :commit  true
-                                      :t       {:from 1 :to :latest}})))))))
+             @(fluree/history conn ledger-name {:context context
+                                                :history "ex:freddy"
+                                                :txn     true
+                                                :data    true
+                                                :commit  true
+                                                :t       {:from 1 :to :latest}})))))))
 
 (deftest ^:integration txn-annotation
   (let [conn        @(fluree/connect-memory)
         ledger-name "annotationtest"
-        ledger      @(fluree/create conn ledger-name)
+        _           @(fluree/create conn ledger-name)
         context     [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
 
-        db0 (fluree/db ledger)]
+        db0 @(fluree/db conn ledger-name)]
     (testing "valid annotations"
       (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
         (let [db1 (->> @(fluree/update db0 {"@context" context
@@ -1307,7 +1307,7 @@
                                                          "@type"       "ex:Yeti"
                                                          "schema:name" "Betty"
                                                          "schema:age"  55}]})
-                       (fluree/commit! ledger)
+                       (fluree/commit! conn)
                        (deref))
 
               db2 (->> @(fluree/update db1 {"@context" context
@@ -1316,7 +1316,7 @@
                                                          "schema:name" "Freddy"
                                                          "schema:age"  1002}]}
                                        {:annotation {"ex:originator" "opts" "ex:data" "ok"}})
-                       (fluree/commit! ledger)
+                       (fluree/commit! conn)
                        (deref))
 
               _db3 (->> @(fluree/update db2 {"@context" context
@@ -1325,15 +1325,15 @@
                                                           "schema:name" "Leticia"
                                                           "schema:age"  38}]}
                                         {:annotation {"ex:originator" "txn" "ex:data" "ok"}})
-                        (fluree/commit! ledger)
+                        (fluree/commit! conn)
                         (deref))]
           (testing "annotations in commit-details"
             (is (pred-match? [{}
                               {"f:annotation" {"id" test-utils/blank-node-id? "ex:data" "ok" "ex:originator" "opts"}}
                               {"f:annotation" {"id" test-utils/blank-node-id? "ex:data" "ok" "ex:originator" "txn"}}]
-                             (->> @(fluree/history ledger {:context        context
-                                                           :commit-details true
-                                                           :t              {:from 1 :to :latest}})
+                             (->> @(fluree/history conn ledger-name {:context        context
+                                                                     :commit-details true
+                                                                     :t              {:from 1 :to :latest}})
                                   (mapv (fn [c] (-> c (get "f:commit") (select-keys ["f:txn" "f:annotation"]))))))))))
 
       (testing "invalid annotations"

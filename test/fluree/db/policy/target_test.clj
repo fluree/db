@@ -104,8 +104,7 @@
                                     ["filter" "(not= ?owner ?$identity)"]]}}})
 (deftest wishlist-scenario
   (let [conn   @(fluree/connect-memory)
-        ledger @(fluree/create conn "policy/target")
-        db0    (fluree/db ledger)
+        db0    @(fluree/create conn "policy/target")
         db1    @(fluree/update db0 {"@context" {"a" "http://a.co/"}
                                     "insert"
                                     [{"@id"    (:id arnold)
@@ -341,8 +340,7 @@
 
 (deftest policy-class-test
   (let [conn   @(fluree/connect-memory)
-        ledger @(fluree/create conn "policy/target")
-        db0    (fluree/db ledger)
+        db0    @(fluree/create conn "policy/target")
 
         default-policy
         {"@id"      "ex:defaultAllowView"
@@ -489,8 +487,7 @@
 (deftest ^:integration target-policy-exception
   (testing "Invalid policy target queries throw exceptions"
     (let [conn   @(fluree/connect-memory)
-          ledger @(fluree/create conn "policy/target-policy-exception")
-          db0    (fluree/db ledger)
+          db0    @(fluree/create conn "policy/target-policy-exception")
           db1    @(fluree/update db0 {"@context" {"a" "http://a.co/"}
                                       "insert"
                                       [{"@id"    (:id arnold)

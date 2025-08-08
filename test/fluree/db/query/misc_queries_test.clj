@@ -6,14 +6,14 @@
             [fluree.db.util :as util]))
 
 (deftest ^:integration result-formatting
-  (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query-context")
-        db     @(fluree/update (fluree/db ledger) {"@context" [test-utils/default-context
-                                                               {:ex "http://example.org/ns/"}]
-                                                   "insert"   [{:id :ex/dan :ex/x 1}
-                                                               {:id :ex/wes :ex/x 2}]})]
-
-    @(fluree/commit! ledger db)
+  (let [conn         (test-utils/create-conn)
+        ledger-alias "query-context"
+        _            @(fluree/create conn ledger-alias)
+        db           @(fluree/update @(fluree/db conn ledger-alias) {"@context" [test-utils/default-context
+                                                                                 {:ex "http://example.org/ns/"}]
+                                                                     "insert"   [{:id :ex/dan :ex/x 1}
+                                                                                 {:id :ex/wes :ex/x 2}]})
+        db           @(fluree/commit! conn db)]
 
     (testing "current query"
       (is (= [{:id   :ex/dan
@@ -63,43 +63,43 @@
       (is (= [{:f/t       1
                :f/assert  [{:id :ex/dan :ex/x 1}]
                :f/retract []}]
-             @(fluree/history ledger {:context [test-utils/default-context
-                                                {:ex "http://example.org/ns/"}]
-                                      :history :ex/dan :t {:from 1}}))
+             @(fluree/history conn ledger-alias {:context [test-utils/default-context
+                                                           {:ex "http://example.org/ns/"}]
+                                                 :history :ex/dan :t {:from 1}}))
           "default context")
       (is (= [{"https://ns.flur.ee/ledger#t"       1
                "https://ns.flur.ee/ledger#assert"
                [{"@id"                     "http://example.org/ns/dan"
                  "http://example.org/ns/x" 1}]
                "https://ns.flur.ee/ledger#retract" []}]
-             @(fluree/history ledger {"@context" nil
-                                      :history   "http://example.org/ns/dan"
-                                      :t         {:from 1}}))
+             @(fluree/history conn ledger-alias {"@context" nil
+                                                 :history   "http://example.org/ns/dan"
+                                                 :t         {:from 1}}))
           "nil context on history query"))))
 
 (deftest ^:integration s+p+o-full-db-queries
   (with-redefs [fluree.db.util/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/everything")
-          db     @(fluree/update
-                   (fluree/db ledger)
-                   {"@context" [test-utils/default-context
-                                {:ex "http://example.org/ns/"}]
-                    "insert"
-                    {:graph [{:id           :ex/alice,
-                              :type         :ex/User,
-                              :schema/name  "Alice"
-                              :schema/email "alice@flur.ee"
-                              :schema/age   42}
-                             {:id          :ex/bob,
-                              :type        :ex/User,
-                              :schema/name "Bob"
-                              :schema/age  22}
-                             {:id           :ex/jane,
-                              :type         :ex/User,
-                              :schema/name  "Jane"
-                              :schema/email "jane@flur.ee"
-                              :schema/age   30}]}})]
+          _  @(fluree/create conn "query/everything")
+          db @(fluree/update
+               @(fluree/db conn "query/everything")
+               {"@context" [test-utils/default-context
+                            {:ex "http://example.org/ns/"}]
+                "insert"
+                {:graph [{:id           :ex/alice,
+                          :type         :ex/User,
+                          :schema/name  "Alice"
+                          :schema/email "alice@flur.ee"
+                          :schema/age   42}
+                         {:id          :ex/bob,
+                          :type        :ex/User,
+                          :schema/name "Bob"
+                          :schema/age  22}
+                         {:id           :ex/jane,
+                          :type         :ex/User,
+                          :schema/name  "Jane"
+                          :schema/email "jane@flur.ee"
+                          :schema/age   30}]}})]
       (testing "Query that pulls entire database."
         (is (= [[:ex/alice :type :ex/User]
                 [:ex/alice :schema/age 42]
@@ -166,7 +166,7 @@
                                   :select  {'?s ["*"]}
                                   :where   {:id '?s, '?p '?o}}))
             "Every triple should be returned.")
-        (let [db*    @(fluree/commit! ledger db)
+        (let [db*    @(fluree/commit! conn db)
               result @(fluree/query db* {:context [test-utils/default-context
                                                    {:ex "http://example.org/ns/"}]
                                          :select  ['?s '?p '?o]
@@ -218,8 +218,8 @@
 (deftest ^:integration illegal-reference-test
   (testing "Illegal reference queries"
     (let [conn   (test-utils/create-conn)
-          people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          ledger-id (test-utils/load-people conn)
+          db     @(fluree/db conn ledger-id)]
       (testing "with non-string objects"
         (let [test-subject @(fluree/query db {:context [test-utils/default-context
                                                         {:ex "http://example.org/ns/"}]
@@ -243,29 +243,29 @@
 
 (deftest ^:integration class-queries
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query/class")
-        db     @(fluree/update
-                 (fluree/db ledger)
-                 {"@context" [test-utils/default-context
-                              {:ex "http://example.org/ns/"}]
-                  "insert"
-                  [{:id           :ex/alice,
-                    :type         :ex/User,
-                    :schema/name  "Alice"
-                    :schema/email "alice@flur.ee"
-                    :schema/age   42}
-                   {:id          :ex/bob,
-                    :type        :ex/User,
-                    :schema/name "Bob"
-                    :schema/age  22}
-                   {:id           :ex/jane,
-                    :type         :ex/User,
-                    :schema/name  "Jane"
-                    :schema/email "jane@flur.ee"
-                    :schema/age   30}
-                   {:id          :ex/dave
-                    :type        :ex/nonUser
-                    :schema/name "Dave"}]})]
+        _  @(fluree/create conn "query/class")
+        db @(fluree/update
+             @(fluree/db conn "query/class")
+             {"@context" [test-utils/default-context
+                          {:ex "http://example.org/ns/"}]
+              "insert"
+              [{:id           :ex/alice,
+                :type         :ex/User,
+                :schema/name  "Alice"
+                :schema/email "alice@flur.ee"
+                :schema/age   42}
+               {:id          :ex/bob,
+                :type        :ex/User,
+                :schema/name "Bob"
+                :schema/age  22}
+               {:id           :ex/jane,
+                :type         :ex/User,
+                :schema/name  "Jane"
+                :schema/email "jane@flur.ee"
+                :schema/age   30}
+               {:id          :ex/dave
+                :type        :ex/nonUser
+                :schema/name "Dave"}]})]
     (testing "type"
       (is (= [[:ex/User]]
              @(fluree/query db {:context [test-utils/default-context
@@ -282,7 +282,7 @@
                                      :where   '{:id ?s, :type ?class}})))))
     (testing "shacl targetClass"
       (let [shacl-db @(fluree/update
-                       (fluree/db ledger)
+                       @(fluree/db conn "query/class")
                        {"@context" [test-utils/default-context
                                     {:ex "http://example.org/ns/"}]
                         "insert"
@@ -299,8 +299,8 @@
 
 (deftest ^:integration type-handling
   (let [conn   @(fluree/connect-memory)
-        ledger @(fluree/create conn "type-handling")
-        db0    (fluree/db ledger)
+        _  @(fluree/create conn "type-handling")
+        db0    @(fluree/db conn "type-handling")
         db1    @(fluree/update db0 {"@context" [test-utils/default-str-context
                                                 {"ex" "http://example.org/ns/"}]
                                     "insert"   [{"id"   "ex:ace"
@@ -362,12 +362,12 @@
 (deftest ^:integration repeated-transaction-results
   (testing "duplicate flakes with different t values"
     (let [conn   @(fluree/connect-memory)
-          ledger @(fluree/create conn "dup-flakes")
-          db0    (fluree/db ledger)
+          _  @(fluree/create conn "dup-flakes")
+          db0    @(fluree/db conn "dup-flakes")
           tx     {"insert" {"@id" "ex:1" "ex:foo" 30}}
           db1    @(fluree/update db0 tx)
           ;; advance the `t`
-          db2    @(fluree/commit! ledger db1)
+          db2    @(fluree/commit! conn db1)
           db3    @(fluree/update db2 tx)]
       (testing "do not become multicardinal result values"
         (is (= [{"ex:foo" 30, "@id" "ex:1"}]
@@ -375,8 +375,8 @@
 
 (deftest ^:integration base-context
   (let [conn @(fluree/connect-memory)
-        ledger @(fluree/create conn "base")
-        db0 (fluree/db ledger)
+        _  @(fluree/create conn "base")
+        db0 @(fluree/db conn "base")
         db1 @(fluree/update db0 {"@context" {"@base" "https://flur.ee/" "ex" "http://example.com/"}
                                  "insert" [{"@id" "freddy" "@type" "Yeti" "name" "Freddy"}
                                            {"@id" "ex:betty" "@type" "Yeti" "name" "Betty"}]})]

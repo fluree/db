@@ -6,10 +6,10 @@
 (deftest ^:integration optional-queries
   (testing "Testing various 'optional' query clauses."
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "query/optional")
+          db0 @(fluree/create conn "query/optional")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
           db      @(fluree/update
-                    (fluree/db ledger)
+                    db0
                     {"@context" context
                      "insert"
                      [{:id          :ex/brian,

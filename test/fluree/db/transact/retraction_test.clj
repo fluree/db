@@ -6,9 +6,9 @@
 (deftest ^:integration retracting-data
   (testing "Retractions of individual properties and entire subjects."
     (let [conn           (test-utils/create-conn)
-          ledger         @(fluree/create conn "tx/retract")
+          db0            @(fluree/create conn "tx/retract")
           db             @(fluree/update
-                           (fluree/db ledger)
+                           db0
                            {"insert"
                             {:context [test-utils/default-context
                                        {:ex "http://example.org/ns/"}]
@@ -42,14 +42,14 @@
           "Alice should no longer have an age property")))
   (testing "retracting ordered lists"
     (let [conn             (test-utils/create-conn)
-          ledger           @(fluree/create conn "tx/retract")
+          db0              @(fluree/create conn "tx/retract")
           context          [test-utils/default-str-context
                             {"ex"        "http://example.org/ns/"
                              "ex:items2" {"@container" "@list"}}]
           q1               {:context context
                             :select  {"ex:list-test" ["*"]}}
           db               @(fluree/update
-                             (fluree/db ledger)
+                             db0
                              {"@context" context
                               "insert"
                               [{"id"        "ex:list-test"

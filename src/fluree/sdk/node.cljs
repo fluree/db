@@ -37,17 +37,17 @@
                       (js->clj :keywordize-keys true)))))
 
 (defn ^:export commit
-  ([ledger db] (fluree/commit! ledger db))
-  ([ledger db opts] (fluree/commit! ledger db
-                                    (js->clj opts :keywordize-keys true))))
+  ([conn db] (fluree/commit! conn db))
+  ([conn db opts] (fluree/commit! conn db
+                                  (js->clj opts :keywordize-keys true))))
 
 (defn ^:export status
-  ([ledger] (clj->js (fluree/status ledger)))
-  ([ledger branch] (clj->js (fluree/status ledger branch))))
+  ([conn ledger-id] (clj->js (fluree/status conn ledger-id)))
+  ([conn ledger-id branch] (clj->js (fluree/status conn ledger-id branch))))
 
 (defn ^:export db
-  [ledger]
-  (fluree/db ledger))
+  [conn ledger-id]
+  (fluree/db conn ledger-id))
 
 (defn ^:export query
   [db query]

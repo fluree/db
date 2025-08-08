@@ -47,8 +47,8 @@
 (deftest ^:integration upsert-data
   (testing "Upserting data into a ledger is identitcal to long-form update txn"
     (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "tx/upsert-test")
-          db        @(fluree/insert (fluree/db ledger) sample-insert-txn)
+          db0       @(fluree/create conn "tx/upsert-test")
+          db        @(fluree/insert db0 sample-insert-txn)
           db+upsert @(fluree/upsert db sample-upsert-txn)]
 
       (is (= [{"@id"         "ex:alice",
@@ -72,9 +72,9 @@
 (deftest ^:integration upsert-no-changes
   (testing "Upserting identical data to existing does not change ledger"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "tx/upsert2")
+          db0    @(fluree/create conn "tx/upsert2")
 
-          db     @(fluree/insert (fluree/db ledger) sample-insert-txn)
+          db     @(fluree/insert db0 sample-insert-txn)
 
           db2    @(fluree/upsert db sample-insert-txn)
 
@@ -94,7 +94,7 @@
 
 (deftest upsert-and-commit
   (let [conn    @(fluree/connect-memory)
-        _ledger @(fluree/create conn "tx/upsert")
+        _db0 @(fluree/create conn "tx/upsert")
 
         _db1 @(fluree/insert! conn "tx/upsert" sample-insert-txn)
         db2  @(fluree/upsert! conn "tx/upsert" sample-upsert-txn)]

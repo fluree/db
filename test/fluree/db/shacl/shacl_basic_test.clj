@@ -6,10 +6,10 @@
 (deftest ^:integration using-pre-defined-types-as-classes
   (testing "Class not used as class initially can still be used as one."
     (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "class/testing")
+          db0 @(fluree/create conn "class/testing")
           context   [test-utils/default-context {:ex "http://example.org/ns/"}]
           db1       @(fluree/update
-                      (fluree/db ledger)
+                      db0
                       {"@context" context
                        "insert"   {:id                 :ex/MyClass
                                    :schema/description "Just a basic object not used as a class"}})
@@ -29,13 +29,13 @@
 (deftest ^:integration shacl-cardinality-constraints
   (testing "shacl minimum and maximum cardinality"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/a")
+          db0 @(fluree/create conn "shacl/a")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/UserShape
@@ -118,13 +118,13 @@
 (deftest ^:integration shacl-datatype-constraints
   (testing "shacl datatype errors"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/b")
+          db0 @(fluree/create conn "shacl/b")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/UserShape
@@ -204,13 +204,13 @@
 (deftest ^:integration shacl-closed-shape
   (testing "shacl closed shape"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/c")
+          db0 @(fluree/create conn "shacl/c")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id                   :ex/UserShape
@@ -263,14 +263,14 @@
 (deftest ^:integration shacl-property-pairs
   (testing "shacl property pairs"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/pairs")
+          db0 @(fluree/create conn "shacl/pairs")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}]
       (testing "single-cardinality equals"
         (let [db @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" context
                     "insert"
                     {:id             :ex/EqualNamesShape
@@ -321,7 +321,7 @@
                    @(fluree/query db-ok user-query))))))
       (testing "multi-cardinality equals"
         (let [db @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" context
                     "insert"
                     {:id             :ex/EqualNamesShape
@@ -470,7 +470,7 @@
                    @(fluree/query db-ok2 user-query))))))
       (testing "disjoint"
         (let [db @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" context
                     "insert"
                     {:id             :ex/DisjointShape
@@ -583,7 +583,7 @@
                      (ex-message db-not-disjoint3)))))))
       (testing "lessThan"
         (let [db     @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/LessThanShape
@@ -766,7 +766,7 @@
                      (ex-message db-iris)))))))
       (testing "lessThanOrEquals"
         (let [db @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" context
                     "insert"
                     {:id             :ex/LessThanOrEqualsShape
@@ -923,14 +923,14 @@
 (deftest ^:integration shacl-value-range
   (testing "shacl value range constraints"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/value-range")
+          db0 @(fluree/create conn "shacl/value-range")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}]
       (testing "exclusive constraints"
         (let [db @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" context
                     "insert"
                     {:id             :ex/ExclusiveNumRangeShape
@@ -1006,7 +1006,7 @@
                      (ex-message db-too-high)))))))
       (testing "inclusive constraints"
         (let [db @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" context
                     "insert"
                     {:id             :ex/InclusiveNumRangeShape
@@ -1092,7 +1092,7 @@
                      (ex-message db-too-high)))))))
       (testing "non-numeric values"
         (let [db         @(fluree/update
-                           (fluree/db ledger)
+                           db0
                            {"@context" context
                             "insert"
                             {:id             :ex/NumRangeShape
@@ -1156,13 +1156,13 @@
 (deftest ^:integration shacl-string-length-constraints
   (testing "shacl string length constraint errors"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/str")
+          db0 @(fluree/create conn "shacl/str")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/UserShape
@@ -1304,13 +1304,13 @@
 (deftest ^:integration shacl-string-pattern-constraints
   (testing "shacl string regex constraint errors"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/str")
+          db0 @(fluree/create conn "shacl/str")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/UserShape
@@ -1435,10 +1435,10 @@ WORLD!")
 
 (deftest language-constraints
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "validation-report")
+        db0 @(fluree/create conn "validation-report")
         context [test-utils/default-str-context
                  {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)]
+        db0     db0]
     (testing "language-in"
       (let [db1 @(fluree/update db0 {"@context" context
                                      "insert"
@@ -1522,13 +1522,13 @@ WORLD!")
 (deftest ^:integration shacl-multiple-properties-test
   (testing "multiple properties works"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/b")
+          db0 @(fluree/create conn "shacl/b")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/UserShape
@@ -1704,9 +1704,9 @@ WORLD!")
 
 (deftest ^:integration property-paths
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "propertypathstest")
+        db0 @(fluree/create conn "propertypathstest")
         context [test-utils/default-str-context {"ex" "http://example.com/"}]
-        db0     (fluree/db ledger)]
+        db0     db0]
     (testing "inverse path"
       (let [;; a valid Parent is anybody who is the object of a parent predicate
             db1          @(fluree/update db0 {"@context" context
@@ -1939,9 +1939,9 @@ WORLD!")
 
 (deftest ^:integration shacl-class-test
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "classtest")
+        db0 @(fluree/create conn "classtest")
         context test-utils/default-str-context
-        db0     (fluree/db ledger)
+        db0     db0
         db1     @(fluree/update db0 {"@context" context
                                      "insert"   [{"@type"          "sh:NodeShape"
                                                   "sh:targetClass" {"@id" "https://example.com/Country"}
@@ -2053,9 +2053,9 @@ WORLD!")
 (deftest ^:integration shacl-in-test
   (testing "value nodes"
     (let [conn    @(fluree/connect-memory)
-          ledger  @(fluree/create conn "shacl-in-test")
+          db0 @(fluree/create conn "shacl-in-test")
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-          db0     (fluree/db ledger)
+          db0     db0
           db1     @(fluree/update db0 {"@context" context
                                        "insert"   [{"type"           ["sh:NodeShape"]
                                                     "sh:targetClass" {"id" "ex:Pony"}
@@ -2087,8 +2087,8 @@ WORLD!")
              (ex-message db2)))))
   (testing "node refs"
     (let [conn    @(fluree/connect-memory)
-          ledger  @(fluree/create conn "shacl-in-test")
-          db0     (fluree/db ledger)
+          db0 @(fluree/create conn "shacl-in-test")
+          db0     db0
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1     @(fluree/update db0 {"@context" context
                                        "insert"   [{"type"           ["sh:NodeShape"]
@@ -2145,8 +2145,8 @@ WORLD!")
                  (update "ex:color" (partial sort-by #(get % "id"))))))))
   (testing "mixed values and refs"
     (let [conn    @(fluree/connect-memory)
-          ledger  @(fluree/create conn "shacl-in-test")
-          db0     (fluree/db ledger)
+          db0 @(fluree/create conn "shacl-in-test")
+          db0     db0
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1     @(fluree/update db0 {"@context" context
                                        "insert"   [{"type"           ["sh:NodeShape"]
@@ -2183,9 +2183,9 @@ WORLD!")
 
 (deftest ^:integration shacl-targetobjectsof-test
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "shacl-target-objects-of-test")
+        db0 @(fluree/create conn "shacl-target-objects-of-test")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)]
+        db0     db0]
     (testing "subject and object of constrained predicate in the same txn"
       (testing "datatype constraint"
         (let [db1                @(fluree/update db0
@@ -2453,8 +2453,8 @@ WORLD!")
 (deftest ^:integration shape-based-constraints
   (testing "sh:node"
     (let [conn    @(fluree/connect-memory)
-          ledger  @(fluree/create conn "shape-constaints")
-          db0     (fluree/db ledger)
+          db0 @(fluree/create conn "shape-constaints")
+          db0     db0
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
 
           db1            @(fluree/update db0 {"@context" context
@@ -2506,8 +2506,8 @@ WORLD!")
 
   (testing "sh:qualifiedValueShape property shape"
     (let [conn        @(fluree/connect-memory)
-          ledger      @(fluree/create conn "shape-constaints")
-          db0         (fluree/db ledger)
+          db0 @(fluree/create conn "shape-constaints")
+          db0         db0
           context     [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1         @(fluree/update db0 {"@context" context
                                            "insert"   [{"id"             "ex:KidShape"
@@ -2565,8 +2565,8 @@ WORLD!")
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShape node shape"
     (let [conn   @(fluree/connect-memory)
-          ledger @(fluree/create conn "shape-constaints")
-          db0    (fluree/db ledger)
+          db0 @(fluree/create conn "shape-constaints")
+          db0    db0
 
           context     [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1         @(fluree/update db0 {"@context" context
@@ -2629,8 +2629,8 @@ WORLD!")
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
     (let [conn   @(fluree/connect-memory)
-          ledger @(fluree/create conn "shape-constraints")
-          db0    (fluree/db ledger)
+          db0 @(fluree/create conn "shape-constraints")
+          db0    db0
 
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1     @(fluree/update db0 {"@context" context
@@ -2721,8 +2721,8 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest fuel-test
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "shape-constaints")
-        db0     (fluree/db ledger)
+        db0 @(fluree/create conn "shape-constaints")
+        db0     db0
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
 
         ;; sh:node constraint needs to query the db, requiring fuel for validation
@@ -2757,9 +2757,9 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest ^:integration post-processing-validation
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "post-processing")
+        db0 @(fluree/create conn "post-processing")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)]
+        db0     db0]
     (testing "shacl-objects-of-test"
       (let [db1                 @(fluree/update db0
                                                 {"@context" context
@@ -2895,9 +2895,9 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest validation-report
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "validation-report")
+        db0 @(fluree/create conn "validation-report")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)]
+        db0     db0]
     (testing "severity"
       (testing "no severity specified defaults to sh:Violation"
         (let [db1 @(fluree/update db0 {"@context" context
@@ -2977,9 +2977,9 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest target-subjects-of
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "validation-report")
+        db0 @(fluree/create conn "validation-report")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)
+        db0     db0
 
         db1 @(fluree/update db0 {"@context" context
                                  "insert"
@@ -3001,9 +3001,9 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest target-node
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "validation-report")
+        db0 @(fluree/create conn "validation-report")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)
+        db0     db0
 
         db1 @(fluree/update db0 {"@context" context
                                  "insert"
@@ -3025,9 +3025,9 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest alternative-path
   (let [conn @(fluree/connect-memory)
-        ledger @(fluree/create conn "validation-report")
+        db0 @(fluree/create conn "validation-report")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0 (fluree/db ledger)
+        db0 db0
 
         db1 @(fluree/update db0 {"@context" context
                                  "insert"
@@ -3074,8 +3074,8 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest multiple-and-encumbered-targets
   (let [conn @(fluree/connect-memory)
-        ledger @(fluree/create conn "encumbered-targets")
-        db0 (fluree/db ledger)]
+        db0 @(fluree/create conn "encumbered-targets")
+        db0 db0]
     (testing "targetClass"
       (testing "with multiple targets"
         (let [db1 @(fluree/update db0 {"@context" test-utils/default-str-context
@@ -3164,8 +3164,8 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest path-segment-handling
   (let [conn @(fluree/connect-memory)
-        ledger @(fluree/create conn "shacl-pp")
-        db0  (fluree/db ledger)
+        db0 @(fluree/create conn "shacl-pp")
+        db0  db0
         db1 @(fluree/update db0 {"@context" {"ex" "http://example.org/",
                                              "schema" "http://schema.org/",
                                              "sh" "http://www.w3.org/ns/shacl#",

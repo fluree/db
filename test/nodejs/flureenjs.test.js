@@ -45,9 +45,7 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
     },
   });
 
-  const ledger = await flureenjs.create(conn, "testledger");
-
-  const db = await flureenjs.db(ledger);
+  const db = await flureenjs.create(conn, "testledger");
 
   const db1 = await flureenjs.stage(db, {
     insert: {
@@ -168,11 +166,10 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
 //  };
 //  const conn = await flureenjs.connect(connOpts);
 //  const ledgerName = "jld/one";
-//  const newLedger = await flureenjs.create(conn, ledgerName);
-//  const db0 = flureenjs.db(newLedger);
+//  const db0 = await flureenjs.create(conn, ledgerName);
 //  const db1 = await flureenjs.stage(db0, testJson);
 //
-//  const db2 = await flureenjs.commit(newLedger, db1, {
+//  const db2 = await flureenjs.commit(conn, db1, {
 //    message: "commit!",
 //    push: true,
 //  });

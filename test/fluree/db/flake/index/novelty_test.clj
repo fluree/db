@@ -12,10 +12,11 @@
                                            :defaults
                                            {:indexing {:reindex-min-bytes 12
                                                        :reindex-max-bytes 10000000}}})
+            ledger-id "index/datetimes"
             context (merge test-utils/default-str-context {"ex" "http://example.org/ns/"})
-            ledger  @(fluree/create conn "index/datetimes")
+            db0     @(fluree/create conn ledger-id)
             db      @(fluree/update
-                      (fluree/db ledger)
+                      db0
                       {"@context" context
                        "insert"
                        [{"@id"   "ex:Foo",
@@ -35,7 +36,7 @@
                                                "@value" "12:42:00"}}]})
             ;; Create a channel to track indexing completion
             index-ch   (async/chan 10)
-            _db-commit @(fluree/commit! ledger db {:index-files-ch index-ch})
+            _db-commit @(fluree/commit! conn db {:index-files-ch index-ch})
             ;; Wait for index completion (root file is written last)
             _          (loop []
                          (when-let [msg (<!! index-ch)]
@@ -43,9 +44,9 @@
                              (recur))))
             ;; Small delay to ensure file handles are released
             _          (<!! (timeout 100))
-            loaded     (test-utils/retry-load conn (:alias ledger) 100)
+            loaded     (test-utils/retry-load conn ledger-id 100)
             q          {"@context" context
                         "select"   {"?s" ["*"]}
                         "where"    {"@id" "?s", "type" "ex:Bar"}}]
-        (is (= @(fluree/query (fluree/db loaded) q)
+        (is (= @(fluree/query loaded q)
                @(fluree/query db q)))))))

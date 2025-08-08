@@ -122,8 +122,7 @@
 (deftest ^:integration basic-datalog-rule
   (testing "Some basic datalog rules"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "reasoner/basic-datalog" nil)
-          db0    @(fluree/update (fluree/db ledger) reasoning-db-data)]
+          db0    @(fluree/update @(fluree/create conn "reasoner/basic-datalog" nil) reasoning-db-data)]
 
       (testing "A standard relationship"
         (let [grandparent-db  @(fluree/update db0 {"insert" [grandparent-rule]})
@@ -184,8 +183,7 @@
 (deftest ^:integration reason-graph-supplied
   (testing "Datalog rules given as JSON-LD at query-time"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "reasoner/basic-datalog-rules" nil)
-          db0    @(fluree/update (fluree/db ledger) reasoning-db-data)]
+          db0    @(fluree/update @(fluree/create conn "reasoner/basic-datalog-rules" nil) reasoning-db-data)]
 
       (testing "A recursive relationship"
         (let [grandparents-db @(fluree/reason db0 :datalog [grandparent-rule])
@@ -204,18 +202,18 @@
 (deftest ^:integration multiple-sources
   (testing "multiple rule sources"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "reasoner/multiple-rule-dbs")
-          db0    @(fluree/update (fluree/db ledger) reasoning-db-data)
+          db0 @(fluree/create conn "reasoner/multiple-rule-dbs")
+          db-base    @(fluree/update db0 reasoning-db-data)
 
           rule-ledger-1 @(fluree/create conn "reasoner/rule-ledger-1")
-          rule-db-1     @(fluree/update (fluree/db rule-ledger-1) {"insert" [uncle-rule]})
+          rule-db-1     @(fluree/update rule-ledger-1 {"insert" [uncle-rule]})
 
           rule-ledger-2 @(fluree/create conn "reasoner/rule-ledger-2")
-          rule-db-2     @(fluree/update (fluree/db rule-ledger-2) {"insert" [aunt-rule]})]
+          rule-db-2     @(fluree/update rule-ledger-2 {"insert" [aunt-rule]})]
 
       (testing "multiple graphs as rule sources"
-        (let [half-reasoned-db @(fluree/reason db0 :datalog [aunt-rule])
-              full-reasoned-db @(fluree/reason db0 :datalog [uncle-rule aunt-rule])]
+        (let [half-reasoned-db @(fluree/reason db-base :datalog [aunt-rule])
+              full-reasoned-db @(fluree/reason db-base :datalog [uncle-rule aunt-rule])]
 
           (is (= [["ex:brian" "ex:janine"]]
                  @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
@@ -232,8 +230,8 @@
               "With both graphs included, two results are returned.")))
 
       (testing "multiple dbs as rule sources"
-        (let [half-reasoned-db @(fluree/reason db0 :datalog [rule-db-1])
-              full-reasoned-db @(fluree/reason db0 :datalog [rule-db-1 rule-db-2])]
+        (let [half-reasoned-db @(fluree/reason db-base :datalog [rule-db-1])
+              full-reasoned-db @(fluree/reason db-base :datalog [rule-db-1 rule-db-2])]
 
           (is (= []
                  @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
@@ -250,8 +248,8 @@
               "With both rule dbs included, two results are returned.")))
 
       (testing "a mixture of graphs and dbs as rule sources"
-        (let [half-reasoned-db @(fluree/reason db0 :datalog [rule-db-1])
-              full-reasoned-db @(fluree/reason db0 :datalog [rule-db-1 aunt-rule])]
+        (let [half-reasoned-db @(fluree/reason db-base :datalog [rule-db-1])
+              full-reasoned-db @(fluree/reason db-base :datalog [rule-db-1 aunt-rule])]
 
           (is (= []
                  @(fluree/query half-reasoned-db {:context {"ex" "http://example.org/"}
@@ -267,8 +265,8 @@
               "With both sources included, two results are returned.")))
 
       (testing "multiple sources targeting identical nodes"
-        (let [alt-rule-first-reasoned-db @(fluree/reason db0 :datalog [alt-grandparent-rule grandparent-rule])
-              alt-rule-last-reasoned-db @(fluree/reason db0 :datalog [grandparent-rule alt-grandparent-rule])]
+        (let [alt-rule-first-reasoned-db @(fluree/reason db-base :datalog [alt-grandparent-rule grandparent-rule])
+              alt-rule-last-reasoned-db @(fluree/reason db-base :datalog [grandparent-rule alt-grandparent-rule])]
           (is (and (= [["ex:alice" "ex:carol"]]
                       @(fluree/query alt-rule-first-reasoned-db {:context {"ex" "http://example.org/"}
                                                                  :select  ["?s" "?grandParent"]
@@ -306,9 +304,9 @@
 (deftest ^:integration recursive-datalog-rule
   (testing "Some basic datalog rules"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "reasoner/recursive-datalog" nil)
+          db0 @(fluree/create conn "reasoner/recursive-datalog" nil)
           db0    @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" {"ex" "http://example.org/"}
                     "insert"   [{"@id"                    "ex:task1"
                                  "ex:description"         "Task 1 (Top Level)"

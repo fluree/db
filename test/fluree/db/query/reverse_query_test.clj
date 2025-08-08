@@ -7,10 +7,10 @@
 (deftest ^:integration context-reverse-test
   (testing "Test that the @reverse context values pulls select values back correctly."
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "query/reverse")
+          db0 @(fluree/create conn "query/reverse")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
           db      @(fluree/update
-                    (fluree/db ledger)
+                    db0
                     {"@context" context
                      "insert"
                      [{:id          :ex/brian
@@ -54,8 +54,8 @@
 
 (deftest ^:integration reverse-preds-in-where-and-select
   (let [conn   @(fluree/connect-memory)
-        ledger @(fluree/create conn "reverse")
-        db0    (fluree/db ledger)
+        db0 @(fluree/create conn "reverse")
+        db0    db0
 
         db1 @(fluree/update db0 {"@context" {"ex" "http://example.org/ns/"}
                                  "insert"   [{"@id"      "ex:dad"
@@ -107,8 +107,8 @@
 
 (deftest ^:integration reverse-subject-crawl-with-policy
   (let [conn   @(fluree/connect-memory)
-        ledger @(fluree/create conn "reverse")
-        db0    (fluree/db ledger)
+        db0 @(fluree/create conn "reverse")
+        db0    db0
 
         db1 @(fluree/update db0 {"@context" {"ex" "http://example.org/ns/"}
                                  "insert"   [{"@id"      "ex:dad"
