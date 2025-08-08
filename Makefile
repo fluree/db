@@ -149,7 +149,7 @@ test: cljtest cljstest nodejs-test browser-test ## Run all tests
 eastwood: ## Run Eastwood linter
 	clojure -M:dev:cljtest:eastwood
 
-ci: test clj-kondo-lint-ci cljfmt-check ## Run all CI checks (tests, linting, formatting)
+ci: test clj-kondo-lint-ci cljfmt-check eastwood ## Run all CI checks (tests, linting, formatting)
 
 clean: ## Remove build artifacts and caches
 	clojure -T:build clean

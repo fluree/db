@@ -227,6 +227,25 @@
         (recur r (into addrs (<? (nameservice/known-addresses nsv ledger-alias))))
         addrs))))
 
+;; --- Branch resolution helpers ---
+
+(defn- branch-from-commit
+  "Extract branch from expanded commit JSON-LD, if present."
+  [expanded-commit]
+  (get-first-value expanded-commit const/iri-branch))
+
+(defn- branch-from-ns
+  "Extract branch from nameservice record, if present."
+  [ns-record]
+  (get ns-record "f:branch"))
+
+(defn- branch-from-alias
+  "Derive branch from an alias of the form 'alias@branch', if present."
+  [ledger-alias]
+  (when (and (string? ledger-alias)
+             (str/includes? ledger-alias "@"))
+    (subs ledger-alias (inc (str/last-index-of ledger-alias "@")))))
+
 (defn ledger-exists?
   "Checks nameservices on a connection and returns true if any nameservice
   already has a ledger associated with the given alias."
@@ -319,9 +338,10 @@
                                                                          index-address))
             expanded-commit (json-ld/expand commit)
             ledger-alias    (commit->ledger-alias conn address expanded-commit)
-            branch          (-> expanded-commit
-                                (get-first-value const/iri-branch)
-                                (or (throw-missing-branch address ledger-alias)))
+            ;; Determine branch using helpers in priority order
+            branch           (or (branch-from-commit expanded-commit)
+                                 (branch-from-ns ns-record)
+                                 (branch-from-alias ledger-alias))
 
             {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
             ledger (ledger/instantiate ledger-alias address branch commit-catalog index-catalog
