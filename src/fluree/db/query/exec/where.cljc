@@ -870,11 +870,11 @@
        (async/pipe initial-solution-ch* out-ch))
      out-ch)))
 
-(defn bound-variables
+(defn clause-variables
   [where]
   (cond
     (nil? where) #{}
-    (sequential? where) (into #{} (mapcat bound-variables) where)
+    (sequential? where) (into #{} (mapcat clause-variables) where)
     (map? where) (if (contains? where ::var)
                    #{(::var where)}
-                   (into #{} (mapcat bound-variables) where))))
+                   (into #{} (mapcat clause-variables) where))))

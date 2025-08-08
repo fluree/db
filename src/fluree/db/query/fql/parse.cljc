@@ -927,7 +927,7 @@
                            (parse-values context))
          where         (-> (get-named txn "where")
                            (parse-where vars context))
-         bound-vars    (-> where where/bound-variables (into vars))
+         bound-vars    (-> where where/clause-variables (into vars))
          delete        (when-let [dlt (get-named txn "delete")]
                          (jld->parsed-triples dlt bound-vars context))
          insert        (when-let [ins (get-named txn "insert")]
