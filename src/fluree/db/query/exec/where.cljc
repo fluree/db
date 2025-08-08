@@ -24,6 +24,11 @@
   [var-sym]
   (assoc unmatched ::var var-sym))
 
+(defn optional-var
+  [var-sym]
+  (-> (unmatched-var var-sym)
+      (assoc ::optional var-sym)))
+
 (defn match-value
   ([mch x]
    (assoc mch ::val x))
@@ -508,7 +513,9 @@
                      :end-flake   end-flake
                      :flake-xf    flake-xf}]
     (if (and (or (iri/sid? s) (nil? s))
-             (or (iri/sid? p) (nil? p)))
+             (or (iri/sid? p) (nil? p))
+             ;; no unmatched optional vars allowed
+             (empty? (keep ::optional [s-mch p-mch o-mch])))
       ;; check for matching flake
       (query-range/resolve-flake-slices db tracker idx error-ch opts)
       ;; cannot return any flakes
@@ -796,10 +803,27 @@
                    (rf default-solution)
                    rf))))))))
 
+(defn clause-variables
+  [where]
+  (cond
+    (nil? where) #{}
+    (sequential? where) (into #{} (mapcat clause-variables) where)
+    (map? where) (if (contains? where ::var)
+                   #{(::var where)}
+                   (into #{} (mapcat clause-variables) where))))
+
 (defmethod match-pattern :optional
   [db tracker solution pattern error-ch]
   (let [clause (pattern-data pattern)
-        opt-ch (async/chan 2 (with-default solution))]
+        ;; keep track of :optional vars that don't match anything
+        solution* (reduce (fn [solution* var]
+                            (update solution* var (fn [match]
+                                                    (if (nil? match)
+                                                      (optional-var var)
+                                                      match))))
+                          solution
+                          (clause-variables clause))
+        opt-ch (async/chan 2 (with-default solution*))]
     (-> (match-clause db tracker solution clause error-ch)
         (async/pipe opt-ch))))
 
@@ -869,12 +893,3 @@
                              initial-solution-ch*)
        (async/pipe initial-solution-ch* out-ch))
      out-ch)))
-
-(defn clause-variables
-  [where]
-  (cond
-    (nil? where) #{}
-    (sequential? where) (into #{} (mapcat clause-variables) where)
-    (map? where) (if (contains? where ::var)
-                   #{(::var where)}
-                   (into #{} (mapcat clause-variables) where))))
