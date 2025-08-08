@@ -652,10 +652,12 @@
     datatype       fluree.db.query.exec.eval/datatype
     equal          fluree.db.query.exec.eval/typed-equal
     floor          fluree.db.query.exec.eval/floor
+    find-grouped-val fluree.db.query.exec.eval/find-grouped-val
     groupconcat    fluree.db.query.exec.eval/groupconcat
     if             fluree.db.query.exec.eval/-if
     in             fluree.db.query.exec.eval/in
     iri            fluree.db.query.exec.eval/iri
+    iri-fn-base    fluree.db.query.exec.eval/iri-fn-base
     is-iri         fluree.db.query.exec.eval/is-iri
     is-literal     fluree.db.query.exec.eval/is-literal
     lang           fluree.db.query.exec.eval/lang
@@ -749,6 +751,25 @@
                             (where/->typed-val nil)
                             args))
 
+           ;; iri function for SCI
+           ;; This is the base two-parameter function
+           iri-fn-base (fn [input ctx]
+                         (log/debug "iri-fn-base called with input:" input "ctx:" (some? ctx))
+                         (let [value (if (map? input)
+                                       (:value input)
+                                       input)
+                               ;; Special handling for @type
+                               expanded (if (= "@type" value)
+                                          const/iri-rdf-type
+                                          (json-ld/expand-iri value ctx))]
+                           (where/->typed-val expanded const/iri-id)))
+
+           ;; Default iri function that will be overridden in bindings
+           ;; This version throws to make it clear when context is missing
+           iri-fn (fn [input]
+                    (throw (ex-info "iri function called without context - should be overridden in bindings"
+                                    {:input input})))
+
            ;; Build eval namespace, excluding macros for now
            eval-ns-fns (reduce (fn [acc [k v]]
                                  (if (contains? macro-symbols k)
@@ -780,7 +801,16 @@
                                   '-and -and-fn
                                   'and -and-fn
                                   '-or -or-fn
-                                  'or -or-fn))
+                                  'or -or-fn
+                                  ;; Add $-CONTEXT as a namespace symbol
+                                  '$-CONTEXT nil
+                                  ;; Add where/->typed-val for iri expansion
+                                  'where/->typed-val where/->typed-val
+                                  ;; Add the base iri function
+                                  'iri-fn-base iri-fn-base
+                                  ;; iri function - will be overridden in bindings with context
+                                  'iri iri-fn
+                                  'fluree.db.query.exec.eval/iri iri-fn))
 
            ;; Build other namespaces
            where-ns-fns {'->typed-val where/->typed-val
@@ -789,10 +819,40 @@
                          'variable? where/variable?
                          'mch->typed-val where/mch->typed-val}
 
-           json-ld-fns {'expand-iri json-ld/expand-iri}
+           json-ld-fns {'expand-iri json-ld/expand-iri
+                        'json-ld/expand-iri json-ld/expand-iri}
 
            const-ns {'iri-id const/iri-id
-                     '_id const/iri-id}
+                     'const/iri-id const/iri-id
+                     ;; String datatypes needed for comparisons
+                     'iri-string const/iri-string
+                     'iri-anyURI const/iri-anyURI
+                     'iri-xsd-normalizedString const/iri-xsd-normalizedString
+                     'iri-lang-string const/iri-lang-string
+                     'iri-xsd-token const/iri-xsd-token
+                     ;; Numeric datatypes
+                     'iri-xsd-decimal const/iri-xsd-decimal
+                     'iri-xsd-double const/iri-xsd-double
+                     'iri-xsd-integer const/iri-xsd-integer
+                     'iri-long const/iri-long
+                     'iri-xsd-int const/iri-xsd-int
+                     'iri-xsd-byte const/iri-xsd-byte
+                     'iri-xsd-short const/iri-xsd-short
+                     'iri-xsd-float const/iri-xsd-float
+                     'iri-xsd-unsignedLong const/iri-xsd-unsignedLong
+                     'iri-xsd-unsignedInt const/iri-xsd-unsignedInt
+                     'iri-xsd-unsignedShort const/iri-xsd-unsignedShort
+                     'iri-xsd-positiveInteger const/iri-xsd-positiveInteger
+                     'iri-xsd-nonPositiveInteger const/iri-xsd-nonPositiveInteger
+                     'iri-xsd-negativeInteger const/iri-xsd-negativeInteger
+                     'iri-xsd-nonNegativeInteger const/iri-xsd-nonNegativeInteger
+                     ;; Time datatypes
+                     'iri-xsd-dateTime const/iri-xsd-dateTime
+                     'iri-xsd-date const/iri-xsd-date
+                     ;; Boolean datatype
+                     'iri-xsd-boolean const/iri-xsd-boolean
+                     ;; RDF type
+                     'iri-rdf-type const/iri-rdf-type}
 
            ;; Core functions - more efficient to define as a static map
            core-fns '{instance? instance?
@@ -932,9 +992,12 @@
                                     'format #?(:clj format :cljs str))
 
            ;; Build user namespace by merging eval namespace with qualified -and/-or
-           user-ns-fns (assoc eval-ns-fns
-                              'fluree.db.query.exec.eval/-and -and-fn
-                              'fluree.db.query.exec.eval/-or -or-fn)]
+           user-ns-fns (-> eval-ns-fns
+                           (assoc 'fluree.db.query.exec.eval/-and -and-fn
+                                  'fluree.db.query.exec.eval/-or -or-fn
+                                  ;; Add iri to user namespace as well
+                                  'iri iri-fn
+                                  'fluree.db.query.exec.eval/iri iri-fn))]
 
        (sci/init {:namespaces {'fluree.db.query.exec.eval eval-ns-fns
                                'fluree.db.query.exec.where where-ns-fns
@@ -951,17 +1014,46 @@
    (defonce ^:private sci-context-singleton
      (delay (create-sci-context))))
 
-;; Macro for conditional evaluation based on build target
+;; GraalVM-specific evaluation function
 #?(:clj
-   (defmacro eval-form
-     "Evaluates a form using either eval (JVM) or SCI (GraalVM).
-      Decision is made at compile time based on graalvm-build? check.
-      For GraalVM builds, uses a singleton SCI context for better performance."
-     [form]
+   (defn eval-graalvm-with-context
+     "Evaluates a form in SCI with context bindings for GraalVM builds."
+     [form ctx]
+     (let [;; Create a context-aware iri function that uses the provided context
+           iri-with-context (fn [input]
+                              (let [value (if (map? input)
+                                            (:value input)
+                                            input)
+                                    expanded (if (= "@type" value)
+                                               const/iri-rdf-type
+                                               (json-ld/expand-iri value ctx))]
+                                (where/->typed-val expanded const/iri-id)))
+           ;; Get the current namespaces from sci-context-singleton
+           current-namespaces (:namespaces @sci-context-singleton)
+           ;; Update the iri function in both namespaces to be safe
+           updated-namespaces (-> current-namespaces
+                                  (assoc-in ['fluree.db.query.exec.eval 'iri] iri-with-context)
+                                  (assoc-in ['fluree.db.query.exec.eval 'fluree.db.query.exec.eval/iri] iri-with-context)
+                                  (assoc-in ['user 'iri] iri-with-context)
+                                  (assoc-in ['user 'fluree.db.query.exec.eval/iri] iri-with-context))
+           ;; Create new SCI context with updated namespaces and bindings
+           ctx-with-bindings (sci/merge-opts @sci-context-singleton
+                                             {:namespaces updated-namespaces
+                                              :bindings {'$-CONTEXT ctx
+                                                         'iri iri-with-context
+                                                         'fluree.db.query.exec.eval/iri iri-with-context}})]
+       (sci/eval-form ctx-with-bindings form))))
+
+;; Enhanced eval-form that accepts context for GraalVM builds
+#?(:clj
+   (defmacro eval-form-with-context
+     "Evaluates a form with additional context bindings for GraalVM builds.
+      For JVM builds, ignores the context and uses regular eval."
+     [form ctx]
      (if-graalvm
-      ;; GraalVM branch - use singleton SCI context
-      `(sci/eval-form @sci-context-singleton ~form)
-      ;; JVM branch - use direct eval
+      ;; GraalVM branch - use our dedicated function
+      `(eval-graalvm-with-context ~form ~ctx)
+      ;; JVM branch - use direct eval, ignoring context
       `(eval ~form))))
 
 ;;; =============================================================================
@@ -994,7 +1086,10 @@
      str-lang str-dt bnode
 
      ;; vector scoring fns
-     dotProduct cosineSimilarity euclidianDistance})
+     dotProduct cosineSimilarity euclidianDistance
+
+     ;; internal helper fns - needed for testing and some query constructs
+     ->typed-val iri-fn-base})
 
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))
@@ -1038,6 +1133,21 @@
   (if (= '[count * nil] [f first-arg r])
     (list 'count-star count-star-sym)
     fn-expr))
+
+;; Helper function to transform iri calls to include context
+(defn transform-iri-calls
+  "Transforms (iri x) calls to (iri-fn-base x $-CONTEXT) for GraalVM builds."
+  [form]
+  (if (graalvm-build?)
+    (walk/postwalk
+     (fn [x]
+       (if (and (sequential? x)
+                (= 'fluree.db.query.exec.eval/iri (first x))
+                (= 2 (count x)))
+         `(iri-fn-base ~(second x) ~'$-CONTEXT)
+         x))
+     form)
+    form))
 
 (defn coerce
   [count-star-sym allow-aggregates? ctx x]
@@ -1089,7 +1199,8 @@
 
 (defn bind-variables
   [count-star-sym var-syms ctx]
-  (into `[~context-var ~ctx]
+  (into `[~context-var ~ctx
+          ~'$-CONTEXT ~ctx]  ; Also bind $-CONTEXT for SCI
         (mapcat (fn [var]
                   `[mch# ~(if (= var count-star-sym)
                             `(find-grouped-val ~soln-sym)
@@ -1103,44 +1214,28 @@
 #?(:clj
    (defmacro parse-qualified-code
      "Parses qualified code, applying GraalVM-specific transformations when needed.
-      For GraalVM builds, expands iri macro calls to their full form since SCI
-      doesn't support runtime macro expansion. Decision is made at compile time."
+      For GraalVM builds, just coerce since we handle iri in the function definition."
      [code count-star-sym ctx allow-aggregates?]
-     (if (graalvm-build?)
-       ;; GraalVM/SCI build - coerce then expand iri macro calls
-       `(let [qualified-code# (coerce ~count-star-sym ~allow-aggregates? ~ctx ~code)]
-          (walk/postwalk
-           (fn [form#]
-             (if (and (seq? form#)
-                      (= 'fluree.db.query.exec.eval/iri (first form#))
-                      (= 2 (count form#)))
-               ;; Replace (fluree.db.query.exec.eval/iri x) with the expanded form
-               `(fluree.db.query.exec.where/->typed-val
-                 (fluree.json-ld/expand-iri
-                  (:value ~(second form#))
-                  ~'$-CONTEXT)
-                 fluree.db.constants/iri-id)
-               form#))
-           qualified-code#))
-       ;; Regular JVM build - just coerce
-       `(coerce ~count-star-sym ~allow-aggregates? ~ctx ~code))))
+     `(coerce ~count-star-sym ~allow-aggregates? ~ctx ~code)))
 
 (defn compile*
   [code ctx allow-aggregates?]
   (let [count-star-sym (gensym "?$-STAR")
         qualified-code (parse-qualified-code code count-star-sym ctx allow-aggregates?)
+        ;; Transform iri calls for GraalVM
+        transformed-code (transform-iri-calls qualified-code)
         vars           (variables qualified-code)
         bdg            (bind-variables count-star-sym vars ctx)]
     `(fn [~soln-sym]
        (let ~bdg
-         ~qualified-code))))
+         ~transformed-code))))
 
 (defn compile
   ([code ctx] (compile code ctx true))
   ([code ctx allow-aggregates?]
    (let [fn-code (compile* code ctx allow-aggregates?)]
      (log/trace "compiled fn:" fn-code)
-     #?(:clj (eval-form fn-code)
+     #?(:clj (eval-form-with-context fn-code ctx)
         :cljs (throw (ex-info "eval not supported in ClojureScript" {:code fn-code}))))))
 
 (defn compile-filter
@@ -1152,5 +1247,5 @@
                               (assoc (quote ~var) ~var)
                               ~f
                               :value))]
-    #?(:clj (eval-form filter-fn-code)
+    #?(:clj (eval-form-with-context filter-fn-code ctx)
        :cljs (throw (ex-info "eval not supported in ClojureScript" {:code filter-fn-code})))))
