@@ -465,9 +465,11 @@
 
 (defn resolve-flake-range
   [{:keys [t] :as db} tracker error-ch [s-mch p-mch o-mch]]
-  (let [s    (get-sid s-mch db)
+  (let [s    (or (get-sid s-mch db)
+                 (get-value s-mch))
         s-fn (::fn s-mch)
-        p    (get-sid p-mch db)
+        p    (or (get-sid p-mch db)
+                 (get-value p-mch))
         p-fn (::fn p-mch)
         o    (or (get-value o-mch)
                  (get-sid o-mch db))
@@ -505,7 +507,12 @@
                      :start-flake start-flake
                      :end-flake   end-flake
                      :flake-xf    flake-xf}]
-    (query-range/resolve-flake-slices db tracker idx error-ch opts)))
+    (if (and (or (iri/sid? s) (nil? s))
+             (or (iri/sid? p) (nil? p)))
+      ;; check for matching flake
+      (query-range/resolve-flake-slices db tracker idx error-ch opts)
+      ;; cannot return any flakes
+      (async/onto-chan (async/chan) []))))
 
 (defn compute-sid
   [s-mch db]
