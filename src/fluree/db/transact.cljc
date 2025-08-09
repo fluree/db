@@ -227,8 +227,8 @@
   returns a db with an updated :commit."
   ([ledger db]
    (commit! ledger db {}))
-  ([{ledger-alias :alias :as ledger}
-    {:keys [branch t stats commit] :as staged-db}
+  ([{ledger-alias :alias, :as ledger}
+    {:keys [alias branch t stats commit] :as staged-db}
     opts]
    (log/debug "commit!: write-transaction start" {:ledger ledger-alias})
    (go-try

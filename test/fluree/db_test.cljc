@@ -1085,34 +1085,38 @@
          ;; wait for everything to be written
          (Thread/sleep 1000)
          (testing "before drop"
+<<<<<<< HEAD
            (is (= ["destined-for-drop" "ns@v2"]
+=======
+           (is (= ["destined-for-drop@main" "ns@v1"]
+>>>>>>> d80188bd1 (remove most of special branch handling)
                   (sort (async/<!! (fs/list-files primary-path)))))
            (is (= ["destined-for-drop"]
                   (async/<!! (fs/list-files (str secondary-path "/ns@v2")))))
            (is (= ["commit" "index" "txn"]
-                  (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
+                  (sort (async/<!! (fs/list-files (str primary-path "/" alias "@main"))))))
            ;; only store txns when signed
            (is (= tx-count
-                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/txn"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/txn"))))))
            ;; initial create call generates an initial commit, each commit has two files
            (is (= (* 2 (inc tx-count))
-                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/commit"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/commit"))))))
            (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
-                  (sort (async/<!! (fs/list-files (str primary-path "/" alias "/index"))))))
+                  (sort (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index"))))))
            ;; one new index root per tx
            (is (= tx-count
-                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/root"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index/root"))))))
            ;; one garbage file for each obsolete index root
            (is (= (dec tx-count)
-                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/garbage"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index/garbage"))))))
            (is (= 6
-                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/spot"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index/spot"))))))
            (is (= 6
-                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/post"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index/post"))))))
            (is (= 6
-                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/tspo"))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index/tspo"))))))
            (is (= 6
-                  (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/opst")))))))
+                  (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index/opst")))))))
          (testing "drop"
            (is (= :dropped
                   @(fluree/drop conn alias))))
@@ -1120,7 +1124,11 @@
          (Thread/sleep 1000)
          (testing "after drop"
            ;; directories are not removed
+<<<<<<< HEAD
            (is (= ["destined-for-drop" "ns@v2"]
+=======
+           (is (= ["destined-for-drop@main" "ns@v1"]
+>>>>>>> d80188bd1 (remove most of special branch handling)
                   (sort (async/<!! (fs/list-files primary-path)))))
            ;; The destined-for-drop directory remains but should be empty
            (is (= ["destined-for-drop"]
@@ -1128,15 +1136,15 @@
            (is (= []
                   (async/<!! (fs/list-files (str secondary-path "/ns@v2/destined-for-drop")))))
            (is (= ["commit" "index" "txn"]
-                  (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
+                  (sort (async/<!! (fs/list-files (str primary-path "/" alias "@main"))))))
            (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
-                  (sort (async/<!! (fs/list-files (str primary-path "/" alias "/index"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/txn"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/commit"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/root"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/root"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/garbage"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/spot"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/post"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/tspo"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/opst")))))))))))
+                  (sort (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/txn"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/commit"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index/root"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index/root"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index/garbage"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index/spot"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index/post"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index/tspo"))))))
+           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "@main" "/index/opst")))))))))))

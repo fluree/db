@@ -44,9 +44,9 @@
   (-> commit-map commit-data/->json-ld json-ld/expand))
 
 (defn load-db
-  [alias commit-catalog index-catalog commit-map]
+  [combined-alias commit-catalog index-catalog commit-map]
   (let [commit-jsonld (commit-map->commit-jsonld commit-map)]
-    (async-db/load alias commit-catalog index-catalog
+    (async-db/load combined-alias commit-catalog index-catalog
                    commit-jsonld commit-map nil)))
 
 (defn update-index-async
@@ -149,17 +149,17 @@
 
 (defn state-map
   "Returns a branch map for specified branch name at supplied commit"
-  ([alias branch-name commit-catalog index-catalog publishers commit-jsonld]
-   (state-map alias branch-name commit-catalog index-catalog publishers commit-jsonld nil))
-  ([alias branch-name commit-catalog index-catalog publishers commit-jsonld indexing-opts]
+  ([combined-alias branch-name commit-catalog index-catalog publishers commit-jsonld]
+   (state-map combined-alias branch-name commit-catalog index-catalog publishers commit-jsonld nil))
+  ([combined-alias branch-name commit-catalog index-catalog publishers commit-jsonld indexing-opts]
    (let [commit-map (commit-data/jsonld->clj commit-jsonld)
-         initial-db (async-db/load alias commit-catalog index-catalog
+         initial-db (async-db/load combined-alias commit-catalog index-catalog
                                    commit-jsonld commit-map indexing-opts)
          state      (atom {:commit     commit-map
                            :current-db initial-db})
          idx-q      (index-queue publishers state)]
      {:name          branch-name
-      :alias         alias
+      :alias         combined-alias
       :state         state
       :index-queue   idx-q
       :indexing-opts indexing-opts})))

@@ -129,17 +129,19 @@
 (defn instantiate
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
+  [combined-alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
    indexing-opts did latest-commit]
-  (let [[_ branch] (util.ledger/ledger-parts alias)
-        branch (or branch "main")
+  (let [;; Parse ledger name and branch from combined alias
+        [ledger-alias branch] (if (clojure.string/includes? combined-alias ":")
+                                (clojure.string/split combined-alias #":" 2)
+                                [combined-alias "main"])
         publishers (cons primary-publisher secondary-publishers)
-        branches {branch (branch/state-map alias branch commit-catalog index-catalog
+        branches {branch (branch/state-map combined-alias branch commit-catalog index-catalog
                                            publishers latest-commit indexing-opts)}]
     (map->Ledger {:id                   (random-uuid)
                   :did                  did
                   :state                (atom (initial-state branches branch))
-                  :alias                alias  ;; Full alias including branch
+                  :alias                combined-alias  ;; Full alias including branch
                   :address              ledger-address
                   :commit-catalog       commit-catalog
                   :index-catalog        index-catalog
@@ -156,17 +158,18 @@
            primary-publisher secondary-publishers]}
    {:keys [did indexing] :as _opts}]
   (go-try
-    (let [;; internal-only opt used for migrating ledgers without genesis commits
+    (let [normalized-alias  alias
+          ;; internal-only opt used for migrating ledgers without genesis commits
           init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit
-                              commit-catalog alias publish-addresses init-time))
+                              commit-catalog normalized-alias publish-addresses init-time))
           ;; Publish genesis commit to nameservice - convert expanded to compact format first
           _              (when primary-publisher
                            (let [;; Convert expanded genesis commit to compact JSON-ld format
                                  commit-map (commit-data/json-ld->map genesis-commit nil)
                                  compact-commit (commit-data/->json-ld commit-map)]
                              (<? (nameservice/publish primary-publisher compact-commit))))]
-      (instantiate alias primary-address commit-catalog index-catalog
+      (instantiate normalized-alias primary-address commit-catalog index-catalog
                    primary-publisher secondary-publishers indexing did genesis-commit))))
 
 (defn trigger-index!
