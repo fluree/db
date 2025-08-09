@@ -37,12 +37,11 @@
   nameservice/Publisher
   (publish [_ data]
     (let [;; Extract data from compact JSON-LD format (both genesis and regular commits now use this)
-          ledger-alias   (get data "alias")
-          branch         (or (get data "branch")
-                             (when (and (string? ledger-alias)
-                                        (str/includes? ledger-alias "@"))
-                               (subs ledger-alias (inc (str/last-index-of ledger-alias "@"))))
-                             "main")
+          combined-alias (get data "alias")
+          ;; Parse branch from combined alias if present
+          [ledger-alias branch] (if (str/includes? combined-alias "@")
+                                  (str/split combined-alias #"@" 2)
+                                  [combined-alias "main"])
           commit-address (get data "address")
           t-value        (get-in data ["data" "t"])
           index-address  (get-in data ["index" "address"])

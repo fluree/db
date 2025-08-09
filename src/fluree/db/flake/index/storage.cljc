@@ -66,9 +66,8 @@
 
 (defn write-garbage
   "Writes garbage record out for latest index."
-  [{:keys [storage serializer] :as _index-catalog} ledger-alias branch t garbage]
+  [{:keys [storage serializer] :as _index-catalog} ledger-alias t garbage]
   (let [data       {:alias   ledger-alias
-                    :branch  branch
                     :t       t
                     :garbage garbage}
         serialized (serde/-serialize-garbage serializer data)]

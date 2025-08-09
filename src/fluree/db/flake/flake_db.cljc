@@ -288,7 +288,7 @@
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
 
-(defrecord FlakeDB [index-catalog commit-catalog alias branch commit t tt-id stats
+(defrecord FlakeDB [index-catalog commit-catalog alias commit t tt-id stats
                     spot post opst tspo vg schema comparators staged novelty policy
                     namespaces namespace-codes max-namespace-code
                     reindex-min-bytes reindex-max-bytes max-old-indexes]
@@ -408,7 +408,7 @@
 
 (defn display
   [db]
-  (select-keys db [:alias :branch :t :stats :policy]))
+  (select-keys db [:alias :t :stats :policy]))
 
 #?(:cljs (extend-type FlakeDB
            IPrintWithWriter
@@ -533,9 +533,9 @@
 
 ;; TODO - VG - need to reify vg from db-root!!
 (defn load
-  ([ledger-alias commit-catalog index-catalog branch commit-pair]
-   (load ledger-alias commit-catalog index-catalog branch commit-pair {}))
-  ([ledger-alias commit-catalog index-catalog branch [commit-jsonld commit-map] indexing-opts]
+  ([ledger-alias commit-catalog index-catalog commit-pair]
+   (load ledger-alias commit-catalog index-catalog commit-pair {}))
+  ([ledger-alias commit-catalog index-catalog [commit-jsonld commit-map] indexing-opts]
    (go-try
      (let [commit-t    (-> commit-jsonld
                            (get-first const/iri-data)
@@ -544,21 +544,12 @@
                          (<? (index-storage/read-db-root index-catalog address))
                          (genesis-root-map ledger-alias))
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
-           ;; Ensure commit map reflects loaded index t when an index address exists
-           commit-map* (if (get-in commit-map [:index :address])
-                         (update commit-map :index
-                                 (fn [idx]
-                                   (let [existing-data (:data idx)
-                                         updated-data  (assoc (or existing-data {}) :t (:t root-map))]
-                                     (assoc idx :data updated-data))))
-                         commit-map)
            indexed-db  (-> root-map
                            (add-reindex-thresholds indexing-opts)
                            (assoc :index-catalog index-catalog
                                   :commit-catalog commit-catalog
                                   :alias ledger-alias
-                                  :branch branch
-                                  :commit commit-map*
+                                  :commit commit-map
                                   :tt-id nil
                                   :comparators index/comparators
                                   :staged nil
