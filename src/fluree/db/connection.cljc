@@ -242,25 +242,6 @@
         (recur r (into addrs (<? (nameservice/known-addresses nsv ledger-alias))))
         addrs))))
 
-;; --- Branch resolution helpers ---
-
-(defn- branch-from-commit
-  "Extract branch from expanded commit JSON-LD, if present."
-  [expanded-commit]
-  (get-first-value expanded-commit const/iri-branch))
-
-(defn- branch-from-ns
-  "Extract branch from nameservice record, if present."
-  [ns-record]
-  (get ns-record "f:branch"))
-
-(defn- branch-from-alias
-  "Derive branch from an alias of the form 'alias@branch', if present."
-  [ledger-alias]
-  (when (and (string? ledger-alias)
-             (str/includes? ledger-alias "@"))
-    (subs ledger-alias (inc (str/last-index-of ledger-alias "@")))))
-
 (defn ledger-exists?
   "Checks nameservices on a connection and returns true if any nameservice
   already has a ledger associated with the given alias."
@@ -284,13 +265,11 @@
     (-> conn :defaults :identity)))
 
 (defn parse-ledger-options
-  [conn {:keys [did branch indexing]
-         :or   {branch commit-data/default-branch}}]
+  [conn {:keys [did indexing]}]
   (let [did*           (parse-identity conn did)
         ledger-default (-> conn :defaults :indexing)
         indexing*      (merge ledger-default indexing)]
     {:did      did*
-     :branch   branch
      :indexing indexing*}))
 
 (defn throw-ledger-exists
@@ -302,11 +281,7 @@
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn} ledger-alias opts]
   (go-try
     (let [;; Normalize ledger-alias to include branch
-          normalized-alias (normalize-ledger-alias ledger-alias)
-          ;; Extract the actual alias without branch for passing to ledger/create
-          [actual-alias _] (if (str/includes? ledger-alias "@")
-                             (str/split ledger-alias #"@" 2)
-                             [ledger-alias nil])]
+          normalized-alias (normalize-ledger-alias ledger-alias)]
       (if (<? (ledger-exists? conn normalized-alias))
         (throw-ledger-exists normalized-alias)
         (let [[cached? ledger-chan] (register-ledger conn normalized-alias)]
@@ -315,7 +290,7 @@
             (let [addr          (<? (primary-address conn normalized-alias))
                   publish-addrs (<? (publishing-addresses conn normalized-alias))
                   ledger-opts   (parse-ledger-options conn opts)
-                  ledger        (<! (ledger/create {:alias                actual-alias
+                  ledger        (<! (ledger/create {:alias                normalized-alias
                                                     :primary-address      addr
                                                     :publish-addresses    publish-addrs
                                                     :commit-catalog       commit-catalog
@@ -337,12 +312,6 @@
            (some (fn [ns]
                    (nameservice/alias ns db-alias))))))
 
-(defn throw-missing-branch
-  [address ledger-alias]
-  (throw (ex-info (str "No committed branches exist for ledger: " ledger-alias
-                       " at address: " address)
-                  {:status 400, :error :db/missing-branch})))
-
 (defn load-ledger*
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn}
    ledger-chan address]
@@ -358,16 +327,12 @@
                                                                          commit-address
                                                                          index-address))
             expanded-commit (json-ld/expand commit)
-            ledger-alias    (commit->ledger-alias conn address expanded-commit)
-            ;; Determine branch using helpers in priority order
-            branch           (or (branch-from-commit expanded-commit)
-                                 (branch-from-ns ns-record)
-                                 (branch-from-alias ledger-alias))
+            combined-alias  (commit->ledger-alias conn address expanded-commit)
 
-            {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
-            ledger (ledger/instantiate ledger-alias address branch commit-catalog index-catalog
+            {:keys [did indexing]} (parse-ledger-options conn {})
+            ledger (ledger/instantiate combined-alias address commit-catalog index-catalog
                                        primary-publisher secondary-publishers indexing did expanded-commit)]
-        (ns-subscribe/subscribe-ledger conn ledger-alias)
+        (ns-subscribe/subscribe-ledger conn combined-alias)
         (async/put! ledger-chan ledger)
         ledger)
       (throw (ex-info (str "Unable to load. No record of ledger at address: " address " exists.")

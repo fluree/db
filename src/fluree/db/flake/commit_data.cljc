@@ -1,5 +1,6 @@
 (ns fluree.db.flake.commit-data
-  (:require [fluree.crypto :as crypto]
+  (:require [clojure.string :as str]
+            [fluree.crypto :as crypto]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
@@ -140,7 +141,10 @@
   (let [id          (get-id jsonld)
         v           (get-first-value jsonld const/iri-v)
         alias       (get-first-value jsonld const/iri-alias)
-        branch      (get-first-value jsonld const/iri-branch)
+        ;; Normalize alias to include @main if no branch present
+        alias*       (if (str/includes? alias "@")
+                       alias
+                       (str alias "@" default-branch))
         address     (-> jsonld
                         (get-first-value const/iri-address)
                         not-empty)
@@ -158,8 +162,7 @@
 
     (cond-> {:id     id
              :v      v
-             :alias  alias
-             :branch branch
+             :alias  alias*
              :time   time
              :tag    (mapv get-value tags)
              :data   (parse-db-data data)
@@ -223,12 +226,9 @@
 
 (defn blank-commit
   "Creates a skeleton blank commit map."
-  [alias branch publish-addresses init-time]
+  [alias publish-addresses init-time]
   (let [commit-json  (->json-ld {:alias  alias
                                  :v      0
-                                 :branch (if branch
-                                           (util/keyword->str branch)
-                                           default-branch)
                                  :data   {:t      0
                                           :flakes 0
                                           :size   0}
@@ -416,7 +416,7 @@
   db-sid. Used when committing to an in-memory ledger value and when reifying
   a ledger from storage on load."
   [db t commit]
-  (let [{:keys [id address alias branch data time v previous author issuer message txn]} commit
+  (let [{:keys [id address alias data time v previous author issuer message txn]} commit
         {db-t :t, db-address :address, data-id :id, :keys [flakes size]} data
         commit-sid (iri/encode-iri db id)
         db-sid     (iri/encode-iri db data-id)]
@@ -426,8 +426,6 @@
       (flake/create commit-sid const/$_address address const/$xsd:string t true nil)
       ;; alias
       (flake/create commit-sid const/$_ledger:alias alias const/$xsd:string t true nil)
-      ;; branch
-      (flake/create commit-sid const/$_ledger:branch branch const/$xsd:string t true nil)
       ;; v
       (flake/create commit-sid const/$_v v const/$xsd:int t true nil)
       ;; time

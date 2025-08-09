@@ -153,11 +153,12 @@
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
 ;; TODO - however this is really a concern of "commit", not staging and I don't think the db should be handling any of it
 (defn write-transaction!
-  [ledger staged]
+  [ledger db-alias staged]
   (go-try
-    (let [{:keys [txn author annotation]} staged]
+    (let [{:keys [txn author annotation]} staged
+          {:keys [commit-catalog]} ledger]
       (if txn
-        (let [{txn-id :address} (<? (save-txn! ledger txn))]
+        (let [{txn-id :address} (<? (save-txn! commit-catalog db-alias txn))]
           {:txn-id     txn-id
            :author     author
            :annotation annotation})
@@ -225,7 +226,7 @@
   ([ledger db]
    (commit! ledger db {}))
   ([{ledger-alias :alias, :as ledger}
-    {:keys [branch t stats commit] :as staged-db}
+    {:keys [alias branch t stats commit] :as staged-db}
     opts]
    (log/debug "commit!: write-transaction start" {:ledger ledger-alias})
    (go-try
@@ -239,14 +240,9 @@
            (commit-data/db->jsonld staged-db commit-data-opts)
 
            {:keys [txn-id author annotation]}
-           (<? (write-transaction! ledger staged-txn))
+           (<? (write-transaction! ledger alias staged-txn))
 
-           _ (log/debug "commit!: write-jsonld(db) start" {:ledger ledger-alias})
-
-           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
-
-           _ (log/debug "commit!: write-jsonld(db) done" {:ledger ledger-alias :db-address (:address data-write-result)})
-
+           data-write-result (<? (commit-storage/write-jsonld commit-catalog alias db-jsonld))
            db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
            dbid              (commit-data/hash->db-id (:hash data-write-result))
            keypair           {:did did, :private private}
@@ -268,7 +264,7 @@
            _ (log/debug "commit!: write-commit start" {:ledger ledger-alias})
 
            {:keys [commit-map commit-jsonld write-result]}
-           (<? (write-commit commit-catalog ledger-alias keypair new-commit))
+           (<? (write-commit commit-catalog alias keypair new-commit))
 
            _ (log/debug "commit!: write-commit done" {:ledger ledger-alias :commit-address (:address write-result)})
 

@@ -21,7 +21,7 @@
 
 (declare ->async-db ->AsyncDB deliver!)
 
-(defrecord AsyncDB [alias branch commit t db-chan]
+(defrecord AsyncDB [alias commit t db-chan]
   dbproto/IFlureeDb
   (-query [_ tracker query-map]
     (go-try
@@ -33,7 +33,7 @@
         (<? (dbproto/-class-ids db tracker subject)))))
   (-index-update [_ commit-index]
     (let [commit* (assoc commit :index commit-index)
-          updated-db (->async-db alias branch commit* t)]
+          updated-db (->async-db alias commit* t)]
       (go-try
         (let [db (<? db-chan)]
           (deliver! updated-db (dbproto/-index-update db commit-index))))
@@ -148,7 +148,7 @@
 
   (-as-of [_ t]
     (let [db-chan-at-t (async/promise-chan)
-          db-at-t      (->AsyncDB alias branch commit t db-chan-at-t)]
+          db-at-t      (->AsyncDB alias commit t db-chan-at-t)]
       (go
         (try*
           (let [db (<? db-chan)]
@@ -189,7 +189,7 @@
         (<? (policy/wrap-policy db tracker policy policy-values)))))
   (root [_]
     (let [root-ch (async/promise-chan)
-          root-db (->AsyncDB alias branch commit t root-ch)]
+          root-db (->AsyncDB alias commit t root-ch)]
       (go
         (try*
           (let [db (<? db-chan)]
@@ -207,7 +207,7 @@
 
 (defn display
   [db]
-  (select-keys db [:alias :branch :t]))
+  (select-keys db [:alias :t]))
 
 #?(:clj
    (defmethod print-method AsyncDB [^AsyncDB db, ^Writer w]
@@ -241,23 +241,18 @@
   "Creates an async-db.
   This is to be used in conjunction with `deliver!` that will deliver the
   loaded db to the async-db."
-  [ledger-alias branch commit-map t]
-  (->AsyncDB ledger-alias branch commit-map t (async/promise-chan)))
+  [ledger-alias commit-map t]
+  (->AsyncDB ledger-alias commit-map t (async/promise-chan)))
 
 (defn load
-  ([ledger-alias branch commit-catalog index-catalog commit-jsonld indexing-opts]
+  ([ledger-alias commit-catalog index-catalog commit-jsonld indexing-opts]
    (let [commit-map (commit-data/jsonld->clj commit-jsonld)]
-     (load ledger-alias branch commit-catalog index-catalog commit-jsonld commit-map indexing-opts)))
-  ([ledger-alias branch commit-catalog index-catalog commit-jsonld commit-map indexing-opts]
+     (load ledger-alias commit-catalog index-catalog commit-jsonld commit-map indexing-opts)))
+  ([ledger-alias commit-catalog index-catalog commit-jsonld commit-map indexing-opts]
    (let [t        (-> commit-map :data :t)
-         ;; Ensure AsyncDB commit reflects index t when an index address exists but :t is missing
-         commit-map* (if (and (get-in commit-map [:index :address])
-                              (nil? (get-in commit-map [:index :data :t])))
-                       (assoc-in commit-map [:index :data :t] t)
-                       commit-map)
-         async-db (->async-db ledger-alias branch commit-map* t)]
+         async-db (->async-db ledger-alias commit-map t)]
      (go
-       (let [db (<! (flake-db/load ledger-alias commit-catalog index-catalog branch
+       (let [db (<! (flake-db/load ledger-alias commit-catalog index-catalog
                                    [commit-jsonld commit-map] indexing-opts))]
          (deliver! async-db db)))
      async-db)))
