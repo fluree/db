@@ -48,7 +48,7 @@
   [node]
   (and (storage? node)
        (-> node
-           (dissoc :idx :id :type conn-vocab/address-identifier)
+           (dissoc "@id" "@type" conn-vocab/address-identifier)
            empty?)))
 
 (defn file-storage?
@@ -158,16 +158,13 @@
   [x]
   (and (subject-node? x)
        (not (blank-node? x))
-       (-> x
-           (dissoc :idx)
-           count
-           (= 1))))
+       (-> x count (= 1))))
 
 (defn split-subject-node
   [node]
-  (let [node* (cond-> node
-                (blank-node? node) (assoc "@id" (iri/new-blank-node-id))
-                true               (dissoc :idx))]
+  (let [node* (if (blank-node? node)
+                (assoc node "@id" (iri/new-blank-node-id))
+                node)]
     (if (ref-node? node*)
       [node*]
       (let [ref-node (select-keys node* ["@id"])]
@@ -190,7 +187,7 @@
 
 (defn flatten-node
   [node]
-  (loop [[[k v] & r] (dissoc node :idx)
+  (loop [[[k v] & r] node
          children    []
          flat-node   {}]
     (if k
