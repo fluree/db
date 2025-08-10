@@ -52,8 +52,8 @@
 (defn reference?
   [node]
   (and (map? node)
-       (contains? node :id)
-       (-> node (dissoc :idx :id) empty?)))
+       (contains? node "@id")
+       (-> node (dissoc "@id") empty?)))
 
 (defn convert-reference
   [node]

@@ -249,8 +249,7 @@
 
 (defn get-types
   [jsonld]
-  (or (:type jsonld)
-      (get jsonld "@type")))
+  (get jsonld "@type"))
 
 (defn of-type?
   "Returns true if the provided json-ld node is of the provided type."
@@ -262,8 +261,7 @@
 (defn get-value
   [val]
   (if (map? val)
-    (or (:value val)
-        (get val "@value"))
+    (get val "@value")
     val))
 
 (defn get-datatype
@@ -284,8 +282,7 @@
 
 (defn get-id
   [jsonld]
-  (or (:id jsonld)
-      (get jsonld "@id")))
+  (get jsonld "@id"))
 
 (defn get-first-id
   [jsonld k]
