@@ -141,10 +141,6 @@
   (let [id          (get-id jsonld)
         v           (get-first-value jsonld const/iri-v)
         alias       (get-first-value jsonld const/iri-alias)
-        ;; Normalize alias to include @main if no branch present
-        alias*       (if (str/includes? alias "@")
-                       alias
-                       (str alias "@" default-branch))
         address     (-> jsonld
                         (get-first-value const/iri-address)
                         not-empty)
@@ -162,7 +158,7 @@
 
     (cond-> {:id     id
              :v      v
-             :alias  alias*
+             :alias  alias
              :time   time
              :tag    (mapv get-value tags)
              :data   (parse-db-data data)
