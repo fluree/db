@@ -142,9 +142,10 @@
             (extract-commit-metadata old-data)
 
             ;; Create new minimal record using existing function
-            new-record (ns-storage/ns-record ledger-alias branch commit-address t-value index-address)
+            combined-alias (str ledger-alias "@" branch)
+            new-record (ns-storage/ns-record combined-alias commit-address t-value index-address)
             record-bytes (json/stringify-UTF8 new-record)
-            new-filename (ns-storage/local-filename ledger-alias branch)]
+            new-filename (ns-storage/local-filename combined-alias)]
 
         ;; Write to new location using storage interface
         (<? (storage/write-bytes file-store new-filename record-bytes))
