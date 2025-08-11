@@ -756,7 +756,7 @@
            iri-fn-base (fn [input ctx]
                          (let [value    (if (map? input) (:value input) input)
                                expanded (if (= "@type" value)
-                                          const/iri-rdf-type
+                                          const/iri-type
                                           (json-ld/expand-iri value ctx))]
                            (where/->typed-val expanded const/iri-id)))
 
@@ -1067,10 +1067,7 @@
      str-lang str-dt bnode
 
      ;; vector scoring fns
-     dotProduct cosineSimilarity euclidianDistance
-
-     ;; internal helper fns - needed for testing and some query constructs
-     ->typed-val iri-fn-base})
+     dotProduct cosineSimilarity euclidianDistance})
 
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))
@@ -1192,17 +1189,10 @@
                            (where/mch->typed-val mch#))]))
         var-syms))
 
-#?(:clj
-   (defmacro parse-qualified-code
-     "Parses qualified code, applying GraalVM-specific transformations when needed.
-      For GraalVM builds, just coerce since we handle iri in the function definition."
-     [code count-star-sym ctx allow-aggregates?]
-     `(coerce ~count-star-sym ~allow-aggregates? ~ctx ~code)))
-
 (defn compile*
   [code ctx allow-aggregates?]
   (let [count-star-sym (gensym "?$-STAR")
-        qualified-code (parse-qualified-code code count-star-sym ctx allow-aggregates?)
+        qualified-code (coerce count-star-sym allow-aggregates? ctx code)
         ;; Transform iri calls for GraalVM
         transformed-code (transform-iri-calls qualified-code)
         vars           (variables qualified-code)
