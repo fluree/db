@@ -127,6 +127,9 @@ cljstest: cljs-browser-test cljs-node-test ## Run all ClojureScript tests
 cljtest: ## Run Clojure tests
 	clojure -X:dev:cljtest
 
+cljtest-sci: ## Run Clojure tests forcing SCI path (GraalVM emulation) and focusing ^:sci tests
+	clojure -X:cljtest-sci
+
 pending-tests: ## Run pending tests
 	clojure -X:dev:pending-tests
 

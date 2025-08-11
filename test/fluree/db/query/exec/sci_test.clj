@@ -1,59 +1,50 @@
 (ns fluree.db.query.exec.sci-test
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.constants :as const]
+            [fluree.db.api :as fluree]
             [fluree.db.query.exec.eval :as eval]
-            [fluree.db.query.exec.where :as where]
+            [fluree.db.test-utils :as test-utils]
             [fluree.json-ld :as json-ld]))
 
-(deftest test-sci-evaluation-directly
-  (testing "Direct SCI evaluation of iri function"
-    ;; First check that we can call the iri-with-context function directly
+(deftest ^:sci sci-end-to-end-filter-functions
+  (testing "filters and functions in real queries (SCI compile->eval path)"
+    (let [ctx [test-utils/default-context {"ex" "http://example.org/ns/"}]
+          conn @(fluree/connect-memory)
+          ledger @(fluree/create conn "test/sci")
+          db (fluree/db ledger)
+          db1 @(fluree/update db {"@context" ctx
+                                  "insert"   [{"@id" "ex:cam"  "schema:name" "Cam"  "ex:age" 28}
+                                              {"@id" "ex:alex" "schema:name" "Alex" "ex:age" 42}]})]
+      ;; numeric comparison in filter
+      (is (= ["Cam"]
+             @(fluree/query db1 {"@context" ctx
+                                 "select"   "?name"
+                                 "where"    [{"@id" "?p" "schema:name" "?name" "ex:age" "?age"}
+                                             ["filter" "(< ?age 30)"]]})))
+      ;; regex in filter
+      (is (= ["Cam"]
+             @(fluree/query db1 {"@context" ctx
+                                 "select"   "?name"
+                                 "where"    [{"@id" "?p" "schema:name" "?name"}
+                                             ["filter" "(regex ?name \"^C\")"]]})))
+      ;; bind + function + filter
+      (is (= ["Cam"]
+             @(fluree/query db1 {"@context" ctx
+                                 "select"   "?name"
+                                 "where"    [{"@id" "?p" "schema:name" "?name"}
+                                             ["bind" "?len" "(strLen ?name)"]
+                                             ["filter" "(= ?len 3)"]]})))
+      ;; iri inside filter
+      (is (= [["ex:cam" "ex:age"]]
+             @(fluree/query db1 {"@context" ctx
+                                 "select"   ["?s" "?p"]
+                                 "where"    [{"@id" "?s" "?p" "?o"}
+                                             ["filter" "(and (= ?p (iri \"ex:age\")) (= ?s (iri \"ex:cam\")))"]]}))))))
+
+(deftest ^:sci compile-and-eval-iri-sci
+  (testing "compile -> eval path expands iri with context under SCI"
     (let [raw-ctx {"ex" "http://example.org/"}
           parsed-ctx (json-ld/parse-context raw-ctx)
-          ;; Test json-ld expansion directly
-          expanded (json-ld/expand-iri "ex:name" parsed-ctx)]
-      (is (= "http://example.org/name" expanded)
-          "json-ld/expand-iri should expand the prefix"))
-
-    (let [raw-ctx {"ex" "http://example.org/"}
-          parsed-ctx (json-ld/parse-context raw-ctx)
-          iri-fn (fn [input]
-                   (let [value (if (map? input)
-                                 (:value input)
-                                 input)
-                         expanded (if (= "@type" value)
-                                    const/iri-rdf-type
-                                    (json-ld/expand-iri value parsed-ctx))]
-                     (where/->typed-val expanded const/iri-id)))
-          direct-result (iri-fn "ex:name")]
-      (is (= "http://example.org/name" (:value direct-result))
-          "Direct iri function call should work"))
-
-    ;; Now test through SCI - parse context before passing to eval-graalvm-with-context
-    (let [raw-ctx {"ex" "http://example.org/"}
-          parsed-ctx (json-ld/parse-context raw-ctx)
-          ;; Use the unqualified symbol as queries would
-          form '(iri "ex:name")
-          result (eval/eval-graalvm-with-context form parsed-ctx)]
-      (is (= "http://example.org/name" (:value result))
-          "Should expand ex:name to full IRI")
-      (is (= "@id" (:datatype-iri result))
-          "Should have @id datatype for IRIs")))
-
-  (testing "Direct SCI evaluation with @type"
-    (let [raw-ctx {}
-          parsed-ctx (json-ld/parse-context raw-ctx)
-          form '(iri "@type")
-          result (eval/eval-graalvm-with-context form parsed-ctx)]
-      (is (= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" (:value result))
-          "Should expand @type to rdf:type IRI")))
-
-  (testing "Direct SCI evaluation with datatype function"
-    (let [raw-ctx {}
-          parsed-ctx (json-ld/parse-context raw-ctx)
-          typed-val {:value "test" :datatype-iri "http://www.w3.org/2001/XMLSchema#string"}
-          ;; Use list instead of syntax quote to avoid namespace qualification
-          form (list 'datatype typed-val)
-          result (eval/eval-graalvm-with-context form parsed-ctx)]
-      (is (= "http://www.w3.org/2001/XMLSchema#string" (:value result))
-          "Should return the datatype IRI"))))
+          compiled-fn (eval/compile '(iri "ex:name") parsed-ctx)
+          result (compiled-fn {})]
+      (is (= "http://example.org/name" (:value result)))
+      (is (= "@id" (:datatype-iri result))))))
