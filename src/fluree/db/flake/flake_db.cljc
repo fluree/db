@@ -165,15 +165,15 @@
   are defining then we know it is a node and have additional data to include."
   [mapx]
   (cond
-    (contains? mapx :value)
+    (contains? mapx "@value")
     false
 
     (list-value? mapx)
     false
 
     (and
-     (contains? mapx :set)
-     (= #{:set :idx} (set (keys mapx))))
+     (contains? mapx "@set")
+     (= 1 (count mapx)))
     false
 
     :else
