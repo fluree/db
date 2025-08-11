@@ -229,7 +229,7 @@
   ([ledger db]
    (commit! ledger db {}))
   ([{ledger-alias :alias :as ledger}
-    {:keys [alias branch t stats commit] :as staged-db}
+    {:keys [branch t stats commit] :as staged-db}
     opts]
    (go-try
      (let [{:keys [commit-catalog]} ledger

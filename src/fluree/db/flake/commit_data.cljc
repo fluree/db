@@ -1,6 +1,5 @@
 (ns fluree.db.flake.commit-data
-  (:require [clojure.string :as str]
-            [fluree.crypto :as crypto]
+  (:require [fluree.crypto :as crypto]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
