@@ -265,7 +265,7 @@
   [db commit-jsonld commit-data-jsonld]
   (go-try
     (let [t-new            (db-t commit-data-jsonld)
-          nses             (map :value
+          nses             (map util/get-value
                                 (get commit-data-jsonld const/iri-namespaces))
           db*              (with-namespaces db nses)
           asserted-flakes  (->> (db-assert commit-data-jsonld)
