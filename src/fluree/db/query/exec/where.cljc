@@ -473,11 +473,13 @@
     [o o-fn]))
 
 (defn comparable-iri?
-  "When matching against"
+  "When matching against an all-iri index (s or p - SIDs), the only values that can be
+  compared are other SIDs or `nil`. Literal values are not comparable."
   [x]
   (or (iri/sid? x) (nil? x)))
 
 (defn unmatched-optional-vars?
+  "A triple pattern with any match components that are empty optional vars."
   [triple-pattern]
   (not-empty (keep get-optional triple-pattern)))
 
