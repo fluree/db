@@ -228,7 +228,7 @@
   ([ledger db]
    (commit! ledger db {}))
   ([{ledger-alias :alias :as ledger}
-    {:keys [alias branch t stats commit] :as staged-db}
+    {:keys [branch t stats commit] :as staged-db}
     opts]
    (log/debug "commit!: write-transaction start" {:ledger ledger-alias})
    (go-try

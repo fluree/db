@@ -1,6 +1,7 @@
 (ns fluree.db.api
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.core.async :as async :refer [go <!]]
+            [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.connection :as connection :refer [connection?]]
@@ -248,6 +249,13 @@
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
    (validate-connection conn)
+   ;; Disallow branch specification in ledger name during creation
+   (when (str/includes? ledger-alias ":")
+     (throw (ex-info (str "Ledger name cannot contain ':' character. "
+                          "Branches must be created separately. "
+                          "Provided: " ledger-alias)
+                     {:error :db/invalid-ledger-name
+                      :ledger-alias ledger-alias})))
    (promise-wrap
     (go-try
       (log/info "Creating ledger" ledger-alias)
