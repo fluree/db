@@ -264,10 +264,17 @@
     (get val "@value")
     val))
 
+(defn get-list
+  [v-map]
+  (get v-map "@list"))
+
+(defn get-lang
+  [v-map]
+  (get v-map "@language"))
+
 (defn get-datatype
   [node]
-  (when (or (contains? node :value)
-            (contains? node "@value"))
+  (when (contains? node "@value")
     (get-types node)))
 
 (defn get-first-value
@@ -297,7 +304,7 @@
      coll))
 
   ([iri context coll]
-   (if (#{:list :set} (-> context (get iri) :container))
+   (if (#{"@list" "@set"} (-> context (get iri) (get "@container")))
      coll
      (unwrap-singleton coll))))
 
@@ -332,7 +339,6 @@
 
 (defn get-graph
   [jsonld]
-  (cond
-    (contains? jsonld :graph)   (:graph jsonld)
-    (contains? jsonld "@graph") (get jsonld "@graph")
-    :else                       jsonld))
+  (if (contains? jsonld "@graph")
+    (get jsonld "@graph")
+    jsonld))
