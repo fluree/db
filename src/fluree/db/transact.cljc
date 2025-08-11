@@ -145,10 +145,11 @@
       parse-data-helpers))
 
 (defn save-txn!
-  ([{:keys [commit-catalog] ledger-alias :alias :as _ledger} txn]
-   (save-txn! commit-catalog ledger-alias txn))
-  ([commit-catalog ledger-alias txn]
-   (let [path (str/join "/" [ledger-alias "txn"])]
+  ([{:keys [commit-catalog alias] :as _ledger} txn]
+   (let [ledger-name (first (str/split alias #"@" 2))]
+     (save-txn! commit-catalog ledger-name txn)))
+  ([commit-catalog ledger-name txn]
+   (let [path (str/join "/" [ledger-name "txn"])]
      (storage/content-write-json commit-catalog path txn))))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
@@ -226,11 +227,12 @@
   returns a db with an updated :commit."
   ([ledger db]
    (commit! ledger db {}))
-  ([{ledger-alias :alias, :as ledger}
+  ([{ledger-alias :alias :as ledger}
     {:keys [alias branch t stats commit] :as staged-db}
     opts]
    (go-try
      (let [{:keys [commit-catalog]} ledger
+           ledger-name (first (str/split ledger-alias #"@" 2))
 
            {:keys [tag time message did private commit-data-opts index-files-ch]
             :or   {time (util/current-time-iso)}}
@@ -240,9 +242,9 @@
            (commit-data/db->jsonld staged-db commit-data-opts)
 
            {:keys [txn-id author annotation]}
-           (<? (write-transaction! ledger alias staged-txn))
+           (<? (write-transaction! ledger ledger-name staged-txn))
 
-           data-write-result (<? (commit-storage/write-jsonld commit-catalog alias db-jsonld))
+           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-name db-jsonld))
            db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
            dbid              (commit-data/hash->db-id (:hash data-write-result))
            keypair           {:did did, :private private}
@@ -262,7 +264,7 @@
                                                       :size       (:size stats)})
 
            {:keys [commit-map commit-jsonld write-result]}
-           (<? (write-commit commit-catalog alias keypair new-commit))
+           (<? (write-commit commit-catalog ledger-name keypair new-commit))
 
            db  (formalize-commit staged-db commit-map)
            db* (ledger/update-commit! ledger branch db index-files-ch)]

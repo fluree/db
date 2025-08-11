@@ -141,21 +141,23 @@
     resp-ch))
 
 (defn write-jsonld
-  [storage ledger-alias jsonld]
-  (let [path (str/join "/" [ledger-alias "commit"])]
+  [storage ledger-name jsonld]
+  (let [path (str/join "/" [ledger-name "commit"])]
     (storage/content-write-json storage path jsonld)))
 
 (defn write-genesis-commit
   [storage ledger-alias publish-addresses init-time]
   (go-try
-    (let [genesis-commit            (commit-data/blank-commit ledger-alias publish-addresses init-time)
+    (let [;; Use full alias for commit data, but base name for storage paths
+          ledger-base-name          (first (str/split ledger-alias #"@" 2))
+          genesis-commit            (commit-data/blank-commit ledger-alias publish-addresses init-time)
           initial-context           (get genesis-commit "@context")
           initial-db-data           (-> genesis-commit
                                         (get "data")
                                         (assoc "@context" initial-context))
-          {db-address :address}     (<? (write-jsonld storage ledger-alias initial-db-data))
+          {db-address :address}     (<? (write-jsonld storage ledger-base-name initial-db-data))
           genesis-commit*           (assoc-in genesis-commit ["data" "address"] db-address)
-          {commit-address :address} (<? (write-jsonld storage ledger-alias genesis-commit*))]
+          {commit-address :address} (<? (write-jsonld storage ledger-base-name genesis-commit*))]
       (-> genesis-commit*
           (assoc "address" commit-address)
           json-ld/expand))))
