@@ -13,12 +13,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn ledger-base-name
-  "Extracts the base ledger name from a ledger alias that may include a branch.
-   e.g., 'my-ledger@main' -> 'my-ledger'"
-  [ledger-alias]
-  (first (str/split ledger-alias #"@" 2)))
-
 (defn get-branch-meta
   "Retrieves branch metadata from ledger state"
   [{:keys [state] :as _ledger} requested-branch]
@@ -138,9 +132,15 @@
   [combined-alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
    indexing-opts did latest-commit]
   (let [;; Parse ledger name and branch from combined alias
+<<<<<<< HEAD
         [ledger-alias branch] (if (clojure.string/includes? combined-alias ":")
                                 (clojure.string/split combined-alias #":" 2)
                                 [combined-alias "main"])
+=======
+        [_ branch] (if (str/includes? combined-alias ":")
+                     (str/split combined-alias #":" 2)
+                     [combined-alias "main"])
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
         publishers (cons primary-publisher secondary-publishers)
         branches {branch (branch/state-map combined-alias branch commit-catalog index-catalog
                                            publishers latest-commit indexing-opts)}]
@@ -164,7 +164,15 @@
            primary-publisher secondary-publishers]}
    {:keys [did indexing] :as _opts}]
   (go-try
+<<<<<<< HEAD
     (let [normalized-alias  alias
+=======
+    (let [normalized-alias  (normalize-alias alias)
+          ;; Add :main if no branch is specified
+          ledger-alias   (if (str/includes? normalized-alias ":")
+                           normalized-alias
+                           (str normalized-alias ":main"))
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
           ;; internal-only opt used for migrating ledgers without genesis commits
           init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit

@@ -1095,8 +1095,13 @@
            (is (= ["destined-for-drop" "ns@v1"]
 >>>>>>> 26564b21c (ensure branches don't use sub-directories)
                   (sort (async/<!! (fs/list-files primary-path)))))
+<<<<<<< HEAD
            (is (= ["destined-for-drop"]
                   (async/<!! (fs/list-files (str secondary-path "/ns@v2")))))
+=======
+           (is (= ["destined-for-drop_main.json"]
+                  (async/<!! (fs/list-files (str secondary-path "/ns@v1")))))
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
            ;; only store txns when signed

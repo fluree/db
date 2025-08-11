@@ -306,10 +306,14 @@
                           {:id test-utils/did?}
                           :f/address test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                           :f/alias   "committest:main"
 =======
                           :f/alias   "committest@main"
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                          :f/alias   "committest:main"
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                           :f/previous
                           {:id test-utils/commit-id?}
                           :f/data    {:f/address test-utils/address?
@@ -330,10 +334,14 @@
         (let [commit-5 {:f/commit {"https://www.w3.org/2018/credentials#issuer" {:id test-utils/did?}
                                    :f/address                                   test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                                    :f/alias                                     "committest:main"
 =======
                                    :f/alias                                     "committest@main"
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                                   :f/alias                                     "committest:main"
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                                    :f/data                                      {:f/address test-utils/address?
                                                                                  :f/assert  [{:ex/x "foo-cat"
                                                                                               :ex/y "bar-cat"
@@ -354,10 +362,14 @@
                                    {:id test-utils/did?}
                                    :f/address  test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                                    :f/alias    "committest:main"
 =======
                                    :f/alias    "committest@main"
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                                   :f/alias    "committest:main"
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                                    :f/data     {:f/address test-utils/address?
                                                 :f/assert  [{:ex/x "foo-cat"
                                                              :ex/y "bar-cat"
@@ -395,10 +407,14 @@
                              {:id test-utils/did?}
                              :f/address  test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                              :f/alias    "committest:main"
 =======
                              :f/alias    "committest@main"
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                             :f/alias    "committest:main"
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                              :f/data     {:f/address test-utils/address?
                                           :f/assert  [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
@@ -418,10 +434,14 @@
                            {:id test-utils/did?}
                            :f/address  test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                            :f/alias    "committest:main"
 =======
                            :f/alias    "committest@main"
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                           :f/alias    "committest:main"
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                            :f/data     {:f/address test-utils/address?
                                         :f/assert  [{:ex/x "foo-3"
                                                      :ex/y "bar-3"
@@ -443,10 +463,14 @@
                            {:id test-utils/did?}
                            :f/address  test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                            :f/alias    "committest:main"
 =======
                            :f/alias    "committest@main"
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                           :f/alias    "committest:main"
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                            :f/data     {:f/address test-utils/address?
                                         :f/assert  [{:ex/x "foo-2"
                                                      :ex/y "bar-2"
@@ -470,10 +494,14 @@
                           {:id test-utils/did?}
                           :f/address  test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                           :f/alias    "committest:main"
 =======
                           :f/alias    "committest@main"
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                          :f/alias    "committest:main"
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                           :f/data     {:f/address  test-utils/address?
                                        :f/assert   [{:ex/x "foo-cat"
                                                      :ex/y "bar-cat"
@@ -492,10 +520,14 @@
                           {:id test-utils/did?}
                           :f/address  test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                           :f/alias    "committest:main"
 =======
                           :f/alias    "committest@main"
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                          :f/alias    "committest:main"
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                           :f/data     {:f/address  test-utils/address?
                                        :f/assert   [{:ex/x "foo-cat"
                                                      :ex/y "bar-cat"
@@ -523,10 +555,14 @@
                           {:id test-utils/did?}
                           :f/address  test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                           :f/alias    "committest:main"
 =======
                           :f/alias    "committest@main"
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                          :f/alias    "committest:main"
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                           :f/previous {:id test-utils/commit-id?}
                           :f/data     {:f/address test-utils/address?
                                        :f/assert  [{:ex/x "foo-1"
@@ -553,10 +589,14 @@
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                             :f/alias    "committest:main"
 =======
                             :f/alias    "committest@main"
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                            :f/alias    "committest:main"
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                             :f/data     {:f/address test-utils/address?
                                          :f/assert  [{:ex/x "foo-3"
                                                       :ex/y "bar-3"
@@ -583,10 +623,14 @@
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                             :f/alias    "committest:main"
 =======
                             :f/alias    "committest@main"
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                            :f/alias    "committest:main"
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                             :f/data     {:f/address test-utils/address?
                                          :f/assert  [{:ex/x "foo-cat"
                                                       :ex/y "bar-cat"
@@ -676,10 +720,14 @@
                              :id   :ex/alice}]
                   :commit  {:f/address  test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                             :f/alias    (str ledger-name ":main")
 =======
                             :f/alias    (str ledger-name "@main")
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                            :f/alias    (str ledger-name ":main")
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
@@ -705,10 +753,14 @@
                              :id   :ex/alice}]
                   :commit  {:f/address  test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                             :f/alias    (str ledger-name ":main")
 =======
                             :f/alias    (str ledger-name "@main")
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                            :f/alias    (str ledger-name ":main")
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
@@ -775,10 +827,14 @@
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                             :f/alias    (str ledger-name ":main")
 =======
                             :f/alias    (str ledger-name "@main")
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                            :f/alias    (str ledger-name ":main")
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
@@ -806,10 +862,14 @@
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                             :f/alias    (str ledger-name ":main")
 =======
                             :f/alias    (str ledger-name "@main")
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                            :f/alias    (str ledger-name ":main")
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
@@ -890,10 +950,14 @@
                     :commit  {:cred/issuer {:id test-utils/did?}
                               :f/address   test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                               :f/alias     (str ledger-name ":main")
 =======
                               :f/alias     (str ledger-name "@main")
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                              :f/alias     (str ledger-name ":main")
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                               :f/data      {:f/address test-utils/address?
                                             :f/assert  [{:ex/x "foo-3"
                                                          :ex/y "bar-3"
@@ -919,10 +983,14 @@
                     :commit  {:cred/issuer {:id test-utils/did?}
                               :f/address   test-utils/address?
 <<<<<<< HEAD
+<<<<<<< HEAD
                               :f/alias     (str ledger-name ":main")
 =======
                               :f/alias     (str ledger-name "@main")
 >>>>>>> d80188bd1 (remove most of special branch handling)
+=======
+                              :f/alias     (str ledger-name ":main")
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
                               :f/data      {:f/address test-utils/address?
                                             :f/assert  [{:ex/x "foo-cat"
                                                          :ex/y "bar-cat"

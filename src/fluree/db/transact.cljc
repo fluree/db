@@ -147,10 +147,14 @@
 (defn save-txn!
   ([{:keys [commit-catalog alias] :as _ledger} txn]
 <<<<<<< HEAD
+<<<<<<< HEAD
    (let [ledger-name (util.ledger/ledger-base-name alias)]
 =======
    (let [ledger-name (first (str/split alias #"@" 2))]
 >>>>>>> 26564b21c (ensure branches don't use sub-directories)
+=======
+   (let [ledger-name (util.ledger/ledger-base-name alias)]
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
      (save-txn! commit-catalog ledger-name txn)))
   ([commit-catalog ledger-name txn]
    (let [path (str/join "/" [ledger-name "txn"])]
@@ -238,10 +242,14 @@
    (go-try
      (let [{:keys [commit-catalog]} ledger
 <<<<<<< HEAD
+<<<<<<< HEAD
            ledger-name (util.ledger/ledger-base-name ledger-alias)
 =======
            ledger-name (first (str/split ledger-alias #"@" 2))
 >>>>>>> 26564b21c (ensure branches don't use sub-directories)
+=======
+           ledger-name (util.ledger/ledger-base-name ledger-alias)
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
 
            {:keys [tag time message did private commit-data-opts index-files-ch]
             :or   {time (util/current-time-iso)}}

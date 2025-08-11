@@ -450,12 +450,18 @@
                     (nameservice/address-path alias)
                     ;; Normalize alias to include branch if not present
 <<<<<<< HEAD
+<<<<<<< HEAD
                     (normalize-ledger-alias alias))]
 =======
                     (if (str/includes? alias "@")
                       alias
                       (str alias "@main")))]
 >>>>>>> 97e7a7e4e (remove 'branch' from most fns)
+=======
+                    (if (str/includes? alias ":")
+                      alias
+                      (str alias ":main")))]
+>>>>>>> 04eb7a9a2 (update branch separator to ':')
         (loop [[publisher & r] (publishers conn)]
           (when publisher
             (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
