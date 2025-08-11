@@ -32,9 +32,8 @@
                    (mapcat (partial remove
                                     (fn [v]
                                       ;; remove value objects unless they have type @id
-                                      (and
-                                       (some? (:value v))
-                                       (not= (:type v) const/iri-id)))))))
+                                      (and (some? (util/get-value v))
+                                           (not= (util/get-types v) const/iri-id)))))))
        not-empty))
 
 (defn expand-annotation
@@ -45,7 +44,7 @@
 
 (defn validate-annotation
   [[annotation :as expanded]]
-  (when-let [specified-id (:id annotation)]
+  (when-let [specified-id (util/get-id annotation)]
     (throw (ex-info "Commit annotation cannot specify a subject identifier."
                     {:status 400, :error :db/invalid-annotation :id specified-id})))
   (when (> (count expanded) 1)
