@@ -1103,8 +1103,11 @@
            ;; directories are not removed
            (is (= ["destined-for-drop" "ns@v1"]
                   (sort (async/<!! (fs/list-files primary-path)))))
-           (is (= []
+           ;; The destined-for-drop directory remains but should be empty
+           (is (= ["destined-for-drop"]
                   (async/<!! (fs/list-files (str secondary-path "/ns@v1")))))
+           (is (= []
+                  (async/<!! (fs/list-files (str secondary-path "/ns@v1/destined-for-drop")))))
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
            (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
