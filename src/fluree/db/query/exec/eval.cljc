@@ -652,12 +652,12 @@
     datatype       fluree.db.query.exec.eval/datatype
     equal          fluree.db.query.exec.eval/typed-equal
     floor          fluree.db.query.exec.eval/floor
-    find-grouped-val fluree.db.query.exec.eval/find-grouped-val
+     
     groupconcat    fluree.db.query.exec.eval/groupconcat
     if             fluree.db.query.exec.eval/-if
     in             fluree.db.query.exec.eval/in
     iri            fluree.db.query.exec.eval/iri
-    iri-fn-base    fluree.db.query.exec.eval/iri-fn-base
+     
     is-iri         fluree.db.query.exec.eval/is-iri
     is-literal     fluree.db.query.exec.eval/is-literal
     lang           fluree.db.query.exec.eval/lang
@@ -780,24 +780,22 @@
                                qualified-symbols)
 
            ;; Add special functions and macro replacements
-           eval-ns-fns (-> eval-ns-fns
-                           (assoc '->typed-val where/->typed-val
-                                  'compare* compare*
-                                  ;; Macro replacements
-                                  '-if -if-fn
-                                  'if -if-fn
-                                  'as as-fn
-                                  'fluree.db.query.exec.eval/as as-fn
-                                  '-and -and-fn
-                                  'and -and-fn
-                                  '-or -or-fn
-                                  'or -or-fn
-                                  ;; Add $-CONTEXT as a namespace symbol
-                                  '$-CONTEXT nil
-                                  ;; Add where/->typed-val for iri expansion
-                                  'where/->typed-val where/->typed-val
-                                  ;; Add the base iri function
-                                  'iri-fn-base iri-fn-base))
+           eval-ns-fns (assoc eval-ns-fns
+                              '->typed-val where/->typed-val
+                              'compare* compare*
+                              ;; Macro replacements
+                              '-if -if-fn
+                              'if -if-fn
+                              'as as-fn
+                              'fluree.db.query.exec.eval/as as-fn
+                              '-and -and-fn
+                              'and -and-fn
+                              '-or -or-fn
+                              'or -or-fn
+                              ;; Add where/->typed-val for iri expansion
+                              'where/->typed-val where/->typed-val
+                              ;; Add the base iri function
+                              'iri-fn-base iri-fn-base)
 
            ;; Build other namespaces
            where-ns-fns {'->typed-val where/->typed-val
@@ -863,8 +861,9 @@
                          (assoc 'struuid (fn [] ((struuid-wrapper)))
                                 'fluree.db.query.exec.eval/struuid (fn [] ((struuid-wrapper)))))
 
-            ;; Core functions - more efficient to define as a static map
-           core-fns '{instance? instance?
+            ;; Core functions via syntax-quote to auto-qualify
+            ;; TODO: consider SCI :allow for clojure.core instead of explicit map
+            core-fns `{instance? instance?
                       boolean? boolean?
                       string? string?
                       number? number?
@@ -988,17 +987,9 @@
                       print print
                       newline newline}
 
-           ;; Resolve core functions
-           resolved-core-fns (reduce (fn [acc [k v]]
-                                       (if-let [resolved (resolve v)]
-                                         (assoc acc k @resolved)
-                                         acc))
-                                     {}
-                                     core-fns)
-
-           ;; Add platform-specific functions
-           resolved-core-fns (assoc resolved-core-fns
-                                    'format #?(:clj format :cljs str))]
+            ;; Merge platform-specific functions
+            resolved-core-fns (assoc core-fns
+                                     `format #?(:clj format :cljs str))]
 
        (sci/init {:namespaces {'fluree.db.query.exec.eval eval-ns-fns
                                'fluree.db.query.exec.where where-ns-fns
