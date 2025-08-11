@@ -32,7 +32,8 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.time-travel :refer [TimeTravel]]
-            [fluree.db.util :as util :refer [try* catch* get-first get-first-value]]
+            [fluree.db.util :as util :refer [try* catch* get-id get-types get-list
+                                             get-first get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]
@@ -148,15 +149,15 @@
     t))
 
 (defn add-list-meta
-  [list-val]
-  (let [m {:i (-> list-val :idx last)}]
+  [idx list-val]
+  (let [m {:i idx}]
     (assoc list-val ::meta m)))
 
 (defn list-value?
   "returns true if json-ld value is a list object."
   [v]
   (and (map? v)
-       (= :list (-> v first key))))
+       (= "@list" (-> v first key))))
 
 (defn node?
   "Returns true if a nested value is itself another node in the graph.
@@ -180,7 +181,7 @@
 
 (defn value-map->flake
   [assert? db sid pid t v-map]
-  (let [ref-id (:id v-map)
+  (let [ref-id (get-id v-map)
         meta   (::meta v-map)]
     (if (and ref-id (node? v-map))
       (let [ref-sid (iri/encode-iri db ref-id)]
@@ -193,9 +194,9 @@
   (let [v-maps (util/sequential value)]
     (mapcat (fn [v-map]
               (if (list-value? v-map)
-                (let [list-vals (:list v-map)]
+                (let [list-vals (get-list v-map)]
                   (into []
-                        (comp (map add-list-meta)
+                        (comp (map-indexed add-list-meta)
                               (map (partial value-map->flake assert? db sid pid t)))
                         list-vals))
                 [(value-map->flake assert? db sid pid t v-map)]))
@@ -213,7 +214,8 @@
 (defn node->flakes
   [assert? db t node]
   (log/trace "node->flakes:" node "assert?" assert?)
-  (let [{:keys [id type]} node
+  (let [id              (get-id node)
+        type            (get-types node)
         sid             (if assert?
                           (iri/encode-iri db id)
                           (or (iri/encode-iri db id)
