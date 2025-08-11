@@ -592,7 +592,7 @@
     (if (nil? value*)
       (throw (ex-info (str "Data type " (iri/sid->iri type-id)
                            " cannot be coerced from provided value: " value ".")
-                      {:status 400 :error, :db/shacl-value-coercion}))
+                      {:status 400 :error, :db/value-coercion}))
       [value* type-id])))
 
 (defn coerce-value
