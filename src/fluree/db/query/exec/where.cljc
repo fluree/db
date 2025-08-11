@@ -493,7 +493,7 @@
             (not (comparable-iri? s))
             (not (comparable-iri? p)))
       ;; no flakes will ever match the given triple pattern
-      (async/onto-chan (async/chan) [])
+      (async/onto-chan! (async/chan) [])
 
       (let [s-fn (::fn s-mch)
             p-fn (::fn p-mch)
