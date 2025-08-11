@@ -13,6 +13,12 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn ledger-base-name
+  "Extracts the base ledger name from a ledger alias that may include a branch.
+   e.g., 'my-ledger@main' -> 'my-ledger'"
+  [ledger-alias]
+  (first (str/split ledger-alias #"@" 2)))
+
 (defn get-branch-meta
   "Retrieves branch metadata from ledger state"
   [{:keys [state] :as _ledger} requested-branch]
