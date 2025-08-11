@@ -7,6 +7,7 @@
             [fluree.db.util :as util :refer [get-first get-first-id
                                              get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
@@ -149,7 +150,7 @@
   [storage ledger-alias publish-addresses init-time]
   (go-try
     (let [;; Use full alias for commit data, but base name for storage paths
-          ledger-base-name          (first (str/split ledger-alias #"@" 2))
+          ledger-base-name          (util.ledger/ledger-base-name ledger-alias)
           genesis-commit            (commit-data/blank-commit ledger-alias publish-addresses init-time)
           initial-context           (get genesis-commit "@context")
           initial-db-data           (-> genesis-commit

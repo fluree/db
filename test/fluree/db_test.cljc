@@ -1068,7 +1068,7 @@
          (testing "before drop"
            (is (= ["destined-for-drop" "ns@v1"]
                   (sort (async/<!! (fs/list-files primary-path)))))
-           (is (= ["destined-for-drop@main.json"]
+           (is (= ["destined-for-drop_main.json"]
                   (async/<!! (fs/list-files (str secondary-path "/ns@v1")))))
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))

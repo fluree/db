@@ -15,6 +15,7 @@
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
@@ -146,7 +147,7 @@
 
 (defn save-txn!
   ([{:keys [commit-catalog alias] :as _ledger} txn]
-   (let [ledger-name (first (str/split alias #"@" 2))]
+   (let [ledger-name (util.ledger/ledger-base-name alias)]
      (save-txn! commit-catalog ledger-name txn)))
   ([commit-catalog ledger-name txn]
    (let [path (str/join "/" [ledger-name "txn"])]
@@ -232,7 +233,7 @@
     opts]
    (go-try
      (let [{:keys [commit-catalog]} ledger
-           ledger-name (first (str/split ledger-alias #"@" 2))
+           ledger-name (util.ledger/ledger-base-name ledger-alias)
 
            {:keys [tag time message did private commit-data-opts index-files-ch]
             :or   {time (util/current-time-iso)}}

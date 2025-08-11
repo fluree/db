@@ -11,6 +11,7 @@
             [fluree.db.storage :as storage]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.virtual-graph :as vg]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -39,7 +40,7 @@
 (defn write-index-file
   [storage ledger-alias index-type serialized-data]
   (let [;; Extract base ledger name from alias for storage path
-        ledger-name (first (str/split ledger-alias #"@" 2))
+        ledger-name (util.ledger/ledger-base-name ledger-alias)
         index-name  (name index-type)
         path        (str/join "/" [ledger-name "index" index-name])]
     (storage/content-write-json storage path serialized-data)))

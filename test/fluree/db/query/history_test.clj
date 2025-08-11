@@ -305,7 +305,7 @@
              [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
                           {:id test-utils/did?}
                           :f/address test-utils/address?
-                          :f/alias   "committest@main"
+                          :f/alias   "committest:main"
                           :f/previous
                           {:id test-utils/commit-id?}
                           :f/data    {:f/address test-utils/address?
@@ -325,7 +325,7 @@
                                               :t              {:from 1 :to 1}})))
         (let [commit-5 {:f/commit {"https://www.w3.org/2018/credentials#issuer" {:id test-utils/did?}
                                    :f/address                                   test-utils/address?
-                                   :f/alias                                     "committest@main"
+                                   :f/alias                                     "committest:main"
                                    :f/data                                      {:f/address test-utils/address?
                                                                                  :f/assert  [{:ex/x "foo-cat"
                                                                                               :ex/y "bar-cat"
@@ -345,7 +345,7 @@
               commit-4 {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                                    {:id test-utils/did?}
                                    :f/address  test-utils/address?
-                                   :f/alias    "committest@main"
+                                   :f/alias    "committest:main"
                                    :f/data     {:f/address test-utils/address?
                                                 :f/assert  [{:ex/x "foo-cat"
                                                              :ex/y "bar-cat"
@@ -382,7 +382,7 @@
                  {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                              {:id test-utils/did?}
                              :f/address  test-utils/address?
-                             :f/alias    "committest@main"
+                             :f/alias    "committest:main"
                              :f/data     {:f/address test-utils/address?
                                           :f/assert  [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
@@ -401,7 +401,7 @@
                {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                            {:id test-utils/did?}
                            :f/address  test-utils/address?
-                           :f/alias    "committest@main"
+                           :f/alias    "committest:main"
                            :f/data     {:f/address test-utils/address?
                                         :f/assert  [{:ex/x "foo-3"
                                                      :ex/y "bar-3"
@@ -422,7 +422,7 @@
                {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                            {:id test-utils/did?}
                            :f/address  test-utils/address?
-                           :f/alias    "committest@main"
+                           :f/alias    "committest:main"
                            :f/data     {:f/address test-utils/address?
                                         :f/assert  [{:ex/x "foo-2"
                                                      :ex/y "bar-2"
@@ -445,7 +445,7 @@
              [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
                           {:id test-utils/did?}
                           :f/address  test-utils/address?
-                          :f/alias    "committest@main"
+                          :f/alias    "committest:main"
                           :f/data     {:f/address  test-utils/address?
                                        :f/assert   [{:ex/x "foo-cat"
                                                      :ex/y "bar-cat"
@@ -463,7 +463,7 @@
               {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                           {:id test-utils/did?}
                           :f/address  test-utils/address?
-                          :f/alias    "committest@main"
+                          :f/alias    "committest:main"
                           :f/data     {:f/address  test-utils/address?
                                        :f/assert   [{:ex/x "foo-cat"
                                                      :ex/y "bar-cat"
@@ -490,7 +490,7 @@
              [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
                           {:id test-utils/did?}
                           :f/address  test-utils/address?
-                          :f/alias    "committest@main"
+                          :f/alias    "committest:main"
                           :f/previous {:id test-utils/commit-id?}
                           :f/data     {:f/address test-utils/address?
                                        :f/assert  [{:ex/x "foo-1"
@@ -516,7 +516,7 @@
                   :commit  {"https://www.w3.org/2018/credentials#issuer"
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
-                            :f/alias    "committest@main"
+                            :f/alias    "committest:main"
                             :f/data     {:f/address test-utils/address?
                                          :f/assert  [{:ex/x "foo-3"
                                                       :ex/y "bar-3"
@@ -542,7 +542,7 @@
                   :commit  {"https://www.w3.org/2018/credentials#issuer"
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
-                            :f/alias    "committest@main"
+                            :f/alias    "committest:main"
                             :f/data     {:f/address test-utils/address?
                                          :f/assert  [{:ex/x "foo-cat"
                                                       :ex/y "bar-cat"
@@ -631,7 +631,7 @@
                              :ex/y "bar-3"
                              :id   :ex/alice}]
                   :commit  {:f/address  test-utils/address?
-                            :f/alias    (str ledger-name "@main")
+                            :f/alias    (str ledger-name ":main")
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
@@ -656,7 +656,7 @@
                              :ex/y "bar-cat"
                              :id   :ex/alice}]
                   :commit  {:f/address  test-utils/address?
-                            :f/alias    (str ledger-name "@main")
+                            :f/alias    (str ledger-name ":main")
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
@@ -722,7 +722,7 @@
                   :commit  {"https://www.w3.org/2018/credentials#issuer"
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
-                            :f/alias    (str ledger-name "@main")
+                            :f/alias    (str ledger-name ":main")
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
@@ -749,7 +749,7 @@
                   :commit  {"https://www.w3.org/2018/credentials#issuer"
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
-                            :f/alias    (str ledger-name "@main")
+                            :f/alias    (str ledger-name ":main")
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
@@ -829,7 +829,7 @@
                                :id   :ex/alice}]
                     :commit  {:cred/issuer {:id test-utils/did?}
                               :f/address   test-utils/address?
-                              :f/alias     (str ledger-name "@main")
+                              :f/alias     (str ledger-name ":main")
                               :f/data      {:f/address test-utils/address?
                                             :f/assert  [{:ex/x "foo-3"
                                                          :ex/y "bar-3"
@@ -854,7 +854,7 @@
                                :id   :ex/alice}]
                     :commit  {:cred/issuer {:id test-utils/did?}
                               :f/address   test-utils/address?
-                              :f/alias     (str ledger-name "@main")
+                              :f/alias     (str ledger-name ":main")
                               :f/data      {:f/address test-utils/address?
                                             :f/assert  [{:ex/x "foo-cat"
                                                          :ex/y "bar-cat"
