@@ -714,7 +714,7 @@
 ;;; in GraalVM native images where regular eval is not available.
 
 (defn graalvm-build?
-  "Returns true if building for GraalVM. 
+  "Returns true if building for GraalVM.
    Checks for environment variable or system property set during build."
   []
   #?(:clj (or (System/getenv "FLUREE_GRAALVM_BUILD")
@@ -1053,9 +1053,12 @@
 
     ;; value map
     (map? x)
-    (let [{:keys [id value type language]}
-          (-> (json-ld/expand {const/iri-data x} ctx)
-              (util/get-first const/iri-data))]
+    (let [expanded-data (-> (json-ld/expand {const/iri-data x} ctx)
+                            (util/get-first const/iri-data))
+          id            (util/get-id expanded-data)
+          value         (util/get-value expanded-data)
+          type          (util/get-types expanded-data)
+          language      (util/get-lang expanded-data)]
       (if id
         (where/->typed-val id const/iri-id)
         (where/->typed-val value type language)))
@@ -1117,7 +1120,7 @@
                ;; Replace (fluree.db.query.exec.eval/iri x) with the expanded form
                `(fluree.db.query.exec.where/->typed-val
                  (fluree.json-ld/expand-iri
-                  (:value ~(second form#))
+                  (fluree.db.util/get-value ~(second form#))
                   ~'$-CONTEXT)
                  fluree.db.constants/iri-id)
                form#))
