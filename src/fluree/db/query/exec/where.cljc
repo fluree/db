@@ -824,18 +824,25 @@
                    #{(::var where)}
                    (into #{} (mapcat clause-variables) where))))
 
+(defn assign-unmatched-optional-vars
+  "In the case where an optional clause returns no results, add all the vars of that
+  clause to the solution as optional vars. This is important if the vars are referenced
+  in subsequent patterns so that we don't erroneously consider them unmatched and
+  therefore able to match any value."
+  [solution optional-vars]
+  (reduce (fn [solution* var]
+            (update solution* var (fn [match]
+                                    (if (nil? match)
+                                      (optional-var var)
+                                      match))))
+          solution
+          optional-vars))
+
 (defmethod match-pattern :optional
   [db tracker solution pattern error-ch]
-  (let [clause (pattern-data pattern)
-        ;; keep track of :optional vars that don't match anything
-        solution* (reduce (fn [solution* var]
-                            (update solution* var (fn [match]
-                                                    (if (nil? match)
-                                                      (optional-var var)
-                                                      match))))
-                          solution
-                          (clause-variables clause))
-        opt-ch (async/chan 2 (with-default solution*))]
+  (let [clause    (pattern-data pattern)
+        solution* (assign-unmatched-optional-vars solution (clause-variables clause))
+        opt-ch    (async/chan 2 (with-default solution*))]
     (-> (match-clause db tracker solution clause error-ch)
         (async/pipe opt-ch))))
 
