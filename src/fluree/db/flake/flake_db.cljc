@@ -159,8 +159,8 @@
   (and (map? v)
        (= "@list" (-> v first key))))
 
-(defn node?
-  "Returns true if a nested value is itself another node in the graph.
+(defn subject-node?
+  "Returns true if a nested value is itself another subject node in the graph.
   Only need to test maps that have :id - and if they have other properties they
   are defining then we know it is a node and have additional data to include."
   [mapx]
@@ -183,7 +183,7 @@
   [assert? db sid pid t v-map]
   (let [ref-id (get-id v-map)
         meta   (::meta v-map)]
-    (if (and ref-id (node? v-map))
+    (if (and ref-id (subject-node? v-map))
       (let [ref-sid (iri/encode-iri db ref-id)]
         (flake/create sid pid ref-sid const/$id t assert? meta))
       (let [[value dt] (datatype/from-expanded db v-map)]
