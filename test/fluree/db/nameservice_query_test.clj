@@ -197,16 +197,18 @@
           (testing "Verify file system structure"
             ;; Check that subdirectories were created correctly
             (let [ns-dir (io/file (str storage-path) "ns@v1")
+                  ;; With ledger names like "tenant1/customers", the structure is:
+                  ;; ns@v1/tenant1/customers/main.json
                   tenant1-dir (io/file ns-dir "tenant1")
                   tenant2-dir (io/file ns-dir "tenant2")]
               (is (.exists ns-dir) "ns@v1 directory should exist")
               (is (.exists tenant1-dir) "tenant1 subdirectory should exist")
               (is (.exists tenant2-dir) "tenant2 subdirectory should exist")
 
-              ;; Check for nameservice files
-              (let [customer-file (io/file ns-dir "tenant1/customers_main.json")
-                    products-file (io/file ns-dir "tenant1/products_main.json")
-                    orders-file (io/file ns-dir "tenant2/orders_main.json")]
+              ;; Check for nameservice files with new structure
+              (let [customer-file (io/file ns-dir "tenant1/customers/main.json")
+                    products-file (io/file ns-dir "tenant1/products/main.json")
+                    orders-file (io/file ns-dir "tenant2/orders/main.json")]
                 (is (.exists customer-file) "Customer nameservice file should exist")
                 (is (.exists products-file) "Products nameservice file should exist")
                 (is (.exists orders-file) "Orders nameservice file should exist"))))
