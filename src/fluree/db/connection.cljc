@@ -70,11 +70,11 @@
 
 (defn normalize-ledger-alias
   "Ensures ledger alias includes branch. 
-  If no @ symbol present, appends @main as default branch."
+  If no : symbol present, appends :main as default branch."
   [ledger-alias]
-  (if (clojure.string/includes? ledger-alias "@")
+  (if (clojure.string/includes? ledger-alias ":")
     ledger-alias
-    (str ledger-alias "@" commit-data/default-branch)))
+    (str ledger-alias ":" commit-data/default-branch)))
 
 (defn register-ledger
   "Creates a promise-chan and saves it in a cache of ledgers being held
@@ -449,9 +449,9 @@
       (let [alias (if (fluree-address? alias)
                     (nameservice/address-path alias)
                     ;; Normalize alias to include branch if not present
-                    (if (str/includes? alias "@")
+                    (if (str/includes? alias ":")
                       alias
-                      (str alias "@main")))]
+                      (str alias ":main")))]
         (loop [[publisher & r] (publishers conn)]
           (when publisher
             (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))

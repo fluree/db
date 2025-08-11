@@ -387,7 +387,7 @@
     opts - (optional) Options map for the commit operation
 
   The ledger-id is automatically extracted from the database object's
-  alias and branch fields (formatted as alias@branch).
+  alias and branch fields (formatted as alias:branch).
 
   Creates a new commit and notifies the nameservice of the new version.
   Returns promise resolving to the committed database."
@@ -538,7 +538,7 @@
 
   Parameters:
     conn - Connection object
-    ledger-id - Ledger alias (with optional @branch) or address
+    ledger-id - Ledger alias (with optional :branch) or address
 
   Returns status map with commit and index information."
   [conn ledger-id]
@@ -901,7 +901,7 @@
 
   Parameters:
     conn - Database connection
-    ledger-alias - The alias/name of the ledger to index (with optional @branch)
+    ledger-alias - The alias/name of the ledger to index (with optional :branch)
     opts - (optional) Options map:
       :timeout - Max wait time in ms (default 300000 / 5 minutes)
 
@@ -915,7 +915,7 @@
       )
     
     ;; Trigger indexing for a specific branch
-    (let [indexed-db @(trigger-index conn \"my-ledger@main\")]
+    (let [indexed-db @(trigger-index conn \"my-ledger:main\")]
       ;; Use indexed-db...
       )"
   ([conn ledger-alias]

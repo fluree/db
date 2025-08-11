@@ -204,9 +204,9 @@
               (is (.exists tenant2-dir) "tenant2 subdirectory should exist")
 
               ;; Check for nameservice files
-              (let [customer-file (io/file ns-dir "tenant1/customers@main.json")
-                    products-file (io/file ns-dir "tenant1/products@main.json")
-                    orders-file (io/file ns-dir "tenant2/orders@main.json")]
+              (let [customer-file (io/file ns-dir "tenant1/customers_main.json")
+                    products-file (io/file ns-dir "tenant1/products_main.json")
+                    orders-file (io/file ns-dir "tenant2/orders_main.json")]
                 (is (.exists customer-file) "Customer nameservice file should exist")
                 (is (.exists products-file) "Products nameservice file should exist")
                 (is (.exists orders-file) "Orders nameservice file should exist"))))

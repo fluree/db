@@ -10,17 +10,19 @@
 
 (defn local-filename
   "Returns the local filename for a ledger's nameservice record.
-   Expects ledger-alias to be in format 'ledger@branch'."
+   Expects ledger-alias to be in format 'ledger:branch'."
   [ledger-alias]
-  (str "ns@v1/" ledger-alias ".json"))
+  ;; Replace : with _ for filesystem compatibility (Windows doesn't allow : in filenames)
+  (let [safe-alias (str/replace ledger-alias ":" "_")]
+    (str "ns@v1/" safe-alias ".json")))
 
 (defn ns-record
   "Generates nameservice metadata map for JSON storage using new minimal format.
-   Expects ledger-alias to be in format 'ledger@branch'."
+   Expects ledger-alias to be in format 'ledger:branch'."
   [ledger-alias commit-address t index-address]
-  (let [[alias branch] (str/split ledger-alias #"@" 2)]
+  (let [[alias branch] (str/split ledger-alias #":" 2)]
     (cond-> {"@context"     {"f" iri/f-ns}
-             "@id"          ledger-alias  ;; Already includes @branch
+             "@id"          ledger-alias  ;; Already includes :branch
              "@type"        ["f:Database" "f:PhysicalDatabase"]
              "f:ledger"     {"@id" alias}  ;; Just the ledger name without branch
              "f:branch"     branch
