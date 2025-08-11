@@ -502,8 +502,8 @@
 
             idx         (try* (index/for-components s p o o-dt)
                               (catch* e
-                                      (log/error e "Error resolving flake range")
-                                      (async/put! error-ch e)))
+                                (log/error e "Error resolving flake range")
+                                (async/put! error-ch e)))
             [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
             start-flake (flake/create s p o* o-dt nil nil util/min-integer)
             end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
