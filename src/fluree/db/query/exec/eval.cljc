@@ -652,12 +652,10 @@
     datatype       fluree.db.query.exec.eval/datatype
     equal          fluree.db.query.exec.eval/typed-equal
     floor          fluree.db.query.exec.eval/floor
-     
     groupconcat    fluree.db.query.exec.eval/groupconcat
     if             fluree.db.query.exec.eval/-if
     in             fluree.db.query.exec.eval/in
     iri            fluree.db.query.exec.eval/iri
-     
     is-iri         fluree.db.query.exec.eval/is-iri
     is-literal     fluree.db.query.exec.eval/is-literal
     lang           fluree.db.query.exec.eval/lang
@@ -861,141 +859,34 @@
                          (assoc 'struuid (fn [] ((struuid-wrapper)))
                                 'fluree.db.query.exec.eval/struuid (fn [] ((struuid-wrapper)))))
 
-            ;; Core functions via syntax-quote to auto-qualify
-            ;; TODO: consider SCI :allow for clojure.core instead of explicit map
-            core-fns `{instance? instance?
-                      boolean? boolean?
-                      string? string?
-                      number? number?
-                      keyword? keyword?
-                      int? int?
-                      pos-int? pos-int?
-                      nat-int? nat-int?
-                      map? map?
-                      vector? vector?
-                      sequential? sequential?
-                      list? list?
-                      set? set?
-                      coll? coll?
-                      fn? fn?
-                      nil? nil?
-                      some? some?
-                      contains? contains?
-                      empty? empty?
-                      not-empty not-empty
-                      every? every?
-                      some some
-                      filter filter
-                      remove remove
-                      first first
-                      second second
-                      rest rest
-                      next next
-                      last last
-                      butlast butlast
-                      take take
-                      drop drop
-                      take-while take-while
-                      drop-while drop-while
-                      nth nth
-                      count count
-                      get get
-                      get-in get-in
-                      assoc assoc
-                      dissoc dissoc
-                      update update
-                      keys keys
-                      vals vals
-                      merge merge
-                      select-keys select-keys
-                      into into
-                      conj conj
-                      concat concat
-                      mapv mapv
-                      reduce reduce
-                      partition partition
-                      group-by group-by
-                      sort sort
-                      sort-by sort-by
-                      reverse reverse
-                      distinct distinct
-                      flatten flatten
-                      zipmap zipmap
-                      frequencies frequencies
-                      range range
-                      repeat repeat
-                      repeatedly repeatedly
-                      iterate iterate
-                      cycle cycle
-                      interleave interleave
-                      interpose interpose
-                      str str
-                      subs subs
-                      re-find re-find
-                      re-matches re-matches
-                      re-pattern re-pattern
-                      re-seq re-seq
-                      inc inc
-                      dec dec
-                      + +
-                      - -
-                      * *
-                      / /
-                      quot quot
-                      rem rem
-                      mod mod
-                      abs abs
-                      max max
-                      min min
-                      rand rand
-                      rand-int rand-int
-                      compare compare
-                      = =
-                      not= not=
-                      < <
-                      > >
-                      <= <=
-                      >= >=
-                      zero? zero?
-                      pos? pos?
-                      neg? neg?
-                      even? even?
-                      odd? odd?
-                      true? true?
-                      false? false?
-                      identity identity
-                      constantly constantly
-                      comp comp
-                      complement complement
-                      partial partial
-                      memoize memoize
-                      atom atom
-                      deref deref
-                      reset! reset!
-                      swap! swap!
-                      compare-and-set! compare-and-set!
-                      meta meta
-                      with-meta with-meta
-                      name name
-                      namespace namespace
-                      symbol symbol
-                      keyword keyword
-                      apply apply
-                      pr-str pr-str
-                      prn-str prn-str
-                      println println
-                      print print
-                      newline newline}
+            ;; Build clojure.core map from a small explicit allowlist to reduce maintenance
+            core-allowlist '[instance? boolean? string? number? keyword?
+                             int? pos-int? nat-int? map? vector? sequential?
+                             list? set? coll? fn? nil? some? contains? empty?
+                             not-empty every? some filter remove first second rest next
+                             last butlast take drop take-while drop-while nth count get
+                             get-in assoc dissoc update keys vals merge select-keys into
+                             conj concat mapv reduce partition group-by sort sort-by reverse
+                             distinct flatten zipmap frequencies range repeat repeatedly iterate
+                             cycle interleave interpose str subs re-find re-matches re-pattern
+                             re-seq inc dec + - * / quot rem mod abs max min compare
+                             = not= < > <= >= zero? pos? neg? even? odd? true? false? identity
+                             constantly comp complement partial
+                             name namespace symbol keyword apply
+                             pr-str shuffle]
 
-            ;; Merge platform-specific functions
-            resolved-core-fns (assoc core-fns
-                                     `format #?(:clj format :cljs str))]
+           core-fns (let [m (into {}
+                                  (keep (fn [sym]
+                                          (when-let [v (ns-resolve 'clojure.core sym)]
+                                            [(symbol (name sym)) (var-get v)])))
+                                  core-allowlist)]
+                      (assoc m `format #?(:clj format :cljs str)))]
 
        (sci/init {:namespaces {'fluree.db.query.exec.eval eval-ns-fns
                                'fluree.db.query.exec.where where-ns-fns
                                'fluree.json-ld json-ld-fns
                                'fluree.db.constants const-ns
-                               'clojure.core resolved-core-fns
+                               'clojure.core core-fns
                                'user {}}
                   :bindings {;; Make constants available
                              'fluree.db.constants/iri-id const/iri-id}}))))
