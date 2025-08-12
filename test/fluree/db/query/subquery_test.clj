@@ -6,8 +6,8 @@
 (deftest ^:integration subquery-basics
   (testing "Basic subquery"
     (let [conn   (test-utils/create-conn)
-          people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          ledger-id (test-utils/load-people conn)
+          db     @(fluree/db conn ledger-id)]
 
       (testing "binding an IRI in the select"
         (is (= [["Alice" 50] ["Brian" 50] ["Cam" 34] ["Liam" 13]]
@@ -59,8 +59,8 @@
 (deftest ^:integration subquery-aggregate-as
   (testing "Subquery with an 'as' aggregate in select clause"
     (let [conn   (test-utils/create-conn)
-          people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          ledger-id (test-utils/load-people conn)
+          db     @(fluree/db conn ledger-id)]
 
       (testing "calculate average in subquery and use it in parent query as filter"
         (let [qry {:context  [test-utils/default-context
@@ -78,8 +78,8 @@
 (deftest ^:integration multiple-subqueries
   (testing "More than one subquery"
     (let [conn   (test-utils/create-conn)
-          people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          ledger-id (test-utils/load-people conn)
+          db     @(fluree/db conn ledger-id)]
 
       (testing "in parallel gets all values"
         (is (= [[13 5] [13 7] [13 9] [13 10] [13 11] [13 42] [13 42] [13 76] [34 5] [34 7] [34 9]
@@ -124,8 +124,8 @@
 (deftest ^:integration subquery-unions
   (testing "Subquery within a union statement"
     (let [conn   (test-utils/create-conn)
-          people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          ledger-id (test-utils/load-people conn)
+          db     @(fluree/db conn ledger-id)]
 
       (testing "calculate average in subquery and use it in parent query as filter"
         (let [qry {:context  [test-utils/default-context
@@ -143,8 +143,8 @@
 (deftest ^:integration subquery-values
   (testing "Subquery with inline values"
     (let [conn   @(fluree/connect-memory nil)
-          people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          ledger-id (test-utils/load-people conn)
+          db     @(fluree/db conn ledger-id)]
       (testing "inline values filters subquery results"
         (is (= [[:ex/alice] [:ex/liam]]
                @(fluree/query db {:context [test-utils/default-context {:ex "http://example.org/ns/"}]

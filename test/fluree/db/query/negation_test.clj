@@ -7,11 +7,11 @@
   (testing "queries with negation"
     (testing "on an existing ledger containing data about people"
       (let [conn    @(fluree/connect-memory)
-            ledger  @(fluree/create conn "negation-test")
+            db0 @(fluree/create conn "negation-test")
             context ["https://flur.ee"
                      test-utils/default-str-context
                      {"ex" "http://example.com/"}]
-            db0     (fluree/db ledger)
+            db0     db0
             db1     @(fluree/update db0 {"@context" context
                                          "insert"   [{"@id"           "ex:alice"
                                                       "@type"         "ex:Person"

@@ -37,8 +37,8 @@
 
 (deftest construct-test
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "people")
-        db0     (fluree/db ledger)
+        db0 @(fluree/create conn "people")
+        db0     db0
         context {"person" "http://example.org/Person#"
                  "ex" "http://example.org/"}
         db1     @(fluree/update db0 {"@context" context "insert" people-data})]
