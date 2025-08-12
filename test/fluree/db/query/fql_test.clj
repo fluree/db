@@ -275,7 +275,7 @@
                  @(fluree/query db q))
               "returns only the results related to the bound values"))))))
 
-(deftest ^:integration bind-query-test
+(deftest ^:integration ^:sci bind-query-test
   (let [conn   (test-utils/create-conn)
         people (test-utils/load-people conn)
         db     (fluree/db people)]

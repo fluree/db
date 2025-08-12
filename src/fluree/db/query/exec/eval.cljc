@@ -729,6 +729,9 @@
     graalvm-branch
     else-branch))
 
+;; Forward declaration for functions referenced in SCI context setup
+#?(:clj (declare find-grouped-val))
+
 ;; SCI context for GraalVM-compatible code evaluation
 #?(:clj
    (defn create-sci-context []
@@ -781,6 +784,9 @@
            eval-ns-fns (assoc eval-ns-fns
                               '->typed-val where/->typed-val
                               'compare* compare*
+                              ;; Internal helper used by compiled code (count *)
+                              'find-grouped-val find-grouped-val
+                              'fluree.db.query.exec.eval/find-grouped-val find-grouped-val
                               ;; Macro replacements
                               '-if -if-fn
                               'if -if-fn

@@ -4,7 +4,7 @@
             [fluree.db.constants :as const]
             [fluree.db.test-utils :as test-utils]))
 
-(deftest ^:integration vector-search-test
+(deftest ^:integration ^:sci vector-search-test
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "vector-score")
         db     @(fluree/update
@@ -61,7 +61,7 @@
         (is (= [["ex:homer" 0.72]]
                results))))))
 
-(deftest ^:integration vector-search-different-scores
+(deftest ^:integration ^:sci vector-search-different-scores
   (testing "Multi-cardinality vector values work as expected"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "vector-score-multi-card")
@@ -123,7 +123,7 @@
                   ["ex:bart" 0.6708203932499369 [0.1 0.9]]]
                  results)))))))
 
-(deftest ^:integration vector-search-mixed-datatype
+(deftest ^:integration ^:sci vector-search-mixed-datatype
   (testing "When a property has some vectors but other datatypes, filter non-vectors in scoring"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "vector-score-mixed-dt")
