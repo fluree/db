@@ -860,20 +860,20 @@
                                 'fluree.db.query.exec.eval/struuid (fn [] ((struuid-wrapper)))))
 
             ;; Build clojure.core map from a small explicit allowlist to reduce maintenance
-            core-allowlist '[instance? boolean? string? number? keyword?
-                             int? pos-int? nat-int? map? vector? sequential?
-                             list? set? coll? fn? nil? some? contains? empty?
-                             not-empty every? some filter remove first second rest next
-                             last butlast take drop take-while drop-while nth count get
-                             get-in assoc dissoc update keys vals merge select-keys into
-                             conj concat mapv reduce partition group-by sort sort-by reverse
-                             distinct flatten zipmap frequencies range repeat repeatedly iterate
-                             cycle interleave interpose str subs re-find re-matches re-pattern
-                             re-seq inc dec + - * / quot rem mod abs max min compare
-                             = not= < > <= >= zero? pos? neg? even? odd? true? false? identity
-                             constantly comp complement partial
-                             name namespace symbol keyword apply
-                             pr-str shuffle]
+           core-allowlist '[instance? boolean? string? number? keyword?
+                            int? pos-int? nat-int? map? vector? sequential?
+                            list? set? coll? fn? nil? some? contains? empty?
+                            not-empty every? some filter remove first second rest next
+                            last butlast take drop take-while drop-while nth count get
+                            get-in assoc dissoc update keys vals merge select-keys into
+                            conj concat mapv reduce partition group-by sort sort-by reverse
+                            distinct flatten zipmap frequencies range repeat repeatedly iterate
+                            cycle interleave interpose str subs re-find re-matches re-pattern
+                            re-seq inc dec + - * / quot rem mod abs max min compare
+                            = not= < > <= >= zero? pos? neg? even? odd? true? false? identity
+                            constantly comp complement partial
+                            name namespace symbol keyword apply
+                            pr-str shuffle]
 
            core-fns (let [m (into {}
                                   (keep (fn [sym]
