@@ -304,7 +304,7 @@
      coll))
 
   ([iri context coll]
-   (if (#{"@list" "@set"} (-> context (get iri) (get "@container")))
+   (if (#{:list :set} (-> context (get iri) :container))
      coll
      (unwrap-singleton coll))))
 
