@@ -13,8 +13,7 @@
             [fluree.db.query.sparql :as sparql]
             [fluree.db.query.sparql.translator :as sparql.translator]
             [fluree.db.query.turtle.parse :as turtle]
-            [fluree.db.util :as util :refer [try* catch* get-id get-lang get-list
-                                             get-value]]
+            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.parse :as util.parse]
@@ -809,11 +808,11 @@
 
 (defn parse-obj-cmp
   [allowed-vars context subj-cmp pred-cmp m triples v-map]
-  (let [id     (get-id v-map)
-        v-list (get-list v-map)
-        value  (get-value v-map)
-        type   (get-type v-map)
-        lang   (get-lang v-map)]
+  (let [id     (util/get-id v-map)
+        v-list (util/get-list v-map)
+        value  (util/get-value v-map)
+        type   (util/get-types v-map)
+        lang   (util/get-lang v-map)]
     (cond v-list
           (reduce (fn [triples [i list-item]]
                     (parse-obj-cmp allowed-vars context subj-cmp pred-cmp {:i i} triples list-item))
@@ -877,7 +876,7 @@
 
 (defn parse-subj-cmp
   [allowed-vars context triples node]
-  (let [id       (get-id node)
+  (let [id       (util/get-id node)
         subj-cmp (cond (v/variable? id) (parse-variable-if-allowed allowed-vars id)
                        (nil? id)        (where/match-iri (iri/new-blank-node-id))
                        :else            (where/match-iri id))]
