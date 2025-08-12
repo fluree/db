@@ -8,6 +8,7 @@
             [fluree.db.connection :as connection]
             [fluree.db.connection.config :as config]
             [fluree.db.connection.vocab :as conn-vocab]
+            [fluree.db.constants :as const]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.nameservice.ipns :as ipns-nameservice]
             [fluree.db.nameservice.storage :as storage-nameservice]
@@ -52,8 +53,8 @@
 (defn reference?
   [node]
   (and (map? node)
-       (contains? node "@id")
-       (-> node (dissoc "@id") empty?)))
+       (contains? node const/iri-id)
+       (-> node (dissoc const/iri-id) empty?)))
 
 (defn convert-reference
   [node]

@@ -520,7 +520,7 @@
       (= const/$id pdt) ;; ref to another node
       (if (= const/$rdf:type (flake/p flake))
         (get-s-iri db (flake/o flake) compact-fn) ;; @type values don't need to be in an @id map
-        {"@id" (get-s-iri db (flake/o flake) compact-fn)})
+        {const/iri-id (get-s-iri db (flake/o flake) compact-fn)})
 
       (datatype/inferable? pdt)
       (serde-json/serialize-object (flake/o flake) pdt)
@@ -632,7 +632,7 @@
         assert-key  (compact const/iri-assert)
         retract-key (compact const/iri-retract)
         refs-ctx*   (cond-> refs-ctx
-                      prev-dbid     (assoc-in [prev-db-key "@type"] "@id")
+                      prev-dbid     (assoc-in [prev-db-key const/iri-type] const/iri-id)
                       (seq assert)  (assoc-in [assert-key "@container"] "@graph")
                       (seq retract) (assoc-in [retract-key "@container"] "@graph"))
         nses        (new-namespaces db)

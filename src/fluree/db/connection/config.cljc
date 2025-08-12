@@ -1,6 +1,7 @@
 (ns fluree.db.connection.config
   (:require [clojure.string :as str]
             [fluree.db.connection.vocab :as conn-vocab]
+            [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util :as util :refer [get-id get-first-value get-value
                                              of-type? try* catch*]]
@@ -48,7 +49,7 @@
   [node]
   (and (storage? node)
        (-> node
-           (dissoc "@id" "@type" conn-vocab/address-identifier)
+           (dissoc const/iri-id const/iri-type conn-vocab/address-identifier)
            empty?)))
 
 (defn file-storage?

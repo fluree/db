@@ -841,7 +841,7 @@
                           ref-obj)
                 v-map*  (if (nil? id)
                           ;; project newly created bnode-id into v-map
-                          (assoc v-map "@id" (where/get-iri ref-cmp))
+                          (assoc v-map const/iri-id (where/get-iri ref-cmp))
                           v-map)]
             (conj (parse-subj-cmp allowed-vars context triples v-map*)
                   [subj-cmp pred-cmp ref-cmp])))))
@@ -861,7 +861,7 @@
                     {:status 400 :error :db/invalid-predicate}))
 
     (= "@type" pred)
-    (let [values*  (map (fn [typ] {"@id" typ})
+    (let [values*  (map (fn [typ] {const/iri-id typ})
                         values)
           pred-cmp (where/match-iri const/iri-rdf-type)]
       (reduce (partial parse-obj-cmp allowed-vars context subj-cmp pred-cmp nil)
@@ -882,7 +882,7 @@
                        :else            (where/match-iri id))]
     (reduce (partial parse-pred-cmp allowed-vars context subj-cmp)
             triples
-            (->> (dissoc node "@id")
+            (->> (dissoc node const/iri-id)
                  ;; deterministic patterns for each pred
                  (sort-by (comp str first))))))
 

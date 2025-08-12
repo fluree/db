@@ -201,7 +201,7 @@
                      (if ev
                        (conj ev v)
                        [v]))))
-   {"@id" id}
+   {const/iri-id id}
    triples))
 
 (defn inserts-by-rule

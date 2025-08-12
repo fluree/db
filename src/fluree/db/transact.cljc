@@ -132,8 +132,8 @@
     (assoc opts
            :commit-data-opts {:compact-fn    compact-fn
                               :compact       (fn [iri] (json-ld/compact iri compact-fn))
-                              :id-key        (json-ld/compact "@id" compact-fn)
-                              :type-key      (json-ld/compact "@type" compact-fn)
+                              :id-key        (json-ld/compact const/iri-id compact-fn)
+                              :type-key      (json-ld/compact const/iri-type compact-fn)
                               :ctx-used-atom ctx-used-atom})))
 
 (defn parse-commit-opts

@@ -229,7 +229,7 @@
                           (get-type-flakes assert? db t sid types)
                           [])]
     (into type-assertions
-          (comp (remove #(-> % key #{"@id" "@type"}))
+          (comp (remove #(-> % key #{const/iri-id const/iri-type}))
                 (mapcat
                  (fn [[prop value]]
                    (let [pid (if assert?
