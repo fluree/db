@@ -404,19 +404,32 @@
 
   Parameters:
     conn - Connection object
-    txn - Transaction map with:
-      'from' or 'ledger' - Ledger identifier
-      JSON-LD document with transaction operations
+    ledger-id - Ledger alias or address (preferred signature)
+    txn - JSON-LD Update (FQL or SPARQL per :format)
     opts - (optional) Options map:
       :context - Override default context
 
   Equivalent to calling `update` then `commit!`.
   Returns promise resolving to committed database."
-  ([conn txn] (update! conn txn nil))
-  ([conn txn opts]
+  ;; New preferred arity matching insert!/upsert!
+  ([conn ledger-id txn opts]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/update! conn txn opts))))
+    (transact-api/update! conn ledger-id txn opts)))
+  ;; 3-arity dispatcher to support both new and legacy usage without arity conflicts
+  ([conn a b]
+   (validate-connection conn)
+   (promise-wrap
+    (if (map? a)
+      ;; legacy: (conn txn opts)
+      (transact-api/update! conn a b)
+      ;; new: (conn ledger-id txn)
+      (transact-api/update! conn a b nil))))
+  ;; Legacy: (conn txn) where txn contains "ledger"
+  ([conn txn]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/update! conn txn nil))))
 
 (defn upsert!
   "Stages insertion or update of entities and commits in one atomic operation.
