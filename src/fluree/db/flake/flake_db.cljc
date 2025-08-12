@@ -203,19 +203,19 @@
             v-maps)))
 
 (defn- get-type-flakes
-  [assert? db t sid type]
+  [assert? db t sid types]
   (into []
         (map (fn [type-item]
                (let [type-sid (iri/encode-iri db type-item)]
                  (flake/create sid const/$rdf:type type-sid
                                const/$id t assert? nil))))
-        type))
+        types))
 
 (defn node->flakes
   [assert? db t node]
   (log/trace "node->flakes:" node "assert?" assert?)
   (let [id              (get-id node)
-        type            (get-types node)
+        types           (get-types node)
         sid             (if assert?
                           (iri/encode-iri db id)
                           (or (iri/encode-iri db id)
@@ -225,11 +225,11 @@
                                 {:status 400
                                  :error  :db/invalid-retraction
                                  :iri    id}))))
-        type-assertions (if (seq type)
-                          (get-type-flakes assert? db t sid type)
+        type-assertions (if (seq types)
+                          (get-type-flakes assert? db t sid types)
                           [])]
     (into type-assertions
-          (comp (remove #(-> % key keyword?))
+          (comp (remove #(-> % key #{"@id" "@type"}))
                 (mapcat
                  (fn [[prop value]]
                    (let [pid (if assert?
@@ -484,7 +484,7 @@
     (try*
       (<? (flake.transact/-merge-commit db commit-jsonld db-data-jsonld))
       (catch* e
-        (log/error e "Error merging commit")
+        (log/error e "Error merging novelty commit")
         (>! error-ch e)))))
 
 (defn merge-novelty-commits

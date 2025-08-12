@@ -321,8 +321,7 @@
                     (first vals)
                     vals)
         list-vals (when (map? first-val)
-                    (or (:list first-val)
-                        (get first-val "@list")))]
+                    (get first-val "@list"))]
     (or list-vals
         vals)))
 
