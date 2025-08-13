@@ -730,7 +730,7 @@
     else-branch))
 
 ;; Forward declaration for functions referenced in SCI context setup
-#?(:clj (declare find-grouped-val))
+(declare find-grouped-val)
 
 ;; SCI context for GraalVM-compatible code evaluation
 #?(:clj
@@ -754,52 +754,45 @@
 
            ;; iri function for SCI
            ;; This is the base two-parameter function used after transformation
-           iri-fn-base (fn [input ctx]
-                         (let [value    (if (map? input) (:value input) input)
-                               expanded (if (= "@type" value)
+           iri-fn-base (fn [{value :value} ctx]
+                         (let [expanded (if (= const/iri-type value)
                                           const/iri-type
                                           (json-ld/expand-iri value ctx))]
                            (where/->typed-val expanded const/iri-id)))
 
-           ;; Build eval namespace, excluding macros for now
-           eval-ns-fns (reduce (fn [acc [k v]]
-                                 (if (contains? macro-symbols k)
-                                   acc
-                                   (try
-                                     (if-let [resolved-var (resolve v)]
-                                       (let [short-name (symbol (name k))
-                                             qualified-name (symbol (name v))
-                                             var-val @resolved-var]
-                                         (-> acc
-                                             (assoc short-name var-val)
-                                             (assoc qualified-name var-val)))
-                                       acc)
-                                     (catch #?(:clj Exception :cljs :default) _
-                                       ;; If we can't resolve (e.g., it's a macro), skip it
-                                       acc))))
-                               {}
-                               qualified-symbols)
+           ;; Build eval namespace in two steps
+           ;; 1) Seed with a few explicit entries
+           eval-ns-fns (reduce-kv (fn [acc _k v]
+                                    (let [unqualified-name (symbol (name v))
+                                          var-val @(resolve v)]
+                                      (assoc acc unqualified-name var-val)))
+                                  {'compare* compare*
+                                   'find-grouped-val find-grouped-val
+                                   'iri-fn-base iri-fn-base}
+                                  (apply dissoc qualified-symbols macro-symbols))
 
-           ;; Add special functions and macro replacements
+           ;; 2) Add macro replacements
            eval-ns-fns (assoc eval-ns-fns
-                              '->typed-val where/->typed-val
-                              'compare* compare*
-                              ;; Internal helper used by compiled code (count *)
-                              'find-grouped-val find-grouped-val
-                              'fluree.db.query.exec.eval/find-grouped-val find-grouped-val
-                              ;; Macro replacements
-                              '-if -if-fn
-                              'if -if-fn
                               'as as-fn
-                              'fluree.db.query.exec.eval/as as-fn
+                              '-if -if-fn
                               '-and -and-fn
-                              'and -and-fn
-                              '-or -or-fn
-                              'or -or-fn
-                              ;; Add where/->typed-val for iri expansion
-                              'where/->typed-val where/->typed-val
-                              ;; Add the base iri function
-                              'iri-fn-base iri-fn-base)
+                              '-or -or-fn)
+
+           ;; 3) For a few dynamic functions, allow with-redefs to affect SCI calls
+           now-wrapper     (when-let [v (resolve 'fluree.db.query.exec.eval/now)]
+                             (fn [] (var-get v)))
+           uuid-wrapper    (when-let [v (resolve 'fluree.db.query.exec.eval/uuid)]
+                             (fn [] (var-get v)))
+           struuid-wrapper (when-let [v (resolve 'fluree.db.query.exec.eval/struuid)]
+                             (fn [] (var-get v)))
+
+           eval-ns-fns (cond-> eval-ns-fns
+                         now-wrapper
+                         (assoc 'now (fn [] ((now-wrapper))))
+                         uuid-wrapper
+                         (assoc 'uuid (fn [] ((uuid-wrapper))))
+                         struuid-wrapper
+                         (assoc 'struuid (fn [] ((struuid-wrapper)))))
 
            ;; Build other namespaces
            where-ns-fns {'->typed-val where/->typed-val
@@ -809,12 +802,9 @@
                          'mch->typed-val where/mch->typed-val}
 
            json-ld-fns {'expand-iri json-ld/expand-iri
-                        'json-ld/expand-iri json-ld/expand-iri
-                        'parse-context json-ld/parse-context
-                        'json-ld/parse-context json-ld/parse-context}
+                        'parse-context json-ld/parse-context}
 
            const-ns {'iri-id const/iri-id
-                     'const/iri-id const/iri-id
                      ;; String datatypes needed for comparisons
                      'iri-string const/iri-string
                      'iri-anyURI const/iri-anyURI
@@ -842,28 +832,8 @@
                      'iri-xsd-date const/iri-xsd-date
                      ;; Boolean datatype
                      'iri-xsd-boolean const/iri-xsd-boolean
-                     ;; RDF type
+                      ;; RDF type
                      'iri-rdf-type const/iri-rdf-type}
-
-            ;; Optionally wrap selected functions to allow with-redefs to affect SCI calls
-            ;; We wrap by resolving the Var on each invocation rather than capturing function values at init
-           now-wrapper     (when-let [v (resolve 'fluree.db.query.exec.eval/now)]
-                             (fn [] (var-get v)))
-           uuid-wrapper    (when-let [v (resolve 'fluree.db.query.exec.eval/uuid)]
-                             (fn [] (var-get v)))
-           struuid-wrapper (when-let [v (resolve 'fluree.db.query.exec.eval/struuid)]
-                             (fn [] (var-get v)))
-
-           eval-ns-fns (cond-> eval-ns-fns
-                         now-wrapper
-                         (assoc 'now (fn [] ((now-wrapper)))
-                                'fluree.db.query.exec.eval/now (fn [] ((now-wrapper))))
-                         uuid-wrapper
-                         (assoc 'uuid (fn [] ((uuid-wrapper)))
-                                'fluree.db.query.exec.eval/uuid (fn [] ((uuid-wrapper))))
-                         struuid-wrapper
-                         (assoc 'struuid (fn [] ((struuid-wrapper)))
-                                'fluree.db.query.exec.eval/struuid (fn [] ((struuid-wrapper)))))
 
             ;; Build clojure.core map from a small explicit allowlist to reduce maintenance
            core-allowlist '[instance? boolean? string? number? keyword?

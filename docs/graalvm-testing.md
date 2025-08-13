@@ -157,6 +157,16 @@ FLUREE_GRAALVM_BUILD=true clojure -M:cljtest -m kaocha.runner --focus fluree.db.
 LOG_LEVEL=debug FLUREE_GRAALVM_BUILD=true clojure -M:cljtest -m kaocha.runner --focus your-test
 ```
 
+### Makefile shortcuts
+
+```bash
+# Run the full Clojure test suite with GraalVM/SCI paths enabled
+make graaltest
+
+# Run only tests marked ^:sci using the SCI path
+make cljtest-sci
+```
+
 ## CI/CD Considerations
 
 Consider adding CI jobs that:
