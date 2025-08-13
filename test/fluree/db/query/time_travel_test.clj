@@ -139,7 +139,7 @@
                                                {})]
           (is (instance? Exception result) "Should return an exception")
           (when (instance? Exception result)
-            (let [msg (.getMessage result)]
+            (let [msg (ex-message result)]
               (is (re-find #"Invalid time travel format" msg) "Error should mention invalid format")))))
 
       ;; Test ambiguous SHA prefix (would require multiple commits with similar prefixes)
@@ -153,7 +153,7 @@
                                                {})]
           (is (instance? Exception result) "Should return an exception for non-existent SHA")
           (when (instance? Exception result)
-            (let [msg (.getMessage result)]
+            (let [msg (ex-message result)]
               (is (or (re-find #"No commit found" msg)
                       (re-find #"invalid-commit-sha" msg))
                   "Error should mention commit not found")))))
@@ -302,7 +302,7 @@
                                                {})]
           (is (instance? Exception result) "Should return an exception for time before data exists")
           (when (instance? Exception result)
-            (let [msg (.getMessage result)]
+            (let [msg (ex-message result)]
               (is (re-find #"no data as of" msg)
                   "Error should mention no data exists at that time")))))
 
