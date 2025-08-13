@@ -123,7 +123,8 @@
                  :exclude-linters    [:implicit-dependencies]
                  ;; Exclude IPFS namespace due to Clojure 1.12.1 compatibility issues
                  :exclude-namespaces [fluree.db.storage.ipfs
-                                      fluree.db.storage.file]}]}
+                                      fluree.db.storage.file
+                                      fluree.db.nameservice.ipns]}]}
 
   :ancient
   {:extra-deps {com.github.liquidz/antq {:mvn/version "RELEASE"}}

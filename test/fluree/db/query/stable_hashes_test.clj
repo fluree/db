@@ -7,10 +7,10 @@
 (deftest stable-hashes-test
   (with-redefs [util/current-time-iso (constantly "1970-01-01T00:12:00.00000Z")]
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "stable-commit-id")
+          db0    @(fluree/create conn "stable-commit-id")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
           db0    @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" context
                     "insert"
                     [{:id           :ex/alice
@@ -27,7 +27,7 @@
                       :schema/name  "Jane"
                       :schema/email "jane@flur.ee"
                       :schema/age   30}]})
-          db1    @(fluree/commit! ledger db0)]
+          db1    @(fluree/commit! conn db0)]
       (testing "stable commit id"
         (is (= "fluree:commit:sha256:bbdainpfs7v2pg2yj76uzpybdfdldvvt5idlbasisuhwlrxbiqhii"
                (get-in db1 [:commit :id]))))

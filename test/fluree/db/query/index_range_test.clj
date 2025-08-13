@@ -9,10 +9,10 @@
 (deftest ^:integration index-range-scans
   (testing "Various index range scans using the API."
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "query/index-range")
+          db0 @(fluree/create conn "query/index-range")
           context [test-utils/default-context {:ex "http://example.org/ns/"}]
           db      @(fluree/update
-                    (fluree/db ledger)
+                    db0
                     {"@context" context
                      "insert"
                      [{:id           :ex/brian,

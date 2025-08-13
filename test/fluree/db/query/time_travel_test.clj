@@ -8,8 +8,7 @@
 (deftest query-with-numeric-t-value-test
   (testing "only gets results from that t"
     (let [conn   (test-utils/create-conn)
-          ledger (test-utils/load-movies conn)
-          db     (fluree/db ledger)
+          db     (test-utils/load-movies conn)
           movies @(fluree/query db {:context [test-utils/default-context
                                               {:ex "http://example.org/ns/"}]
                                     :select  '{?s [:*]}
@@ -45,41 +44,42 @@
                                                                  5000))
           too-early-iso          (util/epoch-ms->iso-8601-str (- start
                                                                  (* 24 60 60 1000)))
-          ledger                 @(fluree/create conn "iso8601/test")
-          _                      (with-redefs-fn {#'util/current-time-millis
+          ledger-id              "iso8601/test"
+          db0                    @(fluree/create conn ledger-id)
+          db1                    (with-redefs-fn {#'util/current-time-millis
                                                   (fn [] start)
                                                   #'util/current-time-iso
                                                   (fn [] start-iso)}
                                    (fn []
                                      (let [db1 @(fluree/update
-                                                 (fluree/db ledger)
+                                                 db0
                                                  {"@context" [test-utils/default-context
                                                               {:ex "http://example.org/ns/"}]
                                                   "insert"   (first test-utils/movies)})]
-                                       @(fluree/commit! ledger db1))))
-          _                      (with-redefs-fn {#'util/current-time-millis
+                                       @(fluree/commit! conn db1))))
+          db2                    (with-redefs-fn {#'util/current-time-millis
                                                   (fn [] three-loaded-millis)
                                                   #'util/current-time-iso
                                                   (fn [] three-loaded-iso)}
                                    (fn []
                                      (let [db2 @(fluree/update
-                                                 (fluree/db ledger)
+                                                 db1
                                                  {"@context" [test-utils/default-context
                                                               {:ex "http://example.org/ns/"}]
                                                   "insert"   (second test-utils/movies)})]
-                                       @(fluree/commit! ledger db2))))
+                                       @(fluree/commit! conn db2))))
           _                      (with-redefs-fn {#'util/current-time-millis
                                                   (fn [] all-loaded-millis)
                                                   #'util/current-time-iso
                                                   (fn [] all-loaded-iso)}
                                    (fn []
                                      (let [db3 @(fluree/update
-                                                 (fluree/db ledger)
+                                                 db2
                                                  {"@context" [test-utils/default-context
                                                               {:ex "http://example.org/ns/"}]
                                                   "insert"   (nth test-utils/movies 2)})]
-                                       @(fluree/commit! ledger db3))))
-          db                     (fluree/db ledger)
+                                       @(fluree/commit! conn db3))))
+          db                     @(fluree/db conn ledger-id)
           base-query             {:context test-utils/default-context
                                   :select  '{?s [:*]}
                                   :where   '{:id ?s, :type :schema/Movie}}

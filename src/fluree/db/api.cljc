@@ -221,6 +221,7 @@
 
 (defn create
   "Creates a new ledger with an initial empty commit at t=0.
+  Returns a promise that resolves to the initial database.
 
   Parameters:
     conn - Connection object
@@ -234,9 +235,10 @@
   ([conn ledger-alias opts]
    (validate-connection conn)
    (promise-wrap
-    (do
+    (go-try
       (log/info "Creating ledger" ledger-alias)
-      (connection/create-ledger conn ledger-alias opts)))))
+      (let [ledger (<? (connection/create-ledger conn ledger-alias opts))]
+        (ledger/current-db ledger))))))
 
 (defn alias->address
   "Resolves a ledger alias to its address.
@@ -248,11 +250,13 @@
 
 (defn load
   "Loads an existing ledger by alias or address.
-  Returns a promise that resolves to the ledger object."
+  Returns a promise that resolves to the latest database."
   [conn alias-or-address]
   (validate-connection conn)
   (promise-wrap
-   (connection/load-ledger conn alias-or-address)))
+   (go-try
+     (let [ledger (<? (connection/load-ledger conn alias-or-address))]
+       (ledger/current-db ledger)))))
 
 (defn drop
   "Deletes a ledger and its associated data.
@@ -364,18 +368,26 @@
   "Persists a staged database as a new immutable version in the ledger.
 
   Parameters:
-    ledger - Ledger object
-    db - Staged database with changes
-    opts - (optional) Options map
+    conn - Connection object
+    db - Staged database with changes to commit
+    opts - (optional) Options map for the commit operation
+
+  The ledger-id is automatically extracted from the database object's
+  alias and branch fields (formatted as alias@branch).
 
   Creates a new commit and notifies the nameservice of the new version.
   Returns promise resolving to the committed database."
-  ([ledger db]
+  ([conn db]
+   (commit! conn db {}))
+  ([conn db opts]
+   (validate-connection conn)
    (promise-wrap
-    (transact/commit! ledger db {})))
-  ([ledger db opts]
-   (promise-wrap
-    (transact/commit! ledger db opts))))
+    (go-try
+      (let [alias (:alias db)
+            ;; For newly created ledgers, we need to commit through the alias
+            ;; not the full ledger-id, as the branch info may not be in nameservice yet
+            ledger (<? (connection/load-ledger conn alias))]
+        (<? (transact/commit! ledger db opts)))))))
 
 (defn ^:deprecated transact!
   "Deprecated: Use `update!` instead.
@@ -392,19 +404,32 @@
 
   Parameters:
     conn - Connection object
-    txn - Transaction map with:
-      'from' or 'ledger' - Ledger identifier
-      JSON-LD document with transaction operations
+    ledger-id - Ledger alias or address (preferred signature)
+    txn - JSON-LD Update (FQL or SPARQL per :format)
     opts - (optional) Options map:
       :context - Override default context
 
   Equivalent to calling `update` then `commit!`.
   Returns promise resolving to committed database."
-  ([conn txn] (update! conn txn nil))
-  ([conn txn opts]
+  ;; New preferred arity matching insert!/upsert!
+  ([conn ledger-id txn opts]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/update! conn txn opts))))
+    (transact-api/update! conn ledger-id txn opts)))
+  ;; 3-arity dispatcher to support both new and legacy usage without arity conflicts
+  ([conn a b]
+   (validate-connection conn)
+   (promise-wrap
+    (if (map? a)
+      ;; legacy: (conn txn opts)
+      (transact-api/update! conn a b)
+      ;; new: (conn ledger-id txn)
+      (transact-api/update! conn a b nil))))
+  ;; Legacy: (conn txn) where txn contains "ledger"
+  ([conn txn]
+   (validate-connection conn)
+   (promise-wrap
+    (transact-api/update! conn txn nil))))
 
 (defn upsert!
   "Stages insertion or update of entities and commits in one atomic operation.
@@ -498,19 +523,38 @@
   "Returns current status of a ledger branch.
 
   Parameters:
-    ledger - Ledger object
-    branch - (optional) Branch name (default: current branch)
+    conn - Connection object
+    ledger-id - Ledger alias or address
+    branch - (optional) Branch name (defaults to current branch)
 
   Returns status map with commit and index information."
-  ([ledger] (ledger/status ledger))
-  ([ledger branch] (ledger/status ledger branch)))
+  ([conn ledger-id]
+   (status conn ledger-id nil))
+  ([conn ledger-id branch]
+   (validate-connection conn)
+   (promise-wrap
+    (go-try
+      (let [ledger (<? (connection/load-ledger conn ledger-id))]
+        (if branch
+          (ledger/status ledger branch)
+          (ledger/status ledger)))))))
 
 ;; db operations
 
 (defn db
-  "Returns the current database value from a ledger."
-  [ledger]
-  (ledger/current-db ledger))
+  "Returns the current database value from a ledger.
+  
+  Parameters:
+    conn - Connection object
+    ledger-id - Ledger alias or address
+    
+  Returns the current database value."
+  [conn ledger-id]
+  (validate-connection conn)
+  (promise-wrap
+   (go-try
+     (let [ledger (<? (connection/load-ledger conn ledger-id))]
+       (ledger/current-db ledger)))))
 
 (defn wrap-policy
   "Applies policy restrictions to a database.
@@ -691,7 +735,8 @@
   "Queries the history of entities across commits.
 
   Parameters:
-    ledger - Ledger object
+    conn - Connection object
+    ledger-id - Ledger alias or address
     query - Query map with:
       'history' - Subject IRI or pattern
       't' - Specific time or {'from': t1, 'to': t2}
@@ -699,27 +744,34 @@
     opts - (optional) Options map
 
   Returns promise resolving to historical flakes."
-  ([ledger query]
-   (history ledger query nil))
-  ([ledger query override-opts]
+  ([conn ledger-id query]
+   (history conn ledger-id query nil))
+  ([conn ledger-id query override-opts]
+   (validate-connection conn)
    (promise-wrap
-    (query-api/history ledger query override-opts))))
+    (go-try
+      (let [ledger (<? (connection/load-ledger conn ledger-id))]
+        (<? (query-api/history ledger query override-opts)))))))
 
 (defn credential-history
   "Executes a history query using a verifiable credential.
 
   Parameters:
-    ledger - Ledger object
+    conn - Connection object
+    ledger-id - Ledger alias or address
     cred-query - Verifiable credential containing history query
     opts - (optional) Options map
 
   Verifies credential and applies identity-based policies.
   Returns promise resolving to historical data."
-  ([ledger cred-query] (credential-history ledger cred-query {}))
-  ([ledger cred-query override-opts]
+  ([conn ledger-id cred-query]
+   (credential-history conn ledger-id cred-query {}))
+  ([conn ledger-id cred-query override-opts]
+   (validate-connection conn)
    (promise-wrap
     (go-try
-      (let [{query :subject, identity :did} (<? (cred/verify cred-query))]
+      (let [ledger (<? (connection/load-ledger conn ledger-id))
+            {query :subject, identity :did} (<? (cred/verify cred-query))]
         (<? (query-api/history ledger query (assoc override-opts :identity identity))))))))
 
 (defn range
