@@ -37,9 +37,9 @@
   [query-results]
   (mapv
    (fn [{q                 const/iri-query
-        target-subjects   const/iri-targetSubject
-        target-properties const/iri-targetProperty
-        :as               policy}]
+         target-subjects   const/iri-targetSubject
+         target-properties const/iri-targetProperty
+         :as               policy}]
      (cond-> policy
        q                 (assoc const/iri-query {const/iri-value q, const/iri-type const/iri-json})
        target-subjects   (assoc const/iri-targetSubject  (mapv (fn [subject]
