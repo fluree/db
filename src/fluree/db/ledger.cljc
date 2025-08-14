@@ -180,7 +180,7 @@
   "Manually triggers indexing for a ledger on the specified branch.
    Uses the current db for that branch. Returns a channel that will receive
    the result when indexing completes.
-   
+
    Options:
    - branch: Branch name (defaults to main branch if not specified)"
   ([ledger]

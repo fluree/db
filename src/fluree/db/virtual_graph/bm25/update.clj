@@ -1,7 +1,9 @@
 (ns fluree.db.virtual-graph.bm25.update
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
+            [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
+            [fluree.db.util :as util]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph.bm25.stemmer :as stm]))
 
@@ -50,7 +52,7 @@
   "Takes an item and returns full concatenated text"
   [item]
   (try
-    (->> (dissoc item "@id")
+    (->> (dissoc item const/iri-id)
          vals
          (reduce
           (fn [all-text sentence]
@@ -178,7 +180,7 @@
     (loop [i     0
            index latest-index]
       (if-let [[action item] (async/<! items-ch)]
-        (let [id     (->> (get item "@id")
+        (let [id     (->> (util/get-id item)
                           (iri/encode-iri bm25))
               index* (if (= ::upsert action)
                        (-> (retract-item index id)

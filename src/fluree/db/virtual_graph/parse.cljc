@@ -104,8 +104,8 @@
       (throw (ex-info "BM25 index query must not contain wildcard '*' in subgraph selector"
                       {:status 400
                        :error  :db/invalid-index})))
-    (if (some #{"@id"} iris)
-      (filter #(not= "@id" %) iris)
+    (if (some #{const/iri-id} iris)
+      (filter (complement #{const/iri-id}) iris)
       (throw (ex-info "BM25 index query must contain @id in the subgraph selector"
                       {:status 400
                        :error  :db/invalid-index})))))
