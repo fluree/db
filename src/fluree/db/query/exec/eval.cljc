@@ -980,7 +980,7 @@
        (if (and (sequential? x)
                 (= 'fluree.db.query.exec.eval/iri (first x))
                 (= 2 (count x)))
-         `(fluree.db.query.exec.eval/iri-fn-base ~(second x) ~'$-CONTEXT)
+         `(fluree.db.query.exec.eval/iri-fn-base ~(second x) ~context-var)
          x))
      form)
     form))
@@ -1067,13 +1067,14 @@
                ;; Replace (fluree.db.query.exec.eval/iri x) with the expanded form
                `(fluree.db.query.exec.where/->typed-val
                  (fluree.json-ld/expand-iri
-                  (fluree.db.util/get-value ~(second form#))
-                  ~'$-CONTEXT)
+                  (:value ~(second form#))
+                  ~context-var)
                  fluree.db.constants/iri-id)
                form#))
            qualified-code#))
        ;; Regular JVM build - just coerce
        `(coerce ~count-star-sym ~allow-aggregates? ~ctx ~code))))
+
 (defn compile*
   [code ctx allow-aggregates?]
   (let [count-star-sym (gensym "?$-STAR")
