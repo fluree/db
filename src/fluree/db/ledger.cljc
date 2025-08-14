@@ -129,15 +129,19 @@
 (defn instantiate
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [ledger-alias ledger-address branch commit-catalog index-catalog primary-publisher secondary-publishers
+  [combined-alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
    indexing-opts did latest-commit]
-  (let [publishers (cons primary-publisher secondary-publishers)
-        branches {branch (branch/state-map ledger-alias branch commit-catalog index-catalog
+  (let [;; Parse ledger name and branch from combined alias
+        [_ branch] (if (str/includes? combined-alias ":")
+                     (str/split combined-alias #":" 2)
+                     [combined-alias "main"])
+        publishers (cons primary-publisher secondary-publishers)
+        branches {branch (branch/state-map combined-alias branch commit-catalog index-catalog
                                            publishers latest-commit indexing-opts)}]
     (map->Ledger {:id                   (random-uuid)
                   :did                  did
                   :state                (atom (initial-state branches branch))
-                  :alias                ledger-alias
+                  :alias                combined-alias  ;; Full alias including branch
                   :address              ledger-address
                   :commit-catalog       commit-catalog
                   :index-catalog        index-catalog
@@ -160,20 +164,24 @@
   context."
   [{:keys [alias primary-address publish-addresses commit-catalog index-catalog
            primary-publisher secondary-publishers]}
-   {:keys [did branch indexing] :as _opts}]
+   {:keys [did indexing] :as _opts}]
   (go-try
-    (let [ledger-alias*  (normalize-alias alias)
+    (let [normalized-alias  (normalize-alias alias)
+          ;; Add :main if no branch is specified
+          ledger-alias   (if (str/includes? normalized-alias ":")
+                           normalized-alias
+                           (str normalized-alias ":main"))
           ;; internal-only opt used for migrating ledgers without genesis commits
           init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit
-                              commit-catalog alias branch publish-addresses init-time))
+                              commit-catalog ledger-alias publish-addresses init-time))
           ;; Publish genesis commit to nameservice - convert expanded to compact format first
           _              (when primary-publisher
-                           (let [;; Convert expanded genesis commit to compact JSON-LD format
+                           (let [;; Convert expanded genesis commit to compact JSON-ld format
                                  commit-map (commit-data/json-ld->map genesis-commit nil)
                                  compact-commit (commit-data/->json-ld commit-map)]
                              (<? (nameservice/publish primary-publisher compact-commit))))]
-      (instantiate ledger-alias* primary-address branch commit-catalog index-catalog
+      (instantiate ledger-alias primary-address commit-catalog index-catalog
                    primary-publisher secondary-publishers indexing did genesis-commit))))
 
 (defn trigger-index!
