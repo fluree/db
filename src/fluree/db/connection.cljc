@@ -310,28 +310,37 @@
 
 (defn load-ledger*
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn}
-   ledger-chan address]
+   ledger-chan ledger-address]
   (go-try
-    (if-let [ns-record (<? (lookup-commit conn address))]
+    (if-let [ns-record (<? (lookup-commit conn ledger-address))]
       (let [;; Extract minimal data from nameservice
             commit-address (get-in ns-record ["f:commit" "@id"])
             index-address  (get-in ns-record ["f:index" "@id"])
 
             ;; Load full commit from disk
-            _              (log/debug "Attempting to load from address:" address)
+            _              (log/debug "Attempting to load from address:" ledger-address)
             commit         (<? (commit-storage/load-commit-with-metadata commit-catalog
                                                                          commit-address
                                                                          index-address))
             expanded-commit (json-ld/expand commit)
-            combined-alias  (commit->ledger-alias conn address expanded-commit)
 
             {:keys [did indexing]} (parse-ledger-options conn {})
-            ledger (ledger/instantiate combined-alias address commit-catalog index-catalog
-                                       primary-publisher secondary-publishers indexing did expanded-commit)]
-        (ns-subscribe/subscribe-ledger conn combined-alias)
+            ;; Extract the alias from the nameservice record, or use the address as the alias
+            ;; (for branch ledgers, the address IS the alias like "test-ledger:feature")
+            ledger-alias (or (get-first-value ns-record const/iri-alias)
+                             ledger-address)
+            ;; Extract branch metadata from ns-record
+            branch-metadata {:created-at (get ns-record "f:createdAt")
+                             :created-from (get ns-record "f:createdFrom")
+                             :protected (get ns-record "f:protected")
+                             :description (get ns-record "f:description")}
+            ledger (ledger/instantiate ledger-alias ledger-address commit-catalog index-catalog
+                                       primary-publisher secondary-publishers indexing did expanded-commit
+                                       branch-metadata)]
+        (ns-subscribe/subscribe-ledger conn ledger-alias)
         (async/put! ledger-chan ledger)
         ledger)
-      (throw (ex-info (str "Unable to load. No record of ledger at address: " address " exists.")
+      (throw (ex-info (str "Unable to load. No record of ledger at address: " ledger-address " exists.")
                       {:status 404, :error :db/unkown-address})))))
 
 (defn load-ledger-address
@@ -495,7 +504,7 @@
     (let [{:keys [timeout]
            :or {timeout 300000}} opts
           ledger (<? (load-ledger-alias conn ledger-alias))
-          complete-ch (ledger/trigger-index! ledger nil)
+          complete-ch (ledger/trigger-index! ledger)
           timeout-ch (async/timeout timeout)]
       (async/alt!
         complete-ch ([result] result)
