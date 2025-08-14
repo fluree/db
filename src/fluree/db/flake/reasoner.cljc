@@ -130,7 +130,7 @@
   (reduce
    (fn [acc rule]
      (if (map? rule)
-       (let [id   (:id rule)
+       (let [id   (util/get-id rule)
              rule (util/get-first-value rule const/iri-rule)]
          (if rule
            (conj acc [(or id (iri/new-blank-node-id)) rule])
@@ -201,7 +201,7 @@
                      (if ev
                        (conj ev v)
                        [v]))))
-   {"@id" id}
+   {const/iri-id id}
    triples))
 
 (defn inserts-by-rule

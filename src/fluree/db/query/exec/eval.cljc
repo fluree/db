@@ -714,7 +714,7 @@
 ;;; in GraalVM native images where regular eval is not available.
 
 (defn graalvm-build?
-  "Returns true if building for GraalVM. 
+  "Returns true if building for GraalVM.
    Checks for environment variable or system property set during build."
   []
   #?(:clj (or (System/getenv "FLUREE_GRAALVM_BUILD")
@@ -999,9 +999,12 @@
 
     ;; value map
     (map? x)
-    (let [{:keys [id value type language]}
-          (-> (json-ld/expand {const/iri-data x} ctx)
-              (util/get-first const/iri-data))]
+    (let [expanded-data (-> (json-ld/expand {const/iri-data x} ctx)
+                            (util/get-first const/iri-data))
+          id            (util/get-id expanded-data)
+          value         (util/get-value expanded-data)
+          type          (util/get-types expanded-data)
+          language      (util/get-lang expanded-data)]
       (if id
         (where/->typed-val id const/iri-id)
         (where/->typed-val value type language)))
@@ -1047,17 +1050,39 @@
                            (where/mch->typed-val mch#))]))
         var-syms))
 
+#?(:clj
+   (defmacro parse-qualified-code
+     "Parses qualified code, applying GraalVM-specific transformations when needed.
+      For GraalVM builds, expands iri macro calls to their full form since SCI
+      doesn't support runtime macro expansion. Decision is made at compile time."
+     [code count-star-sym ctx allow-aggregates?]
+     (if (graalvm-build?)
+       ;; GraalVM/SCI build - coerce then expand iri macro calls
+       `(let [qualified-code# (coerce ~count-star-sym ~allow-aggregates? ~ctx ~code)]
+          (walk/postwalk
+           (fn [form#]
+             (if (and (seq? form#)
+                      (= 'fluree.db.query.exec.eval/iri (first form#))
+                      (= 2 (count form#)))
+               ;; Replace (fluree.db.query.exec.eval/iri x) with the expanded form
+               `(fluree.db.query.exec.where/->typed-val
+                 (fluree.json-ld/expand-iri
+                  (fluree.db.util/get-value ~(second form#))
+                  ~'$-CONTEXT)
+                 fluree.db.constants/iri-id)
+               form#))
+           qualified-code#))
+       ;; Regular JVM build - just coerce
+       `(coerce ~count-star-sym ~allow-aggregates? ~ctx ~code))))
 (defn compile*
   [code ctx allow-aggregates?]
   (let [count-star-sym (gensym "?$-STAR")
-        qualified-code (coerce count-star-sym allow-aggregates? ctx code)
-        ;; Transform iri calls for GraalVM
-        transformed-code (transform-iri-calls qualified-code)
+        qualified-code (parse-qualified-code code count-star-sym ctx allow-aggregates?)
         vars           (variables qualified-code)
         bdg            (bind-variables count-star-sym vars ctx)]
     `(fn [~soln-sym]
        (let ~bdg
-         ~transformed-code))))
+         ~qualified-code))))
 
 (defn compile
   ([code ctx] (compile code ctx true))
