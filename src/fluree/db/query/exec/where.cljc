@@ -341,10 +341,10 @@
 (defn match-and-track-pattern
   [ds tracker solution pattern error-ch]
   (if (:explain tracker)
-    (do (track/pattern-in! tracker pattern)
+    (do (track/pattern-in! tracker pattern solution)
         (-> (match-pattern ds tracker solution pattern error-ch)
             (async/pipe (async/chan 2 (map (fn [solution]
-                                             (track/pattern-out! tracker pattern)
+                                             (track/pattern-out! tracker pattern solution)
                                              solution))))))
     (match-pattern ds tracker solution pattern error-ch)))
 

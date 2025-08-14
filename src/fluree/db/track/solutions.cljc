@@ -12,17 +12,26 @@
 
 (defn pattern-in!
   "Increment :in counter for pattern."
-  [tracker pattern]
+  [tracker pattern solution]
   (swap! tracker
          (fn [explain]
-           (cond-> (update explain pattern (fnil #(update % :in inc) {:in 0 :out 0})) ; increment :in counter
+           (cond-> (update explain pattern (fnil #(-> %
+                                                      (update :in inc)
+                                                      (update :binds-in into (keys solution)))
+                                                 {:in 0
+                                                  :out 0
+                                                  :binds-in (set (:keys solution))
+                                                  :binds-out (set (:keys solution))}))
              ;; if pattern isn't tracked yet, add it to :patterns sequence
              (not (get explain pattern)) (update :patterns conj pattern)))))
 
 (defn pattern-out!
   "Increment :out counter for pattern."
-  [tracker pattern]
-  (swap! tracker update-in [pattern :out] inc))
+  [tracker pattern solution]
+  (swap! tracker (fn [explain]
+                   (-> explain
+                       (update-in [pattern :out] inc)
+                       (update-in [pattern :binds-out] into (keys solution))))))
 
 (defn multi-triple-node-pattern?
   "When a 'node' pattern has more than two entries and gets parsed to multiple triple patterns."
@@ -70,6 +79,8 @@
   [tracker]
   (let [{:keys [patterns] :as explain} @tracker]
     (reduce (fn [explanation pattern]
-              (conj explanation [(display-pattern pattern) (get explain pattern)]))
+              (conj explanation [(display-pattern pattern) (-> (get explain pattern)
+                                                               (update :binds-in sort)
+                                                               (update :binds-out sort))]))
             []
             patterns)))

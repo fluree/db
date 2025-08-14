@@ -77,14 +77,14 @@
     (track-solutions? opts) init-explain))
 
 (defn pattern-in!
-  [tracker pattern]
+  [tracker pattern solution]
   (when-let [solution-tracker (:explain tracker)]
-    (solutions/pattern-in! solution-tracker pattern)))
+    (solutions/pattern-in! solution-tracker pattern solution)))
 
 (defn pattern-out!
-  [tracker pattern]
+  [tracker pattern solution]
   (when-let [solution-tracker (:explain tracker)]
-    (solutions/pattern-out! solution-tracker pattern)))
+    (solutions/pattern-out! solution-tracker pattern solution)))
 
 (defn track-fuel!
   [tracker error-ch]
