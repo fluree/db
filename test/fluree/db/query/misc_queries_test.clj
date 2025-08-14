@@ -394,8 +394,8 @@
 (deftest ^:integration simple-where-select-test
   (testing "Simple where clause with select ?s and limit"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "where-select-test")
-          db     @(fluree/update (fluree/db ledger)
+          db0    @(fluree/create conn "where-select-test")
+          db     @(fluree/update db0
                                  {"@context" [test-utils/default-context
                                               {:ex "http://example.org/ns/"}]
                                   "insert"   [{:id :ex/alice :ex/name "Alice" :ex/age 30}

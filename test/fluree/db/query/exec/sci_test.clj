@@ -9,8 +9,8 @@
   (testing "filters and functions in real queries (SCI compile->eval path)"
     (let [ctx [test-utils/default-context {"ex" "http://example.org/ns/"}]
           conn @(fluree/connect-memory)
-          ledger @(fluree/create conn "test/sci")
-          db (fluree/db ledger)
+          ;; create returns the initial db
+          db @(fluree/create conn "test/sci")
           db1 @(fluree/update db {"@context" ctx
                                   "insert"   [{"@id" "ex:cam"  "schema:name" "Cam"  "ex:age" 28}
                                               {"@id" "ex:alex" "schema:name" "Alex" "ex:age" 42}]})]
