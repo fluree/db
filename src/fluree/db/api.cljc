@@ -12,7 +12,6 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.ledger :as ledger]
-            [fluree.db.merge :as merge]
             [fluree.db.nameservice.query :as ns-query]
             [fluree.db.query.api :as query-api]
             [fluree.db.query.fql.parse :as parse]
@@ -186,18 +185,10 @@
          * For LocalStack: 'http://localhost:4566'
          * For MinIO: 'http://localhost:9000'
        - s3-prefix (optional): The prefix within the bucket
-       - s3-read-timeout-ms (optional): Per-request read timeout (default 20000)
-       - s3-write-timeout-ms (optional): Per-request write timeout (default 60000)
-       - s3-list-timeout-ms (optional): Per-request list timeout (default 20000)
-       - s3-max-retries (optional): Max retry attempts on transient errors (default 4)
-       - s3-retry-base-delay-ms (optional): Base backoff delay in ms (default 150)
-       - s3-retry-max-delay-ms (optional): Max backoff delay in ms (default 2000)
        - parallelism (optional): Number of parallel operations (default: 4)
        - cache-max-mb (optional): Maximum memory for caching in MB (default: 1000)
        - defaults (optional): Default options for ledgers created with this connection"
-     ([{:keys [s3-bucket s3-prefix s3-endpoint parallelism cache-max-mb defaults
-               s3-read-timeout-ms s3-write-timeout-ms s3-list-timeout-ms
-               s3-max-retries s3-retry-base-delay-ms s3-retry-max-delay-ms],
+     ([{:keys [s3-bucket s3-prefix s3-endpoint parallelism cache-max-mb defaults],
         :or   {parallelism 4, cache-max-mb 1000}}]
       (when-not s3-bucket
         (throw (ex-info "S3 bucket name is required for S3 connection"
@@ -212,13 +203,7 @@
                                             "@type"      "Storage"
                                             "s3Bucket"   s3-bucket
                                             "s3Endpoint" s3-endpoint}
-                                     s3-prefix (assoc "s3Prefix" s3-prefix)
-                                     s3-read-timeout-ms (assoc "s3ReadTimeoutMs" s3-read-timeout-ms)
-                                     s3-write-timeout-ms (assoc "s3WriteTimeoutMs" s3-write-timeout-ms)
-                                     s3-list-timeout-ms (assoc "s3ListTimeoutMs" s3-list-timeout-ms)
-                                     s3-max-retries (assoc "s3MaxRetries" s3-max-retries)
-                                     s3-retry-base-delay-ms (assoc "s3RetryBaseDelayMs" s3-retry-base-delay-ms)
-                                     s3-retry-max-delay-ms (assoc "s3RetryMaxDelayMs" s3-retry-max-delay-ms))
+                                     s3-prefix (assoc "s3Prefix" s3-prefix))
                                    (cond-> {"@id"              "connection"
                                             "@type"            "Connection"
                                             "parallelism"      parallelism
@@ -252,10 +237,9 @@
   ([conn ledger-alias opts]
    (validate-connection conn)
    ;; Disallow branch specification in ledger name during creation
-   (when (or (str/includes? ledger-alias ":")
-             (str/includes? ledger-alias "@"))
+   (when (str/includes? ledger-alias ":")
      (throw (ex-info (str "Ledger name cannot contain ':' character. "
-                          "'@' is reserved for time travel. "
+                          "Branches must be created separately. "
                           "Provided: " ledger-alias)
                      {:error :db/invalid-ledger-name
                       :ledger-alias ledger-alias})))
@@ -635,216 +619,6 @@
   (validate-connection conn)
   (promise-wrap
    (api.branch/rename-branch! conn old-branch-spec new-branch-spec)))
-
-;; Branch operations (merge, rebase, reset)
-
-(defn merge!
-  "Merges commits from source branch into target branch.
-  
-  Updates the target branch with changes from the source branch.
-  Supports fast-forward, squash, and regular merge modes.
-  
-  Parameters:
-    conn - Connection object
-    from - Source branch spec (e.g., 'ledger:feature')
-    to - Target branch spec (e.g., 'ledger:main')
-    opts - Map with optional merge options:
-      :ff - Fast-forward behavior (default :auto)
-        :auto - Fast-forward when possible
-        :only - Only allow fast-forward (fail otherwise)
-        :never - Never fast-forward, always create merge commit
-      :squash? - Combine all commits into one (default false)
-        :schema-aware - Use schema rules to resolve
-        function - Custom conflict resolution
-      :preview? - Dry run without making changes (default false)
-      
-  Returns promise resolving to:
-    {:status :success|:conflict|:error
-     :operation :merge
-     :from '...' :to '...'
-     :strategy '3-way'
-     :commits {:merged [...] :conflicts [...]}
-     :new-commit 'sha'}
-     
-  Phase 2 - Not yet implemented."
-  ([conn from to]
-   (merge! conn from to {}))
-  ([conn from to opts]
-   (validate-connection conn)
-   (promise-wrap
-    (merge/merge! conn from to opts))))
-
-(defn rebase!
-  "Rebases source branch onto target branch (updates source branch).
-  
-  NOTE: True rebase is not yet implemented. Currently redirects to merge!
-  which updates the target branch instead of source branch.
-  
-  Parameters:
-    conn - Connection object
-    from - Source branch spec to rebase (will be updated)
-    to - Target branch spec to rebase onto (unchanged)
-    opts - Map with optional rebase options:
-      :ff - Fast-forward behavior (default :auto)
-        :auto - Fast-forward when possible
-        :only - Only allow fast-forward (fail otherwise)
-        :never - Never fast-forward, always replay
-      :squash? - Combine all commits into one (default false)
-      :atomic? - All-or-nothing vs apply-until-conflict (default true)
-      :selector - Which commits to include (default nil = all after LCA)
-        nil - All commits after LCA
-        {:t {:from 42 :to 44}} - Specific t-value range
-        {:t {:from 42 :until :conflict}} - Until conflict
-        {:shas ['sha1' 'sha2']} - Specific commits
-      :preview? - Dry run without making changes (default false)
-      
-  Returns promise resolving to:
-    {:status :success|:conflict|:error
-     :operation :rebase
-     :from '...' :to '...'
-     :strategy 'fast-forward'|'squash'|'replay'
-     :commits {:applied [...] :skipped [...] :conflicts [...]}
-     :new-commit 'sha'}
-     
-  Phase 1 implements: fast-forward and squash modes.
-  Phase 2 will add: cherry-pick and non-atomic modes."
-  ([conn from to]
-   (rebase! conn from to {}))
-  ([conn from to opts]
-   (validate-connection conn)
-   (promise-wrap
-    (merge/rebase! conn from to opts))))
-
-(defn reset-branch!
-  "Resets a branch to a previous state.
-  
-  Two modes available:
-  - Safe mode (default): Creates new commit reverting to target state
-  - Hard mode: Moves branch pointer (rewrites history)
-  
-  Parameters:
-    conn - Connection object
-    branch - Target branch to reset (e.g., 'ledger:main')
-    to - Target state:
-      {:t 90} - Reset to transaction t-value
-      {:sha 'abc123'} - Reset to specific commit SHA
-    opts - Map with optional reset options:
-      :mode - Reset mode (default :safe)
-        :safe - Create revert commit (non-destructive)
-        :hard - Move branch pointer (destructive)
-      :archive - How to archive on hard reset (default {:as :tag})
-        {:as :tag :name 'backup'} - Create tag at old HEAD
-        {:as :branch :name 'backup'} - Create branch at old HEAD
-        {:as :none} - No archive (requires force?)
-      :force? - Required for hard reset without archive (default false)
-      :message - Commit message for safe mode (auto-generated if not provided)
-      :preview? - Dry run without making changes (default false)
-      
-  Returns promise resolving to:
-    {:status :success|:error
-     :operation :reset
-     :branch '...'
-     :mode :safe|:hard
-     :reset-to {:t 90}|{:sha '...'}
-     :new-commit 'sha'  ; For safe mode
-     :archived {:type :tag :name '...'}  ; For hard mode
-     :previous-head 'sha'}
-     
-  Phase 1 implements: safe reset only.
-  Phase 2 will add: hard reset with archiving."
-  ([conn branch to]
-   (reset-branch! conn branch to {}))
-  ([conn branch to opts]
-   (validate-connection conn)
-   (promise-wrap
-    (merge/reset-branch! conn branch to opts))))
-
-;; Legacy API - Deprecated, use rebase! instead
-(defn merge-branches!
-  "DEPRECATED - Use rebase! instead.
-  
-  Legacy merge API maintained for backwards compatibility.
-  Maps to rebase! with appropriate options."
-  ([conn source-branch-spec target-branch-spec]
-   (merge-branches! conn source-branch-spec target-branch-spec {}))
-  ([conn source-branch-spec target-branch-spec opts]
-   (validate-connection conn)
-   ;; Map legacy API to new rebase! API
-   (let [strategy (:strategy opts :auto)
-         new-opts (clojure.core/merge
-                   (case strategy
-                     :fast-forward {:ff :only}
-                     :flatten {:squash? true}
-                     :auto {:ff :auto}
-                     :no-ff {:ff :never}
-                     {})
-                   (dissoc opts :strategy))
-         result @(rebase! conn source-branch-spec target-branch-spec new-opts)]
-     ;; Map new response format to legacy format for backwards compatibility
-     (promise-wrap
-      (go-try
-        (if (= :success (:status result))
-          (assoc result
-                 :type (case (:strategy result)
-                         "fast-forward" :fast-forward
-                         "squash" :flatten
-                         "replay" :rebase
-                         :rebase))
-          result))))))
-
-(defn branch-divergence
-  "Analyzes divergence between two branches.
-  
-  Parameters:
-    conn - Connection object
-    branch1-spec - First branch spec
-    branch2-spec - Second branch spec
-    
-  Returns promise resolving to divergence analysis including:
-    :common-ancestor - Commit ID of common ancestor
-    :branch1-ahead - Number of commits branch1 is ahead
-    :branch2-ahead - Number of commits branch2 is ahead
-    :can-fast-forward - Boolean if one can fast-forward to the other"
-  [conn branch1-spec branch2-spec]
-  (validate-connection conn)
-  (promise-wrap
-   (merge/branch-divergence conn branch1-spec branch2-spec)))
-
-(defn branch-graph
-  "Returns a graph representation of branches and their relationships.
-  
-  Useful for visualizing branch history and relationships in UIs.
-  
-  Parameters:
-    conn - Connection object
-    ledger-spec - Ledger specification (e.g., 'myledger')
-    opts - Options map:
-      :format - Output format (default :json)
-        :json - Structured data for UI rendering
-        :ascii - ASCII art representation
-      :depth - Number of commits to show (default 20)
-        integer - Show N most recent commits
-        :all - Show entire history
-      :branches - Which branches to include (default :all)
-        :all - Include all branches
-        [\"main\" \"feature\"] - Only specified branches
-  
-  Returns promise resolving to:
-    - For :json format: Map with :branches, :commits, and :merges
-    - For :ascii format: String with ASCII art graph
-    
-  Example:
-    ;; Get JSON data for UI
-    @(branch-graph conn \"mydb\" {:format :json :depth 50})
-    
-    ;; Get ASCII visualization
-    @(branch-graph conn \"mydb\" {:format :ascii :branches [\"main\" \"feature\"]})"
-  ([conn ledger-spec]
-   (branch-graph conn ledger-spec {}))
-  ([conn ledger-spec opts]
-   (validate-connection conn)
-   (promise-wrap
-    (merge/branch-graph conn ledger-spec opts))))
 
 ;; db operations
 

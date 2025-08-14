@@ -168,9 +168,8 @@
                    primary-publisher secondary-publishers indexing did genesis-commit))))
 
 (defn trigger-index!
-  "Manually triggers indexing for this ledger.
-   Returns a channel that will receive the result when indexing completes.
-   Since each ledger now represents a single branch, no branch parameter is needed."
+  "Manually triggers indexing for this ledger's current database.
+   Returns a channel that will receive the result when indexing completes."
   [ledger]
   (when-let [state (:state ledger)]
     (branch/trigger-index! @state)))

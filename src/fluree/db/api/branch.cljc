@@ -18,7 +18,7 @@
     conn - Connection object
     new-branch-spec - Full branch spec (e.g., 'ledger:new-branch')
     from-branch-spec - Source branch spec (e.g., 'ledger:old-branch')
-    from-commit - (optional) Specific commit id (sha256 URI) to branch from, defaults to latest
+    from-commit - (optional) Specific commit ID to branch from, defaults to latest
     
   Returns the new branch metadata."
   [conn new-branch-spec from-branch-spec from-commit]
@@ -33,14 +33,13 @@
       ;; Load source ledger to get its current commit
       (let [source-ledger (<? (connection/load-ledger conn from-branch-spec))
             source-db (ledger/current-db source-ledger)
-            ;; Prefer commit ID (sha256 URI) for lineage as it's consistent across storage backends
-            source-commit-id (or from-commit (get-in source-db [:commit :id]))
+            source-commit (or from-commit (get-in source-db [:commit :id]))
 
             ;; Create branch metadata
             created-at (util/current-time-iso)
             branch-metadata {:created-at created-at
                              :created-from {"f:branch" from-branch
-                                            "f:commit" {"@id" source-commit-id}}}
+                                            "f:commit" {"@id" source-commit}}}
 
             ;; Prepare commit for new branch
             source-commit-map (:commit source-db)
@@ -57,9 +56,8 @@
 
         {:name new-branch
          :created-at created-at
-         :created-from {:branch from-branch :commit source-commit-id}
-         ;; Return head as the commit id for consistency across storage systems
-         :head source-commit-id}))))
+         :created-from {:branch from-branch :commit source-commit}
+         :head source-commit}))))
 
 (defn list-branches
   "Lists all available branches for a ledger.

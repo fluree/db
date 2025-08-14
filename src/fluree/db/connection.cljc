@@ -341,7 +341,7 @@
         (async/put! ledger-chan ledger)
         ledger)
       (throw (ex-info (str "Unable to load. No record of ledger at address: " ledger-address " exists.")
-                      {:status 404, :error :db/unknown-address})))))
+                      {:status 404, :error :db/unkown-address})))))
 
 (defn load-ledger-address
   [conn address]
@@ -374,7 +374,7 @@
                   (recur r))
               (do (ns-subscribe/release-ledger conn normalized-alias)
                   (let [ex (ex-info (str "Load for " normalized-alias " failed due to failed address lookup.")
-                                    {:status 404, :error :db/unknown-ledger})]
+                                    {:status 404, :error :db/unkown-ledger})]
                     (async/put! ledger-chan ex)
                     (throw ex))))))))))
 
@@ -493,11 +493,11 @@
     (storage/write-catalog-bytes clg address data)))
 
 (defn trigger-ledger-index
-  "Manually triggers indexing for a ledger/branch and waits for completion.
-
+  "Manually triggers indexing for a ledger and waits for completion.
+   
    Options:
    - :timeout - Max wait time in ms (default 300000 / 5 minutes)
-
+   
    Returns the indexed database object or throws an exception on failure/timeout."
   [conn ledger-alias opts]
   (go-try
