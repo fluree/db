@@ -3,7 +3,7 @@
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 
-(deftest ^:integration aggregates-test
+(deftest ^:integration ^:sci aggregates-test
   (testing "aggregate queries"
     (let [conn   (test-utils/create-conn)
           ledger-id (test-utils/load-people conn)

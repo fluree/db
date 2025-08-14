@@ -65,6 +65,19 @@
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/skip-meta [:pending :docker]}}
 
+  :cljtest-sci
+  {:jvm-opts    ["-Dfluree.graalvm.build=true"]
+   :extra-paths ["test" "dev-resources" "test-resources"]
+   :extra-deps  {lambdaisland/kaocha                   {:mvn/version "1.91.1392"}
+                 org.clojure/test.check                {:mvn/version "1.1.1"}
+                 com.gfredericks/test.chuck            {:mvn/version "0.2.13"}
+                 babashka/fs                           {:mvn/version "0.5.20"}
+                 clj-test-containers/clj-test-containers {:mvn/version "0.7.4"}
+                 org.testcontainers/testcontainers     {:mvn/version "1.19.3"}
+                 org.testcontainers/localstack         {:mvn/version "1.19.3"}}
+   :exec-fn     kaocha.runner/exec-fn
+   :exec-args   {:kaocha.filter/focus-meta [:sci]}}
+
   :pending-tests
   {:extra-paths ["test" "dev-resources" "test-resources"]
    :extra-deps  {lambdaisland/kaocha                     {:mvn/version "1.91.1392"}

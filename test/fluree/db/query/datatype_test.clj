@@ -53,7 +53,7 @@
                                :where   {:id '?u, :schema/name 3}}))
             "only returns the data type queried")))))
 
-(deftest ^:integration datatype-test
+(deftest ^:integration ^:sci datatype-test
   (testing "querying with datatypes"
     (let [conn   (test-utils/create-conn)
           db0 @(fluree/create conn "people")
@@ -226,7 +226,7 @@
                   ["Marge" 36 "xsd:int"]]
                  results)))))))
 
-(deftest ^:integration language-binding-test
+(deftest ^:integration ^:sci language-binding-test
   (testing "language binding with lang function"
     (let [conn   (test-utils/create-conn)
           db0 @(fluree/create conn "lang-test")

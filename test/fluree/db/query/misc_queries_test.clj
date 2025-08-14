@@ -390,3 +390,49 @@
              "name" "Freddy"}]
            @(fluree/query db1 {"@context" {"@base" "https://flur.ee/"}
                                "select" {"freddy" ["*"]}})))))
+
+(deftest ^:integration simple-where-select-test
+  (testing "Simple where clause with select ?s and limit"
+    (let [conn   (test-utils/create-conn)
+          db0    @(fluree/create conn "where-select-test")
+          db     @(fluree/update db0
+                                 {"@context" [test-utils/default-context
+                                              {:ex "http://example.org/ns/"}]
+                                  "insert"   [{:id :ex/alice :ex/name "Alice" :ex/age 30}
+                                              {:id :ex/bob :ex/name "Bob" :ex/age 25}
+                                              {:id :ex/charlie :ex/name "Charlie" :ex/age 35}]})]
+
+      ;; Test the basic query - select any subject with limit 1
+      (let [result @(fluree/query db {"select" "?s"
+                                      "where"  {"@id" "?s"}
+                                      "limit"  1})]
+        (is (= 1 (count result))
+            "Should return exactly one result due to limit")
+        (is (string? (first result))
+            "Should return a string IRI")
+        (is (= "http://example.org/ns/alice" (first result))
+            "Should return alice as it comes first alphabetically"))
+
+      ;; Test with context
+      (let [result @(fluree/query db {"@context" [test-utils/default-context
+                                                  {:ex "http://example.org/ns/"}]
+                                      "select"   "?s"
+                                      "where"    {"@id" "?s"}
+                                      "limit"    1})]
+        (is (= 1 (count result))
+            "Should return exactly one result due to limit")
+        (is (keyword? (first result))
+            "Should return a keyword with context")
+        (is (= :ex/alice (first result))
+            "Should return :ex/alice as it comes first alphabetically"))
+
+      ;; Test without limit to verify all subjects are found
+      (let [result @(fluree/query db {"@context" [test-utils/default-context
+                                                  {:ex "http://example.org/ns/"}]
+                                      "select"   "?s"
+                                      "where"    {"@id" "?s"}})]
+        (is (= 3 (count result))
+            "Should return all three subjects without limit")
+        (is (= [:ex/alice :ex/bob :ex/charlie] result)
+            "Should return all inserted subjects in alphabetical order")))))
+

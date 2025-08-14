@@ -1,5 +1,5 @@
 .PHONY: help all deps jar install deploy nodejs browser webworker cljtest	\
-	cljs-browser-test cljs-node-test cljstest test ci clean			\
+	cljs-browser-test cljs-node-test cljstest test graaltest ci clean			\
 	js-packages sync-package-json publish-nodejs publish-browser		\
 	publish-webworker publish-js pending-tests pt clj-kondo-lint            \
 	clj-kondo-lint-ci cljfmt-check cljfmt-fix
@@ -127,6 +127,12 @@ cljstest: cljs-browser-test cljs-node-test ## Run all ClojureScript tests
 cljtest: ## Run Clojure tests
 	clojure -X:dev:cljtest
 
+cljtest-sci: ## Run Clojure tests forcing SCI path (GraalVM emulation) and focusing ^:sci tests
+	clojure -X:cljtest-sci
+
+graaltest: ## Run Clojure tests with GraalVM/SCI path enabled (full suite)
+	FLUREE_GRAALVM_BUILD=true clojure -X:dev:cljtest
+
 pending-tests: ## Run pending tests
 	clojure -X:dev:pending-tests
 
@@ -149,7 +155,7 @@ test: cljtest cljstest nodejs-test browser-test ## Run all tests
 eastwood: ## Run Eastwood linter
 	clojure -M:dev:cljtest:eastwood
 
-ci: test clj-kondo-lint-ci cljfmt-check eastwood ## Run all CI checks (tests, linting, formatting)
+ci: test graaltest clj-kondo-lint-ci cljfmt-check eastwood ## Run all CI checks (tests, linting, formatting)
 
 clean: ## Remove build artifacts and caches
 	clojure -T:build clean
