@@ -157,7 +157,7 @@
   "returns true if json-ld value is a list object."
   [v]
   (and (map? v)
-       (= "@list" (-> v first key))))
+       (= const/iri-list (-> v first key))))
 
 (defn subject-node?
   "Returns true if a nested value is itself another subject node in the graph.
@@ -165,14 +165,14 @@
   are defining then we know it is a node and have additional data to include."
   [mapx]
   (cond
-    (contains? mapx "@value")
+    (contains? mapx const/iri-value)
     false
 
     (list-value? mapx)
     false
 
     (and
-     (contains? mapx "@set")
+     (contains? mapx const/iri-set)
      (= 1 (count mapx)))
     false
 

@@ -860,7 +860,7 @@
                          " Please use the JSON-LD \"@type\" keyword instead.")
                     {:status 400 :error :db/invalid-predicate}))
 
-    (= "@type" pred)
+    (= const/iri-type pred)
     (let [values*  (map (fn [typ] {const/iri-id typ})
                         values)
           pred-cmp (where/match-iri const/iri-rdf-type)]

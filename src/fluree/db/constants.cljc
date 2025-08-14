@@ -94,6 +94,7 @@
 (def ^:const iri-type "@type")
 (def ^:const iri-json "@json")
 (def ^:const iri-list "@list")
+(def ^:const iri-set "@set")
 (def ^:const iri-filter "@filter")
 (def ^:const iri-t "@t")
 (def ^:const iri-anyURI "http://www.w3.org/2001/XMLSchema#anyURI")

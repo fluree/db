@@ -148,12 +148,12 @@
 (defn subject-node?
   [x]
   (and (map? x)
-       (not (contains? x "@value"))))
+       (not (contains? x const/iri-value))))
 
 (defn blank-node?
   [x]
   (and (subject-node? x)
-       (not (contains? x "@id"))))
+       (not (contains? x const/iri-id))))
 
 (defn ref-node?
   [x]
@@ -164,11 +164,11 @@
 (defn split-subject-node
   [node]
   (let [node* (if (blank-node? node)
-                (assoc node "@id" (iri/new-blank-node-id))
+                (assoc node const/iri-id (iri/new-blank-node-id))
                 node)]
     (if (ref-node? node*)
       [node*]
-      (let [ref-node (select-keys node* ["@id"])]
+      (let [ref-node (select-keys node* [const/iri-id])]
         [ref-node node*]))))
 
 (defn flatten-sequence
@@ -251,7 +251,7 @@
 (defn keywordize-node-id
   [node]
   (if (subject-node? node)
-    (update node "@id" iri->kw)
+    (update node const/iri-id iri->kw)
     node))
 
 (defn keywordize-child-ids
