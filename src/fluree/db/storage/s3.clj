@@ -391,8 +391,8 @@
                          :path full-path
                          :credentials credentials})))))
 
-  storage/ListableStore
-  (list-paths [this path-prefix]
+  storage/RecursiveListableStore
+  (list-paths-recursive [this path-prefix]
     (go-try
       ;; Use existing s3-list function to list objects with the prefix
       (let [results-ch (s3-list this path-prefix)

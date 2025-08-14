@@ -45,7 +45,7 @@
     
     ;; Get database
     (println "\nGetting database...")
-    (let [db (fluree/db ledger)]
+    (let [db @(fluree/db conn ledger-alias)]
       (println "✓ Database retrieved")
       (println "  DB type:" (type db))
       (println "  DB t value:" (:t db))
@@ -55,7 +55,7 @@
       (let [exists? @(fluree/exists? conn ledger-alias)]
         (println "✓ Ledger exists check:" exists?))
       
-      {:ledger ledger :db db})))
+      {:conn conn :ledger-alias ledger-alias :db db})))
 
 (defn test-insert-operations [db]
   (println "\n=== Testing Insert Operations ===")
@@ -96,7 +96,7 @@
       (println "  Batch DB t value:" (:t batch-db))
       batch-db)))
 
-(defn test-update-operations [ledger db]
+(defn test-update-operations [conn ledger-alias db]
   (println "\n=== Testing Update Operations ===")
   
   ;; Update operation
@@ -124,7 +124,7 @@
       
       ;; Test commit
       (println "\nTesting commit...")
-      (let [committed-db @(fluree/commit! ledger upserted-db)]
+      (let [committed-db @(fluree/commit! conn ledger-alias upserted-db)]
         (println "✓ Commit successful")
         (println "  Committed DB t value:" (:t committed-db))
         committed-db))))
@@ -198,7 +198,7 @@
     (println "  Results count:" (count sparql-results))
     (println "  Sample results:" (take 3 sparql-results))))
 
-(defn test-advanced-operations [conn ledger db]
+(defn test-advanced-operations [conn ledger-alias db]
   (println "\n=== Testing Advanced Operations ===")
   
   ;; Test dataset
@@ -218,7 +218,7 @@
   (let [history-query {"@context" {"ex" "http://example.org/ns/"}
                        "history" "ex:alice"
                        "t" {"from" 1}}
-        history-results @(fluree/history ledger history-query)]
+        history-results @(fluree/history conn ledger-alias history-query)]
     (println "✓ History query successful")
     (println "  History entries:" (count history-results))))
 
@@ -229,15 +229,15 @@
   (try
     ;; Test memory connection
     (let [mem-conn (test-memory-connection)
-          {:keys [ledger db]} (test-ledger-operations mem-conn "test/graalvm-mem")
+          {:keys [conn ledger-alias db]} (test-ledger-operations mem-conn "test/graalvm-mem")
           insert-db (test-insert-operations db)
-          update-db (test-update-operations ledger insert-db)]
+          update-db (test-update-operations conn ledger-alias insert-db)]
       (test-query-operations update-db)
-      (test-advanced-operations mem-conn ledger update-db))
+      (test-advanced-operations conn ledger-alias update-db))
     
     ;; Test file connection
     (let [file-conn (test-file-connection)
-          {:keys [ledger db]} (test-ledger-operations file-conn "test/graalvm-file")
+          {:keys [conn ledger-alias db]} (test-ledger-operations file-conn "test/graalvm-file")
           insert-db (test-insert-operations db)]
       (test-query-operations insert-db))
     

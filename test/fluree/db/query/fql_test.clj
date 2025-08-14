@@ -6,8 +6,8 @@
 (deftest ^:integration grouping-test
   (testing "grouped queries"
     (let [conn   (test-utils/create-conn)
-          people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          ledger-id (test-utils/load-people conn)
+          db     @(fluree/db conn ledger-id)]
       (testing "with a single grouped-by field"
         (let [qry     {:context  [test-utils/default-context
                                   {:ex "http://example.org/ns/"}]
@@ -71,8 +71,8 @@
 (deftest ^:integration ordering-test
   (testing "Queries with order"
     (let [conn   (test-utils/create-conn)
-          people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          ledger-id (test-utils/load-people conn)
+          db     @(fluree/db conn ledger-id)]
       (testing "with a single ordered field"
         (let [qry     {:context  [test-utils/default-context
                                   {:ex "http://example.org/ns/"}]
@@ -137,8 +137,8 @@
 
 (deftest ^:integration select-distinct-test
   (let [conn   (test-utils/create-conn)
-        people (test-utils/load-people conn)
-        db     (fluree/db people)]
+        ledger-id (test-utils/load-people conn)
+        db     @(fluree/db conn ledger-id)]
     (testing "distinct results"
       (is (= [["Alice" "alice@example.org"]
               ["Brian" "brian@example.org"]
@@ -165,8 +165,8 @@
 
 (deftest ^:integration select-one-test
   (let [conn   (test-utils/create-conn)
-        people (test-utils/load-people conn)
-        db     (fluree/db people)]
+        ledger-id (test-utils/load-people conn)
+        db     @(fluree/db conn ledger-id)]
     (testing "select-one"
       (testing "with result"
         (testing "with sequential select"
@@ -198,8 +198,8 @@
 (deftest ^:integration values-test
   (testing "Queries with pre-specified values"
     (let [conn   (test-utils/create-conn)
-          people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          ledger-id (test-utils/load-people conn)
+          db     @(fluree/db conn ledger-id)]
       (testing "binding a single variable"
         (testing "with a single value"
           (let [q {:context [test-utils/default-context
@@ -277,8 +277,8 @@
 
 (deftest ^:integration ^:sci bind-query-test
   (let [conn   (test-utils/create-conn)
-        people (test-utils/load-people conn)
-        db     (fluree/db people)]
+        ledger-id (test-utils/load-people conn)
+        db     @(fluree/db conn ledger-id)]
     (testing "with 2 separate fn binds"
       (let [q   {:context  [test-utils/default-context
                             {:ex "http://example.org/ns/"}]
@@ -371,7 +371,7 @@
 (deftest ^:integration iri-test
   (let [conn   (test-utils/create-conn)
         movies (test-utils/load-movies conn)
-        db     (fluree/db movies)]
+        db     movies]
     (testing "iri references"
       (let [test-subject @(fluree/query db {:context test-utils/default-context
                                             :select  '[?name]
@@ -383,7 +383,7 @@
 (deftest ^:integration id-test
   (let [conn   (test-utils/create-conn)
         movies (test-utils/load-movies conn)
-        db     (fluree/db movies)]
+        db     movies]
     (testing "searching for bare id maps"
       (let [test-subject @(fluree/query db {:context test-utils/default-context
                                             :select  '[?id]
@@ -411,9 +411,9 @@
 (deftest language-test
   (testing "Querying ledgers loaded with language-tagged strings"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "jobs")
+          db0 @(fluree/create conn "jobs")
           db     @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" {"ex"         "http://example.com/vocab/"
                                 "occupation" {"@id"        "ex:occupation"
                                               "@container" "@language"}}
@@ -471,8 +471,8 @@
 (deftest ^:integration t-test
   (testing "querying with t values"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "people")
-          db1    @(fluree/update (fluree/db ledger)
+          db0    @(fluree/create conn "people")
+          db1    @(fluree/update db0
                                  {"@context" [test-utils/default-context
                                               {:ex    "http://example.org/ns/"
                                                :value "@value"
@@ -488,7 +488,7 @@
                                    {:id      :ex/bart
                                     :ex/name "Bart"
                                     :ex/age  "forever 10"}]})
-          db1*   @(fluree/commit! ledger db1)
+          db1*   @(fluree/commit! conn db1)
           db2    @(fluree/update db1* {"@context" [test-utils/default-context
                                                    {:ex    "http://example.org/ns/"
                                                     :value "@value"
@@ -499,7 +499,7 @@
                                         {:id            :ex/bart
                                          :ex/dad        {:id :ex/homer}
                                          :ex/occupation "Getting into mischief"}]})
-          db2*   @(fluree/commit! ledger db2)
+          db2*   @(fluree/commit! conn db2)
           db3    @(fluree/update db2* {"@context" [test-utils/default-context
                                                    {:ex    "http://example.org/ns/"
                                                     :value "@value"
@@ -509,7 +509,7 @@
                                          :ex/son {:id :ex/bart}}
                                         {:id     :ex/bart
                                          :ex/mom {:id :ex/marge}}]})
-          db3*   @(fluree/commit! ledger db3)]
+          db3*   @(fluree/commit! conn db3)]
       (testing "using a specific t"
         (let [query   {:context [test-utils/default-context
                                  {:ex    "http://example.org/ns/"
@@ -546,8 +546,8 @@
 
 (deftest ^:integration subject-object-test
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "test/love")
-        db     @(fluree/update (fluree/db ledger)
+        db0 @(fluree/create conn "test/love")
+        db     @(fluree/update db0
                                {"@context" {"id"     "@id",
                                             "type"   "@type",
                                             "ex"     "http://example.org/",
@@ -590,8 +590,8 @@
 
 (deftest bnode-variables-test
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "test/bnodes")
-        db     @(fluree/update (fluree/db ledger)
+        db0 @(fluree/create conn "test/bnodes")
+        db     @(fluree/update db0
                                {"@context" {"ex" "http://example.org/"}
                                 "insert"
                                 [{"@id"    "ex:a",
@@ -613,8 +613,8 @@
 
 (deftest ^:integration select-star-no-graph-crawl-test
   (let [conn   (test-utils/create-conn)
-        ledger (test-utils/load-people conn)
-        db     (fluree/db ledger)]
+        ledger-id (test-utils/load-people conn)
+        db     @(fluree/db conn ledger-id)]
     (testing "select * w/o graph crawl returns all vars bound in where clause"
       (let [query   {:context [test-utils/default-context
                                {:ex "http://example.org/ns/"}]
