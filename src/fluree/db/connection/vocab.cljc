@@ -55,6 +55,24 @@
 (def s3-endpoint
   (system-iri "s3Endpoint"))
 
+(def s3-read-timeout-ms
+  (system-iri "s3ReadTimeoutMs"))
+
+(def s3-write-timeout-ms
+  (system-iri "s3WriteTimeoutMs"))
+
+(def s3-list-timeout-ms
+  (system-iri "s3ListTimeoutMs"))
+
+(def s3-max-retries
+  (system-iri "s3MaxRetries"))
+
+(def s3-retry-base-delay-ms
+  (system-iri "s3RetryBaseDelayMs"))
+
+(def s3-retry-max-delay-ms
+  (system-iri "s3RetryMaxDelayMs"))
+
 (def storage
   (system-iri "storage"))
 

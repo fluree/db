@@ -180,8 +180,20 @@
      (let [identifier  (config/get-first-string config conn-vocab/address-identifier)
            s3-bucket   (config/get-first-string config conn-vocab/s3-bucket)
            s3-prefix   (config/get-first-string config conn-vocab/s3-prefix)
-           s3-endpoint (config/get-first-string config conn-vocab/s3-endpoint)]
-       (s3-storage/open identifier s3-bucket s3-prefix s3-endpoint))))
+           s3-endpoint (config/get-first-string config conn-vocab/s3-endpoint)
+           read-timeout-ms (config/get-first-long config conn-vocab/s3-read-timeout-ms)
+           write-timeout-ms (config/get-first-long config conn-vocab/s3-write-timeout-ms)
+           list-timeout-ms (config/get-first-long config conn-vocab/s3-list-timeout-ms)
+           max-retries (config/get-first-integer config conn-vocab/s3-max-retries)
+           retry-base-delay-ms (config/get-first-long config conn-vocab/s3-retry-base-delay-ms)
+           retry-max-delay-ms (config/get-first-long config conn-vocab/s3-retry-max-delay-ms)]
+       (s3-storage/open identifier s3-bucket s3-prefix s3-endpoint
+                        {:read-timeout-ms read-timeout-ms
+                         :write-timeout-ms write-timeout-ms
+                         :list-timeout-ms list-timeout-ms
+                         :max-retries max-retries
+                         :retry-base-delay-ms retry-base-delay-ms
+                         :retry-max-delay-ms retry-max-delay-ms}))))
 
 (defmethod ig/init-key :fluree.db.storage/ipfs
   [_ config]
