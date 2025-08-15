@@ -10,28 +10,45 @@
   []
   (atom {:patterns []}))
 
+(def initial-stats
+  {:in        0
+   :out       0
+   :binds-in #{}
+   :binds-out #{}})
+
+(defn update-in-stats
+  [{:keys [binds-in] :as stats} solution]
+  (-> stats
+      (update :in inc)
+      (assoc :binds-in (reduce (fn [binds-in* var]
+                                 ;; maintain insert order as metadata
+                                 (conj binds-in* (with-meta var {:ord (count binds-in*)})))
+                               binds-in
+                               (keys solution)))))
+
 (defn pattern-in!
   "Increment :in counter for pattern."
   [tracker pattern solution]
   (swap! tracker
          (fn [explain]
-           (cond-> (update explain pattern (fnil #(-> %
-                                                      (update :in inc)
-                                                      (update :binds-in into (keys solution)))
-                                                 {:in 0
-                                                  :out 0
-                                                  :binds-in (set (:keys solution))
-                                                  :binds-out (set (:keys solution))}))
+           (cond-> (update explain pattern (fnil update-in-stats initial-stats) solution)
              ;; if pattern isn't tracked yet, add it to :patterns sequence
              (not (get explain pattern)) (update :patterns conj pattern)))))
+
+(defn update-out-stats
+  [{:keys [binds-in] :as stats} solution]
+  (-> stats
+      (update :out inc)
+      (assoc :binds-out (reduce (fn [binds-out* var]
+                                  ;; maintain insert order as metadata
+                                  (conj binds-out* (with-meta var {:ord (count binds-out*)})))
+                                binds-in
+                                (keys solution)))))
 
 (defn pattern-out!
   "Increment :out counter for pattern."
   [tracker pattern solution]
-  (swap! tracker (fn [explain]
-                   (-> explain
-                       (update-in [pattern :out] inc)
-                       (update-in [pattern :binds-out] into (keys solution))))))
+  (swap! tracker (fn [explain] (update explain pattern update-out-stats solution))))
 
 (defn multi-triple-node-pattern?
   "When a 'node' pattern has more than two entries and gets parsed to multiple triple patterns."
@@ -80,7 +97,8 @@
   (let [{:keys [patterns] :as explain} @tracker]
     (reduce (fn [explanation pattern]
               (conj explanation [(display-pattern pattern) (-> (get explain pattern)
-                                                               (update :binds-in sort)
-                                                               (update :binds-out sort))]))
+                                                               ;; display vars in order of insertion for readability
+                                                               (update :binds-in #(vec (sort-by (comp :ord meta) %)))
+                                                               (update :binds-out #(vec (sort-by (comp :ord meta) %))))]))
             []
             patterns)))

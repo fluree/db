@@ -16,7 +16,6 @@
             [fluree.db.util.xhttp :as xhttp]
             [fluree.json-ld :as json-ld]))
 
-
 #?(:clj (set! *warn-on-reflection* true))
 
 (def unmatched
