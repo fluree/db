@@ -234,6 +234,34 @@
 
       response)))
 
+(defn- tag-matches?
+  "Check if an XML element's tag matches the given name, ignoring namespace"
+  [tag-name elem]
+  (and (:tag elem)
+       (= tag-name (name (:tag elem)))))
+
+(defn- get-xml-text
+  "Get text content of first matching XML element, ignoring namespace"
+  [tag-name elements]
+  (some (fn [element]
+          (when (tag-matches? tag-name element)
+            (first (:content element))))
+        elements))
+
+(defn parse-list-objects-response
+  "Parse XML response from S3 ListObjectsV2"
+  [xml-str]
+  (let [parsed (xml/parse-str xml-str)
+        contents (xml-seq parsed)]
+    {:truncated? (= "true" (get-xml-text "IsTruncated" contents))
+     :next-continuation-token (get-xml-text "NextContinuationToken" contents)
+     :contents (for [x contents
+                     :when (tag-matches? "Contents" x)]
+                 (let [obj-content (:content x)]
+                   {:key (get-xml-text "Key" obj-content)
+                    :size (get-xml-text "Size" obj-content)
+                    :last-modified (get-xml-text "LastModified" obj-content)}))}))
+
 (defn read-s3-data
   "Read an object from S3"
   [client path]
@@ -252,7 +280,7 @@
                              :request-timeout read-timeout-ms}))]
     (go
       (try
-        (let [response (<? (with-retries thunk policy))]
+        (let [response (<? (with-retries thunk (assoc policy :log-context {:method "GET" :bucket bucket :path full-path})))]
           (>! ch {:Body response}))
         (catch Exception e
           (if (and (ex-data e) (= 404 (:status (ex-data e))))
@@ -277,7 +305,7 @@
                              :body data
                              :credentials credentials
                              :request-timeout write-timeout-ms}))]
-    (async/pipe (with-retries thunk policy) ch)))
+    (async/pipe (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path})) ch)))
 
 (defn s3-list*
   "List objects in S3 with optional continuation token"
@@ -290,8 +318,8 @@
      (go
        (try
          (let [query-params (cond-> {"list-type" "2"}
-                              (not= full-path "/") (assoc "prefix" full-path)
-                              continuation-token (assoc "continuation-token" continuation-token))
+                               (not= full-path "/") (assoc "prefix" full-path)
+                               continuation-token (assoc "continuation-token" continuation-token))
                response (<? (with-retries (fn [] (s3-request {:method "GET"
                                                               :bucket bucket
                                                               :region region
@@ -299,9 +327,10 @@
                                                               :credentials credentials
                                                               :query-params query-params
                                                               :request-timeout list-timeout-ms}))
-                              {:max-retries max-retries
-                               :retry-base-delay-ms retry-base-delay-ms
-                               :retry-max-delay-ms retry-max-delay-ms}))
+                                           {:max-retries max-retries
+                                            :retry-base-delay-ms retry-base-delay-ms
+                                            :retry-max-delay-ms retry-max-delay-ms
+                                            :log-context {:method "LIST" :bucket bucket :path full-path}}))
                parsed (parse-list-objects-response response)]
            (>! ch (update parsed :contents
                           (fn [contents]
@@ -434,18 +463,44 @@
         (= status 504))))
 
 (defn- with-retries
-  "Runs thunk returning a channel; retries on retryable errors with backoff/jitter."
-  [thunk {:keys [max-retries retry-base-delay-ms retry-max-delay-ms] :as _policy}]
+  "Runs thunk returning a channel; retries on retryable errors with backoff/jitter.
+  policy may include :log-context with keys like {:method :bucket :path}"
+  [thunk {:keys [max-retries retry-base-delay-ms retry-max-delay-ms log-context] :as _policy}]
   (let [out (async/promise-chan)]
     (go-loop [attempt 0]
-      (let [res (<! (thunk))]
-        (if (and (instance? Throwable res) (< attempt max-retries) (retryable-error? res))
-          (let [delay (min (* retry-base-delay-ms (long (Math/pow 2 attempt))) retry-max-delay-ms)
-                wait-ms (jitter delay)]
-            (log/warn "S3 request failed, retrying" {:attempt attempt :wait-ms wait-ms :error (ex-message res)})
-            (<! (async/timeout wait-ms))
-            (recur (inc attempt)))
-          (>! out res))))
+      (let [start (System/nanoTime)
+            res (<! (thunk))
+            duration-ms (long (/ (- (System/nanoTime) start) 1000000))]
+        (if (instance? Throwable res)
+          (if (and (< attempt max-retries) (retryable-error? res))
+            (let [delay (min (* retry-base-delay-ms (long (Math/pow 2 attempt))) retry-max-delay-ms)
+                  wait-ms (jitter delay)
+                  data (merge {:event "s3.retry"
+                               :attempt attempt
+                               :wait-ms wait-ms
+                               :duration-ms duration-ms
+                               :error (ex-message res)}
+                              (ex-data res)
+                              log-context)]
+              (log/warn "S3 request failed, retrying" data)
+              (<! (async/timeout wait-ms))
+              (recur (inc attempt)))
+            (let [data (merge {:event "s3.error"
+                               :attempt attempt
+                               :duration-ms duration-ms
+                               :error (ex-message res)}
+                              (ex-data res)
+                              log-context)]
+              (log/error "S3 request failed permanently" data)
+              (>! out res)))
+          (do
+            (when (pos? attempt)
+              (log/info "S3 request succeeded after retries"
+                        (merge {:event "s3.success-after-retry"
+                                :attempts (inc attempt)
+                                :duration-ms duration-ms}
+                               log-context)))
+            (>! out res)))))
     out))
 
 (defn open
