@@ -318,8 +318,8 @@
      (go
        (try
          (let [query-params (cond-> {"list-type" "2"}
-                               (not= full-path "/") (assoc "prefix" full-path)
-                               continuation-token (assoc "continuation-token" continuation-token))
+                              (not= full-path "/") (assoc "prefix" full-path)
+                              continuation-token (assoc "continuation-token" continuation-token))
                response (<? (with-retries (fn [] (s3-request {:method "GET"
                                                               :bucket bucket
                                                               :region region
@@ -327,10 +327,10 @@
                                                               :credentials credentials
                                                               :query-params query-params
                                                               :request-timeout list-timeout-ms}))
-                                           {:max-retries max-retries
-                                            :retry-base-delay-ms retry-base-delay-ms
-                                            :retry-max-delay-ms retry-max-delay-ms
-                                            :log-context {:method "LIST" :bucket bucket :path full-path}}))
+                              {:max-retries max-retries
+                               :retry-base-delay-ms retry-base-delay-ms
+                               :retry-max-delay-ms retry-max-delay-ms
+                               :log-context {:method "LIST" :bucket bucket :path full-path}}))
                parsed (parse-list-objects-response response)]
            (>! ch (update parsed :contents
                           (fn [contents]
