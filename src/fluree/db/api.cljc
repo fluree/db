@@ -713,16 +713,7 @@
   ([conn from to opts]
    (validate-connection conn)
    (promise-wrap
-    (do
-      (require 'fluree.db.api.merge)
-      (let [v (ns-resolve 'fluree.db.api.merge 'rebase!)]
-        (when-not (and v (bound? v))
-          (require 'fluree.db.api.merge :reload)
-          (alter-var-root #'clojure.core/*ns* (constantly *ns*)))
-        (let [v2 (ns-resolve 'fluree.db.api.merge 'rebase!)]
-          (when-not (and v2 (bound? v2))
-            (throw (IllegalStateException. "fluree.db.api.merge/rebase! not bound after reload")))
-          (v2 conn from to opts)))))))
+    (api.merge/rebase! conn from to opts))))
 
 (defn reset-branch!
   "Resets a branch to a previous state.
@@ -825,9 +816,9 @@
            ;; Get branch metadata for common ancestor detection
            branch1-info (<? (ledger/branch-info ledger1))
            branch2-info (<? (ledger/branch-info ledger2))
-           common-ancestor (<? (api.merge/find-common-ancestor conn db1 db2 branch1-info branch2-info))
-           ff-1-to-2 (<? (api.merge/is-fast-forward? conn db1 db2 branch1-info branch2-info))
-           ff-2-to-1 (<? (api.merge/is-fast-forward? conn db2 db1 branch2-info branch1-info))]
+           common-ancestor (<? (api.merge/find-lca conn db1 db2 branch1-info branch2-info))
+           ff-1-to-2 (<? (api.merge/can-fast-forward? conn db1 db2 branch1-info branch2-info))
+           ff-2-to-1 (<? (api.merge/can-fast-forward? conn db2 db1 branch2-info branch1-info))]
        {:common-ancestor common-ancestor
         :can-fast-forward (or ff-1-to-2 ff-2-to-1)
         :fast-forward-direction (cond

@@ -37,28 +37,26 @@
   (= (get-in source-db [:commit :id])
      (get-in target-db [:commit :id])))
 
-(defn- created-from-commit
-  "Get the commit ID a branch was created from.
-  Supports multiple shapes depending on source."
+(defn- branch-origin
+  "Get the commit ID a branch was created from."
   [branch-info]
-  (or (get-in branch-info [:created-from "f:commit" "@id"])         ;; nameservice expanded
-      (get-in branch-info [:created-from :commit])                      ;; internal map
-      (get-in branch-info ["f:createdFrom" "f:commit" "@id"])      ;; raw nameservice
+  (or (get-in branch-info [:created-from "f:commit" "@id"])      ; nameservice expanded
+      (get-in branch-info [:created-from :commit])                ; internal map
+      (get-in branch-info ["f:createdFrom" "f:commit" "@id"])     ; raw nameservice
       (get-in branch-info ["created-from" "f:commit" "@id"])))
 
 (defn- branch-created-from?
   "Check if source branch was created from target commit."
   [source-branch-info target-commit-id]
-  (= (created-from-commit source-branch-info) target-commit-id))
+  (= (branch-origin source-branch-info) target-commit-id))
 
 (defn- branches-share-origin?
   "Check if two branches were created from the same commit."
   [source-branch-info target-branch-info]
-  (when-let [source-origin (created-from-commit source-branch-info)]
-    (= source-origin (created-from-commit target-branch-info))))
+  (when-let [source-origin (branch-origin source-branch-info)]
+    (= source-origin (branch-origin target-branch-info))))
 
-
-(defn- latest-expanded-commit
+(defn- expand-latest-commit
   [conn db]
   (go-try
     (let [commit-catalog (:commit-catalog conn)
@@ -72,12 +70,12 @@
               compact* (assoc compact "id" commit-id)]
           (json-ld/expand compact*))))))
 
-(defn- all-commit-maps
+(defn- get-commit-chain
   "Returns vector of commit maps from genesis to head for a db."
   [conn db]
   (go-try
     (let [commit-catalog (:commit-catalog conn)
-          latest-expanded (<? (latest-expanded-commit conn db))
+          latest-expanded (<? (expand-latest-commit conn db))
           error-ch (async/chan)
           tuples (commit-storage/trace-commits commit-catalog latest-expanded 0 error-ch)]
       (loop [acc []]
@@ -85,9 +83,9 @@
           (recur (conj acc (commit-data/json-ld->map commit-expanded nil)))
           acc)))))
 
-(defn find-common-ancestor
-  "Finds the common ancestor commit between two branches using storage traversal, with
-  metadata heuristics as quick paths. Returns commit id string."
+(defn find-lca
+  "Finds the last common ancestor commit between two branches.
+  Returns commit id string."
   [conn source-db target-db source-branch-info target-branch-info]
   (go-try
     (let [source-commit-id (get-in source-db [:commit :id])
@@ -96,10 +94,10 @@
         (same-commit? source-db target-db) source-commit-id
         (branch-created-from? source-branch-info target-commit-id) target-commit-id
         (branch-created-from? target-branch-info source-commit-id) source-commit-id
-        (branches-share-origin? source-branch-info target-branch-info) (created-from-commit source-branch-info)
+        (branches-share-origin? source-branch-info target-branch-info) (branch-origin source-branch-info)
         :else
-        (let [source-chain (<? (all-commit-maps conn source-db))
-              target-chain (<? (all-commit-maps conn target-db))
+        (let [source-chain (<? (get-commit-chain conn source-db))
+              target-chain (<? (get-commit-chain conn target-db))
               source-id-set (into #{} (keep :id) source-chain)
               ;; Try id-based match first
               lca-id (some (fn [commit]
@@ -116,15 +114,15 @@
                                  (reverse target-chain))))]
           (or lca-id lca-by-t))))))
 
-(defn is-fast-forward?
+(defn can-fast-forward?
   "Checks if merge from source to target is a fast-forward merge.
   A fast-forward is possible when target branch's HEAD is an ancestor of source branch's HEAD."
   [conn source-db target-db source-branch-info target-branch-info]
   (go-try
     (let [target-head (get-in target-db [:commit :id])
-          common-ancestor (<? (find-common-ancestor conn source-db target-db
-                                                    source-branch-info
-                                                    target-branch-info))]
+          common-ancestor (<? (find-lca conn source-db target-db
+                                        source-branch-info
+                                        target-branch-info))]
       (log/debug "Fast-forward check:"
                  "target-head:" target-head
                  "common:" common-ancestor
@@ -134,7 +132,6 @@
 ;; ============================================================================
 ;; Commit Extraction and Processing
 ;; ============================================================================
-
 
 (defn- read-commit-data
   "Reads the actual data from a commit.
@@ -169,7 +166,6 @@
 ;; ============================================================================
 ;; Flake Operations
 ;; ============================================================================
-
 
 (defn- stage-flakes
   "Stages flakes directly into a database.
@@ -224,11 +220,9 @@
 ;; Transaction Replay
 ;; ============================================================================
 
-
-(defn- net-flakes-for-squash
-  "Computes the net effect of all source commits since LCA.
-  Simulates applying all retracts and adds in order to determine final state.
-  Returns a collection of flakes representing the net changes."
+(defn- compute-net-flakes
+  "Computes net effect of all source commits.
+  Returns flakes representing the combined changes."
   [conn target-db source-commits]
   (go-try
     ;; Track current values at each [s,p,dt] spot as we process commits
@@ -305,24 +299,17 @@
                             spot->values)]
             (into (flake/sorted-set-by flake/cmp-flakes-spot) all-flakes)))))))
 
-(defn- spots-changed
-  "Returns a set of [s p dt] spots changed by the provided novelty flakes."
+(defn- get-changed-spots
+  "Returns set of [s p dt] tuples for changed flakes."
   [flakes]
   (into #{} (map (fn [f] [(flake/s f) (flake/p f) (flake/dt f)])) flakes))
-
-
-;; ============================================================================
-;; Replay Loop Functions
-;; ============================================================================
-
-
 
 ;; ============================================================================
 ;; Result Building
 ;; ============================================================================
 
-(defn- build-conflict-response
-  "Build a conflict response map."
+(defn- conflict-response
+  "Build conflict response."
   [from-spec to-spec replay-result opts]
   (log/warn "build-conflict-response: from=" from-spec "to=" to-spec
             "failed-commit=" (get-in replay-result [:failed-commit :id])
@@ -341,8 +328,8 @@
    :message (str "Rebase conflict: Transaction produces different results on target branch. "
                  "Failed at commit: " (get-in replay-result [:failed-commit :id]))})
 
-(defn- build-success-response
-  "Build a success response map."
+(defn- success-response
+  "Build success response."
   [from-spec to-spec replay-result new-commit-sha opts]
   (log/info "build-success-response: from=" from-spec "to=" to-spec
             "applied-count=" (count (:replayed replay-result))
@@ -358,8 +345,8 @@
              :conflicts []}
    :new-commit new-commit-sha})
 
-(defn- generate-commit-message
-  "Generate an appropriate commit message."
+(defn- commit-message
+  "Generate commit message."
   [from-spec opts]
   (or (:message opts)
       (if (:ff-mode opts)
@@ -373,7 +360,7 @@
     (when (not= (:t target-db) (:t final-db))
       (let [commit-result (<? (transact/commit! target-ledger final-db
                                                 (assoc opts
-                                                       :message (generate-commit-message from-spec opts)
+                                                       :message (commit-message from-spec opts)
                                                        :author "system/merge")))]
         (or (get-in commit-result [:commit :id])
             (get-in final-db [:commit :id]))))))
@@ -395,18 +382,16 @@
        :source-branch-info (<? (ledger/branch-info source-ledger))
        :target-branch-info (<? (ledger/branch-info target-ledger))})))
 
-
-(defn- extract-commits-since-storage
-  "Extracts commits after the LCA using commit storage traversal. Returns a vector
-  of commit maps in chronological order (oldest first). Uses commit id to locate LCA,
-  avoids sha->t lookups."
+(defn- extract-commits-since
+  "Extracts commits after LCA. Returns vector of commit maps
+  in chronological order (oldest first)."
   [conn source-db lca-commit-id]
   (go-try
     ;; If LCA is the current commit, there are no commits since then
     (if (= lca-commit-id (get-in source-db [:commit :id]))
       []
       (let [commit-catalog (:commit-catalog conn)
-            latest-expanded (<? (latest-expanded-commit conn source-db))
+            latest-expanded (<? (expand-latest-commit conn source-db))
             error-ch (async/chan)
             ;; include genesis (t=0) so LCA at genesis can be located
             tuples (commit-storage/trace-commits commit-catalog latest-expanded 0 error-ch)
@@ -428,7 +413,11 @@
           (let [ids (mapv :id vtr)
                 ids-norm (mapv normalize-id ids)
                 lca-norm (normalize-id lca-commit-id)
-                idx (when lca-norm (.indexOf ids-norm lca-norm))
+                idx (when lca-norm
+                      (let [found-idx (first (keep-indexed
+                                              (fn [i id] (when (= id lca-norm) i))
+                                              ids-norm))]
+                        (or found-idx -1)))
                 idx* (if (or (nil? idx) (= -1 idx))
                        ;; Don't try SHA lookup if we can't find the commit
                        -1
@@ -449,8 +438,8 @@
                        "walk-ids=" (mapv :id walked*))
             walked*))))))
 
-(defn- enforce-same-ledger!
-  "Throws if from/to are not within the same ledger base."
+(defn- validate-same-ledger!
+  "Ensure from/to are within same ledger."
   [from-spec to-spec]
   (let [[from-ledger _] (util.ledger/ledger-parts from-spec)
         [to-ledger _] (util.ledger/ledger-parts to-spec)]
@@ -459,8 +448,8 @@
                       {:status 400 :error :db/invalid-branch-operation
                        :from from-ledger :to to-ledger})))))
 
-(defn- fast-forward-pointer!
-  "Updates the target branch pointer to the source head by publishing the source commit under the target alias."
+(defn- fast-forward!
+  "Updates target branch pointer to source head."
   [conn from-spec to-spec]
   (go-try
     (let [{:keys [source-db target-branch-info]} (<? (load-branches conn from-spec to-spec))
@@ -487,39 +476,38 @@
        :commits {:applied [] :skipped [] :conflicts []}
        :new-commit nil})))
 
-(defn- squash-rebase!
-  "Performs a squash rebase by replaying transactions and verifying they produce
-  the same semantic results. All changes are combined into a single commit."
+(defn- squash!
+  "Squash rebase - combines all changes into single commit."
   [conn from-spec to-spec opts]
   (go-try
     (let [{:keys [source-db target-db source-branch-info target-branch-info
                   target-ledger]} (<? (load-branches conn from-spec to-spec))
-          common-ancestor (<? (find-common-ancestor conn source-db target-db
-                                                    source-branch-info
-                                                    target-branch-info))
+          common-ancestor (<? (find-lca conn source-db target-db
+                                        source-branch-info
+                                        target-branch-info))
           ;; Use storage traversal to get all commits after LCA. If no LCA, start from t=1.
-          source-commits (<? (extract-commits-since-storage conn source-db common-ancestor))
-          target-commits (<? (extract-commits-since-storage conn target-db common-ancestor))
+          source-commits (<? (extract-commits-since conn source-db common-ancestor))
+          target-commits (<? (extract-commits-since conn target-db common-ancestor))
           _ (log/info "squash-rebase!: LCA=" common-ancestor
                       "source-commits=" (map :id source-commits)
                       "target-commits=" (map :id target-commits))
           ;; Check if we need to look for conflicts
           check-conflicts? (seq target-commits)
           ;; Compute net flakes across all commits (oldest -> newest)
-          source-novelty (<? (net-flakes-for-squash conn target-db source-commits))
+          source-novelty (<? (compute-net-flakes conn target-db source-commits))
           ;; Only compute target novelty if there are target commits
           target-novelty (when check-conflicts?
-                           (<? (net-flakes-for-squash conn target-db target-commits)))
-          s-spots (spots-changed source-novelty)
-          t-spots (when target-novelty (spots-changed target-novelty))
+                           (<? (compute-net-flakes conn target-db target-commits)))
+          s-spots (get-changed-spots source-novelty)
+          t-spots (when target-novelty (get-changed-spots target-novelty))
           conflict-spots (when (and s-spots t-spots)
                            (seq (clojure.set/intersection s-spots t-spots)))]
       (log/debug "squash-rebase!: source-novelty-count=" (count (or source-novelty []))
                  "target-novelty-count=" (count (or target-novelty []))
                  "conflict-spots?=" (boolean conflict-spots))
       (if conflict-spots
-        (build-conflict-response from-spec to-spec {:failed-commit {:id (first (map :id source-commits))}}
-                                 (assoc opts :ff-mode false))
+        (conflict-response from-spec to-spec {:failed-commit {:id (first (map :id source-commits))}}
+                           (assoc opts :ff-mode false))
         (let [net-flakes (seq source-novelty)
               final-db (if net-flakes
                          (<? (stage-flakes target-db net-flakes {:message (:message opts)
@@ -531,7 +519,7 @@
               replay-result {:success true
                              :final-db final-db
                              :replayed (map (fn [c] {:commit c :flakes nil :success true}) source-commits)}]
-          (build-success-response from-spec to-spec replay-result new-commit-sha opts))))))
+          (success-response from-spec to-spec replay-result new-commit-sha opts))))))
 
 ;; ============================================================================
 ;; Safe Reset Implementation
@@ -609,7 +597,7 @@
   "Strictly replays commits from source branch onto target branch."
   [conn from to opts]
   (go-try
-    (enforce-same-ledger! from to)
+    (validate-same-ledger! from to)
     (let [{:keys [ff squash? atomic? selector preview?]
            :or {ff :auto
                 squash? false
@@ -628,8 +616,8 @@
       (let [{:keys [source-db target-db source-branch-info target-branch-info]}
             (<? (load-branches conn from to))
 
-            can-ff? (<? (is-fast-forward? conn source-db target-db
-                                          source-branch-info target-branch-info))]
+            can-ff? (<? (can-fast-forward? conn source-db target-db
+                                           source-branch-info target-branch-info))]
 
         (when preview?
           (reduced
@@ -655,11 +643,11 @@
 
           ;; Fast-forward when possible (unless explicitly disabled)
           (and can-ff? (not= ff :never))
-          (<? (fast-forward-pointer! conn from to))
+          (<? (fast-forward! conn from to))
 
           ;; Squash mode
           squash?
-          (<? (squash-rebase! conn from to opts))
+          (<? (squash! conn from to opts))
 
           ;; Regular replay mode (not yet implemented)
           :else

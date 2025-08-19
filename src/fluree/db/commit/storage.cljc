@@ -42,7 +42,6 @@
       (log/trace "read-commit at:" commit-address "data:" commit-json)
       (let [cred?         (contains? commit-json "credentialSubject")
             subject-path  (if cred? ["credentialSubject"] [])
-            id-path       (conj subject-path "id")
             addr-path     (conj subject-path "address")
             subject-json  (if cred? (get commit-json "credentialSubject") commit-json)
             ;; Prefer commit id from address/hash; fallback to computing from JSON only if needed
