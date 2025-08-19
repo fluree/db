@@ -4,6 +4,7 @@
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
             [fluree.db.api.branch :as api.branch]
+            [fluree.db.api.merge :as api.merge]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.connection :as connection :refer [connection?]]
             [fluree.db.connection.config :as config]
@@ -634,6 +635,205 @@
   (validate-connection conn)
   (promise-wrap
    (api.branch/rename-branch! conn old-branch-spec new-branch-spec)))
+
+;; Branch operations (merge, rebase, reset)
+
+(defn merge!
+  "Three-way delta merge between branches with conflict resolution.
+  
+  Computes deltas from the Lowest Common Ancestor (LCA) for both branches,
+  auto-merges based on conflict policy, and creates a merge commit.
+  
+  Parameters:
+    conn - Connection object
+    from - Source branch spec (e.g., 'ledger:feature')
+    to - Target branch spec (e.g., 'ledger:main')
+    opts - Map with optional merge options:
+      :conflict-policy - How to handle conflicts (default :conservative)
+        :conservative - Reject on any conflict
+        :ours - Keep target branch changes
+        :theirs - Keep source branch changes
+        :last-write-wins - Use most recent change
+        :schema-aware - Use schema rules to resolve
+        function - Custom conflict resolution
+      :preview? - Dry run without making changes (default false)
+      
+  Returns promise resolving to:
+    {:status :success|:conflict|:error
+     :operation :merge
+     :from '...' :to '...'
+     :strategy '3-way'
+     :commits {:merged [...] :conflicts [...]}
+     :new-commit 'sha'}
+     
+  Phase 2 - Not yet implemented."
+  ([conn from to]
+   (merge! conn from to {}))
+  ([conn from to opts]
+   (validate-connection conn)
+   (promise-wrap
+    (api.merge/merge! conn from to opts))))
+
+(defn rebase!
+  "Strictly replays commits from source branch onto target branch.
+  
+  Supports multiple modes: fast-forward, squash, and cherry-pick.
+  Auto fast-forwards when possible unless disabled.
+  
+  Parameters:
+    conn - Connection object
+    from - Source branch spec (e.g., 'ledger:feature')
+    to - Target branch spec (e.g., 'ledger:main')
+    opts - Map with optional rebase options:
+      :ff - Fast-forward behavior (default :auto)
+        :auto - Fast-forward when possible
+        :only - Only allow fast-forward (fail otherwise)
+        :never - Never fast-forward, always replay
+      :squash? - Combine all commits into one (default false)
+      :atomic? - All-or-nothing vs apply-until-conflict (default true)
+      :selector - Which commits to include (default nil = all after LCA)
+        nil - All commits after LCA
+        {:t {:from 42 :to 44}} - Specific t-value range
+        {:t {:from 42 :until :conflict}} - Until conflict
+        {:shas ['sha1' 'sha2']} - Specific commits
+      :preview? - Dry run without making changes (default false)
+      
+  Returns promise resolving to:
+    {:status :success|:conflict|:error
+     :operation :rebase
+     :from '...' :to '...'
+     :strategy 'fast-forward'|'squash'|'replay'
+     :commits {:applied [...] :skipped [...] :conflicts [...]}
+     :new-commit 'sha'}
+     
+  Phase 1 implements: fast-forward and squash modes.
+  Phase 2 will add: cherry-pick and non-atomic modes."
+  ([conn from to]
+   (rebase! conn from to {}))
+  ([conn from to opts]
+   (validate-connection conn)
+   (promise-wrap
+    (do
+      (require 'fluree.db.api.merge)
+      (let [v (ns-resolve 'fluree.db.api.merge 'rebase!)]
+        (when-not (and v (bound? v))
+          (require 'fluree.db.api.merge :reload)
+          (alter-var-root #'clojure.core/*ns* (constantly *ns*)))
+        (let [v2 (ns-resolve 'fluree.db.api.merge 'rebase!)]
+          (when-not (and v2 (bound? v2))
+            (throw (IllegalStateException. "fluree.db.api.merge/rebase! not bound after reload")))
+          (v2 conn from to opts)))))))
+
+(defn reset-branch!
+  "Resets a branch to a previous state.
+  
+  Two modes available:
+  - Safe mode (default): Creates new commit reverting to target state
+  - Hard mode: Moves branch pointer (rewrites history)
+  
+  Parameters:
+    conn - Connection object
+    branch - Target branch to reset (e.g., 'ledger:main')
+    to - Target state:
+      {:t 90} - Reset to transaction t-value
+      {:sha 'abc123'} - Reset to specific commit SHA
+    opts - Map with optional reset options:
+      :mode - Reset mode (default :safe)
+        :safe - Create revert commit (non-destructive)
+        :hard - Move branch pointer (destructive)
+      :archive - How to archive on hard reset (default {:as :tag})
+        {:as :tag :name 'backup'} - Create tag at old HEAD
+        {:as :branch :name 'backup'} - Create branch at old HEAD
+        {:as :none} - No archive (requires force?)
+      :force? - Required for hard reset without archive (default false)
+      :message - Commit message for safe mode (auto-generated if not provided)
+      :preview? - Dry run without making changes (default false)
+      
+  Returns promise resolving to:
+    {:status :success|:error
+     :operation :reset
+     :branch '...'
+     :mode :safe|:hard
+     :reset-to {:t 90}|{:sha '...'}
+     :new-commit 'sha'  ; For safe mode
+     :archived {:type :tag :name '...'}  ; For hard mode
+     :previous-head 'sha'}
+     
+  Phase 1 implements: safe reset only.
+  Phase 2 will add: hard reset with archiving."
+  ([conn branch to]
+   (reset-branch! conn branch to {}))
+  ([conn branch to opts]
+   (validate-connection conn)
+   (promise-wrap
+    (api.merge/reset-branch! conn branch to opts))))
+
+;; Legacy API - Deprecated, use rebase! instead
+(defn merge-branches!
+  "DEPRECATED - Use rebase! instead.
+  
+  Legacy merge API maintained for backwards compatibility.
+  Maps to rebase! with appropriate options."
+  ([conn source-branch-spec target-branch-spec]
+   (merge-branches! conn source-branch-spec target-branch-spec {}))
+  ([conn source-branch-spec target-branch-spec opts]
+   (validate-connection conn)
+   ;; Map legacy API to new rebase! API
+   (let [strategy (:strategy opts :auto)
+         new-opts (clojure.core/merge
+                   (case strategy
+                     :fast-forward {:ff :only}
+                     :flatten {:squash? true}
+                     :auto {:ff :auto}
+                     :no-ff {:ff :never}
+                     {})
+                   (dissoc opts :strategy))
+         result @(rebase! conn source-branch-spec target-branch-spec new-opts)]
+     ;; Map new response format to legacy format for backwards compatibility
+     (promise-wrap
+      (go-try
+        (if (= :success (:status result))
+          (assoc result
+                 :type (case (:strategy result)
+                         "fast-forward" :fast-forward
+                         "squash" :flatten
+                         "replay" :rebase
+                         :rebase))
+          result))))))
+
+(defn branch-divergence
+  "Analyzes divergence between two branches.
+  
+  Parameters:
+    conn - Connection object
+    branch1-spec - First branch spec
+    branch2-spec - Second branch spec
+    
+  Returns promise resolving to divergence analysis including:
+    :common-ancestor - Commit ID of common ancestor
+    :branch1-ahead - Number of commits branch1 is ahead
+    :branch2-ahead - Number of commits branch2 is ahead
+    :can-fast-forward - Boolean if one can fast-forward to the other"
+  [conn branch1-spec branch2-spec]
+  (validate-connection conn)
+  (promise-wrap
+   (go-try
+     (let [ledger1 (<? (connection/load-ledger conn branch1-spec))
+           ledger2 (<? (connection/load-ledger conn branch2-spec))
+           db1 (ledger/current-db ledger1)
+           db2 (ledger/current-db ledger2)
+           ;; Get branch metadata for common ancestor detection
+           branch1-info (<? (ledger/branch-info ledger1))
+           branch2-info (<? (ledger/branch-info ledger2))
+           common-ancestor (<? (api.merge/find-common-ancestor conn db1 db2 branch1-info branch2-info))
+           ff-1-to-2 (<? (api.merge/is-fast-forward? conn db1 db2 branch1-info branch2-info))
+           ff-2-to-1 (<? (api.merge/is-fast-forward? conn db2 db1 branch2-info branch1-info))]
+       {:common-ancestor common-ancestor
+        :can-fast-forward (or ff-1-to-2 ff-2-to-1)
+        :fast-forward-direction (cond
+                                  ff-1-to-2 :branch1-to-branch2
+                                  ff-2-to-1 :branch2-to-branch1
+                                  :else nil)}))))
 
 ;; db operations
 
