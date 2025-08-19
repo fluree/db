@@ -6,6 +6,7 @@
   2. rebase! - Strict replay of commits (Phase 1)
   3. reset-branch! - Safe rollback or hard reset (Phase 1 - safe mode only)"
   (:require [clojure.core.async :as async]
+            [clojure.set]
             [clojure.string :as str]
             [fluree.db.async-db :as async-db]
             [fluree.db.commit.storage :as commit-storage]
@@ -14,16 +15,14 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.flake-db :as flake-db]
-            [fluree.db.flake.transact :as flake.transact]
+            [fluree.db.json-ld.policy :as policy]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.nameservice.sub :as ns-subscribe]
-            [fluree.db.storage :as storage]
-            [fluree.db.time-travel :as time-travel]
+            [fluree.db.query.range :as query-range]
             [fluree.db.transact :as transact]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.json :as json]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
@@ -58,33 +57,6 @@
   (when-let [source-origin (created-from-commit source-branch-info)]
     (= source-origin (created-from-commit target-branch-info))))
 
-(defn- collect-commit-chain
-  "Collect all commit IDs in a branch's history."
-  [initial-commit]
-  (loop [current-commit initial-commit
-         commit-ids #{}]
-    (if-not current-commit
-      commit-ids
-      (let [commit-id (:id current-commit)
-            updated-ids (if commit-id
-                          (conj commit-ids commit-id)
-                          commit-ids)
-            prev-commit (when-let [prev-id (get-in current-commit [:previous :id])]
-                          {:id prev-id
-                           :previous (get-in current-commit [:previous :previous])})]
-        (recur prev-commit updated-ids)))))
-
-(defn- find-first-common-commit
-  "Find the first commit in target that exists in source's history."
-  [source-commits target-commit]
-  (loop [current-commit target-commit]
-    (when current-commit
-      (let [commit-id (:id current-commit)]
-        (if (and commit-id (contains? source-commits commit-id))
-          commit-id
-          (when-let [prev-id (get-in current-commit [:previous :id])]
-            (recur {:id prev-id
-                    :previous (get-in current-commit [:previous :previous])})))))))
 
 (defn- latest-expanded-commit
   [conn db]
@@ -163,18 +135,6 @@
 ;; Commit Extraction and Processing
 ;; ============================================================================
 
-(defn- extract-commits-since
-  "Extracts all commits from a branch since a given commit ID.
-  Returns a sequence of commit maps in chronological order (oldest first)."
-  [db since-commit-id]
-  (go-try
-    (loop [current-commit (:commit db)
-           commits []]
-      (if (or (nil? current-commit)
-              (= (:id current-commit) since-commit-id))
-        (reverse commits)
-        (recur (:previous current-commit)
-               (conj commits current-commit))))))
 
 (defn- read-commit-data
   "Reads the actual data from a commit.
@@ -210,21 +170,10 @@
 ;; Flake Operations
 ;; ============================================================================
 
-(defn- normalize-flake
-  "Normalize a flake for semantic comparison, ignoring t values and metadata."
-  [f]
-  [(flake/s f) (flake/p f) (flake/o f) (flake/dt f) (flake/op f)])
-
-(defn- compare-flakes-semantically
-  "Compares two sets of flakes ignoring t values and metadata.
-  Returns true if they represent the same semantic changes."
-  [flakes1 flakes2]
-  (= (set (map normalize-flake flakes1))
-     (set (map normalize-flake flakes2))))
 
 (defn- stage-flakes
   "Stages flakes directly into a database.
-  Bypasses transaction parsing for rebase operations."
+  Handles retractions by finding and removing matching assertions from the database."
   [db flakes opts]
   (go-try
     (if (empty? flakes)
@@ -233,7 +182,7 @@
                   (<? (async-db/deref-async db))
                   db)
             next-t (flake/next-t (:t db*))
-            ;; retime all flakes to the new t so they are captured in novelty for this commit
+            ;; retime all flakes to the new t
             retimed (into [] (map (fn [f]
                                     (flake/create (flake/s f)
                                                   (flake/p f)
@@ -243,153 +192,130 @@
                                                   (flake/op f)
                                                   (flake/m f)))) flakes)
             {adds true rems false} (group-by flake/op retimed)
+            ;; For retractions, we need to find the actual flakes to remove
+            ;; Look in both novelty AND the indexed data
+            root-db (policy/root db*)
+            flakes-to-remove (when rems
+                               (<? (async/go
+                                     (loop [to-remove []
+                                            remaining rems]
+                                       (if-let [retraction (first remaining)]
+                                         (let [s (flake/s retraction)
+                                               p (flake/p retraction)
+                                               o (flake/o retraction)
+                                               dt (flake/dt retraction)
+                                              ;; Find matching flakes in the database
+                                               existing (<? (query-range/index-range root-db nil :spot = [s p]
+                                                                                     {:flake-xf (filter #(and (= (flake/o %) o)
+                                                                                                              (= (flake/dt %) dt)
+                                                                                                              (true? (flake/op %))))}))
+                                               to-remove* (into to-remove existing)]
+                                           (recur to-remove* (rest remaining)))
+                                         to-remove)))))
             db-after (-> db*
                          (assoc :t next-t
                                 :staged {:txn (:message opts "Rebase merge")
                                          :author (:author opts "system/merge")
                                          :annotation (:annotation opts)})
-                         (commit-data/update-novelty (or adds []) (or rems [])))]
+                         (commit-data/update-novelty (or adds []) flakes-to-remove))]
         db-after))))
 
 ;; ============================================================================
 ;; Transaction Replay
 ;; ============================================================================
 
-(defn- parse-transaction
-  "Parse a transaction JSON string into Clojure data."
-  [txn-str]
-  (try*
-    (json/parse txn-str)
-    (catch* _e
-      nil)))
-
-(defn- read-txn
-  "Reads a stored transaction document from commit storage by address."
-  [conn txn-address]
-  (go-try
-    (when (and txn-address (string? txn-address))
-      (<? (storage/read-json (:commit-catalog conn) txn-address)))))
-
-(defn- staged-flakes
-  "Extracts novelty flakes for the most recent stage at db's :t."
-  [db]
-  (some-> db :novelty :tspo (flake/match-tspo (:t db)) not-empty))
 
 (defn- net-flakes-for-squash
-  "Computes the net set of flakes across source commits since LCA.
-  Uses last-write-wins per (s,p,dt) spot, independent of original t/value.
-  Returns a collection of flakes with t normalized (they will be retimed at staging)."
+  "Computes the net effect of all source commits since LCA.
+  Simulates applying all retracts and adds in order to determine final state.
+  Returns a collection of flakes representing the net changes."
   [conn target-db source-commits]
   (go-try
-    (loop [spot->flake {}
+    ;; Track current values at each [s,p,dt] spot as we process commits
+    (loop [spot->values {}  ; Map of [s p dt] -> set of object values
            commits source-commits]
       (if-let [commit (first commits)]
         (let [data (<? (read-commit-data conn commit target-db))
-              adds (:asserted data)
               rems (:retracted data)
-              build (fn [f opval]
-                      (flake/create (flake/s f)
-                                    (flake/p f)
-                                    (flake/o f)
-                                    (flake/dt f)
-                                    0
-                                    opval
-                                    (flake/m f)))
+              adds (:asserted data)
               spot-key (fn [f] [(flake/s f) (flake/p f) (flake/dt f)])
-              spot->flake* (reduce (fn [m f]
-                                     (assoc m (spot-key f) (build f false)))
-                                   spot->flake
-                                   (or rems []))
-              spot->flake** (reduce (fn [m f]
-                                      (assoc m (spot-key f) (build f true)))
-                                    spot->flake*
-                                    (or adds []))]
-          (recur spot->flake** (rest commits)))
-        (let [novelty (->> spot->flake vals (into (flake/sorted-set-by flake/cmp-flakes-spot)))]
-          novelty)))))
+              ;; Apply retractions - remove values from spots
+              spot->values* (reduce (fn [m f]
+                                      (let [spot (spot-key f)
+                                            val (flake/o f)]
+                                        (update m spot (fnil disj #{}) val)))
+                                    spot->values
+                                    (or rems []))
+              ;; Apply additions - add values to spots  
+              spot->values** (reduce (fn [m f]
+                                       (let [spot (spot-key f)
+                                             val (flake/o f)]
+                                         (update m spot (fnil conj #{}) val)))
+                                     spot->values*
+                                     (or adds []))]
+          (recur spot->values** (rest commits)))
+        ;; Now we have the net state - generate flakes
+        ;; If there are no net changes, return empty
+        (if (empty? spot->values)
+          (flake/sorted-set-by flake/cmp-flakes-spot)
+          ;; We need both assertions for new values AND retractions for existing values
+          ;; that aren't in the final state
+          (let [;; Get existing values from target database for changed spots
+                ;; Use try-catch to handle potential index issues
+                root-db (policy/root target-db)
+                existing-values (try*
+                                  (loop [existing {}
+                                         spots (keys spot->values)]
+                                    (if-let [[s p dt] (first spots)]
+                                      (let [current (try*
+                                                      (<? (query-range/index-range root-db nil :spot = [s p]
+                                                                                   {:flake-xf (comp
+                                                                                               (filter #(= (flake/dt %) dt))
+                                                                                               (map flake/o))}))
+                                                      (catch* e
+                                                        (log/warn "Failed to query existing values for spot" [s p dt]
+                                                                  "- assuming no existing values" (ex-message e))
+                                                        []))]
+                                        (recur (if (seq current)
+                                                 (assoc existing [s p dt] (set current))
+                                                 existing)
+                                               (rest spots)))
+                                      existing))
+                                  (catch* e
+                                    (log/warn "Failed to query existing values, assuming empty" (ex-message e))
+                                    {}))
+                ;; Generate retractions for existing values not in final state
+                ;; and assertions for new values
+                all-flakes (reduce-kv
+                            (fn [flakes spot final-values]
+                              (let [existing-vals (get existing-values spot #{})
+                                    final-vals-set (set final-values)
+                                    to-retract (clojure.set/difference existing-vals final-vals-set)
+                                    to-add final-vals-set
+                                    [s p dt] spot]
+                                (into flakes
+                                      (concat
+                                      ;; Retractions for values that exist but shouldn't
+                                       (map (fn [o] (flake/create s p o dt 0 false nil))
+                                            to-retract)
+                                      ;; Assertions for final values
+                                       (map (fn [o] (flake/create s p o dt 0 true nil))
+                                            to-add)))))
+                            []
+                            spot->values)]
+            (into (flake/sorted-set-by flake/cmp-flakes-spot) all-flakes)))))))
 
 (defn- spots-changed
   "Returns a set of [s p dt] spots changed by the provided novelty flakes."
   [flakes]
   (into #{} (map (fn [f] [(flake/s f) (flake/p f) (flake/dt f)])) flakes))
 
-(defn- replay-transaction
-  "Replays a transaction on a database and returns {:db <staged-db> :flakes <novelty-flakes>}.
-  This stages the transaction but doesn't commit it."
-  [conn db txn-ref]
-  (go-try
-    (when-let [txn (or (<? (read-txn conn txn-ref))
-                       (parse-transaction txn-ref))]
-      (let [context (or (get txn "@context") {})
-            parsed-txn (if (vector? txn) txn [txn])
-            staged-db (<? (flake.transact/stage db nil context nil nil nil
-                                                txn parsed-txn))]
-        {:db staged-db
-         :flakes (staged-flakes staged-db)}))))
 
 ;; ============================================================================
 ;; Replay Loop Functions
 ;; ============================================================================
 
-(defn- process-single-commit
-  "Process a single commit during squash: apply commit's flakes directly (admin path)."
-  [conn current-db commit]
-  (go-try
-    (let [original-data (<? (read-commit-data conn commit current-db))
-          commit-flakes (:all original-data)
-          txn-ref (:txn commit)
-          replay (when txn-ref (<? (replay-transaction conn current-db txn-ref)))
-          replay-flakes (:flakes replay)]
-      (log/debug "process-single-commit: commit-id=" (:id commit)
-                 "txn?=" (boolean txn-ref)
-                 "original-count=" (count (or commit-flakes []))
-                 "replay-count=" (count (or replay-flakes [])))
-      (if (not (compare-flakes-semantically (or commit-flakes []) (or replay-flakes [])))
-        (do (log/warn "process-single-commit: semantic mismatch detected at commit" (:id commit))
-            {:conflict true
-             :commit commit
-             :original-flakes commit-flakes
-             :replayed-flakes replay-flakes})
-        (let [new-db (<? (stage-flakes current-db commit-flakes
-                                       {:message (str "Squash: " (:message commit))
-                                        :author (:author commit)}))]
-          (log/debug "process-single-commit: staged successfully commit-id=" (:id commit))
-          {:success true
-           :new-db new-db
-           :commit commit
-           :flakes commit-flakes})))))
 
-(defn- replay-commits*
-  "Replay a sequence of commits onto a target database."
-  [conn target-db source-commits]
-  (go-try
-    (loop [current-db target-db
-           commits source-commits
-           replayed []]
-      (if-let [commit (first commits)]
-        (let [_ (log/info "replay-commits*: applying commit" (:id commit)
-                          "remaining=" (dec (count commits)))
-              result (<? (process-single-commit conn current-db commit))]
-          (if (:conflict result)
-            ;; Return conflict information
-            (do (log/warn "replay-commits*: conflict at commit" (get-in result [:commit :id]))
-                {:conflict true
-                 :failed-commit (:commit result)
-                 :original-flakes (:original-flakes result)
-                 :replayed-flakes (:replayed-flakes result)
-                 :replayed-so-far replayed})
-            ;; Continue with next commit
-            (recur (:new-db result)
-                   (rest commits)
-                   (conj replayed {:commit (:commit result)
-                                   :flakes (:flakes result)
-                                   :success true}))))
-        ;; All commits replayed successfully
-        (do (log/info "replay-commits*: all commits applied successfully"
-                      "applied-count=" (count replayed))
-            {:success true
-             :final-db current-db
-             :replayed replayed})))))
 
 ;; ============================================================================
 ;; Result Building
@@ -469,14 +395,6 @@
        :source-branch-info (<? (ledger/branch-info source-ledger))
        :target-branch-info (<? (ledger/branch-info target-ledger))})))
 
-(defn- lca-t
-  "Resolves the t value for a commit id on a given db, or 0 if nil."
-  [db commit-id]
-  (go-try
-    (if (and (string? commit-id)
-             (not (str/blank? commit-id)))
-      (<? (time-travel/sha->t db commit-id))
-      0)))
 
 (defn- extract-commits-since-storage
   "Extracts commits after the LCA using commit storage traversal. Returns a vector
@@ -484,51 +402,52 @@
   avoids sha->t lookups."
   [conn source-db lca-commit-id]
   (go-try
-    (let [commit-catalog (:commit-catalog conn)
-          latest-expanded (<? (latest-expanded-commit conn source-db))
-          error-ch (async/chan)
-          ;; include genesis (t=0) so LCA at genesis can be located
-          tuples (commit-storage/trace-commits commit-catalog latest-expanded 0 error-ch)
-          traced (loop [acc []]
-                   (if-let [[exp _] (<? tuples)]
-                     (recur (conj acc (commit-data/json-ld->map exp nil)))
-                     acc))
-          vtr traced
-          head-id (get-in source-db [:commit :id])
-          normalize-id (fn [cid]
-                         (when cid
-                           (let [s (str cid)]
-                             (if (clojure.string/ends-with? s ".json")
-                               (subs s 0 (- (count s) 5))
-                               s))))]
-      (log/debug "extract-commits-since-storage: traced-count=" (count vtr)
-                 "head-id=" head-id "lca-id=" lca-commit-id)
-      (if (seq vtr)
-        (let [ids (mapv :id vtr)
-              ids-norm (mapv normalize-id ids)
-              lca-norm (normalize-id lca-commit-id)
-              idx (when lca-norm (.indexOf ids-norm lca-norm))
-              idx* (if (or (nil? idx) (= -1 idx))
-                     (let [lca-t* (<? (lca-t source-db lca-commit-id))
-                           by-t (some (fn [[i c]] (when (= (get-in c [:data :t]) lca-t*) i))
-                                      (map-indexed vector vtr))]
-                       (if (nil? by-t) -1 by-t))
-                     idx)
-              after-lca (cond
-                          (nil? idx*) vtr
-                          (= -1 idx*) vtr
-                          :else (subvec vtr (inc idx*)))]
-          (log/debug "extract-commits-since-storage: after-lca-count=" (count after-lca)
-                     "after-lca-ids=" (mapv :id after-lca))
-          (vec after-lca))
-        (let [walked (loop [acc [] cur (:commit source-db)]
-                       (if (and cur (not= (:id cur) lca-commit-id))
-                         (recur (conj acc cur) (:previous cur))
-                         acc))
-              walked* (vec (reverse walked))]
-          (log/debug "extract-commits-since-storage: in-memory-walk-count=" (count walked*)
-                     "walk-ids=" (mapv :id walked*))
-          walked*)))))
+    ;; If LCA is the current commit, there are no commits since then
+    (if (= lca-commit-id (get-in source-db [:commit :id]))
+      []
+      (let [commit-catalog (:commit-catalog conn)
+            latest-expanded (<? (latest-expanded-commit conn source-db))
+            error-ch (async/chan)
+            ;; include genesis (t=0) so LCA at genesis can be located
+            tuples (commit-storage/trace-commits commit-catalog latest-expanded 0 error-ch)
+            traced (loop [acc []]
+                     (if-let [[exp _] (<? tuples)]
+                       (recur (conj acc (commit-data/json-ld->map exp nil)))
+                       acc))
+            vtr traced
+            head-id (get-in source-db [:commit :id])
+            normalize-id (fn [cid]
+                           (when cid
+                             (let [s (str cid)]
+                               (if (clojure.string/ends-with? s ".json")
+                                 (subs s 0 (- (count s) 5))
+                                 s))))]
+        (log/debug "extract-commits-since-storage: traced-count=" (count vtr)
+                   "head-id=" head-id "lca-id=" lca-commit-id)
+        (if (seq vtr)
+          (let [ids (mapv :id vtr)
+                ids-norm (mapv normalize-id ids)
+                lca-norm (normalize-id lca-commit-id)
+                idx (when lca-norm (.indexOf ids-norm lca-norm))
+                idx* (if (or (nil? idx) (= -1 idx))
+                       ;; Don't try SHA lookup if we can't find the commit
+                       -1
+                       idx)
+                after-lca (cond
+                            (nil? idx*) vtr
+                            (= -1 idx*) vtr
+                            :else (subvec vtr (inc idx*)))]
+            (log/debug "extract-commits-since-storage: after-lca-count=" (count after-lca)
+                       "after-lca-ids=" (mapv :id after-lca))
+            (vec after-lca))
+          (let [walked (loop [acc [] cur (:commit source-db)]
+                         (if (and cur (not= (:id cur) lca-commit-id))
+                           (recur (conj acc cur) (:previous cur))
+                           acc))
+                walked* (vec (reverse walked))]
+            (log/debug "extract-commits-since-storage: in-memory-walk-count=" (count walked*)
+                       "walk-ids=" (mapv :id walked*))
+            walked*))))))
 
 (defn- enforce-same-ledger!
   "Throws if from/to are not within the same ledger base."
@@ -583,31 +502,36 @@
           target-commits (<? (extract-commits-since-storage conn target-db common-ancestor))
           _ (log/info "squash-rebase!: LCA=" common-ancestor
                       "source-commits=" (map :id source-commits)
-                      "target-commits=" (map :id target-commits))]
-      (let [;; Compute net flakes across all commits (oldest -> newest)
-            source-novelty (<? (net-flakes-for-squash conn target-db source-commits))
-            target-novelty (<? (net-flakes-for-squash conn target-db target-commits))
-            s-spots (spots-changed source-novelty)
-            t-spots (spots-changed target-novelty)
-            conflict-spots (seq (clojure.set/intersection s-spots t-spots))]
-        (log/debug "squash-rebase!: source-novelty-count=" (count (or source-novelty []))
-                   "target-novelty-count=" (count (or target-novelty []))
-                   "conflict-spots?=" (boolean conflict-spots))
-        (if conflict-spots
-          (build-conflict-response from-spec to-spec {:failed-commit {:id (first (map :id source-commits))}}
-                                   (assoc opts :ff-mode false))
-          (let [net-flakes (seq source-novelty)
-                final-db (if net-flakes
-                           (<? (stage-flakes target-db net-flakes {:message (:message opts)
-                                                                   :author "system/merge"}))
-                           target-db)
-                _ (log/info "squash-rebase!: staging-net-flakes count=" (count (or net-flakes [])))
-                new-commit-sha (when net-flakes
-                                 (<? (commit-if-changed target-ledger target-db final-db from-spec opts)))
-                replay-result {:success true
-                               :final-db final-db
-                               :replayed (map (fn [c] {:commit c :flakes nil :success true}) source-commits)}]
-            (build-success-response from-spec to-spec replay-result new-commit-sha opts)))))))
+                      "target-commits=" (map :id target-commits))
+          ;; Check if we need to look for conflicts
+          check-conflicts? (seq target-commits)
+          ;; Compute net flakes across all commits (oldest -> newest)
+          source-novelty (<? (net-flakes-for-squash conn target-db source-commits))
+          ;; Only compute target novelty if there are target commits
+          target-novelty (when check-conflicts?
+                           (<? (net-flakes-for-squash conn target-db target-commits)))
+          s-spots (spots-changed source-novelty)
+          t-spots (when target-novelty (spots-changed target-novelty))
+          conflict-spots (when (and s-spots t-spots)
+                           (seq (clojure.set/intersection s-spots t-spots)))]
+      (log/debug "squash-rebase!: source-novelty-count=" (count (or source-novelty []))
+                 "target-novelty-count=" (count (or target-novelty []))
+                 "conflict-spots?=" (boolean conflict-spots))
+      (if conflict-spots
+        (build-conflict-response from-spec to-spec {:failed-commit {:id (first (map :id source-commits))}}
+                                 (assoc opts :ff-mode false))
+        (let [net-flakes (seq source-novelty)
+              final-db (if net-flakes
+                         (<? (stage-flakes target-db net-flakes {:message (:message opts)
+                                                                 :author "system/merge"}))
+                         target-db)
+              _ (log/info "squash-rebase!: staging-net-flakes count=" (count (or net-flakes [])))
+              new-commit-sha (when net-flakes
+                               (<? (commit-if-changed target-ledger target-db final-db from-spec opts)))
+              replay-result {:success true
+                             :final-db final-db
+                             :replayed (map (fn [c] {:commit c :flakes nil :success true}) source-commits)}]
+          (build-success-response from-spec to-spec replay-result new-commit-sha opts))))))
 
 ;; ============================================================================
 ;; Safe Reset Implementation
