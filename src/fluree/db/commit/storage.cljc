@@ -38,13 +38,30 @@
 (defn read-verified-commit
   [storage commit-address]
   (go-try
-    (when-let [commit-data (<? (storage/read-json storage commit-address))]
-      (log/trace "read-commit at:" commit-address "data:" commit-data)
-      (let [addr-key-path (if (contains? commit-data "credentialSubject")
-                            ["credentialSubject" "address"]
-                            ["address"])]
-        (-> commit-data
-            (assoc-in addr-key-path commit-address)
+    (when-let [commit-json (<? (storage/read-json storage commit-address))]
+      (log/trace "read-commit at:" commit-address "data:" commit-json)
+      (let [cred?         (contains? commit-json "credentialSubject")
+            subject-path  (if cred? ["credentialSubject"] [])
+            id-path       (conj subject-path "id")
+            addr-path     (conj subject-path "address")
+            subject-json  (if cred? (get commit-json "credentialSubject") commit-json)
+            ;; Prefer commit id from address/hash; fallback to computing from JSON only if needed
+            existing-id   (get subject-json "id")
+            ;; Extract base32 hash-like token from the address if present
+            addr-str      (str commit-address)
+            hash-token    (last (clojure.string/split addr-str #"/"))
+            normalized-b  (when (and hash-token (clojure.string/starts-with? hash-token "b")) hash-token)
+            id-from-addr  (when normalized-b (str "fluree:commit:sha256:" normalized-b))
+            computed-id   (or id-from-addr (commit-data/commit-json->commit-id subject-json))
+            subject-json* (cond-> subject-json
+                            (or (nil? existing-id)
+                                (and (string? existing-id) (clojure.string/blank? existing-id)))
+                            (assoc "id" computed-id))
+            commit-json*  (if cred?
+                            (assoc commit-json "credentialSubject" subject-json*)
+                            subject-json*)
+            commit-json** (assoc-in commit-json* addr-path commit-address)]
+        (-> commit-json**
             json-ld/expand
             verify-commit)))))
 
