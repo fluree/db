@@ -807,40 +807,44 @@
           (where/match-meta metadata)))))
 
 (defn parse-obj-cmp
-  [allowed-vars context subj-cmp pred-cmp m triples
-   {:keys [list id value type language] :as v-map}]
-  (cond list
-        (reduce (fn [triples [i list-item]]
-                  (parse-obj-cmp allowed-vars context subj-cmp pred-cmp {:i i} triples list-item))
-                triples
-                (map vector (range) list))
+  [allowed-vars context subj-cmp pred-cmp m triples v-map]
+  (let [id     (util/get-id v-map)
+        v-list (util/get-list v-map)
+        value  (util/get-value v-map)
+        type   (util/get-types v-map)
+        lang   (util/get-lang v-map)]
+    (cond v-list
+          (reduce (fn [triples [i list-item]]
+                    (parse-obj-cmp allowed-vars context subj-cmp pred-cmp {:i i} triples list-item))
+                  triples
+                  (map vector (range) v-list))
 
-    ;; literal object
-        (some? value)
-        (let [m*      (cond-> m
-                        language (assoc :lang language))
-              obj-cmp (if (v/variable? value)
-                        (parse-variable-if-allowed allowed-vars value)
-                        (parse-object-value value type context m*))]
-          (conj triples [subj-cmp pred-cmp obj-cmp]))
+          ;; literal object
+          (some? value)
+          (let [m*      (cond-> m
+                          lang (assoc :lang lang))
+                obj-cmp (if (v/variable? value)
+                          (parse-variable-if-allowed allowed-vars value)
+                          (parse-object-value value type context m*))]
+            (conj triples [subj-cmp pred-cmp obj-cmp]))
 
-    ;; ref object
-        :else
-        (let [ref-obj (if (v/variable? id)
-                        (parse-variable-if-allowed allowed-vars id)
-                        (where/match-iri
-                         (if (nil? id)
-                           (iri/new-blank-node-id)
-                           id)))
-              ref-cmp (if m
-                        (where/match-meta ref-obj m)
-                        ref-obj)
-              v-map*  (if (nil? id)
-                    ;; project newly created bnode-id into v-map
-                        (assoc v-map :id (where/get-iri ref-cmp))
-                        v-map)]
-          (conj (parse-subj-cmp allowed-vars context triples v-map*)
-                [subj-cmp pred-cmp ref-cmp]))))
+          ;; ref object
+          :else
+          (let [ref-obj (if (v/variable? id)
+                          (parse-variable-if-allowed allowed-vars id)
+                          (where/match-iri
+                           (if (nil? id)
+                             (iri/new-blank-node-id)
+                             id)))
+                ref-cmp (if m
+                          (where/match-meta ref-obj m)
+                          ref-obj)
+                v-map*  (if (nil? id)
+                          ;; project newly created bnode-id into v-map
+                          (assoc v-map const/iri-id (where/get-iri ref-cmp))
+                          v-map)]
+            (conj (parse-subj-cmp allowed-vars context triples v-map*)
+                  [subj-cmp pred-cmp ref-cmp])))))
 
 (defn parse-pred-cmp
   [allowed-vars context subj-cmp triples [pred values]]
@@ -856,8 +860,8 @@
                          " Please use the JSON-LD \"@type\" keyword instead.")
                     {:status 400 :error :db/invalid-predicate}))
 
-    (= :type pred)
-    (let [values*  (map (fn [typ] {:id typ})
+    (= const/iri-type pred)
+    (let [values*  (map (fn [typ] {const/iri-id typ})
                         values)
           pred-cmp (where/match-iri const/iri-rdf-type)]
       (reduce (partial parse-obj-cmp allowed-vars context subj-cmp pred-cmp nil)
@@ -871,13 +875,14 @@
               values))))
 
 (defn parse-subj-cmp
-  [allowed-vars context triples {:keys [id] :as node}]
-  (let [subj-cmp (cond (v/variable? id) (parse-variable-if-allowed allowed-vars id)
+  [allowed-vars context triples node]
+  (let [id       (util/get-id node)
+        subj-cmp (cond (v/variable? id) (parse-variable-if-allowed allowed-vars id)
                        (nil? id)        (where/match-iri (iri/new-blank-node-id))
                        :else            (where/match-iri id))]
     (reduce (partial parse-pred-cmp allowed-vars context subj-cmp)
             triples
-            (->> (dissoc node :id :idx)
+            (->> (dissoc node const/iri-id)
                  ;; deterministic patterns for each pred
                  (sort-by (comp str first))))))
 
@@ -886,8 +891,7 @@
   [expanded allowed-vars context]
   (try*
     (reduce (partial parse-subj-cmp allowed-vars context)
-            []
-            expanded)
+            [] expanded)
     (catch* e
       (throw (ex-info (str "Parsing failure due to: " (ex-message e)
                            ". Query: " expanded)
@@ -927,7 +931,7 @@
                            (parse-values context))
          where         (-> (get-named txn "where")
                            (parse-where vars context))
-         bound-vars    (-> where where/bound-variables (into vars))
+         bound-vars    (-> where where/clause-variables (into vars))
          delete        (when-let [dlt (get-named txn "delete")]
                          (jld->parsed-triples dlt bound-vars context))
          insert        (when-let [ins (get-named txn "insert")]

@@ -1040,7 +1040,7 @@
                                                      "secondaryPublishers" {"@type" "Publisher"
                                                                             "storage" {"@id" "secondaryStorage"}}}]})
              alias    "destined-for-drop"
-             _        @(fluree/create conn alias {:reindex-min-bytes 100 :max-old-indexes 3})
+             _        @(fluree/create conn alias {:reindex-min-bytes 100 :max-old-indexes 1000})
              db0      (-> @(fluree/db conn alias)
                           ;; wrap with a policy so we are storing txns
                           (fluree/wrap-policy {"@context" {"ex" "http://example.org/ns/" "f" "https://ns.flur.ee/ledger#"}

@@ -3,7 +3,7 @@
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 
-(deftest ^:integration filter-test
+(deftest ^:integration ^:sci filter-test
   (let [conn   (test-utils/create-conn)
         db0 @(fluree/create conn "query/filter")
         db     @(fluree/update

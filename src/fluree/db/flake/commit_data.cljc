@@ -8,7 +8,8 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.serde.json :as serde-json]
-            [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
+            [fluree.db.util :as util :refer [get-id get-first get-first-value
+                                             get-value try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]))
@@ -128,7 +129,7 @@
 
 (defn parse-db-data
   [data]
-  {:id      (:id data)
+  {:id      (get-id data)
    :t       (get-first-value data const/iri-fluree-t)
    :address (get-first-value data const/iri-address)
    :flakes  (get-first-value data const/iri-flakes)
@@ -136,7 +137,7 @@
 
 (defn jsonld->clj
   [jsonld]
-  (let [id          (:id jsonld)
+  (let [id          (get-id jsonld)
         v           (get-first-value jsonld const/iri-v)
         alias       (get-first-value jsonld const/iri-alias)
         address     (-> jsonld
@@ -158,22 +159,22 @@
              :v      v
              :alias  alias
              :time   time
-             :tag    (mapv :value tags)
+             :tag    (mapv get-value tags)
              :data   (parse-db-data data)
              :author author}
       txn (assoc :txn txn)
       address (assoc :address address)
-      prev-commit (assoc :previous {:id      (:id prev-commit)
+      prev-commit (assoc :previous {:id      (get-id prev-commit)
                                     :address (get-first-value prev-commit const/iri-address)})
       message (assoc :message message)
       ns (assoc :ns (->> ns
                          util/sequential
                          (mapv (fn [namespace]
-                                 (select-keys namespace [:id])))))
-      index (assoc :index {:id      (:id index)
+                                 {:id (get-id namespace)}))))
+      index (assoc :index {:id      (get-id index)
                            :address (get-first-value index const/iri-address)
                            :data    (parse-db-data (get-first index const/iri-data))})
-      issuer (assoc :issuer (select-keys issuer [:id])))))
+      issuer (assoc :issuer {:id (get-id issuer)}))))
 
 (defn update-index-roots
   [commit-map {:keys [spot post opst tspo]}]
@@ -512,7 +513,7 @@
       (= const/$id pdt) ;; ref to another node
       (if (= const/$rdf:type (flake/p flake))
         (get-s-iri db (flake/o flake) compact-fn) ;; @type values don't need to be in an @id map
-        {"@id" (get-s-iri db (flake/o flake) compact-fn)})
+        {const/iri-id (get-s-iri db (flake/o flake) compact-fn)})
 
       (datatype/inferable? pdt)
       (serde-json/serialize-object (flake/o flake) pdt)
@@ -624,7 +625,7 @@
         assert-key  (compact const/iri-assert)
         retract-key (compact const/iri-retract)
         refs-ctx*   (cond-> refs-ctx
-                      prev-dbid     (assoc-in [prev-db-key "@type"] "@id")
+                      prev-dbid     (assoc-in [prev-db-key const/iri-type] const/iri-id)
                       (seq assert)  (assoc-in [assert-key "@container"] "@graph")
                       (seq retract) (assoc-in [retract-key "@container"] "@graph"))
         nses        (new-namespaces db)

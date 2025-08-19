@@ -1518,7 +1518,7 @@
                           GROUP BY ?person"]
              (testing "output :fql"
                (is (= [["ex:bbob" [23]]
-                       ["ex:fbueller" nil]
+                       ["ex:fbueller" [nil]]
                        ["ex:jbob" [0 3 5 6 7 8 9]]
                        ["ex:jdoe" [3 7 42 99]]]
                       @(fluree/query db query {:format :sparql}))))

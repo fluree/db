@@ -55,7 +55,7 @@
     (when-let [[commit _proof] (<? (read-verified-commit storage commit-address))]
       (let [commit-id (commit-data/hash->commit-id commit-hash)]
         (assoc commit
-               :id commit-id
+               const/iri-id commit-id
                const/iri-address commit-address)))))
 
 (defn read-data-jsonld

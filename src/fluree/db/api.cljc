@@ -184,10 +184,18 @@
          * For LocalStack: 'http://localhost:4566'
          * For MinIO: 'http://localhost:9000'
        - s3-prefix (optional): The prefix within the bucket
+       - s3-read-timeout-ms (optional): Per-request read timeout (default 20000)
+       - s3-write-timeout-ms (optional): Per-request write timeout (default 60000)
+       - s3-list-timeout-ms (optional): Per-request list timeout (default 20000)
+       - s3-max-retries (optional): Max retry attempts on transient errors (default 4)
+       - s3-retry-base-delay-ms (optional): Base backoff delay in ms (default 150)
+       - s3-retry-max-delay-ms (optional): Max backoff delay in ms (default 2000)
        - parallelism (optional): Number of parallel operations (default: 4)
        - cache-max-mb (optional): Maximum memory for caching in MB (default: 1000)
        - defaults (optional): Default options for ledgers created with this connection"
-     ([{:keys [s3-bucket s3-prefix s3-endpoint parallelism cache-max-mb defaults],
+     ([{:keys [s3-bucket s3-prefix s3-endpoint parallelism cache-max-mb defaults
+               s3-read-timeout-ms s3-write-timeout-ms s3-list-timeout-ms
+               s3-max-retries s3-retry-base-delay-ms s3-retry-max-delay-ms],
         :or   {parallelism 4, cache-max-mb 1000}}]
       (when-not s3-bucket
         (throw (ex-info "S3 bucket name is required for S3 connection"
@@ -202,7 +210,13 @@
                                             "@type"      "Storage"
                                             "s3Bucket"   s3-bucket
                                             "s3Endpoint" s3-endpoint}
-                                     s3-prefix (assoc "s3Prefix" s3-prefix))
+                                     s3-prefix (assoc "s3Prefix" s3-prefix)
+                                     s3-read-timeout-ms (assoc "s3ReadTimeoutMs" s3-read-timeout-ms)
+                                     s3-write-timeout-ms (assoc "s3WriteTimeoutMs" s3-write-timeout-ms)
+                                     s3-list-timeout-ms (assoc "s3ListTimeoutMs" s3-list-timeout-ms)
+                                     s3-max-retries (assoc "s3MaxRetries" s3-max-retries)
+                                     s3-retry-base-delay-ms (assoc "s3RetryBaseDelayMs" s3-retry-base-delay-ms)
+                                     s3-retry-max-delay-ms (assoc "s3RetryMaxDelayMs" s3-retry-max-delay-ms))
                                    (cond-> {"@id"              "connection"
                                             "@type"            "Connection"
                                             "parallelism"      parallelism
