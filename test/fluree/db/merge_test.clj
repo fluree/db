@@ -397,3 +397,70 @@
 
         (finally
           @(fluree/disconnect conn))))))
+
+(deftest ^:integration namespace-collision-test
+  (testing "Rebase handles namespace collisions correctly"
+    (let [conn @(fluree/connect-memory {})]
+      (try
+        ;; Create initial ledger with base data
+        @(fluree/create conn "ns-test" {})
+        @(fluree/insert! conn "ns-test:main"
+                         {"@context" {"ex" "http://example.org/"
+                                      "schema" "http://schema.org/"}
+                          "@graph" [{"@id" "ex:alice"
+                                     "@type" "schema:Person"
+                                     "schema:name" "Alice"}]})
+
+        ;; Create two branches
+        @(fluree/create-branch! conn "ns-test:feature1" "ns-test:main")
+        @(fluree/create-branch! conn "ns-test:feature2" "ns-test:main")
+
+        ;; In feature1, add a new namespace and use it
+        @(fluree/insert! conn "ns-test:feature1"
+                         {"@context" {"ex" "http://example.org/"
+                                      "custom" "http://custom.org/"}
+                          "@graph" [{"@id" "ex:bob"
+                                     "@type" "custom:Employee"
+                                     "custom:employeeId" "12345"}]})
+
+        ;; In feature2, add a different namespace and use it
+        @(fluree/insert! conn "ns-test:feature2"
+                         {"@context" {"ex" "http://example.org/"
+                                      "internal" "http://internal.org/"}
+                          "@graph" [{"@id" "ex:charlie"
+                                     "@type" "internal:Manager"
+                                     "internal:managerId" "67890"}]})
+
+        ;; Merge feature1 into main (should succeed as fast-forward)
+        (let [merge1 @(fluree/rebase! conn "ns-test:feature1" "ns-test:main")]
+          (is (= :success (:status merge1)) "First merge should succeed"))
+
+        ;; Now merge feature2 into main - this will need to handle namespace collision
+        ;; The internal:Manager namespace might get a different integer ID during rebase
+        (let [merge2 @(fluree/rebase! conn "ns-test:feature2" "ns-test:main"
+                                      {:squash? true})]
+          (is (= :success (:status merge2)) "Second merge should succeed despite namespace differences"))
+
+        ;; Verify final state has all data with correct namespaces
+        (let [main-db @(fluree/load conn "ns-test:main")
+              alice @(fluree/query main-db {"@context" {"ex" "http://example.org/"
+                                                        "schema" "http://schema.org/"}
+                                            "select" "?name"
+                                            "where" {"@id" "ex:alice"
+                                                     "schema:name" "?name"}})
+              bob @(fluree/query main-db {"@context" {"ex" "http://example.org/"
+                                                      "custom" "http://custom.org/"}
+                                          "select" "?id"
+                                          "where" {"@id" "ex:bob"
+                                                   "custom:employeeId" "?id"}})
+              charlie @(fluree/query main-db {"@context" {"ex" "http://example.org/"
+                                                          "internal" "http://internal.org/"}
+                                              "select" "?id"
+                                              "where" {"@id" "ex:charlie"
+                                                       "internal:managerId" "?id"}})]
+          (is (= ["Alice"] alice) "Alice should exist with correct name")
+          (is (= ["12345"] bob) "Bob should exist with correct employee ID")
+          (is (= ["67890"] charlie) "Charlie should exist with correct manager ID"))
+
+        (finally
+          @(fluree/disconnect conn))))))
