@@ -303,6 +303,11 @@
   (-aliases [s])
   (-finalize [s tracker error-ch solution-ch]))
 
+;; Optional extension point to allow a DB to execute an entire GRAPH clause at once
+(defprotocol GraphClauseExecutor
+  (-execute-graph-clause [db tracker solution clause error-ch]
+    "Return a channel of solutions for the entire GRAPH clause. If not implemented or returns nil, the engine will fall back to per-pattern matching."))
+
 (defn matcher?
   [x]
   (satisfies? Matcher x))
@@ -673,8 +678,13 @@
     (go
       (try*
         (when-let [graph (<? (-activate-alias ds alias))]
-          (-> (match-clause graph tracker solution clause error-ch)
-              (async/pipe res-ch)))
+          (if (satisfies? GraphClauseExecutor graph)
+            (if-let [ch (-execute-graph-clause graph tracker solution clause error-ch)]
+              (async/pipe ch res-ch)
+              (-> (match-clause graph tracker solution clause error-ch)
+                  (async/pipe res-ch)))
+            (-> (match-clause graph tracker solution clause error-ch)
+                (async/pipe res-ch))))
         (catch* e
           (log/error e "Error activating alias" alias)
           (>! error-ch (ex-info (str "Error activating alias: " alias

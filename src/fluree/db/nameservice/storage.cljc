@@ -41,17 +41,34 @@
       index-address (assoc "f:index" {"@id" index-address}))))
 
 (defmethod record->json-ld :virtual-graph
-  [{:keys [vg-name vg-type status dependencies config]}]
-  {"@context" {"f" iri/f-ns
-               "fidx" "https://ns.flur.ee/index#"}
-   "@id" vg-name
-   "@type" (cond-> ["f:VirtualGraphDatabase"]
-             vg-type (conj vg-type))
-   "f:name" vg-name
-   "f:status" (or status "ready")
-   "f:dependencies" (mapv (fn [dep] {"@id" dep}) dependencies)
-   "fidx:config" {"@type" "@json"
-                  "@value" config}})
+  [{:keys [vg-name vg-type status dependencies config engine]}]
+  (let [base-record {"@context" {"f" iri/f-ns
+                                 "fidx" "https://ns.flur.ee/index#"}
+                     "@id" vg-name
+                     "@type" (cond-> ["f:VirtualGraphDatabase"]
+                               vg-type (conj vg-type))
+                     "f:name" vg-name
+                     "f:status" (or status "ready")
+                     "f:dependencies" (when (and (not= engine :r2rml)
+                                                 (seq dependencies))
+                                        (mapv (fn [dep] (if (string? dep) {"@id" dep} dep)) dependencies))}
+        ;; Back-compat: always include opaque config blob
+        with-config (assoc base-record "fidx:config" {"@type" "@json"
+                                                      "@value" config})]
+    (case engine
+      ;; New R2RML-style schema using f:* keys
+      (:r2rml "r2rml")
+      (let [{:keys [mapping mappingInline baseIRI rdb]} config
+            rdb* (select-keys rdb [:jdbcUrl :driver :user :password :options])
+            record (cond-> (assoc with-config "f:engine" "r2rml")
+                     mapping       (assoc "f:mapping" {"@id" mapping})
+                     mappingInline (assoc "f:mappingInline" mappingInline)
+                     baseIRI       (assoc "f:baseIRI" baseIRI)
+                     (seq rdb*)    (assoc "f:rdb" rdb*))]
+        record)
+
+      ;; default (BM25 and others) keep prior structure
+      with-config)))
 
 (defn get-commit
   "Returns the minimal nameservice record."
