@@ -24,6 +24,15 @@
   [var-sym]
   (assoc unmatched ::var var-sym))
 
+(defn optional-var
+  [var-sym]
+  (-> (unmatched-var var-sym)
+      (assoc ::optional var-sym)))
+
+(defn get-optional
+  [match]
+  (::optional match))
+
 (defn match-value
   ([mch x]
    (assoc mch ::val x))
@@ -458,49 +467,68 @@
       [nil o-fn*])
     [o o-fn]))
 
-(defn resolve-flake-range
-  [{:keys [t] :as db} tracker error-ch [s-mch p-mch o-mch]]
-  (let [s    (get-sid s-mch db)
-        s-fn (::fn s-mch)
-        p    (get-sid p-mch db)
-        p-fn (::fn p-mch)
-        o    (or (get-value o-mch)
-                 (get-sid o-mch db))
-        o-fn (::fn o-mch)
-        o-dt (some->> o-mch get-datatype-iri (iri/encode-iri db))
+(defn comparable-iri?
+  "When matching against an all-iri index (s or p - SIDs), the only values that can be
+  compared are other SIDs or `nil`. Literal values are not comparable."
+  [x]
+  (or (iri/sid? x) (nil? x)))
 
-        idx         (try* (index/for-components s p o o-dt)
-                          (catch* e
-                            (log/error e "Error resolving flake range")
-                            (async/put! error-ch e)))
-        [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
-        start-flake (flake/create s p o* o-dt nil nil util/min-integer)
-        end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
-        track-fuel  (track/track-fuel! tracker error-ch)
-        subj-filter (when s-fn
-                      (filter (fn [f]
-                                (-> unmatched
-                                    (match-subject db f)
-                                    s-fn))))
-        pred-filter (when p-fn
-                      (filter (fn [f]
-                                (-> unmatched
-                                    (match-predicate db f)
-                                    p-fn))))
-        obj-filter  (when o-fn*
-                      (filter (fn [f]
-                                (-> unmatched
-                                    (match-object db f)
-                                    o-fn*))))
-        flake-xf    (->> [subj-filter pred-filter obj-filter track-fuel]
-                         (remove nil?)
-                         (apply comp))
-        opts        {:idx         idx
-                     :to-t        t
-                     :start-flake start-flake
-                     :end-flake   end-flake
-                     :flake-xf    flake-xf}]
-    (query-range/resolve-flake-slices db tracker idx error-ch opts)))
+(defn unmatched-optional-vars?
+  "A triple pattern with any match components that are empty optional vars."
+  [triple-pattern]
+  (not-empty (keep get-optional triple-pattern)))
+
+(defn resolve-flake-range
+  [{:keys [t] :as db} tracker error-ch [s-mch p-mch o-mch :as triple-pattern]]
+  (let [s    (or (get-sid s-mch db)
+                 (get-value s-mch))
+        p    (or (get-sid p-mch db)
+                 (get-value p-mch))
+        o    (or (get-sid o-mch db)
+                 (get-value o-mch))]
+    (if (or (unmatched-optional-vars? triple-pattern)
+            (not (comparable-iri? s))
+            (not (comparable-iri? p)))
+      ;; no flakes will ever match the given triple pattern
+      (async/onto-chan! (async/chan) [])
+
+      (let [s-fn (::fn s-mch)
+            p-fn (::fn p-mch)
+            o-fn (::fn o-mch)
+            o-dt (some->> o-mch get-datatype-iri (iri/encode-iri db))
+
+            idx         (try* (index/for-components s p o o-dt)
+                              (catch* e
+                                (log/error e "Error resolving flake range")
+                                (async/put! error-ch e)))
+            [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
+            start-flake (flake/create s p o* o-dt nil nil util/min-integer)
+            end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
+            track-fuel  (track/track-fuel! tracker error-ch)
+            subj-filter (when s-fn
+                          (filter (fn [f]
+                                    (-> unmatched
+                                        (match-subject db f)
+                                        s-fn))))
+            pred-filter (when p-fn
+                          (filter (fn [f]
+                                    (-> unmatched
+                                        (match-predicate db f)
+                                        p-fn))))
+            obj-filter  (when o-fn*
+                          (filter (fn [f]
+                                    (-> unmatched
+                                        (match-object db f)
+                                        o-fn*))))
+            flake-xf    (->> [subj-filter pred-filter obj-filter track-fuel]
+                             (remove nil?)
+                             (apply comp))
+            opts        {:idx         idx
+                         :to-t        t
+                         :start-flake start-flake
+                         :end-flake   end-flake
+                         :flake-xf    flake-xf}]
+        (query-range/resolve-flake-slices db tracker idx error-ch opts)))))
 
 (defn compute-sid
   [s-mch db]
@@ -784,10 +812,34 @@
                    (rf default-solution)
                    rf))))))))
 
+(defn clause-variables
+  [where]
+  (cond
+    (nil? where) #{}
+    (sequential? where) (into #{} (mapcat clause-variables) where)
+    (map? where) (if (contains? where ::var)
+                   #{(::var where)}
+                   (into #{} (mapcat clause-variables) where))))
+
+(defn assign-unmatched-optional-vars
+  "In the case where an optional clause returns no results, add all the vars of that
+  clause to the solution as optional vars. This is important if the vars are referenced
+  in subsequent patterns so that we don't erroneously consider them unmatched and
+  therefore able to match any value."
+  [solution optional-vars]
+  (reduce (fn [solution* var]
+            (update solution* var (fn [match]
+                                    (if (nil? match)
+                                      (optional-var var)
+                                      match))))
+          solution
+          optional-vars))
+
 (defmethod match-pattern :optional
   [db tracker solution pattern error-ch]
-  (let [clause (pattern-data pattern)
-        opt-ch (async/chan 2 (with-default solution))]
+  (let [clause    (pattern-data pattern)
+        solution* (assign-unmatched-optional-vars solution (clause-variables clause))
+        opt-ch    (async/chan 2 (with-default solution*))]
     (-> (match-clause db tracker solution clause error-ch)
         (async/pipe opt-ch))))
 
@@ -857,12 +909,3 @@
                              initial-solution-ch*)
        (async/pipe initial-solution-ch* out-ch))
      out-ch)))
-
-(defn bound-variables
-  [where]
-  (cond
-    (nil? where) #{}
-    (sequential? where) (into #{} (mapcat bound-variables) where)
-    (map? where) (if (contains? where ::var)
-                   #{(::var where)}
-                   (into #{} (mapcat bound-variables) where))))

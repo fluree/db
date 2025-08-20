@@ -250,7 +250,12 @@
      (load ledger-alias branch commit-catalog index-catalog commit-jsonld commit-map indexing-opts)))
   ([ledger-alias branch commit-catalog index-catalog commit-jsonld commit-map indexing-opts]
    (let [t        (-> commit-map :data :t)
-         async-db (->async-db ledger-alias branch commit-map t)]
+         ;; Ensure AsyncDB commit reflects index t when an index address exists but :t is missing
+         commit-map* (if (and (get-in commit-map [:index :address])
+                              (nil? (get-in commit-map [:index :data :t])))
+                       (assoc-in commit-map [:index :data :t] t)
+                       commit-map)
+         async-db (->async-db ledger-alias branch commit-map* t)]
      (go
        (let [db (<! (flake-db/load ledger-alias commit-catalog index-catalog branch
                                    [commit-jsonld commit-map] indexing-opts))]

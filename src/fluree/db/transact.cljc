@@ -32,9 +32,8 @@
                    (mapcat (partial remove
                                     (fn [v]
                                       ;; remove value objects unless they have type @id
-                                      (and
-                                       (some? (:value v))
-                                       (not= (:type v) const/iri-id)))))))
+                                      (and (some? (util/get-value v))
+                                           (not= (util/get-types v) const/iri-id)))))))
        not-empty))
 
 (defn expand-annotation
@@ -45,7 +44,7 @@
 
 (defn validate-annotation
   [[annotation :as expanded]]
-  (when-let [specified-id (:id annotation)]
+  (when-let [specified-id (util/get-id annotation)]
     (throw (ex-info "Commit annotation cannot specify a subject identifier."
                     {:status 400, :error :db/invalid-annotation :id specified-id})))
   (when (> (count expanded) 1)
@@ -133,8 +132,8 @@
     (assoc opts
            :commit-data-opts {:compact-fn    compact-fn
                               :compact       (fn [iri] (json-ld/compact iri compact-fn))
-                              :id-key        (json-ld/compact "@id" compact-fn)
-                              :type-key      (json-ld/compact "@type" compact-fn)
+                              :id-key        (json-ld/compact const/iri-id compact-fn)
+                              :type-key      (json-ld/compact const/iri-type compact-fn)
                               :ctx-used-atom ctx-used-atom})))
 
 (defn parse-commit-opts
@@ -271,11 +270,23 @@
        (<? (publish-commit ledger commit-jsonld))
 
        (if (track/track-txn? opts)
-         (-> write-result
-             (select-keys [:address :hash :size])
-             (assoc :ledger-id ledger-alias
-                    :t t
-                    :db db*))
+         (let [indexing-disabled? (-> ledger
+                                      (ledger/get-branch-meta branch)
+                                      :indexing-opts
+                                      :indexing-disabled)
+               index-t (commit-data/index-t commit-map)
+               novelty-size (get-in db* [:novelty :size] 0)
+               reindex-min-bytes (:reindex-min-bytes db*)
+               indexing-needed? (>= novelty-size reindex-min-bytes)]
+           (-> write-result
+               (select-keys [:address :hash :size])
+               (assoc :ledger-id ledger-alias
+                      :t t
+                      :db db*
+                      :indexing-needed indexing-needed?
+                      :index-t index-t
+                      :indexing-disabled indexing-disabled?
+                      :novelty-size novelty-size)))
          db*)))))
 
 (defn transact-ledger!

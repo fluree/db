@@ -36,13 +36,24 @@
   would looses the @type information."
   [query-results]
   (mapv
-   (fn [{q   const/iri-query
-         t-s const/iri-targetSubject
-         t-p const/iri-targetProperty :as policy}]
+   (fn [{q                 const/iri-query
+         target-subjects   const/iri-targetSubject
+         target-properties const/iri-targetProperty
+         :as               policy}]
      (cond-> policy
-       q   (assoc const/iri-query {"@value" q "@type" "@json"})
-       t-s (assoc const/iri-targetSubject  (mapv #(if (get % "@id") % {"@value" % "@type" "@json"}) (util/sequential t-s)))
-       t-p (assoc const/iri-targetProperty (mapv #(if (get % "@id") % {"@value" % "@type" "@json"}) (util/sequential t-p)))))
+       q                 (assoc const/iri-query {const/iri-value q, const/iri-type const/iri-json})
+       target-subjects   (assoc const/iri-targetSubject  (mapv (fn [subject]
+                                                                 (if (util/get-id subject)
+                                                                   subject
+                                                                   {const/iri-value subject
+                                                                    const/iri-type  const/iri-json}))
+                                                               (util/sequential target-subjects)))
+       target-properties (assoc const/iri-targetProperty (mapv (fn [property]
+                                                                 (if (util/get-id property)
+                                                                   property
+                                                                   {const/iri-value property
+                                                                    const/iri-type  const/iri-json}))
+                                                               (util/sequential target-properties)))))
    query-results))
 
 (defn wrap-class-policy
@@ -52,11 +63,11 @@
   (go
     (let [c-values  (->> classes ;; for passing in classes as query `values`
                          util/sequential
-                         (mapv (fn [c] {"@value" c
-                                        "@type"  const/iri-id})))
+                         (mapv (fn [c] {const/iri-value c
+                                        const/iri-type  const/iri-id})))
           policies  (<! (dbproto/-query db tracker {"select" {"?policy" ["*"]}
-                                                    "where"  [{"@id"   "?policy"
-                                                               "@type" "?classes"}]
+                                                    "where"  [{const/iri-id   "?policy"
+                                                               const/iri-type "?classes"}]
                                                     "values" ["?classes" c-values]}))
           policies* (if (util/exception? policies)
                       policies
@@ -92,15 +103,16 @@
   [db tracker identity policy-values]
   (go
     (let [policies  (<! (dbproto/-query db tracker {"select" {"?policy" ["*"]}
-                                                    "where"  [{"@id"                 identity
+                                                    "where"  [{const/iri-id          identity
                                                                const/iri-policyClass "?classes"}
-                                                              {"@id"   "?policy"
-                                                               "@type" "?classes"}]}))
+                                                              {const/iri-id   "?policy"
+                                                               const/iri-type "?classes"}]}))
           policies* (if (util/exception? policies)
                       policies
                       (policy-from-query policies))
 
-          policy-values* (inject-value-binding policy-values "?$identity" {"@value" identity "@type" const/iri-id})]
+          policy-values* (inject-value-binding policy-values "?$identity" {const/iri-value identity
+                                                                           const/iri-type  const/iri-id})]
       (log/trace "wrap-identity-policy - extracted policy from identity: " identity " policy: " policies*)
       (if (util/exception? policies*)
         (ex-info (str "Unable to extract policies for identity: " identity

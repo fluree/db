@@ -3,11 +3,11 @@
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 
-(deftest ^:integration filter-test
+(deftest ^:integration ^:sci filter-test
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query/filter")
+        db0 @(fluree/create conn "query/filter")
         db     @(fluree/update
-                 (fluree/db ledger)
+                 db0
                  {"@context" [test-utils/default-context
                               {:ex "http://example.org/ns/"}]
                   "insert"

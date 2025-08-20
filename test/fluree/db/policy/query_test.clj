@@ -7,11 +7,11 @@
 (deftest ^:integration property-policy-query-enforcement
   (testing "Global restrictions on properties"
     (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "policy/property-policy-query-enforcement")
+          db0 @(fluree/create conn "policy/property-policy-query-enforcement")
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           db        @(fluree/update
-                      (fluree/db ledger)
+                      db0
                       {"@context" {"ex"     "http://example.org/ns/"
                                    "schema" "http://schema.org/"
                                    "f"      "https://ns.flur.ee/ledger#"}
@@ -104,12 +104,12 @@
 (deftest ^:integration class-policy-query-enforcement
   (testing "Restrict an entire class for viewing via relationship "
     (let [conn            (test-utils/create-conn)
-          ledger          @(fluree/create conn "policy/class-policy-query-enforcement")
+          db0 @(fluree/create conn "policy/class-policy-query-enforcement")
           root-did        (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did       (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           john-did        (:id (did/private->did-map "d0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c99"))
           db              @(fluree/update
-                            (fluree/db ledger)
+                            db0
                             {"@context" {"ex"     "http://example.org/ns/"
                                          "schema" "http://schema.org/"
                                          "f"      "https://ns.flur.ee/ledger#"}
@@ -204,9 +204,9 @@
 (deftest ^:integration class-policy-default-allow
   (testing "Class policy only with default allow both true and false behavior "
     (let [conn         (test-utils/create-conn)
-          ledger       @(fluree/create conn "policy/class-policy-default-test")
+          db0 @(fluree/create conn "policy/class-policy-default-test")
           db           @(fluree/update
-                         (fluree/db ledger)
+                         db0
                          {"@context" {"ex" "http://example.org/ns/"
                                       "f"  "https://ns.flur.ee/ledger#"}
                           "insert"   [{"@id"               "ex:data-0",
@@ -395,9 +395,9 @@
 (deftest ^:integration property-policy-nil-query
   (testing "Restrict properties based on policy"
     (let [conn            (test-utils/create-conn)
-          ledger          @(fluree/create conn "policy/property-policy-nil-query")
+          db0 @(fluree/create conn "policy/property-policy-nil-query")
           db              @(fluree/update
-                            (fluree/db ledger)
+                            db0
                             {"@context" {"ex"     "http://example.org/ns/"
                                          "schema" "http://schema.org/"
                                          "f"      "https://ns.flur.ee/ledger#"}

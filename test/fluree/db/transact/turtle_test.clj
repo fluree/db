@@ -24,8 +24,8 @@
 (deftest ^:integration turtle-insert
   (testing "Successfully inserts Turtle data into a ledger"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "tx/turtle-insert")
-          db     @(fluree/insert (fluree/db ledger) turtle-sample {:format :turtle})
+          db0 @(fluree/create conn "tx/turtle-insert")
+          db     @(fluree/insert db0 turtle-sample {:format :turtle})
 
           query  {"@context" {"ex"  "http://example.org/"
                               "xsd" "http://www.w3.org/2001/XMLSchema#"}
@@ -68,8 +68,8 @@
 
   (testing "Successfully inserts and commits Turtle data into a ledger"
     (let [conn    (test-utils/create-conn)
-          _ledger @(fluree/create-with-txn conn {"ledger" "tx/turtle-insert"
-                                                 "insert" {"@id" "ex:foo" "ex:bar" 3}})
+          _db0 @(fluree/create-with-txn conn {"ledger" "tx/turtle-insert"
+                                              "insert" {"@id" "ex:foo" "ex:bar" 3}})
           db      @(fluree/insert! conn "tx/turtle-insert" turtle-sample {:format :turtle})
 
           query {"@context" {"ex"  "http://example.org/"
@@ -87,8 +87,8 @@
 (deftest ^:integration turtle-upsert
   (testing "Successfully upserts Turtle data into a ledger"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "tx/turtle-upsert")
-          db     @(fluree/insert (fluree/db ledger) turtle-sample {:format :turtle})
+          db0 @(fluree/create conn "tx/turtle-upsert")
+          db     @(fluree/insert db0 turtle-sample {:format :turtle})
           db2    @(fluree/upsert db "@prefix ex: <http://example.org/> .
                                         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
                                         ex:foo ex:name \"UPDATED Name\" ;
@@ -104,7 +104,7 @@
 
   (testing "Successfully upserts and commits Turtle data into a ledger"
     (let [conn    (test-utils/create-conn)
-          _ledger @(fluree/create conn "tx/turtle-upsert")
+          _db0 @(fluree/create conn "tx/turtle-upsert")
           _db     @(fluree/insert! conn "tx/turtle-upsert" turtle-sample {:format :turtle})
           db2     @(fluree/upsert! conn "tx/turtle-upsert" "@prefix ex: <http://example.org/> .
                                         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .

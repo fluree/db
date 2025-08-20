@@ -81,9 +81,16 @@
       (str/replace "*" "%2A")
       (str/replace "%7E" "~")))
 
+(defn encode-s3-path
+  "Encode S3 path segments individually to match S3's automatic encoding"
+  [path]
+  (let [segments (str/split path #"/")]
+    (str/join "/" (map url-encode segments))))
+
 (defn canonical-uri
   "Create canonical URI for AWS signature"
   [path]
+  ;; Path must already be encoded when passed to this function
   (str "/" path))
 
 (defn canonical-query-string
@@ -189,21 +196,25 @@
   [bucket region path]
   (str "https://" bucket ".s3." region ".amazonaws.com/" path))
 
+(declare with-retries parse-list-objects-response)
+
 (defn s3-request
   "Make an S3 REST API request"
-  [{:keys [method bucket region path headers body credentials query-params]
+  [{:keys [method bucket region path headers body credentials query-params request-timeout]
     :or {method "GET"
          headers {}}}]
   (go-try
-    (let [query-string (canonical-query-string query-params)
-          url (str (build-s3-url bucket region path)
+    (let [;; Encode path segments for both URL and signature to match S3's encoding
+          encoded-path (encode-s3-path path)
+          query-string (canonical-query-string query-params)
+          url (str (build-s3-url bucket region encoded-path)
                    (when query-string (str "?" query-string)))
           headers-with-content-type (if (and (= method "PUT") body)
                                       (assoc headers "Content-Type" "application/octet-stream")
                                       headers)
           signed-headers (sign-request
                           {:method method
-                           :path path
+                           :path encoded-path  ;; Use encoded path for signature
                            :headers headers-with-content-type
                            :payload body
                            :region region
@@ -213,46 +224,15 @@
 
           ;; Use xhttp for the actual request
           response (<? (case method
-                         "GET" (xhttp/get url {:headers signed-headers})
-                         "PUT" (xhttp/put url body {:headers signed-headers})
-                         "DELETE" (xhttp/delete url {:headers signed-headers})
+                         "GET" (xhttp/get url {:headers signed-headers
+                                               :request-timeout request-timeout})
+                         "PUT" (xhttp/put url body {:headers signed-headers
+                                                    :request-timeout request-timeout})
+                         "DELETE" (xhttp/delete url {:headers signed-headers
+                                                     :request-timeout request-timeout})
                          (throw (ex-info "Unsupported HTTP method" {:method method}))))]
 
       response)))
-
-(defn read-s3-data
-  "Read an object from S3"
-  [client path]
-  (let [{:keys [credentials bucket region prefix]} client
-        ch (async/promise-chan)
-        full-path (str prefix "/" path)]
-    (go
-      (try
-        (let [response (<? (s3-request {:method "GET"
-                                        :bucket bucket
-                                        :region region
-                                        :path full-path
-                                        :credentials credentials}))]
-          (>! ch {:Body response}))
-        (catch Exception e
-          (if (and (ex-data e) (= 404 (:status (ex-data e))))
-            (>! ch ::not-found)
-            (>! ch e)))))
-    ch))
-
-(defn write-s3-data
-  "Write an object to S3"
-  [client path data]
-  (let [{:keys [credentials bucket region prefix]} client
-        ch (async/promise-chan)
-        full-path (str prefix "/" path)]
-    (async/pipe (s3-request {:method "PUT"
-                             :bucket bucket
-                             :region region
-                             :path full-path
-                             :body data
-                             :credentials credentials})
-                ch)))
 
 (defn- tag-matches?
   "Check if an XML element's tag matches the given name, ignoring namespace"
@@ -282,27 +262,75 @@
                     :size (get-xml-text "Size" obj-content)
                     :last-modified (get-xml-text "LastModified" obj-content)}))}))
 
+(defn read-s3-data
+  "Read an object from S3"
+  [client path]
+  (let [{:keys [credentials bucket region prefix read-timeout-ms max-retries retry-base-delay-ms retry-max-delay-ms]} client
+        ch (async/promise-chan)
+        full-path (str prefix path)
+        policy {:max-retries max-retries
+                :retry-base-delay-ms retry-base-delay-ms
+                :retry-max-delay-ms retry-max-delay-ms}
+        thunk (fn []
+                (s3-request {:method "GET"
+                             :bucket bucket
+                             :region region
+                             :path full-path
+                             :credentials credentials
+                             :request-timeout read-timeout-ms}))]
+    (go
+      (try
+        (let [response (<? (with-retries thunk (assoc policy :log-context {:method "GET" :bucket bucket :path full-path})))]
+          (>! ch {:Body response}))
+        (catch Exception e
+          (if (and (ex-data e) (= 404 (:status (ex-data e))))
+            (>! ch ::not-found)
+            (>! ch e)))))
+    ch))
+
+(defn write-s3-data
+  "Write an object to S3"
+  [client path data]
+  (let [{:keys [credentials bucket region prefix write-timeout-ms max-retries retry-base-delay-ms retry-max-delay-ms]} client
+        ch (async/promise-chan)
+        full-path (str prefix path)
+        policy {:max-retries max-retries
+                :retry-base-delay-ms retry-base-delay-ms
+                :retry-max-delay-ms retry-max-delay-ms}
+        thunk (fn []
+                (s3-request {:method "PUT"
+                             :bucket bucket
+                             :region region
+                             :path full-path
+                             :body data
+                             :credentials credentials
+                             :request-timeout write-timeout-ms}))]
+    (async/pipe (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path})) ch)))
+
 (defn s3-list*
   "List objects in S3 with optional continuation token"
   ([client path]
    (s3-list* client path nil))
   ([client path continuation-token]
-   (let [{:keys [credentials bucket region prefix]} client
+   (let [{:keys [credentials bucket region prefix list-timeout-ms max-retries retry-base-delay-ms retry-max-delay-ms]} client
          ch (async/promise-chan)
-         full-path (if (empty? prefix)
-                     path
-                     (str prefix "/" path))]
+         full-path (str prefix path)]
      (go
        (try
          (let [query-params (cond-> {"list-type" "2"}
                               (not= full-path "/") (assoc "prefix" full-path)
                               continuation-token (assoc "continuation-token" continuation-token))
-               response (<? (s3-request {:method "GET"
-                                         :bucket bucket
-                                         :region region
-                                         :path ""
-                                         :credentials credentials
-                                         :query-params query-params}))
+               response (<? (with-retries (fn [] (s3-request {:method "GET"
+                                                              :bucket bucket
+                                                              :region region
+                                                              :path ""
+                                                              :credentials credentials
+                                                              :query-params query-params
+                                                              :request-timeout list-timeout-ms}))
+                              {:max-retries max-retries
+                               :retry-base-delay-ms retry-base-delay-ms
+                               :retry-max-delay-ms retry-max-delay-ms
+                               :log-context {:method "LIST" :bucket bucket :path full-path}}))
                parsed (parse-list-objects-response response)]
            (>! ch (update parsed :contents
                           (fn [contents]
@@ -325,13 +353,21 @@
     ch))
 
 (defn s3-address
-  [identifier s3-bucket s3-prefix path]
-  (storage/build-fluree-address identifier method-name path [s3-bucket s3-prefix]))
+  [identifier path]
+  (storage/build-fluree-address identifier method-name path))
 
-(defrecord S3Store [identifier credentials bucket region prefix]
+(defrecord S3Store [identifier credentials bucket region prefix
+                   ;; timeouts (ms)
+                    read-timeout-ms
+                    write-timeout-ms
+                    list-timeout-ms
+                   ;; retry policy
+                    max-retries
+                    retry-base-delay-ms
+                    retry-max-delay-ms]
   storage/Addressable
   (location [_]
-    (storage/build-location storage/fluree-namespace identifier method-name [bucket prefix]))
+    (storage/build-location storage/fluree-namespace identifier method-name))
 
   storage/Identifiable
   (identifiers [_]
@@ -360,7 +396,7 @@
           {:hash hash
            :path path
            :size (count bytes)
-           :address (s3-address identifier bucket prefix path)}))))
+           :address (s3-address identifier path)}))))
 
   storage/ByteStore
   (write-bytes [this path bytes]
@@ -377,15 +413,20 @@
   (delete [_ address]
     (go-try
       (let [path (storage/get-local-path address)
-            full-path (str prefix "/" path)]
-        (<? (s3-request {:method "DELETE"
-                         :bucket bucket
-                         :region region
-                         :path full-path
-                         :credentials credentials})))))
+            full-path (str prefix path)
+            policy {:max-retries max-retries
+                    :retry-base-delay-ms retry-base-delay-ms
+                    :retry-max-delay-ms retry-max-delay-ms}]
+        (<? (with-retries (fn [] (s3-request {:method "DELETE"
+                                              :bucket bucket
+                                              :region region
+                                              :path full-path
+                                              :credentials credentials
+                                              :request-timeout write-timeout-ms}))
+              policy)))))
 
-  storage/ListableStore
-  (list-paths [this path-prefix]
+  storage/RecursiveListableStore
+  (list-paths-recursive [this path-prefix]
     (go-try
       ;; Use existing s3-list function to list objects with the prefix
       (let [results-ch (s3-list this path-prefix)
@@ -400,17 +441,93 @@
              (filter #(str/ends-with? % ".json"))
              vec)))))
 
+(defn- jitter
+  "Adds +/- 50% jitter to a delay in ms."
+  [ms]
+  (let [delta (max 1 (long (* 0.5 ms)))
+        low (- ms delta)
+        high (+ ms delta)]
+    (+ low (rand-int (inc (- high low))))))
+
+(defn- retryable-error?
+  [e]
+  (let [data (ex-data e)
+        status (:status data)
+        err (:error data)]
+    (or (= err :xhttp/timeout)
+        (nil? status)
+        (= status 429)
+        (= status 500)
+        (= status 502)
+        (= status 503)
+        (= status 504))))
+
+(defn- with-retries
+  "Runs thunk returning a channel; retries on retryable errors with backoff/jitter.
+  policy may include :log-context with keys like {:method :bucket :path}"
+  [thunk {:keys [max-retries retry-base-delay-ms retry-max-delay-ms log-context] :as _policy}]
+  (let [out (async/promise-chan)]
+    (go-loop [attempt 0]
+      (let [start (System/nanoTime)
+            res (<! (thunk))
+            duration-ms (long (/ (- (System/nanoTime) start) 1000000))]
+        (if (instance? Throwable res)
+          (if (and (< attempt max-retries) (retryable-error? res))
+            (let [delay (min (* retry-base-delay-ms (long (Math/pow 2 attempt))) retry-max-delay-ms)
+                  wait-ms (jitter delay)
+                  data (merge {:event "s3.retry"
+                               :attempt attempt
+                               :wait-ms wait-ms
+                               :duration-ms duration-ms
+                               :error (ex-message res)}
+                              (ex-data res)
+                              log-context)]
+              (log/warn "S3 request failed, retrying" data)
+              (<! (async/timeout wait-ms))
+              (recur (inc attempt)))
+            (let [data (merge {:event "s3.error"
+                               :attempt attempt
+                               :duration-ms duration-ms
+                               :error (ex-message res)}
+                              (ex-data res)
+                              log-context)]
+              (log/error "S3 request failed permanently" data)
+              (>! out res)))
+          (do
+            (when (pos? attempt)
+              (log/info "S3 request succeeded after retries"
+                        (merge {:event "s3.success-after-retry"
+                                :attempts (inc attempt)
+                                :duration-ms duration-ms}
+                               log-context)))
+            (>! out res)))))
+    out))
+
 (defn open
   "Open an S3 store using direct HTTP implementation"
   ([bucket prefix]
    (open nil bucket prefix))
   ([identifier bucket prefix]
-   (open identifier bucket prefix nil))
+   (open identifier bucket prefix nil nil))
   ([identifier bucket prefix endpoint-override]
+   (open identifier bucket prefix endpoint-override nil))
+  ([identifier bucket prefix endpoint-override {:keys [read-timeout-ms write-timeout-ms list-timeout-ms
+                                                       max-retries retry-base-delay-ms retry-max-delay-ms]}]
    (let [region (or (System/getenv "AWS_REGION")
                     (System/getenv "AWS_DEFAULT_REGION")
                     "us-east-1")
-         credentials (get-credentials)]
+         credentials (get-credentials)
+         ;; Normalize prefix to always end with / (unless empty)
+         normalized-prefix (when (and prefix (not (str/blank? prefix)))
+                             (if (str/ends-with? prefix "/")
+                               prefix
+                               (str prefix "/")))
+         read-timeout-ms* (or read-timeout-ms 20000)
+         write-timeout-ms* (or write-timeout-ms 60000)
+         list-timeout-ms* (or list-timeout-ms 20000)
+         max-retries* (or max-retries 4)
+         retry-base-delay-ms* (or retry-base-delay-ms 150)
+         retry-max-delay-ms* (or retry-max-delay-ms 2000)]
      (when-not credentials
        (throw (ex-info "AWS credentials not found"
                        {:error :s3/missing-credentials
@@ -418,4 +535,6 @@
      ;; Note: endpoint-override can be handled via with-redefs of build-s3-url in tests
      (when endpoint-override
        (log/warn "endpoint-override provided - can be handled via with-redefs of build-s3-url in tests"))
-     (->S3Store identifier credentials bucket region prefix))))
+     (->S3Store identifier credentials bucket region normalized-prefix
+                read-timeout-ms* write-timeout-ms* list-timeout-ms*
+                max-retries* retry-base-delay-ms* retry-max-delay-ms*))))

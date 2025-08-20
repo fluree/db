@@ -82,8 +82,6 @@
                      result
                      [@db-vol result]))))))
 
-;; Virtual graphs are now created through the nameservice API, not transactions
-
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."

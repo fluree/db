@@ -249,8 +249,7 @@
 
 (defn get-types
   [jsonld]
-  (or (:type jsonld)
-      (get jsonld "@type")))
+  (get jsonld "@type"))
 
 (defn of-type?
   "Returns true if the provided json-ld node is of the provided type."
@@ -262,14 +261,20 @@
 (defn get-value
   [val]
   (if (map? val)
-    (or (:value val)
-        (get val "@value"))
+    (get val "@value")
     val))
+
+(defn get-list
+  [v-map]
+  (get v-map "@list"))
+
+(defn get-lang
+  [v-map]
+  (get v-map "@language"))
 
 (defn get-datatype
   [node]
-  (when (or (contains? node :value)
-            (contains? node "@value"))
+  (when (contains? node "@value")
     (get-types node)))
 
 (defn get-first-value
@@ -284,8 +289,7 @@
 
 (defn get-id
   [jsonld]
-  (or (:id jsonld)
-      (get jsonld "@id")))
+  (get jsonld "@id"))
 
 (defn get-first-id
   [jsonld k]
@@ -317,8 +321,7 @@
                     (first vals)
                     vals)
         list-vals (when (map? first-val)
-                    (or (:list first-val)
-                        (get first-val "@list")))]
+                    (get first-val "@list"))]
     (or list-vals
         vals)))
 
@@ -335,7 +338,6 @@
 
 (defn get-graph
   [jsonld]
-  (cond
-    (contains? jsonld :graph)   (:graph jsonld)
-    (contains? jsonld "@graph") (get jsonld "@graph")
-    :else                       jsonld))
+  (if (contains? jsonld "@graph")
+    (get jsonld "@graph")
+    jsonld))
