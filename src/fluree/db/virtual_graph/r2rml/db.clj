@@ -36,24 +36,54 @@
     (let [[p local] (str/split qname #":" 2)]
       (str (get prefixes p "") local))))
 
-(defn- parse-min-r2rml
-  [mapping-path]
-  (let [content (slurp mapping-path)
-        prefixes (parse-prefixes content)
-        tbl (some-> (re-find #"rr:tableName\s+\"([^\"]+)\"" content) second)
+(defn- parse-triples-map
+  [content prefixes]
+  (let [tbl (some-> (re-find #"rr:tableName\s+\"([^\"]+)\"" content) second)
         template (some-> (re-find #"rr:subjectMap\s*\[\s*rr:template\s+\"([^\"]+)\"" content) second)
-        pom-matches (re-seq #"rr:predicateObjectMap\s*\[([^\]]+)\]" content)
-        preds (->> pom-matches
+        pom-blocks (re-seq #"rr:predicateObjectMap\s*\[([^\]]+)\]" content)
+        preds (->> pom-blocks
                    (map second)
                    (keep (fn [blk]
                            (when-let [pred (or (some-> (re-find #"rr:predicate\s+([^;\s]+)\s*;" blk) second)
                                                (some-> (re-find #"rr:predicate\s+([^;\s]+)" blk) second))]
-                             (when-let [col (some-> (re-find #"rr:objectMap\s*\[\s*rr:column\s+\"([^\"]+)\"" blk) second)]
-                               [(expand-qname prefixes pred) {:column col}]))))
+                             (let [col (some-> (re-find #"rr:objectMap\s*\[\s*rr:column\s+\"([^\"]+)\"" blk) second)
+                                   obj-template (some-> (re-find #"rr:objectMap\s*\[\s*rr:template\s+\"([^\"]+)\"" blk) second)
+                                   datatype (some-> (re-find #"rr:datatype\s+([^;\s]+)\s*;" blk) second)]
+                               (when (or col obj-template)
+                                 (let [pred-iri (expand-qname prefixes pred)
+                                       obj-map (cond-> {}
+                                                 col (assoc :column col)
+                                                 obj-template (assoc :template obj-template)
+                                                 datatype (assoc :datatype (expand-qname prefixes datatype)))]
+                                   [pred-iri obj-map]))))))
                    (into {}))]
     {:table tbl
      :subject-template template
      :predicates preds}))
+
+(defn- parse-min-r2rml
+  [mapping-path]
+  (let [content (slurp mapping-path)
+        prefixes (parse-prefixes content)]
+    ;; Find all triples maps by looking for the pattern
+    (let [triples-map-pattern #"([a-zA-Z][\w\-]*:[\w\-]+)\s+a\s+rr:TriplesMap\s*;"
+          matches (re-seq triples-map-pattern content)]
+      (if (seq matches)
+        (let [result (into {}
+                           (for [[_ map-name] matches]
+                             (let [start-pattern (re-pattern (str "\\Q" map-name "\\E\\s+a\\s+rr:TriplesMap\\s*;"))
+                                   start-match (re-find start-pattern content)
+                                   start-pos (str/index-of content start-match)
+                                  ;; Find the end by looking for the period that ends this triples map
+                                   remaining-content (subs content start-pos)
+                                  ;; Look for the period that ends this triples map (after all predicate-object maps)
+                                   end-pos (str/index-of remaining-content " .\n")
+                                   map-content (if end-pos
+                                                 (subs remaining-content 0 (+ end-pos 3)) ; Include the " .\n"
+                                                 remaining-content)]
+                               [map-name (parse-triples-map map-content prefixes)])))]
+          result)
+        {}))))
 
 (defn- clause->sparql
   "Very minimal conversion from a where clause vector of triples into a SPARQL BGP string."
@@ -99,17 +129,76 @@
           solution
           row))
 
+(defn- find-mapping-for-predicate
+  [mappings predicate]
+  (some (fn [[_ mapping]]
+          (when (get-in mapping [:predicates predicate])
+            mapping))
+        mappings))
+
+(defn- analyze-clause-for-mapping
+  "Analyze the clause to determine which mapping(s) to use based on predicates."
+  [clause mappings]
+  (if (empty? mappings)
+    nil
+    (let [;; Extract predicates from the clause - the clause is a list of triples [s p o]
+          ;; where predicate is a map with :fluree.db.query.exec.where/iri key
+          predicate-maps (filter map? (map second clause))
+          predicates (->> predicate-maps
+                          (map :fluree.db.query.exec.where/iri) ; Extract the IRI using the correct namespaced key
+                          (set))
+          relevant-mappings (->> mappings
+                                 (filter (fn [[_ mapping]]
+                                           (some (fn [pred] (get-in mapping [:predicates pred])) predicates)))
+                                 (map second))]
+      (if (seq relevant-mappings)
+        (first relevant-mappings)
+        (first (vals mappings))))))
+
 (defn- sql-for-mapping
-  [{:keys [table subject-template predicates]}]
-  (let [id-col (or (some->> (extract-template-cols subject-template) first)
-                   "ID")
-        select-cols (->> predicates
-                         (map (fn [[pred {:keys [column]}]]
-                                (let [alias (-> pred (str/split #"/") last)]
-                                  (str column " AS " alias))))
-                         (cons (str id-col " AS id"))
-                         (str/join ", "))]
-    (format "SELECT %s FROM %s" select-cols table)))
+  [mapping]
+  (if (nil? mapping)
+    "SELECT 1 WHERE 1=0" ; Return no results if no mapping
+    (let [table (:table mapping)
+          predicates (:predicates mapping)
+          id-col (or (some->> (extract-template-cols (:subject-template mapping)) first)
+                     "id")
+          select-cols (->> predicates
+                           (filter (fn [[_ {:keys [column template]}]]
+                                     (or column template))) ; Only include predicates with column or template
+                           (map (fn [[pred {:keys [column template]}]]
+                                  (if column
+                                    (let [alias (-> pred (str/split #"/") last)]
+                                      (str column " AS " alias))
+                                    (when template
+                                      (let [alias (-> pred (str/split #"/") last)]
+                                        (str "NULL AS " alias)))))) ; Use NULL for template-based predicates
+                           (remove nil?)
+                           (cons (str id-col " AS id"))
+                           (str/join ", "))]
+      (format "SELECT %s FROM %s" select-cols table))))
+
+(defn- sql-for-predicates
+  [mappings predicates]
+  (let [table-mappings (->> predicates
+                            (map (fn [pred] (find-mapping-for-predicate mappings pred)))
+                            (remove nil?)
+                            (group-by :table))
+        sqls (->> table-mappings
+                  (map (fn [[table table-maps]]
+                         (let [table-map (first table-maps)
+                               relevant-preds (->> predicates
+                                                   (filter (fn [pred]
+                                                             (get-in table-map [:predicates pred]))))
+                               select-cols (->> relevant-preds
+                                                (map (fn [pred]
+                                                       (let [{:keys [column]} (get-in table-map [:predicates pred])
+                                                             alias (-> pred (str/split #"/") last)]
+                                                         (str column " AS " alias))))
+                                                (str/join ", "))]
+                           (format "SELECT %s FROM %s" select-cols table))))
+                  (str/join " UNION ALL "))]
+    sqls))
 
 (defrecord R2RMLDatabase [alias config mapping-spec datasource]
   vg/UpdatableVirtualGraph
@@ -133,7 +222,7 @@
     solution-ch)
 
   where/GraphClauseExecutor
-  (-execute-graph-clause [_ _tracker solution _clause error-ch]
+  (-execute-graph-clause [_ _tracker solution clause error-ch]
     (let [out (async/chan 1)]
       (async/thread
         (try
@@ -141,10 +230,20 @@
                 rdb (or (:rdb cfg) (get cfg "rdb"))
                 db-spec (jdbc-spec rdb)
                 mapping-file (or (:mapping cfg) (get cfg "mapping") (:mapping mapping-spec) (get mapping-spec "mapping"))
-                mapping (parse-min-r2rml mapping-file)
+                mappings (parse-min-r2rml mapping-file)
+                ;; Analyze clause to determine which mapping to use
+                mapping (analyze-clause-for-mapping clause mappings)
                 sql (sql-for-mapping mapping)
                 rows (jdbc/query db-spec [sql])
-                template (:subject-template mapping)]
+                template (:subject-template mapping)
+                ;; Extract variable mappings from clause: [s p o] where p is predicate and o is variable
+                var-mappings (->> clause
+                                  (map (fn [[s p o]]
+                                         (when (and (map? p) (map? o))
+                                           [(get p :fluree.db.query.exec.where/iri)
+                                            (get o :fluree.db.query.exec.where/var)])))
+                                  (remove nil?)
+                                  (into {}))]
             (doseq [row rows]
               (let [id    (or (:id row) (get row :ID) (get row "ID"))
                     s-iri (when (and template id)
@@ -154,12 +253,13 @@
                                                     (where/match-iri s-iri)))
                             solution)
                     sol2  (reduce (fn [acc [pred {:keys [column]}]]
-                                    (let [alias (-> pred (str/split #"/") last)
+                                    (let [var-sym (get var-mappings pred)
+                                          alias (-> pred (str/split #"/") last)
                                           v (or (get row (keyword (str/lower-case alias)))
                                                 (get row (keyword alias))
                                                 (get row alias))]
-                                      (if (some? v)
-                                        (assoc acc (symbol (str "?" alias)) (where/match-value (where/unmatched-var (symbol (str "?" alias))) v))
+                                      (if (and (some? v) var-sym)
+                                        (assoc acc var-sym (where/match-value (where/unmatched-var var-sym) v))
                                         acc)))
                                   sol1
                                   (:predicates mapping))]
@@ -179,5 +279,3 @@
                          :config cfg
                          :mapping-spec (select-keys cfg [:mapping :mappingInline :baseIRI "mapping" "mappingInline" "baseIRI"])
                          :datasource nil})))
-
-
