@@ -15,6 +15,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.flake-db :as flake-db]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
@@ -222,82 +223,123 @@
 
 (defn- compute-net-flakes
   "Computes net effect of all source commits.
-  Returns flakes representing the combined changes."
+  Returns [flakes updated-target-db] where updated-target-db has the necessary namespace mappings."
   [conn target-db source-commits]
   (go-try
-    ;; Track current values at each [s,p,dt] spot as we process commits
-    (loop [spot->values {}  ; Map of [s p dt] -> set of object values
-           commits source-commits]
-      (if-let [commit (first commits)]
-        (let [data (<? (read-commit-data conn commit target-db))
-              rems (:retracted data)
-              adds (:asserted data)
-              spot-key (fn [f] [(flake/s f) (flake/p f) (flake/dt f)])
-              ;; Apply retractions - remove values from spots
-              spot->values* (reduce (fn [m f]
-                                      (let [spot (spot-key f)
-                                            val (flake/o f)]
-                                        (update m spot (fnil disj #{}) val)))
-                                    spot->values
-                                    (or rems []))
-              ;; Apply additions - add values to spots  
-              spot->values** (reduce (fn [m f]
-                                       (let [spot (spot-key f)
-                                             val (flake/o f)]
-                                         (update m spot (fnil conj #{}) val)))
-                                     spot->values*
-                                     (or adds []))]
-          (recur spot->values** (rest commits)))
-        ;; Now we have the net state - generate flakes
-        ;; If there are no net changes, return empty
-        (if (empty? spot->values)
-          (flake/sorted-set-by flake/cmp-flakes-spot)
-          ;; We need both assertions for new values AND retractions for existing values
-          ;; that aren't in the final state
-          (let [;; Get existing values from target database for changed spots
-                ;; Use try-catch to handle potential index issues
-                root-db (policy/root target-db)
-                existing-values (try*
-                                  (loop [existing {}
-                                         spots (keys spot->values)]
-                                    (if-let [[s p dt] (first spots)]
-                                      (let [current (try*
-                                                      (<? (query-range/index-range root-db nil :spot = [s p]
-                                                                                   {:flake-xf (comp
-                                                                                               (filter #(= (flake/dt %) dt))
-                                                                                               (map flake/o))}))
-                                                      (catch* e
-                                                        (log/warn "Failed to query existing values for spot" [s p dt]
-                                                                  "- assuming no existing values" (ex-message e))
-                                                        []))]
-                                        (recur (if (seq current)
-                                                 (assoc existing [s p dt] (set current))
-                                                 existing)
-                                               (rest spots)))
-                                      existing))
-                                  (catch* e
-                                    (log/warn "Failed to query existing values, assuming empty" (ex-message e))
-                                    {}))
-                ;; Generate retractions for existing values not in final state
-                ;; and assertions for new values
-                all-flakes (reduce-kv
-                            (fn [flakes spot final-values]
-                              (let [existing-vals (get existing-values spot #{})
-                                    final-vals-set (set final-values)
-                                    to-retract (clojure.set/difference existing-vals final-vals-set)
-                                    to-add final-vals-set
-                                    [s p dt] spot]
-                                (into flakes
-                                      (concat
-                                      ;; Retractions for values that exist but shouldn't
-                                       (map (fn [o] (flake/create s p o dt 0 false nil))
-                                            to-retract)
-                                      ;; Assertions for final values
-                                       (map (fn [o] (flake/create s p o dt 0 true nil))
-                                            to-add)))))
-                            []
-                            spot->values)]
-            (into (flake/sorted-set-by flake/cmp-flakes-spot) all-flakes)))))))
+    ;; Ensure we have a synchronous db
+    (let [target-db-sync (if (async-db/db? target-db)
+                           (<? (async-db/deref-async target-db))
+                           target-db)
+          ;; First, collect ALL namespaces from all source commits
+          all-namespaces (loop [namespaces #{}
+                                commits source-commits]
+                           (if-let [commit (first commits)]
+                             (let [commit-catalog (:commit-catalog conn)
+                                   data-address (get-in commit [:data :address])
+                                   data-jsonld (when data-address
+                                                 (<? (commit-storage/read-data-jsonld commit-catalog data-address)))
+                                   commit-nses-raw (get data-jsonld const/iri-namespaces)
+                                   commit-nses (when (seq commit-nses-raw)
+                                                 (mapv :value commit-nses-raw))]
+                               (recur (into namespaces commit-nses) (rest commits)))
+                             namespaces))
+          ;; Prepare target-db with all necessary namespaces
+          target-db-prepared (cond-> target-db-sync
+                               (not (map? (:namespaces target-db-sync)))
+                               (assoc :namespaces {})
+
+                               (not (:max-namespace-code target-db-sync))
+                               (assoc :max-namespace-code
+                                      (or (and (:namespace-codes target-db-sync)
+                                               (iri/get-max-namespace-code (:namespace-codes target-db-sync)))
+                                          100)))
+          ;; Add all source namespaces to target-db at once
+          target-db-with-ns (if (seq all-namespaces)
+                              (flake-db/with-namespaces target-db-prepared all-namespaces)
+                              target-db-prepared)]
+
+      ;; Process commits and compute net flakes using the prepared target-db
+      (loop [spot->values {}  ; Map of [s p dt] -> set of object values
+             commits source-commits]
+        (if-let [commit (first commits)]
+          (let [commit-catalog (:commit-catalog conn)
+                data-address (get-in commit [:data :address])
+                data-jsonld (when data-address
+                              (<? (commit-storage/read-data-jsonld commit-catalog data-address)))
+                assert-data (get data-jsonld const/iri-assert)
+                retract-data (get data-jsonld const/iri-retract)
+                t (get-in commit [:data :t])
+                ;; Use the target-db-with-ns to create flakes with correct namespace mappings
+                asserted-flakes (when assert-data
+                                  (flake-db/create-flakes true target-db-with-ns t assert-data))
+                retracted-flakes (when retract-data
+                                   (flake-db/create-flakes false target-db-with-ns t retract-data))
+                spot-key (fn [f] [(flake/s f) (flake/p f) (flake/dt f)])
+                ;; Apply retractions - remove values from spots
+                spot->values* (reduce (fn [m f]
+                                        (let [spot (spot-key f)
+                                              val (flake/o f)]
+                                          (update m spot (fnil disj #{}) val)))
+                                      spot->values
+                                      (or retracted-flakes []))
+                ;; Apply additions - add values to spots  
+                spot->values** (reduce (fn [m f]
+                                         (let [spot (spot-key f)
+                                               val (flake/o f)]
+                                           (update m spot (fnil conj #{}) val)))
+                                       spot->values*
+                                       (or asserted-flakes []))]
+            (recur spot->values** (rest commits)))
+          ;; Now we have the net state - generate flakes
+          ;; If there are no net changes, return empty
+          (if (empty? spot->values)
+            [(flake/sorted-set-by flake/cmp-flakes-spot) target-db-with-ns]
+            ;; We need both assertions for new values AND retractions for existing values
+            ;; that aren't in the final state
+            (let [;; Get existing values from target database for changed spots
+                  ;; Use try-catch to handle potential index issues
+                  root-db (policy/root target-db-with-ns)
+                  existing-values (try*
+                                    (loop [existing {}
+                                           spots (keys spot->values)]
+                                      (if-let [[s p dt] (first spots)]
+                                        (let [current (try*
+                                                        (<? (query-range/index-range root-db nil :spot = [s p]
+                                                                                     {:flake-xf (comp
+                                                                                                 (filter #(= (flake/dt %) dt))
+                                                                                                 (map flake/o))}))
+                                                        (catch* e
+                                                          (log/warn "Failed to query existing values for spot" [s p dt]
+                                                                    "- assuming no existing values" (ex-message e))
+                                                          []))]
+                                          (recur (if (seq current)
+                                                   (assoc existing [s p dt] (set current))
+                                                   existing)
+                                                 (rest spots)))
+                                        existing))
+                                    (catch* e
+                                      (log/warn "Failed to query existing values, assuming empty" (ex-message e))
+                                      {}))
+                  ;; Generate retractions for existing values not in final state
+                  ;; and assertions for new values
+                  all-flakes (reduce-kv
+                              (fn [flakes spot final-values]
+                                (let [existing-vals (get existing-values spot #{})
+                                      final-vals-set (set final-values)
+                                      to-retract (clojure.set/difference existing-vals final-vals-set)
+                                      to-add final-vals-set
+                                      [s p dt] spot]
+                                  (into flakes
+                                        (concat
+                                        ;; Retractions for values that exist but shouldn't
+                                         (map (fn [o] (flake/create s p o dt 0 false nil))
+                                              to-retract)
+                                        ;; Assertions for final values
+                                         (map (fn [o] (flake/create s p o dt 0 true nil))
+                                              to-add)))))
+                              []
+                              spot->values)]
+              [(into (flake/sorted-set-by flake/cmp-flakes-spot) all-flakes) target-db-with-ns])))))))
 
 (defn- get-changed-spots
   "Returns set of [s p dt] tuples for changed flakes."
@@ -494,10 +536,10 @@
           ;; Check if we need to look for conflicts
           check-conflicts? (seq target-commits)
           ;; Compute net flakes across all commits (oldest -> newest)
-          source-novelty (<? (compute-net-flakes conn target-db source-commits))
+          [source-novelty updated-target-db] (<? (compute-net-flakes conn target-db source-commits))
           ;; Only compute target novelty if there are target commits
-          target-novelty (when check-conflicts?
-                           (<? (compute-net-flakes conn target-db target-commits)))
+          [target-novelty _] (when check-conflicts?
+                               (<? (compute-net-flakes conn updated-target-db target-commits)))
           s-spots (get-changed-spots source-novelty)
           t-spots (when target-novelty (get-changed-spots target-novelty))
           conflict-spots (when (and s-spots t-spots)
@@ -510,9 +552,9 @@
                            (assoc opts :ff-mode false))
         (let [net-flakes (seq source-novelty)
               final-db (if net-flakes
-                         (<? (stage-flakes target-db net-flakes {:message (:message opts)
-                                                                 :author "system/merge"}))
-                         target-db)
+                         (<? (stage-flakes updated-target-db net-flakes {:message (:message opts)
+                                                                         :author "system/merge"}))
+                         updated-target-db)
               _ (log/info "squash-rebase!: staging-net-flakes count=" (count (or net-flakes [])))
               new-commit-sha (when net-flakes
                                (<? (commit-if-changed target-ledger target-db final-db from-spec opts)))
