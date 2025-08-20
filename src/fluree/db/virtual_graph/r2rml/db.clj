@@ -17,10 +17,46 @@
         (second m)))
     (catch Throwable _ nil)))
 
+(defn- extract-template-cols
+  [template]
+  (when template
+    (->> (re-seq #"\{([^}]+)\}" template)
+         (map (fn [[_ c]] c))
+         (vec))))
+
+(defn- parse-prefixes
+  [content]
+  (->> (re-seq #"@prefix\s+([a-zA-Z][\w\-]*)\:\s*<([^>]+)>\s*\." content)
+       (reduce (fn [acc [_ p iri]] (assoc acc (str p) iri)) {})))
+
+(defn- expand-qname
+  [prefixes qname]
+  (if (str/starts-with? qname "<")
+    (subs qname 1 (dec (count qname)))
+    (let [[p local] (str/split qname #":" 2)]
+      (str (get prefixes p "") local))))
+
+(defn- parse-min-r2rml
+  [mapping-path]
+  (let [content (slurp mapping-path)
+        prefixes (parse-prefixes content)
+        tbl (some-> (re-find #"rr:tableName\s+\"([^\"]+)\"" content) second)
+        template (some-> (re-find #"rr:subjectMap\s*\[\s*rr:template\s+\"([^\"]+)\"" content) second)
+        pom-matches (re-seq #"rr:predicateObjectMap\s*\[([^\]]+)\]" content)
+        preds (->> pom-matches
+                   (map second)
+                   (keep (fn [blk]
+                           (when-let [pred (or (some-> (re-find #"rr:predicate\s+([^;\s]+)\s*;" blk) second)
+                                               (some-> (re-find #"rr:predicate\s+([^;\s]+)" blk) second))]
+                             (when-let [col (some-> (re-find #"rr:objectMap\s*\[\s*rr:column\s+\"([^\"]+)\"" blk) second)]
+                               [(expand-qname prefixes pred) {:column col}]))))
+                   (into {}))]
+    {:table tbl
+     :subject-template template
+     :predicates preds}))
+
 (defn- clause->sparql
-  "Very minimal conversion from a where clause vector of triples into a SPARQL BGP string.
-   This is a placeholder; we will wire a proper FQL->SPARQL translator for the subgraph.
-   Assumes `clause` is a vector of :tuple patterns already assigned matched vars."
+  "Very minimal conversion from a where clause vector of triples into a SPARQL BGP string."
   [clause]
   (let [triple->s (fn [[s p o]]
                     (let [fmt (fn [m]
@@ -32,8 +68,6 @@
     (->> clause (map triple->s) (str/join "\n"))))
 
 (defn- solution->bindings
-  "Build solution-bindings map for pushdown from currently bound variables.
-   Returns a map of var-name (with leading ?) -> vector of bound values as SPARQL terms (simple strings)."
   [solution]
   (->> solution
        (map (fn [[k v]]
@@ -57,8 +91,6 @@
       password (assoc :password password))))
 
 (defn- row->solution
-  "Convert a SQL row map into a Fluree where solution extending base `solution`.
-   Treats values as plain literals for now."
   [solution row]
   (reduce (fn [sol [k v]]
             (let [k-str (name k)
@@ -66,6 +98,18 @@
               (assoc sol var-sym (where/match-value where/unmatched v))))
           solution
           row))
+
+(defn- sql-for-mapping
+  [{:keys [table subject-template predicates]}]
+  (let [id-col (or (some->> (extract-template-cols subject-template) first)
+                   "ID")
+        select-cols (->> predicates
+                         (map (fn [[pred {:keys [column]}]]
+                                (let [alias (-> pred (str/split #"/") last)]
+                                  (str column " AS " alias))))
+                         (cons (str id-col " AS id"))
+                         (str/join ", "))]
+    (format "SELECT %s FROM %s" select-cols table)))
 
 (defrecord R2RMLDatabase [alias config mapping-spec datasource]
   vg/UpdatableVirtualGraph
@@ -94,26 +138,31 @@
       (async/thread
         (try
           (let [cfg config
-                _ (when (and (nil? (:mapping cfg)) (nil? (get cfg "mapping")))
-                    (log/debug "R2RML mapping not found in config; proceeding with minimal SQL builder for test"))
                 rdb (or (:rdb cfg) (get cfg "rdb"))
                 db-spec (jdbc-spec rdb)
                 mapping-file (or (:mapping cfg) (get cfg "mapping") (:mapping mapping-spec) (get mapping-spec "mapping"))
-                subject-template (read-subject-template mapping-file)
-                rows (jdbc/query db-spec ["SELECT ID AS id, NAME AS name FROM PEOPLE"])]
-            (log/info "R2RML minimal query returned rows:" (count rows) (when (seq rows) (first rows)))
+                mapping (parse-min-r2rml mapping-file)
+                sql (sql-for-mapping mapping)
+                rows (jdbc/query db-spec [sql])
+                template (:subject-template mapping)]
             (doseq [row rows]
               (let [id    (or (:id row) (get row :ID) (get row "ID"))
-                    nm    (or (:name row) (get row :NAME) (get row "NAME"))
-                    s-iri (when (and subject-template id)
-                            (str/replace subject-template "{ID}" (str id)))
+                    s-iri (when (and template id)
+                            (str/replace template (re-pattern (str "\\{" (or (some-> (extract-template-cols template) first) "ID") "\\}")) (str id)))
                     sol1  (if s-iri
                             (assoc solution '?s (-> (where/unmatched-var '?s)
                                                     (where/match-iri s-iri)))
                             solution)
-                    sol2  (if (some? nm)
-                            (assoc sol1 '?name (where/match-value (where/unmatched-var '?name) nm))
-                            sol1)]
+                    sol2  (reduce (fn [acc [pred {:keys [column]}]]
+                                    (let [alias (-> pred (str/split #"/") last)
+                                          v (or (get row (keyword (str/lower-case alias)))
+                                                (get row (keyword alias))
+                                                (get row alias))]
+                                      (if (some? v)
+                                        (assoc acc (symbol (str "?" alias)) (where/match-value (where/unmatched-var (symbol (str "?" alias))) v))
+                                        acc)))
+                                  sol1
+                                  (:predicates mapping))]
                 (async/>!! out sol2)))
             (async/close! out))
           (catch Throwable e
@@ -123,8 +172,6 @@
       out)))
 
 (defn ->R2RMLDatabase
-  "Constructs an R2RMLDatabase from vg-opts.
-   Accepts both stored {:config {...}} and flattened keys (as vg-opts is built in nameservice-loader)."
   [{:keys [alias config] :as vg-opts}]
   (let [cfg (or config
                 (select-keys vg-opts [:mapping :mappingInline :rdb :baseIRI "mapping" "mappingInline" "rdb" "baseIRI"]))]
