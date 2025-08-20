@@ -161,9 +161,9 @@
 (deftest ^:integration vector-search-with-limit
   (testing "Vector search with sorting and limit"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "vector-search-limit")
+          db0    @(fluree/create conn "vector-search-limit")
           db     @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
                     [{"@id"     "ex:homer"
@@ -209,9 +209,9 @@
 (deftest ^:integration vector-search-multi-targets
   (testing "Vector search with multiple target vectors using values"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "vector-search-multi-targets")
+          db0    @(fluree/create conn "vector-search-multi-targets")
           db     @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
                     [{"@id"     "ex:homer"

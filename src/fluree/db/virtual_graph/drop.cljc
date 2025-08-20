@@ -14,8 +14,8 @@
           vg-path (str "virtual-graphs/" vg-name "/")]
       (log/debug "Dropping VG artifacts for" vg-name "at path" vg-path)
       ;; List all files under the VG directory
-      (if (satisfies? storage/ListableStore storage)
-        (let [vg-files (<? (storage/list-paths storage vg-path))]
+      (if (satisfies? storage/RecursiveListableStore storage)
+        (let [vg-files (<? (storage/list-paths-recursive storage vg-path))]
           (log/debug "Found" (count vg-files) "VG files to delete")
           ;; Delete each file
           (doseq [file-path vg-files]
