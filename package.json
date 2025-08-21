@@ -1,6 +1,7 @@
 {
   "dependencies": {
     "@cljs-oss/module-deps": "^1.1.1",
+    "@fluree/sjcl": "^1.0.8-3",
     "@js-joda/core": "3.2.0",
     "@noble/ed25519": "2.3.0",
     "@noble/hashes": "1.8.0",
@@ -8,7 +9,9 @@
     "axios": "^1.5.1",
     "bufferutil": "^4.0.7",
     "form-data": "^4.0.0",
+    "js-sha3": "0.9.3",
     "jsonld": "8.3.3",
+    "scrypt-js": "3.0.1",
     "seedrandom": "^3.0.5",
     "source-map-support": "^0.5.21",
     "utf-8-validate": "^6.0.3",
