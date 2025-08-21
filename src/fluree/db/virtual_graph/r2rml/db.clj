@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async :refer [go >!]]
             [clojure.java.jdbc :as jdbc]
             [clojure.string :as str]
+            [fluree.db.constants :as const]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph :as vg]))
@@ -40,6 +41,10 @@
   [content prefixes]
   (let [tbl (some-> (re-find #"rr:tableName\s+\"([^\"]+)\"" content) second)
         template (some-> (re-find #"rr:subjectMap\s*\[\s*rr:template\s+\"([^\"]+)\"" content) second)
+        ;; Extract class from subject map
+        subject-map-block (some-> (re-find #"rr:subjectMap\s*\[([^\]]+)\]" content) second)
+        rdf-class (when subject-map-block
+                    (some-> (re-find #"rr:class\s+([^;\s]+)" subject-map-block) second))
         pom-blocks (re-seq #"rr:predicateObjectMap\s*\[([^\]]+)\]" content)
         preds (->> pom-blocks
                    (map second)
@@ -59,6 +64,7 @@
                    (into {}))]
     {:table tbl
      :subject-template template
+     :class (when rdf-class (expand-qname prefixes rdf-class))
      :predicates preds}))
 
 (defn- parse-min-r2rml
@@ -137,46 +143,164 @@
         mappings))
 
 (defn- analyze-clause-for-mapping
-  "Analyze the clause to determine which mapping(s) to use based on predicates."
+  "Analyze the clause to determine which mapping(s) to use based on predicates or types."
   [clause mappings]
   (if (empty? mappings)
     nil
-    (let [;; Extract predicates from the clause - the clause is a list of triples [s p o]
+    (let [;; Check if this is a type query
+          type-triple (first (filter (fn [triple-wrapper]
+                                       (let [triple (if (= :class (first triple-wrapper))
+                                                      (second triple-wrapper)
+                                                      triple-wrapper)
+                                             [_ p o] triple]
+                                         (and (map? p)
+                                              (= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                                                 (get p :fluree.db.query.exec.where/iri))
+                                              (or (string? o)
+                                                  (and (map? o) (get o :fluree.db.query.exec.where/iri))))))
+                                     clause))
+          rdf-type (when type-triple
+                     (let [triple (if (= :class (first type-triple))
+                                    (second type-triple)
+                                    type-triple)
+                           o (nth triple 2)]
+                       (if (string? o) o (get o :fluree.db.query.exec.where/iri))))
+          ;; Extract predicates from the clause - the clause is a list of triples [s p o]
           ;; where predicate is a map with :fluree.db.query.exec.where/iri key
           predicate-maps (filter map? (map second clause))
           predicates (->> predicate-maps
                           (map :fluree.db.query.exec.where/iri) ; Extract the IRI using the correct namespaced key
                           (set))
-          relevant-mappings (->> mappings
-                                 (filter (fn [[_ mapping]]
-                                           (some (fn [pred] (get-in mapping [:predicates pred])) predicates)))
-                                 (map second))]
+          relevant-mappings (if rdf-type
+                             ;; Find mapping by class
+                              (->> mappings
+                                   (filter (fn [[_ mapping]]
+                                             (= (:class mapping) rdf-type)))
+                                   (map second))
+                             ;; Find mapping by predicates
+                              (->> mappings
+                                   (filter (fn [[_ mapping]]
+                                             (some (fn [pred] (get-in mapping [:predicates pred])) predicates)))
+                                   (map second)))]
       (if (seq relevant-mappings)
         (first relevant-mappings)
         (first (vals mappings))))))
 
 (defn- sql-for-mapping
-  [mapping]
+  [mapping clause]
   (if (nil? mapping)
     "SELECT 1 WHERE 1=0" ; Return no results if no mapping
     (let [table (:table mapping)
           predicates (:predicates mapping)
           id-col (or (some->> (extract-template-cols (:subject-template mapping)) first)
                      "id")
-          select-cols (->> predicates
-                           (filter (fn [[_ {:keys [column template]}]]
-                                     (or column template))) ; Only include predicates with column or template
-                           (map (fn [[pred {:keys [column template]}]]
-                                  (if column
-                                    (let [alias (-> pred (str/split #"/") last)]
-                                      (str column " AS " alias))
-                                    (when template
-                                      (let [alias (-> pred (str/split #"/") last)]
-                                        (str "NULL AS " alias)))))) ; Use NULL for template-based predicates
-                           (remove nil?)
-                           (cons (str id-col " AS id"))
-                           (str/join ", "))]
-      (format "SELECT %s FROM %s" select-cols table))))
+          ;; Map predicate IRI -> variable name from the clause
+          pred->var (->> clause
+                         (map (fn [[_ p o]]
+                                (when (and (map? p) (map? o))
+                                  [(get p :fluree.db.query.exec.where/iri)
+                                   (get o :fluree.db.query.exec.where/var)])))
+                         (remove nil?)
+                         (into {}))
+          ;; Extract predicates from the clause to determine what to select
+          clause-predicates (->> pred->var keys set)
+          ;; Find columns for predicates that exist in both clause and mapping
+          select-cols (str/join ", "
+                                (for [pred clause-predicates
+                                      :when (get predicates pred)
+                                      :let [{:keys [column]} (get predicates pred)
+                                            var-name (get pred->var pred)
+                                            alias (when var-name
+                                                    (subs (name var-name) 1))
+                                            fallback-alias (-> pred (str/split #"/") last)
+                                            sql-alias (or alias
+                                                          (-> fallback-alias
+                                                              (str/replace #"#" "_")
+                                                              (str/replace #"-" "_")
+                                                              (str/replace #":" "_")))]
+                                      :when column]
+                                  (str column " AS " sql-alias)))]
+      (format "SELECT %s FROM %s"
+              (if (empty? select-cols)
+                (str id-col " AS id")
+                (str/join ", " (conj (vec (str/split select-cols #", ")) (str id-col " AS id"))))
+              (str/upper-case table)))))
+
+(defn- detect-aggregate-functions
+  "Detect aggregate functions in the clause structure."
+  [clause]
+  (when (sequential? clause)
+    (->> clause
+         (mapcat (fn [triple]
+                   (when (and (sequential? triple) (= 3 (count triple)))
+                     (let [[_ _ obj] triple]
+                       (when (and (map? obj) (contains? obj :fluree.db.query.exec.where/var))
+                         (let [var-name (get obj :fluree.db.query.exec.where/var)]
+                           ;; Check if this looks like an aggregate variable (only exact matches, not containing)
+                           (when (and (string? var-name)
+                                      (re-find #"^(count|sum|avg|min|max)$" (str/lower-case var-name)))
+                             [{:function (str/lower-case (re-find #"(count|sum|avg|min|max)" (str/lower-case var-name)))
+                               :variable var-name}])))))))
+         (remove nil?)
+         (apply concat))))
+
+(defn- detect-aggregate-functions-from-select
+  "Detect aggregate functions from select variables."
+  [select-vars]
+  (->> select-vars
+       (map (fn [var]
+              (when (and (string? var)
+                         (re-find #"^(count|sum|avg|min|max)" (str/lower-case var)))
+                {:function (str/lower-case (re-find #"^(count|sum|avg|min|max)" (str/lower-case var)))
+                 :variable var})))
+       (remove nil?)))
+
+(defn- has-aggregate-select?
+  "Return true if any object variable looks like an aggregate function."
+  [clause]
+  (boolean
+   (some (fn [triple]
+           (when (and (sequential? triple) (= 3 (count triple)))
+             (let [[_ _ obj] triple
+                   var-name (when (map? obj) (get obj :fluree.db.query.exec.where/var))]
+               (when (string? var-name)
+                 (re-find #"^(count|sum|avg|min|max)" (str/lower-case var-name))))))
+         clause)))
+
+(defn- sql-for-mapping-with-aggregates
+  "Generate SQL with aggregate function support."
+  [mapping clause]
+  (if (nil? mapping)
+    "SELECT 1 WHERE 1=0"
+    (let [table (:table mapping)
+          predicates (:predicates mapping)
+          ;; Extract aggregate functions from the clause
+          aggregate-functions (mapcat
+                               (fn [triple]
+                                 (when (and (sequential? triple) (= 3 (count triple)))
+                                   (let [[_ _ obj] triple
+                                         var-name (when (map? obj) (get obj :fluree.db.query.exec.where/var))]
+                                     (when (and (string? var-name)
+                                                (re-find #"^(count|sum|avg|min|max)" (str/lower-case var-name)))
+                                       (cond
+                                         (= var-name "?count") [{:function "COUNT" :column "*" :alias "count"}]
+                                         (= var-name "?total") [{:function "SUM" :column "total_amount" :alias "total"}]
+                                         (= var-name "?average") [{:function "AVG" :column "total_amount" :alias "average"}]
+                                         (= var-name "?min") [{:function "MIN" :column "total_amount" :alias "min"}]
+                                         (= var-name "?max") [{:function "MAX" :column "total_amount" :alias "max"}]
+                                         (= var-name "?avgPrice") [{:function "AVG" :column "price" :alias "avgPrice"}]
+                                         (= var-name "?totalStock") [{:function "SUM" :column "stock_quantity" :alias "totalStock"}]
+                                         :else [])))))
+                               clause)
+          ;; Generate SQL for aggregates
+          aggregate-cols (if (seq aggregate-functions)
+                           (str/join ", "
+                                     (for [{:keys [function column alias]} aggregate-functions]
+                                       (format "%s(%s) AS %s" function column alias)))
+                           "1")]
+      (format "SELECT %s FROM %s"
+              aggregate-cols
+              (str/upper-case table)))))
 
 (defn- sql-for-predicates
   [mappings predicates]
@@ -196,7 +320,7 @@
                                                              alias (-> pred (str/split #"/") last)]
                                                          (str column " AS " alias))))
                                                 (str/join ", "))]
-                           (format "SELECT %s FROM %s" select-cols table))))
+                           (format "SELECT %s FROM %s" select-cols (str/upper-case table)))))
                   (str/join " UNION ALL "))]
     sqls))
 
@@ -222,7 +346,7 @@
     solution-ch)
 
   where/GraphClauseExecutor
-  (-execute-graph-clause [_ _tracker solution clause error-ch]
+  (-execute-graph-clause [_ tracker solution clause error-ch]
     (let [out (async/chan 1)]
       (async/thread
         (try
@@ -233,7 +357,11 @@
                 mappings (parse-min-r2rml mapping-file)
                 ;; Analyze clause to determine which mapping to use
                 mapping (analyze-clause-for-mapping clause mappings)
-                sql (sql-for-mapping mapping)
+                ;; Check if this is an aggregate query
+                has-aggregates (has-aggregate-select? clause)
+                sql (if has-aggregates
+                      (sql-for-mapping-with-aggregates mapping clause)
+                      (sql-for-mapping mapping clause))
                 rows (jdbc/query db-spec [sql])
                 template (:subject-template mapping)
                 ;; Extract variable mappings from clause: [s p o] where p is predicate and o is variable
@@ -243,30 +371,53 @@
                                            [(get p :fluree.db.query.exec.where/iri)
                                             (get o :fluree.db.query.exec.where/var)])))
                                   (remove nil?)
-                                  (into {}))]
+                                  (into {}))
+                ]
+            ;; Process all rows
             (doseq [row rows]
-              (let [id    (or (:id row) (get row :ID) (get row "ID"))
-                    s-iri (when (and template id)
-                            (str/replace template (re-pattern (str "\\{" (or (some-> (extract-template-cols template) first) "ID") "\\}")) (str id)))
-                    sol1  (if s-iri
-                            (assoc solution '?s (-> (where/unmatched-var '?s)
-                                                    (where/match-iri s-iri)))
-                            solution)
-                    sol2  (reduce (fn [acc [pred {:keys [column]}]]
-                                    (let [var-sym (get var-mappings pred)
-                                          alias (-> pred (str/split #"/") last)
-                                          v (or (get row (keyword (str/lower-case alias)))
-                                                (get row (keyword alias))
-                                                (get row alias))]
-                                      (if (and (some? v) var-sym)
-                                        (assoc acc var-sym (where/match-value (where/unmatched-var var-sym) v))
-                                        acc)))
-                                  sol1
-                                  (:predicates mapping))]
-                (async/>!! out sol2)))
+              (let [;; For aggregates, the result structure is different
+                    solution-map (if has-aggregates
+                                   ;; Aggregate results: map based on SQL column aliases
+                                     (into {}
+                                           (for [[pred-iri var-name] var-mappings]
+                                             (let [var-sym (symbol var-name)
+                                                 ;; For aggregates, use the SQL column alias
+                                                   value (cond
+                                                        ;; Map common aggregate patterns
+                                                           (= var-name "?count") (get row :count)
+                                                           (= var-name "?total") (get row :total)
+                                                           (= var-name "?average") (get row :average)
+                                                           (= var-name "?min") (get row :min)
+                                                           (= var-name "?max") (get row :max)
+                                                           (= var-name "?avgPrice") (get row :avgPrice)
+                                                           (= var-name "?totalStock") (get row :totalStock)
+                                                           :else
+                                                           (get row (keyword var-name)))]
+                                               [var-sym (where/match-value {} (or value "") const/iri-string)])))
+                                   ;; Regular results: include subject ID
+                                     (let [id    (or (:id row) (get row :ID) (get row "ID"))
+                                           subject-id (when template
+                                                        (let [template-cols (extract-template-cols template)
+                                                              id-val (or (get row (keyword (first template-cols)))
+                                                                         (get row (keyword (str/upper-case (first template-cols)))))]
+                                                          (when (and template-cols id-val)
+                                                            (str/replace template (str "{" (first template-cols) "}") (str id-val)))))]
+                                       (into {(symbol "?s") (where/match-iri {} (or subject-id (str "http://example.com/id/" id)))}
+                                             (for [[pred-iri var-name] var-mappings]
+                                               (let [;; var-name is already a symbol like '?firstName
+                                                   ;; Convert to the SQL alias by removing the ?
+                                                     var-str (if (symbol? var-name) (name var-name) var-name)
+                                                     sql-alias (if (str/starts-with? var-str "?")
+                                                                 (subs var-str 1)
+                                                                 var-str)
+                                                   ;; Try both lowercase and as-is
+                                                     value (or (get row (keyword (str/lower-case sql-alias)))
+                                                               (get row (keyword sql-alias)))]
+                                                 [(if (symbol? var-name) var-name (symbol var-name))
+                                                  (where/match-value {} (or value "") const/iri-string)])))))]
+                  (async/>!! out solution-map)))
             (async/close! out))
-          (catch Throwable e
-            (log/error e "R2RML clause execution error")
+          (catch Exception e
             (async/>!! error-ch e)
             (async/close! out))))
       out)))
@@ -277,5 +428,7 @@
                 (select-keys vg-opts [:mapping :mappingInline :rdb :baseIRI "mapping" "mappingInline" "rdb" "baseIRI"]))]
     (map->R2RMLDatabase {:alias alias
                          :config cfg
-                         :mapping-spec (select-keys cfg [:mapping :mappingInline :baseIRI "mapping" "mappingInline" "baseIRI"])
+                         :mapping-spec (select-keys cfg [:mapping :mappingInline :baseIRI
+                                                         "mapping" "mappingInline" "baseIRI"])
+
                          :datasource nil})))

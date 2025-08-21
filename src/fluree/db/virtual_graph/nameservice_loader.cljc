@@ -1,6 +1,7 @@
 (ns fluree.db.virtual-graph.nameservice-loader
   (:require ;; Register VG type loaders
    #?(:clj [fluree.db.virtual-graph.bm25.index :as bm25])
+   #?(:clj [fluree.db.virtual-graph.r2rml.db :as r2rml-db])
    [fluree.db.nameservice.virtual-graph :as ns-vg]
    [fluree.db.util.async :refer [<? go-try]]
    [fluree.db.util.json :as json]
@@ -105,6 +106,4 @@
 #?(:clj
    (defmethod create-vg-impl :r2rml
      [_db vg-opts _vg-config]
-     (require 'fluree.db.virtual-graph.r2rml.db)
-     (let [ctor (ns-resolve 'fluree.db.virtual-graph.r2rml.db '->R2RMLDatabase)]
-       (ctor vg-opts))))
+     (r2rml-db/->R2RMLDatabase vg-opts)))
