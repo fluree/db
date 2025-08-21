@@ -260,13 +260,13 @@ All contributors must complete a [Contributor License Agreement](https://cla-ass
    - Other Linux: `sudo apt install nodejs npm` (Ubuntu/Debian) or equivalent
    - Windows: Download from [nodejs.org](https://nodejs.org/)
 
-3. **Java**: JDK 11+ required (see `.java-version` for current target)
-   - macOS: `brew install openjdk@11`
+3. **Java**: JDK 17+ required (see `.java-version` for current target)
+   - macOS: `brew install openjdk@17`
    - Arch Linux: `pacman -S jdk-openjdk`
-   - Other Linux: `sudo apt install openjdk-11-jdk` or equivalent
+   - Other Linux: `sudo apt install openjdk-17-jdk` or equivalent
    - Windows: Download from [Oracle](https://www.oracle.com/java/technologies/downloads/) or [OpenJDK](https://openjdk.org/)
    
-   **Note**: Builds should use the Java version specified in `.java-version` (currently 11.0). 
+   **Note**: Builds should use the Java version specified in `.java-version` (currently 17.0). 
    If you use a Java version manager like [jenv](https://github.com/jenv/jenv) or [SDKMAN!](https://sdkman.io/), 
    it will automatically use the correct version.
 
