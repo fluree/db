@@ -217,15 +217,8 @@
             nil)
         (let [types (set (get vg-record "@type" []))]
           (if (contains? types "fidx:R2RML")
-            (let [;; Try to load existing stub ledger first, create if it doesn't exist
-                  stub-ledger (try*
-                               (<? (connection/load-ledger-alias conn "__vg_stub__"))
-                               (catch* e
-                                 ;; If load fails (ledger doesn't exist), create it
-                                 (<? (connection/create-ledger conn "__vg_stub__" {}))))
-                  db (ledger/current-db stub-ledger)]
-              ;; For R2RML we don't require a dependency ledger; use current conn context
-              (<? (vg-loader/load-virtual-graph-from-nameservice db primary-publisher vg-name)))
+            ;; For R2RML we don't require a dependency ledger; pass nil for db
+            (<? (vg-loader/load-virtual-graph-from-nameservice nil primary-publisher vg-name))
             (let [dependencies (get vg-record "f:dependencies")
                   primary-ledger (extract-primary-ledger-name dependencies)]
               (log/debug "Dependencies:" dependencies "Primary ledger:" primary-ledger)

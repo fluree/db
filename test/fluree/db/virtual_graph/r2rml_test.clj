@@ -1,13 +1,15 @@
 (ns fluree.db.virtual-graph.r2rml-test
+  "Integration tests for R2RML virtual graph functionality.
+  Tests the mapping of relational data to RDF through R2RML mappings."
   (:require [clojure.core.async :as async]
             [clojure.java.jdbc :as jdbc]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [fluree.db.api :as fluree]
             [fluree.db.connection.config :as config]
             [fluree.db.connection.system :as system]
-            [fluree.db.nameservice :as nameservice]
-            [fluree.db.util.async :refer [<?]]))
+            [fluree.db.nameservice :as nameservice]))
 
+;; Test database schema and data
 (def h2-spec
   {:classname "org.h2.Driver"
    :subprotocol "h2"
@@ -51,6 +53,7 @@
     (5, 4, 5, 1, 199.99),
     (6, 5, 1, 1, 999.99)"])
 
+;; R2RML mapping definition
 (def r2rml-ttl (str "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n"
                     "@prefix ex: <http://example.com/> .\n"
                     "@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n"
@@ -154,15 +157,21 @@
                     "        rr:objectMap [ rr:column \"unit_price\" ]\n"
                     "    ] ."))
 
-(defn with-h2 [f]
+;; Test fixtures
+(def ^:private test-system (atom nil))
+(def ^:private test-conn (atom nil))
+(def ^:private test-publisher (atom nil))
+
+(defn setup-h2-database
+  "Initialize H2 database with test data"
+  []
   (jdbc/with-db-connection [conn h2-spec]
     (doseq [s create-sql]
-      (jdbc/execute! conn [s]))
-    (f)))
+      (jdbc/execute! conn [s]))))
 
-(use-fixtures :once with-h2)
-
-(defn memory-conn []
+(defn setup-fluree-system
+  "Set up Fluree system and publish R2RML virtual graph"
+  []
   (let [memory-config {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
                                    "@vocab" "https://ns.flur.ee/system#"}
                        "@id"      "memory"
@@ -176,210 +185,195 @@
                                     "indexStorage"     {"@id" "memoryStorage"}
                                     "primaryPublisher" {"@type"   "Publisher"
                                                         "storage" {"@id" "memoryStorage"}}}]}
-        system-map (system/initialize (config/parse memory-config))]
-    system-map))
+        sys (system/initialize (config/parse memory-config))]
+    (reset! test-system sys)
+    (reset! test-conn (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) sys))
+    (reset! test-publisher (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) sys))
+    ;; Publish R2RML virtual graph
+    (let [tmp-file (java.io.File/createTempFile "r2rml" ".ttl")]
+      (spit tmp-file r2rml-ttl)
+      (async/<!! (nameservice/publish @test-publisher {:vg-name "vg/sql"
+                                                       :vg-type "fidx:R2RML"
+                                                       :engine  :r2rml
+                                                       :config  {:mapping (.getAbsolutePath tmp-file)
+                                                                 :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                       :driver  "org.h2.Driver"}}
+                                                       :dependencies ["dummy-ledger@main"]})))))
 
-(defn publish-vg! [publisher vg-name]
-  (let [tmp-file (java.io.File/createTempFile "r2rml" ".ttl")]
-    (spit tmp-file r2rml-ttl)
-    (async/<!! (nameservice/publish publisher {:vg-name vg-name
-                                               :vg-type "fidx:R2RML"
-                                               :engine  :r2rml
-                                               :config  {:mapping (.getAbsolutePath tmp-file)
-                                                         :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                               :driver  "org.h2.Driver"}}
-                                               :dependencies ["dummy-ledger@main"]}))))
+(use-fixtures :once (fn [f]
+                      (setup-h2-database)
+                      (setup-fluree-system)
+                      (f)))
 
-(deftest r2rml-simple-graph-test
-  (let [sys (memory-conn)
-        conn (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) sys)
-        publisher (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) sys)
-        _ (publish-vg! publisher "vg/sql")
-        query {:from ["vg/sql"]
-               :select ['?s '?name]
-               :where [[:graph "vg/sql" {"@id" "?s" "http://schema.org/name" "?name"}]]}]
-    (let [res @(fluree/query-connection conn query)
-          names (set (map second res))]
-      (is (contains? names "Alice"))
-      (is (contains? names "Bob")))))
+;; Integration Tests
 
-(deftest r2rml-customers-test
-  (let [sys (memory-conn)
-        conn (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) sys)
-        publisher (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) sys)
-        _ (publish-vg! publisher "vg/sql")
-        query {:from ["vg/sql"]
-               :select ['?firstName '?lastName '?email]
-               :where [[:graph "vg/sql" {"@id" "?customer"
-                                         "http://xmlns.com/foaf/0.1/firstName" "?firstName"
-                                         "http://xmlns.com/foaf/0.1/lastName" "?lastName"
-                                         "http://xmlns.com/foaf/0.1/mbox" "?email"}]]}]
-    (let [res @(fluree/query-connection conn query)
-          first-names (set (map first res))
-          last-names (set (map second res))
-          emails (set (map #(nth % 2) res))]
-      (is (contains? first-names "John"))
-      (is (contains? first-names "Jane"))
-      (is (contains? last-names "Doe"))
-      (is (contains? last-names "Smith"))
-      (is (contains? emails "john@example.com"))
-      (is (contains? emails "jane@example.com")))))
+(deftest r2rml-basic-mapping-integration-test
+  (testing "R2RML correctly maps relational data to RDF triples"
+    (let [query {:from ["vg/sql"]
+                 :select ['?s '?name]
+                 :where [[:graph "vg/sql" {"@id" "?s"
+                                           "http://schema.org/name" "?name"}]]}
+          res @(fluree/query-connection @test-conn query)]
+      (is (= 3 (count res)) "Should map all 3 people records")
+      (is (= #{"Alice" "Bob" "Charlie"} (set (map second res)))
+          "Should correctly extract names from people table"))))
 
-(deftest r2rml-orders-test
-  (let [sys (memory-conn)
-        conn (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) sys)
-        publisher (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) sys)
-        _ (publish-vg! publisher "vg/sql")
-        query {:from ["vg/sql"]
-               :select ['?orderDate '?totalAmount]
-               :where [[:graph "vg/sql" {"@id" "?order"
-                                         "http://purl.org/dc/terms/date" "?orderDate"
-                                         "http://example.com/totalAmount" "?totalAmount"}]]}]
-    (let [res @(fluree/query-connection conn query)
-          amounts (set (map second res))]
-      (is (contains? amounts 1029.98M))
-      (is (contains? amounts 89.99M))
-      (is (contains? amounts 299.99M))
-      (is (contains? amounts 199.99M))
-      (is (contains? amounts 999.99M)))))
+(deftest r2rml-complex-mapping-integration-test
+  (testing "R2RML handles multiple tables with different data types and vocabularies"
+    ;; Test customer data mapping with FOAF vocabulary
+    (let [query {:from ["vg/sql"]
+                 :select ['?firstName '?lastName '?email]
+                 :where [[:graph "vg/sql" {"@id" "?customer"
+                                           "@type" "http://example.com/Customer"
+                                           "http://xmlns.com/foaf/0.1/firstName" "?firstName"
+                                           "http://xmlns.com/foaf/0.1/lastName" "?lastName"
+                                           "http://xmlns.com/foaf/0.1/mbox" "?email"}]]}
+          res @(fluree/query-connection @test-conn query)
+          expected-set #{["John" "Doe" "john@example.com"]
+                         ["Jane" "Smith" "jane@example.com"]
+                         ["Bob" "Johnson" "bob@example.com"]
+                         ["Alice" "Brown" "alice@example.com"]}]
+      (is (= expected-set (set res)) "Should return exact customer data"))
 
-(deftest r2rml-aggregate-count-test
-  (testing "COUNT aggregate function with proper Fluree syntax"
-    (let [sys (memory-conn)
-          conn (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) sys)
-          publisher (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) sys)
-          _ (publish-vg! publisher "vg/sql")]
-      ;; First test that we get 5 orders
-      (let [basic-query {:from ["vg/sql"]
-                         :select ["?order"]
-                         :where [[:graph "vg/sql" {"@id" "?order"
-                                                   "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "http://example.com/Order"}]]}
-            basic-res @(fluree/query-connection conn basic-query)]
-        (is (= 5 (count basic-res)) "Should get 5 orders from basic query"))
-
-      ;; Test COUNT aggregate - variable binding now works but aggregate processing has issues  
-      (testing "COUNT aggregate - variable binding fixed but aggregate processing incomplete"
-        (let [count-query {:from ["vg/sql"]
-                           :select ["(count ?order)"]
-                           :where [[:graph "vg/sql" {"@id" "?order"
-                                                     "http://example.com/totalAmount" "?amount"}]]}]
-          ;; Variables are now properly bound in solutions! 
-          ;; This demonstrates that R2RML now returns results in Fluree's internal format
-          ;; and SELECT operations including aggregates can process the data
-          (try
-            (let [count-res @(fluree/query-connection conn count-query)]
-              ;; If no exception, aggregates might actually be working!
-              (is (= [[5]] count-res) "COUNT aggregate works with proper variable binding"))
-            (catch Exception e
-              ;; If it throws, that's also acceptable for now - the key is variables are bound
-              (is (instance? Exception e) "COUNT aggregate processing incomplete but major progress made"))))))))
-
-(deftest r2rml-aggregate-sum-test
-  (testing "SUM aggregate function - client-side computation"
-    (let [sys (memory-conn)
-          conn (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) sys)
-          publisher (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) sys)
-          _ (publish-vg! publisher "vg/sql")
-          ;; Virtual graphs currently return raw data; aggregation needs client-side computation
-          query {:from ["vg/sql"]
-                 :select ["?amount"]
+    ;; Test order data mapping with decimal amounts
+    (let [query {:from ["vg/sql"]
+                 :select ['?order '?totalAmount '?status]
                  :where [[:graph "vg/sql" {"@id" "?order"
-                                           "http://example.com/totalAmount" "?amount"}]]}
-          res @(fluree/query-connection conn query)
-          amounts (map first res)
-          total-sum (reduce + 0M amounts)]
-      ;; We should get 5 order amounts that sum to 2619.94
-      (is (= 5 (count amounts)))
-      (is (= 2619.94M total-sum)))))
+                                           "@type" "http://example.com/Order"
+                                           "http://example.com/totalAmount" "?totalAmount"
+                                           "http://example.com/status" "?status"}]]}
+          res @(fluree/query-connection @test-conn query)
+          amounts (map second res)
+          statuses (set (map #(nth % 2) res))]
+      (is (= 5 (count res)) "Should map all 5 order records")
+      (is (every? decimal? amounts) "All amounts should be decimals")
+      (is (= #{"completed" "pending" "cancelled"} statuses)
+          "Should have all three order statuses"))))
 
-(deftest r2rml-aggregate-avg-test
-  (testing "AVG aggregate function - compute from individual amounts"
-    (let [sys (memory-conn)
-          conn (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) sys)
-          publisher (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) sys)
-          _ (publish-vg! publisher "vg/sql")
-          ;; Get individual amounts and compute average
-          query {:from ["vg/sql"]
-                 :select ["?amount"]
+(deftest r2rml-aggregate-query-integration-test
+  (testing "R2RML supports Fluree aggregate functions in SELECT"
+    ;; Test COUNT aggregate
+    (let [count-query {:from ["vg/sql"]
+                       :select ["(count ?order)"]
+                       :where [[:graph "vg/sql" {"@id" "?order"
+                                                 "@type" "http://example.com/Order"}]]}
+          res @(fluree/query-connection @test-conn count-query)]
+      (is (= [[5]] res) "COUNT should return 5 orders"))))
+
+(deftest ^:pending r2rml-literal-value-filtering-test
+  (testing "R2RML supports filtering by literal values in WHERE clauses"
+    ;; This test demonstrates filtering orders by status="completed" 
+    ;; where "completed" is a literal string value, not a variable binding
+    (let [query {:from ["vg/sql"]
+                 :select ["?order" "?amount"]
                  :where [[:graph "vg/sql" {"@id" "?order"
-                                           "http://example.com/totalAmount" "?amount"}]]}]
-      (let [res @(fluree/query-connection conn query)
-            amounts (map first res)
-            avg-val (/ (reduce + 0M amounts) (count amounts))]
-        (is (= 523.988M avg-val))))))
+                                           "@type" "http://example.com/Order"
+                                           "http://example.com/totalAmount" "?amount"
+                                           "http://example.com/status" "completed"}]]} ; <- "completed" is a literal filter
+          res @(fluree/query-connection @test-conn query)
+          order-ids (set (map first res))
+          amounts (map second res)]
+      ;; Orders 1, 2, and 4 have status "completed" in our test data
+      (is (= 3 (count res)) "Should return only 3 completed orders")
+      (is (= #{"http://example.com/order/1"
+               "http://example.com/order/2"
+               "http://example.com/order/4"}
+             order-ids)
+          "Should return specific completed order IDs")
+      (is (= #{1029.98M 89.99M 199.99M} (set amounts))
+          "Should return only completed order amounts")
+      (is (= 1319.96M (reduce + 0M amounts))
+          "Sum of completed orders should be 1319.96"))))
 
-(deftest r2rml-aggregate-min-max-test
-  (testing "MIN and MAX aggregate functions - compute from individual amounts"
-    (let [sys (memory-conn)
-          conn (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) sys)
-          publisher (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) sys)
-          _ (publish-vg! publisher "vg/sql")
-          query {:from ["vg/sql"]
-                 :select ["?amount"]
-                 :where [[:graph "vg/sql" {"@id" "?order"
-                                           "http://example.com/totalAmount" "?amount"}]]}]
-      (let [res @(fluree/query-connection conn query)
-            amounts (map first res)
-            min-val (apply min amounts)
-            max-val (apply max amounts)]
-        (is (= 89.99M min-val))
-        (is (= 1029.98M max-val))))))
-
-(deftest r2rml-group-by-test
-  (testing "GROUP BY with aggregates - client-side grouping"
-    (let [sys (memory-conn)
-          conn (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) sys)
-          publisher (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) sys)
-          _ (publish-vg! publisher "vg/sql")
-          ;; Get all statuses and group them client-side
-          query {:from ["vg/sql"]
-                 :select ["?status"]
-                 :where [[:graph "vg/sql" {"@id" "?order"
-                                           "http://example.com/status" "?status"}]]}]
-      (let [res @(fluree/query-connection conn query)
-            statuses (map first res)
-            status-counts (frequencies statuses)]
-        (is (= 3 (get status-counts "completed")))
-        (is (= 1 (get status-counts "pending")))
-        (is (= 1 (get status-counts "cancelled")))))))
-
-(deftest r2rml-products-test
-  (testing "r2rml-products-test"
-    (let [sys (memory-conn)
-          conn (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) sys)
-          publisher (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) sys)
-          _ (publish-vg! publisher "vg/sql")
-          query {:from ["vg/sql"]
-                 :select ["?product" "?name" "?price"]
+(deftest r2rml-data-type-handling-test
+  (testing "R2RML correctly handles various SQL data types"
+    ;; Test integer columns
+    (let [query {:from ["vg/sql"]
+                 :select ["?stock"]
                  :where [[:graph "vg/sql" {"@id" "?product"
-                                           "http://www.w3.org/2000/01/rdf-schema#label" "?name"
-                                           "http://example.com/price" "?price"}]]}]
-      (let [res @(fluree/query-connection conn query)
-            prices (set (map #(nth % 2) res))]
-        (is (contains? prices 999.99M))
-        (is (contains? prices 29.99M))
-        (is (contains? prices 89.99M))
-        (is (contains? prices 299.99M))
-        (is (contains? prices 199.99M))))))
+                                           "@type" "http://example.com/Product"
+                                           "http://example.com/stockQuantity" "?stock"}]]}
+          res @(fluree/query-connection @test-conn query)
+          stocks (map first res)]
+      (is (= 5 (count stocks)) "Should have 5 products with stock")
+      (is (every? integer? stocks) "All stock values should be integers")
+      (is (= 130 (reduce + stocks)) "Total stock should be 130"))
 
-(deftest r2rml-product-aggregates-test
-  (testing "Product aggregates - client-side computation"
-    (let [sys (memory-conn)
-          conn (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) sys)
-          publisher (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) sys)
-          _ (publish-vg! publisher "vg/sql")
-          ;; Get individual prices and stocks
-          query {:from ["vg/sql"]
-                 :select ["?price" "?stock"]
+    ;; Test decimal columns
+    (let [query {:from ["vg/sql"]
+                 :select ["?price"]
                  :where [[:graph "vg/sql" {"@id" "?product"
-                                           "http://example.com/price" "?price"
-                                           "http://example.com/stockQuantity" "?stock"}]]}]
-      (let [res @(fluree/query-connection conn query)
-            prices (map first res)
-            stocks (map second res)
-            avg-price (/ (reduce + 0M prices) (count prices))
-            total-stock (reduce + 0 stocks)]
-        (is (= 323.99M avg-price))
-        (is (= 130 total-stock))))))
+                                           "@type" "http://example.com/Product"
+                                           "http://example.com/price" "?price"}]]}
+          res @(fluree/query-connection @test-conn query)
+          prices (map first res)]
+      (is (every? decimal? prices) "All prices should be decimals")
+      (is (= 1619.95M (reduce + prices)) "Sum of prices should be correct"))
 
+    ;; Test timestamp columns
+    (let [query {:from ["vg/sql"]
+                 :select ["?created"]
+                 :where [[:graph "vg/sql" {"@id" "?customer"
+                                           "@type" "http://example.com/Customer"
+                                           "http://purl.org/dc/terms/created" "?created"}]]}
+          res @(fluree/query-connection @test-conn query)]
+      (is (= 4 (count res)) "Should have 4 customers with creation dates")
+      (is (every? #(string? (first %)) res) "Timestamps should be strings"))))
 
+(deftest r2rml-rdf-type-mapping-test
+  (testing "R2RML class mappings generate correct rdf:type triples for specific types"
+    ;; Note: Generic type queries across all mappings not yet supported
+    ;; Test each type individually
+    (testing "Order type"
+      (let [query {:from ["vg/sql"]
+                   :select ["?s"]
+                   :where [[:graph "vg/sql" {"@id" "?s"
+                                             "@type" "http://example.com/Order"}]]}
+            res @(fluree/query-connection @test-conn query)]
+        (is (= 5 (count res)) "Should have 5 orders")))
+
+    (testing "Product type"
+      (let [query {:from ["vg/sql"]
+                   :select ["?s"]
+                   :where [[:graph "vg/sql" {"@id" "?s"
+                                             "@type" "http://example.com/Product"}]]}
+            res @(fluree/query-connection @test-conn query)]
+        (is (= 5 (count res)) "Should have 5 products")))
+
+    (testing "Customer type"
+      (let [query {:from ["vg/sql"]
+                   :select ["?s"]
+                   :where [[:graph "vg/sql" {"@id" "?s"
+                                             "@type" "http://example.com/Customer"}]]}
+            res @(fluree/query-connection @test-conn query)]
+        (is (= 4 (count res)) "Should have 4 customers")))
+
+    (testing "Person type"
+      (let [query {:from ["vg/sql"]
+                   :select ["?s"]
+                   :where [[:graph "vg/sql" {"@id" "?s"
+                                             "@type" "http://example.com/Person"}]]}
+            res @(fluree/query-connection @test-conn query)]
+        (is (= 3 (count res)) "Should have 3 people")))))
+
+(deftest r2rml-template-uri-generation-test
+  (testing "R2RML correctly generates URIs from templates"
+    ;; Test URI generation for orders
+    (let [query {:from ["vg/sql"]
+                 :select ["?order"]
+                 :where [[:graph "vg/sql" {"@id" "?order"
+                                           "@type" "http://example.com/Order"}]]}
+          res @(fluree/query-connection @test-conn query)
+          order-uris (map first res)]
+      (is (every? #(re-matches #"^http://example.com/order/\d+$" %) order-uris)
+          "All order URIs should match the template pattern"))
+
+    ;; Test URI generation for products
+    (let [query {:from ["vg/sql"]
+                 :select ["?product"]
+                 :where [[:graph "vg/sql" {"@id" "?product"
+                                           "@type" "http://example.com/Product"}]]}
+          res @(fluree/query-connection @test-conn query)
+          product-uris (map first res)]
+      (is (every? #(re-matches #"^http://example.com/product/\d+$" %) product-uris)
+          "All product URIs should match the template pattern"))))
