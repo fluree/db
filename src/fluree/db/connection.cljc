@@ -135,7 +135,10 @@
 
 (defn fluree-address?
   [x]
-  (str/starts-with? x fluree-address-prefix))
+  (if (string? x)
+    (str/starts-with? x fluree-address-prefix)
+    (throw (ex-info (str "Invalid ledger identifier: " (pr-str x))
+                    {:ledger-id x}))))
 
 (defn relative-ledger-alias?
   [ledger-alias]
@@ -496,11 +499,11 @@
 
 (defn trigger-ledger-index
   "Manually triggers indexing for a ledger/branch and waits for completion.
-   
+
    Options:
    - :branch - Branch name (defaults to main branch)
    - :timeout - Max wait time in ms (default 300000 / 5 minutes)
-   
+
    Returns the indexed database object or throws an exception on failure/timeout."
   [conn ledger-alias opts]
   (go-try
