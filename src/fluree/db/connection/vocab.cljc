@@ -86,7 +86,7 @@
   (system-iri "parallelism"))
 
 (def cache-max-mb
-  (system-iri "cachMaxMb"))
+  (system-iri "cacheMaxMb"))
 
 (def commit-storage
   (system-iri "commitStorage"))
