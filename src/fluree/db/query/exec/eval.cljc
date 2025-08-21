@@ -618,7 +618,7 @@
   (where/->typed-val
    (score/cosine-similarity v1 v2)))
 
-(defn euclideanDistance
+(defn euclidianDistance
   [{v1 :value} {v2 :value}]
   (where/->typed-val
    (score/euclidian-distance v1 v2)))
@@ -705,7 +705,7 @@
 
     dotProduct         fluree.db.query.exec.eval/dotProduct
     cosineSimilarity  fluree.db.query.exec.eval/cosineSimilarity
-    euclidianDistance fluree.db.query.exec.eval/euclideanDistance})
+    euclidianDistance fluree.db.query.exec.eval/euclidianDistance})
 
 ;;; =============================================================================
 ;;; SCI (Small Clojure Interpreter) Support for GraalVM
