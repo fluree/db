@@ -431,8 +431,9 @@
     (when (not= (:t target-db) (:t final-db))
       (let [commit-result (<? (transact/commit! target-ledger final-db
                                                 (assoc opts
-                                                       :message (commit-message from-spec opts)
-                                                       :author "system/merge")))]
+                                                       :message (or (:message opts)
+                                                                    (commit-message from-spec opts))
+                                                       :author (or (:author opts) "system/merge"))))]
         (or (get-in commit-result [:commit :id])
             (get-in final-db [:commit :id]))))))
 
@@ -618,6 +619,58 @@
         (throw (ex-info "Invalid state specification. Must provide :t or :sha"
                         {:status 400 :error :db/invalid-state-spec}))))))
 
+(defn- generate-reset-message
+  "Generate a descriptive message for the reset operation."
+  [state-spec opts]
+  (or (:message opts)
+      (str "Reset branch to "
+           (if (:sha state-spec)
+             (str "commit " (:sha state-spec))
+             (str "t=" (:t state-spec))))))
+
+(defn- filter-commits-to-undo
+  "Filter commits that need to be undone (those after target-t)."
+  [all-commits target-t]
+  (let [commits-to-undo (filter #(> (get-in % [:data :t]) target-t) all-commits)]
+    (log/info "filter-commits-to-undo: target-t=" target-t
+              "total-commits=" (count all-commits)
+              "commits-to-undo=" (count commits-to-undo)
+              "undo-ts=" (map #(get-in % [:data :t]) commits-to-undo))
+    commits-to-undo))
+
+(defn- reverse-commit-flakes
+  "Process a single commit and return its flakes with flipped operations."
+  [conn commit db-with-ns]
+  (go-try
+    (let [commit-flakes (<? (read-commit-data conn commit db-with-ns))
+          all-flakes (concat (:asserted commit-flakes)
+                             (:retracted commit-flakes))]
+      (map flake/flip-flake all-flakes))))
+
+(defn- process-commits-to-reverse
+  "Process multiple commits and collect all their reversed flakes."
+  [conn commits-reversed db-with-ns]
+  (go-try
+    (loop [acc []
+           commits commits-reversed]
+      (if-let [commit (first commits)]
+        (let [flipped (<? (reverse-commit-flakes conn commit db-with-ns))]
+          (recur (into acc flipped) (rest commits)))
+        acc))))
+
+(defn- create-reset-result
+  "Create the result map for a reset operation."
+  [branch-spec state-spec current-t target-t commits-undone new-commit-sha]
+  {:status :success
+   :operation :reset
+   :branch branch-spec
+   :mode :safe
+   :reset-to (or (:sha state-spec) (str "t=" (:t state-spec)))
+   :from-t current-t
+   :to-t target-t
+   :commits-undone commits-undone
+   :new-commit new-commit-sha})
+
 (defn- safe-reset!
   "Creates a new commit that reverts the branch to a previous state.
   This is non-destructive - adds a new commit rather than rewriting history."
@@ -626,7 +679,6 @@
     (let [ledger (<? (connection/load-ledger conn branch-spec))
           current-db (ledger/current-db ledger)
           current-t (:t current-db)
-
           target-db (<? (get-db-at-state conn branch-spec state-spec))
           target-t (:t target-db)]
 
@@ -637,92 +689,46 @@
 
       (log/info "safe-reset!: current-t=" current-t "target-t=" target-t)
 
-      ;; Strategy: Get all commits from current back to genesis,
-      ;; find the ones after target-t, and reverse them
-      (let [;; Get ALL commits from current back to genesis (t=0)
-            all-commits (<? (extract-commits-since conn current-db nil))
-            _ (log/debug "safe-reset!: total-commits=" (count all-commits)
-                         "commit-ts=" (map #(get-in % [:data :t]) all-commits))
+      ;; Get all commits and filter to those we need to undo
+      (let [all-commits (<? (extract-commits-since conn current-db nil))
+            commits-to-undo (filter-commits-to-undo all-commits target-t)]
 
-            ;; Filter to get only commits after target-t (those we need to undo)
-            commits-to-undo (filter #(> (get-in % [:data :t]) target-t) all-commits)
-            _ (log/info "safe-reset!: all-commit-ts=" (map #(get-in % [:data :t]) all-commits)
-                        "target-t=" target-t
-                        "commits-to-undo=" (count commits-to-undo)
-                        "undo-ts=" (map #(get-in % [:data :t]) commits-to-undo))
+        (if (empty? commits-to-undo)
+          ;; No commits to undo - already at target state
+          (create-reset-result branch-spec state-spec current-t target-t 0 nil)
 
-            ;; Process commits to undo in REVERSE order (newest first)
-            ;; This ensures we undo the most recent changes first
-            commits-reversed (reverse commits-to-undo)]
+          ;; Process commits to create reversal
+          (let [;; Process commits in reverse order (newest first)
+                commits-reversed (reverse commits-to-undo)
 
-        (if (empty? commits-reversed)
-          ;; No commits to undo
-          {:status :success
-           :operation :reset
-           :branch branch-spec
-           :mode :safe
-           :reset-to (or (:sha state-spec) (str "t=" (:t state-spec)))
-           :from-t current-t
-           :to-t target-t
-           :commits-undone 0
-           :new-commit nil}
-
-          ;; Process each commit individually and flip its operations
-          ;; We need to process them in reverse order (newest first)
-          (let [;; Collect all namespaces we'll need
+                ;; Prepare database with all needed namespaces
                 all-namespaces (<? (collect-commit-namespaces conn commits-reversed))
                 db-with-ns (prepare-target-db-namespaces current-db all-namespaces)
 
-                ;; Process each commit and collect its flakes
-                all-reversed-flakes (<? (async/go
-                                          (loop [acc []
-                                                 commits commits-reversed]
-                                            (if-let [commit (first commits)]
-                                              (let [;; Read this commit's data
-                                                    commit-flakes (<? (read-commit-data conn commit db-with-ns))
-                                                   ;; Get all flakes (asserted and retracted)
-                                                    all-flakes (concat (:asserted commit-flakes)
-                                                                       (:retracted commit-flakes))
-                                                   ;; Flip each flake's operation
-                                                    flipped (map flake/flip-flake all-flakes)]
-                                                (recur (into acc flipped)
-                                                       (rest commits)))
-                                              acc))))
-
+                ;; Process all commits and collect reversed flakes
+                all-reversed-flakes (<? (process-commits-to-reverse conn commits-reversed db-with-ns))
                 _ (log/info "safe-reset!: total-reversed-flakes=" (count all-reversed-flakes))
 
-                ;; Stage and commit the reversed changes
+                ;; Generate message for the reset commit
+                reset-message (generate-reset-message state-spec opts)
+                reset-author (or (:author opts) "system/reset")
+
+                ;; Stage and commit the reversed changes if any
                 final-db (if (seq all-reversed-flakes)
                            (<? (stage-flakes current-db all-reversed-flakes
-                                             {:message (or (:message opts)
-                                                           (str "Reset branch to "
-                                                                (if (:sha state-spec)
-                                                                  (str "commit " (:sha state-spec))
-                                                                  (str "t=" (:t state-spec)))))
-                                              :author (or (:author opts) "system/reset")}))
+                                             {:message reset-message
+                                              :author reset-author}))
                            current-db)
 
                 new-commit-sha (when (seq all-reversed-flakes)
-                                 (let [commit-result (<? (transact/commit! ledger final-db
-                                                                           (assoc opts
-                                                                                  :message (or (:message opts)
-                                                                                               (str "Reset branch to "
-                                                                                                    (if (:sha state-spec)
-                                                                                                      (str "commit " (:sha state-spec))
-                                                                                                      (str "t=" (:t state-spec)))))
-                                                                                  :author (or (:author opts) "system/reset"))))]
-                                   (or (get-in commit-result [:commit :id])
-                                       (get-in final-db [:commit :id]))))]
+                                 (<? (commit-if-changed ledger current-db final-db
+                                                        branch-spec
+                                                        (assoc opts
+                                                               :message reset-message
+                                                               :author reset-author))))]
 
-            {:status :success
-             :operation :reset
-             :branch branch-spec
-             :mode :safe
-             :reset-to (or (:sha state-spec) (str "t=" (:t state-spec)))
-             :from-t current-t
-             :to-t target-t
-             :commits-undone (count commits-to-undo)
-             :new-commit new-commit-sha}))))))
+            (create-reset-result branch-spec state-spec current-t target-t
+                                 (count commits-to-undo) new-commit-sha)))))))
 
 ;; ============================================================================
 ;; Public API Functions
