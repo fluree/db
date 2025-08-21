@@ -131,31 +131,42 @@
       (= target-head common-ancestor))))
 
 ;; ============================================================================
+;; Utility Functions
+;; ============================================================================
+
+(defn- ensure-sync-db
+  "Ensures we have a synchronous database, dereferencing async if needed."
+  [db]
+  (go-try
+    (if (async-db/db? db)
+      (<? (async-db/deref-async db))
+      db)))
+
+;; ============================================================================
 ;; Commit Extraction and Processing
 ;; ============================================================================
 
 (defn- read-commit-data
   "Reads the actual data from a commit.
-  Returns map with :asserted and :retracted flakes."
+  Returns map with :asserted and :retracted flakes.
+  Note: When used from compute-spot-values, db-context should already have all necessary namespaces."
   [conn commit db-context]
   (go-try
-    (let [db-context* (if (and db-context (async-db/db? db-context))
-                        (<? (async-db/deref-async db-context))
-                        db-context)]
+    (let [db-context* (<? (ensure-sync-db db-context))]
       (when-let [data-address (get-in commit [:data :address])]
         (let [commit-catalog (:commit-catalog conn)
               data-jsonld (<? (commit-storage/read-data-jsonld commit-catalog data-address))
-              nses (map :value (get data-jsonld const/iri-namespaces))
-              db-for-decode (if (seq nses)
-                              (flake-db/with-namespaces db-context* nses)
-                              db-context*)
+              ;; Note: We don't add namespaces here when called from compute-spot-values
+              ;; because the db-context should already have all necessary namespaces.
+              ;; This function is currently only used by compute-spot-values where
+              ;; namespaces are pre-loaded in compute-net-flakes.
               assert-data (get data-jsonld const/iri-assert)
               retract-data (get data-jsonld const/iri-retract)
               t (get-in commit [:data :t])
               asserted-flakes (when assert-data
-                                (flake-db/create-flakes true db-for-decode t assert-data))
+                                (flake-db/create-flakes true db-context* t assert-data))
               retracted-flakes (when retract-data
-                                 (flake-db/create-flakes false db-for-decode t retract-data))]
+                                 (flake-db/create-flakes false db-context* t retract-data))]
           (log/debug "read-commit-data: t=" t
                      "assert-count=" (count assert-data)
                      "retract-count=" (count retract-data))
@@ -175,9 +186,7 @@
   (go-try
     (if (empty? flakes)
       db
-      (let [db* (if (and db (async-db/db? db))
-                  (<? (async-db/deref-async db))
-                  db)
+      (let [db* (<? (ensure-sync-db db))
             next-t (flake/next-t (:t db*))
             ;; retime all flakes to the new t
             retimed (into [] (map (fn [f]
@@ -221,14 +230,6 @@
 ;; Transaction Replay
 ;; ============================================================================
 
-(defn- ensure-sync-db
-  "Ensures we have a synchronous database, dereferencing async if needed."
-  [db]
-  (go-try
-    (if (async-db/db? db)
-      (<? (async-db/deref-async db))
-      db)))
-
 (defn- collect-commit-namespaces
   "Collects all unique namespace IRIs from a sequence of commits."
   [conn commits]
@@ -264,24 +265,6 @@
       (flake-db/with-namespaces target-db-prepared source-namespaces)
       target-db-prepared)))
 
-(defn- read-commit-flakes
-  "Reads and creates flakes from a single commit's data."
-  [conn commit target-db]
-  (go-try
-    (let [commit-catalog (:commit-catalog conn)
-          data-address (get-in commit [:data :address])
-          data-jsonld (when data-address
-                        (<? (commit-storage/read-data-jsonld commit-catalog data-address)))
-          assert-data (get data-jsonld const/iri-assert)
-          retract-data (get data-jsonld const/iri-retract)
-          t (get-in commit [:data :t])
-          asserted-flakes (when assert-data
-                            (flake-db/create-flakes true target-db t assert-data))
-          retracted-flakes (when retract-data
-                             (flake-db/create-flakes false target-db t retract-data))]
-      {:asserted asserted-flakes
-       :retracted retracted-flakes})))
-
 (defn- apply-flakes-to-spot-map
   "Applies a set of flakes to the spot->values accumulator map.
   Retractions remove values, assertions add values."
@@ -310,7 +293,7 @@
     (loop [spot->values {}
            remaining commits]
       (if-let [commit (first remaining)]
-        (let [flakes (<? (read-commit-flakes conn commit target-db))
+        (let [flakes (<? (read-commit-data conn commit target-db))
               updated-spots (apply-flakes-to-spot-map spot->values flakes)]
           (recur updated-spots (rest remaining)))
         spot->values))))
