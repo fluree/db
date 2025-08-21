@@ -11,7 +11,7 @@ Fluree provides Git-like branch operations for managing database version control
 | `rebase!` | ✅ Implemented | Fast-forward and squash modes working |
 | `branch-divergence` | ✅ Implemented | Check if branches can fast-forward |
 | `merge!` | ❌ Not Implemented | Returns not-implemented error |
-| `reset-branch!` | ⚠️ Partial | API exists but delta computation incomplete |
+| `reset-branch!` | ✅ Implemented | Safe reset mode fully working |
 
 ### Core Concepts
 
@@ -76,6 +76,19 @@ Before performing branch operations, it's helpful to understand how branches rel
 Replays commits from source branch onto target branch. Currently supports:
 - **Fast-forward** when target branch is behind source (no divergence)
 - **Squash** to combine all source commits into a single commit on target
+
+#### How Squash Works
+
+When using `squash? true`, Fluree:
+1. Collects all flakes (assertions/retractions) from source commits
+2. Groups them by `[subject predicate object datatype meta]`
+3. Counts net operations (assertions - retractions) for each unique value
+4. Produces final flakes:
+   - Net positive → assertion
+   - Net negative → retraction  
+   - Net zero → cancelled out (no flake)
+
+This means that if you assert a value in one commit and retract it in another, they cancel out and disappear from the squashed result.
 
 Future support planned for:
 - Cherry-pick specific commits
@@ -189,12 +202,16 @@ Resets a branch to a previous state.
 
 | Mode | Status | Description |
 |------|--------|-------------|
-| Safe mode (`:mode :safe`) | ⚠️ Partial | API exists, delta computation not implemented |
+| Safe mode (`:mode :safe`) | ✅ Implemented | Creates a revert commit to target state |
 | Hard mode (`:mode :hard`) | ❌ Not Implemented | Will move branch pointer (rewrite history) |
 | Preview (`:preview? true`) | ✅ Implemented | Dry-run to see what would happen |
 
-**Safe mode** (default): Creates a new commit that reverts to the target state
-**Hard mode**: Moves the branch pointer, rewriting history (requires archive or force)
+**Safe mode** (default): Creates a new commit that reverts to the target state by:
+1. Finding all commits after the target state
+2. Flipping all operations (assertions become retractions, retractions become assertions)
+3. Creating a single new commit with these reversed operations
+
+**Hard mode**: Will move the branch pointer, rewriting history (requires archive or force)
 
 #### Options
 
@@ -217,9 +234,13 @@ Resets a branch to a previous state.
 
 ##### Safe Reset (Creates Revert Commit)
 ```clojure
-;; Note: Safe reset is partially implemented - delta computation not yet complete
+;; Reset to a specific transaction number
 (fluree/reset-branch! conn "ledger:main" {:t 90}
   {:message "Reverting to stable state at t=90"})
+
+;; Reset to a specific commit SHA
+(fluree/reset-branch! conn "ledger:main" {:sha "abc123"}
+  {:message "Reverting to commit abc123"})
 ```
 
 ##### Hard Reset with Archive Tag
@@ -296,6 +317,43 @@ Will compute deltas from the Last Common Ancestor (LCA) for both branches, auto-
 ```
 
 ---
+
+## Understanding Multi-Cardinality Predicates
+
+Fluree's branch operations handle multi-cardinality predicates (where a subject can have multiple values for the same predicate) through its flake model:
+
+### Flake Structure
+A flake is Fluree's atomic unit of data: `[subject predicate object datatype t op meta]`
+- `op` (operation): `true` for assertion, `false` for retraction
+- `meta`: Optional metadata, used for ordered lists (e.g., `{:i 0}` for position 0)
+
+### Set vs List Semantics
+- **Sets** (default): Multiple values with `meta = nil`, order doesn't matter
+- **Lists**: Multiple values with position metadata `{:i 0}`, `{:i 1}`, etc.
+
+### Example: Squashing with Multi-Cardinality
+```clojure
+;; Commit 1: Add skills
+{"@id" "ex:alice" "ex:skills" ["Java" "Python" "Rust"]}
+;; Creates: [alice skills "Java" string t1 true nil]
+;;          [alice skills "Python" string t1 true nil]  
+;;          [alice skills "Rust" string t1 true nil]
+
+;; Commit 2: Remove Java and Rust
+{"delete" {"@id" "ex:alice" "ex:skills" ["Java" "Rust"]}}
+;; Creates: [alice skills "Java" string t2 false nil]
+;;          [alice skills "Rust" string t2 false nil]
+
+;; Commit 3: Re-add Rust
+{"@id" "ex:alice" "ex:skills" ["Rust"]}
+;; Creates: [alice skills "Rust" string t3 true nil]
+
+;; After squash:
+;; - Java: 1 assert, 1 retract = cancelled out (removed)
+;; - Python: 1 assert = kept
+;; - Rust: 2 asserts, 1 retract = kept (net positive)
+;; Result: Alice has skills ["Python", "Rust"]
+```
 
 ## Error Handling
 
@@ -375,6 +433,63 @@ When branches have modified the same data:
 
 ---
 
+## Implementation Details for Developers
+
+### Code Organization
+
+The branch operations are implemented across several namespaces:
+
+- `fluree.db.merge` - Public API entry points
+- `fluree.db.merge.operations` - Core operation implementations (squash!, fast-forward!, safe-reset!)
+- `fluree.db.merge.branch` - Branch analysis and LCA detection
+- `fluree.db.merge.commit` - Commit data reading and namespace handling
+- `fluree.db.merge.flake` - Flake manipulation and cancellation logic
+- `fluree.db.merge.db` - Database preparation and staging
+- `fluree.db.merge.response` - Response formatting and error messages
+
+### Key Algorithms
+
+#### Last Common Ancestor (LCA) Detection
+The LCA is found by:
+1. Checking if branches are at the same commit
+2. Checking if one branch was created from the other's current commit
+3. Checking if branches share a creation origin
+4. Walking commit chains and finding the first common commit
+
+#### Squash Operation Cancellation
+The cancellation algorithm (`cancel-opposite-operations`):
+1. Groups flakes by `[s p o dt m]` (including meta for ordered lists)
+2. Counts assertions and retractions for each group
+3. Calculates net effect (assertions - retractions)
+4. Produces:
+   - Assertion if net > 0
+   - Retraction if net < 0
+   - Nothing if net = 0 (cancelled out)
+
+#### Safe Reset Implementation
+Safe reset (`safe-reset!`):
+1. Loads the current database state
+2. Gets the target state (by t-value or SHA)
+3. Finds all commits after the target state
+4. Reverses each commit's flakes using `flake/flip-flake`
+5. Creates a single new commit with all reversed operations
+
+### Testing Branch Operations
+
+The test suite (`fluree.db.merge-test`) includes:
+- Fast-forward merge tests
+- Squash merge with divergent branches
+- Cancellation of assert/retract pairs
+- Safe reset to previous states
+- File-based and memory-based storage tests
+
+Example test for cancellation:
+```clojure
+(deftest squash-cancellation-test
+  ;; Tests that assert/retract pairs cancel out
+  ;; See test/fluree/db/merge_test.clj for full implementation)
+```
+
 ## Troubleshooting
 
 ### Common Issues
@@ -419,9 +534,13 @@ When branches have modified the same data:
 
 ### Reverting Bad Changes
 ```clojure
-;; Note: This functionality is not yet fully implemented
-;; Currently returns a not-implemented error
-(fluree/reset-branch! conn "main" {:t 100})
+;; Safe reset creates a new commit that reverts to the target state
+(fluree/reset-branch! conn "main" {:t 100}
+  {:message "Reverting to known good state at t=100"})
+
+;; Or reset to a specific commit SHA
+(fluree/reset-branch! conn "main" {:sha "abc123def"}
+  {:message "Reverting to stable release"})
 ```
 
 ### Cherry-picking Bug Fixes
