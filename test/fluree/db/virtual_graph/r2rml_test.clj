@@ -260,7 +260,7 @@
           res @(fluree/query-connection @test-conn count-query)]
       (is (= [[5]] res) "COUNT should return 5 orders"))))
 
-(deftest ^:pending r2rml-literal-value-filtering-test
+(deftest r2rml-literal-value-filtering-test
   (testing "R2RML supports filtering by literal values in WHERE clauses"
     ;; This test demonstrates filtering orders by status="completed" 
     ;; where "completed" is a literal string value, not a variable binding

@@ -92,30 +92,6 @@
           result)
         {}))))
 
-(defn- clause->sparql
-  "Very minimal conversion from a where clause vector of triples into a SPARQL BGP string."
-  [clause]
-  (let [triple->s (fn [[s p o]]
-                    (let [fmt (fn [m]
-                                (cond
-                                  (where/matched-iri? m) (str "<" (where/get-iri m) ">")
-                                  (where/matched-value? m) (pr-str (where/get-value m))
-                                  :else (name (where/get-variable m))))]
-                      (str (fmt s) " " (fmt p) " " (fmt o) " .")))]
-    (->> clause (map triple->s) (str/join "\n"))))
-
-(defn- solution->bindings
-  [solution]
-  (->> solution
-       (map (fn [[k v]]
-              (when (and (symbol? k) (where/matched? v))
-                (let [var (if (-> k name (str/starts-with? "?")) (name k) (str "?" (name k)))
-                      val (or (where/get-iri v)
-                              (where/get-value v))]
-                  [var [val]]))))
-       (remove nil?)
-       (into {})))
-
 (defn- jdbc-spec
   [rdb]
   (let [jdbc-url (or (:jdbcUrl rdb) (get rdb "jdbcUrl"))
@@ -126,22 +102,6 @@
       driver (assoc :classname driver)
       user (assoc :user user)
       password (assoc :password password))))
-
-(defn- row->solution
-  [solution row]
-  (reduce (fn [sol [k v]]
-            (let [k-str (name k)
-                  var-sym (symbol (if (str/starts-with? k-str "?") k-str (str "?" k-str)))]
-              (assoc sol var-sym (where/match-value where/unmatched v))))
-          solution
-          row))
-
-(defn- find-mapping-for-predicate
-  [mappings predicate]
-  (some (fn [[_ mapping]]
-          (when (get-in mapping [:predicates predicate])
-            mapping))
-        mappings))
 
 (defn- analyze-clause-for-mapping
   "Analyze the clause to determine which mapping(s) to use based on predicates or types."
@@ -156,21 +116,21 @@
                                              [_ p o] triple]
                                          (and (map? p)
                                               (= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-                                                 (get p :fluree.db.query.exec.where/iri))
+                                                 (get p ::where/iri))
                                               (or (string? o)
-                                                  (and (map? o) (get o :fluree.db.query.exec.where/iri))))))
+                                                  (and (map? o) (get o ::where/iri))))))
                                      clause))
           rdf-type (when type-triple
                      (let [triple (if (= :class (first type-triple))
                                     (second type-triple)
                                     type-triple)
                            o (nth triple 2)]
-                       (if (string? o) o (get o :fluree.db.query.exec.where/iri))))
+                       (if (string? o) o (get o ::where/iri))))
           ;; Extract predicates from the clause - the clause is a list of triples [s p o]
-          ;; where predicate is a map with :fluree.db.query.exec.where/iri key
+          ;; where predicate is a map with ::where/iri key
           predicate-maps (filter map? (map second clause))
           predicates (->> predicate-maps
-                          (map :fluree.db.query.exec.where/iri) ; Extract the IRI using the correct namespaced key
+                          (map ::where/iri) ; Extract the IRI using the correct namespaced key
                           (set))
           relevant-mappings (if rdf-type
                              ;; Find mapping by class
@@ -187,6 +147,184 @@
         (first relevant-mappings)
         (first (vals mappings))))))
 
+(defn- extract-predicate-bindings
+  "Extract predicate IRI to variable mappings from a query clause (excluding rdf:type)."
+  [clause]
+  (->> clause
+       (map (fn [[_ p o]]
+              (when (and (map? p) (map? o) (get o ::where/var))
+                [(get p ::where/iri)
+                 (get o ::where/var)])))
+       (remove nil?)
+       (into {})))
+
+(defn- extract-predicate-bindings-full
+  "Extract all predicate IRI to variable mappings including rdf:type handling."
+  [clause]
+  (->> clause
+       (map (fn [item]
+              (let [[_ p o] (if (= :class (first item))
+                              (second item)
+                              item)]
+                (cond
+                  ;; Handle rdf:type queries where o is a constant IRI
+                  (and (map? p)
+                       (= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                          (get p ::where/iri))
+                       (map? o)
+                       (get o ::where/iri))
+                  ;; Don't add to var-mappings, will be handled separately
+                  nil
+                  ;; Handle rdf:type queries where o is a variable
+                  (and (map? p)
+                       (= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                          (get p ::where/iri))
+                       (map? o)
+                       (get o ::where/var))
+                  [(get p ::where/iri)
+                   (get o ::where/var)]
+                  ;; Handle regular predicate-variable pairs
+                  (and (map? p) (map? o) (get o ::where/var))
+                  [(get p ::where/iri)
+                   (get o ::where/var)]
+                  :else nil))))
+       (remove nil?)
+       (into {})))
+
+(defn- extract-literal-filters
+  "Extract predicate IRI to literal value mappings for WHERE clause generation."
+  [clause]
+  (->> clause
+       (map (fn [item]
+              (let [[_ p o] (if (= :class (first item))
+                              (second item)
+                              item)]
+                (when (and (map? p)
+                           (get p ::where/iri)
+                           (map? o)
+                           (get o ::where/val))
+                  [(get p ::where/iri)
+                   (get o ::where/val)]))))
+       (remove nil?)
+       (into {})))
+
+(defn- extract-subject-variable
+  "Extract the subject variable from a query clause item."
+  [item]
+  (cond
+    ;; Handle JSON-LD patterns
+    (map? item)
+    (let [id (get item "@id")]
+      (when (and (string? id) (str/starts-with? id "?"))
+        id))
+    ;; Handle :class wrapper format [:class [s p o]]
+    (and (vector? item) (= :class (first item)) (vector? (second item)))
+    (let [triple (second item)
+          subject (first triple)]
+      (when (and (map? subject) (get subject ::where/var))
+        (get subject ::where/var)))
+    ;; Handle regular triple patterns [s p o]
+    (vector? item)
+    (let [subject (first item)]
+      (when (and (map? subject) (get subject ::where/var))
+        (get subject ::where/var)))))
+
+(defn- extract-type-variable
+  "Extract the type variable from a clause item (for rdf:type queries)."
+  [item]
+  (let [[_ p o] (if (= :class (first item))
+                  (second item)
+                  item)]
+    (when (and (map? p)
+               (= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                  (get p ::where/iri))
+               (map? o)
+               (get o ::where/var))
+      (get o ::where/var))))
+
+(defn- get-column-value
+  "Get column value from row, trying different case variations."
+  [row col]
+  (or
+   ;; Try exact match first
+   (get row (keyword col))
+   ;; Try lowercase
+   (get row (keyword (str/lower-case col)))
+   ;; Try uppercase
+   (get row (keyword (str/upper-case col)))
+   ;; Try with underscores converted
+   (get row (keyword (str/replace (str/lower-case col) "_" "-")))
+   (get row (keyword (str/replace (str/upper-case col) "_" "-")))))
+
+(defn- value->rdf-match
+  "Convert a raw value to an RDF match object with appropriate datatype."
+  [value var-sym]
+  (if value
+    (cond
+      (instance? java.sql.Timestamp value)
+      (where/match-value {} (.toString ^java.sql.Timestamp value) const/iri-xsd-dateTime)
+      (instance? java.util.Date value)
+      (where/match-value {} (.toString ^java.util.Date value) const/iri-xsd-dateTime)
+      (decimal? value)
+      (where/match-value {} value const/iri-xsd-decimal)
+      (integer? value)
+      (where/match-value {} value const/iri-xsd-integer)
+      :else
+      (where/match-value {} value const/iri-string))
+    (where/unmatched-var var-sym)))
+
+(defn- generate-column-alias
+  "Generate SQL column alias from variable name or predicate IRI."
+  [var-name pred]
+  (or (when var-name
+        (subs (name var-name) 1))
+      (-> pred
+          (str/split #"/")
+          last
+          (str/replace #"[#:-]" "_"))))
+
+(defn- build-select-columns
+  "Build SELECT column list with aliases for the given predicates."
+  [predicates pred->var clause-predicates]
+  (str/join ", "
+            (for [pred clause-predicates
+                  :when (get predicates pred)
+                  :let [{:keys [column]} (get predicates pred)
+                        var-name (get pred->var pred)
+                        sql-alias (generate-column-alias var-name pred)]
+                  :when column]
+              (str column " AS " sql-alias))))
+
+(defn- build-where-clause
+  "Build WHERE clause from literal filter conditions."
+  [predicates pred->literal]
+  (let [conditions (for [[pred-iri literal-val] pred->literal
+                         :when (get predicates pred-iri)
+                         :let [{:keys [column]} (get predicates pred-iri)]]
+                     (if (string? literal-val)
+                       (format "%s = '%s'" column literal-val)
+                       (format "%s = %s" column literal-val)))]
+    (when (seq conditions)
+      (str " WHERE " (str/join " AND " conditions)))))
+
+(defn- combine-select-columns
+  "Combine selected columns with template columns for final SELECT clause."
+  [select-cols template-cols id-col]
+  (let [template-col-selects (when template-cols
+                               (str/join ", " template-cols))]
+    (cond
+      (and (empty? select-cols) template-col-selects)
+      template-col-selects
+
+      (and (seq select-cols) template-col-selects)
+      (str select-cols ", " template-col-selects)
+
+      (empty? select-cols)
+      (str id-col " AS id")
+
+      :else
+      (str/join ", " (conj (vec (str/split select-cols #", ")) (str id-col " AS id"))))))
+
 (defn- sql-for-mapping
   [mapping clause]
   (if (nil? mapping)
@@ -195,72 +333,28 @@
           predicates (:predicates mapping)
           template-cols (extract-template-cols (:subject-template mapping))
           id-col (or (first template-cols) "id")
-          ;; Map predicate IRI -> variable name from the clause
-          pred->var (->> clause
-                         (map (fn [[_ p o]]
-                                (when (and (map? p) (map? o))
-                                  [(get p :fluree.db.query.exec.where/iri)
-                                   (get o :fluree.db.query.exec.where/var)])))
-                         (remove nil?)
-                         (into {}))
-          ;; Extract predicates from the clause to determine what to select
-          clause-predicates (->> pred->var keys set)
-          ;; Find columns for predicates that exist in both clause and mapping
-          select-cols (str/join ", "
-                                (for [pred clause-predicates
-                                      :when (get predicates pred)
-                                      :let [{:keys [column]} (get predicates pred)
-                                            var-name (get pred->var pred)
-                                            alias (when var-name
-                                                    (subs (name var-name) 1))
-                                            fallback-alias (-> pred (str/split #"/") last)
-                                            sql-alias (or alias
-                                                          (-> fallback-alias
-                                                              (str/replace #"#" "_")
-                                                              (str/replace #"-" "_")
-                                                              (str/replace #":" "_")))]
-                                      :when column]
-                                  (str column " AS " sql-alias)))]
-      ;; Always select template columns so we can build the subject URI
-      (let [template-col-selects (when template-cols
-                                   (str/join ", " template-cols))
-            all-selects (cond
-                          (and (empty? select-cols) template-col-selects)
-                          template-col-selects
 
-                          (and (not (empty? select-cols)) template-col-selects)
-                          (str select-cols ", " template-col-selects)
+          ;; Extract variable bindings and literal filters
+          pred->var (extract-predicate-bindings clause)
+          pred->literal (extract-literal-filters clause)
 
-                          (empty? select-cols)
-                          (str id-col " AS id")
+          ;; Build SELECT and WHERE clauses
+          clause-predicates (set (keys pred->var))
+          select-cols (build-select-columns predicates pred->var clause-predicates)
+          all-selects (combine-select-columns select-cols template-cols id-col)
+          where-clause (build-where-clause predicates pred->literal)
 
-                          :else
-                          (str/join ", " (conj (vec (str/split select-cols #", ")) (str id-col " AS id"))))]
-        (format "SELECT %s FROM %s"
-                all-selects
-                (str/upper-case table))))))
+          ;; Generate final SQL
+          final-sql (format "SELECT %s FROM %s%s"
+                            all-selects
+                            (str/upper-case table)
+                            (or where-clause ""))]
 
-(defn- sql-for-predicates
-  [mappings predicates]
-  (let [table-mappings (->> predicates
-                            (map (fn [pred] (find-mapping-for-predicate mappings pred)))
-                            (remove nil?)
-                            (group-by :table))
-        sqls (->> table-mappings
-                  (map (fn [[table table-maps]]
-                         (let [table-map (first table-maps)
-                               relevant-preds (->> predicates
-                                                   (filter (fn [pred]
-                                                             (get-in table-map [:predicates pred]))))
-                               select-cols (->> relevant-preds
-                                                (map (fn [pred]
-                                                       (let [{:keys [column]} (get-in table-map [:predicates pred])
-                                                             alias (-> pred (str/split #"/") last)]
-                                                         (str column " AS " alias))))
-                                                (str/join ", "))]
-                           (format "SELECT %s FROM %s" select-cols (str/upper-case table)))))
-                  (str/join " UNION ALL "))]
-    sqls))
+      (when (seq pred->literal)
+        (log/debug "Literal filters:" pred->literal)
+        (log/debug "Generated SQL:" final-sql))
+
+      final-sql)))
 
 (defrecord R2RMLDatabase [alias config mapping-spec datasource]
   vg/UpdatableVirtualGraph
@@ -299,57 +393,9 @@
                 rows (jdbc/query db-spec [sql])
                 template (:subject-template mapping)
                 ;; Extract variable mappings from clause: [s p o] where p is predicate and o is variable
-                var-mappings (->> clause
-                                  (map (fn [item]
-                                         (let [[s p o] (if (= :class (first item))
-                                                         (second item)
-                                                         item)]
-                                           (cond
-                                             ;; Handle rdf:type queries where o is a constant IRI
-                                             (and (map? p)
-                                                  (= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-                                                     (get p :fluree.db.query.exec.where/iri))
-                                                  (map? o)
-                                                  (get o :fluree.db.query.exec.where/iri))
-                                             ;; Don't add to var-mappings, will be handled separately
-                                             nil
-                                             ;; Handle rdf:type queries where o is a variable
-                                             (and (map? p)
-                                                  (= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-                                                     (get p :fluree.db.query.exec.where/iri))
-                                                  (map? o)
-                                                  (get o :fluree.db.query.exec.where/var))
-                                             [(get p :fluree.db.query.exec.where/iri)
-                                              (get o :fluree.db.query.exec.where/var)]
-                                             ;; Handle regular predicate-variable pairs
-                                             (and (map? p) (map? o) (get o :fluree.db.query.exec.where/var))
-                                             [(get p :fluree.db.query.exec.where/iri)
-                                              (get o :fluree.db.query.exec.where/var)]
-                                             :else nil))))
-                                  (remove nil?)
-                                  (into {}))
-                ;; Extract subject variable from clause - handle both formats:
-                ;; 1. JSON-LD: {"@id" "?var" ...}  
-                ;; 2. Triple patterns: [s p o] or [:class [s p o]]
-                subject-var (some (fn [item]
-                                    (cond
-                                     ;; Handle JSON-LD patterns
-                                      (map? item)
-                                      (let [id (get item "@id")]
-                                        (when (and (string? id) (str/starts-with? id "?"))
-                                          id))
-                                     ;; Handle :class wrapper format [:class [s p o]]
-                                      (and (vector? item) (= :class (first item)) (vector? (second item)))
-                                      (let [triple (second item)
-                                            subject (first triple)]
-                                        (when (and (map? subject) (get subject :fluree.db.query.exec.where/var))
-                                          (get subject :fluree.db.query.exec.where/var)))
-                                     ;; Handle regular triple patterns [s p o]
-                                      (vector? item)
-                                      (let [subject (first item)]
-                                        (when (and (map? subject) (get subject :fluree.db.query.exec.where/var))
-                                          (get subject :fluree.db.query.exec.where/var)))))
-                                  clause)
+                var-mappings (extract-predicate-bindings-full clause)
+                ;; Extract subject variable from clause
+                subject-var (some extract-subject-variable clause)
                 _ nil]
             ;; Process all rows - stream each as a solution
             (doseq [row rows]
@@ -358,34 +404,14 @@
                                  (let [template-cols (extract-template-cols template)]
                                    ;; Replace all template variables with their values
                                    (reduce (fn [tmpl col]
-                                             (let [;; Try different case variations since different DBs handle column names differently
-                                                   col-val (or
-                                                           ;; Try exact match first
-                                                            (get row (keyword col))
-                                                           ;; Try lowercase
-                                                            (get row (keyword (str/lower-case col)))
-                                                           ;; Try uppercase
-                                                            (get row (keyword (str/upper-case col)))
-                                                           ;; Try with underscores converted
-                                                            (get row (keyword (str/replace (str/lower-case col) "_" "-")))
-                                                            (get row (keyword (str/replace (str/upper-case col) "_" "-"))))]
+                                             (let [col-val (get-column-value row col)]
                                                (if col-val
                                                  (str/replace tmpl (str "{" col "}") (str col-val))
                                                  tmpl)))
                                            template
                                            template-cols)))
                     ;; Check if we need to add type variable
-                    type-var (some (fn [item]
-                                     (let [[s p o] (if (= :class (first item))
-                                                     (second item)
-                                                     item)]
-                                       (when (and (map? p)
-                                                  (= "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-                                                     (get p :fluree.db.query.exec.where/iri))
-                                                  (map? o)
-                                                  (get o :fluree.db.query.exec.where/var))
-                                         (get o :fluree.db.query.exec.where/var))))
-                                   clause)
+                    type-var (some extract-type-variable clause)
                     ;; Build solution map with proper match objects, merging with initial solution
                     solution-map (into (or solution {})
                                        (concat
@@ -411,19 +437,7 @@
                                                 value (or (get row (keyword (str/lower-case sql-alias)))
                                                           (get row (keyword sql-alias)))
                                                 var-sym (if (symbol? var-name) var-name (symbol var-name))]
-                                            [var-sym (if value
-                                                       (cond
-                                                         (instance? java.sql.Timestamp value)
-                                                         (where/match-value {} (.toString value) const/iri-xsd-dateTime)
-                                                         (instance? java.util.Date value)
-                                                         (where/match-value {} (.toString value) const/iri-xsd-dateTime)
-                                                         (decimal? value)
-                                                         (where/match-value {} value const/iri-xsd-decimal)
-                                                         (integer? value)
-                                                         (where/match-value {} value const/iri-xsd-integer)
-                                                         :else
-                                                         (where/match-value {} value const/iri-string))
-                                                       (where/unmatched-var var-sym))]))))]
+                                            [var-sym (value->rdf-match value var-sym)]))))]
                 ;; Use non-blocking put to stream solutions
                 (async/>!! out solution-map)))
             (async/close! out))
