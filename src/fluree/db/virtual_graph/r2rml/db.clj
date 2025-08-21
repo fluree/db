@@ -226,82 +226,6 @@
                 (str/join ", " (conj (vec (str/split select-cols #", ")) (str id-col " AS id"))))
               (str/upper-case table)))))
 
-(defn- detect-aggregate-functions
-  "Detect aggregate functions in the clause structure."
-  [clause]
-  (when (sequential? clause)
-    (->> clause
-         (mapcat (fn [triple]
-                   (when (and (sequential? triple) (= 3 (count triple)))
-                     (let [[_ _ obj] triple]
-                       (when (and (map? obj) (contains? obj :fluree.db.query.exec.where/var))
-                         (let [var-name (get obj :fluree.db.query.exec.where/var)]
-                           ;; Check if this looks like an aggregate variable (only exact matches, not containing)
-                           (when (and (string? var-name)
-                                      (re-find #"^(count|sum|avg|min|max)$" (str/lower-case var-name)))
-                             [{:function (str/lower-case (re-find #"(count|sum|avg|min|max)" (str/lower-case var-name)))
-                               :variable var-name}])))))))
-         (remove nil?)
-         (apply concat))))
-
-(defn- detect-aggregate-functions-from-select
-  "Detect aggregate functions from select variables."
-  [select-vars]
-  (->> select-vars
-       (map (fn [var]
-              (when (and (string? var)
-                         (re-find #"^(count|sum|avg|min|max)" (str/lower-case var)))
-                {:function (str/lower-case (re-find #"^(count|sum|avg|min|max)" (str/lower-case var)))
-                 :variable var})))
-       (remove nil?)))
-
-(defn- has-aggregate-select?
-  "Return true if any object variable looks like an aggregate function."
-  [clause]
-  (boolean
-   (some (fn [triple]
-           (when (and (sequential? triple) (= 3 (count triple)))
-             (let [[_ _ obj] triple
-                   var-name (when (map? obj) (get obj :fluree.db.query.exec.where/var))]
-               (when (string? var-name)
-                 (re-find #"^(count|sum|avg|min|max)" (str/lower-case var-name))))))
-         clause)))
-
-(defn- sql-for-mapping-with-aggregates
-  "Generate SQL with aggregate function support."
-  [mapping clause]
-  (if (nil? mapping)
-    "SELECT 1 WHERE 1=0"
-    (let [table (:table mapping)
-          predicates (:predicates mapping)
-          ;; Extract aggregate functions from the clause
-          aggregate-functions (mapcat
-                               (fn [triple]
-                                 (when (and (sequential? triple) (= 3 (count triple)))
-                                   (let [[_ _ obj] triple
-                                         var-name (when (map? obj) (get obj :fluree.db.query.exec.where/var))]
-                                     (when (and (string? var-name)
-                                                (re-find #"^(count|sum|avg|min|max)" (str/lower-case var-name)))
-                                       (cond
-                                         (= var-name "?count") [{:function "COUNT" :column "*" :alias "count"}]
-                                         (= var-name "?total") [{:function "SUM" :column "total_amount" :alias "total"}]
-                                         (= var-name "?average") [{:function "AVG" :column "total_amount" :alias "average"}]
-                                         (= var-name "?min") [{:function "MIN" :column "total_amount" :alias "min"}]
-                                         (= var-name "?max") [{:function "MAX" :column "total_amount" :alias "max"}]
-                                         (= var-name "?avgPrice") [{:function "AVG" :column "price" :alias "avgPrice"}]
-                                         (= var-name "?totalStock") [{:function "SUM" :column "stock_quantity" :alias "totalStock"}]
-                                         :else [])))))
-                               clause)
-          ;; Generate SQL for aggregates
-          aggregate-cols (if (seq aggregate-functions)
-                           (str/join ", "
-                                     (for [{:keys [function column alias]} aggregate-functions]
-                                       (format "%s(%s) AS %s" function column alias)))
-                           "1")]
-      (format "SELECT %s FROM %s"
-              aggregate-cols
-              (str/upper-case table)))))
-
 (defn- sql-for-predicates
   [mappings predicates]
   (let [table-mappings (->> predicates
@@ -357,11 +281,7 @@
                 mappings (parse-min-r2rml mapping-file)
                 ;; Analyze clause to determine which mapping to use
                 mapping (analyze-clause-for-mapping clause mappings)
-                ;; Check if this is an aggregate query
-                has-aggregates (has-aggregate-select? clause)
-                sql (if has-aggregates
-                      (sql-for-mapping-with-aggregates mapping clause)
-                      (sql-for-mapping mapping clause))
+                sql (sql-for-mapping mapping clause)
                 rows (jdbc/query db-spec [sql])
                 template (:subject-template mapping)
                 ;; Extract variable mappings from clause: [s p o] where p is predicate and o is variable
@@ -372,50 +292,61 @@
                                             (get o :fluree.db.query.exec.where/var)])))
                                   (remove nil?)
                                   (into {}))
-                ]
-            ;; Process all rows
+                ;; Extract subject variable from clause - handle both formats:
+                ;; 1. JSON-LD: {"@id" "?var" ...}  
+                ;; 2. Triple patterns: [s p o] or [:class [s p o]]
+                subject-var (some (fn [item]
+                                    (cond
+                                     ;; Handle JSON-LD patterns
+                                      (map? item)
+                                      (let [id (get item "@id")]
+                                        (when (and (string? id) (str/starts-with? id "?"))
+                                          id))
+                                     ;; Handle :class wrapper format [:class [s p o]]
+                                      (and (vector? item) (= :class (first item)) (vector? (second item)))
+                                      (let [triple (second item)
+                                            subject (first triple)]
+                                        (when (and (map? subject) (get subject :fluree.db.query.exec.where/var))
+                                          (get subject :fluree.db.query.exec.where/var)))
+                                     ;; Handle regular triple patterns [s p o]
+                                      (vector? item)
+                                      (let [subject (first item)]
+                                        (when (and (map? subject) (get subject :fluree.db.query.exec.where/var))
+                                          (get subject :fluree.db.query.exec.where/var)))))
+                                  clause)
+                _ nil]
+            ;; Process all rows - stream each as a solution
             (doseq [row rows]
-              (let [;; For aggregates, the result structure is different
-                    solution-map (if has-aggregates
-                                   ;; Aggregate results: map based on SQL column aliases
-                                     (into {}
-                                           (for [[pred-iri var-name] var-mappings]
-                                             (let [var-sym (symbol var-name)
-                                                 ;; For aggregates, use the SQL column alias
-                                                   value (cond
-                                                        ;; Map common aggregate patterns
-                                                           (= var-name "?count") (get row :count)
-                                                           (= var-name "?total") (get row :total)
-                                                           (= var-name "?average") (get row :average)
-                                                           (= var-name "?min") (get row :min)
-                                                           (= var-name "?max") (get row :max)
-                                                           (= var-name "?avgPrice") (get row :avgPrice)
-                                                           (= var-name "?totalStock") (get row :totalStock)
-                                                           :else
-                                                           (get row (keyword var-name)))]
-                                               [var-sym (where/match-value {} (or value "") const/iri-string)])))
-                                   ;; Regular results: include subject ID
-                                     (let [id    (or (:id row) (get row :ID) (get row "ID"))
-                                           subject-id (when template
-                                                        (let [template-cols (extract-template-cols template)
-                                                              id-val (or (get row (keyword (first template-cols)))
-                                                                         (get row (keyword (str/upper-case (first template-cols)))))]
-                                                          (when (and template-cols id-val)
-                                                            (str/replace template (str "{" (first template-cols) "}") (str id-val)))))]
-                                       (into {(symbol "?s") (where/match-iri {} (or subject-id (str "http://example.com/id/" id)))}
-                                             (for [[pred-iri var-name] var-mappings]
-                                               (let [;; var-name is already a symbol like '?firstName
-                                                   ;; Convert to the SQL alias by removing the ?
-                                                     var-str (if (symbol? var-name) (name var-name) var-name)
-                                                     sql-alias (if (str/starts-with? var-str "?")
-                                                                 (subs var-str 1)
-                                                                 var-str)
-                                                   ;; Try both lowercase and as-is
-                                                     value (or (get row (keyword (str/lower-case sql-alias)))
-                                                               (get row (keyword sql-alias)))]
-                                                 [(if (symbol? var-name) var-name (symbol var-name))
-                                                  (where/match-value {} (or value "") const/iri-string)])))))]
-                  (async/>!! out solution-map)))
+              (let [id    (or (:id row) (get row :ID) (get row "ID"))
+                    subject-id (when template
+                                 (let [template-cols (extract-template-cols template)
+                                       id-val (or (get row (keyword (first template-cols)))
+                                                  (get row (keyword (str/upper-case (first template-cols)))))]
+                                   (when (and template-cols id-val)
+                                     (str/replace template (str "{" (first template-cols) "}") (str id-val)))))
+                    ;; Build solution map with proper match objects, merging with initial solution
+                    solution-map (into (or solution {})
+                                       (concat
+                                         ;; Add subject if we have one (use the variable from WHERE clause if present)
+                                        (when subject-var
+                                          (let [subj-symbol (if (symbol? subject-var) subject-var (symbol subject-var))
+                                                subj-iri (or subject-id (str "http://example.com/id/" (or id "unknown")))]
+                                            [[subj-symbol (where/match-iri {} subj-iri)]]))
+                                         ;; Add variable bindings from the clause
+                                        (for [[pred-iri var-name] var-mappings]
+                                          (let [var-str (if (symbol? var-name) (name var-name) var-name)
+                                                sql-alias (if (str/starts-with? var-str "?")
+                                                            (subs var-str 1)
+                                                            var-str)
+                                                 ;; Try both lowercase and as-is
+                                                value (or (get row (keyword (str/lower-case sql-alias)))
+                                                          (get row (keyword sql-alias)))
+                                                var-sym (if (symbol? var-name) var-name (symbol var-name))]
+                                            [var-sym (if value
+                                                       (where/match-value {} value const/iri-string)
+                                                       (where/unmatched-var var-sym))]))))]
+                ;; Use non-blocking put to stream solutions
+                (async/>!! out solution-map)))
             (async/close! out))
           (catch Exception e
             (async/>!! error-ch e)
