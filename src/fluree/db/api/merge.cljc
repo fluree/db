@@ -21,6 +21,7 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.nameservice.sub :as ns-subscribe]
             [fluree.db.query.range :as query-range]
+            [fluree.db.time-travel :as time-travel]
             [fluree.db.transact :as transact]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
@@ -603,10 +604,14 @@
           current-db (ledger/current-db ledger)]
       (cond
         (:t state-spec)
+        ;; Simply set the t value to travel back in time
+        ;; The commit info will still be from current, but that's OK
+        ;; We'll compute the changes needed based on the data state
         (assoc current-db :t (:t state-spec))
 
         (:sha state-spec)
-        (let [target-t (<? ((:sha->t current-db) current-db (:sha state-spec)))]
+        ;; Use the sha->t method from the TimeTravel protocol
+        (let [target-t (<? (time-travel/sha->t current-db (:sha state-spec)))]
           (assoc current-db :t target-t))
 
         :else
@@ -616,7 +621,7 @@
 (defn- safe-reset!
   "Creates a new commit that reverts the branch to a previous state.
   This is non-destructive - adds a new commit rather than rewriting history."
-  [conn branch-spec state-spec _opts]
+  [conn branch-spec state-spec opts]
   (go-try
     (let [ledger (<? (connection/load-ledger conn branch-spec))
           current-db (ledger/current-db ledger)
@@ -630,17 +635,94 @@
                         {:status 400 :error :db/no-op
                          :current-t current-t})))
 
-      ;; TODO: In a full implementation, we would:
-      ;; 1. Query the target state to get all data
-      ;; 2. Query the current state to get all data
-      ;; 3. Compute the delta (what to add and what to remove)
-      ;; 4. Create a transaction that applies these changes
-      ;; 5. Commit the transaction with appropriate message
+      (log/info "safe-reset!: current-t=" current-t "target-t=" target-t)
 
-      ;; For now, throw not-implemented
-      (throw (ex-info "Safe reset not yet fully implemented"
-                      {:status 501 :error :not-implemented
-                       :message "Safe reset requires delta computation between states"})))))
+      ;; Strategy: Get all commits from current back to genesis,
+      ;; find the ones after target-t, and reverse them
+      (let [;; Get ALL commits from current back to genesis (t=0)
+            all-commits (<? (extract-commits-since conn current-db nil))
+            _ (log/debug "safe-reset!: total-commits=" (count all-commits)
+                         "commit-ts=" (map #(get-in % [:data :t]) all-commits))
+
+            ;; Filter to get only commits after target-t (those we need to undo)
+            commits-to-undo (filter #(> (get-in % [:data :t]) target-t) all-commits)
+            _ (log/info "safe-reset!: all-commit-ts=" (map #(get-in % [:data :t]) all-commits)
+                        "target-t=" target-t
+                        "commits-to-undo=" (count commits-to-undo)
+                        "undo-ts=" (map #(get-in % [:data :t]) commits-to-undo))
+
+            ;; Process commits to undo in REVERSE order (newest first)
+            ;; This ensures we undo the most recent changes first
+            commits-reversed (reverse commits-to-undo)]
+
+        (if (empty? commits-reversed)
+          ;; No commits to undo
+          {:status :success
+           :operation :reset
+           :branch branch-spec
+           :mode :safe
+           :reset-to (or (:sha state-spec) (str "t=" (:t state-spec)))
+           :from-t current-t
+           :to-t target-t
+           :commits-undone 0
+           :new-commit nil}
+
+          ;; Process each commit individually and flip its operations
+          ;; We need to process them in reverse order (newest first)
+          (let [;; Collect all namespaces we'll need
+                all-namespaces (<? (collect-commit-namespaces conn commits-reversed))
+                db-with-ns (prepare-target-db-namespaces current-db all-namespaces)
+
+                ;; Process each commit and collect its flakes
+                all-reversed-flakes (<? (async/go
+                                          (loop [acc []
+                                                 commits commits-reversed]
+                                            (if-let [commit (first commits)]
+                                              (let [;; Read this commit's data
+                                                    commit-flakes (<? (read-commit-data conn commit db-with-ns))
+                                                   ;; Get all flakes (asserted and retracted)
+                                                    all-flakes (concat (:asserted commit-flakes)
+                                                                       (:retracted commit-flakes))
+                                                   ;; Flip each flake's operation
+                                                    flipped (map flake/flip-flake all-flakes)]
+                                                (recur (into acc flipped)
+                                                       (rest commits)))
+                                              acc))))
+
+                _ (log/info "safe-reset!: total-reversed-flakes=" (count all-reversed-flakes))
+
+                ;; Stage and commit the reversed changes
+                final-db (if (seq all-reversed-flakes)
+                           (<? (stage-flakes current-db all-reversed-flakes
+                                             {:message (or (:message opts)
+                                                           (str "Reset branch to "
+                                                                (if (:sha state-spec)
+                                                                  (str "commit " (:sha state-spec))
+                                                                  (str "t=" (:t state-spec)))))
+                                              :author (or (:author opts) "system/reset")}))
+                           current-db)
+
+                new-commit-sha (when (seq all-reversed-flakes)
+                                 (let [commit-result (<? (transact/commit! ledger final-db
+                                                                           (assoc opts
+                                                                                  :message (or (:message opts)
+                                                                                               (str "Reset branch to "
+                                                                                                    (if (:sha state-spec)
+                                                                                                      (str "commit " (:sha state-spec))
+                                                                                                      (str "t=" (:t state-spec)))))
+                                                                                  :author (or (:author opts) "system/reset"))))]
+                                   (or (get-in commit-result [:commit :id])
+                                       (get-in final-db [:commit :id]))))]
+
+            {:status :success
+             :operation :reset
+             :branch branch-spec
+             :mode :safe
+             :reset-to (or (:sha state-spec) (str "t=" (:t state-spec)))
+             :from-t current-t
+             :to-t target-t
+             :commits-undone (count commits-to-undo)
+             :new-commit new-commit-sha}))))))
 
 ;; ============================================================================
 ;; Public API Functions

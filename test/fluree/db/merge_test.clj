@@ -1,5 +1,6 @@
 (ns fluree.db.merge-test
   (:require [babashka.fs :as fs]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]))
 
@@ -461,6 +462,148 @@
           (is (= ["Alice"] alice) "Alice should exist with correct name")
           (is (= ["12345"] bob) "Bob should exist with correct employee ID")
           (is (= ["67890"] charlie) "Charlie should exist with correct manager ID"))
+
+        (finally
+          @(fluree/disconnect conn))))))
+
+(deftest ^:integration reset-branch-test
+  (testing "Reset branch to previous state"
+    (let [conn @(fluree/connect-memory {})]
+      (try
+        ;; Create ledger with initial data
+        @(fluree/create conn "reset-test" {})
+
+        ;; First commit - add Alice
+        @(fluree/insert! conn "reset-test:main"
+                         {"@context" {"ex" "http://example.org/"}
+                          "@graph" [{"@id" "ex:alice"
+                                     "@type" "Person"
+                                     "ex:name" "Alice"
+                                     "ex:age" 30}]})
+
+        (let [db-after-alice @(fluree/load conn "reset-test:main")
+              t-after-alice (:t db-after-alice)]
+
+          ;; Second commit - add Bob
+          @(fluree/insert! conn "reset-test:main"
+                           {"@context" {"ex" "http://example.org/"}
+                            "@graph" [{"@id" "ex:bob"
+                                       "@type" "Person"
+                                       "ex:name" "Bob"
+                                       "ex:age" 25}]})
+
+          ;; Third commit - update Alice's age
+          @(fluree/update! conn "reset-test:main"
+                           {"@context" {"ex" "http://example.org/"}
+                            "where" {"@id" "ex:alice"
+                                     "ex:age" "?age"}
+                            "delete" {"@id" "ex:alice"
+                                      "ex:age" "?age"}
+                            "insert" {"@id" "ex:alice"
+                                      "ex:age" 31}})
+
+          ;; Verify current state has both Alice (age 31) and Bob
+          (let [current-db @(fluree/load conn "reset-test:main")
+                current-result @(fluree/query current-db {"@context" {"ex" "http://example.org/"}
+                                                          "select" ["?name" "?age"]
+                                                          "where" {"@id" "?id"
+                                                                   "ex:name" "?name"
+                                                                   "ex:age" "?age"}
+                                                          "order-by" "?name"})]
+            (is (= [["Alice" 31] ["Bob" 25]] current-result) "Current state should have Alice (31) and Bob"))
+
+          ;; Reset to after first commit (only Alice with age 30)
+          (let [reset-result @(fluree/reset-branch! conn "reset-test:main"
+                                                    {:t t-after-alice}
+                                                    {:message "Revert to initial state with only Alice"})]
+            (is (= :success (:status reset-result)) "Reset should succeed")
+            (is (= :safe (:mode reset-result)) "Should use safe mode")
+            (is (string? (:new-commit reset-result)) "Should create a new commit")
+
+            ;; Verify state after reset
+            (let [reset-db @(fluree/load conn "reset-test:main")
+                  reset-result @(fluree/query reset-db {"@context" {"ex" "http://example.org/"}
+                                                        "select" ["?name" "?age"]
+                                                        "where" {"@id" "?id"
+                                                                 "ex:name" "?name"
+                                                                 "ex:age" "?age"}})]
+              (is (= [["Alice" 30]] reset-result) "After reset should only have Alice with original age"))))
+
+        (finally
+          @(fluree/disconnect conn))))))
+
+(deftest ^:integration reset-branch-with-sha-test
+  (testing "Reset branch using commit SHA"
+    (let [conn @(fluree/connect-memory {})]
+      (try
+        ;; Create ledger with initial data
+        @(fluree/create conn "reset-sha-test" {})
+
+        ;; First commit - add initial data
+        @(fluree/insert! conn "reset-sha-test:main"
+                         {"@context" {"ex" "http://example.org/"}
+                          "@graph" [{"@id" "ex:project"
+                                     "@type" "Project"
+                                     "ex:name" "Initial Project"
+                                     "ex:status" "planning"}]})
+
+        (let [db-after-first @(fluree/load conn "reset-sha-test:main")
+              first-commit-id (get-in db-after-first [:commit :id])
+              ;; Extract just the SHA part if it has a prefix
+              ;; The SHA includes the 'b' prefix as part of base32 encoding
+              first-sha (if (str/starts-with? first-commit-id "fluree:commit:sha256:")
+                          (subs first-commit-id 21)
+                          first-commit-id)]
+
+          ;; Second commit - update status
+          @(fluree/update! conn "reset-sha-test:main"
+                           {"@context" {"ex" "http://example.org/"}
+                            "where" {"@id" "ex:project"
+                                     "ex:status" "?status"}
+                            "delete" {"@id" "ex:project"
+                                      "ex:status" "?status"}
+                            "insert" {"@id" "ex:project"
+                                      "ex:status" "in-progress"}})
+
+          ;; Third commit - add team member
+          @(fluree/insert! conn "reset-sha-test:main"
+                           {"@context" {"ex" "http://example.org/"}
+                            "@graph" [{"@id" "ex:alice"
+                                       "@type" "TeamMember"
+                                       "ex:name" "Alice"
+                                       "ex:role" "developer"}]})
+
+          ;; Verify current state
+          (let [current-db @(fluree/load conn "reset-sha-test:main")
+                project-status @(fluree/query current-db {"@context" {"ex" "http://example.org/"}
+                                                          "select" "?status"
+                                                          "where" {"@id" "ex:project"
+                                                                   "ex:status" "?status"}})
+                team-members @(fluree/query current-db {"@context" {"ex" "http://example.org/"}
+                                                        "select" "?name"
+                                                        "where" {"@type" "TeamMember"
+                                                                 "ex:name" "?name"}})]
+            (is (= ["in-progress"] project-status) "Project should be in-progress")
+            (is (= ["Alice"] team-members) "Should have Alice as team member"))
+
+          ;; Reset using SHA to first commit
+          (let [reset-result @(fluree/reset-branch! conn "reset-sha-test:main"
+                                                    {:sha first-sha}
+                                                    {:message "Reset to initial commit using SHA"})]
+            (is (= :success (:status reset-result)) "Reset with SHA should succeed")
+
+            ;; Verify state after reset
+            (let [reset-db @(fluree/load conn "reset-sha-test:main")
+                  project-status @(fluree/query reset-db {"@context" {"ex" "http://example.org/"}
+                                                          "select" "?status"
+                                                          "where" {"@id" "ex:project"
+                                                                   "ex:status" "?status"}})
+                  team-members @(fluree/query reset-db {"@context" {"ex" "http://example.org/"}
+                                                        "select" "?name"
+                                                        "where" {"@type" "TeamMember"
+                                                                 "ex:name" "?name"}})]
+              (is (= ["planning"] project-status) "Project should be back to planning status")
+              (is (empty? team-members) "Should have no team members after reset"))))
 
         (finally
           @(fluree/disconnect conn))))))
