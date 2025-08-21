@@ -144,6 +144,61 @@
         (finally
           @(fluree/disconnect conn))))))
 
+(deftest ^:integration squash-cancellation-test
+  (testing "Squash merge cancels out assert/retract pairs"
+    (let [conn @(fluree/connect-memory {})]
+      (try
+        ;; Create ledger with initial data
+        @(fluree/create conn "cancel-test" {})
+        @(fluree/insert! conn "cancel-test:main"
+                         {"@context" {"ex" "http://example.org/"}
+                          "@graph" [{"@id" "ex:alice"
+                                     "@type" "Person"
+                                     "ex:name" "Alice"}]})
+
+        ;; Create feature branch
+        @(fluree/create-branch! conn "cancel-test:feature" "cancel-test:main")
+
+        ;; In feature branch:
+        ;; Commit 1: Add skills to Alice
+        @(fluree/insert! conn "cancel-test:feature"
+                         {"@context" {"ex" "http://example.org/"}
+                          "@graph" [{"@id" "ex:alice"
+                                     "ex:skills" ["Java" "Python" "Rust"]}]})
+
+        ;; Commit 2: Remove some skills (including Rust)
+        @(fluree/update! conn "cancel-test:feature"
+                         {"@context" {"ex" "http://example.org/"}
+                          "delete" {"@id" "ex:alice"
+                                    "ex:skills" ["Java" "Rust"]}})
+
+        ;; Commit 3: Re-add Rust (and JavaScript)
+        @(fluree/insert! conn "cancel-test:feature"
+                         {"@context" {"ex" "http://example.org/"}
+                          "@graph" [{"@id" "ex:alice"
+                                     "ex:skills" ["Rust" "JavaScript"]}]})
+
+        ;; Squash merge feature into main
+        (let [merge-result @(fluree/rebase! conn "cancel-test:feature" "cancel-test:main"
+                                            {:squash? true})]
+          (is (= :success (:status merge-result)) "Squash merge should succeed"))
+
+        ;; Verify final state in main
+        ;; Java: asserted then retracted = cancelled out (should not exist)
+        ;; Rust: asserted, retracted, then asserted again = net assertion (should exist)
+        ;; Python: only asserted = should exist
+        ;; JavaScript: only asserted = should exist
+        (let [main-db @(fluree/load conn "cancel-test:main")
+              result @(fluree/query main-db {"@context" {"ex" "http://example.org/"}
+                                             "select" "?skill"
+                                             "where" {"@id" "ex:alice"
+                                                      "ex:skills" "?skill"}})]
+          (is (= #{"Python" "Rust" "JavaScript"} (set result))
+              "Should have Python, Rust, and JavaScript but not Java (cancelled out)"))
+
+        (finally
+          @(fluree/disconnect conn))))))
+
 (deftest ^:integration file-squash-merge-test
   (testing "Squash merge on file-backed storage"
     (fs/with-temp-dir [tmp-dir {:prefix "fluree-squash-test-"}]
