@@ -135,7 +135,10 @@
 
 (defn fluree-address?
   [x]
-  (str/starts-with? x fluree-address-prefix))
+  (if (string? x)
+    (str/starts-with? x fluree-address-prefix)
+    (throw (ex-info (str "Invalid ledger identifier: " (pr-str x))
+                    {:ledger-id x}))))
 
 (defn relative-ledger-alias?
   [ledger-alias]
