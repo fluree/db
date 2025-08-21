@@ -4,7 +4,6 @@
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
             [fluree.db.api.branch :as api.branch]
-            [fluree.db.api.merge :as api.merge]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.connection :as connection :refer [connection?]]
             [fluree.db.connection.config :as config]
@@ -13,6 +12,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.ledger :as ledger]
+            [fluree.db.merge :as merge]
             [fluree.db.nameservice.query :as ns-query]
             [fluree.db.query.api :as query-api]
             [fluree.db.query.fql.parse :as parse]
@@ -672,7 +672,7 @@
   ([conn from to opts]
    (validate-connection conn)
    (promise-wrap
-    (api.merge/merge! conn from to opts))))
+    (merge/merge! conn from to opts))))
 
 (defn rebase!
   "Strictly replays commits from source branch onto target branch.
@@ -713,7 +713,7 @@
   ([conn from to opts]
    (validate-connection conn)
    (promise-wrap
-    (api.merge/rebase! conn from to opts))))
+    (merge/rebase! conn from to opts))))
 
 (defn reset-branch!
   "Resets a branch to a previous state.
@@ -757,7 +757,7 @@
   ([conn branch to opts]
    (validate-connection conn)
    (promise-wrap
-    (api.merge/reset-branch! conn branch to opts))))
+    (merge/reset-branch! conn branch to opts))))
 
 ;; Legacy API - Deprecated, use rebase! instead
 (defn merge-branches!
@@ -808,23 +808,7 @@
   [conn branch1-spec branch2-spec]
   (validate-connection conn)
   (promise-wrap
-   (go-try
-     (let [ledger1 (<? (connection/load-ledger conn branch1-spec))
-           ledger2 (<? (connection/load-ledger conn branch2-spec))
-           db1 (ledger/current-db ledger1)
-           db2 (ledger/current-db ledger2)
-           ;; Get branch metadata for common ancestor detection
-           branch1-info (<? (ledger/branch-info ledger1))
-           branch2-info (<? (ledger/branch-info ledger2))
-           common-ancestor (<? (api.merge/find-lca conn db1 db2 branch1-info branch2-info))
-           ff-1-to-2 (<? (api.merge/can-fast-forward? conn db1 db2 branch1-info branch2-info))
-           ff-2-to-1 (<? (api.merge/can-fast-forward? conn db2 db1 branch2-info branch1-info))]
-       {:common-ancestor common-ancestor
-        :can-fast-forward (or ff-1-to-2 ff-2-to-1)
-        :fast-forward-direction (cond
-                                  ff-1-to-2 :branch1-to-branch2
-                                  ff-2-to-1 :branch2-to-branch1
-                                  :else nil)}))))
+   (merge/branch-divergence conn branch1-spec branch2-spec)))
 
 ;; db operations
 
