@@ -193,7 +193,7 @@
 (def ledger-specific-opts #{:policy-class :policy :policy-values})
 
 (defn ledger-opts-override
-  [{:keys [opts from from-named] :as q} {:keys [alias] :as db}]
+  [{:keys [opts] :as q} {:keys [alias] :as _db}]
   (let [ledger-opts (-> opts (get alias) (select-keys ledger-specific-opts))]
     (update q :opts merge ledger-opts)))
 
