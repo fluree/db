@@ -136,7 +136,7 @@
         active-cols (atom #{})
         next-col (atom 0)]
 
-    (doseq [[idx commit] (map-indexed vector commits)]
+    (doseq [[_ commit] (map-indexed vector commits)]
       (let [branches (set (:branches commit))
             commit-id (:id commit)
             short-id (if (str/includes? commit-id ":")

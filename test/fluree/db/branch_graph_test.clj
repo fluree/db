@@ -1,5 +1,6 @@
 (ns fluree.db.branch-graph-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.core.async :refer [<!!]]
+            [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.merge :as merge]))
 
@@ -34,8 +35,8 @@
                                      "title" "Feature commit"}]})
 
         (testing "JSON format graph"
-          (let [graph @(merge/branch-graph conn "graph-test" {:format :json
-                                                              :depth 10})]
+          (let [graph (<!! (merge/branch-graph conn "graph-test" {:format :json
+                                                                  :depth 10}))]
             (is (map? graph) "Graph should be a map")
             (is (contains? graph :branches) "Graph should have branches")
             (is (contains? graph :commits) "Graph should have commits")
@@ -50,8 +51,8 @@
                   "Feature branch should have created-from info"))))
 
         (testing "ASCII format graph"
-          (let [graph @(merge/branch-graph conn "graph-test" {:format :ascii
-                                                              :depth 5})]
+          (let [graph (<!! (merge/branch-graph conn "graph-test" {:format :ascii
+                                                                  :depth 5}))]
             (println "\n=== ASCII Graph Output ===")
             (println graph)
             (println "=========================\n")
@@ -61,8 +62,8 @@
             (is (re-find #"feature" graph) "ASCII graph should mention feature branch")))
 
         (testing "Branch filtering"
-          (let [graph @(merge/branch-graph conn "graph-test" {:format :json
-                                                              :branches #{"main"}})]
+          (let [graph (<!! (merge/branch-graph conn "graph-test" {:format :json
+                                                                  :branches #{"main"}}))]
             (is (= 1 (count (:branches graph))) "Should only have main branch")
             (is (contains? (:branches graph) "main") "Should have main branch")))
 
