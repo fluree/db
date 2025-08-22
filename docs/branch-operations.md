@@ -8,10 +8,11 @@ Fluree provides Git-like branch operations for managing database version control
 
 | Function | Status | Description |
 |----------|--------|-------------|
-| `rebase!` | ✅ Implemented | Fast-forward and squash modes working |
+| `merge!` | ✅ Implemented | Fast-forward and squash modes working |
+| `rebase!` | ⚠️ Partial | Squash mode only (commit-by-commit replay not yet) |
 | `branch-divergence` | ✅ Implemented | Check if branches can fast-forward |
-| `merge!` | ❌ Not Implemented | Returns not-implemented error |
-| `reset-branch!` | ✅ Implemented | Safe reset mode fully working |
+| `reset-branch!` | ⚠️ Partial | Safe mode only (hard reset not yet) |
+| `branch-graph` | ✅ Implemented | JSON and ASCII graph visualization |
 
 ### Core Concepts
 
@@ -27,22 +28,34 @@ Fluree provides Git-like branch operations for managing database version control
 
 ```clojure
 (require '[fluree.db.api :as fluree])
+(require '[fluree.db.merge :as merge])
+(require '[clojure.core.async :refer [<!!]])
 
 ;; Connect to your database
 (def conn @(fluree/connect {...}))
 
+;; MERGE: Update target branch with source changes
 ;; Simple case: Fast-forward when no divergence
-@(fluree/rebase! conn "mydb:feature" "mydb:main")
+@(fluree/merge! conn "mydb:feature" "mydb:main")
 
 ;; When branches have diverged: Squash commits
-@(fluree/rebase! conn "mydb:feature" "mydb:main" 
+@(fluree/merge! conn "mydb:feature" "mydb:main" 
   {:squash? true
    :message "Feature complete: Add user authentication"})
+
+;; REBASE: Update source branch by replaying onto target
+;; Note: This updates the feature branch, not main!
+@(fluree/rebase! conn "mydb:feature" "mydb:main"
+  {:squash? true
+   :message "Rebase feature onto latest main"})
 
 ;; Check if fast-forward is possible before operating
 (def divergence @(fluree/branch-divergence conn "mydb:feature" "mydb:main"))
 (when (:can-fast-forward divergence)
   (println "Fast-forward is possible!"))
+
+;; Visualize branch relationships
+(println (<!! (merge/branch-graph conn "mydb" {:format :ascii})))
 ```
 
 ### Design Principles
@@ -71,9 +84,9 @@ Before performing branch operations, it's helpful to understand how branches rel
 
 ## Operations
 
-### 1. REBASE - Atomic Strict Replay
+### 1. MERGE - Updates Target Branch with Source Changes
 
-Replays commits from source branch onto target branch. Currently supports:
+Merges commits from source branch into target branch. Currently supports:
 - **Fast-forward** when target branch is behind source (no divergence)
 - **Squash** to combine all source commits into a single commit on target
 
@@ -91,8 +104,8 @@ When using `squash? true`, Fluree:
 This means that if you assert a value in one commit and retract it in another, they cancel out and disappear from the squashed result.
 
 Future support planned for:
-- Cherry-pick specific commits
-- Non-atomic mode (apply commits until conflict)
+- Regular 3-way merge (without squash)
+- Schema-aware conflict resolution when validation is added
 
 #### Options
 
@@ -100,101 +113,61 @@ Future support planned for:
 |--------|------|---------|-------------|
 | `ff` | keyword | `:auto` | Fast-forward behavior: `:auto`, `:only`, `:never` |
 | `squash?` | boolean | `false` | Combine all commits into one |
-| `atomic?` | boolean | `true` | All-or-nothing vs. apply-until-conflict |
-| `from` | int/string/nil | `nil` | Starting commit (t-value or SHA) |
-| `to` | int/string/keyword/nil | `nil` | Ending commit (t-value, SHA, or `:conflict`) |
-| `commits` | vector/nil | `nil` | Specific commits to cherry-pick |
 | `message` | string | auto-generated | Commit message for the new commit |
 | `preview?` | boolean | `false` | Dry run without making changes |
 
 **Note on `:message`:**
-- The `:message` option sets the commit message for the new commit created by the rebase
-- If not provided, auto-generates: `"Squash rebase from <source-branch>"` or `"Fast-forward from <source-branch>"`
+- The `:message` option sets the commit message for the new commit created by the merge
+- If not provided, auto-generates: `"Squash merge from <source-branch>"` or similar
 - This is stored as the commit's message property (separate from annotation)
 - For fast-forward operations, no new commit is created so the message is not used
 
-##### Commit Selection (Future Feature)
-When implemented, you'll be able to select specific commits:
-- **Default** (no options): All commits after LCA
-- **Range by t-value**: `{:from 42 :to 44}` - Include commits from t=42 to t=44
-- **Range by SHA**: `{:from "sha1" :to "sha2"}` - Include commits from sha1 to sha2
-- **Until conflict**: `{:from 42 :to :conflict}` - Apply from t=42 until first conflict
-- **Cherry-pick specific**: `{:commits [42 43 45]}` or `{:commits ["sha1" "sha2"]}`
-
-**Note**: Type determines interpretation - integers are t-values, strings are SHAs
-
 #### Examples
 
-##### Standard Rebase (Auto fast-forward when possible)
+##### Standard Merge (Auto fast-forward when possible)
 ```clojure
 ;; Automatically fast-forwards if possible, otherwise fails
-(fluree/rebase! conn "ledger:feature" "ledger:main")
+(fluree/merge! conn "ledger:feature" "ledger:main")
 ```
 
-##### Squash Rebase
+##### Squash Merge
 ```clojure
 ;; Combines all commits from feature branch into single commit on main
-(fluree/rebase! conn "ledger:feature" "ledger:main"
+(fluree/merge! conn "ledger:feature" "ledger:main"
   {:squash? true
    :message "Feature X implementation"})
 ```
 
-##### Cherry-pick Specific Commits (Not Yet Implemented)
-```clojure
-;; This will be the API when implemented:
-
-;; Cherry-pick by SHA
-(fluree/rebase! conn "ledger:feature" "ledger:main"
-  {:commits ["sha1" "sha2"]
-   :atomic? false})  ; Continue past conflicts
-
-;; Or cherry-pick by t-value
-(fluree/rebase! conn "ledger:feature" "ledger:main"
-  {:commits [42 45 47]})
-
-;; Or select a range
-(fluree/rebase! conn "ledger:feature" "ledger:main"
-  {:from 42 :to 50})  ; All commits from t=42 to t=50
-
-;; Or until conflict
-(fluree/rebase! conn "ledger:feature" "ledger:main"
-  {:from 42 :to :conflict})  ; Apply from t=42 until first conflict
-```
-
 ##### Fast-forward Only
 ```clojure
-(fluree/rebase! conn "ledger:feature" "ledger:main"
+(fluree/merge! conn "ledger:feature" "ledger:main"
   {:ff :only})  ; Fail if fast-forward not possible
 ```
 
 #### Response
 
 ```clojure
-{:status :success  ; or :conflict, :error
- :operation :rebase
+{:status :success  ; or :error
+ :operation :merge
  :from "ledger:feature"
  :to "ledger:main" 
- :strategy "fast-forward"  ; or "squash", "replay"
- :commits {:applied ["sha1" "sha2"]  ; commits that were applied
-           :skipped []  ; commits skipped (future feature)
-           :conflicts []}  ; conflicting commits (if any)
- :new-commit "sha-of-new-commit"}  ; nil for fast-forward (just moves pointer)
+ :strategy "fast-forward"  ; or "squash"
+ :commits {:merged 3}  ; number of commits merged
+ :new-commit "sha-of-new-commit"}  ; for squash merge
 ```
 
 #### Implementation Status
 **Currently Implemented:**
 - Fast-forward (`:ff :auto`, `:ff :only`, `:ff :never`)
 - Squash (`:squash? true`)
-- Conflict detection for overlapping changes
 
 **Not Yet Implemented:**
-- Cherry-pick (`:from`, `:to`, `:commits` options)
-- Non-atomic mode (`:atomic? false`)
-- Commit-by-commit replay without squash
+- Regular 3-way merge (without squash)
+- Conflict detection and resolution (will come with SHACL/policy validation)
 
 ---
 
-### 2. RESET - Safe Rollback or Hard Reset
+### 3. RESET - Safe Rollback or Hard Reset
 
 Resets a branch to a previous state.
 
@@ -273,48 +246,57 @@ Resets a branch to a previous state.
 
 ---
 
-### 3. MERGE - Three-way Delta Merge (Future API)
+### 2. REBASE - Replays Source Branch onto Target
 
-**⚠️ NOT YET IMPLEMENTED** - This section describes the planned future API for reference.
+Rebases source branch onto target branch by replaying source commits on top of target. The **source branch is updated** with new commits, while the target branch remains unchanged.
 
-Will compute deltas from the Last Common Ancestor (LCA) for both branches, auto-merge based on a conflict policy, and create a merge commit on the target branch. Will reject if there are unresolved conflicts.
+**Note:** This is true git-style rebase where the source branch is modified, not the target.
 
 #### Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `conflict-policy` | keyword/function | `:conservative` | How to handle conflicts |
+| `squash?` | boolean | `false` | Combine all commits into one |
+| `message` | string | auto-generated | Commit message for the new commit |
 | `preview?` | boolean | `false` | Dry run without making changes |
 
-##### Conflict Policies
-- `:conservative` - Reject on any conflict (default)
-- `:ours` - Keep changes from target branch
-- `:theirs` - Keep changes from source branch
-- `:last-write-wins` - Use the most recent change based on timestamp
-- `:schema-aware` - Use schema rules to resolve conflicts
-- `function` - Custom conflict resolution function
+#### Examples
 
-#### Example
-
+##### Squash Rebase
 ```clojure
-;; This will be the API when implemented:
-(fluree/merge! conn "ledger:feature" "ledger:main"
-  {:conflict-policy :conservative
-   :preview? false})
+;; Rebases feature branch ONTO main (feature gets main's commits, main unchanged)
+(fluree/rebase! conn "ledger:feature" "ledger:main"
+  {:squash? true
+   :message "Rebase feature onto main"})
+```
+
+##### Preview Mode
+```clojure
+;; See what would happen without making changes
+(fluree/rebase! conn "ledger:feature" "ledger:main"
+  {:squash? true
+   :preview? true})
 ```
 
 #### Response
 
 ```clojure
-{:status :success  ; or :conflict, :error
- :operation :merge
+{:status :success  ; or :error
+ :operation :rebase
  :from "ledger:feature"
  :to "ledger:main"
- :strategy "3-way"
- :commits {:merged ["sha1" "sha2"]
-           :conflicts []}
- :new-commit "sha-of-merge-commit"}
+ :strategy "squash"  ; or "replay" when implemented
+ :commits {:rebased 3}  ; number of commits rebased
+ :new-commit "sha-of-new-commit"}
 ```
+
+#### Implementation Status
+**Currently Implemented:**
+- Squash rebase (`:squash? true`)
+
+**Not Yet Implemented:**
+- Commit-by-commit replay (without squash)
+- Cherry-pick specific commits
 
 ---
 
@@ -398,9 +380,9 @@ For conflicts:
 
 (if (:can-fast-forward div)
   ;; Simple fast-forward
-  @(fluree/rebase! conn "ledger:feature-x" "ledger:main")
+  @(fluree/merge! conn "ledger:feature-x" "ledger:main")
   ;; Squash for clean history
-  @(fluree/rebase! conn "ledger:feature-x" "ledger:main" 
+  @(fluree/merge! conn "ledger:feature-x" "ledger:main" 
     {:squash? true
      :message "Add feature X with complete implementation"}))
 ```
@@ -410,15 +392,14 @@ For conflicts:
 When branches have modified the same data:
 
 ```clojure
-;; Attempt rebase
-(def result @(fluree/rebase! conn "feature" "main" {:squash? true}))
+;; Attempt merge
+(def result @(fluree/merge! conn "feature" "main" {:squash? true}))
 
-;; Check for conflicts
-(when (= :conflict (:status result))
-  (println "Conflict detected!")
-  (println "Conflicting commits:" (get-in result [:commits :conflicts]))
-  ;; Currently, manual resolution required - merge the data in your application
-  ;; Then create a new commit with resolved data)
+;; Check for errors
+(when (= :error (:status result))
+  (println "Error:" (:message result))
+  ;; Handle the error based on :error key
+  )
 ```
 
 ## Best Practices
@@ -498,17 +479,9 @@ Example test for cancellation:
 ```clojure
 ;; This happens when branches have diverged
 ;; Solution: Use squash mode instead
-@(fluree/rebase! conn "feature" "main" {:squash? true})
+@(fluree/merge! conn "feature" "main" {:squash? true})
 ```
 
-#### "Rebase conflict" Error
-```clojure
-;; Occurs when same data modified in both branches
-;; Currently requires manual resolution:
-;; 1. Query both branches to understand the conflict
-;; 2. Determine correct final state
-;; 3. Create new commit with resolved data
-```
 
 #### "Cannot operate across different ledgers" Error
 ```clojure
@@ -526,10 +499,10 @@ Example test for cancellation:
 
 ;; If can fast-forward, do it
 (if (:can-fast-forward divergence)
-  @(fluree/rebase! conn "feature" "main" {:ff :only})
+  @(fluree/merge! conn "feature" "main" {:ff :only})
   ;; Otherwise, squash commits
-  @(fluree/rebase! conn "feature" "main" {:squash? true
-                                           :message "Feature implementation"}))
+  @(fluree/merge! conn "feature" "main" {:squash? true
+                                          :message "Feature implementation"}))
 ```
 
 ### Reverting Bad Changes
@@ -543,10 +516,10 @@ Example test for cancellation:
   {:message "Reverting to stable release"})
 ```
 
-### Cherry-picking Bug Fixes
+### Rebasing Feature Branch
 ```clojure
-;; Note: Cherry-pick functionality not yet implemented
-;; This will be the API when available:
-(fluree/rebase! conn "develop" "main"
-  {:commits ["fix1-sha" "fix2-sha"]})
+;; Rebase feature branch onto main (updates feature branch)
+(fluree/rebase! conn "feature" "main"
+  {:squash? true
+   :message "Rebase feature onto latest main"})
 ```
