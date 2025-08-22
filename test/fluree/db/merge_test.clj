@@ -32,7 +32,7 @@
           (is (= :branch1-to-branch2 (:fast-forward-direction divergence))))
 
         ;; Merge feature into main (should be fast-forward)
-        (let [merge-result @(fluree/rebase! conn "merge-test:feature" "merge-test:main")]
+        (let [merge-result @(fluree/merge! conn "merge-test:feature" "merge-test:main")]
           (println "Fast-forward merge result:" merge-result)
           (is (= :success (:status merge-result)) "Merge should succeed")
           (is (= "fast-forward" (:strategy merge-result)) "Should be a fast-forward merge")
@@ -118,9 +118,9 @@
           (is (not (:can-fast-forward divergence)) "Should not be able to fast-forward"))
 
         ;; Merge with squash strategy
-        (let [merge-result @(fluree/rebase! conn "flatten-test:feature" "flatten-test:main"
-                                            {:squash? true
-                                             :message "Squash merge feature into main"})]
+        (let [merge-result @(fluree/merge! conn "flatten-test:feature" "flatten-test:main"
+                                           {:squash? true
+                                            :message "Squash merge feature into main"})]
           (is (= :success (:status merge-result)) "Merge should succeed")
           (is (= "squash" (:strategy merge-result)) "Should be a squash merge"))
 
@@ -179,8 +179,8 @@
                                      "ex:skills" ["Rust" "JavaScript"]}]})
 
         ;; Squash merge feature into main
-        (let [merge-result @(fluree/rebase! conn "cancel-test:feature" "cancel-test:main"
-                                            {:squash? true})]
+        (let [merge-result @(fluree/merge! conn "cancel-test:feature" "cancel-test:main"
+                                           {:squash? true})]
           (is (= :success (:status merge-result)) "Squash merge should succeed"))
 
         ;; Verify final state in main
@@ -269,9 +269,9 @@
             (is (not (:can-fast-forward divergence)) "Should not be able to fast-forward"))
 
           ;; Merge with squash strategy
-          (let [merge-result @(fluree/rebase! conn "flatten-file-test:feature" "flatten-file-test:main"
-                                              {:squash? true
-                                               :message "Squash merge feature into main"})]
+          (let [merge-result @(fluree/merge! conn "flatten-file-test:feature" "flatten-file-test:main"
+                                             {:squash? true
+                                              :message "Squash merge feature into main"})]
             (is (= :success (:status merge-result)) "Merge should succeed")
             (is (= "squash" (:strategy merge-result)) "Should be a squash merge"))
 
@@ -329,10 +329,10 @@
                                     "ex:name" "Alice Smith"}})
 
         ;; Attempt merge - should detect conflict
-        (let [merge-result @(fluree/rebase! conn "conflict-test:feature" "conflict-test:main"
-                                            {:squash? true})]
+        (let [merge-result @(fluree/merge! conn "conflict-test:feature" "conflict-test:main"
+                                           {:squash? true})]
           (is (= :conflict (:status merge-result)) "Should have conflict status")
-          (is (= :db/rebase-conflict (:error merge-result)) "Should have rebase conflict error")
+          (is (= :db/merge-conflict (:error merge-result)) "Should have merge conflict error")
           (when (map? merge-result)
             (is (contains? merge-result :commits) "Should include commit details")
             (is (seq (get-in merge-result [:commits :conflicts])) "Should have conflicts")
@@ -372,8 +372,8 @@
                                        "ex:name" "David"}]})
 
           ;; Try fast-forward only - should fail since FF not possible
-          (let [merge-result @(fluree/rebase! conn "strategy-test:ff-test" "strategy-test:main"
-                                              {:ff :only})]
+          (let [merge-result @(fluree/merge! conn "strategy-test:ff-test" "strategy-test:main"
+                                             {:ff :only})]
             ;; Since fast-forward is not possible, it should return error
             (is (= :error (:status merge-result)) "Should fail when FF not possible")
             (is (= :db/cannot-fast-forward (:error merge-result)) "Should have cannot-fast-forward error")))
@@ -390,10 +390,10 @@
                                        "ex:name" "Eve"}]})
 
           ;; Force non-fast-forward merge (use squash instead of FF)
-          (let [merge-result @(fluree/rebase! conn "strategy-test:no-ff" "strategy-test:main"
-                                              {:ff :never
-                                               :squash? true
-                                               :message "Force merge commit"})]
+          (let [merge-result @(fluree/merge! conn "strategy-test:no-ff" "strategy-test:main"
+                                             {:ff :never
+                                              :squash? true
+                                              :message "Force merge commit"})]
             (is (= :success (:status merge-result)) "Should succeed")
             (is (= "squash" (:strategy merge-result)) "Should use squash instead of FF")))
 
@@ -433,13 +433,13 @@
                                      "ex:priority" "high"}]})
 
         ;; Merge feature-a into main
-        (let [merge-a @(fluree/rebase! conn "complex-test:feature-a" "complex-test:main")]
+        (let [merge-a @(fluree/merge! conn "complex-test:feature-a" "complex-test:main")]
           (is (= :success (:status merge-a)) "First merge should succeed")
           (is (= "fast-forward" (:strategy merge-a)) "First merge should be fast-forward"))
 
         ;; Now merge feature-b into main (should handle divergence properly)
-        (let [merge-b @(fluree/rebase! conn "complex-test:feature-b" "complex-test:main"
-                                       {:squash? true})]
+        (let [merge-b @(fluree/merge! conn "complex-test:feature-b" "complex-test:main"
+                                      {:squash? true})]
           (is (= :success (:status merge-b)) "Second merge should succeed")
           (is (= "squash" (:strategy merge-b)) "Second merge should be squash due to divergence"))
 
@@ -487,14 +487,14 @@
                                      "@type" "internal:Manager"
                                      "internal:managerId" "67890"}]})
 
-        ;; Merge feature1 into main (should succeed as fast-forward)
-        (let [merge1 @(fluree/rebase! conn "ns-test:feature1" "ns-test:main")]
+        ;; Merge feature1 into main
+        (let [merge1 @(fluree/merge! conn "ns-test:feature1" "ns-test:main")]
           (is (= :success (:status merge1)) "First merge should succeed"))
 
         ;; Now merge feature2 into main - this will need to handle namespace collision
-        ;; The internal:Manager namespace might get a different integer ID during rebase
-        (let [merge2 @(fluree/rebase! conn "ns-test:feature2" "ns-test:main"
-                                      {:squash? true})]
+        ;; The internal:Manager namespace might get a different integer ID during merge
+        (let [merge2 @(fluree/merge! conn "ns-test:feature2" "ns-test:main"
+                                     {:squash? true})]
           (is (= :success (:status merge2)) "Second merge should succeed despite namespace differences"))
 
         ;; Verify final state has all data with correct namespaces

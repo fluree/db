@@ -1,11 +1,18 @@
 (ns fluree.db.merge
   "Public API for merge, rebase, and reset operations on Fluree database branches."
-  (:require [fluree.db.connection :as connection]
+  (:require [fluree.db.api.branch :as api.branch]
+            [fluree.db.connection :as connection]
             [fluree.db.ledger :as ledger]
             [fluree.db.merge.branch :as merge-branch]
+            [fluree.db.merge.commit :as merge-commit]
+            [fluree.db.merge.db :as merge-db]
+            [fluree.db.merge.flake :as merge-flake]
             [fluree.db.merge.graph :as merge-graph]
             [fluree.db.merge.operations :as ops]
-            [fluree.db.util.async :refer [<? go-try]]))
+            [fluree.db.nameservice.sub :as ns-subscribe]
+            [fluree.db.transact :as transact]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]))
 
 (defn merge!
   "Merges commits from source branch into target branch.
@@ -31,72 +38,173 @@
     (merge-branch/validate-same-ledger! from to)
     (let [{:keys [ff squash? preview?]
            :or {ff :auto
-                squash? false}} opts]
+                squash? false}} opts
 
-      ;; Load branches and check for fast-forward
-      (let [{:keys [source-db target-db source-branch-info target-branch-info]}
-            (<? (merge-branch/load-branches conn from to))
+          {:keys [source-db target-db source-branch-info target-branch-info]}
+          (<? (merge-branch/load-branches conn from to))
 
-            can-ff? (<? (merge-branch/can-fast-forward? conn source-db target-db
-                                                        source-branch-info target-branch-info))]
+          can-ff? (<? (merge-branch/can-fast-forward? conn source-db target-db
+                                                      source-branch-info target-branch-info))]
 
-        (when preview?
-          (reduced
-           {:status :preview
-            :operation :merge
-            :from from
-            :to to
-            :can-fast-forward can-ff?
-            :strategy (cond
-                        (and can-ff? (not= ff :never)) "fast-forward"
-                        squash? "squash"
-                        :else "merge")}))
+      (when preview?
+        (reduced
+         {:status :preview
+          :operation :merge
+          :from from
+          :to to
+          :can-fast-forward can-ff?
+          :strategy (cond
+                      (and can-ff? (not= ff :never)) "fast-forward"
+                      squash? "squash"
+                      :else "merge")}))
 
-        (cond
+      (cond
           ;; Fast-forward only mode - fail if not possible
-          (and (= ff :only) (not can-ff?))
-          {:status :error
-           :operation :merge
-           :from from
-           :to to
-           :error :db/cannot-fast-forward
-           :message "Fast-forward not possible - branches have diverged"}
+        (and (= ff :only) (not can-ff?))
+        {:status :error
+         :operation :merge
+         :from from
+         :to to
+         :error :db/cannot-fast-forward
+         :message "Fast-forward not possible - branches have diverged"}
 
           ;; Fast-forward when possible (unless explicitly disabled)
-          (and can-ff? (not= ff :never))
-          (<? (ops/fast-forward! conn from to))
+        (and can-ff? (not= ff :never))
+        (<? (ops/fast-forward! conn from to))
 
           ;; Squash mode
-          squash?
-          (<? (ops/squash! conn from to opts))
+        squash?
+        (<? (ops/squash! conn from to opts))
 
           ;; Regular merge mode (not yet implemented)
-          :else
-          (throw (ex-info "Regular merge not yet implemented. Use :squash? true or :ff :auto"
-                          {:status 501 :error :not-implemented})))))))
+        :else
+        (throw (ex-info "Regular merge not yet implemented. Use :squash? true or :ff :auto"
+                        {:status 501 :error :not-implemented}))))))
+
+(defn- recreate-branch
+  "Deletes and recreates a branch pointing to a new commit."
+  [conn branch-spec temp-branch new-commit-id branch-metadata]
+  (go-try
+    ;; Delete the existing branch
+    (<? (api.branch/delete-branch! conn branch-spec))
+    ;; Recreate it pointing to the new commit
+    (<? (api.branch/create-branch!
+         conn branch-spec temp-branch
+         (assoc branch-metadata :from-commit new-commit-id)))
+    ;; Ensure subsequent loads see fresh state
+    (ns-subscribe/release-ledger conn branch-spec)))
+
+(defn- compute-rebase-flakes
+  "Computes the net flakes for rebasing source onto target."
+  [conn target-db source-commits]
+  (go-try
+    ;; Prepare target DB with namespaces from source commits
+    (let [all-namespaces (<? (merge-commit/collect-commit-namespaces conn source-commits))
+          prepared-target-db (merge-db/prepare-target-db-namespaces target-db all-namespaces)
+          ;; Compute net flakes
+          [net-flakes _] (<? (merge-flake/compute-net-flakes
+                              conn prepared-target-db source-commits))]
+      net-flakes)))
 
 (defn rebase!
   "Rebases source branch onto target branch (updates source branch).
   
-  Note: This is currently a stub. The original implementation has been
-  moved to merge! as it was updating the target branch instead of source.
+  Takes the source branch and replays its commits on top of the target branch.
+  The source branch is updated with new commits, target branch remains unchanged.
   
-  TODO: Implement true rebase that updates the source branch by
-  replaying its commits on top of the target branch."
+  Parameters:
+    conn - Connection object
+    from - Source branch to rebase (will be updated)
+    to - Target branch to rebase onto (unchanged)
+    opts - Rebase options:
+      :squash? - Combine all commits into one (default false)
+      :preview? - Dry run without changes (default false)
+      
+  Returns promise resolving to rebase result."
   [conn from to opts]
   (go-try
-    ;; True rebase would:
-    ;; 1. Find where 'from' diverged from 'to'
-    ;; 2. Take all commits from 'from' since divergence
-    ;; 3. Replay them on top of latest 'to'
-    ;; 4. Update 'from' branch with new commits
-    ;; 5. Leave 'to' branch unchanged
+    (merge-branch/validate-same-ledger! from to)
+    (let [{:keys [squash? preview?]
+           :or {squash? false}} opts
 
-    (throw (ex-info "True rebase not yet implemented. Use merge! to apply changes from one branch to another."
-                    {:status 501
-                     :error :not-implemented
-                     :note "Current 'rebase' functionality has been moved to merge!"
-                     :suggestion "Use merge! with :squash? or :ff options"}))))
+          ;; Load branches and find LCA
+          {:keys [source-db target-db source-branch-info target-branch-info]}
+          (<? (merge-branch/load-branches conn from to))
+
+          lca (<? (merge-branch/find-lca conn source-db target-db
+                                         source-branch-info target-branch-info))]
+
+      (when preview?
+        (reduced
+         {:status :preview
+          :operation :rebase
+          :from from
+          :to to
+          :lca lca
+          :strategy (if squash? "squash" "replay")}))
+
+      ;; Get commits from source since LCA
+      (let [source-commits (<? (merge-commit/extract-commits-since conn source-db lca))]
+
+        ;; Check if there's anything to rebase
+        (when (empty? source-commits)
+          (throw (ex-info "Nothing to rebase - source branch is already up to date"
+                          {:status 400 :error :db/no-op})))
+
+        ;; Compute the net flakes for rebase
+        (let [net-flakes (if squash?
+                           (<? (compute-rebase-flakes conn target-db source-commits))
+                           (throw (ex-info "Commit-by-commit replay not yet implemented for rebase"
+                                           {:status 501 :error :not-implemented})))
+
+              message (or (:message opts)
+                          (if squash?
+                            (str "Rebase " from " onto " to " (squashed)")
+                            (str "Rebase " from " onto " to)))
+
+              [ledger-id _] (util.ledger/ledger-parts from)
+
+              ;; Create temporary branch manually (can't use with-temp-branch as we need it for recreate)
+              temp-branch-name (str ledger-id ":__rebase_temp_" (random-uuid))
+              _ (<? (api.branch/create-branch! conn temp-branch-name to nil))
+
+              ;; Create the rebased commit on temp branch
+              new-commit-id (try
+                              (<? (go-try
+                                    ;; Load temp branch and stage flakes
+                                    (let [temp-ledger (<? (connection/load-ledger conn temp-branch-name))
+                                          temp-db (ledger/current-db temp-ledger)
+                                          staged-db (<? (merge-db/stage-flakes temp-db net-flakes nil))
+                                          ;; Commit the rebased state
+                                          result (<? (transact/commit! temp-ledger staged-db
+                                                                       {:message message
+                                                                        :author (or (:author opts) "system/rebase")}))]
+                                      (:id (:commit result)))))
+                              (catch #?(:clj Exception :cljs js/Error) e
+                                ;; Clean up temp branch on error
+                                (try
+                                  (<? (api.branch/delete-branch! conn temp-branch-name))
+                                  (catch #?(:clj Exception :cljs js/Error) _ nil))
+                                (throw e)))
+
+              ;; Recreate source branch pointing to new commit
+              _ (<? (recreate-branch conn from
+                                     temp-branch-name
+                                     new-commit-id
+                                     (select-keys source-branch-info [:protected :description])))
+
+              ;; Clean up temp branch
+              _ (try
+                  (<? (api.branch/delete-branch! conn temp-branch-name))
+                  (catch #?(:clj Exception :cljs js/Error) _ nil))]
+
+          {:status :success
+           :operation :rebase
+           :from from
+           :to to
+           :strategy (if squash? "squash" "replay")
+           :commits {:rebased (count source-commits)}
+           :new-commit new-commit-id})))))
 
 (defn reset-branch!
   "Resets a branch to a previous state."
