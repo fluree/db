@@ -214,10 +214,12 @@
                  :select ['?s '?name]
                  :where [[:graph "vg/sql" {"@id" "?s"
                                            "http://schema.org/name" "?name"}]]}
-          res @(fluree/query-connection @test-conn query)]
-      (is (= 3 (count res)) "Should map all 3 people records")
-      (is (= #{"Alice" "Bob" "Charlie"} (set (map second res)))
-          "Should correctly extract names from people table"))))
+          res @(fluree/query-connection @test-conn query)
+          expected #{["http://example.com/person/1" "Alice"]
+                     ["http://example.com/person/2" "Bob"]
+                     ["http://example.com/person/3" "Charlie"]}]
+      (is (= expected (set res))
+          "Should return exactly the 3 people with their correct IRIs and names"))))
 
 (deftest r2rml-complex-mapping-integration-test
   (testing "R2RML handles multiple tables with different data types and vocabularies"
@@ -244,12 +246,13 @@
                                            "http://example.com/totalAmount" "?totalAmount"
                                            "http://example.com/status" "?status"}]]}
           res @(fluree/query-connection @test-conn query)
-          amounts (map second res)
-          statuses (set (map #(nth % 2) res))]
-      (is (= 5 (count res)) "Should map all 5 order records")
-      (is (every? decimal? amounts) "All amounts should be decimals")
-      (is (= #{"completed" "pending" "cancelled"} statuses)
-          "Should have all three order statuses"))))
+          expected #{["http://example.com/order/1" 1029.98M "completed"]
+                     ["http://example.com/order/2" 89.99M "completed"]
+                     ["http://example.com/order/3" 299.99M "pending"]
+                     ["http://example.com/order/4" 199.99M "completed"]
+                     ["http://example.com/order/5" 999.99M "cancelled"]}]
+      (is (= expected (set res))
+          "Should return all 5 orders with correct IRIs, amounts, and statuses"))))
 
 (deftest r2rml-aggregate-query-integration-test
   (testing "R2RML supports Fluree aggregate functions in SELECT"
@@ -454,10 +457,11 @@
                                            "@type" "http://example.com/Product"
                                            "http://example.com/stockQuantity" "?stock"}]]}
           res @(fluree/query-connection @test-conn query)
-          stocks (map first res)]
-      (is (= 5 (count stocks)) "Should have 5 products with stock")
-      (is (every? integer? stocks) "All stock values should be integers")
-      (is (= 130 (reduce + stocks)) "Total stock should be 130"))
+          stocks (map first res)
+          expected-stocks #{10 50 25 15 30}]  ; From products table: (1,10), (2,50), (3,25), (4,15), (5,30)
+      (is (= expected-stocks (set stocks))
+          "Should return exact stock quantities: 10, 50, 25, 15, 30")
+      (is (every? integer? stocks) "All stock values should be integers"))
 
     ;; Test decimal columns
     (let [query {:from ["vg/sql"]
@@ -466,9 +470,11 @@
                                            "@type" "http://example.com/Product"
                                            "http://example.com/price" "?price"}]]}
           res @(fluree/query-connection @test-conn query)
-          prices (map first res)]
-      (is (every? decimal? prices) "All prices should be decimals")
-      (is (= 1619.95M (reduce + prices)) "Sum of prices should be correct"))
+          prices (map first res)
+          expected-prices #{999.99M 29.99M 89.99M 299.99M 199.99M}]  ; From products table
+      (is (= expected-prices (set prices))
+          "Should return exact prices: 999.99, 29.99, 89.99, 299.99, 199.99")
+      (is (every? decimal? prices) "All prices should be decimals"))
 
     ;; Test timestamp columns
     (let [query {:from ["vg/sql"]
@@ -537,3 +543,64 @@
           product-uris (map first res)]
       (is (every? #(re-matches #"^http://example.com/product/\d+$" %) product-uris)
           "All product URIs should match the template pattern"))))
+
+(deftest r2rml-filter-test
+  (testing "R2RML correctly handles filter expressions in WHERE clause"
+    ;; Test basic filter with string comparison on name
+    (let [query {:from ["vg/sql"]
+                 :context {"ex" "http://example.com/"
+                           "schema" "http://schema.org/"}
+                 :select ["?person" "?name"]
+                 :where [[:graph "vg/sql"
+                          {"@id" "?person"
+                           "@type" "ex:Person"
+                           "schema:name" "?name"}]
+                         [:filter "(= ?name \"Alice\")"]]}
+          res @(fluree/query-connection @test-conn query)]
+      (is (= [["ex:person/1" "Alice"]] res)
+          "Should return only Alice with her compacted IRI"))
+
+    ;; Test filter with string comparison
+    (let [query {:from ["vg/sql"]
+                 :context {"ex" "http://example.com/"
+                           "foaf" "http://xmlns.com/foaf/0.1/"}
+                 :select ["?customer" "?firstName"]
+                 :where [[:graph "vg/sql"
+                          {"@id" "?customer"
+                           "@type" "ex:Customer"
+                           "foaf:firstName" "?firstName"}]
+                         [:filter "(= ?firstName \"John\")"]]}
+          res @(fluree/query-connection @test-conn query)]
+      (is (= [["ex:customer/1" "John"]] res)
+          "Should return only John (customer 1) with compacted IRI"))
+
+    ;; Test multiple filters
+    (let [query {:from ["vg/sql"]
+                 :context {"ex" "http://example.com/"}
+                 :select ["?order" "?total"]
+                 :where [[:graph "vg/sql"
+                          {"@id" "?order"
+                           "@type" "ex:Order"
+                           "ex:totalAmount" "?total"
+                           "ex:status" "?status"}]
+                         [:filter "(> ?total 100.00)"]
+                         [:filter "(= ?status \"completed\")"]]}
+          res @(fluree/query-connection @test-conn query)]
+      (is (= #{["ex:order/1" 1029.98M]
+               ["ex:order/4" 199.99M]}
+             (set res))
+          "Should return only completed orders over $100: order/1 (1029.98) and order/4 (199.99)"))
+
+    ;; Test filter with string comparison on lastName
+    (let [query {:from ["vg/sql"]
+                 :context {"ex" "http://example.com/"
+                           "foaf" "http://xmlns.com/foaf/0.1/"}
+                 :select ["?customer" "?lastName"]
+                 :where [[:graph "vg/sql"
+                          {"@id" "?customer"
+                           "@type" "ex:Customer"
+                           "foaf:lastName" "?lastName"}]
+                         [:filter "(= ?lastName \"Smith\")"]]}
+          res @(fluree/query-connection @test-conn query)]
+      (is (= [["ex:customer/2" "Smith"]] res)
+          "Should return only Jane Smith (customer 2) with compacted IRI"))))

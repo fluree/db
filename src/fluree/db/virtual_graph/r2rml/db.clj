@@ -226,6 +226,13 @@
        (remove nil?)
        (into {})))
 
+(defn- extract-filter-expressions
+  "Extract filter expressions from clause patterns."
+  [clause]
+  (->> clause
+       (filter #(and (vector? %) (= :filter (first %))))
+       (map second)))
+
 (defn- extract-subject-variable
   "Extract the subject variable from a query clause item."
   [item]
@@ -301,6 +308,23 @@
           last
           (str/replace #"[#:-]" "_"))))
 
+(defn- variable->sql-column
+  "Convert a Fluree query variable to its SQL column name based on predicate mappings."
+  [var-name pred->var predicates]
+  (when var-name
+    (let [var-str (if (str/starts-with? var-name "?")
+                    (subs var-name 1)
+                    var-name)
+          ;; Find which predicate maps to this variable
+          pred-iri (some (fn [[p v]]
+                           (when (or (= v var-name)
+                                     (= v (symbol var-name))
+                                     (= (name v) var-str))
+                             p))
+                         pred->var)]
+      (when-let [pred-mapping (get predicates pred-iri)]
+        (:column pred-mapping)))))
+
 (defn- build-select-columns
   "Build SELECT column list with aliases for the given predicates."
   [predicates pred->var clause-predicates]
@@ -313,17 +337,47 @@
                   :when column]
               (str column " AS " sql-alias))))
 
+(defn- filter-expr->sql
+  "Convert a Fluree filter expression to SQL WHERE condition.
+   Handles basic comparison operators and functions."
+  [expr pred->var predicates]
+  ;; This is a simplified version - in production you'd want a proper parser
+  ;; For now, handle basic patterns like (> ?age 45) or (= ?name \"Alice\")
+  (let [expr-str (if (string? expr) expr (str expr))
+        ;; Replace Fluree variables (which use ?-prefix notation) with SQL column names
+        replaced (reduce (fn [s [_pred-iri var-name]]
+                           (if-let [column (variable->sql-column var-name pred->var predicates)]
+                             (str/replace s
+                                          (re-pattern (str "\\?" (name var-name)))
+                                          column)
+                             s))
+                         expr-str
+                         pred->var)]
+    ;; Convert filter operators to SQL equivalents
+    (-> replaced
+        (str/replace "=" "=")
+        (str/replace "!=" "<>")
+        (str/replace ">" ">")
+        (str/replace "<" "<")
+        (str/replace ">=" ">=")
+        (str/replace "<=" "<=")
+        ;; Remove outer parentheses if present
+        (str/replace #"^\((.*)\)$" "$1"))))
+
 (defn- build-where-clause
-  "Build WHERE clause from literal filter conditions."
-  [predicates pred->literal]
-  (let [conditions (for [[pred-iri literal-val] pred->literal
-                         :when (get predicates pred-iri)
-                         :let [{:keys [column]} (get predicates pred-iri)]]
-                     (if (string? literal-val)
-                       (format "%s = '%s'" column literal-val)
-                       (format "%s = %s" column literal-val)))]
-    (when (seq conditions)
-      (str " WHERE " (str/join " AND " conditions)))))
+  "Build WHERE clause from literal filter conditions and filter expressions."
+  [predicates pred->literal filter-exprs pred->var]
+  (let [literal-conditions (for [[pred-iri literal-val] pred->literal
+                                 :when (get predicates pred-iri)
+                                 :let [{:keys [column]} (get predicates pred-iri)]]
+                             (if (string? literal-val)
+                               (format "%s = '%s'" column literal-val)
+                               (format "%s = %s" column literal-val)))
+        filter-conditions (map #(filter-expr->sql % pred->var predicates)
+                               filter-exprs)
+        all-conditions (concat literal-conditions filter-conditions)]
+    (when (seq all-conditions)
+      (str " WHERE " (str/join " AND " all-conditions)))))
 
 (defn- combine-select-columns
   "Combine selected columns with template columns for final SELECT clause."
@@ -352,15 +406,16 @@
           template-cols (extract-template-cols (:subject-template mapping))
           id-col (or (first template-cols) "id")
 
-          ;; Extract variable bindings and literal filters
+          ;; Extract variable bindings, literal filters, and filter expressions
           pred->var (extract-predicate-bindings clause)
           pred->literal (extract-literal-filters clause)
+          filter-exprs (extract-filter-expressions clause)
 
           ;; Build SELECT and WHERE clauses
           clause-predicates (set (keys pred->var))
           select-cols (build-select-columns predicates pred->var clause-predicates)
           all-selects (combine-select-columns select-cols template-cols id-col)
-          where-clause (build-where-clause predicates pred->literal)
+          where-clause (build-where-clause predicates pred->literal filter-exprs pred->var)
 
           ;; Generate final SQL
           final-sql (format "SELECT %s FROM %s%s"
@@ -368,8 +423,9 @@
                             (str/upper-case table)
                             (or where-clause ""))]
 
-      (when (seq pred->literal)
+      (when (or (seq pred->literal) (seq filter-exprs))
         (log/debug "Literal filters:" pred->literal)
+        (log/debug "Filter expressions:" filter-exprs)
         (log/debug "Generated SQL:" final-sql))
 
       final-sql)))
@@ -534,7 +590,8 @@
                             solution-ch)
       out-ch)))
 
-(defn ->R2RMLDatabase
+(defn create
+  "Create and initialize an R2RML virtual database with the provided configuration."
   [{:keys [alias config] :as vg-opts}]
   (let [cfg (or config
                 (select-keys vg-opts [:mapping :mappingInline :rdb :baseIRI "mapping" "mappingInline" "rdb" "baseIRI"]))]

@@ -106,4 +106,4 @@
 #?(:clj
    (defmethod create-vg-impl :r2rml
      [_db vg-opts _vg-config]
-     (r2rml-db/->R2RMLDatabase vg-opts)))
+     (r2rml-db/create vg-opts)))
