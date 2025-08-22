@@ -639,21 +639,21 @@
 ;; Branch operations (merge, rebase, reset)
 
 (defn merge!
-  "Three-way delta merge between branches with conflict resolution.
+  "Merges commits from source branch into target branch.
   
-  Computes deltas from the Lowest Common Ancestor (LCA) for both branches,
-  auto-merges based on conflict policy, and creates a merge commit.
+  Updates the target branch with changes from the source branch.
+  Supports fast-forward, squash, and regular merge modes.
   
   Parameters:
     conn - Connection object
     from - Source branch spec (e.g., 'ledger:feature')
     to - Target branch spec (e.g., 'ledger:main')
     opts - Map with optional merge options:
-      :conflict-policy - How to handle conflicts (default :conservative)
-        :conservative - Reject on any conflict
-        :ours - Keep target branch changes
-        :theirs - Keep source branch changes
-        :last-write-wins - Use most recent change
+      :ff - Fast-forward behavior (default :auto)
+        :auto - Fast-forward when possible
+        :only - Only allow fast-forward (fail otherwise)
+        :never - Never fast-forward, always create merge commit
+      :squash? - Combine all commits into one (default false)
         :schema-aware - Use schema rules to resolve
         function - Custom conflict resolution
       :preview? - Dry run without making changes (default false)
@@ -675,15 +675,15 @@
     (merge/merge! conn from to opts))))
 
 (defn rebase!
-  "Strictly replays commits from source branch onto target branch.
+  "Rebases source branch onto target branch (updates source branch).
   
-  Supports multiple modes: fast-forward, squash, and cherry-pick.
-  Auto fast-forwards when possible unless disabled.
+  NOTE: True rebase is not yet implemented. Currently redirects to merge!
+  which updates the target branch instead of source branch.
   
   Parameters:
     conn - Connection object
-    from - Source branch spec (e.g., 'ledger:feature')
-    to - Target branch spec (e.g., 'ledger:main')
+    from - Source branch spec to rebase (will be updated)
+    to - Target branch spec to rebase onto (unchanged)
     opts - Map with optional rebase options:
       :ff - Fast-forward behavior (default :auto)
         :auto - Fast-forward when possible
@@ -809,6 +809,42 @@
   (validate-connection conn)
   (promise-wrap
    (merge/branch-divergence conn branch1-spec branch2-spec)))
+
+(defn branch-graph
+  "Returns a graph representation of branches and their relationships.
+  
+  Useful for visualizing branch history and relationships in UIs.
+  
+  Parameters:
+    conn - Connection object
+    ledger-spec - Ledger specification (e.g., 'myledger')
+    opts - Options map:
+      :format - Output format (default :json)
+        :json - Structured data for UI rendering
+        :ascii - ASCII art representation
+      :depth - Number of commits to show (default 20)
+        integer - Show N most recent commits
+        :all - Show entire history
+      :branches - Which branches to include (default :all)
+        :all - Include all branches
+        [\"main\" \"feature\"] - Only specified branches
+  
+  Returns promise resolving to:
+    - For :json format: Map with :branches, :commits, and :merges
+    - For :ascii format: String with ASCII art graph
+    
+  Example:
+    ;; Get JSON data for UI
+    @(branch-graph conn \"mydb\" {:format :json :depth 50})
+    
+    ;; Get ASCII visualization
+    @(branch-graph conn \"mydb\" {:format :ascii :branches [\"main\" \"feature\"]})"
+  ([conn ledger-spec]
+   (branch-graph conn ledger-spec {}))
+  ([conn ledger-spec opts]
+   (validate-connection conn)
+   (promise-wrap
+    (merge/branch-graph conn ledger-spec opts))))
 
 ;; db operations
 
