@@ -3,6 +3,7 @@
   Tests the mapping of relational data to RDF through R2RML mappings."
   (:require [clojure.core.async :as async]
             [clojure.java.jdbc :as jdbc]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [fluree.db.api :as fluree]
             [fluree.db.connection.config :as config]
@@ -307,6 +308,142 @@
           "Should return specific completed order IDs")
       (is (= #{1029.98M 89.99M 199.99M} (set amounts))
           "Should return only completed order amounts"))))
+
+(deftest r2rml-context-iri-expansion-test
+  (testing "R2RML correctly handles @context for IRI expansion and compaction"
+    ;; Test with context that defines prefixes for our vocabulary
+    (let [query {:from ["vg/sql"]
+                 :context {"@vocab" "http://example.com/"
+                           "schema" "http://schema.org/"
+                           "foaf" "http://xmlns.com/foaf/0.1/"
+                           "dcterms" "http://purl.org/dc/terms/"}
+                 :select ["?customer" "?firstName" "?lastName" "?email"]
+                 :where {"@id" "?customer"
+                         "@type" "Customer"  ;; Uses @vocab expansion
+                         "foaf:firstName" "?firstName"  ;; Uses prefix expansion
+                         "foaf:lastName" "?lastName"
+                         "foaf:mbox" "?email"}}
+          res @(fluree/query-connection @test-conn query)]
+      (is (= 4 (count res)) "Should return all 4 customers")
+      (is (= #{"John" "Jane" "Bob" "Alice"}
+             (set (map second res)))
+          "Should return all customer first names")
+      (is (every? #(str/ends-with? (nth % 3) "@example.com") res)
+          "All emails should end with @example.com")))
+
+    ;; Test with different context for orders using @vocab
+  (let [query {:from ["vg/sql"]
+               :context {"@vocab" "http://example.com/"
+                         "@base" "http://example.com/"}
+               :select ["?order" "?amount"]
+               :where {"@id" "?order"
+                       "@type" "Order"  ;; Expands to http://example.com/Order
+                       "totalAmount" "?amount"  ;; Expands to http://example.com/totalAmount
+                       "status" "completed"}}  ;; Expands to http://example.com/status
+        res @(fluree/query-connection @test-conn query)]
+    (is (= 3 (count res)) "Should return 3 completed orders")
+    (is (= #{1029.98M 89.99M 199.99M} (set (map second res)))
+        "Should return correct order amounts"))
+
+    ;; Test mixed context with both prefix and vocab
+  (let [query {:from ["vg/sql"]
+               :context {"@vocab" "http://default.org/"
+                         "ex" "http://example.com/"
+                         "schema" "http://schema.org/"}
+               :select ["?person" "?name"]
+               :where {"@id" "?person"
+                       "@type" "ex:Person"  ;; Uses prefix
+                       "schema:name" "?name"}}  ;; Uses prefix
+        res @(fluree/query-connection @test-conn query)]
+    (is (= 3 (count res)) "Should return all 3 people")
+    (is (= #{"Alice" "Bob" "Charlie"} (set (map second res)))
+        "Should return all person names")))
+
+(deftest r2rml-context-with-graph-clause-test
+  (testing "R2RML @context works with explicit [:graph ...] syntax too"
+    (let [query {:from ["vg/sql"]
+                 :context {"ex" "http://example.com/"
+                           "schema" "http://schema.org/"}
+                 :select ["?product" "?sku" "?price"]
+                 :where [[:graph "vg/sql"
+                          {"@id" "?product"
+                           "@type" "ex:Product"
+                           "ex:sku" "?sku"
+                           "ex:price" "?price"}]]}
+          res @(fluree/query-connection @test-conn query)]
+      (is (= 5 (count res)) "Should return all 5 products")
+      (is (every? #(str/starts-with? (second %) "SKU") res)
+          "All SKUs should start with 'SKU'")
+      (is (= 1619.95M (reduce + (map #(nth % 2) res)))
+          "Sum of all product prices should be 1619.95"))))
+
+(deftest r2rml-iri-compaction-in-results-test
+  (testing "R2RML properly returns IRIs in query results"
+    ;; Test that subject IRIs are returned in results
+    (let [query {:from ["vg/sql"]
+                 :context {"ex" "http://example.com/"
+                           "schema" "http://schema.org/"}
+                 :select ["?person" "?name"]
+                 :where {"@id" "?person"
+                         "@type" "ex:Person"
+                         "schema:name" "?name"}}
+          res @(fluree/query-connection @test-conn query)]
+      (is (= 3 (count res)) "Should return all 3 people")
+      ;; Check that IRIs are COMPACTED using the context prefix
+      (is (every? #(str/starts-with? (first %) "ex:person/") res)
+          "Person IRIs should be compacted with 'ex:' prefix")
+      ;; Check that we get the names
+      (is (= #{"Alice" "Bob" "Charlie"}
+             (set (map second res)))
+          "Should return all person names")
+      ;; Verify specific compacted person IRIs
+      (let [person-iris (set (map first res))]
+        (is (contains? person-iris "ex:person/1") "Should have compacted ex:person/1")
+        (is (contains? person-iris "ex:person/2") "Should have compacted ex:person/2")
+        (is (contains? person-iris "ex:person/3") "Should have compacted ex:person/3")))
+
+    ;; Test with correct FOAF prefix to verify compaction
+    (let [query {:from ["vg/sql"]
+                 :context {"foaf" "http://xmlns.com/foaf/0.1/"}
+                 :select ["?customer" "?firstName"]
+                 :where {"@id" "?customer"
+                         "@type" "http://example.com/Customer"  ;; Full IRI since no ex: prefix
+                         "foaf:firstName" "?firstName"}}
+          res @(fluree/query-connection @test-conn query)]
+      (is (= 4 (count res)) "Should return all 4 customers")
+      ;; Check that customer IRIs are NOT compacted (no prefix defined for them)
+      (is (every? #(str/starts-with? (first %) "http://example.com/customer/") res)
+          "Customer IRIs should be full IRIs without prefix compaction"))
+
+    ;; Test with ORDER IRIs to see full IRI paths
+    (let [query {:from ["vg/sql"]
+                 :context {"ex" "http://example.com/"}
+                 :select ["?order" "?status"]
+                 :where {"@id" "?order"
+                         "@type" "ex:Order"
+                         "ex:status" "?status"}}
+          res @(fluree/query-connection @test-conn query)]
+      (is (= 5 (count res)) "Should return all 5 orders")
+      ;; Verify order IRIs are COMPACTED
+      (is (every? #(str/starts-with? (first %) "ex:order/") res)
+          "Order IRIs should be compacted with 'ex:' prefix")
+      ;; Check status values
+      (is (= #{"completed" "pending" "cancelled"}
+             (set (map second res)))
+          "Should have all three order statuses"))
+
+    ;; Test with no context to see full IRIs
+    (let [query {:from ["vg/sql"]
+                 :select ["?product" "?sku"]
+                 :where [[:graph "vg/sql"
+                          {"@id" "?product"
+                           "@type" "http://example.com/Product"
+                           "http://example.com/sku" "?sku"}]]}
+          res @(fluree/query-connection @test-conn query)]
+      (is (= 5 (count res)) "Should return all 5 products")
+      ;; Full IRIs should be returned without context
+      (is (every? #(re-matches #"^http://example\.com/product/\d+$" (first %)) res)
+          "Product IRIs should be full IRIs matching the pattern"))))
 
 (deftest r2rml-data-type-handling-test
   (testing "R2RML correctly handles various SQL data types"
