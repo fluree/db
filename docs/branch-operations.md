@@ -88,7 +88,7 @@ Before performing branch operations, it's helpful to understand how branches rel
 
 ```clojure
 ;; Check relationship between branches
-(def divergence @(fluree/branch-divergence conn "feature" "main"))
+(def divergence @(fluree/branch-divergence conn "ledger:feature" "ledger:main"))
 
 ;; Returns:
 {:common-ancestor "fluree:commit:sha256:..."
@@ -408,7 +408,7 @@ When branches have modified the same data:
 
 ```clojure
 ;; Attempt merge
-(def result @(fluree/merge! conn "feature" "main" {:squash? true}))
+(def result @(fluree/merge! conn "ledger:feature" "ledger:main" {:squash? true}))
 
 ;; Check for errors
 (when (= :error (:status result))
@@ -494,7 +494,7 @@ Example test for cancellation:
 ```clojure
 ;; This happens when branches have diverged
 ;; Solution: Use squash mode instead
-@(fluree/merge! conn "feature" "main" {:squash? true})
+@(fluree/merge! conn "ledger:feature" "ledger:main" {:squash? true})
 ```
 
 
@@ -510,31 +510,31 @@ Example test for cancellation:
 ### Feature Branch Integration
 ```clojure
 ;; Check if fast-forward is possible
-(def divergence @(fluree/branch-divergence conn "feature" "main"))
+(def divergence @(fluree/branch-divergence conn "ledger:feature" "ledger:main"))
 
 ;; If can fast-forward, do it
 (if (:can-fast-forward divergence)
-  @(fluree/merge! conn "feature" "main" {:ff :only})
+  @(fluree/merge! conn "ledger:feature" "ledger:main" {:ff :only})
   ;; Otherwise, squash commits
-  @(fluree/merge! conn "feature" "main" {:squash? true
-                                          :message "Feature implementation"}))
+  @(fluree/merge! conn "ledger:feature" "ledger:main" {:squash? true
+                                                   :message "Feature implementation"}))
 ```
 
 ### Reverting Bad Changes
 ```clojure
 ;; Safe reset creates a new commit that reverts to the target state
-(fluree/reset-branch! conn "main" {:t 100}
+(fluree/reset-branch! conn "ledger:main" {:t 100}
   {:message "Reverting to known good state at t=100"})
 
 ;; Or reset to a specific commit SHA
-(fluree/reset-branch! conn "main" {:sha "abc123def"}
+(fluree/reset-branch! conn "ledger:main" {:sha "abc123def"}
   {:message "Reverting to stable release"})
 ```
 
 ### Rebasing Feature Branch
 ```clojure
 ;; Rebase feature branch onto main (updates feature branch)
-(fluree/rebase! conn "feature" "main"
+(fluree/rebase! conn "ledger:feature" "ledger:main"
   {:squash? true
    :message "Rebase feature onto latest main"})
 ```
