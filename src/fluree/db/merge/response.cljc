@@ -6,10 +6,10 @@
   "Creates a conflict response for a failed merge/rebase operation."
   [from to failed-commit opts]
   {:status :conflict
-   :operation (if (:ff-mode opts) :merge :rebase)
+   :operation :merge
    :from from
    :to to
-   :error :db/rebase-conflict
+   :error :db/merge-conflict
    :strategy (cond
                (:ff-mode opts) "fast-forward"
                (:squash? opts) "squash"
@@ -22,7 +22,7 @@
   "Creates a success response for a completed merge/rebase operation."
   [from to replay-result new-commit-sha opts]
   {:status :success
-   :operation (if (:ff-mode opts) :merge :rebase)
+   :operation :merge
    :from from
    :to to
    :strategy (cond
