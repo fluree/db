@@ -53,17 +53,17 @@
                                 (= r2rml-triples-map (get-iri o))))
                          triples)))
          (map (fn [[subject triples]]
-                (let [props (into {} (map (fn [[_s p o]] 
-                                            [(get-iri p) o]) 
+                (let [props (into {} (map (fn [[_s p o]]
+                                            [(get-iri p) o])
                                           triples))
                       ;; Get logical table
                       logical-table-node (get-iri (get props r2rml-logical-table))
                       table-name (when logical-table-node
-                                  (let [lt-triples (get by-subject logical-table-node)]
-                                    (some (fn [[_s p o]]
-                                           (when (= r2rml-table-name (get-iri p))
-                                             (::where/val o)))
-                                         lt-triples)))
+                                   (let [lt-triples (get by-subject logical-table-node)]
+                                     (some (fn [[_s p o]]
+                                             (when (= r2rml-table-name (get-iri p))
+                                               (::where/val o)))
+                                           lt-triples)))
                       ;; Get subject map
                       subject-map-node (get-iri (get props r2rml-subject-map))
                       [template rdf-class] (when subject-map-node
@@ -75,31 +75,31 @@
                                                 (get-iri (get sm-props r2rml-class))]))
                       ;; Get predicate-object maps
                       pom-nodes (keep (fn [[_s p o]]
-                                       (when (= r2rml-predicate-object-map (get-iri p))
-                                         (get-iri o)))
-                                     triples)
+                                        (when (= r2rml-predicate-object-map (get-iri p))
+                                          (get-iri o)))
+                                      triples)
                       predicates (into {}
-                                      (keep (fn [pom-node]
-                                             (let [pom-triples (get by-subject pom-node)
-                                                   pom-props (into {} (map (fn [[_s p o]]
-                                                                             [(get-iri p) o])
-                                                                           pom-triples))
-                                                   pred-iri (get-iri (get pom-props r2rml-predicate))
-                                                   obj-map-node (get-iri (get pom-props r2rml-object-map))
-                                                   obj-props (when obj-map-node
-                                                              (let [om-triples (get by-subject obj-map-node)]
-                                                                (into {} (map (fn [[_s p o]]
+                                       (keep (fn [pom-node]
+                                               (let [pom-triples (get by-subject pom-node)
+                                                     pom-props (into {} (map (fn [[_s p o]]
                                                                                [(get-iri p) o])
-                                                                             om-triples))))]
-                                               (when (and pred-iri obj-props)
-                                                 [pred-iri {:column (::where/val (get obj-props r2rml-column))
-                                                           :template (::where/val (get obj-props r2rml-template))
-                                                           :datatype (get-iri (get obj-props r2rml-datatype))}])))
-                                           pom-nodes))]
+                                                                             pom-triples))
+                                                     pred-iri (get-iri (get pom-props r2rml-predicate))
+                                                     obj-map-node (get-iri (get pom-props r2rml-object-map))
+                                                     obj-props (when obj-map-node
+                                                                 (let [om-triples (get by-subject obj-map-node)]
+                                                                   (into {} (map (fn [[_s p o]]
+                                                                                   [(get-iri p) o])
+                                                                                 om-triples))))]
+                                                 (when (and pred-iri obj-props)
+                                                   [pred-iri {:column (::where/val (get obj-props r2rml-column))
+                                                              :template (::where/val (get obj-props r2rml-template))
+                                                              :datatype (get-iri (get obj-props r2rml-datatype))}])))
+                                             pom-nodes))]
                   [subject {:table table-name
-                           :subject-template template
-                           :class rdf-class
-                           :predicates predicates}])))
+                            :subject-template template
+                            :class rdf-class
+                            :predicates predicates}])))
          (into {}))))
 
 (defn- parse-min-r2rml
