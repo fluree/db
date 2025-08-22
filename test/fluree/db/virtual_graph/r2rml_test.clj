@@ -285,6 +285,29 @@
       (is (= 1319.96M (reduce + 0M amounts))
           "Sum of completed orders should be 1319.96"))))
 
+(deftest r2rml-simplified-syntax-test
+  (testing "R2RML queries work without [:graph ...] wrapper syntax using BM25-style pattern collection"
+    ;; Test that we can query directly with a map in the where clause
+    ;; This should now work with the new -match-triple/-finalize approach
+    (let [query {:from ["vg/sql"]
+                 :select ["?order" "?amount"]
+                 :where {"@id" "?order"
+                         "@type" "http://example.com/Order"
+                         "http://example.com/totalAmount" "?amount"
+                         "http://example.com/status" "completed"}}
+          res @(fluree/query-connection @test-conn query)
+          order-ids (set (map first res))
+          amounts (map second res)]
+      ;; Should get the same results as the test with [:graph ...] wrapper
+      (is (= 3 (count res)) "Should return only 3 completed orders")
+      (is (= #{"http://example.com/order/1"
+               "http://example.com/order/2"
+               "http://example.com/order/4"}
+             order-ids)
+          "Should return specific completed order IDs")
+      (is (= #{1029.98M 89.99M 199.99M} (set amounts))
+          "Should return only completed order amounts"))))
+
 (deftest r2rml-data-type-handling-test
   (testing "R2RML correctly handles various SQL data types"
     ;; Test integer columns
