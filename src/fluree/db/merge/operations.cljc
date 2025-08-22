@@ -77,7 +77,7 @@
         (let [result (<? (transact/commit! target-ledger final-db
                                            (assoc opts
                                                   :message (or (:message opts)
-                                                               (str "Squash rebase from " from))
+                                                               (str "Squash merge from " from))
                                                   :author (or (:author opts) "system/merge"))))]
           {:final-db final-db
            :new-commit-sha (or (get-in result [:commit :id])
