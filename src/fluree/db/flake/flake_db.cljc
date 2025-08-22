@@ -383,13 +383,9 @@
       ;; Normalize the input - strip known prefixes if present
       ;; Always ensure we end up with 'b' prefix + hash
       (let [sha-normalized (cond
-                             ;; Full commit ID prefix with b
-                             (str/starts-with? sha "fluree:commit:sha256:b")
-                             (subs sha 22) ; already has 'b' prefix
-
-                             ;; Partial commit ID prefix without b
+                             ;; Full commit ID prefix
                              (str/starts-with? sha "fluree:commit:sha256:")
-                             (subs sha 21) ; may or may not have 'b'
+                             (subs sha 21) ; Extract everything after the prefix
 
                              ;; Already has correct format (starts with 'b')
                              (str/starts-with? sha "b")
@@ -403,15 +399,16 @@
         (log/debug "sha->t normalized SHA:" sha-normalized "length:" sha-length)
 
         (cond
-          ;; Too long to be a valid SHA (52 = 'b' + 51 char hash)
-          (> sha-length 52)
+          ;; Too long to be a valid SHA (53 = 'bb' + 51 char hash) 
+          ;; Fluree uses 'bb' prefix for base32 encoded commit IDs
+          (> sha-length 53)
           (throw (ex-info (str "Invalid SHA: too long (" sha-length " chars). "
-                               "SHA-256 in base32 with 'b' prefix should be 52 characters.")
+                               "SHA-256 in base32 with 'bb' prefix should be 53 characters.")
                           {:status 400 :error :db/invalid-commit-sha
                            :sha sha :normalized sha-normalized :length sha-length}))
 
-          ;; Full SHA - use direct efficient lookup (52 chars with 'b' prefix)
-          (= 52 sha-length)
+          ;; Full SHA - use direct efficient lookup (53 chars with 'bb' prefix)
+          (= 53 sha-length)
           (let [;; sha-normalized already has 'b' prefix from normalization
                 commit-id (str "fluree:commit:sha256:" sha-normalized)
                 direct-query {:select ["?t"]
