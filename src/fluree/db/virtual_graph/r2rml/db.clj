@@ -4,10 +4,25 @@
             [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.query.turtle.parse :as turtle]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph :as vg]))
 
 (set! *warn-on-reflection* true)
+
+;; R2RML vocabulary IRIs
+(def ^:const r2rml-ns "http://www.w3.org/ns/r2rml#")
+(def ^:const r2rml-triples-map (str r2rml-ns "TriplesMap"))
+(def ^:const r2rml-logical-table (str r2rml-ns "logicalTable"))
+(def ^:const r2rml-table-name (str r2rml-ns "tableName"))
+(def ^:const r2rml-subject-map (str r2rml-ns "subjectMap"))
+(def ^:const r2rml-template (str r2rml-ns "template"))
+(def ^:const r2rml-class (str r2rml-ns "class"))
+(def ^:const r2rml-predicate-object-map (str r2rml-ns "predicateObjectMap"))
+(def ^:const r2rml-predicate (str r2rml-ns "predicate"))
+(def ^:const r2rml-object-map (str r2rml-ns "objectMap"))
+(def ^:const r2rml-column (str r2rml-ns "column"))
+(def ^:const r2rml-datatype (str r2rml-ns "datatype"))
 
 (defn- extract-template-cols
   [template]
@@ -16,72 +31,84 @@
          (map (fn [[_ c]] c))
          (vec))))
 
-(defn- parse-prefixes
-  [content]
-  (->> (re-seq #"@prefix\s+([a-zA-Z][\w\-]*)\:\s*<([^>]+)>\s*\." content)
-       (reduce (fn [acc [_ p iri]] (assoc acc (str p) iri)) {})))
+(defn- get-iri
+  "Extract IRI from either a string or a ::where/iri map"
+  [x]
+  (if (string? x)
+    x
+    (::where/iri x)))
 
-(defn- expand-qname
-  [prefixes qname]
-  (if (str/starts-with? qname "<")
-    (subs qname 1 (dec (count qname)))
-    (let [[p local] (str/split qname #":" 2)]
-      (str (get prefixes p "") local))))
-
-(defn- parse-triples-map
-  [content prefixes]
-  (let [tbl (some-> (re-find #"rr:tableName\s+\"([^\"]+)\"" content) second)
-        ;; Use Pattern.DOTALL flag to handle multiline content
-        template (some-> (re-find #"(?s)rr:subjectMap\s*\[.*?rr:template\s+\"([^\"]+)\"" content) second)
-        ;; Extract class from subject map
-        subject-map-block (some-> (re-find #"rr:subjectMap\s*\[([^\]]+)\]" content) second)
-        rdf-class (when subject-map-block
-                    (some-> (re-find #"rr:class\s+([^;\s]+)" subject-map-block) second))
-        pom-blocks (re-seq #"rr:predicateObjectMap\s*\[([^\]]+)\]" content)
-        preds (->> pom-blocks
-                   (map second)
-                   (keep (fn [blk]
-                           (when-let [pred (or (some-> (re-find #"rr:predicate\s+([^;\s]+)\s*;" blk) second)
-                                               (some-> (re-find #"rr:predicate\s+([^;\s]+)" blk) second))]
-                             (let [col (some-> (re-find #"rr:objectMap\s*\[\s*rr:column\s+\"([^\"]+)\"" blk) second)
-                                   obj-template (some-> (re-find #"rr:objectMap\s*\[\s*rr:template\s+\"([^\"]+)\"" blk) second)
-                                   datatype (some-> (re-find #"rr:datatype\s+([^;\s]+)\s*;" blk) second)]
-                               (when (or col obj-template)
-                                 (let [pred-iri (expand-qname prefixes pred)
-                                       obj-map (cond-> {}
-                                                 col (assoc :column col)
-                                                 obj-template (assoc :template obj-template)
-                                                 datatype (assoc :datatype (expand-qname prefixes datatype)))]
-                                   [pred-iri obj-map]))))))
-                   (into {}))]
-    {:table tbl
-     :subject-template template
-     :class (when rdf-class (expand-qname prefixes rdf-class))
-     :predicates preds}))
+(defn- parse-r2rml-ttl
+  "Parse R2RML TTL content using the turtle parser and extract mapping information
+   from the expanded triples."
+  [ttl-content]
+  (let [triples (turtle/parse ttl-content)
+        ;; Group triples by subject IRI
+        by-subject (group-by #(get-iri (first %)) triples)]
+    ;; Find all TriplesMap instances
+    (->> by-subject
+         (filter (fn [[_subject triples]]
+                   (some (fn [[_s p o]]
+                           (and (= const/iri-rdf-type (get-iri p))
+                                (= r2rml-triples-map (get-iri o))))
+                         triples)))
+         (map (fn [[subject triples]]
+                (let [props (into {} (map (fn [[_s p o]] 
+                                            [(get-iri p) o]) 
+                                          triples))
+                      ;; Get logical table
+                      logical-table-node (get-iri (get props r2rml-logical-table))
+                      table-name (when logical-table-node
+                                  (let [lt-triples (get by-subject logical-table-node)]
+                                    (some (fn [[_s p o]]
+                                           (when (= r2rml-table-name (get-iri p))
+                                             (::where/val o)))
+                                         lt-triples)))
+                      ;; Get subject map
+                      subject-map-node (get-iri (get props r2rml-subject-map))
+                      [template rdf-class] (when subject-map-node
+                                             (let [sm-triples (get by-subject subject-map-node)
+                                                   sm-props (into {} (map (fn [[_s p o]]
+                                                                            [(get-iri p) o])
+                                                                          sm-triples))]
+                                               [(::where/val (get sm-props r2rml-template))
+                                                (get-iri (get sm-props r2rml-class))]))
+                      ;; Get predicate-object maps
+                      pom-nodes (keep (fn [[_s p o]]
+                                       (when (= r2rml-predicate-object-map (get-iri p))
+                                         (get-iri o)))
+                                     triples)
+                      predicates (into {}
+                                      (keep (fn [pom-node]
+                                             (let [pom-triples (get by-subject pom-node)
+                                                   pom-props (into {} (map (fn [[_s p o]]
+                                                                             [(get-iri p) o])
+                                                                           pom-triples))
+                                                   pred-iri (get-iri (get pom-props r2rml-predicate))
+                                                   obj-map-node (get-iri (get pom-props r2rml-object-map))
+                                                   obj-props (when obj-map-node
+                                                              (let [om-triples (get by-subject obj-map-node)]
+                                                                (into {} (map (fn [[_s p o]]
+                                                                               [(get-iri p) o])
+                                                                             om-triples))))]
+                                               (when (and pred-iri obj-props)
+                                                 [pred-iri {:column (::where/val (get obj-props r2rml-column))
+                                                           :template (::where/val (get obj-props r2rml-template))
+                                                           :datatype (get-iri (get obj-props r2rml-datatype))}])))
+                                           pom-nodes))]
+                  [subject {:table table-name
+                           :subject-template template
+                           :class rdf-class
+                           :predicates predicates}])))
+         (into {}))))
 
 (defn- parse-min-r2rml
   [mapping-path]
   (let [content (slurp mapping-path)
-        prefixes (parse-prefixes content)]
-    ;; Find all triples maps by looking for the pattern
-    (let [triples-map-pattern #"([a-zA-Z][\w\-]*:[\w\-]+)\s+a\s+rr:TriplesMap\s*;"
-          matches (re-seq triples-map-pattern content)]
-      (if (seq matches)
-        (let [result (into {}
-                           (for [[_ map-name] matches]
-                             (let [start-pattern (re-pattern (str "\\Q" map-name "\\E\\s+a\\s+rr:TriplesMap\\s*;"))
-                                   start-match (re-find start-pattern content)
-                                   start-pos (str/index-of content start-match)
-                                  ;; Find the end by looking for the period that ends this triples map
-                                   remaining-content (subs content start-pos)
-                                  ;; Look for the period that ends this triples map (after all predicate-object maps)
-                                   end-pos (str/index-of remaining-content " .\n")
-                                   map-content (if end-pos
-                                                 (subs remaining-content 0 (+ end-pos 3)) ; Include the " .\n"
-                                                 remaining-content)]
-                               [map-name (parse-triples-map map-content prefixes)])))]
-          result)
-        {}))))
+        mappings (parse-r2rml-ttl content)]
+    (log/debug "Parsed R2RML mappings:" mappings)
+    ;; Return all mappings as is - the analyze-clause-for-mapping function will select the right one
+    mappings))
 
 (defn- jdbc-spec
   [rdb]
