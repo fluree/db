@@ -347,6 +347,111 @@
 
       final-sql)))
 
+(defn- process-template-subject
+  "Generate subject IRI from template and row data."
+  [template row]
+  (when template
+    (let [template-cols (extract-template-cols template)]
+      (reduce (fn [tmpl col]
+                (let [col-val (get-column-value row col)]
+                  (if col-val
+                    (str/replace tmpl (str "{" col "}") (str col-val))
+                    tmpl)))
+              template
+              template-cols))))
+
+(defn- build-subject-binding
+  "Build subject variable binding for solution map."
+  [subject-var subject-id row-id]
+  (when subject-var
+    (let [subj-symbol (if (symbol? subject-var) subject-var (symbol subject-var))
+          subj-iri (or subject-id (str "http://example.com/id/" (or row-id "unknown")))]
+      [[subj-symbol (where/match-iri {} subj-iri)]])))
+
+(defn- build-type-binding
+  "Build type variable binding for solution map."
+  [type-var mapping-class]
+  (when (and type-var mapping-class)
+    (let [type-sym (if (symbol? type-var) type-var (symbol type-var))]
+      [[type-sym (where/match-iri {} mapping-class)]])))
+
+(defn- build-predicate-bindings
+  "Build predicate variable bindings for solution map."
+  [var-mappings row]
+  (for [[pred-iri var-name] var-mappings
+        :when (and var-name
+                   (not= pred-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"))]
+    (let [var-str (if (symbol? var-name) (name var-name) (str var-name))
+          sql-alias (if (and var-str (str/starts-with? var-str "?"))
+                      (subs var-str 1)
+                      var-str)
+          value (or (get row (keyword (str/lower-case sql-alias)))
+                    (get row (keyword sql-alias)))
+          var-sym (if (symbol? var-name) var-name (symbol var-name))]
+      [var-sym (value->rdf-match value var-sym)])))
+
+(defn- row->solution
+  "Transform a database row into a solution map with all variable bindings."
+  [row mapping var-mappings subject-var type-var base-solution]
+  (let [id (or (:id row) (get row :ID) (get row "ID"))
+        subject-id (process-template-subject (:subject-template mapping) row)
+        subject-bindings (build-subject-binding subject-var subject-id id)
+        type-bindings (build-type-binding type-var (:class mapping))
+        predicate-bindings (build-predicate-bindings var-mappings row)]
+    (into (or base-solution {})
+          (concat subject-bindings type-bindings predicate-bindings))))
+
+(defn- prepare-r2rml-query
+  "Prepare R2RML query by parsing mapping and generating SQL."
+  [config mapping-spec patterns]
+  (let [rdb (or (:rdb config) (get config "rdb"))
+        db-spec (jdbc-spec rdb)
+        mapping-file (or (:mapping config)
+                         (get config "mapping")
+                         (:mapping mapping-spec)
+                         (get mapping-spec "mapping"))
+        mappings (parse-min-r2rml mapping-file)
+        mapping (analyze-clause-for-mapping patterns mappings)
+        sql (sql-for-mapping mapping patterns)]
+    {:db-spec db-spec
+     :sql sql
+     :mapping mapping}))
+
+(defn- extract-query-variables
+  "Extract all variable information from patterns."
+  [patterns]
+  {:var-mappings (extract-predicate-bindings-full patterns)
+   :subject-var (some extract-subject-variable patterns)
+   :type-var (some extract-type-variable patterns)})
+
+(defn- execute-r2rml-query
+  "Execute SQL query and transform results to solution maps."
+  [db-spec sql mapping variables base-solution]
+  (let [{:keys [var-mappings subject-var type-var]} variables
+        rows (jdbc/query db-spec [sql])]
+    (map (fn [row]
+           (row->solution row mapping var-mappings
+                          subject-var type-var base-solution))
+         rows)))
+
+(defn- stream-r2rml-results
+  "Stream R2RML query results to output channel.
+   Returns immediately, processing happens in background."
+  [config mapping-spec patterns base-solution error-ch output-ch]
+  (async/thread
+    (try
+      (let [{:keys [db-spec sql mapping]} (prepare-r2rml-query config mapping-spec patterns)
+            variables (extract-query-variables patterns)
+            solutions (execute-r2rml-query db-spec sql mapping variables base-solution)]
+        ;; Stream each solution to the output channel using blocking put
+        (doseq [solution solutions]
+          (async/>!! output-ch solution))
+        (async/close! output-ch))
+      (catch Exception e
+        (log/error e "Error in R2RML processing")
+        (async/>!! error-ch e)
+        (async/close! output-ch)))))
+
 (defrecord R2RMLDatabase [alias config mapping-spec datasource]
   vg/UpdatableVirtualGraph
   (upsert [this _source-db _new-flakes _remove-flakes]
@@ -390,59 +495,9 @@
                                 (try
                                   (let [patterns (get solution ::r2rml-patterns)]
                                     (if (seq patterns)
-                                      ;; Execute R2RML processing directly (like BM25 does search directly)
-                                      (try
-                                        (let [cfg config
-                                              rdb (or (:rdb cfg) (get cfg "rdb"))
-                                              db-spec (jdbc-spec rdb)
-                                              mapping-file (or (:mapping cfg) (get cfg "mapping") (:mapping mapping-spec) (get mapping-spec "mapping"))
-                                              mappings (parse-min-r2rml mapping-file)
-                                              mapping (analyze-clause-for-mapping patterns mappings)
-                                              sql (sql-for-mapping mapping patterns)
-                                              rows (jdbc/query db-spec [sql])
-                                              template (:subject-template mapping)
-                                              var-mappings (extract-predicate-bindings-full patterns)
-                                              subject-var (some extract-subject-variable patterns)]
-
-                                          ;; Process all rows and stream them
-                                          (doseq [row rows]
-                                            (let [id (or (:id row) (get row :ID) (get row "ID"))
-                                                  subject-id (when template
-                                                               (let [template-cols (extract-template-cols template)]
-                                                                 (reduce (fn [tmpl col]
-                                                                           (let [col-val (get-column-value row col)]
-                                                                             (if col-val
-                                                                               (str/replace tmpl (str "{" col "}") (str col-val))
-                                                                               tmpl)))
-                                                                         template
-                                                                         template-cols)))
-                                                  type-var (some extract-type-variable patterns)
-                                                  solution-map (into (or solution {})
-                                                                     (concat
-                                                                      (when subject-var
-                                                                        (let [subj-symbol (if (symbol? subject-var) subject-var (symbol subject-var))
-                                                                              subj-iri (or subject-id (str "http://example.com/id/" (or id "unknown")))]
-                                                                          [[subj-symbol (where/match-iri {} subj-iri)]]))
-                                                                      (when (and type-var (:class mapping))
-                                                                        (let [type-sym (if (symbol? type-var) type-var (symbol type-var))]
-                                                                          [[type-sym (where/match-iri {} (:class mapping))]]))
-                                                                      (for [[pred-iri var-name] var-mappings
-                                                                            :when (and var-name
-                                                                                       (not= pred-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"))]
-                                                                        (let [var-str (if (symbol? var-name) (name var-name) (str var-name))
-                                                                              sql-alias (if (and var-str (str/starts-with? var-str "?"))
-                                                                                          (subs var-str 1)
-                                                                                          var-str)
-                                                                              value (or (get row (keyword (str/lower-case sql-alias)))
-                                                                                        (get row (keyword sql-alias)))
-                                                                              var-sym (if (symbol? var-name) var-name (symbol var-name))]
-                                                                          [var-sym (value->rdf-match value var-sym)]))))]
-                                              (async/>! ch solution-map)))
-                                          (async/close! ch))
-                                        (catch Exception e
-                                          (log/error e "Error in R2RML processing")
-                                          (async/>! error-ch e)
-                                          (async/close! ch)))
+                                      ;; Stream R2RML results using refactored functions
+                                      (stream-r2rml-results config mapping-spec patterns
+                                                            solution error-ch ch)
                                       ;; No R2RML patterns, just pass through
                                       (do (async/>! ch solution)
                                           (async/close! ch))))
