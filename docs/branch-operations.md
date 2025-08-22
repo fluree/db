@@ -56,6 +56,21 @@ Fluree provides Git-like branch operations for managing database version control
 
 ;; Visualize branch relationships
 (println (<!! (merge/branch-graph conn "mydb" {:format :ascii})))
+;; Output:
+;; * [main] Release v2.0
+;; * Merge feature branch (squashed)
+;; |\
+;; | | * [hotfix] Emergency security patch
+;; | * | [feature] Add final touches
+;; | | * Fix critical bug
+;; | * | Implement user preferences
+;; | * | Add user settings UI
+;; | |/
+;; | * Update dependencies
+;; |/
+;; * Add authentication module
+;; * Set up database schema
+;; * Initial commit
 ```
 
 ### Design Principles
