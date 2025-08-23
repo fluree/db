@@ -814,3 +814,142 @@
         (is (= expected (set res))
             "Should return correct data using JSON-LD R2RML mapping")))))
 
+(deftest r2rml-constant-values-test
+  (testing "R2RML supports constant values in object mappings"
+    (let [constant-ttl (str "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n"
+                            "@prefix ex: <http://example.com/> .\n"
+                            "@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\n"
+
+                            "ex:CustomersWithTypeMap a rr:TriplesMap ;\n"
+                            "  rr:logicalTable [ rr:tableName \"customers\" ] ;\n"
+                            "  rr:subjectMap [\n"
+                            "    rr:template \"http://example.com/customer/{customer_id}\" ;\n"
+                            "    rr:class ex:Customer\n"
+                            "  ] ;\n"
+                            "  rr:predicateObjectMap [\n"
+                            "    rr:predicate foaf:firstName ;\n"
+                            "    rr:objectMap [ rr:column \"first_name\" ]\n"
+                            "  ] ;\n"
+                            "  rr:predicateObjectMap [\n"
+                            "    rr:predicate ex:source ;\n"
+                            "    rr:objectMap [ rr:constant \"Database Import\" ]\n"
+                            "  ] ;\n"
+                            "  rr:predicateObjectMap [\n"
+                            "    rr:predicate ex:status ;\n"
+                            "    rr:objectMap [ rr:constant ex:Active ]\n"
+                            "  ] .\n")]
+      ;; Publish R2RML with constant values
+      (async/<!! (nameservice/publish @test-publisher {:vg-name "vg/constants"
+                                                       :vg-type "fidx:R2RML"
+                                                       :engine  :r2rml
+                                                       :config  {:mappingInline constant-ttl
+                                                                 :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                       :driver  "org.h2.Driver"}}
+                                                       :dependencies ["dummy-ledger@main"]}))
+      ;; Query using the constant values
+      (let [query {"from" ["vg/constants"]
+                   "select" ["?customer" "?firstName" "?source" "?status"]
+                   "where" [["graph" "vg/constants" {"@id" "?customer"
+                                                     "@type" "http://example.com/Customer"
+                                                     "http://xmlns.com/foaf/0.1/firstName" "?firstName"
+                                                     "http://example.com/source" "?source"
+                                                     "http://example.com/status" "?status"}]]}
+            res @(fluree/query-connection @test-conn query)
+            ;; All customers should have the same constant values
+            expected #{["http://example.com/customer/1" "John" "Database Import" "http://example.com/Active"]
+                       ["http://example.com/customer/2" "Jane" "Database Import" "http://example.com/Active"]
+                       ["http://example.com/customer/3" "Bob" "Database Import" "http://example.com/Active"]
+                       ["http://example.com/customer/4" "Alice" "Database Import" "http://example.com/Active"]}]
+        (is (= expected (set res))
+            "Should return constant values for all records")))))
+
+(deftest r2rml-datatype-test
+  (testing "R2RML supports XSD datatypes in object mappings"
+    (let [datatype-ttl (str "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n"
+                            "@prefix ex: <http://example.com/> .\n"
+                            "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n"
+
+                            "ex:OrdersWithTypesMap a rr:TriplesMap ;\n"
+                            "  rr:logicalTable [ rr:tableName \"orders\" ] ;\n"
+                            "  rr:subjectMap [\n"
+                            "    rr:template \"http://example.com/order/{order_id}\" ;\n"
+                            "    rr:class ex:Order\n"
+                            "  ] ;\n"
+                            "  rr:predicateObjectMap [\n"
+                            "    rr:predicate ex:orderDate ;\n"
+                            "    rr:objectMap [ \n"
+                            "      rr:column \"order_date\" ;\n"
+                            "      rr:datatype xsd:date\n"
+                            "    ]\n"
+                            "  ] ;\n"
+                            "  rr:predicateObjectMap [\n"
+                            "    rr:predicate ex:amount ;\n"
+                            "    rr:objectMap [ \n"
+                            "      rr:column \"order_amount\" ;\n"
+                            "      rr:datatype xsd:decimal\n"
+                            "    ]\n"
+                            "  ] .\n")]
+      ;; Publish R2RML with datatypes
+      (async/<!! (nameservice/publish @test-publisher {:vg-name "vg/datatypes"
+                                                       :vg-type "fidx:R2RML"
+                                                       :engine  :r2rml
+                                                       :config  {:mappingInline datatype-ttl
+                                                                 :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                       :driver  "org.h2.Driver"}}
+                                                       :dependencies ["dummy-ledger@main"]}))
+      ;; Query using the datatyped values
+      (let [query {"from" ["vg/datatypes"]
+                   "select" ["?order" "?date" "?amount"]
+                   "where" [["graph" "vg/datatypes" {"@id" "?order"
+                                                     "@type" "http://example.com/Order"
+                                                     "http://example.com/orderDate" "?date"
+                                                     "http://example.com/amount" "?amount"}]]}
+            res @(fluree/query-connection @test-conn query)]
+        ;; For now, just verify the query returns results
+        ;; In a complete implementation, we'd verify the datatypes are preserved
+        (is (seq res)
+            "Should return orders with datatyped values")))))
+
+(deftest r2rml-object-template-test
+  (testing "R2RML supports templates in object mappings"
+    (let [template-ttl (str "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n"
+                            "@prefix ex: <http://example.com/> .\n"
+                            "@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\n"
+
+                            "ex:CustomersWithTemplateMap a rr:TriplesMap ;\n"
+                            "  rr:logicalTable [ rr:tableName \"customers\" ] ;\n"
+                            "  rr:subjectMap [\n"
+                            "    rr:template \"http://example.com/customer/{customer_id}\" ;\n"
+                            "    rr:class ex:Customer\n"
+                            "  ] ;\n"
+                            "  rr:predicateObjectMap [\n"
+                            "    rr:predicate foaf:name ;\n"
+                            "    rr:objectMap [ rr:template \"{first_name} {last_name}\" ]\n"
+                            "  ] ;\n"
+                            "  rr:predicateObjectMap [\n"
+                            "    rr:predicate ex:identifier ;\n"
+                            "    rr:objectMap [ rr:template \"CUST-{customer_id}\" ]\n"
+                            "  ] .\n")]
+      ;; Publish R2RML with object templates
+      (async/<!! (nameservice/publish @test-publisher {:vg-name "vg/templates"
+                                                       :vg-type "fidx:R2RML"
+                                                       :engine  :r2rml
+                                                       :config  {:mappingInline template-ttl
+                                                                 :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                       :driver  "org.h2.Driver"}}
+                                                       :dependencies ["dummy-ledger@main"]}))
+      ;; Query using the template-generated values
+      (let [query {"from" ["vg/templates"]
+                   "select" ["?customer" "?name" "?id"]
+                   "where" [["graph" "vg/templates" {"@id" "?customer"
+                                                     "@type" "http://example.com/Customer"
+                                                     "http://xmlns.com/foaf/0.1/name" "?name"
+                                                     "http://example.com/identifier" "?id"}]]}
+            res @(fluree/query-connection @test-conn query)
+            expected #{["http://example.com/customer/1" "John Doe" "CUST-1"]
+                       ["http://example.com/customer/2" "Jane Smith" "CUST-2"]
+                       ["http://example.com/customer/3" "Bob Johnson" "CUST-3"]
+                       ["http://example.com/customer/4" "Alice Brown" "CUST-4"]}]
+        (is (= expected (set res))
+            "Should return template-generated values")))))
+

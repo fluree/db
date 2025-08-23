@@ -97,14 +97,32 @@
                                                                     (when (= r2rml-object-map (get-iri p))
                                                                       (get-iri o)))
                                                                   pom-triples)
-                                               column (when obj-map-node
-                                                        (let [om-triples (get by-subject obj-map-node)]
-                                                          (some (fn [[_s p o]]
-                                                                  (when (= r2rml-column (get-iri p))
-                                                                    (::where/val o)))
-                                                                om-triples)))]
-                                           (if (and pred column)
-                                             (assoc acc pred column)
+                                               ;; Parse object map - support column, constant, template, and datatype
+                                               object-map (when obj-map-node
+                                                            (let [om-triples (get by-subject obj-map-node)
+                                                                  column (some (fn [[_s p o]]
+                                                                                 (when (= r2rml-column (get-iri p))
+                                                                                   (::where/val o)))
+                                                                               om-triples)
+                                                                  constant (some (fn [[_s p o]]
+                                                                                   (when (= "http://www.w3.org/ns/r2rml#constant" (get-iri p))
+                                                                                     (or (::where/val o) (get-iri o))))
+                                                                                 om-triples)
+                                                                  template (some (fn [[_s p o]]
+                                                                                   (when (= r2rml-template (get-iri p))
+                                                                                     (::where/val o)))
+                                                                                 om-triples)
+                                                                  datatype (some (fn [[_s p o]]
+                                                                                   (when (= "http://www.w3.org/ns/r2rml#datatype" (get-iri p))
+                                                                                     (get-iri o)))
+                                                                                 om-triples)]
+                                                              (cond
+                                                                column {:type :column :value column :datatype datatype}
+                                                                constant {:type :constant :value constant :datatype datatype}
+                                                                template {:type :template :value template :datatype datatype}
+                                                                :else nil)))]
+                                           (if (and pred object-map)
+                                             (assoc acc pred object-map)
                                              acc)))
                                        {}
                                        pom-nodes)]
@@ -354,20 +372,53 @@
                                      (= v (symbol var-name))
                                      (= (name v) var-str))
                              p))
-                         pred->var)]
-      (get predicates pred-iri))))
+                         pred->var)
+          object-map (get predicates pred-iri)]
+      ;; Extract column from object map
+      (cond
+        (map? object-map) (when (= :column (:type object-map))
+                            (:value object-map))
+        (string? object-map) object-map  ; Backward compatibility
+        :else nil))))
+
+(defn- extract-template-needed-columns
+  "Extract column names from a template that need to be selected."
+  [template]
+  (map second (re-seq #"\{([^}]+)\}" template)))
 
 (defn- build-select-columns
   "Build SELECT column list with aliases for the given predicates."
   [predicates pred->var clause-predicates]
-  (str/join ", "
-            (for [pred clause-predicates
-                  :when (get predicates pred)
-                  :let [column (get predicates pred)
-                        var-name (get pred->var pred)
-                        sql-alias (generate-column-alias var-name pred)]
-                  :when column]
-              (str column " AS " sql-alias))))
+  (log/debug "build-select-columns: predicates=" predicates)
+  ;; First collect regular columns
+  (let [regular-cols (->> (for [pred clause-predicates
+                                :when (get predicates pred)
+                                :let [object-map (get predicates pred)
+                                      var-name (get pred->var pred)
+                                      sql-alias (generate-column-alias var-name pred)
+                                      _ (log/debug "Processing pred:" pred "object-map:" object-map)]]
+                            ;; Handle different object map types
+                            (case (:type object-map)
+                              :column (str (:value object-map) " AS " sql-alias)
+                              ;; For templates, we don't add a SELECT column here
+                              :template nil
+                              ;; Constants don't need to be in SELECT
+                              :constant nil
+                              ;; Fallback for backward compatibility
+                              (when (string? object-map)
+                                (str object-map " AS " sql-alias))))
+                          (remove nil?))
+        ;; Then collect columns needed by templates
+        template-cols (->> (for [pred clause-predicates
+                                 :when (get predicates pred)
+                                 :let [object-map (get predicates pred)]]
+                             (when (and (map? object-map) (= :template (:type object-map)))
+                               (extract-template-needed-columns (:value object-map))))
+                           (remove nil?)
+                           flatten
+                           distinct
+                           (map #(str % " AS " (str/lower-case %))))]
+    (str/join ", " (concat regular-cols template-cols))))
 
 (defn- filter-expr->sql
   "Convert a Fluree filter expression to SQL WHERE condition.
@@ -401,13 +452,20 @@
   [predicates pred->literal filter-exprs pred->var]
   (let [literal-conditions (for [[pred-iri literal-val] pred->literal
                                  :when (get predicates pred-iri)
-                                 :let [column (get predicates pred-iri)]]
-                             (if (string? literal-val)
-                               (format "%s = '%s'" column literal-val)
-                               (format "%s = %s" column literal-val)))
+                                 :let [object-map (get predicates pred-iri)
+                                       column (if (map? object-map)
+                                                (when (= :column (:type object-map))
+                                                  (:value object-map))
+                                                ;; Backward compatibility
+                                                object-map)]]
+                             (when column
+                               (if (string? literal-val)
+                                 (format "%s = '%s'" column literal-val)
+                                 (format "%s = %s" column literal-val))))
         filter-conditions (map #(filter-expr->sql % pred->var predicates)
                                filter-exprs)
-        all-conditions (concat literal-conditions filter-conditions)]
+        all-conditions (->> (concat literal-conditions filter-conditions)
+                            (remove nil?))]
     (when (seq all-conditions)
       (str " WHERE " (str/join " AND " all-conditions)))))
 
@@ -493,6 +551,27 @@
     (let [type-sym (if (symbol? type-var) type-var (symbol type-var))]
       [[type-sym (where/match-iri {} mapping-class)]])))
 
+(defn- apply-template
+  "Apply a template to replace {column} placeholders with values from row."
+  [template row]
+  (reduce (fn [result [full-match col-name]]
+            (let [col-keyword (keyword (str/lower-case col-name))
+                  col-value (get row col-keyword)]
+              (if col-value
+                (str/replace result full-match (str col-value))
+                result)))
+          template
+          (re-seq #"\{([^}]+)\}" template)))
+
+(defn- apply-datatype
+  "Apply XSD datatype to a value."
+  [value datatype]
+  (if datatype
+    ;; For now, just return the value with type info
+    ;; In a full implementation, we'd convert to proper RDF typed literal
+    {:value value :datatype datatype}
+    value))
+
 (defn- build-predicate-bindings
   "Build predicate variable bindings for solution map."
   [var-mappings mapping row]
@@ -503,12 +582,27 @@
   (for [[pred-iri var-name] var-mappings
         :when (and var-name
                    (not= pred-iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"))]
-    (let [;; Use the same alias generation logic as in SQL generation
-          sql-alias (generate-column-alias var-name pred-iri)
-          _ (log/debug "Looking for pred:" pred-iri "-> alias:" sql-alias)
-          ;; Look up value using the alias (which H2 returns in lowercase)
-          value (or (get row (keyword (str/lower-case sql-alias)))
-                    (get row (keyword sql-alias)))
+    (let [object-map (get (:predicates mapping) pred-iri)
+          _ (log/debug "Object map for" pred-iri ":" object-map)
+          ;; Handle different object map types
+          value (cond
+                  ;; Map structure with type
+                  (map? object-map)
+                  (case (:type object-map)
+                    :column (let [sql-alias (generate-column-alias var-name pred-iri)
+                                  col-val (or (get row (keyword (str/lower-case sql-alias)))
+                                              (get row (keyword sql-alias)))]
+                              (apply-datatype col-val (:datatype object-map)))
+                    :constant (apply-datatype (:value object-map) (:datatype object-map))
+                    :template (let [expanded (apply-template (:value object-map) row)]
+                                (apply-datatype expanded (:datatype object-map)))
+                    nil)
+                  ;; String for backward compatibility
+                  (string? object-map)
+                  (let [sql-alias (generate-column-alias var-name pred-iri)]
+                    (or (get row (keyword (str/lower-case sql-alias)))
+                        (get row (keyword sql-alias))))
+                  :else nil)
           var-sym (if (symbol? var-name) var-name (symbol var-name))]
       (log/debug "Binding" var-sym "to" value)
       (when value
