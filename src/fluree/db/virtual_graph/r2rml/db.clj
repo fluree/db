@@ -54,12 +54,20 @@
                                         triples))
                     ;; Get logical table
                     logical-table-node (get-iri (get props r2rml-logical-table))
-                    table-name (when logical-table-node
-                                 (let [lt-triples (get by-subject logical-table-node)]
-                                   (some (fn [[_s p o]]
-                                           (when (= r2rml-table-name (get-iri p))
-                                             (::where/val o)))
-                                         lt-triples)))
+                    logical-table (when logical-table-node
+                                    (let [lt-triples (get by-subject logical-table-node)
+                                          table-name (some (fn [[_s p o]]
+                                                             (when (= r2rml-table-name (get-iri p))
+                                                               (::where/val o)))
+                                                           lt-triples)
+                                          sql-query (some (fn [[_s p o]]
+                                                            (when (= "http://www.w3.org/ns/r2rml#sqlQuery" (get-iri p))
+                                                              (::where/val o)))
+                                                          lt-triples)]
+                                      (cond
+                                        sql-query {:type :sql-query :query sql-query}
+                                        table-name {:type :table-name :name table-name}
+                                        :else nil)))
                     ;; Get subject map
                     subject-map-node (get-iri (get props r2rml-subject-map))
                     [template rdf-class] (when subject-map-node
@@ -100,12 +108,18 @@
                                              acc)))
                                        {}
                                        pom-nodes)]
-                (when table-name
-                  [(keyword (str/replace table-name "\"" ""))
-                   {:table table-name
-                    :subject-template template
-                    :class rdf-class
-                    :predicates predicates}]))))
+                (when logical-table
+                  (let [table-key (case (:type logical-table)
+                                    :table-name (keyword (str/replace (:name logical-table) "\"" ""))
+                                    :sql-query (keyword (str (hash (:query logical-table)))))]
+                    [table-key
+                     {:logical-table logical-table
+                      :table (case (:type logical-table)
+                               :table-name (:name logical-table)
+                               :sql-query (str "(" (:query logical-table) ") AS subquery"))
+                      :subject-template template
+                      :class rdf-class
+                      :predicates predicates}])))))
        (filter some?)
        (into {})))
 
@@ -435,10 +449,13 @@
           all-selects (combine-select-columns select-cols template-cols id-col)
           where-clause (build-where-clause predicates pred->literal filter-exprs pred->var)
 
-          ;; Generate final SQL
+          ;; Generate final SQL - don't uppercase if it's a subquery
+          table-ref (if (str/starts-with? table "(")
+                      table  ; It's a subquery, use as-is
+                      (str/upper-case table))  ; It's a table name, uppercase it
           final-sql (format "SELECT %s FROM %s%s"
                             all-selects
-                            (str/upper-case table)
+                            table-ref
                             (or where-clause ""))]
 
       (when (or (seq pred->literal) (seq filter-exprs))

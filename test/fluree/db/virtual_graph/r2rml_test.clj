@@ -659,6 +659,105 @@
         (is (= expected (set res))
             "Should return correct data using inline R2RML mapping")))))
 
+(deftest r2rml-sql-query-test
+  (testing "R2RML supports SQL queries as logical tables"
+    ;; Create an R2RML mapping with rr:sqlQuery
+    (let [sql-query-ttl (str "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n"
+                             "@prefix ex: <http://example.com/> .\n"
+                             "@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\n"
+
+                             "ex:ActiveCustomersMap a rr:TriplesMap ;\n"
+                             "  rr:logicalTable [\n"
+                             "    rr:sqlQuery \"SELECT customer_id, first_name || ' ' || last_name AS full_name FROM customers WHERE customer_id <= 2\"\n"
+                             "  ] ;\n"
+                             "  rr:subjectMap [\n"
+                             "    rr:template \"http://example.com/customer/{customer_id}\" ;\n"
+                             "    rr:class ex:ActiveCustomer\n"
+                             "  ] ;\n"
+                             "  rr:predicateObjectMap [\n"
+                             "    rr:predicate foaf:name ;\n"
+                             "    rr:objectMap [ rr:column \"full_name\" ]\n"
+                             "  ] .\n")
+          ;; Create a test system with SQL query mapping
+          test-system-sql (system/initialize
+                           (config/parse
+                            {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
+                                         "@vocab" "https://ns.flur.ee/system#"}
+                             "@id"      "memory"
+                             "@graph"   [{"@id"   "memoryStorage"
+                                          "@type" "Storage"}
+                                         {"@id"              "connection"
+                                          "@type"            "Connection"
+                                          "parallelism"      4
+                                          "cacheMaxMb"       1000
+                                          "commitStorage"    {"@id" "memoryStorage"}
+                                          "indexStorage"     {"@id" "memoryStorage"}
+                                          "primaryPublisher" {"@type"   "Publisher"
+                                                              "storage" {"@id" "memoryStorage"}}}]}))
+          conn-sql (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) test-system-sql)
+          publisher-sql (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) test-system-sql)]
+      ;; Publish R2RML with SQL query mapping
+      (async/<!! (nameservice/publish publisher-sql {:vg-name "vg/sql-query"
+                                                     :vg-type "fidx:R2RML"
+                                                     :engine  :r2rml
+                                                     :config  {:mappingInline sql-query-ttl
+                                                               :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                     :driver  "org.h2.Driver"}}
+                                                     :dependencies ["dummy-ledger@main"]}))
+      ;; Query using the SQL query mapping
+      (let [query {"from" ["vg/sql-query"]
+                   "select" ["?customer" "?name"]
+                   "where" [["graph" "vg/sql-query" {"@id" "?customer"
+                                                     "@type" "http://example.com/ActiveCustomer"
+                                                     "http://xmlns.com/foaf/0.1/name" "?name"}]]}
+            res @(fluree/query-connection conn-sql query)
+            expected #{["http://example.com/customer/1" "John Doe"]
+                       ["http://example.com/customer/2" "Jane Smith"]}]
+        (is (= expected (set res))
+            "Should return only customers 1 and 2 with concatenated names"))))
+
+  (testing "R2RML supports complex SQL queries with aggregation"
+    (let [agg-query-ttl (str "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n"
+                             "@prefix ex: <http://example.com/> .\n\n"
+
+                             "ex:CustomerOrderSummaryMap a rr:TriplesMap ;\n"
+                             "  rr:logicalTable [\n"
+                             "    rr:sqlQuery \"SELECT c.customer_id, c.first_name, COUNT(o.order_id) AS order_count FROM customers c LEFT JOIN orders o ON c.customer_id = o.customer_id GROUP BY c.customer_id, c.first_name\"\n"
+                             "  ] ;\n"
+                             "  rr:subjectMap [\n"
+                             "    rr:template \"http://example.com/customer-summary/{customer_id}\" ;\n"
+                             "    rr:class ex:CustomerSummary\n"
+                             "  ] ;\n"
+                             "  rr:predicateObjectMap [\n"
+                             "    rr:predicate ex:firstName ;\n"
+                             "    rr:objectMap [ rr:column \"first_name\" ]\n"
+                             "  ] ;\n"
+                             "  rr:predicateObjectMap [\n"
+                             "    rr:predicate ex:orderCount ;\n"
+                             "    rr:objectMap [ rr:column \"order_count\" ]\n"
+                             "  ] .\n")]
+      (async/<!! (nameservice/publish @test-publisher {:vg-name "vg/agg-sql"
+                                                       :vg-type "fidx:R2RML"
+                                                       :engine  :r2rml
+                                                       :config  {:mappingInline agg-query-ttl
+                                                                 :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                       :driver  "org.h2.Driver"}}
+                                                       :dependencies ["dummy-ledger@main"]}))
+      (let [query {"from" ["vg/agg-sql"]
+                   "select" ["?customer" "?firstName" "?orderCount"]
+                   "where" [["graph" "vg/agg-sql" {"@id" "?customer"
+                                                   "@type" "http://example.com/CustomerSummary"
+                                                   "http://example.com/firstName" "?firstName"
+                                                   "http://example.com/orderCount" "?orderCount"}]]}
+            res @(fluree/query-connection @test-conn query)
+            ;; Customer 1 has 2 orders, Customer 2 has 1 order, Customer 3 has 1 order, Customer 4 has 1 order
+            expected #{["http://example.com/customer-summary/1" "John" 2]
+                       ["http://example.com/customer-summary/2" "Jane" 1]
+                       ["http://example.com/customer-summary/3" "Bob" 1]
+                       ["http://example.com/customer-summary/4" "Alice" 1]}]
+        (is (= expected (set res))
+            "Should return customer order counts from aggregated SQL query")))))
+
 (deftest r2rml-json-ld-mapping-test
   (testing "R2RML supports JSON-LD format mappings"
     ;; Create an R2RML mapping in JSON-LD format
