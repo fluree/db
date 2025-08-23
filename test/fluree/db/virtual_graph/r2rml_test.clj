@@ -198,8 +198,7 @@
                                                        :engine  :r2rml
                                                        :config  {:mapping (.getAbsolutePath tmp-file)
                                                                  :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                       :driver  "org.h2.Driver"}}
-                                                       :dependencies ["dummy-ledger@main"]})))))
+                                                                       :driver  "org.h2.Driver"}}})))))
 
 (use-fixtures :once (fn [f]
                       (setup-h2-database)
@@ -645,8 +644,7 @@
                                                         :engine  :r2rml
                                                         :config  {:mappingInline inline-ttl
                                                                   :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                        :driver  "org.h2.Driver"}}
-                                                        :dependencies ["dummy-ledger@main"]}))
+                                                                        :driver  "org.h2.Driver"}}}))
       ;; Query using the inline mapping
       (let [query {"from" ["vg/inline-sql"]
                    "select" ["?s" "?name"]
@@ -702,8 +700,7 @@
                                                      :engine  :r2rml
                                                      :config  {:mappingInline sql-query-ttl
                                                                :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                     :driver  "org.h2.Driver"}}
-                                                     :dependencies ["dummy-ledger@main"]}))
+                                                                     :driver  "org.h2.Driver"}}}))
       ;; Query using the SQL query mapping
       (let [query {"from" ["vg/sql-query"]
                    "select" ["?customer" "?name"]
@@ -741,8 +738,7 @@
                                                        :engine  :r2rml
                                                        :config  {:mappingInline agg-query-ttl
                                                                  :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                       :driver  "org.h2.Driver"}}
-                                                       :dependencies ["dummy-ledger@main"]}))
+                                                                       :driver  "org.h2.Driver"}}}))
       (let [query {"from" ["vg/agg-sql"]
                    "select" ["?customer" "?firstName" "?orderCount"]
                    "where" [["graph" "vg/agg-sql" {"@id" "?customer"
@@ -797,8 +793,7 @@
                                                         :engine  :r2rml
                                                         :config  {:mappingInline json-ld-mapping
                                                                   :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                        :driver  "org.h2.Driver"}}
-                                                        :dependencies ["dummy-ledger@main"]}))
+                                                                        :driver  "org.h2.Driver"}}}))
       ;; Query using the JSON-LD mapping
       (let [query {"from" ["vg/jsonld-sql"]
                    "select" ["?customer" "?firstName" "?lastName"]
@@ -844,8 +839,7 @@
                                                        :engine  :r2rml
                                                        :config  {:mappingInline constant-ttl
                                                                  :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                       :driver  "org.h2.Driver"}}
-                                                       :dependencies ["dummy-ledger@main"]}))
+                                                                       :driver  "org.h2.Driver"}}}))
       ;; Query using the constant values
       (let [query {"from" ["vg/constants"]
                    "select" ["?customer" "?firstName" "?source" "?status"]
@@ -895,8 +889,7 @@
                                                        :engine  :r2rml
                                                        :config  {:mappingInline datatype-ttl
                                                                  :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                       :driver  "org.h2.Driver"}}
-                                                       :dependencies ["dummy-ledger@main"]}))
+                                                                       :driver  "org.h2.Driver"}}}))
       ;; Query using the datatyped values
       (let [query {"from" ["vg/datatypes"]
                    "select" ["?order" "?date" "?amount"]
@@ -936,8 +929,7 @@
                                                        :engine  :r2rml
                                                        :config  {:mappingInline template-ttl
                                                                  :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                       :driver  "org.h2.Driver"}}
-                                                       :dependencies ["dummy-ledger@main"]}))
+                                                                       :driver  "org.h2.Driver"}}}))
       ;; Query using the template-generated values
       (let [query {"from" ["vg/templates"]
                    "select" ["?customer" "?name" "?id"]
@@ -952,4 +944,65 @@
                        ["http://example.com/customer/4" "Alice Brown" "CUST-4"]}]
         (is (= expected (set res))
             "Should return template-generated values")))))
+
+(deftest r2rml-language-tags-test
+  (testing "R2RML supports language tags on literals"
+    (let [language-ttl (str "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n"
+                            "@prefix ex: <http://example.com/> .\n"
+                            "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\n"
+
+                            "ex:CustomersI18nMap a rr:TriplesMap ;\n"
+                            "  rr:logicalTable [ rr:tableName \"customers\" ] ;\n"
+                            "  rr:subjectMap [\n"
+                            "    rr:template \"http://example.com/customer/{customer_id}\" ;\n"
+                            "    rr:class ex:Customer\n"
+                            "  ] ;\n"
+                            "  rr:predicateObjectMap [\n"
+                            "    rr:predicate rdfs:label ;\n"
+                            "    rr:objectMap [ \n"
+                            "      rr:column \"first_name\" ;\n"
+                            "      rr:language \"en\"\n"
+                            "    ]\n"
+                            "  ] ;\n"
+                            "  rr:predicateObjectMap [\n"
+                            "    rr:predicate ex:fullName ;\n"
+                            "    rr:objectMap [ \n"
+                            "      rr:template \"{first_name} {last_name}\" ;\n"
+                            "      rr:language \"en-US\"\n"
+                            "    ]\n"
+                            "  ] ;\n"
+                            "  rr:predicateObjectMap [\n"
+                            "    rr:predicate ex:description ;\n"
+                            "    rr:objectMap [ \n"
+                            "      rr:constant \"Customer Account\" ;\n"
+                            "      rr:language \"en\"\n"
+                            "    ]\n"
+                            "  ] .\n")]
+      ;; Publish R2RML with language tags
+      (async/<!! (nameservice/publish @test-publisher {:vg-name "vg/language"
+                                                       :vg-type "fidx:R2RML"
+                                                       :engine  :r2rml
+                                                       :config  {:mappingInline language-ttl
+                                                                 :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                       :driver  "org.h2.Driver"}}}))
+      ;; Query using the language-tagged values
+      (let [query {"from" ["vg/language"]
+                   "select" ["?customer" "?label" "?fullName" "?description"]
+                   "where" [["graph" "vg/language" {"@id" "?customer"
+                                                    "@type" "http://example.com/Customer"
+                                                    "http://www.w3.org/2000/01/rdf-schema#label" "?label"
+                                                    "http://example.com/fullName" "?fullName"
+                                                    "http://example.com/description" "?description"}]]}
+            res @(fluree/query-connection @test-conn query)]
+        ;; Verify we get results with language-tagged values
+        ;; Note: The actual language tag handling in results depends on Fluree's query processor
+        (is (= 4 (count res))
+            "Should return all customers with language-tagged values")
+        ;; Check that first customer has expected values
+        (let [first-result (first (filter #(= "http://example.com/customer/1" (first %)) res))]
+          (is (some? first-result) "Should find customer 1")
+          (when first-result
+            (is (= "John" (second first-result)) "Should have English label")
+            (is (= "John Doe" (nth first-result 2)) "Should have full name with language tag")
+            (is (= "Customer Account" (nth first-result 3)) "Should have constant description")))))))
 

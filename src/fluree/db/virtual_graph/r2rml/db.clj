@@ -115,11 +115,15 @@
                                                                   datatype (some (fn [[_s p o]]
                                                                                    (when (= "http://www.w3.org/ns/r2rml#datatype" (get-iri p))
                                                                                      (get-iri o)))
+                                                                                 om-triples)
+                                                                  language (some (fn [[_s p o]]
+                                                                                   (when (= "http://www.w3.org/ns/r2rml#language" (get-iri p))
+                                                                                     (::where/val o)))
                                                                                  om-triples)]
                                                               (cond
-                                                                column {:type :column :value column :datatype datatype}
-                                                                constant {:type :constant :value constant :datatype datatype}
-                                                                template {:type :template :value template :datatype datatype}
+                                                                column {:type :column :value column :datatype datatype :language language}
+                                                                constant {:type :constant :value constant :datatype datatype :language language}
+                                                                template {:type :template :value template :datatype datatype :language language}
                                                                 :else nil)))]
                                            (if (and pred object-map)
                                              (assoc acc pred object-map)
@@ -333,21 +337,41 @@
    (get row (keyword (str/replace (str/upper-case col) "_" "-")))))
 
 (defn- value->rdf-match
-  "Convert a raw value to an RDF match object with appropriate datatype."
+  "Convert a raw value to an RDF match object with appropriate datatype or language."
   [value var-sym]
-  (if value
+  (cond
+    ;; Handle values with language tags or datatypes
+    (map? value)
     (cond
-      (instance? java.sql.Timestamp value)
-      (where/match-value {} (.toString ^java.sql.Timestamp value) const/iri-xsd-dateTime)
-      (instance? java.util.Date value)
-      (where/match-value {} (.toString ^java.util.Date value) const/iri-xsd-dateTime)
-      (decimal? value)
-      (where/match-value {} value const/iri-xsd-decimal)
-      (integer? value)
-      (where/match-value {} value const/iri-xsd-integer)
+      (:language value)
+      ;; Create a language-tagged literal using match-lang
+      (where/match-lang {} (str (:value value)) (:language value))
+      (:datatype value)
+      ;; Create a typed literal
+      (where/match-value {} (str (:value value)) (:datatype value))
       :else
-      (where/match-value {} value const/iri-string))
-    (where/unmatched-var var-sym)))
+      ;; Just the value
+      (where/match-value {} (str (:value value)) const/iri-string))
+
+    ;; Handle nil values
+    (nil? value)
+    (where/unmatched-var var-sym)
+
+    ;; Handle regular values
+    (instance? java.sql.Timestamp value)
+    (where/match-value {} (.toString ^java.sql.Timestamp value) const/iri-xsd-dateTime)
+
+    (instance? java.util.Date value)
+    (where/match-value {} (.toString ^java.util.Date value) const/iri-xsd-dateTime)
+
+    (decimal? value)
+    (where/match-value {} value const/iri-xsd-decimal)
+
+    (integer? value)
+    (where/match-value {} value const/iri-xsd-integer)
+
+    :else
+    (where/match-value {} value const/iri-string)))
 
 (defn- generate-column-alias
   "Generate SQL column alias from variable name or predicate IRI."
@@ -563,14 +587,14 @@
           template
           (re-seq #"\{([^}]+)\}" template)))
 
-(defn- apply-datatype
-  "Apply XSD datatype to a value."
-  [value datatype]
-  (if datatype
-    ;; For now, just return the value with type info
-    ;; In a full implementation, we'd convert to proper RDF typed literal
-    {:value value :datatype datatype}
-    value))
+(defn- apply-datatype-and-language
+  "Apply XSD datatype and/or language tag to a value."
+  [value datatype language]
+  (cond
+    ;; Language tag takes precedence over datatype for string literals
+    language {:value value :language language}
+    datatype {:value value :datatype datatype}
+    :else value))
 
 (defn- build-predicate-bindings
   "Build predicate variable bindings for solution map."
@@ -592,10 +616,10 @@
                     :column (let [sql-alias (generate-column-alias var-name pred-iri)
                                   col-val (or (get row (keyword (str/lower-case sql-alias)))
                                               (get row (keyword sql-alias)))]
-                              (apply-datatype col-val (:datatype object-map)))
-                    :constant (apply-datatype (:value object-map) (:datatype object-map))
+                              (apply-datatype-and-language col-val (:datatype object-map) (:language object-map)))
+                    :constant (apply-datatype-and-language (:value object-map) (:datatype object-map) (:language object-map))
                     :template (let [expanded (apply-template (:value object-map) row)]
-                                (apply-datatype expanded (:datatype object-map)))
+                                (apply-datatype-and-language expanded (:datatype object-map) (:language object-map)))
                     nil)
                   ;; String for backward compatibility
                   (string? object-map)
