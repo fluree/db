@@ -483,25 +483,45 @@
    restrictions))
 
 (defn equiv-all-values
-  "Handles rules cls-avf"
+  "Handles rules cls-avf - generates both forward entailment and backward inference rules for allValuesFrom"
   [rule-class restrictions]
   (reduce
    (fn [acc restriction]
      (let [{:keys [property is-inverse?]} (extract-property-with-inverse restriction)
            all-val  (util/get-first-id restriction const/iri-owl:allValuesFrom)
-           rule     (if is-inverse?
-                     ;; For inverse: if y has property x, then x must be of type all-val
-                      {"where"  {"@id"    "?y"
-                                 property "?x"}
-                       "insert" {"@id"   "?x"
-                                 "@type" all-val}}
-                     ;; Normal: if x has property y, then y must be of type all-val
-                      {"where"  {"@id"    "?x"
-                                 property "?y"}
-                       "insert" {"@id"   "?y"
-                                 "@type" all-val}})]
+           ;; Forward entailment: if x is of rule-class and has the property, then target must be of all-val type
+           forward-rule (if is-inverse?
+                         ;; For inverse: if x is rule-class and y has property x, then y must be of type all-val
+                          {"where"  [{"@id"   "?x"
+                                      "@type" rule-class}
+                                     {"@id"    "?y"
+                                      property "?x"}]
+                           "insert" {"@id"   "?y"
+                                     "@type" all-val}}
+                         ;; Normal: if x is rule-class and x has property y, then y must be of type all-val
+                          {"where"  [{"@id"   "?x"
+                                      "@type" rule-class}
+                                     {"@id"    "?x"
+                                      property "?y"}]
+                           "insert" {"@id"   "?y"
+                                     "@type" all-val}})
+           ;; Backward inference: anything that appears as a value of the property is of that type
+           ;; This is needed for OWL 2 RL compliance
+           backward-rule (if is-inverse?
+                          ;; For inverse: if y has property x, then y is of type all-val
+                           {"where"  {"@id"    "?y"
+                                      property "?x"}
+                            "insert" {"@id"   "?y"
+                                      "@type" all-val}}
+                          ;; Normal: if x has property y, then y is of type all-val
+                           {"where"  {"@id"    "?x"
+                                      property "?y"}
+                            "insert" {"@id"   "?y"
+                                      "@type" all-val}})]
        (if (and property all-val)
-         (conj acc [(str rule-class "(owl:allValuesFrom-" property ")") rule])
+         (-> acc
+             (conj [(str rule-class "(owl:allValuesFrom-forward-" property ")") forward-rule])
+             (conj [(str all-val "(owl:allValuesFrom-backward-" property ")") backward-rule]))
          (do (log/warn "owl:Restriction for class" rule-class
                        "is not properly defined. owl:onProperty is:" (get restriction const/iri-owl:onProperty)
                        "and owl:allValuesFrom is:" (util/get-first restriction const/iri-owl:allValuesFrom)
@@ -812,7 +832,7 @@
   (reduce
    (fn [acc intersection-of-statement]
      (let [intersections (util/unwrap-list (get intersection-of-statement const/iri-owl:intersectionOf))
-           {:keys [classes has-value some-values qual-cardinality union-of]} (group-by equiv-class-type intersections)
+           {:keys [classes has-value some-values all-values qual-cardinality union-of]} (group-by equiv-class-type intersections)
            ;; Build union conditions for intersection from union-of group
            union-conditions (reduce (fn [acc* union-class]
                                       (let [union-members (util/unwrap-list (get union-class const/iri-owl:unionOf))
@@ -829,6 +849,7 @@
            restrictions  (cond->> union-conditions
                            has-value (into (has-value-condition "?y" has-value))
                            some-values (into (some-values-condition "?y" some-values)))
+           ;; Note: all-values restrictions don't add conditions, they create separate forward rules
            class-list    (only-named-ids classes)
            cls-int1      (when (or (seq class-list)
                                    (seq restrictions))
@@ -847,6 +868,31 @@
                             "insert" {"@id"   "?y"
                                       "@type" (into [] class-list)}})
 
+           ;; Generate forward entailment rules for allValuesFrom in intersections
+           all-values-rules (reduce (fn [acc* all-val-restriction]
+                                      (let [{:keys [property is-inverse?]} (extract-property-with-inverse all-val-restriction)
+                                            target-class (util/get-first-id all-val-restriction const/iri-owl:allValuesFrom)]
+                                        (if (and property target-class)
+                                          (let [rule (if is-inverse?
+                                                      ;; For inverse: if x is rule-class and y has property x, then y is target-class
+                                                       {"where"  [{"@id"   "?x"
+                                                                   "@type" rule-class}
+                                                                  {"@id"    "?y"
+                                                                   property "?x"}]
+                                                        "insert" {"@id"   "?y"
+                                                                  "@type" target-class}}
+                                                      ;; Normal: if x is rule-class and x has property y, then y is target-class
+                                                       {"where"  [{"@id"   "?x"
+                                                                   "@type" rule-class}
+                                                                  {"@id"    "?x"
+                                                                   property "?y"}]
+                                                        "insert" {"@id"   "?y"
+                                                                  "@type" target-class}})]
+                                            (conj acc* [(str rule-class "(owl:allValuesFrom-forward-" property ")") rule]))
+                                          acc*)))
+                                    []
+                                    all-values)
+
            triples       (reduce
                           (fn [triples* c]
                             (conj triples* [rule-class const/iri-rdfs:subClassOf {"@id" c}]))
@@ -863,7 +909,8 @@
 
        (cond-> acc
          cls-int1 (conj [(str rule-class "(owl:intersectionOf-1)#" (hash class-list)) cls-int1])
-         cls-int2 (conj [(str rule-class "(owl:intersectionOf-2)#" (hash class-list)) cls-int2]))))
+         cls-int2 (conj [(str rule-class "(owl:intersectionOf-2)#" (hash class-list)) cls-int2])
+         (seq all-values-rules) (into all-values-rules))))
    []
    intersection-of-statements))
 
