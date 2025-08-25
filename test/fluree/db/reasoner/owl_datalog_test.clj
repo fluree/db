@@ -151,8 +151,8 @@
                                 "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
                     "insert"   [{"@id"                     "ex:hasFormulation"
                                  "@type"                   "owl:ObjectProperty"
-                                 "owl:propertyChainAxiom"  [{"@id" "ex:isDirectPartOf"}
-                                                            {"@id" "ex:conformsTo"}]}
+                                 "owl:propertyChainAxiom"  {"@list" [{"@id" "ex:isDirectPartOf"}
+                                                                     {"@id" "ex:conformsTo"}]}}
                                 {"@id"   "ex:FormulatedSubstance"
                                  "@type" "owl:Class"
                                  "owl:equivalentClass" {"@type"              "owl:Restriction"
@@ -172,7 +172,7 @@
           db-reasoned @(fluree/reason db-with-data :owl-datalog)]
 
       (testing "Property chain should infer hasFormulation relationship"
-        (is (= "ex:formulation1"
+        (is (= ["ex:formulation1"]
                @(fluree/query db-reasoned
                               {:context {"ex" "http://example.org/"}
                                :select  "?formulation"
