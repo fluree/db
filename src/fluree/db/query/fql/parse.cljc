@@ -961,7 +961,8 @@
 
 (defn upsert-where-del
   "Takes parsed transaction data and for each triple pattern, replaces the object position
-   with a variable corresponding to the predicate. Returns a map with :where and :delete keys.
+  with a variable corresponding to the subject and predicate. Returns a map with :where
+  and :delete keys.
 
    Skips blank nodes as they are new subjects with no existing flakes to retract."
   [parsed-txn]
