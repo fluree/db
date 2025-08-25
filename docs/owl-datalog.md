@@ -14,12 +14,12 @@ OWL 2 RL has limited support for complex class expressions in intersections. OWL
 
 ```turtle
 # Complex equivalentClass with multiple restrictions
-DrugFormulation ≡ Specification ∩ ∀(isMemberOf)⁻.Ingredient ∩ ∃hasUnit.{mg}
+ElectricVehicle ≡ Vehicle ∩ ∀hasPowerSource.{electricity} ∩ ∃hasRange.LongRange
 ```
 
 This generates rules for:
-- Forward entailment: If x is DrugFormulation → x has the required properties
-- Backward inference: If x meets all intersection criteria → x is DrugFormulation
+- Forward entailment: If x is ElectricVehicle → x has the required properties
+- Backward inference: If x meets all intersection criteria → x is ElectricVehicle
 
 ### Union Classes as Multiple Rules
 
@@ -27,12 +27,12 @@ While OWL 2 RL supports basic unions, OWL-Datalog compiles unions into multiple 
 
 ```turtle
 # Union in equivalentClass
-DrugTarget ≡ Protein ∪ Receptor ∪ Enzyme
+PaymentMethod ≡ CreditCard ∪ DebitCard ∪ DigitalWallet
 
 # Generates separate rules:
-# Rule 1: Protein(?x) → DrugTarget(?x)
-# Rule 2: Receptor(?x) → DrugTarget(?x) 
-# Rule 3: Enzyme(?x) → DrugTarget(?x)
+# Rule 1: CreditCard(?x) → PaymentMethod(?x)
+# Rule 2: DebitCard(?x) → PaymentMethod(?x) 
+# Rule 3: DigitalWallet(?x) → PaymentMethod(?x)
 ```
 
 ### Property Chains with Inverse Properties
@@ -51,20 +51,20 @@ ChainedClass ≡ ∃(hasParent ∘ hasChild⁻ ∘ hasSibling).Person
 
 #### hasValue Forward Entailment
 ```turtle
-# If x is KilogramMagnitude, infer hasUnit kg
-KilogramMagnitude ≡ Magnitude ∩ ∃hasUnit.{kg}
+# If x is KilogramMeasurement, infer hasUnit kg
+KilogramMeasurement ≡ Measurement ∩ ∃hasUnit.{kg}
 ```
 
 #### allValuesFrom Forward Entailment
 ```turtle
-# If x is SafeContainer and x contains y, then y is SafeItem
-SafeContainer ≡ Container ∩ ∀contains.SafeItem
+# If x is SecureFolder and x contains y, then y is SecureDocument
+SecureFolder ≡ Folder ∩ ∀contains.SecureDocument
 ```
 
 #### Multiple Restrictions on Same Property
 ```turtle
 # Multiple constraints on the same property
-ComplexProduct ≡ Item ∩ ∃hasProperty.PropertyA ∩ ∃hasProperty.PropertyB ∩ ∃hasProperty.{specificValue}
+LuxuryCar ≡ Car ∩ ∃hasFeature.LeatherSeats ∩ ∃hasFeature.NavigationSystem ∩ ∃hasFeature.{sunroof}
 ```
 
 ## Supported Constructs
@@ -124,10 +124,10 @@ OWL-Datalog extends the base OWL 2 RL ruleset with:
 
 ```turtle
 # Forward entailment works:
-KilogramMagnitude(?x) → hasUnit(?x, kg)
+KilogramMeasurement(?x) → hasUnit(?x, kg)
 
 # Backward inference doesn't work:
-hasUnit(?x, "95"^^xsd:int) ↛ HighQuality(?x)
+hasQualityScore(?x, "95"^^xsd:int) ↛ HighQuality(?x)
 ```
 
 **Workaround**: Use untyped literals or object properties where possible.
@@ -153,19 +153,19 @@ ChainedClass ≡ ∀hasGrandchild.Person
 Currently only parsed, not reasoned over:
 ```turtle
 # Planned support:
-MedicalTeam ≡ Group ∩ =3 hasMember.Doctor
+BoardOfDirectors ≡ Group ∩ ≥5 hasMember.Director ∩ ≤15 hasMember.Director
 ```
 
 #### Disjointness Reasoning
 ```turtle
 # Planned support:
-Drug owl:disjointWith Disease
+Student owl:disjointWith Teacher
 ```
 
 #### Complement Classes
 ```turtle  
 # Planned support:
-NonToxic ≡ ¬Toxic
+Inactive ≡ ¬Active
 ```
 
 #### Enhanced Datatype Support
@@ -207,22 +207,22 @@ OWL-Datalog is intentionally incomplete for full OWL DL to maintain decidability
   },
   "insert": [
     {
-      "@id": "ex:SafeFormulation",
+      "@id": "ex:PremiumProduct",
       "@type": "owl:Class",
       "owl:equivalentClass": {
         "@type": "owl:Class",
         "owl:intersectionOf": {
           "@list": [
-            {"@id": "ex:Formulation"},
+            {"@id": "ex:Product"},
             {
               "@type": "owl:Restriction",
-              "owl:onProperty": {"@id": "ex:contains"},
-              "owl:allValuesFrom": {"@id": "ex:SafeIngredient"}
+              "owl:onProperty": {"@id": "ex:hasQuality"},
+              "owl:allValuesFrom": {"@id": "ex:HighQuality"}
             },
             {
               "@type": "owl:Restriction", 
-              "owl:onProperty": {"@id": "ex:hasConcentration"},
-              "owl:someValuesFrom": {"@id": "ex:LowConcentration"}
+              "owl:onProperty": {"@id": "ex:hasWarranty"},
+              "owl:someValuesFrom": {"@id": "ex:ExtendedWarranty"}
             }
           ]
         }
@@ -326,6 +326,6 @@ OWL-Datalog provides a powerful middle ground between the limited expressivity o
 - **Fast query performance** over materialized inferences
 - **Complex class expressions** with intersections and unions
 - **Property relationship reasoning** including chains and inverses
-- **Pharmaceutical/scientific domains** with rich restriction patterns
+- **Rich domain modeling** with complex restriction patterns
 
 The reasoner's Horn clause foundation ensures decidability while supporting significantly more expressive constructs than standard OWL 2 RL profiles.
