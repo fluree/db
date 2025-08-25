@@ -417,14 +417,18 @@
           {:property nil
            :is-inverse? false}))
 
-      ;; Property chain as property
+      ;; Property chain as property (when the onProperty directly contains a chain definition)
+      ;; This is for cases like: "owl:onProperty" {"owl:propertyChainAxiom" [...]}
       (contains? on-property const/iri-owl:propertyChainAxiom)
-      {:property-chain (util/unwrap-list (get on-property const/iri-owl:propertyChainAxiom))
-       :is-chain? true
-       :property nil
-       :is-inverse? false}
+      (let [chain-val (get on-property const/iri-owl:propertyChainAxiom)
+            ;; Ensure chain is always a sequence
+            chain-seq (util/sequential chain-val)]
+        {:property-chain chain-seq
+         :is-chain? true
+         :property nil
+         :is-inverse? false})
 
-      ;; Direct property reference
+      ;; Direct property reference (including properties that have chain axioms defined elsewhere)
       :else
       {:property (util/get-id on-property)
        :is-inverse? false})))
@@ -436,8 +440,16 @@
    (fn [acc restriction]
      (let [{:keys [property is-inverse?]} (extract-property-with-inverse restriction)
            has-val  (util/get-first restriction const/iri-owl:hasValue)
-           has-val* (if (util/get-id has-val)
+           has-val* (cond
+                      (util/get-id has-val)
                       {"@id" (util/get-id has-val)}
+
+                      ;; For typed data values, preserve the full object for matching
+                      (and (map? has-val) (contains? has-val "@value"))
+                      has-val
+
+                      ;; For simple values, use raw value
+                      :else
                       (util/get-value has-val))
            rule1    (if is-inverse?
                      ;; For inverse: if has-val has property x, then x is rule-class
@@ -613,8 +625,16 @@
    (fn [acc has-value-statement]
      (let [property   (util/get-first-id has-value-statement const/iri-owl:onProperty)
            has-value  (util/get-first has-value-statement const/iri-owl:hasValue)
-           has-value* (if-let [has-val-id (util/get-id has-value)]
-                        {"@id" has-val-id}
+           has-value* (cond
+                        (util/get-id has-value)
+                        {"@id" (util/get-id has-value)}
+
+                        ;; For typed data values, preserve the full object for matching
+                        (and (map? has-value) (contains? has-value "@value"))
+                        has-value
+
+                        ;; For simple values, use raw value
+                        :else
                         (util/get-value has-value))]
        (conj acc {"@id"    binding-var
                   property has-value*})))
@@ -893,6 +913,41 @@
                                     []
                                     all-values)
 
+           ;; Generate forward entailment rules for hasValue in intersections
+           has-value-rules (reduce (fn [acc* has-val-restriction]
+                                     (let [{:keys [property is-inverse?]} (extract-property-with-inverse has-val-restriction)
+                                           has-val  (util/get-first has-val-restriction const/iri-owl:hasValue)
+                                           has-val* (cond
+                                                      (util/get-id has-val)
+                                                      {"@id" (util/get-id has-val)}
+
+                                                    ;; For typed data values, preserve the full object for matching
+                                                      (and (map? has-val) (contains? has-val "@value"))
+                                                      has-val
+
+                                                    ;; For simple values, use raw value
+                                                      :else
+                                                      (util/get-value has-val))]
+                                       (if (and property has-val*)
+                                         (let [rule (if is-inverse?
+                                                    ;; For inverse: if x is rule-class, then has-val has property x
+                                                      (when (map? has-val*)  ;; Can't do inverse for scalar values
+                                                        {"where"  {"@id"   "?x"
+                                                                   "@type" rule-class}
+                                                         "insert" {"@id"    (get has-val* "@id")
+                                                                   property "?x"}})
+                                                    ;; Normal: if x is rule-class, then x has property has-val
+                                                      {"where"  {"@id"   "?x"
+                                                                 "@type" rule-class}
+                                                       "insert" {"@id"    "?x"
+                                                                 property has-val*}})]
+                                           (if rule
+                                             (conj acc* [(str rule-class "(owl:hasValue-forward-" property ")") rule])
+                                             acc*))
+                                         acc*)))
+                                   []
+                                   has-value)
+
            triples       (reduce
                           (fn [triples* c]
                             (conj triples* [rule-class const/iri-rdfs:subClassOf {"@id" c}]))
@@ -910,7 +965,8 @@
        (cond-> acc
          cls-int1 (conj [(str rule-class "(owl:intersectionOf-1)#" (hash class-list)) cls-int1])
          cls-int2 (conj [(str rule-class "(owl:intersectionOf-2)#" (hash class-list)) cls-int2])
-         (seq all-values-rules) (into all-values-rules))))
+         (seq all-values-rules) (into all-values-rules)
+         (seq has-value-rules) (into has-value-rules))))
    []
    intersection-of-statements))
 
