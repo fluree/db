@@ -864,7 +864,10 @@
 
   Parameters:
     db - Database value
-    methods - Reasoner method or vector of methods (:datalog, :owl2rl)
+    methods - Reasoner method or vector of methods (:datalog, :owl2rl, :owl-datalog)
+              :datalog - Custom datalog rules
+              :owl2rl - OWL 2 RL profile rules  
+              :owl-datalog - Extended OWL 2 RL with additional Datalog-compatible constructs
     rule-sources - (optional) JSON-LD rules or nil to use rules from db
     opts - (optional) Options map
 

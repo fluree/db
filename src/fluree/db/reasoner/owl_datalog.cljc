@@ -27,46 +27,49 @@
 (defn equiv-class-type
   [equiv-class-statement]
   (let [statement-id (util/get-id equiv-class-statement)]
-    (cond (util/of-type? equiv-class-statement const/iri-owl:Restriction)
-          (cond
-            (contains? equiv-class-statement const/iri-owl:hasValue)
-            :has-value
+    (cond
+          ;; Check for Restriction types first, before checking if it's a blank node
+      (util/of-type? equiv-class-statement const/iri-owl:Restriction)
+      (cond
+        (contains? equiv-class-statement const/iri-owl:hasValue)
+        :has-value
 
-            (contains? equiv-class-statement const/iri-owl:someValuesFrom)
-            :some-values
+        (contains? equiv-class-statement const/iri-owl:someValuesFrom)
+        :some-values
 
-            (contains? equiv-class-statement const/iri-owl:allValuesFrom)
-            :all-values
+        (contains? equiv-class-statement const/iri-owl:allValuesFrom)
+        :all-values
 
-            (contains? equiv-class-statement const/iri-owl:maxCardinality)
-            :max-cardinality
+        (contains? equiv-class-statement const/iri-owl:maxCardinality)
+        :max-cardinality
 
-            (contains? equiv-class-statement const/iri-owl:maxQualifiedCardinality)
-            :max-qual-cardinality
+        (contains? equiv-class-statement const/iri-owl:maxQualifiedCardinality)
+        :max-qual-cardinality
 
-            (contains? equiv-class-statement const/iri-owl:qualifiedCardinality)
-            :qual-cardinality
+        (contains? equiv-class-statement const/iri-owl:qualifiedCardinality)
+        :qual-cardinality
 
-            :else
-            (do
-              (log/warn "Unsupported owl:Restriction" equiv-class-statement)
-              nil))
+        :else
+        (do
+          (log/warn "Unsupported owl:Restriction" equiv-class-statement)
+          nil))
 
-          (contains? equiv-class-statement const/iri-owl:oneOf)
-          :one-of
+      (contains? equiv-class-statement const/iri-owl:oneOf)
+      :one-of
 
-          (contains? equiv-class-statement const/iri-owl:intersectionOf)
-          :intersection-of
+      (contains? equiv-class-statement const/iri-owl:intersectionOf)
+      :intersection-of
 
-          (contains? equiv-class-statement const/iri-owl:unionOf)
-          :union-of
+      (contains? equiv-class-statement const/iri-owl:unionOf)
+      :union-of
 
-          statement-id
-          (if (iri/blank-node-id? statement-id)
-            :blank-nodes
-            :classes)
+          ;; Only check for blank nodes/classes if none of the above matched
+      statement-id
+      (if (iri/blank-node-id? statement-id)
+        :blank-nodes
+        :classes)
 
-          :else nil)))
+      :else nil)))
 
 (defmulti to-datalog (fn [rule-type _inserts _owl-statement _all-rules]
                        rule-type))
@@ -463,30 +466,34 @@
   (reduce
    (fn [acc restriction]
      (let [property (util/get-first-id restriction const/iri-owl:onProperty)
-           {:keys [classes one-of]} (group-by equiv-class-type (get restriction const/iri-owl:someValuesFrom))
-           rule     (cond
-                      ;; special case where someValuesFrom is owl:Thing, means
-                      ;; everything with property should be in the class (cls-svf2)
-                      (and classes (= const/iri-owl:Thing (-> classes first util/get-id)))
-                      {"where"  {"@id"    "?x"
-                                 property nil}
-                       "insert" {"@id"   "?x"
-                                 "@type" rule-class}}
+           some-values-val (get restriction const/iri-owl:someValuesFrom)
+           ;; someValuesFrom could be a single class or a collection - ensure it's a collection
+           some-values-seq (if (sequential? some-values-val) some-values-val [some-values-val])
+           {:keys [classes one-of]} (group-by equiv-class-type some-values-seq)
+           rule     (when property ;; Only generate rule if property is valid
+                      (cond
+                        ;; special case where someValuesFrom is owl:Thing, means
+                        ;; everything with property should be in the class (cls-svf2)
+                        (and classes (= const/iri-owl:Thing (-> classes first util/get-id)))
+                        {"where"  {"@id"    "?x"
+                                   property nil}
+                         "insert" {"@id"   "?x"
+                                   "@type" rule-class}}
 
-                      ;; an explicit class is defined for someValuesFrom (cls-svf1)
-                      classes
-                      {"where"  [{"@id"    "?x"
-                                  property "?y"}
-                                 {"@id"   "?y"
-                                  "@type" (-> classes first util/get-id)}]
-                       "insert" {"@id"   "?x"
-                                 "@type" rule-class}}
+                        ;; an explicit class is defined for someValuesFrom (cls-svf1)
+                        classes
+                        {"where"  [{"@id"    "?x"
+                                    property "?y"}
+                                   {"@id"   "?y"
+                                    "@type" (-> classes first util/get-id)}]
+                         "insert" {"@id"   "?x"
+                                   "@type" rule-class}}
 
-                      ;; one-of is defined for someValuesFrom (cls-svf1)
-                      one-of
-                      {"where"  [(one-of-condition "?x" property (first one-of))]
-                       "insert" {"@id"   "?x"
-                                 "@type" rule-class}})]
+                        ;; one-of is defined for someValuesFrom (cls-svf1)
+                        one-of
+                        {"where"  [(one-of-condition "?x" property (first one-of))]
+                         "insert" {"@id"   "?x"
+                                   "@type" rule-class}}))]
        (if rule
          (conj acc [(str rule-class "(owl:someValuesFrom-" property ")") rule])
          (do (log/warn "owl:Restriction for class" rule-class
@@ -607,11 +614,14 @@
 (defmethod to-datalog ::cax-eqc
   [_ inserts owl-statement all-rules]
   (let [c1 (util/get-id owl-statement) ;; the class which is the subject
+        equiv-class-val (get owl-statement const/iri-owl:equivalentClass)
+        unwrapped (util/unwrap-list equiv-class-val)
+        ;; Ensure unwrapped is always a sequence for group-by
+        unwrapped-seq (if (sequential? unwrapped) unwrapped [unwrapped])
         ;; combine with all other equivalent classes for a set of 2+ total classes
         {:keys [classes intersection-of union-of one-of
                 has-value some-values all-values
-                max-cardinality max-qual-cardinality]} (->> (get owl-statement const/iri-owl:equivalentClass)
-                                                            util/unwrap-list
+                max-cardinality max-qual-cardinality]} (->> unwrapped-seq
                                                             (group-by equiv-class-type))]
     (cond-> all-rules
       classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
@@ -761,6 +771,11 @@
 
 (defn owl->datalog
   [inserts owl-graph]
-  (->> owl-graph
-       (mapcat (partial statement->datalog inserts))
-       (into base-rules)))
+  (log/debug "OWL->Datalog processing" (count owl-graph) "statements")
+  (let [rules (->> owl-graph
+                   (mapcat (partial statement->datalog inserts))
+                   (into base-rules))]
+    (log/debug "Generated" (count rules) "rules from OWL statements")
+    (doseq [[id _] (take 5 rules)]
+      (log/debug "  Rule:" id))
+    rules))

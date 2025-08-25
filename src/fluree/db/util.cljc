@@ -254,9 +254,10 @@
 (defn of-type?
   "Returns true if the provided json-ld node is of the provided type."
   [jsonld rdf-type]
-  (->> jsonld
-       get-types
-       (some #(= % rdf-type))))
+  (let [types (get-types jsonld)]
+    (if (sequential? types)
+      (some #(= % rdf-type) types)
+      (= types rdf-type))))
 
 (defn get-value
   [val]
