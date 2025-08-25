@@ -9,34 +9,39 @@
                         "@graph"   [{"@id"         "ex:alice",
                                      "@type"        "ex:User",
                                      "schema:name" "Alice"
+                                     "ex:nums"     [1 2 3]
                                      "schema:age"  42}
                                     {"@id"         "ex:bob",
                                      "@type"        "ex:User",
                                      "schema:name" "Bob"
+                                     "ex:nums"     [1 2 3]
                                      "schema:age"  22}]})
 
 (def sample-upsert-txn {"@context" {"ex" "http://example.org/ns/"
                                     "schema" "http://schema.org/"}
                         "@graph"   [{"@id"         "ex:alice"
+                                     "ex:nums"     [4 5 6]
                                      "schema:name" "Alice2"}
                                     {"@id"         "ex:bob"
+                                     "ex:nums"     [4 5 6]
                                      "schema:name" "Bob2"}
                                     {"@id"         "ex:jane"
+                                     "ex:nums"     [4 5 6]
                                      "schema:name" "Jane2"}]})
 
 (def sample-update-txn {"@context" (get sample-upsert-txn "@context")
-                        "where" [["optional" {"@id" "ex:alice"
-                                              "schema:name" "?f0"}]
-                                 ["optional" {"@id" "ex:bob"
-                                              "schema:name" "?f1"}]
-                                 ["optional" {"@id" "ex:jane"
-                                              "schema:name" "?f2"}]]
-                        "delete" [{"@id" "ex:alice"
-                                   "schema:name" "?f0"}
-                                  {"@id" "ex:bob"
-                                   "schema:name" "?f1"}
-                                  {"@id" "ex:jane"
-                                   "schema:name" "?f2"}]
+                        "where" [["optional" {"@id" "ex:alice" "ex:nums" "?f0"}]
+                                 ["optional" {"@id" "ex:alice" "schema:name" "?f1"}]
+                                 ["optional" {"@id" "ex:bob" "ex:nums" "?f2"}]
+                                 ["optional" {"@id" "ex:bob" "schema:name" "?f3"}]
+                                 ["optional" {"@id" "ex:jane" "ex:nums" "?f4"}]
+                                 ["optional" {"@id" "ex:jane" "schema:name" "?f5"}]]
+                        "delete" [{"@id" "ex:alice" "ex:nums" "?f0"}
+                                  {"@id" "ex:alice" "schema:name" "?f1"}
+                                  {"@id" "ex:bob" "ex:nums" "?f2"}
+                                  {"@id" "ex:bob" "schema:name" "?f3"}
+                                  {"@id" "ex:jane" "ex:nums" "?f4"}
+                                  {"@id" "ex:jane" "schema:name" "?f5"}]
                         "insert" (get sample-upsert-txn "@graph")})
 
 (deftest upsert-parsing
@@ -54,12 +59,15 @@
       (is (= [{"@id"         "ex:alice",
                "@type"       "ex:User",
                "schema:age"  42,
+               "ex:nums"     [4 5 6],
                "schema:name" "Alice2"}
               {"@id"         "ex:bob",
                "schema:age"  22,
+               "ex:nums"     [4 5 6],
                "schema:name" "Bob2",
                "@type"       "ex:User"}
               {"@id"         "ex:jane",
+               "ex:nums"     [4 5 6],
                "schema:name" "Jane2"}]
              @(fluree/query db+upsert
                             {"@context" {"ex"     "http://example.org/ns/"
@@ -137,13 +145,16 @@
     (testing "upsert! commits the data"
       (is (= [{"@type" "ex:User",
                "schema:age" 42,
+               "ex:nums" [4 5 6],
                "schema:name" "Alice2",
                "@id" "ex:alice"}
               {"@type" "ex:User",
                "schema:age" 22,
+               "ex:nums" [4 5 6],
                "schema:name" "Bob2",
                "@id" "ex:bob"}
               {"schema:name" "Jane2",
+               "ex:nums" [4 5 6],
                "@id" "ex:jane"}]
              @(fluree/query db2
                             {"@context" {"ex" "http://example.org/ns/"
