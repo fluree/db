@@ -50,7 +50,10 @@
           ns-metadata    (ns-record ledger-alias branch commit-address t-value index-address)
           record-bytes   (json/stringify-UTF8 ns-metadata)
           filename       (local-filename ledger-alias branch)]
-      (storage/write-bytes store filename record-bytes)))
+      (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :branch branch :filename filename})
+      (let [res (storage/write-bytes store filename record-bytes)]
+        (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :branch branch :filename filename})
+        res)))
 
   (retract [_ ledger-alias]
     (let [filename (local-filename ledger-alias)

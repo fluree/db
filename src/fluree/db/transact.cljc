@@ -227,6 +227,7 @@
   ([{ledger-alias :alias, :as ledger}
     {:keys [branch t stats commit] :as staged-db}
     opts]
+   (log/debug "commit!: write-transaction start" {:ledger ledger-alias})
    (go-try
      (let [{:keys [commit-catalog]} ledger
 
@@ -240,7 +241,12 @@
            {:keys [txn-id author annotation]}
            (<? (write-transaction! ledger staged-txn))
 
+           _ (log/debug "commit!: write-jsonld(db) start" {:ledger ledger-alias})
+
            data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
+
+           _ (log/debug "commit!: write-jsonld(db) done" {:ledger ledger-alias :db-address (:address data-write-result)})
+
            db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
            dbid              (commit-data/hash->db-id (:hash data-write-result))
            keypair           {:did did, :private private}
@@ -259,15 +265,24 @@
                                                       :flakes     (:flakes stats)
                                                       :size       (:size stats)})
 
+           _ (log/debug "commit!: write-commit start" {:ledger ledger-alias})
+
            {:keys [commit-map commit-jsonld write-result]}
            (<? (write-commit commit-catalog ledger-alias keypair new-commit))
 
+           _ (log/debug "commit!: write-commit done" {:ledger ledger-alias :commit-address (:address write-result)})
+
            db  (formalize-commit staged-db commit-map)
+
+           _ (log/debug "commit!: ledger/update-commit! start" {:ledger ledger-alias :t t})
+
            db* (ledger/update-commit! ledger branch db index-files-ch)]
 
-       (log/debug "Committing t" t "at" time)
+       (log/debug "commit!: ledger/update-commit! done, publish-commit start" {:ledger ledger-alias :t t :at time})
 
        (<? (publish-commit ledger commit-jsonld))
+
+       (log/debug "commit!: publish-commit done" {:ledger ledger-alias})
 
        (if (track/track-txn? opts)
          (let [indexing-disabled? (-> ledger

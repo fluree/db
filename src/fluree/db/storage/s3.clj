@@ -204,7 +204,8 @@
     :or {method "GET"
          headers {}}}]
   (go-try
-    (let [;; Encode path segments for both URL and signature to match S3's encoding
+    (let [start (System/nanoTime)
+          ;; Encode path segments for both URL and signature to match S3's encoding
           encoded-path (encode-s3-path path)
           query-string (canonical-query-string query-params)
           url (str (build-s3-url bucket region encoded-path)
@@ -223,6 +224,7 @@
                            :query-params query-params})
 
           ;; Use xhttp for the actual request
+          _ (log/debug "s3-request start" {:method method :bucket bucket :path encoded-path :timeout request-timeout})
           response (<? (case method
                          "GET" (xhttp/get url {:headers signed-headers
                                                :request-timeout request-timeout})
@@ -231,8 +233,9 @@
                          "DELETE" (xhttp/delete url {:headers signed-headers
                                                      :request-timeout request-timeout})
                          (throw (ex-info "Unsupported HTTP method" {:method method}))))]
-
-      response)))
+      (let [dur-ms (long (/ (- (System/nanoTime) start) 1000000))]
+        (log/debug "s3-request done" {:method method :bucket bucket :path encoded-path :duration-ms dur-ms})
+        response))))
 
 (defn- tag-matches?
   "Check if an XML element's tag matches the given name, ignoring namespace"
