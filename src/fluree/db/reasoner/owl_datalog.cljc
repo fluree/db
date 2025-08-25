@@ -196,22 +196,78 @@
 
 ;; turns list of properties into:
 ;; [{"@id" "?u0", "?p1" "?u1"}, {"@id" "?u2", "?p2" "?u3"} ... ]
+(defn extract-chain-property
+  "Extract property from chain element, handling inverse properties.
+  Returns {:property prop-id :is-inverse? bool}"
+  [chain-element]
+  (cond
+    ;; Direct property ID string
+    (string? chain-element)
+    {:property chain-element
+     :is-inverse? false}
+
+    ;; Map with inverseOf - could be single or double inverse
+    (and (map? chain-element) (contains? chain-element const/iri-owl:inverseOf))
+    (let [inverse-val (util/get-first chain-element const/iri-owl:inverseOf)]
+      (cond
+        ;; Check if inverse-val has an @id - use that with inverse flag
+        ;; This handles cases where a property is defined elsewhere and referenced here
+        (and inverse-val (util/get-id inverse-val))
+        {:property (util/get-id inverse-val)
+         :is-inverse? true}
+
+        ;; Double inverse case - but still check if intermediate has @id
+        (and inverse-val (contains? inverse-val const/iri-owl:inverseOf))
+        ;; Even though it's a double inverse, if the intermediate has an @id, use it
+        (if-let [intermediate-id (util/get-id inverse-val)]
+          {:property intermediate-id
+           :is-inverse? true}
+          ;; Otherwise normalize to original
+          (let [original-prop (util/get-first-id inverse-val const/iri-owl:inverseOf)]
+            (if original-prop
+              (do (log/debug "Found double inverse in property chain, normalizing to original:" original-prop)
+                  {:property original-prop
+                   :is-inverse? false}) ;; Double inverse normalizes to non-inverse
+              (throw (ex-info "Invalid double inverse property - no target property specified"
+                              {:chain-element chain-element})))))
+
+        ;; Single inverse case - just extract the property being inverted
+        :else
+        (if-let [inverse-prop (util/get-first-id chain-element const/iri-owl:inverseOf)]
+          {:property inverse-prop
+           :is-inverse? true}
+          (throw (ex-info "Invalid inverse property - no target property specified"
+                          {:chain-element chain-element})))))
+
+    ;; Map with @id - normal property reference
+    (and (map? chain-element) (util/get-id chain-element))
+    {:property (util/get-id chain-element)
+     :is-inverse? false}
+
+    :else
+    (throw (ex-info "Invalid property chain element"
+                    {:chain-element chain-element}))))
+
 (defmethod to-datalog ::prp-spo2
   [_ _ owl-statement all-rules]
   (try*
     (let [prop    (util/get-id owl-statement)
-          p-chain (get-named-ids owl-statement const/iri-owl:propertyChainAxiom)
+          p-chain-raw (util/unwrap-list (get owl-statement const/iri-owl:propertyChainAxiom))
+          p-chain (mapv extract-chain-property p-chain-raw)
           where   (->> p-chain
-                       (map-indexed (fn [idx p-n]
-                                      (if p-n
-                                        {"@id" (str "?u" idx)
-                                         p-n   (str "?u" (inc idx))}
+                       (map-indexed (fn [idx {:keys [property is-inverse?]}]
+                                      (if property
+                                        (if is-inverse?
+                                          ;; For inverse: ?u(n+1) property ?u(n)
+                                          {"@id" (str "?u" (inc idx))
+                                           property (str "?u" idx)}
+                                          ;; For normal: ?u(n) property ?u(n+1)
+                                          {"@id" (str "?u" idx)
+                                           property (str "?u" (inc idx))})
                                         (throw
                                          (ex-info
                                           (str "propertyChainAxiom for property: "
-                                               prop " - should only contain IRIs however "
-                                               "it appears to contain at least one scalar value "
-                                               "(e.g. a string or number)")
+                                               prop " - contains invalid element")
                                           {:owl-statement owl-statement})))))
                        (into []))
           rule    {"where"  where
@@ -326,28 +382,97 @@
    []
    restrictions))
 
+(defn extract-property-with-inverse
+  "Extracts a property from a restriction, handling inverse properties.
+  Returns a map with :property and :is-inverse? keys.
+  Handles double inverse normalization (inverse of inverse = original)."
+  [restriction]
+  (let [on-property (util/get-first restriction const/iri-owl:onProperty)]
+    (cond
+      ;; No on-property found
+      (nil? on-property)
+      {:property nil
+       :is-inverse? false}
+
+      ;; Check for double inverse (inverse of inverse)
+      (and (contains? on-property const/iri-owl:inverseOf)
+           (let [inverse-val (util/get-first on-property const/iri-owl:inverseOf)]
+             (and inverse-val (contains? inverse-val const/iri-owl:inverseOf))))
+      (let [double-inverse-prop (util/get-first on-property const/iri-owl:inverseOf)
+            original-prop (util/get-first-id double-inverse-prop const/iri-owl:inverseOf)]
+        (if original-prop
+          (do (log/debug "Found double inverse property, normalizing to original:" original-prop)
+              {:property original-prop
+               :is-inverse? false}) ;; Double inverse normalizes to non-inverse
+          {:property nil
+           :is-inverse? false}))
+
+      ;; Single inverse property
+      (contains? on-property const/iri-owl:inverseOf)
+      (let [inverse-prop (util/get-first-id on-property const/iri-owl:inverseOf)]
+        (if inverse-prop
+          (do (log/debug "Found inverse property" inverse-prop "in restriction for" (util/get-id restriction))
+              {:property inverse-prop
+               :is-inverse? true})
+          {:property nil
+           :is-inverse? false}))
+
+      ;; Property chain as property
+      (contains? on-property const/iri-owl:propertyChainAxiom)
+      {:property-chain (util/unwrap-list (get on-property const/iri-owl:propertyChainAxiom))
+       :is-chain? true
+       :property nil
+       :is-inverse? false}
+
+      ;; Direct property reference
+      :else
+      {:property (util/get-id on-property)
+       :is-inverse? false})))
+
 (defn equiv-has-value
   "Handles rules cls-hv1, cls-hv2"
   [rule-class restrictions]
   (reduce
    (fn [acc restriction]
-     (let [property (util/get-first-id restriction const/iri-owl:onProperty)
+     (let [{:keys [property is-inverse?]} (extract-property-with-inverse restriction)
            has-val  (util/get-first restriction const/iri-owl:hasValue)
            has-val* (if (util/get-id has-val)
-                      {"@id" has-val}
+                      {"@id" (util/get-id has-val)}
                       (util/get-value has-val))
-           rule1    {"where"  {"@id"    "?x"
-                               property has-val*}
-                     "insert" {"@id"   "?x"
-                               "@type" rule-class}}
-           rule2    {"where"  {"@id"   "?x"
-                               "@type" rule-class}
-                     "insert" {"@id"    "?x"
-                               property has-val*}}]
+           rule1    (if is-inverse?
+                     ;; For inverse: if has-val has property x, then x is rule-class
+                      {"where"  (if (map? has-val*)
+                                  {"@id"    (get has-val* "@id")
+                                   property "?x"}
+                                ;; For scalar values, can't have inverse
+                                  (throw (ex-info "Cannot have inverse property with scalar hasValue"
+                                                  {:restriction restriction})))
+                       "insert" {"@id"   "?x"
+                                 "@type" rule-class}}
+                     ;; Normal: if x has property has-val, then x is rule-class
+                      {"where"  {"@id"    "?x"
+                                 property has-val*}
+                       "insert" {"@id"   "?x"
+                                 "@type" rule-class}})
+           rule2    (if is-inverse?
+                     ;; For inverse: if x is rule-class, then has-val has property x
+                      {"where"  {"@id"   "?x"
+                                 "@type" rule-class}
+                       "insert" (if (map? has-val*)
+                                  {"@id"    (get has-val* "@id")
+                                   property "?x"}
+                                ;; Can't insert inverse for scalar
+                                  nil)}
+                     ;; Normal: if x is rule-class, then x has property has-val
+                      {"where"  {"@id"   "?x"
+                                 "@type" rule-class}
+                       "insert" {"@id"    "?x"
+                                 property has-val*}})]
        (if (and property has-val*)
-         (-> acc
-             (conj [(str rule-class "(owl:Restriction-" property "-1)") rule1])
-             (conj [(str rule-class "(owl:Restriction-" property "-2)") rule2]))
+         (cond-> acc
+           true (conj [(str rule-class "(owl:Restriction-" property "-1)") rule1])
+           ;; Only add rule2 if it has a valid insert clause
+           (get rule2 "insert") (conj [(str rule-class "(owl:Restriction-" property "-2)") rule2]))
          (do (log/warn "owl:Restriction for class" rule-class
                        "is not properly defined. owl:onProperty is:" property
                        "and owl:hasValue is:" has-val
@@ -362,12 +487,19 @@
   [rule-class restrictions]
   (reduce
    (fn [acc restriction]
-     (let [property (util/get-first-id restriction const/iri-owl:onProperty)
+     (let [{:keys [property is-inverse?]} (extract-property-with-inverse restriction)
            all-val  (util/get-first-id restriction const/iri-owl:allValuesFrom)
-           rule     {"where"  {"@id"    "?x"
-                               property "?y"}
-                     "insert" {"@id"   "?y"
-                               "@type" all-val}}]
+           rule     (if is-inverse?
+                     ;; For inverse: if y has property x, then x must be of type all-val
+                      {"where"  {"@id"    "?y"
+                                 property "?x"}
+                       "insert" {"@id"   "?x"
+                                 "@type" all-val}}
+                     ;; Normal: if x has property y, then y must be of type all-val
+                      {"where"  {"@id"    "?x"
+                                 property "?y"}
+                       "insert" {"@id"   "?y"
+                                 "@type" all-val}})]
        (if (and property all-val)
          (conj acc [(str rule-class "(owl:allValuesFrom-" property ")") rule])
          (do (log/warn "owl:Restriction for class" rule-class
@@ -387,43 +519,67 @@
   binding-var should be the variables that is being bound in the parent where statement
   clause."
   [binding-var some-values-statements]
-  (reduce
-   (fn [acc some-values-statement]
-     (let [property (util/get-first-id some-values-statement const/iri-owl:onProperty)
-           {:keys [classes union-of]} (group-by equiv-class-type (get some-values-statement const/iri-owl:someValuesFrom))]
-       (cond
-         classes
-         (let [target-type (-> classes first util/get-id)]
-           (if (and property target-type)
-             (-> acc
-                 (conj {"@id"    binding-var
-                        property "?_some-val-rel"}) ;; choosing a binding var name unlikely to collide
-                 (conj {"@id"   "?_some-val-rel"
-                        "@type" target-type}))
-             (do (log/warn (str "Ignoring owl:someValuesFrom rule: " some-values-statement
-                                " as property or target @type not supported by owl2rl reasoning."))
-                 acc)))
+  (let [result
+        (reduce
+         (fn [{:keys [acc var-counter]} some-values-statement]
+           (let [{:keys [property is-inverse?]} (extract-property-with-inverse some-values-statement)
+                 ;; Get the someValuesFrom value - could be a single value or a collection
+                 some-values-val (get some-values-statement const/iri-owl:someValuesFrom)
+                 ;; Ensure it's a collection for consistent processing
+                 some-values-seq (if (sequential? some-values-val) some-values-val [some-values-val])
+                 {:keys [classes union-of]} (group-by equiv-class-type some-values-seq)
+                 ;; Use a unique variable for each restriction
+                 var-name (str "?_sv" var-counter)]
+             (cond
+               classes
+               (let [target-type (-> classes first util/get-id)]
+                 (if (and property target-type)
+                   {:acc (if is-inverse?
+                           ;; For inverse: something of target-type has property pointing to binding-var
+                           (-> acc
+                               (conj {"@id"   var-name
+                                      "@type" target-type})
+                               (conj {"@id"    var-name
+                                      property binding-var}))
+                           ;; Normal: binding-var has property pointing to something of target-type
+                           (-> acc
+                               (conj {"@id"    binding-var
+                                      property var-name})
+                               (conj {"@id"   var-name
+                                      "@type" target-type})))
+                    :var-counter (inc var-counter)}
+                   (do (log/warn (str "Ignoring owl:someValuesFrom rule: " some-values-statement
+                                      " as property or target @type not supported by owl2rl reasoning."))
+                       {:acc acc :var-counter var-counter})))
 
-         union-of
-         (let [union-classes   (-> union-of
-                                   first ;; always sequential, but only can be one value so take first
-                                   (get-named-ids const/iri-owl:unionOf))
-               with-property-q {"@id"    binding-var
-                                property "?_some-val-rel"}
-               of-classes-q    (reduce (fn [acc class]
-                                         (conj acc {"@id"   "?_some-val-rel"
-                                                    "@type" {"@id" class}}))
-                                       ["union"]
-                                       union-classes)]
-           (conj acc with-property-q of-classes-q))
+               union-of
+               (let [union-classes   (-> union-of
+                                         first ;; always sequential, but only can be one value so take first
+                                         (get-named-ids const/iri-owl:unionOf))
+                     with-property-q (if is-inverse?
+                                      ;; For inverse with union
+                                       {"@id"    var-name
+                                        property binding-var}
+                                      ;; Normal with union
+                                       {"@id"    binding-var
+                                        property var-name})
+                     of-classes-q    (reduce (fn [acc class]
+                                               (conj acc {"@id"   var-name
+                                                          "@type" {"@id" class}}))
+                                             ["union"]
+                                             union-classes)]
+                 {:acc (conj acc with-property-q of-classes-q)
+                  :var-counter (inc var-counter)})
 
-         :else
-         (do (log/warn "Ignoring some rules from nested owl:someValuesFrom values."
-                       "Currently only support explicit classes and owl:unionOf values."
-                       "Please let us know if there is a rule you think should be supported.")
-             acc))))
-   []
-   some-values-statements))
+               :else
+               (do (log/warn "Ignoring some rules from nested owl:someValuesFrom values."
+                             "Currently only support explicit classes and owl:unionOf values."
+                             "Please let us know if there is a rule you think should be supported.")
+                   {:acc acc :var-counter var-counter}))))
+         {:acc [] :var-counter 0}
+         some-values-statements)]
+    ;; Return just the accumulated conditions
+    (:acc result)))
 
 (defn has-value-condition
   "Used to build where statement for owl:hasValue restriction when the
@@ -465,37 +621,182 @@
   [rule-class restrictions]
   (reduce
    (fn [acc restriction]
-     (let [property (util/get-first-id restriction const/iri-owl:onProperty)
+     (let [{:keys [property is-inverse? is-chain? property-chain]} (extract-property-with-inverse restriction)
            some-values-val (get restriction const/iri-owl:someValuesFrom)
            ;; someValuesFrom could be a single class or a collection - ensure it's a collection
            some-values-seq (if (sequential? some-values-val) some-values-val [some-values-val])
-           {:keys [classes one-of]} (group-by equiv-class-type some-values-seq)
-           rule     (when property ;; Only generate rule if property is valid
+           {:keys [classes one-of union-of]} (group-by equiv-class-type some-values-seq)
+           rule     (cond
+                      ;; Handle property chain in restriction
+                      is-chain?
+                      (let [chain-elements (mapv extract-chain-property property-chain)
+                            chain-vars (mapv #(str "?chain" %) (range (inc (count chain-elements))))
+                            where-clauses (mapv (fn [idx {:keys [property is-inverse?]}]
+                                                  (if is-inverse?
+                                                    {"@id" (get chain-vars (inc idx))
+                                                     property (get chain-vars idx)}
+                                                    {"@id" (get chain-vars idx)
+                                                     property (get chain-vars (inc idx))}))
+                                                (range (count chain-elements))
+                                                chain-elements)]
+                        (when (and classes (seq chain-elements))
+                          {"where" (conj where-clauses
+                                         {"@id" (last chain-vars)
+                                          "@type" (-> classes first util/get-id)})
+                           "insert" {"@id" "?chain0"
+                                     "@type" rule-class}}))
+
+                      ;; Normal property handling
+                      property
                       (cond
                         ;; special case where someValuesFrom is owl:Thing, means
                         ;; everything with property should be in the class (cls-svf2)
                         (and classes (= const/iri-owl:Thing (-> classes first util/get-id)))
-                        {"where"  {"@id"    "?x"
-                                   property nil}
-                         "insert" {"@id"   "?x"
-                                   "@type" rule-class}}
+                        (if is-inverse?
+                          ;; For inverse: anything that is pointed to by something should be in the class
+                          {"where"  {"@id"    "?y"
+                                     property "?x"}
+                           "insert" {"@id"   "?x"
+                                     "@type" rule-class}}
+                          ;; Normal: anything with the property should be in the class
+                          {"where"  {"@id"    "?x"
+                                     property nil}
+                           "insert" {"@id"   "?x"
+                                     "@type" rule-class}})
 
                         ;; an explicit class is defined for someValuesFrom (cls-svf1)
                         classes
-                        {"where"  [{"@id"    "?x"
-                                    property "?y"}
-                                   {"@id"   "?y"
-                                    "@type" (-> classes first util/get-id)}]
-                         "insert" {"@id"   "?x"
-                                   "@type" rule-class}}
+                        (if is-inverse?
+                          ;; For inverse: if y has property x, and y is of type Class, then x is rule-class
+                          {"where"  [{"@id"   "?y"
+                                      "@type" (-> classes first util/get-id)}
+                                     {"@id"    "?y"
+                                      property "?x"}]
+                           "insert" {"@id"   "?x"
+                                     "@type" rule-class}}
+                          ;; Normal: if x has property y, and y is of type Class, then x is rule-class
+                          {"where"  [{"@id"    "?x"
+                                      property "?y"}
+                                     {"@id"   "?y"
+                                      "@type" (-> classes first util/get-id)}]
+                           "insert" {"@id"   "?x"
+                                     "@type" rule-class}})
 
                         ;; one-of is defined for someValuesFrom (cls-svf1)
                         one-of
-                        {"where"  [(one-of-condition "?x" property (first one-of))]
-                         "insert" {"@id"   "?x"
-                                   "@type" rule-class}}))]
-       (if rule
+                        (if is-inverse?
+                          ;; For inverse with one-of: build union of conditions where y is one of the individuals and y has property x
+                          (let [individuals (get-named-ids (first one-of) const/iri-owl:oneOf)
+                                union-conditions (reduce (fn [acc i]
+                                                           (conj acc {"@id"    i
+                                                                      property "?x"}))
+                                                         ["union"]
+                                                         individuals)]
+                            {"where"  [union-conditions]
+                             "insert" {"@id"   "?x"
+                                       "@type" rule-class}})
+                          {"where"  [(one-of-condition "?x" property (first one-of))]
+                           "insert" {"@id"   "?x"
+                                     "@type" rule-class}})
+
+                        ;; union-of is defined for someValuesFrom - generate multiple rules
+                        union-of
+                        :union-of ;; Return special marker to handle below
+                        )
+
+                      ;; No valid property - can't generate rule
+                      :else nil)]
+       (cond
+         ;; Handle union-of case - generate multiple rules (one for each union member)
+         (= rule :union-of)
+         (let [{:keys [property is-inverse?]} (extract-property-with-inverse restriction)
+               union-classes (-> union-of first (get const/iri-owl:unionOf) util/unwrap-list)]
+           (reduce (fn [acc* union-class]
+                     (cond
+                       ;; Restriction in union - check this first before simple class ID
+                       (and (util/of-type? union-class const/iri-owl:Restriction)
+                            (contains? union-class const/iri-owl:onProperty)
+                            (contains? union-class const/iri-owl:someValuesFrom))
+                       (let [restr-prop (util/get-first-id union-class const/iri-owl:onProperty)
+                             restr-class (util/get-first-id union-class const/iri-owl:someValuesFrom)]
+                         (if (and restr-prop restr-class)
+                           (let [restr-rule (if is-inverse?
+                                             ;; For inverse with restriction: complex pattern
+                                              {"where"  [{"@id"    "?y"
+                                                          restr-prop "?z"}
+                                                         {"@id"   "?z"
+                                                          "@type" restr-class}
+                                                         {"@id"    "?y"
+                                                          property "?x"}]
+                                               "insert" {"@id"   "?x"
+                                                         "@type" rule-class}}
+                                             ;; Normal with restriction
+                                              {"where"  [{"@id"    "?x"
+                                                          property "?y"}
+                                                         {"@id"    "?y"
+                                                          restr-prop "?z"}
+                                                         {"@id"   "?z"
+                                                          "@type" restr-class}]
+                                               "insert" {"@id"   "?x"
+                                                         "@type" rule-class}})]
+                             (conj acc* [(str rule-class "(owl:someValuesFrom-" property "-union-restriction-" restr-prop ")") restr-rule]))
+                           acc*))
+
+                       ;; Nested union
+                       (contains? union-class const/iri-owl:unionOf)
+                       (let [nested-union-classes (util/unwrap-list (get union-class const/iri-owl:unionOf))]
+                         (reduce (fn [acc** nested-class]
+                                   (if-let [nested-class-id (util/get-id nested-class)]
+                                     (let [nested-rule (if is-inverse?
+                                                         {"where"  [{"@id"   "?y"
+                                                                     "@type" nested-class-id}
+                                                                    {"@id"    "?y"
+                                                                     property "?x"}]
+                                                          "insert" {"@id"   "?x"
+                                                                    "@type" rule-class}}
+                                                         {"where"  [{"@id"    "?x"
+                                                                     property "?y"}
+                                                                    {"@id"   "?y"
+                                                                     "@type" nested-class-id}]
+                                                          "insert" {"@id"   "?x"
+                                                                    "@type" rule-class}})]
+                                       (conj acc** [(str rule-class "(owl:someValuesFrom-" property "-nested-union-" nested-class-id ")") nested-rule]))
+                                     acc**))
+                                 acc*
+                                 nested-union-classes))
+
+                       ;; Simple class ID (check after restriction and nested union)
+                       (util/get-id union-class)
+                       (let [union-class-id (util/get-id union-class)
+                             union-rule (if is-inverse?
+                                         ;; For inverse: if y has property x, and y is of union type, then x is rule-class
+                                          {"where"  [{"@id"   "?y"
+                                                      "@type" union-class-id}
+                                                     {"@id"    "?y"
+                                                      property "?x"}]
+                                           "insert" {"@id"   "?x"
+                                                     "@type" rule-class}}
+                                         ;; Normal: if x has property y, and y is of union type, then x is rule-class
+                                          {"where"  [{"@id"    "?x"
+                                                      property "?y"}
+                                                     {"@id"   "?y"
+                                                      "@type" union-class-id}]
+                                           "insert" {"@id"   "?x"
+                                                     "@type" rule-class}})]
+                         (conj acc* [(str rule-class "(owl:someValuesFrom-" property "-union-" union-class-id ")") union-rule]))
+
+                       :else
+                       (do (log/warn "Ignoring unsupported union member in someValuesFrom:" union-class)
+                           acc*)))
+                   acc
+                   union-classes))
+
+         ;; Normal rule case
+         rule
          (conj acc [(str rule-class "(owl:someValuesFrom-" property ")") rule])
+
+         ;; No rule generated - log warning
+         :else
          (do (log/warn "owl:Restriction for class" rule-class
                        "is not properly defined. owl:onProperty is:" (get restriction const/iri-owl:onProperty)
                        "and owl:someValuesFrom is:" (util/get-first restriction const/iri-owl:someValuesFrom)
@@ -511,8 +812,21 @@
   (reduce
    (fn [acc intersection-of-statement]
      (let [intersections (util/unwrap-list (get intersection-of-statement const/iri-owl:intersectionOf))
-           {:keys [classes has-value some-values qual-cardinality]} (group-by equiv-class-type intersections)
-           restrictions  (cond->> []
+           {:keys [classes has-value some-values qual-cardinality union-of]} (group-by equiv-class-type intersections)
+           ;; Build union conditions for intersection from union-of group
+           union-conditions (reduce (fn [acc* union-class]
+                                      (let [union-members (util/unwrap-list (get union-class const/iri-owl:unionOf))
+                                            union-ids (keep util/get-id union-members)]
+                                        (if (seq union-ids)
+                                          (conj acc* (reduce (fn [union-acc id]
+                                                               (conj union-acc {"@id" "?y"
+                                                                                "@type" id}))
+                                                             ["union"]
+                                                             union-ids))
+                                          acc*)))
+                                    []
+                                    union-of)
+           restrictions  (cond->> union-conditions
                            has-value (into (has-value-condition "?y" has-value))
                            some-values (into (some-values-condition "?y" some-values)))
            class-list    (only-named-ids classes)
@@ -559,7 +873,28 @@
   (reduce
    (fn [acc union-of-statement]
      (let [unions            (util/unwrap-list (get union-of-statement const/iri-owl:unionOf))
-           {:keys [classes has-value]} (group-by equiv-class-type unions)
+           ;; Process each union member to extract classes (including from nested unions)
+           expanded-classes  (reduce (fn [acc* union-member]
+                                       (cond
+                                         ;; Simple class
+                                         (and (util/get-id union-member)
+                                              (not (contains? union-member const/iri-owl:unionOf)))
+                                         (conj acc* (util/get-id union-member))
+
+                                         ;; Nested union - flatten it
+                                         (contains? union-member const/iri-owl:unionOf)
+                                         (let [nested-unions (util/unwrap-list (get union-member const/iri-owl:unionOf))]
+                                           (reduce (fn [acc** nested]
+                                                     (if-let [nested-id (util/get-id nested)]
+                                                       (conj acc** nested-id)
+                                                       acc**))
+                                                   acc*
+                                                   nested-unions))
+
+                                         :else acc*))
+                                     []
+                                     unions)
+           {:keys [has-value]} (group-by equiv-class-type unions)
            restrictions      (cond->> []
                                has-value (into (has-value-condition "?y" has-value)))
            restriction-rules (map (fn [where]
@@ -568,7 +903,6 @@
                                       "insert" {"@id"   "?y"
                                                 "@type" rule-class}}])
                                   restrictions)
-           class-list        (map util/get-id classes)
            ;; could do optional clauses instead of separate
            ;; opted for separate for now to keep it simple
            ;; and allow for possibly fewer rule triggers with
@@ -580,13 +914,13 @@
                                             "insert" {"@id"   "?y"
                                                       "@type" rule-class}}]
                                   [(str rule-class "(owl:unionOf-" idx ")") rule]))
-                              class-list)
+                              expanded-classes)
 
            triples           (reduce
                               (fn [triples* c]
                                 (conj triples* [c const/iri-rdfs:subClassOf {"@id" rule-class}]))
                               []
-                              class-list)]
+                              expanded-classes)]
 
        ;; unionOf inserts subClassOf rules (scm-uni)
        (swap! inserts assoc (str rule-class "(owl:unionOf-subclass)") triples)

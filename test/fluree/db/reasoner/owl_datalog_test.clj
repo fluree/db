@@ -231,3 +231,171 @@
                                                       "@type" "?type"}}))
                        "ex:ComplexProduct")
             "ex:product1 should be inferred as ex:ComplexProduct")))))
+
+(deftest ^:integration unionOf-in-class-expressions-test
+  (testing "owl:unionOf in class definitions (disjunction as multiple rules)"
+    ;; Pattern: Class ≡ (A ∪ B) means if x is A OR B, then x is Class
+    ;; Also tests: Class ≡ ∃property.(A ∪ B)
+    (let [conn (test-utils/create-conn)
+          db @(fluree/create conn "reasoner/union-of" nil)
+
+          ontology {"@context" {"ex"   "http://example.org/"
+                                "owl"  "http://www.w3.org/2002/07/owl#"
+                                "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                    "insert"   [;; DrugTarget is anything that's either a Protein or a Receptor
+                                {"@id"                  "ex:DrugTarget"
+                                 "@type"                "owl:Class"
+                                 "owl:equivalentClass"  {"@type"       "owl:Class"
+                                                         "owl:unionOf" {"@list" [{"@id" "ex:Protein"}
+                                                                                 {"@id" "ex:Receptor"}]}}}
+                                ;; MedicationUser refers to some (Patient OR Participant)
+                                {"@id"                  "ex:MedicationUser"
+                                 "@type"                "owl:Class"
+                                 "owl:equivalentClass"  {"@type"              "owl:Restriction"
+                                                         "owl:onProperty"     {"@id" "ex:refersTo"}
+                                                         "owl:someValuesFrom" {"@type"       "owl:Class"
+                                                                               "owl:unionOf" {"@list" [{"@id" "ex:Patient"}
+                                                                                                       {"@id" "ex:Participant"}]}}}}
+                                {"@id" "ex:Protein" "@type" "owl:Class"}
+                                {"@id" "ex:Receptor" "@type" "owl:Class"}
+                                {"@id" "ex:Patient" "@type" "owl:Class"}
+                                {"@id" "ex:Participant" "@type" "owl:Class"}
+                                {"@id" "ex:refersTo" "@type" "owl:ObjectProperty"}]}
+
+          db-with-ontology @(fluree/update db ontology)
+
+          ;; Test data
+          instance-data {"@context" {"ex" "http://example.org/"}
+                         "insert"   [;; protein1 is a Protein, should be inferred as DrugTarget
+                                     {"@id" "ex:protein1" "@type" "ex:Protein"}
+                                   ;; receptor1 is a Receptor, should be inferred as DrugTarget
+                                     {"@id" "ex:receptor1" "@type" "ex:Receptor"}
+                                   ;; record1 refers to a Patient, should be inferred as MedicationUser
+                                     {"@id" "ex:record1"
+                                      "ex:refersTo" {"@id" "ex:patient1" "@type" "ex:Patient"}}
+                                   ;; record2 refers to a Participant, should be inferred as MedicationUser
+                                     {"@id" "ex:record2"
+                                      "ex:refersTo" {"@id" "ex:participant1" "@type" "ex:Participant"}}]}
+
+          db-with-data @(fluree/update db-with-ontology instance-data)
+          db-reasoned @(fluree/reason db-with-data :owl-datalog)]
+
+      (testing "Union of named classes"
+        (is (contains? (set @(fluree/query db-reasoned
+                                           {:context {"ex" "http://example.org/"}
+                                            :select  "?type"
+                                            :where   {"@id"   "ex:protein1"
+                                                      "@type" "?type"}}))
+                       "ex:DrugTarget")
+            "Protein should be inferred as DrugTarget")
+
+        (is (contains? (set @(fluree/query db-reasoned
+                                           {:context {"ex" "http://example.org/"}
+                                            :select  "?type"
+                                            :where   {"@id"   "ex:receptor1"
+                                                      "@type" "?type"}}))
+                       "ex:DrugTarget")
+            "Receptor should be inferred as DrugTarget"))
+
+      (testing "Union in someValuesFrom restriction"
+        (is (contains? (set @(fluree/query db-reasoned
+                                           {:context {"ex" "http://example.org/"}
+                                            :select  "?type"
+                                            :where   {"@id"   "ex:record1"
+                                                      "@type" "?type"}}))
+                       "ex:MedicationUser")
+            "Record referring to Patient should be inferred as MedicationUser")
+
+        (is (contains? (set @(fluree/query db-reasoned
+                                           {:context {"ex" "http://example.org/"}
+                                            :select  "?type"
+                                            :where   {"@id"   "ex:record2"
+                                                      "@type" "?type"}}))
+                       "ex:MedicationUser")
+            "Record referring to Participant should be inferred as MedicationUser")))))
+
+(deftest ^:integration inverse-roles-in-restrictions-test
+  (testing "Inverse roles in restrictions and property chains"
+    ;; Pattern: ∃R⁻.C means "has something of type C that R's to this"
+    ;; Example: Container ≡ ∃contains⁻.Product (anything that contains a Product is a Container)
+    (let [conn (test-utils/create-conn)
+          db @(fluree/create conn "reasoner/inverse-roles" nil)
+
+          ontology {"@context" {"ex"   "http://example.org/"
+                                "owl"  "http://www.w3.org/2002/07/owl#"
+                                "rdfs" "http://www.w3.org/2000/01/rdf-schema#"}
+                    "insert"   [;; Container is anything that has something contained in it
+                                {"@id"                  "ex:Container"
+                                 "@type"                "owl:Class"
+                                 "owl:equivalentClass"  {"@type"              "owl:Restriction"
+                                                         "owl:onProperty"     {"@type"         "owl:ObjectProperty"
+                                                                               "owl:inverseOf" {"@id" "ex:containedIn"}}
+                                                         "owl:someValuesFrom" {"@id" "ex:Product"}}}
+                                ;; Supervised is something that has a Supervisor supervising it
+                                {"@id"                  "ex:Supervised"
+                                 "@type"                "owl:Class"
+                                 "owl:equivalentClass"  {"@type"              "owl:Restriction"
+                                                         "owl:onProperty"     {"@type"         "owl:ObjectProperty"
+                                                                               "owl:inverseOf" {"@id" "ex:supervises"}}
+                                                         "owl:someValuesFrom" {"@id" "ex:Supervisor"}}}
+                                ;; Property chain with inverse: hasSiblingItem = containedIn o containedIn⁻
+                                ;; This means: things that share the same container
+                                {"@id"                    "ex:hasSiblingItem"
+                                 "@type"                  "owl:ObjectProperty"
+                                 "owl:propertyChainAxiom" {"@list" [{"@id" "ex:containedIn"}
+                                                                    {"@type"         "owl:ObjectProperty"
+                                                                     "owl:inverseOf" {"@id" "ex:containedIn"}}]}}
+                                {"@id" "ex:containedIn" "@type" "owl:ObjectProperty"}
+                                {"@id" "ex:supervises" "@type" "owl:ObjectProperty"}
+                                {"@id" "ex:Product" "@type" "owl:Class"}
+                                {"@id" "ex:Supervisor" "@type" "owl:Class"}]}
+
+          db-with-ontology @(fluree/update db ontology)
+
+          instance-data {"@context" {"ex" "http://example.org/"}
+                         "insert"   [;; box1 doesn't explicitly say it's a Container
+                                     {"@id" "ex:box1"}
+                                   ;; product1 is contained in box1
+                                     {"@id" "ex:product1"
+                                      "@type" "ex:Product"
+                                      "ex:containedIn" {"@id" "ex:box1"}}
+                                   ;; employee1 doesn't explicitly say they're Supervised
+                                     {"@id" "ex:employee1"}
+                                   ;; manager1 supervises employee1
+                                     {"@id" "ex:manager1"
+                                      "@type" "ex:Supervisor"
+                                      "ex:supervises" {"@id" "ex:employee1"}}
+                                   ;; For property chain test
+                                     {"@id" "ex:item1"
+                                      "ex:containedIn" {"@id" "ex:box2"}}
+                                     {"@id" "ex:item2"
+                                      "ex:containedIn" {"@id" "ex:box2"}}]}
+
+          db-with-data @(fluree/update db-with-ontology instance-data)
+          db-reasoned @(fluree/reason db-with-data :owl-datalog)]
+
+      (testing "Inverse role in someValuesFrom"
+        (is (contains? (set @(fluree/query db-reasoned
+                                           {:context {"ex" "http://example.org/"}
+                                            :select  "?type"
+                                            :where   {"@id"   "ex:box1"
+                                                      "@type" "?type"}}))
+                       "ex:Container")
+            "box1 should be inferred as Container because product1 is containedIn it")
+
+        (is (contains? (set @(fluree/query db-reasoned
+                                           {:context {"ex" "http://example.org/"}
+                                            :select  "?type"
+                                            :where   {"@id"   "ex:employee1"
+                                                      "@type" "?type"}}))
+                       "ex:Supervised")
+            "employee1 should be inferred as Supervised because manager1 supervises them"))
+
+      (testing "Inverse role in property chain"
+        (is (= #{"ex:item1" "ex:item2"}
+               (set @(fluree/query db-reasoned
+                                   {:context {"ex" "http://example.org/"}
+                                    :select  "?sibling"
+                                    :where   {"@id"              "ex:item1"
+                                              "ex:hasSiblingItem" "?sibling"}})))
+            "Property chain with inverse should infer item1 hasSiblingItem item1 and item2 (things in same container)")))))
