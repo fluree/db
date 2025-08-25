@@ -960,25 +960,35 @@
       iri/blank-node-id?))
 
 (defn upsert-where-del
-  "For an upsert transaction.
+  "Takes parsed transaction data and for each triple pattern, replaces the object position
+   with a variable corresponding to the predicate. Returns a map with :where and :delete keys.
 
-   Takes a parsed transaction and for each triple, replaces the object position
-   with a variable and returns a map with :where and :delete keys.
-
-   Skips blank nodes as they cannot be deleted."
+   Skips blank nodes as they are new subjects with no existing flakes to retract."
   [parsed-txn]
   (loop [[next-triple & r] parsed-txn
-         i      0
-         where  []
-         delete []]
+         vars              {}
+         where             []
+         delete            []]
     (if next-triple
       (if (blank-node-subject? next-triple)
-        (recur r (inc i) where delete) ;; can't delete blank node properties
-        (let [new-var    (str "?f" i)
-              delete-smt (assoc next-triple 2 (parse-variable new-var))
-              where-smt  (where/->pattern :optional [delete-smt])] ;; use optional so other matched triples still delete if no match
-          (recur r (inc i) (conj where where-smt) (conj delete delete-smt))))
-      {:where  where
+        ;; no need to find/delete a blank node subject, it's guaranteed to be new
+        (recur r vars where delete)
+        (let [s-iri (-> next-triple (get 0) where/get-iri)
+              p-iri (-> next-triple (get 1) where/get-iri)]
+
+          (if (get vars [s-iri p-iri])
+            ;; we've already generated a pattern for this data
+            (recur r vars where delete)
+            ;; generate where and delete pattern
+            (let [o-var      (str "?f" (count vars))
+                  delete-smt (assoc next-triple 2 (parse-variable o-var))
+                  ;; optional so we don't have to match every var in order to delete
+                  where-smt  (where/->pattern :optional [delete-smt])]
+              (recur r
+                     (assoc vars [s-iri p-iri] o-var)
+                     (conj where where-smt)
+                     (conj delete delete-smt))))))
+      {:where where
        :delete delete})))
 
 (defn parse-upsert-txn

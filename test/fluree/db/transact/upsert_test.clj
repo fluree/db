@@ -92,6 +92,42 @@
              @(fluree/query db3 query))
           "Resulting data should be identical to original insert"))))
 
+(deftest ^:integration upsert-multicardinal-data
+  (let [conn (test-utils/create-conn)
+        db0  @(fluree/create conn "tx/upsert3")
+        db1  @(fluree/insert db0 {"@context" {"ex" "http://example.org/ns/"}
+                                  "@graph"   [{"@id"       "ex:alice",
+                                               "@type"     "ex:User",
+                                               "ex:letter" ["a" "b" "c" "d"]
+                                               "ex:num"    [2 4 6 8]}
+                                              {"@id"       "ex:bob",
+                                               "@type"     "ex:User",
+                                               "ex:letter" ["a" "b" "c" "d"]
+                                               "ex:num"    [2 4 6 8]}]})]
+    (testing "multiple multicardinal properties can be upserted"
+      (let [{_time :time db2 :db}
+            @(fluree/upsert db1 {"@context" {"ex"     "http://example.org/ns/"
+                                             "schema" "http://schema.org/"}
+                                 "@graph"   [{"@id"       "ex:alice"
+                                              "ex:letter" ["e" "f" "g" "h"]
+                                              "ex:num"    [3 5 7 9]}
+                                             {"@id"       "ex:bob"
+                                              "ex:letter" ["e" "f" "g" "h"]
+                                              "ex:num"    [3 5 7 9]}]}
+                            {:meta {:time true}})]
+        (testing "and the result is correct"
+          (is (= [{"@type"     "ex:User",
+                   "ex:letter" ["e" "f" "g" "h"],
+                   "ex:num"    [3 5 7 9],
+                   "@id"       "ex:alice"}
+                  {"@type"     "ex:User",
+                   "ex:letter" ["e" "f" "g" "h"],
+                   "ex:num"    [3 5 7 9],
+                   "@id"       "ex:bob"}]
+                 @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"}
+                                     "where"    [{"@id" "?s" "@type" "ex:User"}]
+                                     "select"   {"?s" ["*"]}}))))))))
+
 (deftest upsert-and-commit
   (let [conn    @(fluree/connect-memory)
         _db0 @(fluree/create conn "tx/upsert")
