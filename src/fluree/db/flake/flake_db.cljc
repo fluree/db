@@ -382,16 +382,13 @@
   (sha->t [db sha]
     (go-try
       (log/debug "sha->t looking up commit SHA:" sha)
-      ;; Normalize the input - strip known prefixes if present
-      ;; Always ensure we end up with 'b' prefix + hash
-      (let [sha-normalized (cond
-                             ;; Full commit ID prefix with b
-                             (str/starts-with? sha "fluree:commit:sha256:b")
-                             (subs sha 22) ; already has 'b' prefix
-
-                             ;; Partial commit ID prefix without b
-                             (str/starts-with? sha "fluree:commit:sha256:")
-                             (subs sha 21) ; may or may not have 'b'
+      ;; Normalize the input - use only 'fluree:commit:sha256:b' prefix when present,
+      ;; otherwise ensure the value starts with 'b'
+      (let [prefix-b "fluree:commit:sha256:b"
+            sha-normalized (cond
+                             ;; Input is a full commit IRI with ':b' segment - keep leading 'b'
+                             (str/starts-with? sha prefix-b)
+                             (subs sha (dec (count prefix-b)))
 
                              ;; Already has correct format (starts with 'b')
                              (str/starts-with? sha "b")
@@ -412,8 +409,14 @@
                           {:status 400 :error :db/invalid-commit-sha
                            :sha sha :normalized sha-normalized :length sha-length}))
 
-          ;; Full SHA - use direct efficient lookup (52 chars with 'b' prefix)
-          (= 52 sha-length)
+          ;; Too short to be a useful/efficient prefix (minimum 6)
+          (< sha-length 6)
+          (throw (ex-info "SHA prefix must be at least 6 characters"
+                          {:status 400 :error :db/invalid-commit-sha :min 6}))
+
+          ;; Full SHA - use direct efficient lookup (51-52 chars with 'b' prefix)
+          (or (= 52 sha-length)
+              (= 51 sha-length))
           (let [;; sha-normalized already has 'b' prefix from normalization
                 commit-id (str "fluree:commit:sha256:" sha-normalized)
                 direct-query {:select ["?t"]

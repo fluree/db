@@ -181,15 +181,28 @@
   [time-str]
   (cond
     (str/starts-with? time-str "t:")
-    (-> time-str
-        (subs 2)
-        util/str->long)
+    (let [val (subs time-str 2)]
+      (when (str/blank? val)
+        (throw (ex-info "Missing value for time travel spec"
+                        {:status 400 :error :db/invalid-time-travel})))
+      (util/str->long val))
 
     (str/starts-with? time-str "iso:")
-    (subs time-str 4)
+    (let [val (subs time-str 4)]
+      (when (str/blank? val)
+        (throw (ex-info "Missing value for time travel spec"
+                        {:status 400 :error :db/invalid-time-travel})))
+      val)
 
     (str/starts-with? time-str "sha:")
-    {:sha (subs time-str 4)}
+    (let [val (subs time-str 4)]
+      (when (str/blank? val)
+        (throw (ex-info "Missing value for time travel spec"
+                        {:status 400 :error :db/invalid-time-travel})))
+      (when (< (count val) 6)
+        (throw (ex-info "SHA prefix must be at least 6 characters"
+                        {:status 400 :error :db/invalid-commit-sha :min 6})))
+      {:sha val})
 
     :else
     (throw (ex-info (str "Invalid time travel format: " time-str
@@ -232,8 +245,8 @@
   [conn tracker alias {:keys [t] :as sanitized-query}]
   (go-try
     (try*
-      (let [[alias explicit-t] (extract-query-string-t alias)
-            ledger       (<? (connection/load-ledger-alias conn alias))
+      (let [[base-alias explicit-t] (extract-query-string-t alias)
+            ledger       (<? (connection/load-ledger-alias conn base-alias))
             db           (ledger/current-db ledger)
             t*           (or explicit-t t)
             query*       (assoc sanitized-query :t t*)]

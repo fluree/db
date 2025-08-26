@@ -250,9 +250,10 @@
   ([conn ledger-alias opts]
    (validate-connection conn)
    ;; Disallow branch specification in ledger name during creation
-   (when (str/includes? ledger-alias ":")
+   (when (or (str/includes? ledger-alias ":")
+             (str/includes? ledger-alias "@"))
      (throw (ex-info (str "Ledger name cannot contain ':' character. "
-                          "Branches must be created separately. "
+                          "'@' is reserved for time travel. "
                           "Provided: " ledger-alias)
                      {:error :db/invalid-ledger-name
                       :ledger-alias ledger-alias})))
