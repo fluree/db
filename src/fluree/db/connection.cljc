@@ -429,7 +429,9 @@
   (go-try
     (let [storage       (:storage index-catalog)
           index-address (some-> (util/get-first latest-commit const/iri-index)
-                                (util/get-first-value const/iri-address))]
+                                (util/get-first-value const/iri-address))
+          ;; Extract ledger alias from the commit
+          ledger-alias  (util/get-first-value latest-commit const/iri-alias)]
       (when index-address
         (log/debug "Dropping index" index-address)
         (let [{:keys [spot opst post tspo]} (<? (storage/read-json storage index-address true))
@@ -438,12 +440,22 @@
               spot-ch    (drop-index-nodes storage (:id spot))
               post-ch    (drop-index-nodes storage (:id post))
               tspo-ch    (drop-index-nodes storage (:id tspo))
-              opst-ch    (drop-index-nodes storage (:id opst))]
+              opst-ch    (drop-index-nodes storage (:id opst))
+              ;; Also clean up cuckoo filter files for all branches
+              cuckoo-ch  (when ledger-alias
+                           (let [ledger-name (first (str/split ledger-alias #":" 2))]
+                             ;; Dynamic require to avoid circular dependency
+                             (when-let [delete-fn (try
+                                                    (require 'fluree.db.indexer.cuckoo)
+                                                    (resolve 'fluree.db.indexer.cuckoo/delete-all-filters)
+                                                    (catch #?(:clj Exception :cljs js/Error) _e nil))]
+                               (delete-fn index-catalog ledger-name))))]
           (<? garbage-ch)
           (<? spot-ch)
           (<? post-ch)
           (<? tspo-ch)
           (<? opst-ch)
+          (when cuckoo-ch (<? cuckoo-ch))
           (<? (storage/delete storage index-address))))
       :index-dropped)))
 

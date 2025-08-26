@@ -1,13 +1,16 @@
 (ns fluree.db.flake.index.novelty
   (:require [clojure.core.async :as async :refer [<! >! go go-loop]]
+            [clojure.string :as str]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.index :as index]
             [fluree.db.flake.index.storage :as storage]
+            [fluree.db.indexer.cuckoo :as cuckoo]
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -320,16 +323,20 @@
 
 (defn write-resolved-nodes
   [db idx changes-ch error-ch index-ch]
-  (go-loop [stats     {:idx idx, :novel 0, :unchanged 0, :garbage #{}, :updated-ids {}}
+  (go-loop [stats     {:idx idx, :novel 0, :unchanged 0, :garbage #{}, :updated-ids {}, :new-segments []}
             last-node nil]
     (if-let [{::keys [old-id] :as node} (<! index-ch)]
       (if (index/resolved? node)
         (let [updated-ids  (:updated-ids stats)
               written-node (<! (write-node db idx node updated-ids changes-ch error-ch))
+              ;; Extract just the filename from the address
+              segment-name (when-let [addr (:id written-node)]
+                             (last (str/split (str addr) #"/")))
               stats*  (-> stats
                           (update :novel inc)
                           (assoc-in [:updated-ids (:id node)] (:id written-node))
-                          (cond-> (not= old-id :empty) (update :garbage conj old-id)))]
+                          (cond-> (not= old-id :empty) (update :garbage conj old-id))
+                          (cond-> segment-name (update :new-segments conj segment-name)))]
           (recur stats*
                  written-node))
         (recur (update stats :unchanged inc)
@@ -355,11 +362,12 @@
      ::t            t}))
 
 (defn tally
-  [db-status {:keys [idx root garbage] :as _tally-data}]
+  [db-status {:keys [idx root garbage new-segments] :as _tally-data}]
   (-> db-status
       (update :db assoc idx root)
       (update :indexes conj idx)
-      (update :garbage into garbage)))
+      (update :garbage into garbage)
+      (update :new-segments into new-segments)))
 
 (defn refresh-all
   ([db error-ch]
@@ -369,7 +377,7 @@
         (map (partial extract-root db))
         (map (partial refresh-index db changes-ch error-ch))
         async/merge
-        (async/reduce tally {:db db, :indexes [], :garbage #{}}))))
+        (async/reduce tally {:db db, :indexes [], :garbage #{}, :new-segments []}))))
 
 (defn refresh
   [{:keys [novelty t alias] :as db} changes-ch max-old-indexes]
@@ -390,7 +398,7 @@
            (throw e))
 
           refresh-ch
-          ([{:keys [garbage], refreshed-db :db, :as _status}]
+          ([{:keys [garbage new-segments], refreshed-db :db, :as _status}]
            (let [{:keys [index-catalog alias] :as refreshed-db*}
                  (assoc-in refreshed-db [:stats :indexed] t)
                 ;; TODO - ideally issue garbage/root writes to RAFT together
@@ -402,6 +410,21 @@
                                    write-res))
                  db-root-res   (<? (storage/write-db-root index-catalog refreshed-db* (:address garbage-res)))
                  _             (<! (notify-new-index-file db-root-res :root t changes-ch))
+
+                 ;; Update cuckoo filter with new segments
+                 _ (let [[ledger-id branch-name] (util.ledger/ledger-parts alias)
+                                              ;; Read existing filter or create new one
+                         existing-filter (<? (cuckoo/read-filter index-catalog ledger-id branch-name))
+                         filter (or existing-filter (cuckoo/create-filter-chain))
+                                              ;; Add new segments and db-root (but NOT garbage file)
+                         all-segments (cond-> new-segments
+                                        (:address db-root-res)
+                                        (conj (last (str/split (:address db-root-res) #"/"))))
+                         updated-filter (if (seq all-segments)
+                                          (cuckoo/batch-add-chain filter all-segments)
+                                          filter)]
+                                          ;; Always write the filter (even if empty) to ensure it exists
+                     (<? (cuckoo/write-filter index-catalog ledger-id branch-name t updated-filter)))
 
                  index-address (:address db-root-res)
                  index-id      (str "fluree:index:sha256:" (:hash db-root-res))
