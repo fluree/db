@@ -421,11 +421,11 @@
                        :retry-base-delay-ms retry-base-delay-ms
                        :retry-max-delay-ms  retry-max-delay-ms}]
         (<? (with-retries (fn [] (s3-request {:method          "DELETE"
-                                             :bucket          bucket
-                                             :region          region
-                                             :path            full-path
-                                             :credentials     credentials
-                                             :request-timeout write-timeout-ms}))
+                                              :bucket          bucket
+                                              :region          region
+                                              :path            full-path
+                                              :credentials     credentials
+                                              :request-timeout write-timeout-ms}))
               policy)))))
 
   storage/RecursiveListableStore

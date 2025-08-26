@@ -228,6 +228,11 @@
     (let [store (get-content-store clg ::default)]
       (-content-write-bytes store k v)))
 
+  (get-hash [clg address]
+    (if-let [store (locate-address clg address)]
+      (get-hash store address)
+      (async-location-error address)))
+
   EraseableStore
   (delete [clg address]
     (if-let [store (locate-address clg address)]
