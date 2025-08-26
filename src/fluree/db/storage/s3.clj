@@ -233,9 +233,8 @@
                          "DELETE" (xhttp/delete url {:headers signed-headers
                                                      :request-timeout request-timeout})
                          (throw (ex-info "Unsupported HTTP method" {:method method}))))]
-      (let [dur-ms (long (/ (- (System/nanoTime) start) 1000000))]
-        (log/debug "s3-request done" {:method method :bucket bucket :path encoded-path :duration-ms dur-ms})
-        response))))
+      (log/debug "s3-request done" {:method method :bucket bucket :path encoded-path :duration-ms (long (/ (- (System/nanoTime) start) 1000000))})
+      response)))
 
 (defn- tag-matches?
   "Check if an XML element's tag matches the given name, ignoring namespace"
@@ -308,7 +307,10 @@
                              :body data
                              :credentials credentials
                              :request-timeout write-timeout-ms}))]
-    (async/pipe (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path})) ch)))
+    (go
+      (let [res (<? (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path})))]
+        (>! ch res)))
+    ch))
 
 (defn s3-list*
   "List objects in S3 with optional continuation token"
