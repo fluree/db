@@ -102,6 +102,9 @@
          :hash    hash
          :size    original-size})))
 
+  (get-hash [_ address]
+    (-> address storage/split-address last (str/split #"/") last storage/strip-extension))
+
   storage/ByteStore
   (write-bytes [_ path bytes]
     (let [final-bytes (if encryption-key

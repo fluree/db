@@ -46,6 +46,9 @@
          :hash    hash
          :size    (count hashable)})))
 
+  (get-hash [_ address]
+    (-> address storage/split-address last))
+
   storage/ByteStore
   (write-bytes [_ path bytes]
     (go

@@ -51,7 +51,10 @@
         {:path    hash
          :hash    hash
          :address (ipfs-address identifier hash)
-         :size    size}))))
+         :size    size})))
+
+  (get-hash [_ address]
+    (-> address storage/split-address last)))
 
 (defn open
   ([endpoint]

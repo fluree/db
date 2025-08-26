@@ -51,6 +51,12 @@
   (let [i (str/last-index-of address ":")]
     [(subs address 0 i) (subs address (inc i))]))
 
+(defn strip-extension
+  [filename]
+  (if-let [idx (str/last-index-of filename ".")]
+    (subs filename 0 idx)
+    filename))
+
 (defn valid-identifier?
   [x]
   (and (str/includes? x "/")
@@ -103,7 +109,9 @@
 (defprotocol ContentAddressedStore
   (-content-write-bytes [store k v]
     "Writes pre-serialized data `v` to store associated with key `k` and the
-    hashed value of `v`. Returns value's address."))
+    hashed value of `v`. Returns value's address.")
+  (get-hash [store address]
+    "Returns the hash of the data associated with `address` within `store`"))
 
 (defprotocol ByteStore
   "ByteStore is used by consensus to replicate files across servers"

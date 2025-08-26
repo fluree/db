@@ -35,17 +35,20 @@
         (.removeItem js/localStorage path))))
 
   storage/ContentAddressedStore
-  (-content-write-bytes [_ k v]
+  (-content-write-bytes [_ _ v]
     (go
       (let [hashable (if (storage/hashable? v)
                        v
                        (pr-str v))
-            hash     (crypto/sha2-256 hashable :base32)]
-        (.setItem js/localStorage k v)
-        {:path    k
-         :address (local-storage-address identifier k)
+            hash     (crypto/sha2-256 hashable :base32)
+            address  (local-storage-address identifier hash)]
+        (.setItem js/localStorage address v)
+        {:address address
          :hash    hash
-         :size    (count hashable)}))))
+         :size    (count hashable)})))
+
+  (get-hash [_ address]
+    (-> address storage/split-address last)))
 
 (defn open
   ([]
