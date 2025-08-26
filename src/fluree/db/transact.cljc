@@ -247,7 +247,7 @@
 
            _ (log/debug "commit!: write-jsonld(db) start" {:ledger ledger-alias})
 
-           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
+           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-name db-jsonld))
 
            _ (log/debug "commit!: write-jsonld(db) done" {:ledger ledger-alias :db-address (:address data-write-result)})
            db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
