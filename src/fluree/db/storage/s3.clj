@@ -471,7 +471,7 @@
   "Runs thunk returning a channel; retries on retryable errors with backoff/jitter.
   policy may include :log-context with keys like {:method :bucket :path}"
   [thunk {:keys [max-retries retry-base-delay-ms retry-max-delay-ms log-context] :as _policy}]
-  (let [out (async/promise-chan)]
+  (let [out (async/chan 1)]
     (go-loop [attempt 0]
       (let [start (System/nanoTime)
             res (<! (thunk))
@@ -497,7 +497,8 @@
                               (ex-data res)
                               log-context)]
               (log/error "S3 request failed permanently" data)
-              (>! out res)))
+              (>! out res)
+              (async/close! out)))
           (do
             (when (pos? attempt)
               (log/info "S3 request succeeded after retries"
@@ -505,7 +506,8 @@
                                 :attempts (inc attempt)
                                 :duration-ms duration-ms}
                                log-context)))
-            (>! out res)))))
+            (>! out res)
+            (async/close! out)))))
     out))
 
 (defn open
