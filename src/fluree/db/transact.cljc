@@ -245,7 +245,11 @@
            {:keys [txn-id author annotation]}
            (<? (write-transaction! ledger ledger-name staged-txn))
 
+           _ (log/debug "commit!: write-jsonld(db) start" {:ledger ledger-alias})
+
            data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-name db-jsonld))
+
+           _ (log/debug "commit!: write-jsonld(db) done" {:ledger ledger-alias :db-address (:address data-write-result)})
            db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
            dbid              (commit-data/hash->db-id (:hash data-write-result))
            keypair           {:did did, :private private}
