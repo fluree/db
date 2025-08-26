@@ -87,8 +87,9 @@
                         (get-first-value const/iri-fluree-t))
           db        (current-db ledger branch)
           current-t (:t db)]
-      (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
-                 "where current cached db t value is:" current-t)
+      (log/debug "notify of new commit for ledger:" (:alias ledger)
+                 "at t value:" commit-t "where current cached db t value is:"
+                 current-t)
       ;; note, index updates will have same t value as current one, so still need to check if t = current-t
       (cond
         (= commit-t (flake/next-t current-t))
