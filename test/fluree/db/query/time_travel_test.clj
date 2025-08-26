@@ -121,15 +121,15 @@
               (is (= [["Alice"]] result-full)
                   "At full commit SHA for t1: Should only see Alice")))
 
-          ;; Test with even shorter SHA prefix (4 chars) to ensure prefix matching works
-          (let [short-sha-4 (subs commit-sha 0 4)
-                query-short-4 {"select" ["?name"]
+          ;; Test with minimum SHA prefix length enforcement (6 chars)
+          (let [short-sha-6 (subs commit-sha 0 6)
+                query-short-6 {"select" ["?name"]
                                "where" [{"@id" "?s" "name" "?name"}]
-                               "from" [(str ledger-name "@sha:" short-sha-4)]
+                               "from" [(str ledger-name "@sha:" short-sha-6)]
                                "orderBy" ["?name"]}
-                result-short-4 @(fluree/query-connection conn query-short-4 {})]
-            (is (= [["Alice"]] result-short-4)
-                "At very short commit SHA prefix (4 chars) for t1: Should only see Alice"))))
+                result-short-6 @(fluree/query-connection conn query-short-6 {})]
+            (is (= [["Alice"]] result-short-6)
+                "At commit SHA prefix (6 chars) for t1: Should only see Alice"))))
 
       (testing "Invalid time travel format returns error"
         (let [result @(fluree/query-connection conn
@@ -141,6 +141,17 @@
           (when (instance? Exception result)
             (let [msg (ex-message result)]
               (is (re-find #"Invalid time travel format" msg) "Error should mention invalid format")))))
+
+      (testing "Missing value for time travel spec returns error"
+        (doseq [spec ["@t:" "@iso:" "@sha:"]]
+          (let [result @(fluree/query-connection conn
+                                                 {"select" ["?s"]
+                                                  "where" [{"@id" "?s"}]
+                                                  "from" [(str ledger-name spec)]}
+                                                 {})]
+            (is (instance? Exception result) (str "Should return an exception for spec " spec))
+            (when (instance? Exception result)
+              (is (re-find #"Missing value for time travel spec" (ex-message result)))))))
 
       ;; Test ambiguous SHA prefix (would require multiple commits with similar prefixes)
       ;; This is hard to test reliably since we'd need to generate commits with specific SHA patterns
