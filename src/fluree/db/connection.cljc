@@ -484,11 +484,11 @@
     (storage/write-catalog-bytes clg address data)))
 
 (defn trigger-ledger-index
-  "Manually triggers indexing for a ledger and waits for completion.
-   
+  "Manually triggers indexing for a ledger/branch and waits for completion.
+
    Options:
    - :timeout - Max wait time in ms (default 300000 / 5 minutes)
-   
+
    Returns the indexed database object or throws an exception on failure/timeout."
   [conn ledger-alias opts]
   (go-try
