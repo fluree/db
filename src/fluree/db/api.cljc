@@ -1,6 +1,7 @@
 (ns fluree.db.api
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.core.async :as async :refer [go <!]]
+            [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.connection :as connection :refer [connection?]]
@@ -19,6 +20,8 @@
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph.create :as vg-create]
+            [fluree.db.virtual-graph.drop :as vg-drop]
             [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge load range exists? update drop]))
 
@@ -248,11 +251,38 @@
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
    (validate-connection conn)
+   (when (and (string? ledger-alias) (str/includes? ledger-alias "@"))
+     (throw (ex-info "Ledger alias cannot contain '@' symbol" {:error :db/invalid-config :alias ledger-alias})))
    (promise-wrap
     (go-try
       (log/info "Creating ledger" ledger-alias)
       (let [ledger (<? (connection/create-ledger conn ledger-alias opts))]
         (ledger/current-db ledger))))))
+
+(defn create-virtual-graph
+  "Creates a new virtual graph in the nameservice.
+
+  Parameters:
+    conn - Connection object
+    config - Virtual graph configuration map:
+      :name - Virtual graph name (any unique identifier)
+      :type - Virtual graph type (e.g. :bm25)
+      :config - Type-specific configuration
+      :dependencies - (optional) List of ledger dependencies
+
+  For BM25 virtual graphs, config should include:
+    :stemmer - Stemmer identifier (e.g. \"snowballStemmer-en\")
+    :stopwords - Stopwords identifier (e.g. \"stopwords-en\")
+    :query - FQL query defining documents to index
+    :ledgers - List of ledger aliases to index from
+
+  Returns promise resolving to virtual graph database object that supports:
+    - query operations via query-connection
+    - sync method to wait for indexing completion"
+  [conn config]
+  (validate-connection conn)
+  (promise-wrap
+   (vg-create/create conn config)))
 
 (defn alias->address
   "Resolves a ledger alias to its address.
@@ -278,6 +308,21 @@
   [conn ledger-alias]
   (promise-wrap
    (connection/drop-ledger conn ledger-alias)))
+
+(defn drop-virtual-graph
+  "Deletes a virtual graph and its associated data.
+  
+  Parameters:
+    conn - Connection object
+    vg-name - Virtual graph name
+  
+  Removes the virtual graph from nameservice, cleans up all index files,
+  and unregisters any dependencies. Returns a promise that resolves when
+  deletion is complete."
+  [conn vg-name]
+  (validate-connection conn)
+  (promise-wrap
+   (vg-drop/drop-virtual-graph conn vg-name)))
 
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
