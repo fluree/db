@@ -55,10 +55,10 @@
     (go
       (get @contents path)))
 
-  storage/ListableStore
-  (list-paths [_ prefix]
+  storage/RecursiveListableStore
+  (list-paths-recursive [_ prefix]
+    ;; Memory storage already stores flat paths, so recursive is the same as regular listing
     (go
-      ;; Filter keys in contents that start with the prefix and end with .json
       (->> @contents
            keys
            (filter #(and (str/starts-with? % prefix)

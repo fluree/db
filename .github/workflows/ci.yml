@@ -116,6 +116,20 @@ jobs:
           clj-kondo: 'latest'
       - run: make clj-kondo-lint-ci
 
+  eastwood-lint:
+    name: eastwood lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: 'latest'
+      - run: make eastwood
+
   notifications:
     name: send notifications
     if: always()

@@ -54,7 +54,7 @@
     (when-let [[commit _proof] (<? (read-verified-commit storage commit-address))]
       (let [commit-id (commit-data/hash->commit-id commit-hash)]
         (assoc commit
-               :id commit-id
+               const/iri-id commit-id
                const/iri-address commit-address)))))
 
 (defn read-data-jsonld
@@ -101,16 +101,19 @@
   "Loads commit from disk and merges nameservice metadata (address, index)"
   [storage commit-address index-address]
   (go-try
+    (log/debug "commit.storage/load-commit-with-metadata start" {:address commit-address :index-address index-address})
     (when-let [commit-data (<? (storage/read-json storage commit-address))]
       (let [addr-key-path (if (contains? commit-data "credentialSubject")
                             ["credentialSubject" "address"]
                             ["address"])
             index-key-path (if (contains? commit-data "credentialSubject")
                              ["credentialSubject" "index" "address"]
-                             ["index" "address"])]
-        (-> commit-data
-            (assoc-in addr-key-path commit-address)
-            (cond-> index-address (assoc-in index-key-path index-address)))))))
+                             ["index" "address"])
+            result (-> commit-data
+                       (assoc-in addr-key-path commit-address)
+                       (cond-> index-address (assoc-in index-key-path index-address)))]
+        (log/debug "commit.storage/load-commit-with-metadata done" {:address commit-address})
+        result))))
 
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.

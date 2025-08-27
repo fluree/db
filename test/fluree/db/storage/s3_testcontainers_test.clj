@@ -91,11 +91,11 @@
 
             ;; Test ledger creation
             (let [ledger-id "testcontainers-test"
-                  ledger @(fluree/create conn ledger-id)]
-              (is (some? ledger) "Ledger should be created")
+                  db0 @(fluree/create conn ledger-id)]
+              (is (some? db0) "Ledger should be created")
 
               ;; Test basic operations
-              (let [db @(fluree/update (fluree/db ledger)
+              (let [db @(fluree/update db0
                                        {"@context" {"ex" "http://example.org/ns/"}
                                         "insert" [{"@id" "ex:alice"
                                                    "@type" "ex:Person"
@@ -105,7 +105,7 @@
                                                    "ex:name" "Bob"}]})
 
                     ;; Commit the data
-                    committed-db @(fluree/commit! ledger db)
+                    committed-db @(fluree/commit! conn db)
                     ;; Query the data
                     results @(fluree/query committed-db
                                            {"@context" {"ex" "http://example.org/ns/"}
@@ -125,8 +125,7 @@
                                                       :s3-endpoint *s3-endpoint*
                                                       :cache-max-mb 50
                                                       :parallelism 1})
-                      reloaded @(fluree/load fresh-conn ledger-id)
-                      reloaded-db (fluree/db reloaded)
+                      reloaded-db @(fluree/load fresh-conn ledger-id)
                       reload-results @(fluree/query reloaded-db
                                                     {"@context" {"ex" "http://example.org/ns/"}
                                                      "select" ["?s" "?name"]
@@ -136,7 +135,9 @@
                   (is (= results reload-results) "Reloaded data should match")
 
                   ;; Check S3 object paths
-                  (let [store (s3/->S3Store nil (s3/get-credentials) bucket "us-east-1" "test")
+                  (let [store (s3/->S3Store nil (s3/get-credentials) bucket "us-east-1" "test"
+                                            20000 60000 20000
+                                            4 150 2000)
                         list-ch (s3/s3-list store "")
                         objects-resp (<!! list-ch)
                         object-keys (map :key (:contents objects-resp))]
@@ -182,10 +183,10 @@
                                                               :reindex-max-bytes 10000}}})]
           (try
             (let [ledger-id "indexing-test"
-                  ledger @(fluree/create conn ledger-id)
+                  db0 @(fluree/create conn ledger-id)
 
                   ;; Add enough data to trigger indexing
-                  db1 @(fluree/update (fluree/db ledger)
+                  db1 @(fluree/update db0
                                       {"@context" {"ex" "http://example.org/ns/"}
                                        "insert" (for [i (range 50)]
                                                   {"@id" (str "ex:person" i)
@@ -194,14 +195,16 @@
                                                    "ex:age" i})})
 
                   ;; Commit to trigger indexing and query to verify data
-                  db2 @(fluree/commit! ledger db1)
+                  db2 @(fluree/commit! conn db1)
                   count-result @(fluree/query db2
                                               {"@context" {"ex" "http://example.org/ns/"}
                                                "select" "(count ?s)"
                                                "where" {"@id" "?s"
                                                         "@type" "ex:Person"}})
                   ;; Verify index files were created in S3 using our s3-list
-                  store (s3/->S3Store nil (s3/get-credentials) bucket "us-east-1" "indexing")
+                  store (s3/->S3Store nil (s3/get-credentials) bucket "us-east-1" "indexing"
+                                      20000 60000 20000
+                                      4 150 2000)
                   list-ch (s3/s3-list store "")
                   objects-resp (<!! list-ch)
                   object-keys (map :key (:contents objects-resp))]

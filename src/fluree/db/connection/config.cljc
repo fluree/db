@@ -2,33 +2,30 @@
   (:require [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.db.connection.vocab :as conn-vocab]
+            [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util :as util :refer [get-id get-first get-first-value
-                                             get-value try* catch*]]
+                                             get-value of-type? try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn type?
-  [node kind]
-  (-> node (get-first :type) (= kind)))
-
 (defn config-value?
   [node]
   (or (contains? node conn-vocab/env-var)
       (contains? node conn-vocab/java-prop)
       (contains? node conn-vocab/default-val)
-      (type? node conn-vocab/config-val-type)))
+      (of-type? node conn-vocab/config-val-type)))
 
 (defn connection?
   [node]
-  (type? node conn-vocab/connection-type))
+  (of-type? node conn-vocab/connection-type))
 
 (defn connection-config?
   [node]
-  (or (type? node conn-vocab/config-type)
+  (or (of-type? node conn-vocab/config-type)
       (and (not (contains? node :type))
            (or (contains? node conn-vocab/primary-publisher)
                (contains? node conn-vocab/secondary-publishers)
@@ -38,11 +35,11 @@
 
 (defn system?
   [node]
-  (type? node conn-vocab/system-type))
+  (of-type? node conn-vocab/system-type))
 
 (defn publisher?
   [node]
-  (type? node conn-vocab/publisher-type))
+  (of-type? node conn-vocab/publisher-type))
 
 (defn storage-nameservice?
   [node]
@@ -57,13 +54,13 @@
 
 (defn storage?
   [node]
-  (type? node conn-vocab/storage-type))
+  (of-type? node conn-vocab/storage-type))
 
 (defn memory-storage?
   [node]
   (and (storage? node)
        (-> node
-           (dissoc :idx :id :type conn-vocab/address-identifier)
+           (dissoc const/iri-id const/iri-type conn-vocab/address-identifier)
            empty?)))
 
 (defn file-storage?
@@ -166,30 +163,27 @@
 (defn subject-node?
   [x]
   (and (map? x)
-       (not (contains? x :value))))
+       (not (contains? x const/iri-value))))
 
 (defn blank-node?
   [x]
   (and (subject-node? x)
-       (not (contains? x :id))))
+       (not (contains? x const/iri-id))))
 
 (defn ref-node?
   [x]
   (and (subject-node? x)
        (not (blank-node? x))
-       (-> x
-           (dissoc :idx)
-           count
-           (= 1))))
+       (-> x count (= 1))))
 
 (defn split-subject-node
   [node]
-  (let [node* (cond-> node
-                (blank-node? node) (assoc :id (iri/new-blank-node-id))
-                true               (dissoc :idx))]
+  (let [node* (if (blank-node? node)
+                (assoc node const/iri-id (iri/new-blank-node-id))
+                node)]
     (if (ref-node? node*)
       [node*]
-      (let [ref-node (select-keys node* [:id])]
+      (let [ref-node (select-keys node* [const/iri-id])]
         [ref-node node*]))))
 
 (defn flatten-sequence
@@ -209,7 +203,7 @@
 
 (defn flatten-node
   [node]
-  (loop [[[k v] & r] (dissoc node :idx)
+  (loop [[[k v] & r] node
          children    []
          flat-node   {}]
     (if k
@@ -272,7 +266,7 @@
 (defn keywordize-node-id
   [node]
   (if (subject-node? node)
-    (update node :id iri->kw)
+    (update node const/iri-id iri->kw)
     node))
 
 (defn keywordize-child-ids
@@ -341,7 +335,8 @@
   (when-let [index-options (get-first defaults conn-vocab/index-options)]
     {:reindex-min-bytes (get-first-long index-options conn-vocab/reindex-min-bytes)
      :reindex-max-bytes (get-first-long index-options conn-vocab/reindex-max-bytes)
-     :max-old-indexes   (get-first-integer index-options conn-vocab/max-old-indexes)}))
+     :max-old-indexes   (get-first-integer index-options conn-vocab/max-old-indexes)
+     :indexing-disabled (get-first-boolean index-options conn-vocab/indexing-disabled)}))
 
 (defn parse-defaults
   [config]

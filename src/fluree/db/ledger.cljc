@@ -118,7 +118,7 @@
           ::newer)))))
 
 (defrecord Ledger [id address alias did state cache commit-catalog
-                   index-catalog reasoner primary-publisher secondary-publishers])
+                   index-catalog reasoner primary-publisher secondary-publishers indexing-opts])
 
 (defn initial-state
   [branches current-branch]
@@ -144,7 +144,8 @@
                   :primary-publisher    primary-publisher
                   :secondary-publishers secondary-publishers
                   :cache                (atom {})
-                  :reasoner             #{}})))
+                  :reasoner             #{}
+                  :indexing-opts        indexing-opts})))
 
 (defn normalize-alias
   "For a ledger alias, removes any preceding '/' or '#' if exists."
@@ -174,3 +175,16 @@
                              (<? (nameservice/publish primary-publisher compact-commit))))]
       (instantiate ledger-alias* primary-address branch commit-catalog index-catalog
                    primary-publisher secondary-publishers indexing did genesis-commit))))
+
+(defn trigger-index!
+  "Manually triggers indexing for a ledger on the specified branch.
+   Uses the current db for that branch. Returns a channel that will receive
+   the result when indexing completes.
+
+   Options:
+   - branch: Branch name (defaults to main branch if not specified)"
+  ([ledger]
+   (trigger-index! ledger nil))
+  ([ledger branch]
+   (let [branch-meta (get-branch-meta ledger branch)]
+     (branch/trigger-index! branch-meta))))

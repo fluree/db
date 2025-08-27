@@ -70,28 +70,28 @@
                   (js->clj opts :keywordize-keys true))))
 
 (defn ^:export commit
-  ([ledger db] (fluree/commit! ledger db))
-  ([ledger db opts] (.then (fluree/commit! ledger db
-                                           (js->clj opts :keywordize-keys true))
-                           (fn [result]
-                             (if (map? result)
-                               ;; If result is a map with :db key, handle it specially
-                               (let [db-val (:db result)
-                                     js-result (-> result
-                                                   (dissoc :db)
-                                                   clj->js)]
-                                 (aset js-result "db" db-val)
-                                 js-result)
-                               ;; Otherwise just return the db as-is
-                               result)))))
+  ([conn db] (fluree/commit! conn db))
+  ([conn db opts] (.then (fluree/commit! conn db
+                                         (js->clj opts :keywordize-keys true))
+                         (fn [result]
+                           (if (map? result)
+                             ;; If result is a map with :db key, handle it specially
+                             (let [db-val (:db result)
+                                   js-result (-> result
+                                                 (dissoc :db)
+                                                 clj->js)]
+                               (aset js-result "db" db-val)
+                               js-result)
+                             ;; Otherwise just return the db as-is
+                             result)))))
 
 (defn ^:export status
-  ([ledger] (clj->js (fluree/status ledger)))
-  ([ledger branch] (clj->js (fluree/status ledger branch))))
+  ([conn ledger-id] (clj->js (fluree/status conn ledger-id)))
+  ([conn ledger-id branch] (clj->js (fluree/status conn ledger-id branch))))
 
 (defn ^:export db
-  [ledger]
-  (fluree/db ledger))
+  [conn ledger-id]
+  (fluree/db conn ledger-id))
 
 (defn ^:export query
   [db query]

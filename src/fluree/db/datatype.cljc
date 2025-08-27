@@ -583,16 +583,18 @@
   an expanded json-ld value map. If type is defined but not a predefined data type, will
   return nil prompting downstream process to look up (or create) a custom data
   type. Value coercion is only attempted when a required-type is supplied."
-  [db {:keys [type value] :as _value-map}]
-  (let [type-id (if type
+  [db value-map]
+  (let [value   (util/get-value value-map)
+        type    (util/get-types value-map)
+        type-id (if type
                   (or (get default-data-types type)
                       (iri/encode-iri db type))
                   (infer value))
-        value* (coerce value type-id)]
+        value*  (coerce value type-id)]
     (if (nil? value*)
       (throw (ex-info (str "Data type " (iri/sid->iri type-id)
                            " cannot be coerced from provided value: " value ".")
-                      {:status 400 :error, :db/shacl-value-coercion}))
+                      {:status 400 :error, :db/value-coercion}))
       [value* type-id])))
 
 (defn coerce-value

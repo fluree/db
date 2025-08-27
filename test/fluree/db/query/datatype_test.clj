@@ -14,9 +14,9 @@
 
 (deftest ^:integration mixed-datatypes-test
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "ledger/datatype")]
+        db0 @(fluree/create conn "ledger/datatype")]
     (testing "Querying predicates with mixed datatypes"
-      (let [mixed-db @(fluree/update (fluree/db ledger)
+      (let [mixed-db @(fluree/update db0
                                      {"insert"
                                       [{:context     context-edn
                                         :id          :ex/coco
@@ -53,12 +53,12 @@
                                :where   {:id '?u, :schema/name 3}}))
             "only returns the data type queried")))))
 
-(deftest ^:integration datatype-test
+(deftest ^:integration ^:sci datatype-test
   (testing "querying with datatypes"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "people")
+          db0 @(fluree/create conn "people")
           db     @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" [test-utils/default-context
                                 {:ex    "http://example.org/ns/"
                                  :value "@value"
@@ -154,9 +154,9 @@
 (deftest ^:integration json-datatype-test
   (testing "querying with @json datatype"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "json-test")
+          db0 @(fluree/create conn "json-test")
           db     @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" {"ex"    "http://example.org/ns/"}
                     "insert"
                     [{"id"      "ex:doc1"
@@ -197,9 +197,9 @@
 (deftest ^:integration value-type-binding-test
   (testing "querying with @value and @type variable bindings"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "value-type-test")
+          db0 @(fluree/create conn "value-type-test")
           db     @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" {"ex"  "http://example.org/ns/"
                                 "xsd" "http://www.w3.org/2001/XMLSchema#"}
                     "insert"
@@ -226,12 +226,12 @@
                   ["Marge" 36 "xsd:int"]]
                  results)))))))
 
-(deftest ^:integration language-binding-test
+(deftest ^:integration ^:sci language-binding-test
   (testing "language binding with lang function"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "lang-test")
+          db0 @(fluree/create conn "lang-test")
           db     @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
                     [{"@id"      "ex:greeting"
@@ -264,16 +264,16 @@
 (deftest ^:integration transaction-binding-test
   (testing "transaction (@t) binding with t as a variable"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "t-test")
+          db0    @(fluree/create conn "t-test")
           ;; First transaction
           db1    @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" {"ex" "http://example.org/ns/"}
                     "insert"
                     [{"@id"     "ex:alice"
                       "ex:name" "Alice"
                       "ex:age"  30}]})
-          db1*   @(fluree/commit! ledger db1)
+          db1*   @(fluree/commit! conn db1)
           ;; Second transaction
           db2    @(fluree/update
                    db1*
@@ -281,7 +281,7 @@
                     "insert"
                     [{"@id"      "ex:alice"
                       "ex:hobby" "Reading"}]})
-          db2*   @(fluree/commit! ledger db2)
+          db2*   @(fluree/commit! conn db2)
           ;; Third transaction
           db3    @(fluree/update
                    db2*
@@ -289,7 +289,7 @@
                     "insert"
                     [{"@id"     "ex:alice"
                       "ex:city" "Boston"}]})
-          db3*   @(fluree/commit! ledger db3)]
+          db3*   @(fluree/commit! conn db3)]
       (testing "binding transaction number to a variable"
         (let [query {"@context" {"ex" "http://example.org/ns/"}
                      "select"  ["?p" "?o" "?t"]

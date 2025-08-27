@@ -227,6 +227,25 @@
         (recur r (into addrs (<? (nameservice/known-addresses nsv ledger-alias))))
         addrs))))
 
+;; --- Branch resolution helpers ---
+
+(defn- branch-from-commit
+  "Extract branch from expanded commit JSON-LD, if present."
+  [expanded-commit]
+  (get-first-value expanded-commit const/iri-branch))
+
+(defn- branch-from-ns
+  "Extract branch from nameservice record, if present."
+  [ns-record]
+  (get ns-record "f:branch"))
+
+(defn- branch-from-alias
+  "Derive branch from an alias of the form 'alias@branch', if present."
+  [ledger-alias]
+  (when (and (string? ledger-alias)
+             (str/includes? ledger-alias "@"))
+    (subs ledger-alias (inc (str/last-index-of ledger-alias "@")))))
+
 (defn ledger-exists?
   "Checks nameservices on a connection and returns true if any nameservice
   already has a ledger associated with the given alias."
@@ -319,9 +338,10 @@
                                                                          index-address))
             expanded-commit (json-ld/expand commit)
             ledger-alias    (commit->ledger-alias conn address expanded-commit)
-            branch          (-> expanded-commit
-                                (get-first-value const/iri-branch)
-                                (or (throw-missing-branch address ledger-alias)))
+            ;; Determine branch using helpers in priority order
+            branch           (or (branch-from-commit expanded-commit)
+                                 (branch-from-ns ns-record)
+                                 (branch-from-alias ledger-alias))
 
             {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
             ledger (ledger/instantiate ledger-alias address branch commit-catalog index-catalog
@@ -473,3 +493,25 @@
   [conn address data]
   (let [clg (-> conn :index-catalog :storage)]
     (storage/write-catalog-bytes clg address data)))
+
+(defn trigger-ledger-index
+  "Manually triggers indexing for a ledger/branch and waits for completion.
+
+   Options:
+   - :branch - Branch name (defaults to main branch)
+   - :timeout - Max wait time in ms (default 300000 / 5 minutes)
+
+   Returns the indexed database object or throws an exception on failure/timeout."
+  [conn ledger-alias opts]
+  (go-try
+    (let [{:keys [branch timeout]
+           :or {timeout 300000}} opts
+          ledger (<? (load-ledger-alias conn ledger-alias))
+          complete-ch (ledger/trigger-index! ledger branch)
+          timeout-ch (async/timeout timeout)]
+      (async/alt!
+        complete-ch ([result] result)
+        timeout-ch (ex-info "Indexing wait timeout, but assume indexing is proceeding in the background."
+                            {:status 408
+                             :error :db/timeout
+                             :timeout timeout})))))

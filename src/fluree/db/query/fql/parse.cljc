@@ -807,40 +807,44 @@
           (where/match-meta metadata)))))
 
 (defn parse-obj-cmp
-  [allowed-vars context subj-cmp pred-cmp m triples
-   {:keys [list id value type language] :as v-map}]
-  (cond list
-        (reduce (fn [triples [i list-item]]
-                  (parse-obj-cmp allowed-vars context subj-cmp pred-cmp {:i i} triples list-item))
-                triples
-                (map vector (range) list))
+  [allowed-vars context subj-cmp pred-cmp m triples v-map]
+  (let [id     (util/get-id v-map)
+        v-list (util/get-list v-map)
+        value  (util/get-value v-map)
+        type   (util/get-types v-map)
+        lang   (util/get-lang v-map)]
+    (cond v-list
+          (reduce (fn [triples [i list-item]]
+                    (parse-obj-cmp allowed-vars context subj-cmp pred-cmp {:i i} triples list-item))
+                  triples
+                  (map vector (range) v-list))
 
-    ;; literal object
-        (some? value)
-        (let [m*      (cond-> m
-                        language (assoc :lang language))
-              obj-cmp (if (v/variable? value)
-                        (parse-variable-if-allowed allowed-vars value)
-                        (parse-object-value value type context m*))]
-          (conj triples [subj-cmp pred-cmp obj-cmp]))
+          ;; literal object
+          (some? value)
+          (let [m*      (cond-> m
+                          lang (assoc :lang lang))
+                obj-cmp (if (v/variable? value)
+                          (parse-variable-if-allowed allowed-vars value)
+                          (parse-object-value value type context m*))]
+            (conj triples [subj-cmp pred-cmp obj-cmp]))
 
-    ;; ref object
-        :else
-        (let [ref-obj (if (v/variable? id)
-                        (parse-variable-if-allowed allowed-vars id)
-                        (where/match-iri
-                         (if (nil? id)
-                           (iri/new-blank-node-id)
-                           id)))
-              ref-cmp (if m
-                        (where/match-meta ref-obj m)
-                        ref-obj)
-              v-map*  (if (nil? id)
-                    ;; project newly created bnode-id into v-map
-                        (assoc v-map :id (where/get-iri ref-cmp))
-                        v-map)]
-          (conj (parse-subj-cmp allowed-vars context triples v-map*)
-                [subj-cmp pred-cmp ref-cmp]))))
+          ;; ref object
+          :else
+          (let [ref-obj (if (v/variable? id)
+                          (parse-variable-if-allowed allowed-vars id)
+                          (where/match-iri
+                           (if (nil? id)
+                             (iri/new-blank-node-id)
+                             id)))
+                ref-cmp (if m
+                          (where/match-meta ref-obj m)
+                          ref-obj)
+                v-map*  (if (nil? id)
+                          ;; project newly created bnode-id into v-map
+                          (assoc v-map const/iri-id (where/get-iri ref-cmp))
+                          v-map)]
+            (conj (parse-subj-cmp allowed-vars context triples v-map*)
+                  [subj-cmp pred-cmp ref-cmp])))))
 
 (defn parse-pred-cmp
   [allowed-vars context subj-cmp triples [pred values]]
@@ -856,8 +860,8 @@
                          " Please use the JSON-LD \"@type\" keyword instead.")
                     {:status 400 :error :db/invalid-predicate}))
 
-    (= :type pred)
-    (let [values*  (map (fn [typ] {:id typ})
+    (= const/iri-type pred)
+    (let [values*  (map (fn [typ] {const/iri-id typ})
                         values)
           pred-cmp (where/match-iri const/iri-rdf-type)]
       (reduce (partial parse-obj-cmp allowed-vars context subj-cmp pred-cmp nil)
@@ -871,13 +875,14 @@
               values))))
 
 (defn parse-subj-cmp
-  [allowed-vars context triples {:keys [id] :as node}]
-  (let [subj-cmp (cond (v/variable? id) (parse-variable-if-allowed allowed-vars id)
+  [allowed-vars context triples node]
+  (let [id       (util/get-id node)
+        subj-cmp (cond (v/variable? id) (parse-variable-if-allowed allowed-vars id)
                        (nil? id)        (where/match-iri (iri/new-blank-node-id))
                        :else            (where/match-iri id))]
     (reduce (partial parse-pred-cmp allowed-vars context subj-cmp)
             triples
-            (->> (dissoc node :id :idx)
+            (->> (dissoc node const/iri-id)
                  ;; deterministic patterns for each pred
                  (sort-by (comp str first))))))
 
@@ -886,8 +891,7 @@
   [expanded allowed-vars context]
   (try*
     (reduce (partial parse-subj-cmp allowed-vars context)
-            []
-            expanded)
+            [] expanded)
     (catch* e
       (throw (ex-info (str "Parsing failure due to: " (ex-message e)
                            ". Query: " expanded)
@@ -927,7 +931,7 @@
                            (parse-values context))
          where         (-> (get-named txn "where")
                            (parse-where vars context))
-         bound-vars    (-> where where/bound-variables (into vars))
+         bound-vars    (-> where where/clause-variables (into vars))
          delete        (when-let [dlt (get-named txn "delete")]
                          (jld->parsed-triples dlt bound-vars context))
          insert        (when-let [ins (get-named txn "insert")]
@@ -956,25 +960,36 @@
       iri/blank-node-id?))
 
 (defn upsert-where-del
-  "For an upsert transaction.
+  "Takes parsed transaction data and for each triple pattern, replaces the object position
+  with a variable corresponding to the subject and predicate. Returns a map with :where
+  and :delete keys.
 
-   Takes a parsed transaction and for each triple, replaces the object position
-   with a variable and returns a map with :where and :delete keys.
-
-   Skips blank nodes as they cannot be deleted."
+   Skips blank nodes as they are new subjects with no existing flakes to retract."
   [parsed-txn]
   (loop [[next-triple & r] parsed-txn
-         i      0
-         where  []
-         delete []]
+         vars              {}
+         where             []
+         delete            []]
     (if next-triple
       (if (blank-node-subject? next-triple)
-        (recur r (inc i) where delete) ;; can't delete blank node properties
-        (let [new-var    (str "?f" i)
-              delete-smt (assoc next-triple 2 (parse-variable new-var))
-              where-smt  (where/->pattern :optional [delete-smt])] ;; use optional so other matched triples still delete if no match
-          (recur r (inc i) (conj where where-smt) (conj delete delete-smt))))
-      {:where  where
+        ;; no need to find/delete a blank node subject, it's guaranteed to be new
+        (recur r vars where delete)
+        (let [s-iri (-> next-triple (get 0) where/get-iri)
+              p-iri (-> next-triple (get 1) where/get-iri)]
+
+          (if (get vars [s-iri p-iri])
+            ;; we've already generated a pattern for this data
+            (recur r vars where delete)
+            ;; generate where and delete pattern
+            (let [o-var      (str "?f" (count vars))
+                  delete-smt (assoc next-triple 2 (parse-variable o-var))
+                  ;; optional so we don't have to match every var in order to delete
+                  where-smt  (where/->pattern :optional [delete-smt])]
+              (recur r
+                     (assoc vars [s-iri p-iri] o-var)
+                     (conj where where-smt)
+                     (conj delete delete-smt))))))
+      {:where where
        :delete delete})))
 
 (defn parse-upsert-txn

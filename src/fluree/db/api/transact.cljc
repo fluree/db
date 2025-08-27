@@ -49,14 +49,18 @@
 (defn transact!
   [conn ledger-id parsed-txn]
   (go-try
-    (let [ledger (async/<! (connection/load-ledger conn ledger-id))]
-      (if (util/exception? ledger)
-        (if (not-found? ledger)
-          (throw (ex-info (str "Ledger " ledger-id " does not exist")
-                          {:status 409 :error :db/ledger-not-exists}
-                          ledger))
-          (throw ledger))
-        (<? (transact/transact-ledger! ledger parsed-txn))))))
+    (if ledger-id
+      (let [ledger (async/<! (connection/load-ledger conn ledger-id))]
+        (if (util/exception? ledger)
+          (if (not-found? ledger)
+            (throw (ex-info (str "Ledger " ledger-id " does not exist")
+                            {:status 409 :error :db/ledger-not-exists}
+                            ledger))
+            (throw ledger))
+          (<? (transact/transact-ledger! ledger parsed-txn))))
+      (throw (ex-info "Missing ledger specification."
+                      {:ledger-id ledger-id
+                       :status 400})))))
 
 (defn insert!
   [conn ledger-id txn override-opts]
@@ -73,14 +77,21 @@
       (<? (transact! conn ledger-id parsed-txn)))))
 
 (defn update!
-  [conn txn override-opts]
-  (go-try
-    (let [{:keys [ledger-id] :as parsed-txn}
-          (-> txn
-              (parse/parse-sparql override-opts)
-              (parse/ensure-ledger)
-              (parse/parse-update-txn override-opts))]
-      (<? (transact! conn ledger-id parsed-txn)))))
+  ([conn txn override-opts]
+   (go-try
+     (let [{:keys [ledger-id] :as parsed-txn}
+           (-> txn
+               (parse/parse-sparql override-opts)
+               (parse/ensure-ledger)
+               (parse/parse-update-txn override-opts))]
+       (<? (transact! conn ledger-id parsed-txn)))))
+  ([conn ledger-id txn override-opts]
+   (go-try
+     (let [parsed-txn (-> txn
+                          (parse/parse-sparql override-opts)
+                          (parse/parse-update-txn override-opts)
+                          (assoc :ledger-id ledger-id))]
+       (<? (transact! conn ledger-id parsed-txn))))))
 
 (defn credential-transact!
   "Like transact!, but use when leveraging a Verifiable Credential or signed JWS.

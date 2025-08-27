@@ -7,6 +7,7 @@
             [fluree.db.connection :as connection]
             [fluree.db.connection.config :as config]
             [fluree.db.connection.vocab :as conn-vocab]
+            [fluree.db.constants :as const]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.nameservice.ipns :as ipns-nameservice]
             [fluree.db.nameservice.storage :as storage-nameservice]
@@ -51,8 +52,8 @@
 (defn reference?
   [node]
   (and (map? node)
-       (contains? node :id)
-       (-> node (dissoc :idx :id) empty?)))
+       (contains? node const/iri-id)
+       (-> node (dissoc const/iri-id) empty?)))
 
 (defn convert-reference
   [node]
@@ -178,8 +179,20 @@
      (let [identifier  (config/get-first-string config conn-vocab/address-identifier)
            s3-bucket   (config/get-first-string config conn-vocab/s3-bucket)
            s3-prefix   (config/get-first-string config conn-vocab/s3-prefix)
-           s3-endpoint (config/get-first-string config conn-vocab/s3-endpoint)]
-       (s3-storage/open identifier s3-bucket s3-prefix s3-endpoint))))
+           s3-endpoint (config/get-first-string config conn-vocab/s3-endpoint)
+           read-timeout-ms (config/get-first-long config conn-vocab/s3-read-timeout-ms)
+           write-timeout-ms (config/get-first-long config conn-vocab/s3-write-timeout-ms)
+           list-timeout-ms (config/get-first-long config conn-vocab/s3-list-timeout-ms)
+           max-retries (config/get-first-integer config conn-vocab/s3-max-retries)
+           retry-base-delay-ms (config/get-first-long config conn-vocab/s3-retry-base-delay-ms)
+           retry-max-delay-ms (config/get-first-long config conn-vocab/s3-retry-max-delay-ms)]
+       (s3-storage/open identifier s3-bucket s3-prefix s3-endpoint
+                        {:read-timeout-ms read-timeout-ms
+                         :write-timeout-ms write-timeout-ms
+                         :list-timeout-ms list-timeout-ms
+                         :max-retries max-retries
+                         :retry-base-delay-ms retry-base-delay-ms
+                         :retry-max-delay-ms retry-max-delay-ms}))))
 
 (defmethod ig/init-key :fluree.db.storage/ipfs
   [_ config]
