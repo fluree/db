@@ -49,10 +49,11 @@
 
 ;; TODO: Verify hash
 (defn read-commit-jsonld
-  [storage commit-address commit-hash]
+  [storage commit-address]
   (go-try
     (when-let [[commit _proof] (<? (read-verified-commit storage commit-address))]
-      (let [commit-id (commit-data/hash->commit-id commit-hash)]
+      (let [commit-hash (storage/get-hash storage commit-address)
+            commit-id   (commit-data/hash->commit-id commit-hash)]
         (assoc commit
                const/iri-id commit-id
                const/iri-address commit-address)))))
@@ -120,8 +121,8 @@
     (go
       (try*
         (loop [[commit proof] (verify-commit latest-commit)
-               last-t        nil
-               commit-tuples (list)] ;; note 'conj' will put at beginning of list (smallest 't' first)
+               last-t         nil
+               commit-tuples  (list)] ;; note 'conj' will put at beginning of list (smallest 't' first)
           (let [prev-commit-addr (-> commit
                                      (get-first const/iri-previous)
                                      (get-first-value const/iri-address))

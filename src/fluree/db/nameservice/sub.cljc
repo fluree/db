@@ -50,9 +50,9 @@
   (update current-state :subscriptions dissoc ledger-alias))
 
 (defn notify
-  [{:keys [commit-catalog] :as conn} address hash]
+  [{:keys [commit-catalog] :as conn} address]
   (go-try
-    (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address hash))]
+    (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
       (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
         (if-let [ledger-ch (cached-ledger conn ledger-alias)]
           (do (log/debug "Notification received for ledger" ledger-alias
