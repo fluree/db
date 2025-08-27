@@ -187,6 +187,10 @@
     (let [json-data (<? (storage/read-json commit-catalog addr))]
       (assoc json-data "address" addr))))
 
+(defn parse-address-hash
+  [{:keys [commit-catalog] :as _conn} addr]
+  (storage/get-hash commit-catalog addr))
+
 (defn lookup-publisher-commit
   [conn ledger-address]
   (lookup-commit* ledger-address (publishers conn)))
