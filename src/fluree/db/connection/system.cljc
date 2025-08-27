@@ -151,7 +151,7 @@
   (let [env-var     (get-first-value config-value-node conn-vocab/env-var)
         java-prop   (get-first-value config-value-node conn-vocab/java-prop)
         default-val (get-first-value config-value-node conn-vocab/default-val)]
-    {:value (get-priority-value env-var java-prop default-val)}))
+    {const/iri-value (get-priority-value env-var java-prop default-val)}))
 
 (defmethod ig/init-key :fluree.db/cache
   [_ max-mb]
