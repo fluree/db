@@ -341,7 +341,7 @@
         (async/put! ledger-chan ledger)
         ledger)
       (throw (ex-info (str "Unable to load. No record of ledger at address: " ledger-address " exists.")
-                      {:status 404, :error :db/unkown-address})))))
+                      {:status 404, :error :db/unknown-address})))))
 
 (defn load-ledger-address
   [conn address]
@@ -374,7 +374,7 @@
                   (recur r))
               (do (ns-subscribe/release-ledger conn normalized-alias)
                   (let [ex (ex-info (str "Load for " normalized-alias " failed due to failed address lookup.")
-                                    {:status 404, :error :db/unkown-ledger})]
+                                    {:status 404, :error :db/unknown-ledger})]
                     (async/put! ledger-chan ex)
                     (throw ex))))))))))
 

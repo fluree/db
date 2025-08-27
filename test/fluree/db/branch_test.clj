@@ -73,7 +73,7 @@
             (let [result @(fluree/load conn "test-ledger:feature-branch")]
               (is (util/exception? result) "Should return an exception when loading deleted branch")
               (when (util/exception? result)
-                (is (= :db/unkown-ledger (:error (ex-data result))) "Should have correct error code"))))
+                (is (= :db/unknown-ledger (:error (ex-data result))) "Should have correct error code"))))
 
           (testing "Cannot delete main branch"
             (let [result @(fluree/delete-branch! conn "test-ledger:main")]
