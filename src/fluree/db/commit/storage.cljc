@@ -37,7 +37,7 @@
 (defn read-verified-commit
   [storage commit-address]
   (go-try
-    (when-let [commit-data (<? (storage/read-json storage commit-address))]
+    (when-let [commit-data (<? (storage/content-read-json storage commit-address))]
       (log/trace "read-commit at:" commit-address "data:" commit-data)
       (let [addr-key-path  (if (contains? commit-data "credentialSubject")
                              ["credentialSubject" "address"]

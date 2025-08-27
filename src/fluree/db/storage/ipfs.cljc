@@ -53,6 +53,17 @@
          :address (ipfs-address identifier hash)
          :size    size})))
 
+  storage/ContentArchive
+  (-content-read-bytes [_ address]
+    (go-try
+      (let [{:keys [ns method local]} (storage/parse-address address)
+            path                      (build-ipfs-path method local)]
+        (when-not (and (= "fluree" ns)
+                       (#{"ipfs" "ipns"} method))
+          (throw (ex-info (str "Invalid file type or method: " address)
+                          {:status 500 :error :db/invalid-address})))
+        (<? (ipfs/cat endpoint path false)))))
+
   (get-hash [_ address]
     (-> address storage/split-address last)))
 

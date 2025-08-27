@@ -403,6 +403,14 @@
            :size    (count bytes)
            :address (s3-address identifier path)}))))
 
+  storage/ContentArchive
+  (-content-read-bytes [this address]
+    (go-try
+      (let [path (storage/get-local-path address)
+            resp (<? (read-s3-data this path))]
+        (when (not= resp ::not-found)
+          (:Body resp)))))
+
   (get-hash [_ address]
     (-> address storage/split-address last (str/split #"/") last storage/strip-extension))
 

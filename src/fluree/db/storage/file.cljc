@@ -102,6 +102,11 @@
          :hash    hash
          :size    original-size})))
 
+  storage/ContentArchive
+  (-content-read-bytes [_ address]
+    (let [path (storage-path root address)]
+      (fs/read-file path encryption-key)))
+
   (get-hash [_ address]
     (-> address storage/split-address last (str/split #"/") last storage/strip-extension))
 

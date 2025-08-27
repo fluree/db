@@ -46,6 +46,12 @@
          :hash    hash
          :size    (count hashable)})))
 
+  storage/ContentArchive
+  (-content-read-bytes [_ address]
+    (go
+      (let [path (storage/get-local-path address)]
+        (get @contents path))))
+
   (get-hash [_ address]
     (-> address storage/split-address last))
 
