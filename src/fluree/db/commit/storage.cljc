@@ -133,7 +133,7 @@
 
             (if (= from-t commit-t)
               (async/onto-chan! resp-ch commit-tuples*)
-              (when-let [verified-commit (<? (read-verified-commit storage prev-commit-addr))]
+              (when-let [verified-commit (<? (read-commit-jsonld storage prev-commit-addr))]
                 (recur verified-commit commit-t commit-tuples*)))))
         (catch* e
           (log/error e "Error tracing commits")
