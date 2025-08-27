@@ -91,8 +91,8 @@
             (log/info "Subscribed ledger:" ledger-alias "received subscription message:" msg)
             (let [action (get msg "action")]
               (if (= "new-commit" action)
-                (let [{:keys [address hash]} (get msg "data")]
-                  (notify conn address hash))
+                (let [{:keys [address]} (get msg "data")]
+                  (notify conn address))
                 (log/info "New subscrition message with action: " action "received, ignored.")))
             (recur)))
         :subscribed))))
