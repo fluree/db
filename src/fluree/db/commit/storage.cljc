@@ -39,24 +39,26 @@
   (go-try
     (when-let [commit-data (<? (storage/read-json storage commit-address))]
       (log/trace "read-commit at:" commit-address "data:" commit-data)
-      (let [addr-key-path (if (contains? commit-data "credentialSubject")
-                            ["credentialSubject" "address"]
-                            ["address"])]
-        (-> commit-data
-            (assoc-in addr-key-path commit-address)
-            json-ld/expand
-            verify-commit)))))
+      (let [addr-key-path  (if (contains? commit-data "credentialSubject")
+                             ["credentialSubject" "address"]
+                             ["address"])
+            [commit proof] (-> commit-data
+                               (assoc-in addr-key-path commit-address)
+                               json-ld/expand
+                               verify-commit)
+            commit-hash    (storage/get-hash storage commit-address)
+            commit-id      (commit-data/hash->commit-id commit-hash)
+            commit*        (assoc commit
+                                  const/iri-id commit-id
+                                  const/iri-address commit-address)]
+        [commit* proof]))))
 
 ;; TODO: Verify hash
 (defn read-commit-jsonld
   [storage commit-address]
   (go-try
     (when-let [[commit _proof] (<? (read-verified-commit storage commit-address))]
-      (let [commit-hash (storage/get-hash storage commit-address)
-            commit-id   (commit-data/hash->commit-id commit-hash)]
-        (assoc commit
-               const/iri-id commit-id
-               const/iri-address commit-address)))))
+      commit)))
 
 (defn read-data-jsonld
   [storage address]
@@ -136,7 +138,7 @@
 
             (if (= from-t commit-t)
               (async/onto-chan! resp-ch commit-tuples*)
-              (when-let [verified-commit (<? (read-commit-jsonld storage prev-commit-addr))]
+              (when-let [verified-commit (<? (read-verified-commit storage prev-commit-addr))]
                 (recur verified-commit commit-t commit-tuples*)))))
         (catch* e
           (log/error e "Error tracing commits")
