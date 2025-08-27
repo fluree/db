@@ -379,6 +379,110 @@
   (latest-t [_]
     t)
 
+  (sha->t [db sha]
+    (go-try
+      (log/debug "sha->t looking up commit SHA:" sha)
+      ;; Normalize the input - use only 'fluree:commit:sha256:b' prefix when present,
+      ;; otherwise ensure the value starts with 'b'
+      (let [prefix-b "fluree:commit:sha256:b"
+            sha-normalized (cond
+                             ;; Input is a full commit IRI with ':b' segment - keep leading 'b'
+                             (str/starts-with? sha prefix-b)
+                             (subs sha (dec (count prefix-b)))
+
+                             ;; Already has correct format (starts with 'b')
+                             (str/starts-with? sha "b")
+                             sha
+
+                             ;; User provided just the hash without 'b' prefix
+                             :else
+                             (str "b" sha))
+            sha-length (count sha-normalized)]
+
+        (log/debug "sha->t normalized SHA:" sha-normalized "length:" sha-length)
+
+        (cond
+          ;; Too long to be a valid SHA (52 = 'b' + 51 char hash)
+          (> sha-length 52)
+          (throw (ex-info (str "Invalid SHA: too long (" sha-length " chars). "
+                               "SHA-256 in base32 with 'b' prefix should be 52 characters.")
+                          {:status 400 :error :db/invalid-commit-sha
+                           :sha sha :normalized sha-normalized :length sha-length}))
+
+          ;; Too short to be a useful/efficient prefix (minimum 6)
+          (< sha-length 6)
+          (throw (ex-info "SHA prefix must be at least 6 characters"
+                          {:status 400 :error :db/invalid-commit-sha :min 6}))
+
+          ;; Full SHA - use direct efficient lookup (51-52 chars with 'b' prefix)
+          (or (= 52 sha-length)
+              (= 51 sha-length))
+          (let [;; sha-normalized already has 'b' prefix from normalization
+                commit-id (str "fluree:commit:sha256:" sha-normalized)
+                direct-query {:select ["?t"]
+                              :values ["?commit" [{"@type" "@id" "@value" commit-id}]]
+                              :where [{"@id" "?commit"
+                                       const/iri-data "?data"}
+                                      {"@id" "?data"
+                                       const/iri-fluree-t "?t"}]}
+                direct-result (<? (fql/query (policy/root db) nil direct-query))]
+            (if (seq direct-result)
+              (do
+                (log/debug "sha->t found exact match for" commit-id)
+                (ffirst direct-result))
+              (throw (ex-info (str "No commit found with SHA: " sha-normalized)
+                              {:status 400 :error :db/invalid-commit-sha :sha sha}))))
+
+          ;; Partial SHA - use prefix matching (< 52 chars)
+          :else
+          (let [;; sha-normalized already has 'b' prefix from normalization
+                commit-id-prefix (str "fluree:commit:sha256:" sha-normalized)
+                ;; Use the index to find commits with this SHA prefix
+                start-sid (iri/encode-iri db commit-id-prefix)
+                end-sid (iri/encode-iri db (str commit-id-prefix "~"))
+                ;; Get flakes for subjects in this range
+                flakes (-> db
+                           policy/root
+                           (query-range/index-range
+                            nil ;; TODO: track fuel
+                            :spot
+                            >= [start-sid]
+                            < [end-sid])
+                           <?)
+                ;; Get unique subject IDs (commit IDs)
+                commit-sids (distinct (map flake/s flakes))]
+            (log/debug "sha->t prefix search found" (count commit-sids) "matching commits")
+            (cond
+              (empty? commit-sids)
+              (throw (ex-info (str "No commit found with SHA prefix: " sha-normalized)
+                              {:status 400 :error :db/invalid-commit-sha :sha sha}))
+
+              (> (count commit-sids) 1)
+              ;; Multiple matches - SHA prefix is ambiguous
+              (let [commit-ids (mapv #(iri/decode-sid db %) commit-sids)]
+                (throw (ex-info (str "Ambiguous SHA prefix: " sha-normalized ". Multiple commits match.")
+                                {:status 400 :error :db/ambiguous-commit-sha
+                                 :sha sha
+                                 :matches commit-ids})))
+
+              :else
+              ;; Found exactly one commit via prefix - now get its t value
+              (let [found-commit-sid (first commit-sids)
+                    found-commit-id (iri/decode-sid db found-commit-sid)
+                    ;; Use values to directly query for this specific commit's t value
+                    prefix-query {:select ["?t"]
+                                  :values ["?commit" [{"@type" "@id" "@value" found-commit-id}]]
+                                  :where [{"@id" "?commit"
+                                           const/iri-data "?data"}
+                                          {"@id" "?data"
+                                           const/iri-fluree-t "?t"}]}
+                    prefix-result (<? (fql/query (policy/root db) nil prefix-query))]
+                (log/debug "sha->t prefix match query result for" found-commit-id ":" prefix-result)
+                (if (seq prefix-result)
+                  (ffirst prefix-result)
+                  (throw (ex-info (str "Could not find t value for commit: " sha)
+                                  {:status 500 :error :db/commit-lookup-error :sha sha}))))))))))
+
   (-as-of [db t]
     (assoc db :t t))
 
