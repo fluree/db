@@ -57,7 +57,7 @@
   (def ledger @(fluree/create file-conn ledger-alias))
 
   (def db1 @(fluree/stage
-             (fluree/db ledger)
+             @(fluree/db file-conn ledger-alias)
              {"@context" default-context
               "insert"   [{:id           :ex/brian,
                            :type         :ex/User,

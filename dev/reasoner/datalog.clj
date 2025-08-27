@@ -9,7 +9,7 @@
   (def ledger @(fluree/create conn "test/rule"))
 
   (def db @(fluree/stage
-            (fluree/db ledger)
+            @(fluree/db conn "test/rule")
             {"@context" {"ex" "http://example.org/"}
              "insert"   [{"@id"        "ex:brian"
                           "ex:name"    "Brian"
