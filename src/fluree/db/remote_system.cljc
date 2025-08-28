@@ -56,13 +56,13 @@
                      {:status 400
                       :error  :db/websocket-error})))))))
 
-(defn remote-read
+(defn remote-read-json
   "Returns a core async channel with value of remote resource."
-  [system-state commit-key keywordize-keys?]
-  (log/debug "Remote read initiated for: " commit-key)
+  [system-state resource-key keywordize-keys?]
+  (log/debug "Remote read json initiated for: " resource-key)
   (let [server-host (pick-server system-state)]
     (xhttp/post-json (str server-host "/fluree/remote/resource")
-                     {:resource commit-key}
+                     {:resource resource-key}
                      {:keywordize-keys keywordize-keys?})))
 
 (defn not-found-error?
@@ -127,7 +127,7 @@
 (defrecord RemoteSystem [system-state address-identifiers msg-in pub msg-out]
   storage/JsonArchive
   (-read-json [_ address keywordize?]
-    (remote-read system-state address keywordize?))
+    (remote-read-json system-state address keywordize?))
 
   storage/Identifiable
   (identifiers [_]
