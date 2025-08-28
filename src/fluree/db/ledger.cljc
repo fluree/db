@@ -3,13 +3,16 @@
             [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
+            [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util :as util :refer [get-first get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -116,6 +119,74 @@
                     " at t value: " commit-t " however, latest t is more current: "
                     current-t)
           ::newer)))))
+
+(defn expand-and-extract-ns
+  "Expands a nameservice record and extracts key fields via IRIs.
+
+  Returns map {:ledger-alias :branch :ns-t :commit-address :index-address}."
+  [ns-record]
+  (let [expanded (json-ld/expand ns-record)
+        ;; The @id field contains the full ledger:branch alias
+        ledger-alias (get-first-value expanded const/iri-id)]
+    {:ledger-alias   ledger-alias
+     :branch         (or (get-first-value expanded const/iri-branch)
+                         (when (and (string? ledger-alias)
+                                    (str/includes? ledger-alias ":"))
+                           (second (str/split ledger-alias #":" 2))))
+     :ns-t           (get-first-value expanded const/iri-fluree-t)
+     :commit-address (-> (get-first expanded const/iri-commit)
+                         (get-first-value const/iri-id))
+     :index-address  (-> (get-first expanded const/iri-index)
+                         (get-first-value const/iri-id))}))
+
+(defn idx-address->idx-id
+  "Extracts the hash from a content-addressed index address and returns the index ID.
+  Address format is like: 'fluree:file://ledger/index/root/abc123def.json'
+  Returns: 'fluree:index:sha256:abc123def'"
+  [index-address]
+  (let [hash (-> index-address
+                 (str/split #"/")
+                 last
+                 (str/replace #"\.json$" ""))]
+    (str "fluree:index:sha256:" hash)))
+
+(defn notify-index
+  "Applies an index-only update when the provided index root matches the current commit t.
+
+    Returns one of:
+    - ::index-updated     when index was applied and address changed
+    - ::index-current     when index address is same or older
+    - ::stale             when index root.t is ahead of current commit t"
+  [ledger {:keys [index-address branch]}]
+  (go-try
+    (let [branch     (or branch (:branch @(:state ledger)))
+          db         (current-db ledger branch)
+          {:keys [index-catalog]} ledger
+          cur-t      (:t db)
+          cur-idx    (get-in db [:commit :index :address])]
+
+        ;; Short-circuit if index address hasn't changed
+      (if (= index-address cur-idx)
+        ::index-current
+
+          ;; Only load the index file if the address is different
+        (let [root    (<? (index-storage/read-db-root index-catalog index-address))
+              root-t  (:t root)]
+          (cond
+            (flake/t-after? root-t cur-t)
+            ::stale
+
+            (flake/t-before? root-t cur-t)
+            ::index-current
+
+            :else
+            (let [data       (-> db :commit :data)
+                  index-id   (idx-address->idx-id index-address)
+                  index-map  (commit-data/new-index data index-id index-address
+                                                    (select-keys root [:spot :post :opst :tspo]))
+                  updated-db (<? (dbproto/-index-update db index-map))]
+              (update-commit! ledger branch updated-db)
+              ::index-updated)))))))
 
 (defrecord Ledger [id address alias did state cache commit-catalog
                    index-catalog reasoner primary-publisher secondary-publishers indexing-opts])
