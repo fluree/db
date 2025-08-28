@@ -69,7 +69,7 @@
    (deftest load-from-file-test
      (testing "can load a file ledger with single cardinality predicates"
        (with-temp-dir [storage-path {}]
-         (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
+         (let [conn         @(fluree/connect-file {:storage-path {"defaultVal" (str storage-path)}})
                ledger-alias "load-from-file-test-single-card"
                db0          @(fluree/create conn ledger-alias)
                db           @(fluree/update
