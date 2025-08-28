@@ -1,6 +1,6 @@
 (ns fluree.db.storage.ipfs
-  (:require [clojure.string :as str]
-            [clojure.core.async :refer [go]]
+  (:require [clojure.core.async :refer [go]]
+            [clojure.string :as str]
             [fluree.db.method.ipfs.xhttp :as ipfs]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
