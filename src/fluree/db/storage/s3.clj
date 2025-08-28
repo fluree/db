@@ -412,7 +412,13 @@
           (:Body resp)))))
 
   (get-hash [_ address]
-    (-> address storage/split-address last (str/split #"/") last storage/strip-extension))
+    (go
+      (-> address
+          storage/split-address
+          last
+          (str/split #"/")
+          last
+          storage/strip-extension)))
 
   storage/ByteStore
   (write-bytes [this path bytes]

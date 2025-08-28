@@ -46,7 +46,7 @@
                                (assoc-in addr-key-path commit-address)
                                json-ld/expand
                                verify-commit)
-            commit-hash    (storage/get-hash storage commit-address)
+            commit-hash    (<? (storage/get-hash storage commit-address))
             commit-id      (commit-data/hash->commit-id commit-hash)
             commit*        (assoc commit
                                   const/iri-id commit-id

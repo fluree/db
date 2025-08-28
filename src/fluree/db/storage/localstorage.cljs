@@ -54,7 +54,7 @@
         (.getItem js/localStorage path))))
 
   (get-hash [_ address]
-    (-> address storage/split-address last)))
+    (go (-> address storage/split-address last))))
 
 (defn open
   ([]

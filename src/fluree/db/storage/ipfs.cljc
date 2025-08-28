@@ -1,5 +1,6 @@
 (ns fluree.db.storage.ipfs
   (:require [clojure.string :as str]
+            [clojure.core.async :refer [go]]
             [fluree.db.method.ipfs.xhttp :as ipfs]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
@@ -65,7 +66,7 @@
         (<? (ipfs/cat endpoint path false)))))
 
   (get-hash [_ address]
-    (-> address storage/split-address last)))
+    (go (-> address storage/split-address last))))
 
 (defn open
   ([endpoint]
