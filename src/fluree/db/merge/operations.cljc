@@ -139,19 +139,16 @@
           source-commits (<? (load-and-validate-branches conn source-db lca))
 
           ;; Get target commits since LCA to check for conflicts
-          target-commits (<? (merge-commit/extract-commits-since conn target-db lca))
-          _ (log/info "squash!: target-commits=" (count target-commits))
+          target-commits (<? (merge-commit/extract-commits-since conn target-db lca))]
 
-          ;; Prepare target DB with namespaces from source commits
-          all-namespaces (<? (merge-commit/collect-commit-namespaces conn source-commits))
-          updated-target-db (merge-db/prepare-target-db-namespaces target-db all-namespaces)]
+      (log/info "squash!: target-commits=" (count target-commits))
 
       (if (seq target-commits)
         ;; Target has diverged - check for conflicts and apply if safe
-        (<? (handle-diverged-branches conn updated-target-db source-commits target-commits
+        (<? (handle-diverged-branches conn target-db source-commits target-commits
                                       from to opts target-ledger))
         ;; Fast path - target hasn't diverged, just apply source commits
-        (<? (handle-fast-path conn updated-target-db source-commits from to opts target-ledger))))))
+        (<? (handle-fast-path conn target-db source-commits from to opts target-ledger))))))
 
 (defn- validate-reset-state
   "Validates that the branch is not already at the target state."
@@ -160,13 +157,6 @@
     (throw (ex-info "Branch is already at the specified state"
                     {:status 400 :error :db/no-op
                      :current-t current-t}))))
-
-(defn- prepare-reset-database
-  "Prepares the database with necessary namespaces for reset operation."
-  [conn current-db commits-reversed]
-  (go-try
-    (let [all-namespaces (<? (merge-commit/collect-commit-namespaces conn commits-reversed))]
-      (merge-db/prepare-target-db-namespaces current-db all-namespaces))))
 
 (defn- apply-reset-changes
   "Stages and commits the reversed changes to reset the branch."
@@ -213,8 +203,8 @@
 
           ;; Process commits to create reversal
           (let [commits-reversed (reverse commits-to-undo)
-                db-with-ns (<? (prepare-reset-database conn current-db commits-reversed))
-                all-reversed-flakes (<? (merge-flake/process-commits-to-reverse conn commits-reversed db-with-ns))
+                ;; pass current-db; namespaces will be created dynamically as needed
+                all-reversed-flakes (<? (merge-flake/process-commits-to-reverse conn commits-reversed current-db))
                 _ (log/info "safe-reset!: total-reversed-flakes=" (count all-reversed-flakes))
                 new-commit-sha (<? (apply-reset-changes ledger current-db all-reversed-flakes state-spec opts))]
 

@@ -2,7 +2,6 @@
   "Flake manipulation and spot-based operations for merge operations."
   (:require [fluree.db.flake :as flake]
             [fluree.db.merge.commit :as merge-commit]
-            [fluree.db.merge.db :as merge-db]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
 
@@ -37,16 +36,23 @@
      grouped)))
 
 (defn- collect-all-flakes
-  "Collects all flakes from source commits."
+  "Collects all flakes from source commits, threading updated namespace state."
   [conn source-commits target-db]
   (go-try
     (loop [all-flakes []
-           remaining source-commits]
+           cur-db     target-db
+           remaining  source-commits]
       (if-let [commit (first remaining)]
-        (let [commit-data (<? (merge-commit/read-commit-data conn commit target-db))
-              commit-flakes (concat (:asserted commit-data) (:retracted commit-data))]
-          (recur (into all-flakes commit-flakes) (rest remaining)))
-        all-flakes))))
+        (let [{:keys [asserted retracted db]} (<? (merge-commit/read-commit-data conn commit cur-db))
+              commit-flakes (concat asserted retracted)
+              ;; Debug: Check for null subjects
+              null-flakes (filter #(nil? (flake/s %)) commit-flakes)]
+          (when (seq null-flakes)
+            (log/error "collect-all-flakes: Found" (count null-flakes) "flakes with null subjects"
+                       "at t=" (get-in commit [:data :t])
+                       "first null flake:" (first null-flakes)))
+          (recur (into all-flakes commit-flakes) db (rest remaining)))
+        [all-flakes cur-db]))))
 
 (defn compute-net-flakes
   "Computes net effect of all source commits by collecting flakes and cancelling opposites.
@@ -55,18 +61,14 @@
   (go-try
     ;; Step 1: Ensure synchronous db
     (let [target-db-sync (<? (merge-commit/ensure-sync-db target-db))
-          ;; Step 2: Collect all namespaces from source commits
-          all-namespaces (<? (merge-commit/collect-commit-namespaces conn source-commits))
-          ;; Step 3: Prepare target-db with namespaces
-          target-db-with-ns (merge-db/prepare-target-db-namespaces target-db-sync all-namespaces)
-          ;; Step 4: Collect all flakes from commits
-          all-flakes (<? (collect-all-flakes conn source-commits target-db-with-ns))
+          ;; Collect all flakes from commits, threading updated db via dynamic codec
+          [all-flakes target-db-ready] (<? (collect-all-flakes conn source-commits target-db-sync))
           ;; Step 5: Cancel out opposite operations (assert/retract pairs)
           net-flakes (cancel-opposite-operations all-flakes)]
 
       (log/info "compute-net-flakes: collected" (count all-flakes) "flakes, net" (count net-flakes) "after cancellation")
 
-      [(into (flake/sorted-set-by flake/cmp-flakes-spot) net-flakes) target-db-with-ns])))
+      [(into (flake/sorted-set-by flake/cmp-flakes-spot) net-flakes) target-db-ready])))
 
 (defn get-changed-spots
   "Returns the set of [s p dt] coordinates that have changed in the given flakes."
@@ -77,9 +79,8 @@
   "Process a single commit and return its flakes with flipped operations."
   [conn commit db-with-ns]
   (go-try
-    (let [commit-flakes (<? (merge-commit/read-commit-data conn commit db-with-ns))
-          all-flakes (concat (:asserted commit-flakes)
-                             (:retracted commit-flakes))]
+    (let [{:keys [asserted retracted]} (<? (merge-commit/read-commit-data conn commit db-with-ns))
+          all-flakes (concat asserted retracted)]
       (map flake/flip-flake all-flakes))))
 
 (defn process-commits-to-reverse

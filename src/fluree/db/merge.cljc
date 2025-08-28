@@ -94,18 +94,6 @@
     ;; Ensure subsequent loads see fresh state
     (ns-subscribe/release-ledger conn branch-spec)))
 
-(defn- compute-rebase-flakes
-  "Computes the net flakes for rebasing source onto target."
-  [conn target-db source-commits]
-  (go-try
-    ;; Prepare target DB with namespaces from source commits
-    (let [all-namespaces (<? (merge-commit/collect-commit-namespaces conn source-commits))
-          prepared-target-db (merge-db/prepare-target-db-namespaces target-db all-namespaces)
-          ;; Compute net flakes
-          [net-flakes _] (<? (merge-flake/compute-net-flakes
-                              conn prepared-target-db source-commits))]
-      net-flakes)))
-
 (defn rebase!
   "Rebases source branch onto target branch (updates source branch).
   
@@ -152,10 +140,10 @@
                           {:status 400 :error :db/no-op})))
 
         ;; Compute the net flakes for rebase
-        (let [net-flakes (if squash?
-                           (<? (compute-rebase-flakes conn target-db source-commits))
-                           (throw (ex-info "Commit-by-commit replay not yet implemented for rebase"
-                                           {:status 501 :error :not-implemented})))
+        (let [[net-flakes _] (if squash?
+                               (<? (merge-flake/compute-net-flakes conn target-db source-commits))
+                               (throw (ex-info "Commit-by-commit replay not yet implemented for rebase"
+                                               {:status 501 :error :not-implemented})))
 
               message (or (:message opts)
                           (if squash?

@@ -7,6 +7,7 @@
             [fluree.db.constants :as const]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.flake-db :as flake-db]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
@@ -103,12 +104,55 @@
               commit-nses-raw (get data-jsonld const/iri-namespaces)
               commit-nses (when (seq commit-nses-raw)
                             (mapv :value commit-nses-raw))]
+          (log/debug "collect-commit-namespaces: t=" (get-in commit [:data :t])
+                     "raw-namespaces=" commit-nses-raw
+                     "processed-namespaces=" commit-nses)
           (recur (into namespaces commit-nses) (rest remaining)))
-        namespaces))))
+        (do
+          (log/debug "collect-commit-namespaces: final-namespaces=" namespaces)
+          namespaces)))))
+
+;; Dynamic namespace codec for on-the-fly namespace creation during merge flake creation
+(defn- build-sid
+  [{:keys [namespaces] :as _db} ns nme]
+  (let [ns-code (get namespaces ns)]
+    (iri/->sid ns-code nme)))
+
+(defn- ensure-namespace
+  [db ns]
+  (let [nses     (:namespaces db)
+        ns-codes (:namespace-codes db)]
+    (if (contains? nses ns)
+      db
+      (let [new-ns-code (iri/next-namespace-code ns-codes)]
+        (-> db
+            (update :namespaces assoc ns new-ns-code)
+            (update :namespace-codes assoc new-ns-code ns))))))
+
+(defn- dynamic-namespace-codec
+  "Returns [codec vol] where codec implements IRICodec and mutates vol to add
+  namespaces on-demand during encode-iri. vol holds {:namespaces :namespace-codes}"
+  [db-context]
+  (let [start {:namespaces (:namespaces db-context)
+               :namespace-codes (:namespace-codes db-context)}
+        vol   (volatile! start)
+        codec (reify iri/IRICodec
+                (encode-iri [_ iri-str]
+                  (let [[ns nme] (iri/decompose iri-str)]
+                    (when ns
+                      (vswap! vol ensure-namespace ns))
+                    (build-sid @vol ns nme)))
+                (decode-sid [_ sid]
+                  (iri/sid->iri sid (:namespace-codes @vol))))]
+    [codec vol]))
 
 (defn read-commit-data
   "Reads the actual data from a commit.
-  Returns map with :asserted and :retracted flakes."
+  Returns map with :asserted and :retracted flakes.
+  
+  Note: The commit data is stored in JSON-LD format with expanded IRIs,
+  so namespace translation happens automatically when flakes are created
+  in the target database context."
   [conn commit db-context]
   (go-try
     (when-let [data-address (get-in commit [:data :address])]
@@ -117,15 +161,25 @@
             assert-data (get data-jsonld const/iri-assert)
             retract-data (get data-jsonld const/iri-retract)
             t (get-in commit [:data :t])
+            ;; Build a dynamic codec that adds namespaces on-demand during encoding
+            [codec vol] (dynamic-namespace-codec db-context)
             asserted-flakes (when assert-data
-                              (flake-db/create-flakes true db-context t assert-data))
+                              (flake-db/create-flakes true codec t assert-data))
             retracted-flakes (when retract-data
-                               (flake-db/create-flakes false db-context t retract-data))]
+                               (flake-db/create-flakes false codec t retract-data))
+            ;; Update db-context with any namespaces added during encode
+            vol-state @vol
+            ns-codes (:namespace-codes vol-state)
+            db* (-> db-context
+                    (assoc :namespaces (:namespaces vol-state)
+                           :namespace-codes ns-codes
+                           :max-namespace-code (iri/get-max-namespace-code ns-codes)))]
         (log/debug "read-commit-data: t=" t
                    "assert-count=" (count assert-data)
                    "retract-count=" (count retract-data))
         {:asserted asserted-flakes
          :retracted retracted-flakes
          :all (concat (or asserted-flakes [])
-                      (or retracted-flakes []))}))))
+                      (or retracted-flakes []))
+         :db db*}))))
 
