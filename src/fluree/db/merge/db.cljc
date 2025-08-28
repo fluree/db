@@ -6,30 +6,24 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.flake-db :as flake-db]
-            [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.ledger :as ledger]
             [fluree.db.query.range :as query-range]
             [fluree.db.time-travel :as time-travel]
-            [fluree.db.util.async :refer [<? go-try]]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.log :as log]))
 
 (defn prepare-target-db-namespaces
-  "Prepares target database with proper namespace configuration and adds source namespaces."
+  "Adds only truly new namespaces from source into the target-db using target's code space."
   [target-db source-namespaces]
-  (let [;; Ensure target-db has proper namespace configuration
-        target-db-prepared (cond-> target-db
-                             (not (map? (:namespaces target-db)))
-                             (assoc :namespaces {})
-
-                             (not (:max-namespace-code target-db))
-                             (assoc :max-namespace-code
-                                    (or (and (:namespace-codes target-db)
-                                             (iri/get-max-namespace-code (:namespace-codes target-db)))
-                                        100)))]
-    ;; Add all source namespaces to target-db
-    (if (seq source-namespaces)
-      (flake-db/with-namespaces target-db-prepared source-namespaces)
-      target-db-prepared)))
+  (let [existing-iris (set (keys (:namespaces target-db)))
+        new-namespaces (remove existing-iris source-namespaces)]
+    (log/debug "prepare-target-db-namespaces: existing=" existing-iris
+               "source=" source-namespaces
+               "new=" new-namespaces)
+    (if (seq new-namespaces)
+      (flake-db/with-namespaces target-db new-namespaces)
+      target-db)))
 
 (defn- ensure-sync-db-internal
   "Ensures we have a synchronous database, dereferencing async if needed."
