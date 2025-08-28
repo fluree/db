@@ -65,6 +65,22 @@
                      {:resource resource-key}
                      {:keywordize-keys keywordize-keys?})))
 
+(defn remote-read-bytes
+  [system-state resource-key]
+  (log/debug "Remote read json initiated for: " resource-key)
+  (let [server-host (pick-server system-state)]
+    (xhttp/post (str server-host "/fluree/remote/resource")
+                {:resource resource-key}
+                {:keywordize-keys false})))
+
+(defn remote-get-hash
+  [system-state address]
+  (log/debug "Remote get hash initiated for: " address)
+  (let [server-host (pick-server system-state)]
+    (xhttp/post (str server-host "/fluree/remote/hash")
+                {:address address}
+                {:keywordize-keys false})))
+
 (defn not-found-error?
   [e]
   (-> e ex-data :status (= 404)))
@@ -128,6 +144,12 @@
   storage/JsonArchive
   (-read-json [_ address keywordize?]
     (remote-read-json system-state address keywordize?))
+
+  storage/ContentArchive
+  (-content-read-bytes [_ address]
+    (remote-read-bytes system-state address))
+  (get-hash [_ address]
+    (remote-get-hash system-state address))
 
   storage/Identifiable
   (identifiers [_]
