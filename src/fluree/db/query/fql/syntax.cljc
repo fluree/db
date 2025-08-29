@@ -161,7 +161,6 @@
     ::ledger-opts       [:map
                          [:did {:optional true} ::identity]
                          [:identity {:optional true} ::identity]
-                         [:branch {:optional true} :string]
                          [:indexing {:optional true}
                           [:map
                            [:reindex-min-bytes {:optional true} nat-int?]

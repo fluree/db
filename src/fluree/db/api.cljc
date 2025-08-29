@@ -3,6 +3,7 @@
             [clojure.core.async :as async :refer [go <!]]
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
+            [fluree.db.api.branch :as api.branch]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.connection :as connection :refer [connection?]]
             [fluree.db.connection.config :as config]
@@ -272,8 +273,12 @@
   (connection/primary-address conn ledger-alias))
 
 (defn load
-  "Loads an existing ledger by alias or address.
-  Returns a promise that resolves to the latest database."
+  "Loads an existing ledger by alias or address and returns its current database.
+  
+  If alias includes a branch (e.g., 'my-db:feature'), loads that specific branch.
+  If no branch is specified (e.g., 'my-db'), loads the default 'main' branch.
+  
+  Returns a promise that resolves to the current database from the loaded branch."
   [conn alias-or-address]
   (validate-connection conn)
   (promise-wrap
@@ -557,16 +562,92 @@
      (let [ledger (<? (connection/load-ledger conn ledger-id))]
        (ledger/status ledger)))))
 
-;; db operations
+;; Branch operations
 
-(defn db
-  "Returns the current database value from a ledger.
+(defn create-branch!
+  "Creates a new branch from an existing branch.
   
   Parameters:
     conn - Connection object
-    ledger-id - Ledger alias or address
+    new-branch-spec - Full branch spec (e.g., 'ledger:new-branch')
+    from-branch-spec - Source branch spec (e.g., 'ledger:old-branch')
+    from-commit - (optional) Specific commit ID to branch from, defaults to latest
     
-  Returns the current database value."
+  Returns promise resolving to the new branch metadata."
+  ([conn new-branch-spec from-branch-spec]
+   (create-branch! conn new-branch-spec from-branch-spec nil))
+  ([conn new-branch-spec from-branch-spec from-commit]
+   (validate-connection conn)
+   (promise-wrap
+    (api.branch/create-branch! conn new-branch-spec from-branch-spec from-commit))))
+
+(defn list-branches
+  "Lists all available branches for a ledger.
+  
+  Parameters:
+    conn - Connection object
+    ledger-alias - Ledger alias string (without branch)
+    
+  Returns promise resolving to a vector of branch names."
+  [conn ledger-alias]
+  (validate-connection conn)
+  (promise-wrap
+   (api.branch/list-branches conn ledger-alias)))
+
+(defn branch-info
+  "Returns detailed information about a specific branch.
+  
+  Parameters:
+    conn - Connection object
+    branch-spec - Full branch spec (e.g., \"ledger:branch\")
+    
+  Returns branch metadata including creation info, head commit, etc."
+  [conn branch-spec]
+  (validate-connection conn)
+  (promise-wrap
+   (api.branch/branch-info conn branch-spec)))
+
+(defn delete-branch!
+  "Deletes a branch.
+  
+  Parameters:
+    conn - Connection object
+    branch-spec - Full branch spec to delete (e.g., \"ledger:branch\")
+    
+  Cannot delete the default branch or protected branches.
+  Returns promise resolving when deletion is complete."
+  [conn branch-spec]
+  (validate-connection conn)
+  (promise-wrap
+   (api.branch/delete-branch! conn branch-spec)))
+
+(defn rename-branch!
+  "Renames a branch.
+  
+  Parameters:
+    conn - Connection object
+    old-branch-spec - Current branch spec (e.g., \"ledger:old-branch\")
+    new-branch-spec - New branch spec (e.g., \"ledger:new-branch\")
+    
+  Returns promise resolving when rename is complete."
+  [conn old-branch-spec new-branch-spec]
+  (validate-connection conn)
+  (promise-wrap
+   (api.branch/rename-branch! conn old-branch-spec new-branch-spec)))
+
+;; db operations
+
+(defn db
+  "Returns a database value from a ledger.
+  
+  Loads the specified ledger and returns its current database value.
+  
+  Parameters:
+    conn - Connection object
+    ledger-id - Ledger alias or address (format: 'ledger:branch' or just 'ledger')
+                If no branch is specified, defaults to ':main'
+      
+  Returns a promise that resolves to a database value for querying."
   [conn ledger-id]
   (validate-connection conn)
   (promise-wrap

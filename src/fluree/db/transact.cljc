@@ -184,7 +184,9 @@
 (defn write-commit
   [commit-storage alias {:keys [did private]} commit]
   (go-try
-    (let [commit-jsonld (commit-data/->json-ld commit)
+    (let [;; Extract base ledger name for storage path
+          ledger-name   (util.ledger/ledger-base-name alias)
+          commit-jsonld (commit-data/->json-ld commit)
           ;; For credential/generate, we need a DID map with public key
           did-map (when (and did private)
                     (if (map? did)
@@ -193,7 +195,7 @@
           signed-commit (if did-map
                           (<? (credential/generate commit-jsonld private did-map))
                           commit-jsonld)
-          commit-res    (<? (commit-storage/write-jsonld commit-storage alias signed-commit))
+          commit-res    (<? (commit-storage/write-jsonld commit-storage ledger-name signed-commit))
 
           [commit* commit-jsonld*]
           (-> [commit commit-jsonld]
@@ -205,10 +207,21 @@
 
 (defn publish-commit
   "Publishes commit to all nameservices registered with the ledger."
-  [{:keys [primary-publisher secondary-publishers] :as _ledger} commit-jsonld]
+  [{:keys [primary-publisher secondary-publishers alias] :as _ledger} commit-jsonld]
   (go-try
-    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
-      (nameservice/publish-to-all commit-jsonld secondary-publishers)
+    (let [existing-record (when primary-publisher
+                            (<? (nameservice/lookup primary-publisher alias)))
+          branch-metadata (when existing-record
+                            {:created-at (get existing-record "f:createdAt")
+                             :created-from (get existing-record "f:createdFrom")
+                             :protected (get existing-record "f:protected")
+                             :description (get existing-record "f:description")})
+          ;; Add branch metadata to commit if it exists
+          commit-with-metadata (if branch-metadata
+                                 (assoc commit-jsonld "branchMetadata" branch-metadata)
+                                 commit-jsonld)
+          result (<? (nameservice/publish primary-publisher commit-with-metadata))]
+      (nameservice/publish-to-all commit-with-metadata secondary-publishers)
       result)))
 
 (defn formalize-commit
@@ -228,7 +241,7 @@
   ([ledger db]
    (commit! ledger db {}))
   ([{ledger-alias :alias :as ledger}
-    {:keys [branch t stats commit] :as staged-db}
+    {:keys [t stats commit] :as staged-db}
     opts]
    (log/debug "commit!: write-transaction start" {:ledger ledger-alias})
    (go-try
@@ -254,7 +267,9 @@
            dbid              (commit-data/hash->db-id (:hash data-write-result))
            keypair           {:did did, :private private}
 
-           new-commit (commit-data/new-db-commit-map {:old-commit commit
+           ;; Ensure the commit has the correct alias for this branch
+           old-commit-with-alias (assoc commit :alias ledger-alias)
+           new-commit (commit-data/new-db-commit-map {:old-commit old-commit-with-alias
                                                       :issuer     did
                                                       :message    message
                                                       :tag        tag
@@ -271,7 +286,7 @@
            _ (log/debug "commit!: write-commit start" {:ledger ledger-alias})
 
            {:keys [commit-map commit-jsonld write-result]}
-           (<? (write-commit commit-catalog ledger-name keypair new-commit))
+           (<? (write-commit commit-catalog ledger-alias keypair new-commit))
 
            _ (log/debug "commit!: write-commit done" {:ledger ledger-alias :commit-address (:address write-result)})
 
@@ -279,7 +294,7 @@
 
            _ (log/debug "commit!: ledger/update-commit! start" {:ledger ledger-alias :t t})
 
-           db* (ledger/update-commit! ledger branch db index-files-ch)]
+           db* (ledger/update-commit! ledger db index-files-ch)]
 
        (log/debug "commit!: ledger/update-commit! done, publish-commit start" {:ledger ledger-alias :t t :at time})
 
@@ -289,7 +304,6 @@
 
        (if (track/track-txn? opts)
          (let [indexing-disabled? (-> ledger
-                                      (ledger/get-branch-meta branch)
                                       :indexing-opts
                                       :indexing-disabled)
                index-t (commit-data/index-t commit-map)
@@ -310,11 +324,8 @@
 (defn transact-ledger!
   [ledger parsed-txn]
   (go-try
-    (let [{:keys [branch] :as parsed-opts,
-           :or   {branch commit-data/default-branch}}
-          (:opts parsed-txn)
-
-          db       (ledger/current-db ledger branch)
+    (let [parsed-opts (:opts parsed-txn)
+          db       (ledger/current-db ledger)
           staged   (<? (stage-triples db parsed-txn))
           ;; commit API takes a did-map and parsed context as opts
           ;; whereas stage API takes a did IRI and unparsed context.
