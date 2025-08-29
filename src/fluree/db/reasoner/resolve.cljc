@@ -119,4 +119,5 @@
                         {:select ["?s" "?rule"]
                          :where  {"@id"          "?s",
                                   const/iri-rule "?rule"}})
-    :owl2rl (extract-owl2rl-from-db db)))
+    :owl2rl (extract-owl2rl-from-db db)
+    :owl-datalog (extract-owl2rl-from-db db)))
