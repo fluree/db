@@ -1,6 +1,7 @@
 (ns fluree.db.api.transact
   (:refer-clojure :exclude [update])
   (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.db.connection :as connection]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.query.fql.parse :as parse]
@@ -130,6 +131,13 @@
                                                                            ; are no policies
                                                                            ; to check.
            ledger-opts (-> parsed-txn :opts syntax/coerce-ledger-opts)
+           ;; Disallow branch specification in ledger name during creation
+           _           (when (str/includes? ledger-id ":")
+                         (throw (ex-info (str "Ledger name cannot contain ':' character. "
+                                              "Branches must be created separately. "
+                                              "Provided: " ledger-id)
+                                         {:error :db/invalid-ledger-name
+                                          :ledger-alias ledger-id})))
            ledger      (<? (connection/create-ledger conn ledger-id ledger-opts))]
        (<? (transact/transact-ledger! ledger parsed-txn))))))
 
