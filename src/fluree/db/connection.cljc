@@ -111,47 +111,66 @@
     :stale  - cached state behind; drop for reload
 
   Assumes branch already resolved in ns-info."
-  [db {:keys [ns-t index-address commit-address]}]
+  [db {:keys [ns-t index-address commit-address] :as _ns-info}]
   (let [cur-t   (:t db)
-        cur-idx (get-in db [:commit :index :address])]
-    (cond
-      (and (= ns-t cur-t)
-           (or (nil? index-address)
-               (= index-address cur-idx)))
-      :noop
+        cur-idx (get-in db [:commit :index :address])
+        action  (cond
+                  (and (= ns-t cur-t)
+                       (or (nil? index-address)
+                           (= index-address cur-idx)))
+                  :noop
 
-      (= ns-t cur-t)
-      :index
+                  (= ns-t cur-t)
+                  :index
 
-      (= ns-t (flake/next-t cur-t))
-      (if commit-address
-        :commit
-        :noop)
+                  (= ns-t (flake/next-t cur-t))
+                  (if commit-address
+                    :commit
+                    :noop)
 
-      (flake/t-after? ns-t (flake/next-t cur-t))
-      :stale
+                  (flake/t-after? ns-t (flake/next-t cur-t))
+                  :stale
 
-      :else
-      :noop)))
+                  :else
+                  :noop)]
+    (log/debug "plan-ns-update" {:cur-t cur-t
+                                   :cur-idx cur-idx
+                                   :ns-t ns-t
+                                   :index-address index-address
+                                   :commit-address commit-address
+                                   :action action})
+    action))
 
 (defn- notify*
   "Internal notify logic shared by both forms.
   Takes a connection, ns-info map, and optionally pre-loaded expanded-commit."
   [{:keys [commit-catalog] :as conn} ns-info expanded-commit]
   (go-try
-    (let [{:keys [ledger-alias branch commit-address index-address]} ns-info]
+    (let [{:keys [ledger-alias branch commit-address index-address ns-t]} ns-info]
+      (log/debug "notify* received ns-info" {:ledger-alias ledger-alias
+                                              :branch branch
+                                              :ns-t ns-t
+                                              :commit-address commit-address
+                                              :index-address index-address
+                                              :expanded-commit? (boolean expanded-commit)})
       (if-let [ledger-ch (and ledger-alias (ns-subscribe/cached-ledger conn ledger-alias))]
         (let [ledger  (<? ledger-ch)
               db      (ledger/current-db ledger branch)
               action  (plan-ns-update db ns-info)]
+          (log/debug "notify* planned action" {:ledger-alias ledger-alias :action action})
           (case action
             :noop
             (do (log/debug "Ledger" ledger-alias "is already up to date")
                 true)
 
             :index
-            (<? (ledger/notify-index ledger {:index-address index-address
-                                             :branch        branch}))
+            (do (log/debug "Applying index-only update" {:ledger-alias ledger-alias
+                                                          :branch branch
+                                                          :index-address index-address})
+                (let [res (<? (ledger/notify-index ledger {:index-address index-address
+                                                           :branch        branch}))]
+                  (log/debug "notify-index result" {:ledger-alias ledger-alias :result res})
+                  res))
 
             :commit
             (let [expanded-commit (or expanded-commit
@@ -162,9 +181,10 @@
                                                        (get-first const/iri-data)
                                                        (get-first-value const/iri-address))]
                                     (<? (commit-storage/read-data-jsonld commit-catalog db-address)))]
+              (log/debug "Applying commit update" {:ledger-alias ledger-alias :t ns-t})
               (case (<? (ledger/notify ledger expanded-commit expanded-data))
                 (::ledger/current ::ledger/newer ::ledger/updated)
-                (do (log/debug "Ledger" ledger-alias "is up to date")
+                (do (log/debug "Ledger" ledger-alias "is up to date after commit path")
                     true)
                 ::ledger/stale
                 (do (log/debug "Dropping state for stale ledger:" ledger-alias)
@@ -174,19 +194,6 @@
             (do (log/debug "Dropping state for stale ledger:" ledger-alias)
                 (ns-subscribe/release-ledger conn ledger-alias))))
         (log/debug "Ledger not currently loaded:" ledger-alias "; skipping notify of changes.")))))
-
-(defn- commit->ns-info
-  "Builds an ns-info-like map from an expanded commit."
-  [expanded-commit]
-  {:ledger-alias   (get-first-value expanded-commit const/iri-alias)
-   :branch         (get-first-value expanded-commit const/iri-branch)
-   :ns-t           (-> expanded-commit
-                       (get-first const/iri-data)
-                       (get-first-value const/iri-fluree-t))
-   :commit-address (get-first-value expanded-commit const/iri-address)
-   :index-address  (-> expanded-commit
-                       (get-first const/iri-index)
-                       (get-first-value const/iri-id))})
 
 (defn notify
   "Notifies the connection of an update to keep cached db state current.

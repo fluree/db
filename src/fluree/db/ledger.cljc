@@ -165,20 +165,30 @@
           {:keys [index-catalog]} ledger
           cur-t      (:t db)
           cur-idx    (get-in db [:commit :index :address])]
-
+        (log/debug "notify-index called" {:alias (:alias ledger)
+                                           :branch branch
+                                           :cur-t cur-t
+                                           :cur-idx cur-idx
+                                           :new-index-address index-address})
         ;; Short-circuit if index address hasn't changed
       (if (= index-address cur-idx)
-        ::index-current
+        (do (log/debug "notify-index: index address unchanged, skipping" {:address index-address})
+            ::index-current)
 
           ;; Only load the index file if the address is different
         (let [root    (<? (index-storage/read-db-root index-catalog index-address))
               root-t  (:t root)]
+          (log/debug "notify-index loaded root" {:root-t root-t :cur-t cur-t})
           (cond
             (flake/t-after? root-t cur-t)
-            ::stale
+            (do (log/debug "notify-index: root ahead of current commit; marking stale"
+                           {:root-t root-t :cur-t cur-t})
+                ::stale)
 
             (flake/t-before? root-t cur-t)
-            ::index-current
+            (do (log/debug "notify-index: root behind current commit; ignoring"
+                           {:root-t root-t :cur-t cur-t})
+                ::index-current)
 
             :else
             (let [data       (-> db :commit :data)
@@ -186,6 +196,8 @@
                   index-map  (commit-data/new-index data index-id index-address
                                                     (select-keys root [:spot :post :opst :tspo]))
                   updated-db (<? (dbproto/-index-update db index-map))]
+              (log/debug "notify-index: applying new index" {:index-id index-id
+                                                               :address index-address})
               (update-commit! ledger branch updated-db)
               ::index-updated)))))))
 
