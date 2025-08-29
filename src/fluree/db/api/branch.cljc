@@ -35,7 +35,6 @@
             source-db (ledger/current-db source-ledger)
             ;; Prefer commit ID (sha256 URI) for lineage as it's consistent across storage backends
             source-commit-id (or from-commit (get-in source-db [:commit :id]))
-            source-commit-addr (get-in source-db [:commit :address])
 
             ;; Create branch metadata
             created-at (util/current-time-iso)
