@@ -34,6 +34,19 @@
      #fluree/SID [5 "datatype"] [#fluree/SID [2 "string"]]
      #fluree/SID [5 "path"] [#fluree/SID [17 "email"]]}]})
 
+(defn property-ns-code
+  "Returns namespace code for the property of the flake"
+  [flake]
+  (-> flake
+      flake/p
+      iri/get-ns-code))
+
+(def ^:const shacl-ns-code (get iri/default-namespaces iri/shacl-ns))
+
+(defn shacl-flake?
+  [f]
+  (= shacl-ns-code (property-ns-code f)))
+
 (def numeric-types
   #{const/$xsd:int
     const/$xsd:short
@@ -101,7 +114,9 @@
    (build-shape-node db tracker shape-sid #{shape-sid} 0))
   ([db tracker shape-sid built-nodes depth]
    (go-try
-     (let [flakes (<? (query-range/index-range db tracker :spot = [shape-sid] {}))]
+     (let [flakes (<? (query-range/index-range db tracker :spot = [shape-sid]
+                                               ;; only pull in shape-related flakes
+                                               {:flake-xf (filter shacl-flake?)}))]
        (if (seq flakes)
          (loop [[f & r] (sort-by (comp :i flake/m) flakes)
                 node {const/$id shape-sid}]
@@ -1169,20 +1184,10 @@
             (recur r (assoc shapes shape-sid shape))))
         shapes))))
 
-(defn property-ns-code
-  "Returns namespace code for the property of the flake"
-  [flake]
-  (-> flake
-      flake/p
-      iri/get-ns-code))
-
-(def ^:const shacl-ns-code (get iri/default-namespaces iri/shacl-ns))
-
 (defn modified-shape?
-  "All SHACL rules have property IRIs in the S."
-  [flake]
-  (let [p-ns (property-ns-code flake)]
-    (= p-ns shacl-ns-code)))
+  "All SHACL rules have property IRIs in the SHACL namespace."
+  [flakes]
+  (some shacl-flake? flakes))
 
 (defn hydrate-shape-cache!
   ([db]
@@ -1204,7 +1209,7 @@
   `modified-subjects` is a sequence of s-flakes of modified subjects."
   [data-db tracker new-flakes context]
   (go-try
-    (let [shapes (if (some modified-shape? new-flakes)
+    (let [shapes (if (modified-shape? new-flakes)
                    (<? (extract-shapes data-db tracker))
                    (cached-shapes data-db))]
       (if (empty? shapes)
