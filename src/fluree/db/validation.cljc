@@ -22,7 +22,10 @@
 (defn variable?
   [x]
   (and (or (string? x) (symbol? x) (keyword? x))
-       (-> x name first (= \?))))
+       (-> x name first (= \?))
+       (if (string? x)
+         (re-matches #"^\?\S+$" x)
+         true)))
 
 (defn bnode-variable?
   [x]

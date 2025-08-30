@@ -501,6 +501,35 @@ Query execution options.
 - `meta` - Include metadata in results
 - `policy` - Policy restrictions
 - `policy-class` - Policy class restrictions
+- `objectVarParsing` - Controls whether bare object strings that look like variables (e.g., `"?x"`) are parsed as variables in the WHERE clause.
+  - Default: `true`
+  - When `false`, scalar object values like `"?not-a-var"` are treated as string literals. Use the explicit JSON-LD form to bind a variable: `{"@variable": "?v"}`.
+  - This flag does not affect variable parsing for `@id` or predicate keys; those are always treated as variables when they begin with `?`.
+  - Explicit `{"@variable": "?..."}` is always honored regardless of this flag.
+
+### Example: Literal match vs explicit variable
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "opts": {"objectVarParsing": false},
+  "select": ["?s"],
+  "where": [
+    {"@id": "?s", "ex:prop": "?not-a-var"}
+  ]
+}
+```
+
+To bind a variable when the flag is false:
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "opts": {"objectVarParsing": false},
+  "select": ["?v"],
+  "where": [
+    {"@id": "ex:s", "ex:prop": {"@variable": "?v"}}
+  ]
+}
+```
 
 ## Complete Examples
 

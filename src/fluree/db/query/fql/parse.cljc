@@ -22,6 +22,12 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(def ^:dynamic *object-var-parsing*
+  "When true (default), bare object values like \"?x\" are parsed as variables.
+  When false, only an explicit object value map with '@variable' is parsed as
+  a variable. Keys and @id variable parsing are unaffected."
+  true)
+
 (defn parse-var-name
   "Returns x as a symbol if x is a valid variable, or nil otherwise. A valid
   variable is a string, symbol, or keyword whose name starts with '?'."
@@ -437,14 +443,25 @@
 
 (defn parse-object-map
   [s-mch p-mch o vars context]
-  (let [o* (expand-keys o context)]
-    (if-let [v (get o* const/iri-value)]
-      (let [attrs (dissoc o* const/iri-value)
-            o-mch (if-let [var (parse-var-name v)]
-                    (parse-variable-attributes var attrs vars context)
+  (let [o* (expand-keys o context)
+        explicit-var (get o "@variable")]
+    (cond
+      explicit-var
+      (let [attrs (-> o (dissoc "@variable") (expand-keys context))
+            var   (parse-var-name explicit-var)
+            o-mch (parse-variable-attributes var attrs vars context)]
+        [(flip-reverse-pattern [s-mch p-mch o-mch])])
+
+      (contains? o* const/iri-value)
+      (let [v     (get o* const/iri-value)
+            attrs (dissoc o* const/iri-value)
+            o-mch (if (and (parse-var-name v)
+                           *object-var-parsing*)
+                    (parse-variable-attributes (parse-var-name v) attrs vars context)
                     (parse-value-attributes v attrs context))]
         [(flip-reverse-pattern [s-mch p-mch o-mch])])
-      ;; ref
+
+      :else ;;ref
       (let [id-map  (with-id o context) ; not o*, we can't use expanded or we'll lose @reverse
             o-mch   (-> id-map
                         (get const/iri-id)
@@ -458,7 +475,7 @@
 (defn parse-statement*
   [s-mch p-mch o vars context]
   (cond
-    (v/query-variable? o)
+    (and (v/query-variable? o) *object-var-parsing*)
     (let [o-mch (parse-variable o)]
       [(flip-reverse-pattern [s-mch p-mch o-mch])])
 
@@ -761,28 +778,36 @@
       (get m (keyword nme))
       (get m (symbol nme))))
 
+(defn object-var-parsing
+  "Return :object-var-parsing from opts if present; otherwise nil."
+  [opts]
+  (if (contains? opts :object-var-parsing)
+    (:object-var-parsing opts)
+    true))
+
 (defn parse-query*
   ([q] (parse-query* q nil))
   ([q parent-context]
-   (let [orig-context  (:context q)
-         context       (cond->> (json-ld/parse-context orig-context)
-                         parent-context (merge parent-context))
-         [vars values] (parse-values (:values q) context)
-         where         (parse-where (:where q) vars context)
-         construct     (parse-construct q context)
-         grouping      (parse-grouping q)
-         ordering      (parse-ordering q)]
-     (-> q
-         (assoc :context context
-                :where where)
-         (cond-> (seq values) (assoc :values values)
-                 orig-context (assoc :orig-context orig-context)
-                 grouping  (assoc :group-by grouping)
-                 ordering  (assoc :order-by ordering)
-                 construct (assoc :construct construct))
-         (parse-having context)
-         (parse-select context)
-         parse-fuel))))
+   (binding [*object-var-parsing* (object-var-parsing (:opts q))]
+     (let [orig-context  (:context q)
+           context       (cond->> (json-ld/parse-context orig-context)
+                           parent-context (merge parent-context))
+           [vars values] (parse-values (:values q) context)
+           where         (parse-where (:where q) vars context)
+           construct     (parse-construct q context)
+           grouping      (parse-grouping q)
+           ordering      (parse-ordering q)]
+       (-> q
+           (assoc :context context
+                  :where where)
+           (cond-> (seq values) (assoc :values values)
+                   orig-context (assoc :orig-context orig-context)
+                   grouping  (assoc :group-by grouping)
+                   ordering  (assoc :order-by ordering)
+                   construct (assoc :construct construct))
+           (parse-having context)
+           (parse-select context)
+           parse-fuel)))))
 
 (defmethod parse-pattern :query
   [[_ sub-query] _vars context]
@@ -812,18 +837,33 @@
         v-list (util/get-list v-map)
         value  (util/get-value v-map)
         type   (util/get-types v-map)
-        lang   (util/get-lang v-map)]
+        lang   (util/get-lang v-map)
+        explicit-var (get v-map "@variable")]
     (cond v-list
           (reduce (fn [triples [i list-item]]
                     (parse-obj-cmp allowed-vars context subj-cmp pred-cmp {:i i} triples list-item))
                   triples
                   (map vector (range) v-list))
 
+          explicit-var
+          (let [var-val    (cond
+                             (map? explicit-var) (util/get-value explicit-var)
+                             (sequential? explicit-var) (-> explicit-var first util/get-value)
+                             :else explicit-var)
+                var-mch    (parse-variable-if-allowed allowed-vars var-val)
+                dt         (if (sequential? type) (first type) type)
+                dt-matcher (some-> dt (where/datatype-matcher context))
+                lang-mch   (some-> lang where/lang-matcher)
+                f          (combine-filters lang-mch dt-matcher)
+                obj-cmp    (cond-> var-mch f (where/with-filter f))]
+            (conj triples [subj-cmp pred-cmp obj-cmp]))
+
           ;; literal object
           (some? value)
           (let [m*      (cond-> m
                           lang (assoc :lang lang))
-                obj-cmp (if (v/variable? value)
+                obj-cmp (if (and (v/variable? value)
+                                 *object-var-parsing*)
                           (parse-variable-if-allowed allowed-vars value)
                           (parse-object-value value type context m*))]
             (conj triples [subj-cmp pred-cmp obj-cmp]))
@@ -925,32 +965,33 @@
   ([txn]
    (parse-update-txn txn {}))
   ([txn override-opts]
-   (let [context       (or (ctx-util/txn-context txn)
-                           (:context override-opts))
-         [vars values] (-> (get-named txn "values")
-                           (parse-values context))
-         where         (-> (get-named txn "where")
-                           (parse-where vars context))
-         bound-vars    (-> where where/clause-variables (into vars))
-         delete        (when-let [dlt (get-named txn "delete")]
-                         (jld->parsed-triples dlt bound-vars context))
-         insert        (when-let [ins (get-named txn "insert")]
-                         (jld->parsed-triples ins bound-vars context))
-         annotation    (util/get-first-value txn const/iri-annotation)
-         opts          (-> (get-named txn "opts")
-                           (parse-txn-opts override-opts context))
-         ledger-id     (get-named txn "ledger")]
-     (when (and (empty? insert) (empty? delete))
-       (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
-                       {:status 400 :error :db/invalid-transaction})))
-     (cond-> {:opts opts}
-       ledger-id    (assoc :ledger-id ledger-id)
-       context      (assoc :context context)
-       where        (assoc :where where)
-       annotation   (assoc :annotation annotation)
-       (seq values) (assoc :values values)
-       (seq delete) (assoc :delete delete)
-       (seq insert) (assoc :insert insert)))))
+   (binding [*object-var-parsing* (object-var-parsing override-opts)]
+     (let [context       (or (ctx-util/txn-context txn)
+                             (:context override-opts))
+           [vars values] (-> (get-named txn "values")
+                             (parse-values context))
+           where         (-> (get-named txn "where")
+                             (parse-where vars context))
+           bound-vars    (-> where where/clause-variables (into vars))
+           delete        (when-let [dlt (get-named txn "delete")]
+                           (jld->parsed-triples dlt bound-vars context))
+           insert        (when-let [ins (get-named txn "insert")]
+                           (jld->parsed-triples ins bound-vars context))
+           annotation    (util/get-first-value txn const/iri-annotation)
+           opts          (-> (get-named txn "opts")
+                             (parse-txn-opts override-opts context))
+           ledger-id     (get-named txn "ledger")]
+       (when (and (empty? insert) (empty? delete))
+         (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
+                         {:status 400 :error :db/invalid-transaction})))
+       (cond-> {:opts opts}
+         ledger-id    (assoc :ledger-id ledger-id)
+         context      (assoc :context context)
+         where        (assoc :where where)
+         annotation   (assoc :annotation annotation)
+         (seq values) (assoc :values values)
+         (seq delete) (assoc :delete delete)
+         (seq insert) (assoc :insert insert))))))
 
 (defn blank-node-subject?
   [parsed-triple]
@@ -1001,7 +1042,8 @@
         opts       (parse-txn-opts nil opts context)
         parsed-txn (if turtle?
                      (turtle/parse txn)
-                     (jld->parsed-triples txn nil context))
+                     (binding [*object-var-parsing* false]
+                       (jld->parsed-triples txn nil context)))
         {:keys [where delete]} (upsert-where-del parsed-txn)]
     {:opts    opts
      :context context
@@ -1013,7 +1055,8 @@
   [txn {:keys [format context] :as opts}]
   {:insert (if (= :turtle format)
              (turtle/parse txn)
-             (jld->parsed-triples txn nil context))
+             (binding [*object-var-parsing* false]
+               (jld->parsed-triples txn nil context)))
    :context context
    :opts opts})
 
