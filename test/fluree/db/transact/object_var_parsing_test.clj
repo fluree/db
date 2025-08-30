@@ -88,12 +88,12 @@
 
 (deftest ^:integration insert-literal-qmark-string-has-xsd-string-type
   (testing "insert! with bare '?not-a-var' stores as xsd:string and value '?not-a-var'"
-    (let [conn   (test-utils/create-conn)
-          db0 @(fluree/create conn "tx/obj-var-insert")
-          db1 @(fluree/insert! conn "tx/obj-var-insert"
-                               {"@context" {"ex" "http://example.org/ns/"}
-                                "@graph"   [{"@id" "ex:s"
-                                             "ex:prop" "?not-a-var"}]})
+    (let [conn  (test-utils/create-conn)
+          _db0 @(fluree/create conn "tx/obj-var-insert")
+          db1  @(fluree/insert! conn "tx/obj-var-insert"
+                                {"@context" {"ex" "http://example.org/ns/"}
+                                 "@graph"   [{"@id" "ex:s"
+                                              "ex:prop" "?not-a-var"}]})
           results @(fluree/query db1
                                  {"@context" {"ex" "http://example.org/ns/"
                                               "xsd" "http://www.w3.org/2001/XMLSchema#"}
@@ -107,8 +107,8 @@
 
 (deftest ^:integration upsert-literal-qmark-string-has-xsd-string-type
   (testing "upsert! with bare '?not-a-var' stores as xsd:string and value '?not-a-var'"
-    (let [conn   (test-utils/create-conn)
-          db0 @(fluree/create conn "tx/obj-var-upsert")
+    (let [conn  (test-utils/create-conn)
+          _db0 @(fluree/create conn "tx/obj-var-upsert")
           _dbi @(fluree/insert! conn "tx/obj-var-upsert"
                                 {"@context" {"ex" "http://example.org/ns/"}
                                  "@graph"   [{"@id" "ex:s"
@@ -130,12 +130,12 @@
 
 (deftest query-literal-qmark-string-with-flag-false-requires-literal-match
   (testing "With objectVarParsing false, where with bare '?not-a-var' matches literal value"
-    (let [conn   (test-utils/create-conn)
-          db0 @(fluree/create conn "tx/obj-var-query-literal")
-          db1 @(fluree/insert! conn "tx/obj-var-query-literal"
-                               {"@context" {"ex" "http://example.org/ns/"}
-                                "@graph"   [{"@id" "ex:s"
-                                             "ex:prop" "?not-a-var"}]})
+    (let [conn  (test-utils/create-conn)
+          _db0 @(fluree/create conn "tx/obj-var-query-literal")
+          db1  @(fluree/insert! conn "tx/obj-var-query-literal"
+                                {"@context" {"ex" "http://example.org/ns/"}
+                                 "@graph"   [{"@id" "ex:s"
+                                              "ex:prop" "?not-a-var"}]})
           results @(fluree/query db1
                                  {"@context" {"ex" "http://example.org/ns/"}
                                   "opts"     {"objectVarParsing" false}
@@ -148,12 +148,12 @@
 
 (deftest query-explicit-variable-in-where-still-parses-when-flag-false
   (testing "With objectVarParsing false, where with {'@variable': '?v'} binds a variable"
-    (let [conn   (test-utils/create-conn)
-          db0 @(fluree/create conn "tx/obj-var-query-var")
-          db1 @(fluree/insert! conn "tx/obj-var-query-var"
-                               {"@context" {"ex" "http://example.org/ns/"}
-                                "@graph"   [{"@id" "ex:s"
-                                             "ex:prop" "?not-a-var"}]})
+    (let [conn  (test-utils/create-conn)
+          _db0 @(fluree/create conn "tx/obj-var-query-var")
+          db1  @(fluree/insert! conn "tx/obj-var-query-var"
+                                {"@context" {"ex" "http://example.org/ns/"}
+                                 "@graph"   [{"@id" "ex:s"
+                                              "ex:prop" "?not-a-var"}]})
           results @(fluree/query db1
                                  {"@context" {"ex" "http://example.org/ns/"}
                                   "opts"     {"objectVarParsing" false}
@@ -166,7 +166,7 @@
 
 (deftest ^:integration update-literal-qmark-string-where-binds-and-updates
   (testing "update! with objectVarParsing false matches literal '?not-a-var' in where, binds subject, and adds new property"
-    (let [conn   (test-utils/create-conn)
+    (let [conn  (test-utils/create-conn)
           _db0 @(fluree/create conn "tx/obj-var-update")
           _dbi @(fluree/insert! conn "tx/obj-var-update"
                                 {"@context" {"ex" "http://example.org/ns/"}
