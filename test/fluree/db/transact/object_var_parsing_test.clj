@@ -52,7 +52,7 @@
                            "schema:date" {"@variable" "?d"}}]
                "insert"  [{"@id" "ex:s"
                            "schema:foo" {"@variable" "?d"
-                                          "@type" "xsd:dateTime"}}]}
+                                         "@type" "xsd:dateTime"}}]}
           {:keys [insert]} (parse/parse-update-txn txn {:object-var-parsing false})
           [_ _ o] (first insert)]
       (is (= '?d (where/get-variable o))
