@@ -3,13 +3,16 @@
             [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
+            [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util :as util :refer [get-first get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -116,6 +119,109 @@
                     " at t value: " commit-t " however, latest t is more current: "
                     current-t)
           ::newer)))))
+
+(defn expand-and-extract-ns
+  "Expands a nameservice record and extracts key fields via IRIs.
+
+  Returns map {:ledger-alias :branch :ns-t :commit-address :index-address}."
+  [ns-record]
+  (let [expanded      (json-ld/expand ns-record)
+        ;; The @id field must contain the full ledger:branch alias
+        ledger-alias  (get-first-value expanded const/iri-id)
+        branch-val    (get-first-value expanded const/iri-branch)
+        ns-t          (get-first-value expanded const/iri-fluree-t)
+        commit-node   (get-first expanded const/iri-commit)
+        commit-addr   (some-> commit-node (get-first-value const/iri-id))
+        index-node    (get-first expanded const/iri-index)
+        index-addr    (some-> index-node (get-first-value const/iri-id))]
+    ;; Validate required/malformed fields with clear errors/warnings
+    (when (or (nil? ledger-alias) (not (string? ledger-alias)))
+      (log/warn "notify: nameservice record missing or invalid @id (ledger alias)" {:ns-record ns-record})
+      (throw (ex-info "Invalid nameservice record: missing @id (ledger alias)"
+                      {:status 400 :error :db/invalid-ns-record})))
+    (when-not (str/includes? ledger-alias ":")
+      (log/warn "notify: nameservice @id must include branch (ledger:branch)" {:ledger-alias ledger-alias})
+      (throw (ex-info (str "Invalid nameservice record: @id must include branch (expected 'ledger:branch'), got '" ledger-alias "'")
+                      {:status 400 :error :db/invalid-ns-record :ledger-alias ledger-alias})))
+    (when (nil? ns-t)
+      (log/warn "notify: nameservice record missing f:t (commit t)" {:ledger-alias ledger-alias :ns-record ns-record})
+      (throw (ex-info "Invalid nameservice record: missing f:t (commit t)"
+                      {:status 400 :error :db/invalid-ns-record :ledger-alias ledger-alias})))
+    ;; If f:commit is present but malformed (not a node or missing @id), throw
+    (when (and commit-node (nil? commit-addr))
+      (log/warn "notify: nameservice record f:commit present but missing @id" {:ledger-alias ledger-alias :commit commit-node})
+      (throw (ex-info "Invalid nameservice record: f:commit must be an object with @id"
+                      {:status 400 :error :db/invalid-ns-record :ledger-alias ledger-alias})))
+    ;; If f:index is present but malformed, warn (not fatal)
+    (when (and index-node (nil? index-addr))
+      (log/warn "notify: nameservice record f:index present but missing @id" {:ledger-alias ledger-alias :index index-node}))
+    {:ledger-alias   ledger-alias
+     :branch         (or branch-val
+                         (second (str/split ledger-alias #":" 2)))
+     :ns-t           ns-t
+     :commit-address commit-addr
+     :index-address  index-addr}))
+
+(defn idx-address->idx-id
+  "Extracts the hash from a content-addressed index address and returns the index ID.
+  Address format is like: 'fluree:file://ledger/index/root/abc123def.json'
+  Returns: 'fluree:index:sha256:abc123def'"
+  [index-address]
+  (let [hash (-> index-address
+                 (str/split #"/")
+                 last
+                 (str/replace #"\.json$" ""))]
+    (str "fluree:index:sha256:" hash)))
+
+(defn notify-index
+  "Applies an index-only update when the provided index root matches the current commit t.
+
+    Returns one of:
+    - ::index-updated     when index was applied and address changed
+    - ::index-current     when index address is same or older
+    - ::stale             when index root.t is ahead of current commit t"
+  [ledger {:keys [index-address branch]}]
+  (go-try
+    (let [branch     (or branch (:branch @(:state ledger)))
+          db         (current-db ledger branch)
+          {:keys [index-catalog]} ledger
+          cur-t      (:t db)
+          cur-idx    (get-in db [:commit :index :address])]
+      (log/debug "notify-index called" {:alias (:alias ledger)
+                                        :branch branch
+                                        :cur-t cur-t
+                                        :cur-idx cur-idx
+                                        :new-index-address index-address})
+        ;; Short-circuit if index address hasn't changed
+      (if (= index-address cur-idx)
+        (do (log/debug "notify-index: index address unchanged, skipping" {:address index-address})
+            ::index-current)
+
+          ;; Only load the index file if the address is different
+        (let [root    (<? (index-storage/read-db-root index-catalog index-address))
+              root-t  (:t root)]
+          (log/debug "notify-index loaded root" {:root-t root-t :cur-t cur-t})
+          (cond
+            (flake/t-after? root-t cur-t)
+            (do (log/debug "notify-index: root ahead of current commit; marking stale"
+                           {:root-t root-t :cur-t cur-t})
+                ::stale)
+
+            (flake/t-before? root-t cur-t)
+            (do (log/debug "notify-index: root behind current commit; ignoring"
+                           {:root-t root-t :cur-t cur-t})
+                ::index-current)
+
+            :else
+            (let [data       (-> db :commit :data)
+                  index-id   (idx-address->idx-id index-address)
+                  index-map  (commit-data/new-index data index-id index-address
+                                                    (select-keys root [:spot :post :opst :tspo]))
+                  updated-db (<? (dbproto/-index-update db index-map))]
+              (log/debug "notify-index: applying new index" {:index-id index-id
+                                                             :address index-address})
+              (update-commit! ledger branch updated-db)
+              ::index-updated)))))))
 
 (defrecord Ledger [id address alias did state cache commit-catalog
                    index-catalog reasoner primary-publisher secondary-publishers indexing-opts])

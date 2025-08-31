@@ -301,19 +301,22 @@
        (<? (connection/ledger-exists? conn address))))))
 
 (defn notify
-  "Notifies the connection of a new commit for maintaining current db state.
-
-  Parameters:
-    conn - Connection object
-    commit-address - Address where commit is stored
-    commit-hash - Hash of the commit
-
-  Updates in-memory ledger if commit is next in sequence.
-  Returns promise resolving when notification is processed."
-  [conn commit-address commit-hash]
-  (validate-connection conn)
-  (promise-wrap
-   (connection/notify conn commit-address commit-hash)))
+  "Notifies the connection of an update for maintaining current db state.
+   Arity 2:
+    conn, ns-record – a nameservice record map (possibly compacted). Will be
+    expanded internally to extract commit/index details and apply updates.
+    Applies both new commits and/or new indexes as needed.
+  Arity 3:
+    conn, commit-address, commit-hash.
+    Only applies new commit if newer, does not handle new indexes if not."
+  ([conn ns-record]
+   (validate-connection conn)
+   (promise-wrap
+    (connection/notify conn ns-record)))
+  ([conn commit-address commit-hash]
+   (validate-connection conn)
+   (promise-wrap
+    (connection/notify conn commit-address commit-hash))))
 
 (defn insert
   "Stages insertion of new entities into a database.
