@@ -146,18 +146,10 @@
 
 (defn save-txn!
   ([{:keys [commit-catalog alias] :as _ledger} txn]
-<<<<<<< HEAD
-<<<<<<< HEAD
    (let [ledger-name (util.ledger/ledger-base-name alias)]
-=======
-   (let [ledger-name (first (str/split alias #"@" 2))]
->>>>>>> 26564b21c (ensure branches don't use sub-directories)
-=======
-   (let [ledger-name (util.ledger/ledger-base-name alias)]
->>>>>>> 04eb7a9a2 (update branch separator to ':')
      (save-txn! commit-catalog ledger-name txn)))
   ([commit-catalog ledger-name txn]
-   (let [path (str/join "/" [ledger-name "txn"])]
+   (let [path (str/join "/" [ledger-name "txn")]
      (storage/content-write-json commit-catalog path txn))))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
@@ -241,15 +233,7 @@
    (log/debug "commit!: write-transaction start" {:ledger ledger-alias})
    (go-try
      (let [{:keys [commit-catalog]} ledger
-<<<<<<< HEAD
-<<<<<<< HEAD
            ledger-name (util.ledger/ledger-base-name ledger-alias)
-=======
-           ledger-name (first (str/split ledger-alias #"@" 2))
->>>>>>> 26564b21c (ensure branches don't use sub-directories)
-=======
-           ledger-name (util.ledger/ledger-base-name ledger-alias)
->>>>>>> 04eb7a9a2 (update branch separator to ':')
 
            {:keys [tag time message did private commit-data-opts index-files-ch]
             :or   {time (util/current-time-iso)}}
@@ -258,18 +242,23 @@
            {:keys [db-jsonld staged-txn]}
            (commit-data/db->jsonld staged-db commit-data-opts)
 
+           _ (log/debug "commit!: prepared db-jsonld and staged txn"
+                        {:alias ledger-alias :branch branch :t t
+                         :has-staged? (boolean staged-txn)})
+
            {:keys [txn-id author annotation]}
            (<? (write-transaction! ledger ledger-name staged-txn))
 
-<<<<<<< HEAD
-           _ (log/debug "commit!: write-jsonld(db) start" {:ledger ledger-alias})
+           _ (log/debug "commit!: writing DB data jsonld"
+                        {:alias ledger-alias :branch branch})
 
            data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-name db-jsonld))
-
-           _ (log/debug "commit!: write-jsonld(db) done" {:ledger ledger-alias :db-address (:address data-write-result)})
-=======
-           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-name db-jsonld))
->>>>>>> 26564b21c (ensure branches don't use sub-directories)
+           _ (log/debug "commit!: wrote DB data jsonld"
+                        {:alias ledger-alias
+                         :branch branch
+                         :address (:address data-write-result)
+                         :hash (:hash data-write-result)
+                         :size (:size data-write-result)})
            db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
            dbid              (commit-data/hash->db-id (:hash data-write-result))
            keypair           {:did did, :private private}
@@ -288,15 +277,16 @@
                                                       :flakes     (:flakes stats)
                                                       :size       (:size stats)})
 
-           _ (log/debug "commit!: write-commit start" {:ledger ledger-alias})
-
+           _ (log/debug "commit!: writing commit" {:alias ledger-alias :branch branch :t t})
            {:keys [commit-map commit-jsonld write-result]}
            (<? (write-commit commit-catalog ledger-name keypair new-commit))
-<<<<<<< HEAD
-
-           _ (log/debug "commit!: write-commit done" {:ledger ledger-alias :commit-address (:address write-result)})
-=======
->>>>>>> 26564b21c (ensure branches don't use sub-directories)
+           _ (log/debug "commit!: wrote commit"
+                        {:alias ledger-alias
+                         :branch branch
+                         :t t
+                         :commit-address (:address write-result)
+                         :hash (:hash write-result)
+                         :size (:size write-result)})
 
            db  (formalize-commit staged-db commit-map)
 
@@ -304,9 +294,18 @@
 
            db* (ledger/update-commit! ledger branch db index-files-ch)]
 
-       (log/debug "commit!: ledger/update-commit! done, publish-commit start" {:ledger ledger-alias :t t :at time})
-
+       (log/debug "Committing t" t "at" time)
+       (log/info "Publish commit to nameservice starting"
+                 {:alias ledger-alias
+                  :branch branch
+                  :t t
+                  :commit-address (:address write-result)})
        (<? (publish-commit ledger commit-jsonld))
+       (log/info "Publish commit to nameservice completed"
+                 {:alias ledger-alias
+                  :branch branch
+                  :t t
+                  :commit-address (:address write-result)})
 
        (log/debug "commit!: publish-commit done" {:ledger ledger-alias})
 

@@ -307,10 +307,23 @@
                              :body data
                              :credentials credentials
                              :request-timeout write-timeout-ms}))]
-    (go
-      (let [res (<? (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path})))]
-        (>! ch res)))
-    ch))
+<<<<<<< HEAD
+    (log/debug "S3 PUT starting"
+               {:bucket bucket
+                :region region
+                :key full-path
+                :bytes (if (string? data) (count (.getBytes ^String data "UTF-8")) (count ^bytes data))
+                :timeout-ms write-timeout-ms})
+    (async/pipe (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path})) ch)))
+=======
+    (log/debug "S3 PUT starting"
+               {:bucket bucket
+                :region region
+                :key full-path
+                :bytes (if (string? data) (count (.getBytes ^String data "UTF-8")) (count ^bytes data))
+                :timeout-ms write-timeout-ms})
+    (async/pipe (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path})) ch)))
+>>>>>>> 41d3024a8 (Add debug and info logging for nameservice publishing and commit processes)
 
 (defn s3-list*
   "List objects in S3 with optional continuation token"
