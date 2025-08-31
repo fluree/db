@@ -305,6 +305,12 @@
                              :body data
                              :credentials credentials
                              :request-timeout write-timeout-ms}))]
+    (log/debug "S3 PUT starting"
+               {:bucket bucket
+                :region region
+                :key full-path
+                :bytes (if (string? data) (count (.getBytes ^String data "UTF-8")) (count ^bytes data))
+                :timeout-ms write-timeout-ms})
     (async/pipe (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path})) ch)))
 
 (defn s3-list*
