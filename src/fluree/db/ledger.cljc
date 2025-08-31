@@ -125,19 +125,42 @@
 
   Returns map {:ledger-alias :branch :ns-t :commit-address :index-address}."
   [ns-record]
-  (let [expanded (json-ld/expand ns-record)
-        ;; The @id field contains the full ledger:branch alias
-        ledger-alias (get-first-value expanded const/iri-id)]
+  (let [expanded      (json-ld/expand ns-record)
+        ;; The @id field must contain the full ledger:branch alias
+        ledger-alias  (get-first-value expanded const/iri-id)
+        branch-val    (get-first-value expanded const/iri-branch)
+        ns-t          (get-first-value expanded const/iri-fluree-t)
+        commit-node   (get-first expanded const/iri-commit)
+        commit-addr   (some-> commit-node (get-first-value const/iri-id))
+        index-node    (get-first expanded const/iri-index)
+        index-addr    (some-> index-node (get-first-value const/iri-id))]
+    ;; Validate required/malformed fields with clear errors/warnings
+    (when (or (nil? ledger-alias) (not (string? ledger-alias)))
+      (log/warn "notify: nameservice record missing or invalid @id (ledger alias)" {:ns-record ns-record})
+      (throw (ex-info "Invalid nameservice record: missing @id (ledger alias)"
+                      {:status 400 :error :db/invalid-ns-record})))
+    (when-not (str/includes? ledger-alias ":")
+      (log/warn "notify: nameservice @id must include branch (ledger:branch)" {:ledger-alias ledger-alias})
+      (throw (ex-info (str "Invalid nameservice record: @id must include branch (expected 'ledger:branch'), got '" ledger-alias "'")
+                      {:status 400 :error :db/invalid-ns-record :ledger-alias ledger-alias})))
+    (when (nil? ns-t)
+      (log/warn "notify: nameservice record missing f:t (commit t)" {:ledger-alias ledger-alias :ns-record ns-record})
+      (throw (ex-info "Invalid nameservice record: missing f:t (commit t)"
+                      {:status 400 :error :db/invalid-ns-record :ledger-alias ledger-alias})))
+    ;; If f:commit is present but malformed (not a node or missing @id), throw
+    (when (and commit-node (nil? commit-addr))
+      (log/warn "notify: nameservice record f:commit present but missing @id" {:ledger-alias ledger-alias :commit commit-node})
+      (throw (ex-info "Invalid nameservice record: f:commit must be an object with @id"
+                      {:status 400 :error :db/invalid-ns-record :ledger-alias ledger-alias})))
+    ;; If f:index is present but malformed, warn (not fatal)
+    (when (and index-node (nil? index-addr))
+      (log/warn "notify: nameservice record f:index present but missing @id" {:ledger-alias ledger-alias :index index-node}))
     {:ledger-alias   ledger-alias
-     :branch         (or (get-first-value expanded const/iri-branch)
-                         (when (and (string? ledger-alias)
-                                    (str/includes? ledger-alias ":"))
-                           (second (str/split ledger-alias #":" 2))))
-     :ns-t           (get-first-value expanded const/iri-fluree-t)
-     :commit-address (-> (get-first expanded const/iri-commit)
-                         (get-first-value const/iri-id))
-     :index-address  (-> (get-first expanded const/iri-index)
-                         (get-first-value const/iri-id))}))
+     :branch         (or branch-val
+                         (second (str/split ledger-alias #":" 2)))
+     :ns-t           ns-t
+     :commit-address commit-addr
+     :index-address  index-addr}))
 
 (defn idx-address->idx-id
   "Extracts the hash from a content-addressed index address and returns the index ID.
@@ -164,11 +187,11 @@
           {:keys [index-catalog]} ledger
           cur-t      (:t db)
           cur-idx    (get-in db [:commit :index :address])]
-        (log/debug "notify-index called" {:alias (:alias ledger)
-                                           :branch branch
-                                           :cur-t cur-t
-                                           :cur-idx cur-idx
-                                           :new-index-address index-address})
+      (log/debug "notify-index called" {:alias (:alias ledger)
+                                        :branch branch
+                                        :cur-t cur-t
+                                        :cur-idx cur-idx
+                                        :new-index-address index-address})
         ;; Short-circuit if index address hasn't changed
       (if (= index-address cur-idx)
         (do (log/debug "notify-index: index address unchanged, skipping" {:address index-address})
@@ -196,7 +219,7 @@
                                                     (select-keys root [:spot :post :opst :tspo]))
                   updated-db (<? (dbproto/-index-update db index-map))]
               (log/debug "notify-index: applying new index" {:index-id index-id
-                                                               :address index-address})
+                                                             :address index-address})
               (update-commit! ledger branch updated-db)
               ::index-updated)))))))
 
