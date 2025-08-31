@@ -311,7 +311,16 @@
                 :key full-path
                 :bytes (if (string? data) (count (.getBytes ^String data "UTF-8")) (count ^bytes data))
                 :timeout-ms write-timeout-ms})
-    (async/pipe (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path})) ch)))
+    (let [start (System/nanoTime)
+          src   (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path}))]
+      (async/go
+        (let [res (async/<! src)
+              duration-ms (long (/ (- (System/nanoTime) start) 1000000))]
+          (when-not (instance? Throwable res)
+            (log/debug "S3 PUT completed" {:bucket bucket :key full-path :duration-ms duration-ms}))
+          (async/>! ch res)
+          (async/close! ch)))
+      ch)))
 
 (defn s3-list*
   "List objects in S3 with optional continuation token"
