@@ -46,14 +46,14 @@
           ns-metadata    (ns-record ledger-alias commit-address t-value index-address)
           record-bytes   (json/stringify-UTF8 ns-metadata)
           filename       (local-filename ledger-alias)]
-      (log/info "NS publish starting"
-                {:alias ledger-alias
-                 :t t-value
-                 :commit commit-address
-                 :index index-address
-                 :file filename})
+      (log/debug "NS publish starting"
+                 {:alias ledger-alias
+                  :t t-value
+                  :commit commit-address
+                  :index index-address
+                  :file filename})
       (let [res (storage/write-bytes store filename record-bytes)]
-        (log/info "NS publish completed" {:alias ledger-alias :file filename})
+        (log/debug "NS publish completed" {:alias ledger-alias :file filename})
         res)))
 
   (retract [_ ledger-alias]
