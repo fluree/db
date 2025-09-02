@@ -132,8 +132,8 @@
                                                                            ; are no policies
                                                                            ; to check.
            ledger-opts (-> parsed-txn :opts syntax/coerce-ledger-opts)
-          _           (util.ledger/validate-ledger-name ledger-id)
-          ledger      (<? (connection/create-ledger conn ledger-id ledger-opts))]
+           _           (util.ledger/validate-ledger-name ledger-id)
+           ledger      (<? (connection/create-ledger conn ledger-id ledger-opts))]
        (<? (transact/transact-ledger! ledger parsed-txn))))))
 
 (defn credential-create-with-txn!

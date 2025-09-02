@@ -134,11 +134,11 @@
                   :else
                   :noop)]
     (log/debug "plan-ns-update" {:cur-t cur-t
-                                   :cur-idx cur-idx
-                                   :ns-t ns-t
-                                   :index-address index-address
-                                   :commit-address commit-address
-                                   :action action})
+                                 :cur-idx cur-idx
+                                 :ns-t ns-t
+                                 :index-address index-address
+                                 :commit-address commit-address
+                                 :action action})
     action))
 
 (defn- notify*
@@ -148,11 +148,11 @@
   (go-try
     (let [{:keys [ledger-alias branch commit-address index-address ns-t]} ns-info]
       (log/debug "notify* received ns-info" {:ledger-alias ledger-alias
-                                              :branch branch
-                                              :ns-t ns-t
-                                              :commit-address commit-address
-                                              :index-address index-address
-                                              :expanded-commit? (boolean expanded-commit)})
+                                             :branch branch
+                                             :ns-t ns-t
+                                             :commit-address commit-address
+                                             :index-address index-address
+                                             :expanded-commit? (boolean expanded-commit)})
       (if-let [ledger-ch (and ledger-alias (ns-subscribe/cached-ledger conn ledger-alias))]
         (let [ledger  (<? ledger-ch)
               db      (ledger/current-db ledger branch)
@@ -165,8 +165,8 @@
 
             :index
             (do (log/debug "Applying index-only update" {:ledger-alias ledger-alias
-                                                          :branch branch
-                                                          :index-address index-address})
+                                                         :branch branch
+                                                         :index-address index-address})
                 (let [res (<? (ledger/notify-index ledger {:index-address index-address
                                                            :branch        branch}))]
                   (log/debug "notify-index result" {:ledger-alias ledger-alias :result res})
@@ -600,4 +600,4 @@
         timeout-ch (ex-info "Indexing wait timeout, but assume indexing is proceeding in the background."
                             {:status 408
                              :error :db/timeout
-                             :timeout timeout})))) )
+                             :timeout timeout})))))
