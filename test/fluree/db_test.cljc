@@ -1108,7 +1108,7 @@
              ;; For now, just check we have some commit files
              (is (pos? (count commit-files))
                  (str "Should have commit files, got: " (count commit-files)))))
-         (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
+         (is (= ["cuckoo" "garbage" "opst" "post" "root" "spot" "tspo"]
                 (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index"))))))
            ;; one new index root per tx
          (is (= tx-count
@@ -1142,7 +1142,7 @@
            ;; Storage directories remain but are empty after drop
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias))))))
-           (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
+           (is (= ["cuckoo" "garbage" "opst" "post" "root" "spot" "tspo"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/txn"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/commit"))))))

@@ -341,7 +341,7 @@
         (async/put! ledger-chan ledger)
         ledger)
       (throw (ex-info (str "Unable to load. No record of ledger at address: " ledger-address " exists.")
-                      {:status 404, :error :db/unknown-address})))))
+                      {:status 404, :error :db/unkown-address})))))
 
 (defn load-ledger-address
   [conn address]
@@ -374,7 +374,7 @@
                   (recur r))
               (do (ns-subscribe/release-ledger conn normalized-alias)
                   (let [ex (ex-info (str "Load for " normalized-alias " failed due to failed address lookup.")
-                                    {:status 404, :error :db/unknown-ledger})]
+                                    {:status 404, :error :db/unkown-ledger})]
                     (async/put! ledger-chan ex)
                     (throw ex))))))))))
 
@@ -429,7 +429,9 @@
   (go-try
     (let [storage       (:storage index-catalog)
           index-address (some-> (util/get-first latest-commit const/iri-index)
-                                (util/get-first-value const/iri-address))]
+                                (util/get-first-value const/iri-address))
+          ;; Extract ledger alias from the commit
+          ledger-alias  (util/get-first-value latest-commit const/iri-alias)]
       (when index-address
         (log/debug "Dropping index" index-address)
         (let [{:keys [spot opst post tspo]} (<? (storage/read-json storage index-address true))
@@ -438,12 +440,22 @@
               spot-ch    (drop-index-nodes storage (:id spot))
               post-ch    (drop-index-nodes storage (:id post))
               tspo-ch    (drop-index-nodes storage (:id tspo))
-              opst-ch    (drop-index-nodes storage (:id opst))]
+              opst-ch    (drop-index-nodes storage (:id opst))
+              ;; Also clean up cuckoo filter files for all branches
+              cuckoo-ch  (when ledger-alias
+                           (let [ledger-name (first (str/split ledger-alias #":" 2))]
+                             ;; Dynamic require to avoid circular dependency
+                             (when-let [delete-fn (try
+                                                    (require 'fluree.db.indexer.cuckoo)
+                                                    (resolve 'fluree.db.indexer.cuckoo/delete-all-filters)
+                                                    (catch #?(:clj Exception :cljs js/Error) _e nil))]
+                               (delete-fn index-catalog ledger-name))))]
           (<? garbage-ch)
           (<? spot-ch)
           (<? post-ch)
           (<? tspo-ch)
           (<? opst-ch)
+          (when cuckoo-ch (<? cuckoo-ch))
           (<? (storage/delete storage index-address))))
       :index-dropped)))
 
@@ -493,11 +505,11 @@
     (storage/write-catalog-bytes clg address data)))
 
 (defn trigger-ledger-index
-  "Manually triggers indexing for a ledger/branch and waits for completion.
-
+  "Manually triggers indexing for a ledger and waits for completion.
+   
    Options:
    - :timeout - Max wait time in ms (default 300000 / 5 minutes)
-
+   
    Returns the indexed database object or throws an exception on failure/timeout."
   [conn ledger-alias opts]
   (go-try
