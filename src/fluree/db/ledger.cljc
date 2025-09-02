@@ -1,5 +1,6 @@
 (ns fluree.db.ledger
   (:require [clojure.string :as str]
+            [fluree.db.async-db :as async-db]
             [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
@@ -208,16 +209,31 @@
                 ::stale)
 
             (flake/t-before? root-t cur-t)
-            (do (log/debug "notify-index: root behind current commit; ignoring"
-                           {:root-t root-t :cur-t cur-t})
-                ::index-current)
+            (if (some? cur-idx)
+              (do (log/debug "notify-index: root behind current commit; ignoring"
+                             {:root-t root-t :cur-t cur-t})
+                  ::index-current)
+              (do (log/debug "notify-index: root behind current commit but no current index; applying"
+                             {:root-t root-t :cur-t cur-t})
+                  (let [data       (-> db :commit :data)
+                        index-id   (idx-address->idx-id index-address)
+                        index-map  (commit-data/new-index data index-id index-address
+                                                          (select-keys root [:spot :post :opst :tspo]))
+                        updated-db (<? (dbproto/-index-update db index-map))]
+                    (log/debug "notify-index: applying new index (no current index)" {:index-id index-id
+                                                                                      :address index-address})
+                    (update-commit! ledger branch updated-db)
+                    ::index-updated)))
 
             :else
             (let [data       (-> db :commit :data)
                   index-id   (idx-address->idx-id index-address)
                   index-map  (commit-data/new-index data index-id index-address
                                                     (select-keys root [:spot :post :opst :tspo]))
-                  updated-db (<? (dbproto/-index-update db index-map))]
+                  res        (dbproto/-index-update db index-map)
+                  updated-db (if (async-db/db? res)
+                               (do (<? (async-db/deref-async res)) res)
+                               (<? res))]
               (log/debug "notify-index: applying new index" {:index-id index-id
                                                              :address index-address})
               (update-commit! ledger branch updated-db)
