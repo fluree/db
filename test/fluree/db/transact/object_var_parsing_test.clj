@@ -51,9 +51,9 @@
                             "schema:text" "?age"
                             "schema:name" "?name"}]}]
         (is (thrown-with-msg?
-              clojure.lang.ExceptionInfo
-              #"variable \?name is not bound"
-              (parse/parse-update-txn txn {})))))
+             clojure.lang.ExceptionInfo
+             #"variable \?name is not bound"
+             (parse/parse-update-txn txn {})))))
     (testing "via the where clause"
       (let [txn {"@context" ctx
                  "where" [{"@id" "ex:s" "schema:name" "?name"}]
@@ -61,9 +61,9 @@
                             "schema:text" "?age"
                             "schema:name" "?name"}]}]
         (is (thrown-with-msg?
-              clojure.lang.ExceptionInfo
-              #"variable \?age is not bound"
-              (parse/parse-update-txn txn {})))))))
+             clojure.lang.ExceptionInfo
+             #"variable \?age is not bound"
+             (parse/parse-update-txn txn {})))))))
 
 (deftest update-with-object-var-parsing-false-treats-bare-var-as-literal
   (testing "With objectVarParsing false, bare object '?not-a-var' in update insert is literal"
