@@ -222,7 +222,9 @@
                         updated-db (<? (dbproto/-index-update db index-map))]
                     (log/debug "notify-index: applying new index (no current index)" {:index-id index-id
                                                                                       :address index-address})
-                    (update-commit! ledger branch updated-db)
+                    ;; Index-only update: update branch state without enforcing next-commit?
+                    (let [branch-meta (get-branch-meta ledger branch)]
+                      (swap! (:state branch-meta) branch/update-index updated-db))
                     ::index-updated)))
 
             :else
@@ -236,7 +238,9 @@
                                (<? res))]
               (log/debug "notify-index: applying new index" {:index-id index-id
                                                              :address index-address})
-              (update-commit! ledger branch updated-db)
+              ;; Index-only update: update branch state without enforcing next-commit?
+              (let [branch-meta (get-branch-meta ledger branch)]
+                (swap! (:state branch-meta) branch/update-index updated-db))
               ::index-updated)))))))
 
 (defrecord Ledger [id address alias did state cache commit-catalog
