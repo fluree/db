@@ -327,7 +327,7 @@
       where/->iri-ref))
 
 (defmulti parse-pattern
-  (fn [pattern _bound-vars _context]
+  (fn [pattern _var-config _context]
     (v/where-pattern-type pattern)))
 
 (defn parse-bind-map
@@ -975,7 +975,9 @@
          var-config    (var-parsing-config vars override-opts)
          where         (-> (get-named txn "where")
                            (parse-where var-config context))
-         var-config*   (update var-config :bound-vars into (where/clause-variables where))
+         var-config*   (cond-> (update var-config :bound-vars into (where/clause-variables where))
+                         ;; don't attempt variable parsing if there are no unified vars
+                         (not (or where vars))  (assoc :parse-object-vars? false))
          delete        (when-let [dlt (get-named txn "delete")]
                          (jld->parsed-triples dlt var-config* context))
          insert        (when-let [ins (get-named txn "insert")]
