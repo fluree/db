@@ -57,7 +57,7 @@
                       :error  :db/websocket-error})))))))
 
 (defn remote-read-json
-  "Returns a core async channel with value of remote resource."
+  "Returns a core async channel with value of remote resources."
   [system-state resource-key keywordize-keys?]
   (log/debug "Remote read json initiated for: " resource-key)
   (let [server-host (pick-server system-state)]

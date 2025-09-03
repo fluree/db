@@ -28,6 +28,12 @@
     path
     (str "//" path)))
 
+(defn unsanitize-path
+  [path]
+  (if (str/starts-with? path "//")
+    (subs path 2)
+    path))
+
 (defn build-address
   ([location path]
    (let [path* (sanitize-path path)]

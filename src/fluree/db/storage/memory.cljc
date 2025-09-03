@@ -53,7 +53,7 @@
         (get @contents path))))
 
   (get-hash [_ address]
-    (go (-> address storage/split-address last)))
+    (go (-> address storage/split-address last storage/unsanitize-path)))
 
   storage/ByteStore
   (write-bytes [_ path bytes]
