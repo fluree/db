@@ -77,9 +77,9 @@
   [system-state address]
   (log/debug "Remote get hash initiated for: " address)
   (let [server-host (pick-server system-state)]
-    (xhttp/post (str server-host "/fluree/remote/hash")
-                {:address address}
-                {:keywordize-keys false})))
+    (xhttp/post-json (str server-host "/fluree/remote/hash")
+                     {:address address}
+                     {:keywordize-keys false})))
 
 (defn not-found-error?
   [e]
@@ -147,9 +147,13 @@
 
   storage/ContentArchive
   (-content-read-bytes [_ address]
-    (remote-read-bytes system-state address))
+    (go-try
+      (let [read-result (<? (remote-read-json system-state address false))]
+        (json/stringify read-result))))
   (get-hash [_ address]
-    (remote-get-hash system-state address))
+    (go-try
+      (let [hash-result (<? (remote-get-hash system-state address))]
+        (json/stringify hash-result))))
 
   storage/Identifiable
   (identifiers [_]
