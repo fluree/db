@@ -14,7 +14,7 @@
     (let [txn {"@context" ctx
                "@graph"   [{"@id" "ex:s"
                             "schema:text" "?age"}]}
-          {:keys [insert]} (parse/parse-insert-txn txn {:context (parse/parse-txn-opts nil nil nil)})
+          {:keys [insert]} (parse/parse-insert-txn txn (parse/parse-txn-opts nil nil nil))
           [_ _ o] (first insert)]
       (is (nil? (where/get-variable o))
           "Should not parse bare '?age' as a variable in insert")
