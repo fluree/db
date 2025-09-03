@@ -456,10 +456,10 @@
 (defn parse-object-map
   [s-mch p-mch o {:keys [parse-object-vars?] :as var-config} context]
   (let [o* (expand-keys o context)
-        explicit-var (get o "@variable")]
+        explicit-var (get o const/iri-variable)]
     (cond
       explicit-var
-      (let [attrs (-> o (dissoc "@variable") (expand-keys context))
+      (let [attrs (-> o (dissoc const/iri-variable) (expand-keys context))
             var   (parse-var-name explicit-var)
             o-mch (parse-variable-attributes var attrs var-config context)]
         [(flip-reverse-pattern [s-mch p-mch o-mch])])
@@ -843,7 +843,7 @@
         value  (util/get-value v-map)
         type   (util/get-types v-map)
         lang   (util/get-lang v-map)
-        explicit-var (get v-map "@variable")]
+        explicit-var (get v-map const/iri-variable)]
     (cond v-list
           (reduce (fn [triples [i list-item]]
                     (parse-obj-cmp var-config context subj-cmp pred-cmp {:i i} triples list-item))
