@@ -19,6 +19,7 @@
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.log :as log]
+            [fluree.db.util.parse :as util.parse]
             [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge load range exists? update drop]))
 
@@ -123,7 +124,7 @@
 
 (defn connect-file
   "Forms a connection backed by local file storage.
-  
+
   Options:
     - storage-path (optional): Directory path for file storage (default: \"data\")
     - parallelism (optional): Number of parallel operations (default: 4)
@@ -133,18 +134,18 @@
       The key should be exactly 32 bytes long for optimal security.
       Example: \"my-secret-32-byte-encryption-key!\"
     - defaults (optional): Default options for ledgers created with this connection
-  
+
   Returns a core.async channel that resolves to a connection, or an exception if
   the connection cannot be established.
-  
+
   Examples:
     ;; Basic file storage
     (connect-file {:storage-path \"./my-data\"})
-    
+
     ;; File storage with encryption
     (connect-file {:storage-path \"./secure-data\"
                    :aes256-key \"my-secret-32-byte-encryption-key!\"})
-                   
+
     ;; Full configuration
     (connect-file {:storage-path \"./data\"
                    :parallelism 8
@@ -175,7 +176,7 @@
 #?(:clj
    (defn connect-s3
      "Forms a connection backed by S3 storage.
-     
+
      Options:
        - s3-bucket (required): The S3 bucket name
        - s3-endpoint (required): S3 endpoint URL
@@ -405,7 +406,7 @@
 
 (defn ^:deprecated transact!
   "Deprecated: Use `update!` instead.
-  
+
   Updates a ledger and commits the changes in one operation."
   ([conn txn] (transact! conn txn nil))
   ([conn txn opts]
@@ -508,7 +509,7 @@
 
 (defn ^:deprecated credential-transact!
   "Deprecated: Use `credential-update!` instead.
-  
+
   Executes a transaction using a verifiable credential."
   ([conn txn] (credential-update! conn txn nil))
   ([conn txn opts] (credential-update! conn txn opts)))
@@ -557,11 +558,11 @@
 
 (defn db
   "Returns the current database value from a ledger.
-  
+
   Parameters:
     conn - Connection object
     ledger-id - Ledger alias or address
-    
+
   Returns the current database value."
   [conn ledger-id]
   (validate-connection conn)
@@ -583,8 +584,9 @@
    (wrap-policy db policy nil))
   ([db policy policy-values]
    (promise-wrap
-    (let [policy* (json-ld/expand policy)]
-      (policy/wrap-policy db policy* policy-values)))))
+    (let [policy* (json-ld/expand policy)
+          policy-values* (util.parse/normalize-values policy-values)]
+      (policy/wrap-policy db policy* policy-values*)))))
 
 (defn wrap-class-policy
   "Applies policy restrictions based on policy classes in the database.
@@ -600,7 +602,8 @@
    (wrap-class-policy db policy-classes nil))
   ([db policy-classes policy-values]
    (promise-wrap
-    (policy/wrap-class-policy db nil policy-classes policy-values))))
+    (let [policy-values* (util.parse/normalize-values policy-values)]
+      (policy/wrap-class-policy db nil policy-classes policy-values*)))))
 
 (defn wrap-identity-policy
   "Applies policy restrictions based on an identity's policy classes.
@@ -618,7 +621,8 @@
    (wrap-identity-policy db identity nil))
   ([db identity policy-values]
    (promise-wrap
-    (policy/wrap-identity-policy db nil identity policy-values))))
+    (let [policy-values* (util.parse/normalize-values policy-values)]
+      (policy/wrap-identity-policy db nil identity policy-values*)))))
 
 (defn dataset
   "Creates a composed dataset from multiple resolved graph databases.
@@ -837,7 +841,7 @@
   "Encodes an IRI to Fluree's internal compact format.
 
   Parameters:
-    db - Database value  
+    db - Database value
     iri - IRI string to encode
 
   Used for range scans, slices and advanced index operations.
@@ -900,20 +904,20 @@
 
 (defn trigger-index
   "Manually triggers indexing for a ledger and waits for completion.
-  
+
   This is useful for external indexing processes (e.g., AWS Lambda) that need
   to ensure a ledger is indexed without creating new transactions.
-  
+
   Parameters:
     conn - Database connection
     ledger-alias - The alias/name of the ledger to index
     opts - (optional) Options map:
       :branch - Branch name (defaults to main branch)
       :timeout - Max wait time in ms (default 300000 / 5 minutes)
-  
+
   Returns a promise that resolves to the indexed database object.
   Throws an exception if indexing fails or times out.
-  
+
   Example:
     ;; Trigger indexing and wait for completion
     (let [indexed-db @(trigger-index conn \"my-ledger\")]
