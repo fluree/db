@@ -173,9 +173,16 @@
             (do (log/debug "Applying index-only update" {:ledger-alias ledger-alias
                                                          :branch branch
                                                          :index-address index-address})
-                (let [res (<? (ledger/notify-index ledger {:index-address index-address
-                                                           :branch        branch}))]
+                (let [res (try* (<? (ledger/notify-index ledger {:index-address index-address
+                                                                 :branch        branch}))
+                                (catch* e
+                                  (log/warn e "notify-index failed; marking stale to reload"
+                                            {:ledger-alias ledger-alias :branch branch
+                                             :index-address index-address})
+                                  ::ledger/stale))]
                   (log/debug "notify-index result" {:ledger-alias ledger-alias :result res})
+                  (when (= res ::ledger/stale)
+                    (ns-subscribe/release-ledger conn ledger-alias))
                   res))
 
             :commit
@@ -188,13 +195,18 @@
                                                        (get-first-value const/iri-address))]
                                     (<? (commit-storage/read-data-jsonld commit-catalog db-address)))]
               (log/debug "Applying commit update" {:ledger-alias ledger-alias :t ns-t})
-              (case (<? (ledger/notify ledger expanded-commit expanded-data))
-                (::ledger/current ::ledger/newer ::ledger/updated)
-                (do (log/debug "Ledger" ledger-alias "is up to date after commit path")
-                    true)
-                ::ledger/stale
-                (do (log/debug "Dropping state for stale ledger:" ledger-alias)
-                    (ns-subscribe/release-ledger conn ledger-alias))))
+              (let [res (try* (<? (ledger/notify ledger expanded-commit expanded-data))
+                              (catch* e
+                                (log/warn e "notify commit failed; marking stale to reload"
+                                          {:ledger-alias ledger-alias :t ns-t})
+                                ::ledger/stale))]
+                (case res
+                  (::ledger/current ::ledger/newer ::ledger/updated)
+                  (do (log/debug "Ledger" ledger-alias "is up to date after commit path")
+                      true)
+                  ::ledger/stale
+                  (do (log/debug "Dropping state for stale ledger:" ledger-alias)
+                      (ns-subscribe/release-ledger conn ledger-alias)))))
 
             :stale
             (do (log/debug "Dropping state for stale ledger:" ledger-alias)

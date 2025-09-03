@@ -186,8 +186,22 @@
              :commit     new-commit
              :current-db new-db))
     (do
-      (log/warn "Commit update failure.\n  Current commit:" current-commit
-                "\n  New commit:" new-commit)
+      (let [current-t   (commit-data/t current-commit)
+            new-t       (commit-data/t new-commit)
+            t-ok?       (or (nil? current-t)
+                            (= new-t (inc current-t)))
+            current-id  (:id current-commit)
+            new-prev-id (-> new-commit :previous :id)
+            prev-ok?    (= new-prev-id current-id)]
+        (log/warn "Commit update failure.\n  Current commit:" current-commit
+                  "\n  New commit:" new-commit)
+        (log/warn "Commit update failure detail"
+                  {:current-t current-t
+                   :new-t new-t
+                   :t-ok? t-ok?
+                   :current-id current-id
+                   :new-prev-id new-prev-id
+                   :prev-ok? prev-ok?}))
       (throw (ex-info (str "Commit failed, latest committed db is "
                            (commit-data/t current-commit)
                            " and you are trying to commit at db at t value of: "
