@@ -10,7 +10,7 @@
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.util :as util :refer [get-first get-first-value]]
+            [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
@@ -98,8 +98,16 @@
       (cond
         (= commit-t (flake/next-t current-t))
         (let [updated-db (<? (flake.transact/-merge-commit db expanded-commit expanded-data))]
-          (update-commit! ledger branch updated-db)
-          ::updated)
+          (try*
+            (update-commit! ledger branch updated-db)
+            ::updated
+            (catch* e
+              (log/warn e "notify commit sequencing conflict; marking ledger stale to reload"
+                        {:alias (:alias ledger)
+                         :branch branch
+                         :current-t current-t
+                         :commit-t commit-t})
+              ::stale)))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
         (flake/t-after? commit-t (flake/next-t current-t))
