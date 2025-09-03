@@ -133,7 +133,11 @@
                          {:status :success, :db indexed-db, :commit indexed-commit})
                        (catch* e
                          (log/error e "Error updating index")
-                         {:status :error, :error e}))]
+                         {:status :error
+                          :error  (ex-info "Indexing failed"
+                                           {:alias (:alias db*)
+                                            :t     (:t db*)}
+                                           e)}))]
           (when complete-ch
             (async/put! complete-ch result))
           (if (= :success (:status result))
