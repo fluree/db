@@ -14,7 +14,7 @@
     (let [txn {"@context" ctx
                "@graph"   [{"@id" "ex:s"
                             "schema:text" "?age"}]}
-          {:keys [insert]} (parse/parse-insert-txn txn {:context (parse/parse-txn-opts nil nil nil)})
+          {:keys [insert]} (parse/parse-insert-txn txn (parse/parse-txn-opts nil nil nil))
           [_ _ o] (first insert)]
       (is (nil? (where/get-variable o))
           "Should not parse bare '?age' as a variable in insert")
@@ -23,15 +23,47 @@
       (is (= "?age" (where/get-value o))
           "Literal should equal '?age'"))))
 
-(deftest update-bare-var-default-throws-when-unbound
-  (testing "Bare object '?age' in update without binding should throw by default"
+(deftest object-var-parsing-update-opt
+  (testing "ignored when no values clause or where clause"
     (let [txn {"@context" ctx
                "insert"  [{"@id" "ex:s"
                            "schema:text" "?age"}]}]
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo
-           #"variable \?age is not bound"
-           (parse/parse-update-txn txn {}))))))
+      (testing "object-var-parsing true"
+        (let [{:keys [insert]} (parse/parse-update-txn txn {:object-var-parsing true})
+              [_ _ o] (first insert)]
+          (is (nil? (where/get-variable o))
+              "should not parse variable")))
+      (testing "object-var-parsing false"
+        (let [{:keys [insert]} (parse/parse-update-txn txn {:object-var-parsing false})
+              [_ _ o] (first insert)]
+          (is (nil? (where/get-variable o))
+              "should not parse variable")))
+      (testing "object-var-parsing default"
+        (let [{:keys [insert]} (parse/parse-update-txn txn nil)
+              [_ _ o] (first insert)]
+          (is (nil? (where/get-variable o))
+              "should not parse variable")))))
+  (testing "defaults to true when unified variables are present"
+    (testing "via the values clause"
+      (let [txn {"@context" ctx
+                 "values" ["?age" [1 2 3]]
+                 "insert" [{"@id" "ex:s"
+                            "schema:text" "?age"
+                            "schema:name" "?name"}]}]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"variable \?name is not bound"
+             (parse/parse-update-txn txn {})))))
+    (testing "via the where clause"
+      (let [txn {"@context" ctx
+                 "where" [{"@id" "ex:s" "schema:name" "?name"}]
+                 "insert" [{"@id" "ex:s"
+                            "schema:text" "?age"
+                            "schema:name" "?name"}]}]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"variable \?age is not bound"
+             (parse/parse-update-txn txn {})))))))
 
 (deftest update-with-object-var-parsing-false-treats-bare-var-as-literal
   (testing "With objectVarParsing false, bare object '?not-a-var' in update insert is literal"

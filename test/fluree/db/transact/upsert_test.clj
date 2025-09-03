@@ -46,7 +46,7 @@
 
 (deftest upsert-parsing
   (testing "Parsed upsert txn is identical to long-form update txn"
-    (is (= (parse/parse-upsert-txn sample-upsert-txn {})
+    (is (= (update (parse/parse-upsert-txn sample-upsert-txn {}) :opts dissoc :object-var-parsing)
            (parse/parse-update-txn sample-update-txn {})))))
 
 (deftest ^:integration upsert-data
