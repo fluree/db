@@ -327,7 +327,7 @@
                                                                          commit-address
                                                                          index-address))
             expanded-commit (json-ld/expand commit)
-            combined-alias  (commit->ledger-alias conn address expanded-commit)
+            ledger-alias  (commit->ledger-alias conn address expanded-commit)
 
             {:keys [did indexing]} (parse-ledger-options conn {})
             ledger (ledger/instantiate combined-alias address commit-catalog index-catalog
