@@ -1,6 +1,5 @@
 (ns fluree.db.ledger
-  (:require [clojure.string :as str]
-            [fluree.db.branch :as branch]
+  (:require [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
