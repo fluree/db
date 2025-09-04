@@ -14,7 +14,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]))
 
-(def commit-version 1)
+(def commit-version 2)
 (def data-version 0)
 
 (def default-branch
@@ -223,7 +223,7 @@
   "Creates a skeleton blank commit map."
   [alias publish-addresses init-time]
   (let [commit-json  (->json-ld {:alias  alias
-                                 :v      0
+                                 :v      commit-version
                                  :data   {:t      0
                                           :flakes 0
                                           :size   0}
