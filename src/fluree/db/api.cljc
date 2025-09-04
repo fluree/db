@@ -19,6 +19,7 @@
             [fluree.db.transact :as transact]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try <?]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge load range exists? update drop]))
@@ -249,13 +250,8 @@
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
    (validate-connection conn)
-   ;; Disallow branch specification in ledger name during creation
-   (when (str/includes? ledger-alias ":")
-     (throw (ex-info (str "Ledger name cannot contain ':' character. "
-                          "Branches must be created separately. "
-                          "Provided: " ledger-alias)
-                     {:error :db/invalid-ledger-name
-                      :ledger-alias ledger-alias})))
+   ;; Validate ledger name
+   (util.ledger/validate-ledger-name ledger-alias)
    (promise-wrap
     (go-try
       (log/info "Creating ledger" ledger-alias)
