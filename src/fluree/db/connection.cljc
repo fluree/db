@@ -326,9 +326,9 @@
             ledger-alias  (commit->ledger-alias conn address expanded-commit)
 
             {:keys [did indexing]} (parse-ledger-options conn {})
-            ledger (ledger/instantiate combined-alias address commit-catalog index-catalog
+            ledger (ledger/instantiate ledger-alias address commit-catalog index-catalog
                                        primary-publisher secondary-publishers indexing did expanded-commit)]
-        (ns-subscribe/subscribe-ledger conn combined-alias)
+        (ns-subscribe/subscribe-ledger conn ledger-alias)
         (async/put! ledger-chan ledger)
         ledger)
       (throw (ex-info (str "Unable to load. No record of ledger at address: " address " exists.")
