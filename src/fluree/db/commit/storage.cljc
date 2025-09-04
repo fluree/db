@@ -37,25 +37,28 @@
 (defn read-verified-commit
   [storage commit-address]
   (go-try
-    (when-let [commit-data (<? (storage/read-json storage commit-address))]
+    (when-let [commit-data (<? (storage/content-read-json storage commit-address))]
       (log/trace "read-commit at:" commit-address "data:" commit-data)
-      (let [addr-key-path (if (contains? commit-data "credentialSubject")
-                            ["credentialSubject" "address"]
-                            ["address"])]
-        (-> commit-data
-            (assoc-in addr-key-path commit-address)
-            json-ld/expand
-            verify-commit)))))
+      (let [addr-key-path  (if (contains? commit-data "credentialSubject")
+                             ["credentialSubject" "address"]
+                             ["address"])
+            [commit proof] (-> commit-data
+                               (assoc-in addr-key-path commit-address)
+                               json-ld/expand
+                               verify-commit)
+            commit-hash    (<? (storage/get-hash storage commit-address))
+            commit-id      (commit-data/hash->commit-id commit-hash)
+            commit*        (assoc commit
+                                  const/iri-id commit-id
+                                  const/iri-address commit-address)]
+        [commit* proof]))))
 
 ;; TODO: Verify hash
 (defn read-commit-jsonld
-  [storage commit-address commit-hash]
+  [storage commit-address]
   (go-try
     (when-let [[commit _proof] (<? (read-verified-commit storage commit-address))]
-      (let [commit-id (commit-data/hash->commit-id commit-hash)]
-        (assoc commit
-               const/iri-id commit-id
-               const/iri-address commit-address)))))
+      commit)))
 
 (defn read-data-jsonld
   [storage address]
@@ -123,8 +126,8 @@
     (go
       (try*
         (loop [[commit proof] (verify-commit latest-commit)
-               last-t        nil
-               commit-tuples (list)] ;; note 'conj' will put at beginning of list (smallest 't' first)
+               last-t         nil
+               commit-tuples  (list)] ;; note 'conj' will put at beginning of list (smallest 't' first)
           (let [prev-commit-addr (-> commit
                                      (get-first const/iri-previous)
                                      (get-first-value const/iri-address))

@@ -93,9 +93,9 @@
     [cached? p-chan]))
 
 (defn notify
-  [{:keys [commit-catalog] :as conn} address hash]
+  [{:keys [commit-catalog] :as conn} address]
   (go-try
-    (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address hash))]
+    (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
       (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
         (if-let [ledger-ch (ns-subscribe/cached-ledger conn ledger-alias)]
           (do (log/debug "Notification received for ledger" ledger-alias
@@ -186,6 +186,10 @@
   (go-try
     (let [json-data (<? (storage/read-json commit-catalog addr))]
       (assoc json-data "address" addr))))
+
+(defn parse-address-hash
+  [{:keys [commit-catalog] :as _conn} addr]
+  (storage/get-hash commit-catalog addr))
 
 (defn lookup-publisher-commit
   [conn ledger-address]

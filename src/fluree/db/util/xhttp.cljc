@@ -76,7 +76,8 @@
     (ex-info message
              (cond-> {:url   url
                       :error error}
-               status (assoc :status status)))))
+               status (assoc :status status))
+             e)))
 
 #?(:clj
    (defn throw-if-timeout [error]

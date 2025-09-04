@@ -47,14 +47,13 @@
   ([{:keys [state] :as ledger} branch-name db index-files-ch]
    (log/debug "Attempting to update ledger:" (:alias ledger)
               "and branch:" branch-name "with new commit to t" (:t db))
-   (let [branch-meta (get-branch-meta ledger branch-name)]
-     (when-not branch-meta
-       (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
-                            "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
-                       {:status 400, :error :db/invalid-branch})))
+   (if-let [branch-meta (get-branch-meta ledger branch-name)]
      (-> branch-meta
          (branch/update-commit! db index-files-ch)
-         branch/current-db))))
+         branch/current-db)
+     (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
+                          "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
+                     {:status 400, :error :db/invalid-branch})))))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
@@ -87,8 +86,9 @@
                         (get-first-value const/iri-fluree-t))
           db        (current-db ledger branch)
           current-t (:t db)]
-      (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
-                 "where current cached db t value is:" current-t)
+      (log/debug "notify of new commit for ledger:" (:alias ledger)
+                 "at t value:" commit-t "where current cached db t value is:"
+                 current-t)
       ;; note, index updates will have same t value as current one, so still need to check if t = current-t
       (cond
         (= commit-t (flake/next-t current-t))
