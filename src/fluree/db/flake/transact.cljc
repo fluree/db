@@ -116,8 +116,24 @@
   [db tracker context identity author annotation raw-txn parsed-txn]
   (go-try
     (when (novelty/max-novelty? db)
-      (throw (ex-info "Maximum novelty exceeded, no transactions will be processed until indexing has completed."
-                      {:status 503 :error :db/max-novelty-exceeded})))
+      (let [novelty-bytes        (long (get-in db [:novelty :size] 0))
+            max-novelty-bytes    (long (:reindex-max-bytes db))
+            novelty-mb           (/ (double novelty-bytes) 1000000.0)
+            max-novelty-mb       (/ (double max-novelty-bytes) 1000000.0)
+            round2               (fn [x]
+                                   (/ (double (int (+ 0.5 (* x 100.0)))) 100.0))
+            novelty-mb-r         (round2 novelty-mb)
+            max-novelty-mb-r     (round2 max-novelty-mb)
+            msg                  (str "Maximum novelty exceeded ("
+                                      novelty-mb-r " MB > max " max-novelty-mb-r
+                                      " MB). No transactions will be processed until indexing has completed.")]
+        (throw (ex-info msg
+                        {:status              503
+                         :error               :db/max-novelty-exceeded
+                         :novelty-bytes       novelty-bytes
+                         :novelty-mb          novelty-mb
+                         :max-novelty-bytes   max-novelty-bytes
+                         :max-novelty-mb      max-novelty-mb}))))
     (when (policy.modify/deny-all? db)
       (throw (ex-info "Database policy denies all modifications."
                       {:status 403 :error :db/policy-exception})))
