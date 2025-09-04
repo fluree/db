@@ -449,9 +449,7 @@
       (let [alias (if (fluree-address? alias)
                     (nameservice/address-path alias)
                     ;; Normalize alias to include branch if not present
-                    (if (str/includes? alias ":")
-                      alias
-                      (str alias ":main")))]
+                    (normalize-ledger-alias alias))]
         (loop [[publisher & r] (publishers conn)]
           (when publisher
             (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))

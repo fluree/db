@@ -7,6 +7,7 @@
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.json :as json]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
 (defn local-filename
@@ -14,14 +15,16 @@
    Expects ledger-alias to be in format 'ledger:branch'.
    Returns path like 'ns@v1/ledger-name/branch.json'."
   [ledger-alias]
-  (let [[ledger-name branch] (str/split ledger-alias #":" 2)]
+  (let [[ledger-name branch] (util.ledger/ledger-parts ledger-alias)
+        branch (or branch "main")]
     (str const/ns-version "/" ledger-name "/" branch ".json")))
 
 (defn ns-record
   "Generates nameservice metadata map for JSON storage using new minimal format.
    Expects ledger-alias to be in format 'ledger:branch'."
   [ledger-alias commit-address t index-address]
-  (let [[alias branch] (str/split ledger-alias #":" 2)]
+  (let [[alias branch] (util.ledger/ledger-parts ledger-alias)
+        branch (or branch "main")]
     (cond-> {"@context"     {"f" iri/f-ns}
              "@id"          ledger-alias  ;; Already includes :branch
              "@type"        ["f:Database" "f:PhysicalDatabase"]
