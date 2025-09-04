@@ -1,6 +1,7 @@
 (ns fluree.db.nameservice.storage
   (:require [clojure.core.async :refer [go]]
             [clojure.string :as str]
+            [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
@@ -14,7 +15,7 @@
    Returns path like 'ns@v1/ledger-name/branch.json'."
   [ledger-alias]
   (let [[ledger-name branch] (str/split ledger-alias #":" 2)]
-    (str "ns@v1/" ledger-name "/" branch ".json")))
+    (str const/ns-version "/" ledger-name "/" branch ".json")))
 
 (defn ns-record
   "Generates nameservice metadata map for JSON storage using new minimal format.
@@ -79,7 +80,7 @@
     (go-try
       ;; Use recursive listing to support ledger names with '/' characters
       (if (satisfies? storage/RecursiveListableStore store)
-        (if-let [list-paths-result (storage/list-paths-recursive store "ns@v1")]
+        (if-let [list-paths-result (storage/list-paths-recursive store const/ns-version)]
           (loop [remaining-paths (<? list-paths-result)
                  records []]
             (if-let [path (first remaining-paths)]
