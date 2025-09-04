@@ -495,7 +495,7 @@
     (let [{:keys [timeout]
            :or {timeout 300000}} opts
           ledger (<? (load-ledger-alias conn ledger-alias))
-          complete-ch (ledger/trigger-index! ledger nil)
+          complete-ch (ledger/trigger-index! ledger)
           timeout-ch (async/timeout timeout)]
       (async/alt!
         complete-ch ([result] result)
