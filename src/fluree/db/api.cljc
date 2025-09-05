@@ -249,7 +249,6 @@
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
    (validate-connection conn)
-   ;; Validate ledger name
    (util.ledger/validate-ledger-name ledger-alias)
    (promise-wrap
     (go-try

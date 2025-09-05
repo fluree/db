@@ -189,7 +189,7 @@
 
 (def flat-filename-regex
   ;; Explicitly target ns@v1 flat files regardless of current const/ns-version
-  (re-pattern (str "^ns@v1/([^/]+)@([^/]+)\\.json$")))
+  (re-pattern "^ns@v1/([^/]+)@([^/]+)\\.json$"))
 
 (defn find-flat-nameservice-files
   "Find ns@v1 files using the legacy flat naming: ns@v1/<ledger>@<branch>.json"

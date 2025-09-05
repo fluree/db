@@ -155,12 +155,12 @@
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
 ;; TODO - however this is really a concern of "commit", not staging and I don't think the db should be handling any of it
 (defn write-transaction!
-  [ledger db-alias staged]
+  [ledger ledger-name staged]
   (go-try
     (let [{:keys [txn author annotation]} staged
           {:keys [commit-catalog]} ledger]
       (if txn
-        (let [{txn-id :address} (<? (save-txn! commit-catalog db-alias txn))]
+        (let [{txn-id :address} (<? (save-txn! commit-catalog ledger-name txn))]
           {:txn-id     txn-id
            :author     author
            :annotation annotation})
