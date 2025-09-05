@@ -9,7 +9,6 @@
                        [clojure.core.async :refer [go <!]]
                        [clojure.core.async.interop :refer [<p!]]])
             [fluree.db.api :as fluree]
-            [fluree.db.constants :as const]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.util :as util]))
 

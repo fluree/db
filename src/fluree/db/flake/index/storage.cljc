@@ -39,8 +39,7 @@
 
 (defn write-index-file
   [storage ledger-alias index-type serialized-data]
-  (let [;; Extract base ledger name from alias for storage path
-        ledger-name (util.ledger/ledger-base-name ledger-alias)
+  (let [ledger-name (util.ledger/ledger-base-name ledger-alias)
         index-name  (name index-type)
         path        (str/join "/" [ledger-name "index" index-name])]
     (storage/content-write-json storage path serialized-data)))
