@@ -1,16 +1,17 @@
-(ns fluree.db.migrations.nameservice-v1
-  "Nameservice Migration to ns@v1 Format
+(ns fluree.db.migrations.nameservice
+  "Nameservice Migration to ns@v2 Format
   
-  This migration handles the transition from the legacy nameservice format to the new
-  ns@v1 directory structure with minimal storage records.
+  This migration handles the transition from the legacy nameservice formats (pre-ns@v1 and
+  ns@v1) to the new ns@v2 directory structure with minimal storage records.
   
   WHAT IT DOES:
   - Detects old nameservice files stored at root level (e.g., ledger-name.json)
   - Extracts essential metadata from full commit JSON-LD records
   - Creates new minimal records with only: commit address, t value, index address
-  - Stores them in the new ns@v1/ directory with branch-aware naming (ledger-name/branch.json)
+  - Stores them in the new ns@v2/ directory with branch-aware naming (ledger-name/branch.json)
   - Cleans up old files after successful migration
-  - Additionally: migrates prior ns@v1 flat files (ledger@branch.json) to nested (ledger/branch.json)
+  - Additionally: migrates prior ns@v1 flat files (ledger@branch.json) and nested files
+    (ledger/branch.json) to ns@v2 nested layout
   
   WHEN IT RUNS:
   - Automatically at file storage initialization (legacy and flat->nested checks are independent)
