@@ -13,7 +13,7 @@
 (defn local-filename
   "Returns the local filename for a ledger's nameservice record.
    Expects ledger-alias to be in format 'ledger:branch'.
-   Returns path like 'ns@v1/ledger-name/branch.json'."
+   Returns path like 'ns@v2/ledger-name/branch.json'."
   [ledger-alias]
   (let [[ledger-name branch] (util.ledger/ledger-parts ledger-alias)
         branch (or branch "main")]

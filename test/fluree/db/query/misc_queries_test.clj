@@ -170,34 +170,23 @@
               result @(fluree/query db* {:context [test-utils/default-context
                                                    {:ex "http://example.org/ns/"}]
                                          :select  ['?s '?p '?o]
-                                         :where   {:id '?s, '?p '?o}})]
-          (is (= [["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"
-                   :f/address
-                   "fluree:memory://tqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"]
-                  ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn" :f/flakes 11]
-                  ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn" :f/size 1266]
-                  ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn" :f/t 1]
-                  ["fluree:commit:sha256:bdx3mocoug3imi5tc6dp3kmeyrpfevhynymvzpawp732atyxjcqd"
-                   "https://www.w3.org/2018/credentials#issuer"
-                   "did:key:z6Mkf2bJEm3KiDeCzrxbQDvT8jfYiz5t2Lo3fuvwPL6E6duw"]
-                  ["fluree:commit:sha256:bdx3mocoug3imi5tc6dp3kmeyrpfevhynymvzpawp732atyxjcqd"
-                   :f/address
-                   "fluree:memory://dx3mocoug3imi5tc6dp3kmeyrpfevhynymvzpawp732atyxjcqd"]
-                  ["fluree:commit:sha256:bdx3mocoug3imi5tc6dp3kmeyrpfevhynymvzpawp732atyxjcqd"
-                   :f/alias
-                   "query/everything:main"]
-                  ["fluree:commit:sha256:bdx3mocoug3imi5tc6dp3kmeyrpfevhynymvzpawp732atyxjcqd"
-                   :f/data
-                   "fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"]
-                  ["fluree:commit:sha256:bdx3mocoug3imi5tc6dp3kmeyrpfevhynymvzpawp732atyxjcqd"
-                   :f/previous
-                   "fluree:commit:sha256:bzhewx5bn4b3a4kwgv273k2rnh3gh7a6l4d7mmlntirrcj2urnbi"]
-                  ["fluree:commit:sha256:bdx3mocoug3imi5tc6dp3kmeyrpfevhynymvzpawp732atyxjcqd"
-                   :f/time
-                   720000]
-                  ["fluree:commit:sha256:bdx3mocoug3imi5tc6dp3kmeyrpfevhynymvzpawp732atyxjcqd"
-                   :f/v
-                   1]
+                                         :where   {:id '?s, '?p '?o}})
+              expected-commit-id   "fluree:commit:sha256:bbssolklwzebg6jgcjki3bsg3wbnybtzvaqymkai5loz7sixr4iav"
+              expected-commit-addr "fluree:memory://bssolklwzebg6jgcjki3bsg3wbnybtzvaqymkai5loz7sixr4iav"
+              expected-commit-previous "fluree:commit:sha256:bsx5gbgyyigspr2yuswue4lprez7ykj63n7gmpb3nzfzbs7f5bvo"
+              expected-db-id       "fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"
+              expected-db-addr     "fluree:memory://tqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"]
+          (is (= [[expected-db-id  :f/address  expected-db-addr]
+                  [expected-db-id :f/flakes 11]
+                  [expected-db-id :f/size 1266]
+                  [expected-db-id :f/t 1]
+                  [expected-commit-id "https://www.w3.org/2018/credentials#issuer" "did:key:z6Mkf2bJEm3KiDeCzrxbQDvT8jfYiz5t2Lo3fuvwPL6E6duw"]
+                  [expected-commit-id  :f/address  expected-commit-addr]
+                  [expected-commit-id  :f/alias  "query/everything:main"]
+                  [expected-commit-id :f/data expected-db-id]
+                  [expected-commit-id :f/previous  expected-commit-previous]
+                  [expected-commit-id :f/time 720000]
+                  [expected-commit-id :f/v 2]
                   [:ex/alice :type :ex/User]
                   [:ex/alice :schema/age 42]
                   [:ex/alice :schema/email "alice@flur.ee"]
