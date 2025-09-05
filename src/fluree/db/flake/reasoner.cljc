@@ -145,6 +145,15 @@
   (log/debug "Reasoner - source OWL rules: " graph)
   (owl-datalog/owl->datalog inserts graph))
 
+(defmethod rules-from-graph :owl-datalog
+  [_ inserts graph]
+  (log/debug "Reasoner - source OWL-Datalog statements from DB:" (count graph) "items")
+  (when (seq graph)
+    (log/debug "First few statements:" (take 2 graph)))
+  ;; For now, owl-datalog uses the same base as owl2rl
+  ;; We'll extend this with additional rules for complex equivalences
+  (owl-datalog/owl->datalog inserts graph))
+
 (defn extract-rules-from-dbs
   [method inserts dbs]
   (go-try
