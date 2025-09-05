@@ -23,7 +23,7 @@
       ([result next]
        (let [{:keys [limit total]} (swap! fuel update :total inc)]
          (when (and (pos? limit) (= (inc limit) total))
-           (log/error "Fuel limit of" limit "exceeded")
+           (log/info "Fuel limit of" limit "exceeded")
            (put! error-ch
                  (ex-info "Fuel limit exceeded" {:used total, :limit limit}))))
        (rf result next))
