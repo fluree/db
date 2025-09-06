@@ -14,8 +14,7 @@
             [fluree.db.storage :as storage]
             [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.json-ld :as json-ld])
+            [fluree.db.util.log :as log :include-macros true])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
