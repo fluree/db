@@ -206,7 +206,7 @@
           (throw (ex-info (str "Commit failed, The previous commit id of the new commit: '"
                                (previous-id new-commit)
                                "' does not match the current commit id: '"
-                               (commit-data/t new-commit)
+                               (:id new-commit)
                                "'.")
                           {:status 400 :error :db/invalid-commit}))))))
 
