@@ -331,8 +331,8 @@
             ;; Load full commit from disk
             _               (log/debug "Attempting to load from address:" address)
             expanded-commit (<? (commit-storage/load-commit-with-metadata commit-catalog
-                                                                         commit-address
-                                                                         index-address))
+                                                                          commit-address
+                                                                          index-address))
             ledger-alias    (commit->ledger-alias conn address expanded-commit)
             ;; Determine branch using helpers in priority order
             branch           (or (branch-from-commit expanded-commit)
