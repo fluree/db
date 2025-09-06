@@ -18,6 +18,7 @@
             [fluree.db.transact :as transact]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try <?]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge load range exists? update drop]))
@@ -248,6 +249,7 @@
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
    (validate-connection conn)
+   (util.ledger/validate-ledger-name ledger-alias)
    (promise-wrap
     (go-try
       (log/info "Creating ledger" ledger-alias)
@@ -387,7 +389,7 @@
     opts - (optional) Options map for the commit operation
 
   The ledger-id is automatically extracted from the database object's
-  alias and branch fields (formatted as alias@branch).
+  alias and branch fields (formatted as alias:branch).
 
   Creates a new commit and notifies the nameservice of the new version.
   Returns promise resolving to the committed database."
@@ -534,24 +536,19 @@
     (transact-api/create-with-txn conn txn opts))))
 
 (defn status
-  "Returns current status of a ledger branch.
+  "Returns current status of a ledger.
 
   Parameters:
     conn - Connection object
-    ledger-id - Ledger alias or address
-    branch - (optional) Branch name (defaults to current branch)
+    ledger-id - Ledger alias (with optional :branch) or address
 
   Returns status map with commit and index information."
-  ([conn ledger-id]
-   (status conn ledger-id nil))
-  ([conn ledger-id branch]
-   (validate-connection conn)
-   (promise-wrap
-    (go-try
-      (let [ledger (<? (connection/load-ledger conn ledger-id))]
-        (if branch
-          (ledger/status ledger branch)
-          (ledger/status ledger)))))))
+  [conn ledger-id]
+  (validate-connection conn)
+  (promise-wrap
+   (go-try
+     (let [ledger (<? (connection/load-ledger conn ledger-id))]
+       (ledger/status ledger)))))
 
 ;; db operations
 
@@ -906,9 +903,8 @@
 
   Parameters:
     conn - Database connection
-    ledger-alias - The alias/name of the ledger to index
+    ledger-alias - The alias/name of the ledger to index (with optional :branch)
     opts - (optional) Options map:
-      :branch - Branch name (defaults to main branch)
       :timeout - Max wait time in ms (default 300000 / 5 minutes)
 
   Returns a promise that resolves to the indexed database object.
@@ -917,6 +913,11 @@
   Example:
     ;; Trigger indexing and wait for completion
     (let [indexed-db @(trigger-index conn \"my-ledger\")]
+      ;; Use indexed-db...
+      )
+    
+    ;; Trigger indexing for a specific branch
+    (let [indexed-db @(trigger-index conn \"my-ledger:main\")]
       ;; Use indexed-db...
       )"
   ([conn ledger-alias]

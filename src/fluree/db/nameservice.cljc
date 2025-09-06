@@ -25,8 +25,11 @@
   (retract [publisher ledger-alias]
     "Remove the nameservice record for the ledger.")
   (publishing-address [publisher ledger-alias]
-    "Returns full publisher address/iri which will get published in commit. If
-    'private', return `nil`."))
+    "Returns the value to write into the commit's ns field for this nameservice.
+    This may be a full address/IRI (e.g., fluree:ipns://...) or a resolvable
+    identifier such as a ledger alias (e.g., ledger:branch), depending on the
+    nameservice implementation. The returned value will be used with this same
+    nameservice's lookup function. If publishing should be private, return nil."))
 
 (defprotocol Publication
   (subscribe [publication ledger-alias]
