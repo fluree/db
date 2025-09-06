@@ -320,12 +320,6 @@
            (some (fn [ns]
                    (nameservice/alias ns db-alias))))))
 
-(defn throw-missing-branch
-  [address ledger-alias]
-  (throw (ex-info (str "No committed branches exist for ledger: " ledger-alias
-                       " at address: " address)
-                  {:status 400, :error :db/missing-branch})))
-
 (defn load-ledger*
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn}
    ledger-chan address]
