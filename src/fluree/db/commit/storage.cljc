@@ -114,7 +114,8 @@
                              ["index" "address"])
             result (-> commit-data
                        (assoc-in addr-key-path commit-address)
-                       (cond-> index-address (assoc-in index-key-path index-address)))]
+                       (cond-> index-address (assoc-in index-key-path index-address))
+                       json-ld/expand)]
         (log/debug "commit.storage/load-commit-with-metadata done" {:address commit-address})
         result))))
 

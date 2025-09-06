@@ -330,11 +330,10 @@
             index-address  (get-in ns-record ["f:index" "@id"])
 
             ;; Load full commit from disk
-            _              (log/debug "Attempting to load from address:" address)
-            commit         (<? (commit-storage/load-commit-with-metadata commit-catalog
+            _               (log/debug "Attempting to load from address:" address)
+            expanded-commit (<? (commit-storage/load-commit-with-metadata commit-catalog
                                                                          commit-address
                                                                          index-address))
-            expanded-commit (json-ld/expand commit)
             ledger-alias    (commit->ledger-alias conn address expanded-commit)
             ;; Determine branch using helpers in priority order
             branch           (or (branch-from-commit expanded-commit)
@@ -464,12 +463,10 @@
                   commit-address (get-in ns-record ["f:commit" "@id"])
                   index-address  (get-in ns-record ["f:index" "@id"])
                   latest-commit  (when commit-address
-                                   (let [commit (<? (commit-storage/load-commit-with-metadata
-                                                     (:commit-catalog conn)
-                                                     commit-address
-                                                     index-address))]
-                                     (when commit
-                                       (json-ld/expand commit))))]
+                                   (<? (commit-storage/load-commit-with-metadata
+                                        (:commit-catalog conn)
+                                        commit-address
+                                        index-address)))]
               (log/debug "Dropping ledger" ledger-addr)
               (when latest-commit
                 (drop-index-artifacts conn latest-commit)
