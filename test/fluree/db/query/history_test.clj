@@ -305,8 +305,7 @@
              [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
                           {:id test-utils/did?}
                           :f/address test-utils/address?
-                          :f/alias   "committest"
-                          :f/branch  "main"
+                          :f/alias   "committest:main"
                           :f/previous
                           {:id test-utils/commit-id?}
                           :f/data    {:f/address test-utils/address?
@@ -319,15 +318,14 @@
                                       :f/t       1
                                       :id        test-utils/db-id?}
                           :f/time    720000
-                          :f/v       1
+                          :f/v       2
                           :id        test-utils/commit-id?}}]
              @(fluree/history conn ledger-id {:context        context
                                               :commit-details true
                                               :t              {:from 1 :to 1}})))
         (let [commit-5 {:f/commit {"https://www.w3.org/2018/credentials#issuer" {:id test-utils/did?}
                                    :f/address                                   test-utils/address?
-                                   :f/alias                                     "committest"
-                                   :f/branch                                    "main"
+                                   :f/alias                                     "committest:main"
                                    :f/data                                      {:f/address test-utils/address?
                                                                                  :f/assert  [{:ex/x "foo-cat"
                                                                                               :ex/y "bar-cat"
@@ -342,13 +340,12 @@
                                    :f/message                                   "meow"
                                    :f/previous                                  {:id test-utils/commit-id?}
                                    :f/time                                      720000
-                                   :f/v                                         1
+                                   :f/v                                         2
                                    :id                                          test-utils/commit-id?}}
               commit-4 {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                                    {:id test-utils/did?}
                                    :f/address  test-utils/address?
-                                   :f/alias    "committest"
-                                   :f/branch   "main"
+                                   :f/alias    "committest:main"
                                    :f/data     {:f/address test-utils/address?
                                                 :f/assert  [{:ex/x "foo-cat"
                                                              :ex/y "bar-cat"
@@ -360,7 +357,7 @@
                                                 :id        test-utils/db-id?}
                                    :f/previous {:id test-utils/commit-id?}
                                    :f/time     720000
-                                   :f/v        1
+                                   :f/v        2
                                    :id         test-utils/commit-id?}}]
           (is (pred-match?
                [commit-4 commit-5]
@@ -385,8 +382,7 @@
                  {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                              {:id test-utils/did?}
                              :f/address  test-utils/address?
-                             :f/alias    "committest"
-                             :f/branch   "main"
+                             :f/alias    "committest:main"
                              :f/data     {:f/address test-utils/address?
                                           :f/assert  [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
@@ -398,15 +394,14 @@
                                           :id        test-utils/db-id?}
                              :f/previous {:id test-utils/commit-id?}
                              :f/time     720000
-                             :f/v        1
+                             :f/v        2
                              :id         test-utils/commit-id?}}
                  c4)))
           (is (pred-match?
                {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                            {:id test-utils/did?}
                            :f/address  test-utils/address?
-                           :f/alias    "committest"
-                           :f/branch   "main"
+                           :f/alias    "committest:main"
                            :f/data     {:f/address test-utils/address?
                                         :f/assert  [{:ex/x "foo-3"
                                                      :ex/y "bar-3"
@@ -420,15 +415,14 @@
                                         :id        test-utils/db-id?}
                            :f/previous {:id test-utils/commit-id?}
                            :f/time     720000
-                           :f/v        1
+                           :f/v        2
                            :id         test-utils/commit-id?}}
                c3))
           (is (pred-match?
                {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                            {:id test-utils/did?}
                            :f/address  test-utils/address?
-                           :f/alias    "committest"
-                           :f/branch   "main"
+                           :f/alias    "committest:main"
                            :f/data     {:f/address test-utils/address?
                                         :f/assert  [{:ex/x "foo-2"
                                                      :ex/y "bar-2"
@@ -442,7 +436,7 @@
                                         :id        test-utils/db-id?}
                            :f/previous {:id test-utils/commit-id?}
                            :f/time     720000
-                           :f/v        1
+                           :f/v        2
                            :id         test-utils/commit-id?}}
                c2))))
 
@@ -451,8 +445,7 @@
              [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
                           {:id test-utils/did?}
                           :f/address  test-utils/address?
-                          :f/alias    "committest"
-                          :f/branch   "main"
+                          :f/alias    "committest:main"
                           :f/data     {:f/address  test-utils/address?
                                        :f/assert   [{:ex/x "foo-cat"
                                                      :ex/y "bar-cat"
@@ -465,13 +458,12 @@
                                        :id         test-utils/db-id?}
                           :f/previous {:id test-utils/commit-id?}
                           :f/time     720000
-                          :f/v        1
+                          :f/v        2
                           :id         test-utils/commit-id?}}
               {:f/commit {"https://www.w3.org/2018/credentials#issuer"
                           {:id test-utils/did?}
                           :f/address  test-utils/address?
-                          :f/alias    "committest"
-                          :f/branch   "main"
+                          :f/alias    "committest:main"
                           :f/data     {:f/address  test-utils/address?
                                        :f/assert   [{:ex/x "foo-cat"
                                                      :ex/y "bar-cat"
@@ -487,7 +479,7 @@
                           :f/message  "meow"
                           :f/previous {:id test-utils/commit-id?}
                           :f/time     720000
-                          :f/v        1
+                          :f/v        2
                           :id         test-utils/commit-id?}}]
              @(fluree/history conn ledger-id {:context        context
                                               :commit-details true
@@ -498,8 +490,7 @@
              [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
                           {:id test-utils/did?}
                           :f/address  test-utils/address?
-                          :f/alias    "committest"
-                          :f/branch   "main"
+                          :f/alias    "committest:main"
                           :f/previous {:id test-utils/commit-id?}
                           :f/data     {:f/address test-utils/address?
                                        :f/assert  [{:ex/x "foo-1"
@@ -511,7 +502,7 @@
                                        :f/t       1
                                        :id        test-utils/db-id?}
                           :f/time     720000
-                          :f/v        1
+                          :f/v        2
                           :id         test-utils/commit-id?}}]
              @(fluree/history conn ledger-id {:context        context
                                               :commit-details true
@@ -525,8 +516,7 @@
                   :commit  {"https://www.w3.org/2018/credentials#issuer"
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
-                            :f/alias    "committest"
-                            :f/branch   "main"
+                            :f/alias    "committest:main"
                             :f/data     {:f/address test-utils/address?
                                          :f/assert  [{:ex/x "foo-3"
                                                       :ex/y "bar-3"
@@ -540,7 +530,7 @@
                                          :id        test-utils/db-id?}
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
-                            :f/v        1
+                            :f/v        2
                             :id         test-utils/commit-id?}
                   :retract [{:ex/x "foo-2"
                              :ex/y "bar-2"
@@ -552,8 +542,7 @@
                   :commit  {"https://www.w3.org/2018/credentials#issuer"
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
-                            :f/alias    "committest"
-                            :f/branch   "main"
+                            :f/alias    "committest:main"
                             :f/data     {:f/address test-utils/address?
                                          :f/assert  [{:ex/x "foo-cat"
                                                       :ex/y "bar-cat"
@@ -642,13 +631,12 @@
                              :ex/y "bar-3"
                              :id   :ex/alice}]
                   :commit  {:f/address  test-utils/address?
-                            :f/alias    ledger-name
-                            :f/branch   "main"
+                            :f/alias    (str ledger-name ":main")
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
                                                        :id   :ex/alice}]
-                                         :f/flakes   34
+                                         :f/flakes   32
                                          :f/previous {:id test-utils/db-id?}
                                          :f/retract  [{:ex/x "foo-2"
                                                        :ex/y "bar-2"
@@ -658,7 +646,7 @@
                                          :id         test-utils/db-id?}
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
-                            :f/v        1
+                            :f/v        2
                             :id         test-utils/commit-id?}
                   :retract [{:ex/x "foo-2"
                              :ex/y "bar-2"
@@ -668,13 +656,12 @@
                              :ex/y "bar-cat"
                              :id   :ex/alice}]
                   :commit  {:f/address  test-utils/address?
-                            :f/alias    ledger-name
-                            :f/branch   "main"
+                            :f/alias    (str ledger-name ":main")
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
                                                        :id   :ex/alice}]
-                                         :f/flakes   64
+                                         :f/flakes   62
                                          :f/previous {:id test-utils/db-id?}
                                          :f/retract  [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
@@ -685,7 +672,7 @@
                             :f/message  "meow"
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
-                            :f/v        1
+                            :f/v        2
                             :id         test-utils/commit-id?}
                   :retract [{:ex/x "foo-3"
                              :ex/y "bar-3"
@@ -735,13 +722,12 @@
                   :commit  {"https://www.w3.org/2018/credentials#issuer"
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
-                            :f/alias    ledger-name
-                            :f/branch   "main"
+                            :f/alias    (str ledger-name ":main")
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-3"
                                                        :ex/y "bar-3"
                                                        :id   :ex/alice}]
-                                         :f/flakes   32
+                                         :f/flakes   30
                                          :f/previous {:id test-utils/db-id?}
                                          :f/retract  [{:ex/x "foo-2"
                                                        :ex/y "bar-2"
@@ -751,7 +737,7 @@
                                          :id         test-utils/db-id?}
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
-                            :f/v        1
+                            :f/v        2
                             :id         test-utils/commit-id?}
                   :retract [{:ex/x "foo-2"
                              :ex/y "bar-2"
@@ -763,8 +749,7 @@
                   :commit  {"https://www.w3.org/2018/credentials#issuer"
                             {:id test-utils/did?}
                             :f/address  test-utils/address?
-                            :f/alias    ledger-name
-                            :f/branch   "main"
+                            :f/alias    (str ledger-name ":main")
                             :f/data     {:f/address  test-utils/address?
                                          :f/assert   [{:ex/x "foo-cat"
                                                        :ex/y "bar-cat"
@@ -780,7 +765,7 @@
                             :f/message  "meow"
                             :f/previous {:id test-utils/commit-id?}
                             :f/time     720000
-                            :f/v        1
+                            :f/v        2
                             :id         test-utils/commit-id?}
                   :retract [{:ex/x "foo-3"
                              :ex/y "bar-3"
@@ -844,13 +829,12 @@
                                :id   :ex/alice}]
                     :commit  {:cred/issuer {:id test-utils/did?}
                               :f/address   test-utils/address?
-                              :f/alias     ledger-name
-                              :f/branch    "main"
+                              :f/alias     (str ledger-name ":main")
                               :f/data      {:f/address test-utils/address?
                                             :f/assert  [{:ex/x "foo-3"
                                                          :ex/y "bar-3"
                                                          :id   :ex/alice}]
-                                            :f/flakes  34
+                                            :f/flakes  32
                                             :f/retract [{:ex/x "foo-2"
                                                          :ex/y "bar-2"
                                                          :id   :ex/alice}]
@@ -859,7 +843,7 @@
                                             :id        test-utils/db-id?}
                               :f/previous  {:id test-utils/commit-id?}
                               :f/time      720000
-                              :f/v         1
+                              :f/v         2
                               :id          test-utils/commit-id?}
                     :retract [{:ex/x "foo-2"
                                :ex/y "bar-2"
@@ -870,13 +854,12 @@
                                :id   :ex/alice}]
                     :commit  {:cred/issuer {:id test-utils/did?}
                               :f/address   test-utils/address?
-                              :f/alias     ledger-name
-                              :f/branch    "main"
+                              :f/alias     (str ledger-name ":main")
                               :f/data      {:f/address test-utils/address?
                                             :f/assert  [{:ex/x "foo-cat"
                                                          :ex/y "bar-cat"
                                                          :id   :ex/alice}]
-                                            :f/flakes  64
+                                            :f/flakes  60
                                             :f/retract [{:ex/x "foo-3"
                                                          :ex/y "bar-3"
                                                          :id   :ex/alice}]
@@ -886,7 +869,7 @@
                               :f/message   "meow"
                               :f/previous  {:id test-utils/commit-id?}
                               :f/time      720000
-                              :f/v         1
+                              :f/v         2
                               :id          test-utils/commit-id?}
                     :retract [{:ex/x "foo-3"
                                :ex/y "bar-3"
@@ -1024,7 +1007,7 @@
                 "f:time"     720000,
                 "f:previous" {"id" test-utils/commit-id?},
                 "id"         test-utils/commit-id?
-                "f:v"        1,
+                "f:v"        2,
                 "f:branch"   "main",
                 "f:address"  test-utils/address?
                 "f:data"     {"f:address"  test-utils/address?
@@ -1040,7 +1023,7 @@
                 "f:txn"      test-utils/address?
                 "f:previous" {"id" test-utils/commit-id?}
                 "id"         test-utils/commit-id?
-                "f:v"        1,
+                "f:v"        2,
                 "f:branch"   "main",
                 "f:address"  test-utils/address?
                 "f:data"     {"f:address"  test-utils/address?
@@ -1056,7 +1039,7 @@
                 "f:txn"      test-utils/address?
                 "f:previous" {"id" test-utils/commit-id?},
                 "id"         test-utils/commit-id?
-                "f:v"        1,
+                "f:v"        2,
                 "f:branch"   "main",
                 "f:address"  test-utils/address?
                 "f:data"     {"f:address"  test-utils/address?
@@ -1107,7 +1090,7 @@
                            "f:time"     720000,
                            "f:previous" {"id" test-utils/commit-id?},
                            "id"         test-utils/commit-id?
-                           "f:v"        1,
+                           "f:v"        2,
                            "f:branch"   "main",
                            "f:address"  test-utils/address?
                            "f:data"
@@ -1145,7 +1128,7 @@
                            "f:txn"      test-utils/address?
                            "f:previous" {"id" test-utils/commit-id?},
                            "id"         test-utils/commit-id?
-                           "f:v"        1,
+                           "f:v"        2,
                            "f:branch"   "main",
                            "f:address"  test-utils/address?
                            "f:data"
@@ -1165,7 +1148,7 @@
                            "f:txn"      test-utils/address?
                            "f:previous" {"id" test-utils/commit-id?},
                            "id"         test-utils/commit-id?
-                           "f:v"        1,
+                           "f:v"        2,
                            "f:branch"   "main",
                            "f:address"  test-utils/address?
                            "f:data"
@@ -1197,7 +1180,7 @@
                             "f:time"     720000,
                             "f:previous" {"id" test-utils/commit-id?},
                             "id"         test-utils/commit-id?
-                            "f:v"        1,
+                            "f:v"        2,
                             "f:branch"   "main",
                             "f:address"  test-utils/address?
                             "f:data"
@@ -1248,7 +1231,7 @@
                             "f:time"     720000,
                             "f:previous" {"id" test-utils/commit-id?},
                             "id"         test-utils/commit-id?
-                            "f:v"        1,
+                            "f:v"        2,
                             "f:branch"   "main",
                             "f:address"  test-utils/address?
                             "f:data"

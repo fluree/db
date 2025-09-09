@@ -54,8 +54,14 @@
 (defn split-address
   "Splits `address` into the fully qualified storage method and local path."
   [address]
-  (let [i (str/last-index-of address ":")]
-    [(subs address 0 i) (subs address (inc i))]))
+  (let [i (str/index-of address "://")]
+    (if i
+      ;; For addresses with ://, the location is everything before ://
+      ;; and the path is everything after ://
+      [(subs address 0 i) (subs address (+ i 3))]
+      ;; Fallback for addresses without ://
+      (let [i (str/last-index-of address ":")]
+        [(subs address 0 i) (subs address (inc i))]))))
 
 (defn strip-extension
   [filename]

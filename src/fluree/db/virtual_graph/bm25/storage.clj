@@ -4,6 +4,7 @@
             [fluree.db.serde.protocol :as serde]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.virtual-graph :as vg]
             [fluree.db.virtual-graph.bm25.index :as bm25]
             [fluree.db.virtual-graph.bm25.stemmer :as stemmer]
@@ -123,7 +124,9 @@
   (go-try
     (let [data            (vg-data vg)
           serialized-data (serde/-serialize-bm25 serializer data)
-          path            (vg/storage-path :bm25 db-alias (vg/trim-alias-ref alias))
+          ;; Extract base ledger name for content-addressed storage
+          ledger-name     (util.ledger/ledger-base-name db-alias)
+          path            (vg/storage-path :bm25 ledger-name (vg/trim-alias-ref alias))
           write-res       (<? (storage/content-write-json storage path serialized-data))]
       (assoc write-res :type "bm25"))))
 

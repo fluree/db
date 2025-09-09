@@ -9,6 +9,7 @@
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.json-ld :as json-ld]))
 
 (defn prep-opts
@@ -130,6 +131,7 @@
                                                                            ; are no policies
                                                                            ; to check.
            ledger-opts (-> parsed-txn :opts syntax/coerce-ledger-opts)
+           _           (util.ledger/validate-ledger-name ledger-id)
            ledger      (<? (connection/create-ledger conn ledger-id ledger-opts))]
        (<? (transact/transact-ledger! ledger parsed-txn))))))
 

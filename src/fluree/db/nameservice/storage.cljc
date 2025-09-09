@@ -1,33 +1,34 @@
 (ns fluree.db.nameservice.storage
   (:require [clojure.core.async :refer [go]]
             [clojure.string :as str]
+            [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.json :as json]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
 (defn local-filename
-  ([ledger-alias]
-   (local-filename ledger-alias "main"))
-  ([ledger-alias branch]
-   (str "ns@v1/" ledger-alias "@" (or branch "main") ".json")))
-
-(defn publishing-address*
-  [store ledger-alias]
-  (-> store
-      storage/location
-      (storage/build-address ledger-alias)))
+  "Returns the local filename for a ledger's nameservice record.
+   Expects ledger-alias to be in format 'ledger:branch'.
+   Returns path like 'ns@v2/ledger-name/branch.json'."
+  [ledger-alias]
+  (let [[ledger-name branch] (util.ledger/ledger-parts ledger-alias)
+        branch (or branch "main")]
+    (str const/ns-version "/" ledger-name "/" branch ".json")))
 
 (defn ns-record
-  "Generates nameservice metadata map for JSON storage using new minimal format"
-  [ledger-alias branch commit-address t index-address]
-  (let [branch (or branch "main")]
+  "Generates nameservice metadata map for JSON storage using new minimal format.
+   Expects ledger-alias to be in format 'ledger:branch'."
+  [ledger-alias commit-address t index-address]
+  (let [[alias branch] (util.ledger/ledger-parts ledger-alias)
+        branch (or branch "main")]
     (cond-> {"@context"     {"f" iri/f-ns}
-             "@id"          (str ledger-alias "@" branch)
+             "@id"          ledger-alias  ;; Already includes :branch
              "@type"        ["f:Database" "f:PhysicalDatabase"]
-             "f:ledger"     {"@id" ledger-alias}
+             "f:ledger"     {"@id" alias}  ;; Just the ledger name without branch
              "f:branch"     branch
              "f:commit"     {"@id" commit-address}
              "f:t"          t
@@ -38,22 +39,14 @@
   nameservice/Publisher
   (publish [_ data]
     (let [;; Extract data from compact JSON-LD format (both genesis and regular commits now use this)
-          ledger-alias   (get data "alias")
-          branch         (or (get data "branch")
-                             (when (and (string? ledger-alias)
-                                        (str/includes? ledger-alias "@"))
-                               (subs ledger-alias (inc (str/last-index-of ledger-alias "@"))))
-                             "main")
+          ledger-alias   (get data "alias")  ;; Already includes @branch
           commit-address (get data "address")
           t-value        (get-in data ["data" "t"])
           index-address  (get-in data ["index" "address"])
-          ns-metadata    (ns-record ledger-alias branch commit-address t-value index-address)
+          ns-metadata    (ns-record ledger-alias commit-address t-value index-address)
           record-bytes   (json/stringify-UTF8 ns-metadata)
-          filename       (local-filename ledger-alias branch)]
-      (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :branch branch :filename filename})
-      (let [res (storage/write-bytes store filename record-bytes)]
-        (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :branch branch :filename filename})
-        res)))
+          filename       (local-filename ledger-alias)]
+      (storage/write-bytes store filename record-bytes)))
 
   (retract [_ ledger-alias]
     (let [filename (local-filename ledger-alias)
@@ -63,14 +56,16 @@
       (storage/delete store address)))
 
   (publishing-address [_ ledger-alias]
-    (go (publishing-address* store ledger-alias)))
+    ;; Just return the alias - lookup will handle branch extraction via local-filename
+    (go ledger-alias))
 
   nameservice/iNameService
   (lookup [_ ledger-address]
     (go-try
-      (let [{:keys [alias branch]} (nameservice/resolve-address (storage/location store) ledger-address nil)
-            branch                  (or branch "main")
-            filename                (local-filename alias branch)]
+      ;; ledger-address is just the alias (potentially with @branch)
+      (let [filename (local-filename ledger-address)]
+        (log/debug "StorageNameService lookup:" {:ledger-address ledger-address
+                                                 :filename filename})
         (when-let [record-bytes (<? (storage/read-bytes store filename))]
           (json/parse record-bytes false)))))
 
@@ -85,7 +80,7 @@
     (go-try
       ;; Use recursive listing to support ledger names with '/' characters
       (if (satisfies? storage/RecursiveListableStore store)
-        (if-let [list-paths-result (storage/list-paths-recursive store "ns@v1")]
+        (if-let [list-paths-result (storage/list-paths-recursive store const/ns-version)]
           (loop [remaining-paths (<? list-paths-result)
                  records []]
             (if-let [path (first remaining-paths)]
