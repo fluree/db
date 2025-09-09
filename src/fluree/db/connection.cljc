@@ -503,4 +503,4 @@
         timeout-ch (ex-info "Indexing wait timeout, but assume indexing is proceeding in the background."
                             {:status 408
                              :error :db/timeout
-                             :timeout timeout})))) )
+                             :timeout timeout})))))
