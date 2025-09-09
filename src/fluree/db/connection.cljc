@@ -207,6 +207,20 @@
                 (ns-subscribe/release-ledger conn ledger-alias))))
         (log/debug "Ledger not currently loaded:" ledger-alias "; skipping notify of changes.")))))
 
+(defn- commit->ns-info
+  "Builds an ns-info-like map from an expanded commit.
+   Used to unify logic between nameservice record and direct commit notifications."
+  [expanded-commit]
+  {:ledger-alias   (get-first-value expanded-commit const/iri-alias)
+   :branch         (get-first-value expanded-commit const/iri-branch)
+   :ns-t           (-> expanded-commit
+                       (get-first const/iri-data)
+                       (get-first-value const/iri-fluree-t))
+   :commit-address (get-first-value expanded-commit const/iri-address)
+   :index-address  (-> expanded-commit
+                       (get-first const/iri-index)
+                       (get-first-value const/iri-id))})
+
 (defn notify
   "Notifies the connection of an update to keep cached db state current.
 
