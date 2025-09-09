@@ -28,10 +28,10 @@
                        :schema/email "jane@flur.ee"
                        :schema/age   30}]})]
       (testing "stable commit id"
-        (is (= "fluree:commit:sha256:bb7xyuvqhe2wgobfj7ylsaoyuh3nucqcichfblkkl6zfirha5pvlh"
+        (is (= "fluree:commit:sha256:be2l2fggrwhsqgd4hhug4l6co2v7nbucdwecinjhdkjwzzxw775q"
                (get-in db1 [:commit :id]))))
       (testing "stable commit address"
-        (is (= "fluree:memory://b7xyuvqhe2wgobfj7ylsaoyuh3nucqcichfblkkl6zfirha5pvlh"
+        (is (= "fluree:memory://e2l2fggrwhsqgd4hhug4l6co2v7nbucdwecinjhdkjwzzxw775q"
                (get-in db1 [:commit :address]))))
       (testing "stable db id"
         (is (= "fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"
