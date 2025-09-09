@@ -149,7 +149,7 @@
    (let [ledger-name (util.ledger/ledger-base-name alias)]
      (save-txn! commit-catalog ledger-name txn)))
   ([commit-catalog ledger-name txn]
-   (let [path (str/join "/" [ledger-name "txn")]
+   (let [path (str/join "/" [ledger-name "txn"])]
      (storage/content-write-json commit-catalog path txn))))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)

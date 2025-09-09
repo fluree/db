@@ -174,11 +174,11 @@
           {:keys [index-catalog]} ledger
           cur-t      (:t db)
           cur-idx    (get-in db [:commit :index :address])]
-        (log/debug "notify-index called" {:alias (:alias ledger)
-                                           :branch branch
-                                           :cur-t cur-t
-                                           :cur-idx cur-idx
-                                           :new-index-address index-address})
+      (log/debug "notify-index called" {:alias (:alias ledger)
+                                        :branch branch
+                                        :cur-t cur-t
+                                        :cur-idx cur-idx
+                                        :new-index-address index-address})
         ;; Short-circuit if index address hasn't changed
       (if (= index-address cur-idx)
         (do (log/debug "notify-index: index address unchanged, skipping" {:address index-address})
@@ -278,7 +278,7 @@
                            (let [;; Convert expanded genesis commit to compact JSON-ld format
                                  commit-map (commit-data/json-ld->map genesis-commit nil)
                                  compact-commit (commit-data/->json-ld commit-map)]
-                             (<? (nameservice/publish primary-publisher compact-commit)))]
+                             (<? (nameservice/publish primary-publisher compact-commit))))]
       (instantiate normalized-alias primary-address commit-catalog index-catalog
                    primary-publisher secondary-publishers indexing did genesis-commit))))
 

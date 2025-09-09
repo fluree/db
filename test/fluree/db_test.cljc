@@ -1085,23 +1085,10 @@
          ;; wait for everything to be written
          (Thread/sleep 1000)
          (testing "before drop"
-<<<<<<< HEAD
-<<<<<<< HEAD
            (is (= ["destined-for-drop" "ns@v2"]
-=======
-           (is (= ["destined-for-drop@main" "ns@v1"]
->>>>>>> d80188bd1 (remove most of special branch handling)
-=======
-           (is (= ["destined-for-drop" "ns@v1"]
->>>>>>> 26564b21c (ensure branches don't use sub-directories)
                   (sort (async/<!! (fs/list-files primary-path)))))
-<<<<<<< HEAD
            (is (= ["destined-for-drop"]
                   (async/<!! (fs/list-files (str secondary-path "/ns@v2")))))
-=======
-           (is (= ["destined-for-drop_main.json"]
-                  (async/<!! (fs/list-files (str secondary-path "/ns@v1")))))
->>>>>>> 04eb7a9a2 (update branch separator to ':')
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
            ;; only store txns when signed
@@ -1133,15 +1120,7 @@
          (Thread/sleep 1000)
          (testing "after drop"
            ;; directories are not removed
-<<<<<<< HEAD
-<<<<<<< HEAD
            (is (= ["destined-for-drop" "ns@v2"]
-=======
-           (is (= ["destined-for-drop@main" "ns@v1"]
->>>>>>> d80188bd1 (remove most of special branch handling)
-=======
-           (is (= ["destined-for-drop" "ns@v1"]
->>>>>>> 26564b21c (ensure branches don't use sub-directories)
                   (sort (async/<!! (fs/list-files primary-path)))))
            ;; The destined-for-drop directory remains but should be empty
            (is (= ["destined-for-drop"]

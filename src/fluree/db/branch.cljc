@@ -197,30 +197,29 @@
       (assoc current-state
              :commit     new-commit
              :current-db new-db))
-    (do
-      (let [current-t   (commit-data/t current-commit)
-            new-t       (commit-data/t new-commit)
-            t-ok?       (or (nil? current-t)
-                           (= new-t (inc current-t)))
-            current-id  (:id current-commit)
-            new-prev-id (-> new-commit :previous :id)
-            prev-ok?    (= new-prev-id current-id)]
-        (log/warn "Commit update failure.\n  Current commit:" current-commit
-                  "\n  New commit:" new-commit)
-        (log/warn "Commit update failure detail"
-                  {:current-t current-t
-                   :new-t new-t
-                   :t-ok? t-ok?
-                   :current-id current-id
-                   :new-prev-id new-prev-id
-                   :prev-ok? prev-ok?}))
+    (let [current-t   (commit-data/t current-commit)
+          new-t       (commit-data/t new-commit)
+          t-ok?       (or (nil? current-t)
+                          (= new-t (inc current-t)))
+          current-id  (:id current-commit)
+          new-prev-id (-> new-commit :previous :id)
+          prev-ok?    (= new-prev-id current-id)]
+      (log/warn "Commit update failure detail"
+                {:current-t current-t
+                 :new-t new-t
+                 :t-ok? t-ok?
+                 :current-id current-id
+                 :new-prev-id new-prev-id
+                 :prev-ok? prev-ok?
+                 :current-commit current-commit
+                 :new-commit new-commit})
       (throw (ex-info (str "Commit failed, latest committed db is "
                            (commit-data/t current-commit)
                            " and you are trying to commit at db at t value of: "
                            (commit-data/t new-commit)
                            ". These should be one apart. Likely db was "
                            "updated by another user or process.")
-                      {:status 400 :error :db/invalid-commit}))))
+                      {:status 400 :error :db/invalid-commit})))))
 
 (defn update-commit!
   "There are 3 t values, the db's t, the 'commit' attached to the db's t, and
