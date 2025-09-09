@@ -172,30 +172,81 @@
     (util/str->long t-val)
     t-val))
 
-(defn extract-query-string-t
-  "This uses the http query string format to as a generic way to
-  select a specific 'db' that can be used in queries. For now there
-  is only one parameter/key we look for, and that is `t` which can
-  be used to specify the moment in time.
+(defn parse-time-travel-val
+  "Parses time travel value from @ syntax.
+  Supports:
+   - t:42 -> returns 42 as long
+   - iso:2025-07-01T00:00:00Z -> returns ISO string
+   - sha:abc123 -> returns {:sha \"abc123\"} map"
+  [time-str]
+  (cond
+    (str/starts-with? time-str "t:")
+    (let [val (subs time-str 2)]
+      (when (str/blank? val)
+        (throw (ex-info "Missing value for time travel spec"
+                        {:status 400 :error :db/invalid-time-travel})))
+      (util/str->long val))
 
-  e.g.:
-   - my/db?t=42
-   - my/db?t=2020-01-01T00:00:00Z"
+    (str/starts-with? time-str "iso:")
+    (let [val (subs time-str 4)]
+      (when (str/blank? val)
+        (throw (ex-info "Missing value for time travel spec"
+                        {:status 400 :error :db/invalid-time-travel})))
+      val)
+
+    (str/starts-with? time-str "sha:")
+    (let [val (subs time-str 4)]
+      (when (str/blank? val)
+        (throw (ex-info "Missing value for time travel spec"
+                        {:status 400 :error :db/invalid-time-travel})))
+      (when (< (count val) 6)
+        (throw (ex-info "SHA prefix must be at least 6 characters"
+                        {:status 400 :error :db/invalid-commit-sha :min 6})))
+      {:sha val})
+
+    :else
+    (throw (ex-info (str "Invalid time travel format: " time-str
+                         ". Expected t:, iso:, or sha: prefix")
+                    {:status 400 :error :db/invalid-time-travel}))))
+
+(defn extract-query-string-t
+  "Extracts time travel specification from ledger alias.
+  Supports two formats:
+   1. HTTP query string format: my/db?t=42 or my/db?t=2020-01-01T00:00:00Z
+   2. @ syntax: my/db@t:42, my/db@iso:2025-07-01T00:00:00Z, my/db@sha:abc123
+  
+  Returns [base-alias time-travel-value] where time-travel-value can be:
+   - nil (no time travel)
+   - Long (t value)
+   - String (ISO datetime)
+   - Map with :sha key (commit SHA)"
   [alias]
-  (let [[alias query-str] (str/split alias #"\?")]
-    (if query-str
-      [alias (-> query-str
-                 query-str->map
-                 (get "t")
-                 parse-t-val)]
-      [alias nil])))
+  (cond
+    ;; Check for @ syntax first (takes precedence)
+    (str/includes? alias "@")
+    (let [at-idx (str/index-of alias "@")
+          base-alias (subs alias 0 at-idx)
+          time-str (subs alias (inc at-idx))]
+      [base-alias (parse-time-travel-val time-str)])
+
+    ;; Fall back to ? query string syntax
+    (str/includes? alias "?")
+    (let [[base-alias query-str] (str/split alias #"\?")]
+      [base-alias (-> query-str
+                      query-str->map
+                      (get "t")
+                      parse-t-val)])
+
+    ;; No time travel specification
+    :else
+    [alias nil]))
 
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
   (go-try
     (try*
-      (let [[alias explicit-t] (extract-query-string-t alias)
-            ledger       (<? (connection/load-ledger-alias conn alias))
+      (let [[base-alias explicit-t] (extract-query-string-t alias)
+            ledger       (<? (connection/load-ledger-alias conn base-alias))
             db           (ledger/current-db ledger)
             t*           (or explicit-t t)
             query*       (assoc sanitized-query :t t*)]

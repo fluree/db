@@ -146,6 +146,11 @@
   (latest-t [_]
     t)
 
+  (sha->t [_ sha]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (time-travel/sha->t db sha)))))
+
   (-as-of [_ t]
     (let [db-chan-at-t (async/promise-chan)
           db-at-t      (->AsyncDB alias commit t db-chan-at-t)]
