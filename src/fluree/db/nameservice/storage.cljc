@@ -39,14 +39,22 @@
   nameservice/Publisher
   (publish [_ data]
     (let [;; Extract data from compact JSON-LD format (both genesis and regular commits now use this)
-          ledger-alias   (get data "alias")  ;; Already includes @branch
+          ledger-alias   (get data "alias")  ;; Already includes :branch
           commit-address (get data "address")
           t-value        (get-in data ["data" "t"])
           index-address  (get-in data ["index" "address"])
           ns-metadata    (ns-record ledger-alias commit-address t-value index-address)
           record-bytes   (json/stringify-UTF8 ns-metadata)
           filename       (local-filename ledger-alias)]
-      (storage/write-bytes store filename record-bytes)))
+      (log/debug "NS publish starting"
+                 {:alias ledger-alias
+                  :t t-value
+                  :commit commit-address
+                  :index index-address
+                  :file filename})
+      (let [res (storage/write-bytes store filename record-bytes)]
+        (log/debug "NS publish completed" {:alias ledger-alias :file filename})
+        res)))
 
   (retract [_ ledger-alias]
     (let [filename (local-filename ledger-alias)

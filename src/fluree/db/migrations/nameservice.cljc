@@ -33,6 +33,7 @@
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.filesystem :as fs]
             [fluree.db.util.json :as json]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
 (defn needs-migration?
@@ -150,9 +151,9 @@
             full-alias (str ledger-alias ":" branch)
             new-record (ns-storage/ns-record full-alias commit-address t-value index-address)
             record-bytes (json/stringify-UTF8 new-record)
-            ;; Write to current ns version nested path (ns@v2/...)
-            new-filename (str const/ns-version "/" (first (str/split full-alias #":" 2)) "/"
-                              (or (second (str/split full-alias #":" 2)) "main") ".json")]
+            [ledger-name branch-name] (util.ledger/ledger-parts full-alias)
+            branch-name (or branch-name "main")
+            new-filename (str const/ns-version "/" ledger-name "/" branch-name ".json")]
 
         ;; Write to new location using storage interface
         (<? (storage/write-bytes file-store new-filename record-bytes))

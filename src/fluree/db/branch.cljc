@@ -44,9 +44,9 @@
   (-> commit-map commit-data/->json-ld json-ld/expand))
 
 (defn load-db
-  [alias commit-catalog index-catalog commit-map]
+  [combined-alias commit-catalog index-catalog commit-map]
   (let [commit-jsonld (commit-map->commit-jsonld commit-map)]
-    (async-db/load alias commit-catalog index-catalog
+    (async-db/load combined-alias commit-catalog index-catalog
                    commit-jsonld commit-map nil)))
 
 (defn update-index-async
@@ -62,8 +62,8 @@
     (let [updated-commit (assoc commit :index index-map)
           updated-db     (async-db/->async-db alias updated-commit t)]
       (go ;; update index in the background, return updated db immediately
-        (->> (dbproto/-index-update current-db index-map)
-             (async-db/deliver! updated-db)))
+        (let [db* (<? (dbproto/-index-update current-db index-map))]
+          (async-db/deliver! updated-db db*)))
       updated-db)))
 
 (defn update-index
@@ -110,7 +110,7 @@
   [{db-commit :commit, :as db} idx-commit branch-state]
   (if (newer-index? idx-commit db-commit)
     (let [updated-db (or (use-latest-db db idx-commit branch-state)
-                         (try* (dbproto/-index-update db (:index idx-commit))
+                         (try* (<? (dbproto/-index-update db (:index idx-commit)))
                                (catch* e (log/error e "Exception updating db with new index, attempting full reload. Exception:" (ex-message e))
                                        (reload-with-index db (:index idx-commit)))))]
       updated-db)
@@ -133,7 +133,11 @@
                          {:status :success, :db indexed-db, :commit indexed-commit})
                        (catch* e
                          (log/error e "Error updating index")
-                         {:status :error, :error e}))]
+                         {:status :error
+                          :error  (ex-info "Indexing failed"
+                                           {:alias (:alias db*)
+                                            :t     (:t db*)}
+                                           e)}))]
           (when complete-ch
             (async/put! complete-ch result))
           (if (= :success (:status result))
@@ -149,17 +153,17 @@
 
 (defn state-map
   "Returns a branch map for specified branch name at supplied commit"
-  ([alias branch-name commit-catalog index-catalog publishers commit-jsonld]
-   (state-map alias branch-name commit-catalog index-catalog publishers commit-jsonld nil))
-  ([alias branch-name commit-catalog index-catalog publishers commit-jsonld indexing-opts]
+  ([combined-alias branch-name commit-catalog index-catalog publishers commit-jsonld]
+   (state-map combined-alias branch-name commit-catalog index-catalog publishers commit-jsonld nil))
+  ([combined-alias branch-name commit-catalog index-catalog publishers commit-jsonld indexing-opts]
    (let [commit-map (commit-data/jsonld->clj commit-jsonld)
-         initial-db (async-db/load alias commit-catalog index-catalog
+         initial-db (async-db/load combined-alias commit-catalog index-catalog
                                    commit-jsonld commit-map indexing-opts)
          state      (atom {:commit     commit-map
                            :current-db initial-db})
          idx-q      (index-queue publishers state)]
      {:name          branch-name
-      :alias         alias
+      :alias         combined-alias
       :state         state
       :index-queue   idx-q
       :indexing-opts indexing-opts})))
@@ -193,22 +197,29 @@
       (assoc current-state
              :commit     new-commit
              :current-db new-db))
-    (do (log/warn "Commit update failure.\n  Current commit:" current-commit
-                  "\n  New commit:" new-commit)
-        (if-not (next-t? current-commit new-commit)
-          (throw (ex-info (str "Commit failed, latest committed db t is "
-                               (commit-data/t current-commit)
-                               " and you are trying to commit at db at t value of: "
-                               (commit-data/t new-commit)
-                               ". These should be one apart. Likely db was "
-                               "updated by another user or process.")
-                          {:status 400 :error :db/invalid-commit}))
-          (throw (ex-info (str "Commit failed, The previous commit id of the new commit: '"
-                               (previous-id new-commit)
-                               "' does not match the current commit id: '"
-                               (commit-data/t new-commit)
-                               "'.")
-                          {:status 400 :error :db/invalid-commit}))))))
+    (let [current-t   (commit-data/t current-commit)
+          new-t       (commit-data/t new-commit)
+          t-ok?       (or (nil? current-t)
+                          (= new-t (inc current-t)))
+          current-id  (:id current-commit)
+          new-prev-id (-> new-commit :previous :id)
+          prev-ok?    (= new-prev-id current-id)]
+      (log/warn "Commit update failure detail"
+                {:current-t current-t
+                 :new-t new-t
+                 :t-ok? t-ok?
+                 :current-id current-id
+                 :new-prev-id new-prev-id
+                 :prev-ok? prev-ok?
+                 :current-commit current-commit
+                 :new-commit new-commit})
+      (throw (ex-info (str "Commit failed, latest committed db is "
+                           (commit-data/t current-commit)
+                           " and you are trying to commit at db at t value of: "
+                           (commit-data/t new-commit)
+                           ". These should be one apart. Likely db was "
+                           "updated by another user or process.")
+                      {:status 400 :error :db/invalid-commit})))))
 
 (defn update-commit!
   "There are 3 t values, the db's t, the 'commit' attached to the db's t, and
