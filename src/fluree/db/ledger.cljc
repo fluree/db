@@ -140,9 +140,7 @@
         ledger-alias (get-first-value expanded const/iri-id)]
     {:ledger-alias   ledger-alias
      :branch         (or (get-first-value expanded const/iri-branch)
-                         (when (and (string? ledger-alias)
-                                    (str/includes? ledger-alias ":"))
-                           (second (str/split ledger-alias #":" 2))))
+                         (second (util.ledger/ledger-parts ledger-alias)))
      :ns-t           (get-first-value expanded const/iri-fluree-t)
      :commit-address (-> (get-first expanded const/iri-commit)
                          (get-first-value const/iri-id))
@@ -242,9 +240,7 @@
   [combined-alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
    indexing-opts did latest-commit]
   (let [;; Parse ledger name and branch from combined alias
-        [ledger-alias branch] (if (str/includes? combined-alias ":")
-                                (str/split combined-alias #":" 2)
-                                [combined-alias "main"])
+        [_ branch] (util.ledger/ledger-parts combined-alias)
         publishers (cons primary-publisher secondary-publishers)
         branches {branch (branch/state-map combined-alias branch commit-catalog index-catalog
                                            publishers latest-commit indexing-opts)}]
@@ -268,18 +264,16 @@
            primary-publisher secondary-publishers]}
    {:keys [did indexing] :as _opts}]
   (go-try
-    (let [normalized-alias  alias
-          ;; internal-only opt used for migrating ledgers without genesis commits
-          init-time      (util/current-time-iso)
+    (let [init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit
-                              commit-catalog normalized-alias publish-addresses init-time))
+                              commit-catalog alias publish-addresses init-time))
           ;; Publish genesis commit to nameservice - convert expanded to compact format first
           _              (when primary-publisher
                            (let [;; Convert expanded genesis commit to compact JSON-ld format
                                  commit-map (commit-data/json-ld->map genesis-commit nil)
                                  compact-commit (commit-data/->json-ld commit-map)]
                              (<? (nameservice/publish primary-publisher compact-commit))))]
-      (instantiate normalized-alias primary-address commit-catalog index-catalog
+      (instantiate alias primary-address commit-catalog index-catalog
                    primary-publisher secondary-publishers indexing did genesis-commit))))
 
 (defn trigger-index!

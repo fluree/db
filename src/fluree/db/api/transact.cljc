@@ -1,7 +1,6 @@
 (ns fluree.db.api.transact
   (:refer-clojure :exclude [update])
   (:require [clojure.core.async :as async]
-            [clojure.string :as str]
             [fluree.db.connection :as connection]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.query.fql.parse :as parse]
