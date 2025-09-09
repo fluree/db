@@ -10,8 +10,8 @@
             [fluree.db.util.log :as log]))
 
 (defn local-filename
-  ([ledger-alias]
-   (local-filename ledger-alias "main"))
+  ([resource-name]
+   (str "ns@v1/" resource-name ".json"))
   ([ledger-alias branch]
    (str "ns@v1/" ledger-alias "@" (or branch "main") ".json")))
 
@@ -35,32 +35,36 @@
              "f:status"     "ready"}
       index-address (assoc "f:index" {"@id" index-address}))))
 
-(defrecord StorageNameService [store vg-state]
-  nameservice/Publisher
-  (publish [_ data]
-    (if (= (get data "type") "virtual-graph")
-      ;; Handle virtual graph records (already JSON-LD bytes + filename provided)
-      (let [record-bytes (get data "bytes")
-            filename     (get data "filename")]
-        (log/debug "nameservice.storage/publish virtual-graph" {:filename filename})
-        (storage/write-bytes store filename record-bytes))
-      ;; Handle regular commit records
-      (let [ledger-alias   (get data "alias")
-            branch         (or (get data "branch")
-                               (when (and (string? ledger-alias)
-                                          (str/includes? ledger-alias "@"))
-                                 (subs ledger-alias (inc (str/last-index-of ledger-alias "@"))))
-                               "main")
-            commit-address (get data "address")
-            t-value        (get-in data ["data" "t"])
-            index-address  (get-in data ["index" "address"])
-            ns-metadata    (ns-record ledger-alias branch commit-address t-value index-address)
-            record-bytes   (json/stringify-UTF8 ns-metadata)
-            filename       (local-filename ledger-alias branch)]
-        (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :branch branch :filename filename})
-        (let [res (storage/write-bytes store filename record-bytes)]
-          (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :branch branch :filename filename})
-          res))))
+;; Convert internal record map to JSON-LD for nameservice storage
+(defmulti record->json-ld
+  "Converts a nameservice record to JSON-LD format"
+  (fn [record]
+    (cond
+      (contains? record :vg-name) :virtual-graph
+      (= (get record "type") "virtual-graph") :virtual-graph
+      :else :ledger)))
+
+(defmethod record->json-ld :ledger
+  [record]
+  (let [{:strs [alias branch address]
+         {:strs [t]} "data"
+         {index-address "address"} "index"} record]
+    (ns-record alias branch address t index-address)))
+
+(defmethod record->json-ld :virtual-graph
+  [{:keys [vg-name vg-type status dependencies config] :as _record}]
+  {"@context" {"f" iri/f-ns
+               "fidx" "https://ns.flur.ee/index#"}
+   "@id" vg-name
+   "@type" (cond-> ["f:VirtualGraphDatabase"]
+             vg-type (conj vg-type))
+   "f:name" vg-name
+   "f:status" (or status "ready")
+   "f:dependencies" (mapv (fn [dep] {"@id" dep}) dependencies)
+   "fidx:config" {"@type" "@json"
+                  "@value" config}})
+
+;; NOTE: Primary StorageNameService defined later; this earlier definition was removed to avoid duplication
 
 (defn get-commit
   "Returns the minimal nameservice record."
@@ -127,8 +131,8 @@
                           (if (empty? updated-vgs)
                             (dissoc m ledger)
                             (assoc m ledger updated-vgs))))
-                    deps  ;; Start with existing deps, not empty map!
-                    deps))))
+                      deps  ;; Start with existing deps, not empty map!
+                      deps))))
 
 (defrecord StorageNameService [store vg-state]
   nameservice/Publisher
@@ -182,9 +186,9 @@
 
   (all-records [_]
     (go-try
-      ;; Use the ListableStore protocol to list all nameservice files
-      (if (satisfies? storage/ListableStore store)
-        (loop [remaining-paths (<? (storage/list-paths store "ns@v1"))
+      ;; Use recursive listing to support ledger names with '/' characters
+      (if (satisfies? storage/RecursiveListableStore store)
+        (loop [remaining-paths (<? (storage/list-paths-recursive store "ns@v1"))
                records []]
           (if-let [path (first remaining-paths)]
             (if-let [file-content (<? (storage/read-bytes store path))]
@@ -195,9 +199,9 @@
                 (recur (rest remaining-paths) (conj records record)))
               (recur (rest remaining-paths) records))
             records))
-        ;; Fallback for stores that don't support ListableStore
+        ;; Fallback for stores that don't support RecursiveListableStore
         (do
-          (log/debug "Storage backend does not support ListableStore protocol")
+          (log/debug "Storage backend does not support RecursiveListableStore protocol")
           [])))))
 
 (defn start

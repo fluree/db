@@ -589,7 +589,7 @@
 (defmethod parse-pattern :graph
   [[_ graph where] var-config context]
   (let [graph* (or (parse-variable graph)
-                   (parse-graph-string graph context))
+                   graph)
         where* (parse-where-clause where var-config context)]
     [(where/->pattern :graph [graph* where*])]))
 
