@@ -90,7 +90,7 @@ R2RML (RDB to RDF Mapping Language) is a W3C standard for expressing mappings fr
             "@type" "http://xmlns.com/foaf/0.1/Person"
             "http://xmlns.com/foaf/0.1/name" "?name"}]})
 
-(fluree/query-connection conn query)
+@(fluree/query-connection conn query)
 ;; Returns: [["http://example.com/person/1" "John Doe"]
 ;;           ["http://example.com/person/2" "Jane Smith"]]
 ```
