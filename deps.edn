@@ -38,7 +38,8 @@
         org.babashka/sci {:mvn/version "0.10.47"}
         
         ;; r2rml 
-        org.clojure/java.jdbc             {:mvn/version "0.7.12"}}
+        org.clojure/java.jdbc             {:mvn/version "0.7.12"}
+        com.mysql/mysql-connector-j       {:mvn/version "8.0.33"}}
 
  :paths ["src" "resources" "target/classes"]
 

@@ -163,14 +163,21 @@
                               (str/starts-with? (str/trim content) "["))))
 
         ;; Parse to triples using existing infrastructure
+        _ (log/debug "Parsing R2RML:" (if turtle? "Turtle format" "JSON-LD format")
+                     ", content length:" (count content))
         triples (if turtle?
-                  (turtle/parse content)
+                  (try
+                    (turtle/parse content)
+                    (catch Exception e
+                      (log/error e "Failed to parse Turtle R2RML:" (ex-message e))
+                      (throw e)))
                   ;; Use JSON-LD parser with R2RML context
                   (fql-parse/jld->parsed-triples content nil
                                                  {"@vocab" "http://www.w3.org/ns/r2rml#"
                                                   "rr" "http://www.w3.org/ns/r2rml#"
                                                   "rdf" "http://www.w3.org/1999/02/22-rdf-syntax-ns#"}))
 
+        _ (log/debug "Parsed" (count triples) "triples from R2RML")
         ;; Group by subject and extract mappings
         by-subject (group-by #(get-iri (first %)) triples)
         mappings (parse-r2rml-from-triples by-subject)]
@@ -530,20 +537,18 @@
           select-cols (build-select-columns predicates pred->var clause-predicates)
           all-selects (combine-select-columns select-cols template-cols id-col)
           where-clause (build-where-clause predicates pred->literal filter-exprs pred->var)
-
-          ;; Generate final SQL - don't uppercase if it's a subquery
-          table-ref (if (str/starts-with? table "(")
-                      table  ; It's a subquery, use as-is
-                      (str/upper-case table))  ; It's a table name, uppercase it
           final-sql (format "SELECT %s FROM %s%s"
                             all-selects
-                            table-ref
+                            table
                             (or where-clause ""))]
 
-      (when (or (seq pred->literal) (seq filter-exprs))
-        (log/debug "Literal filters:" pred->literal)
-        (log/debug "Filter expressions:" filter-exprs)
-        (log/debug "Generated SQL:" final-sql))
+      (log/debug "R2RML SQL Generation:"
+                 {:table           table
+                  :select-columns  all-selects
+                  :where-clause    (or where-clause "none")
+                  :final-sql       final-sql
+                  :literal-filters (when (seq pred->literal) pred->literal)
+                  :filter-exprs    (when (seq filter-exprs) filter-exprs)})
 
       final-sql)))
 
@@ -659,6 +664,12 @@
                            (get mapping-spec "mapping"))
         mappings (parse-min-r2rml mapping-source)
         mapping (analyze-clause-for-mapping patterns mappings)
+        _ (log/debug "R2RML Mapping Selection:"
+                     {:mappings-count    (count mappings)
+                      :available-classes (when (seq mappings) (map :class mappings))
+                      :selected-mapping  (when mapping
+                                           {:class (:class mapping)
+                                            :table (:table mapping)})})
         sql (sql-for-mapping mapping patterns)]
     {:db-spec db-spec
      :sql sql
@@ -675,7 +686,12 @@
   "Execute SQL query and transform results to solution maps."
   [db-spec sql mapping variables base-solution]
   (let [{:keys [var-mappings subject-var type-var]} variables
-        rows (jdbc/query db-spec [sql])]
+        _ (log/debug "Executing R2RML SQL query:" sql)
+        rows (try
+               (jdbc/query db-spec [sql])
+               (catch Exception e
+                 (log/error "SQL execution failed:" (ex-message e))
+                 (throw e)))]
     (map (fn [row]
            (row->solution row mapping var-mappings
                           subject-var type-var base-solution))
