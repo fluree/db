@@ -213,22 +213,27 @@
           vg-record (<? (ns-vg/get-virtual-graph primary-publisher vg-name))]
       (log/debug "VG record from nameservice:" vg-record)
       (if (= :not-found vg-record)
-        (do (log/debug "Virtual graph not found in nameservice:" vg-name)
-            nil)
+        ;; Not a virtual graph, return nil
+        (do
+          (log/debug "Virtual graph not found in nameservice:" vg-name)
+          nil)
+        ;; This is a virtual graph - need to instantiate it
         (let [types (set (get vg-record "@type" []))]
           (if (contains? types "fidx:R2RML")
             ;; For R2RML we don't require a dependency ledger; pass nil for db
             (<? (vg-loader/load-virtual-graph-from-nameservice nil primary-publisher vg-name))
             (let [dependencies (get vg-record "f:dependencies")
+                  ;; Find first ledger dependency
                   primary-ledger (extract-primary-ledger-name dependencies)]
               (log/debug "Dependencies:" dependencies "Primary ledger:" primary-ledger)
               (if primary-ledger
                 (let [ledger (<? (connection/load-ledger-alias conn primary-ledger))
                       db (ledger/current-db ledger)]
                   (log/debug "Loading VG from nameservice...")
+                  ;; Load the VG directly using the nameservice
                   (<? (vg-loader/load-virtual-graph-from-nameservice db primary-publisher vg-name)))
                 (throw (ex-info (str "Virtual graph has no ledger dependencies: " vg-name)
-                                {:status 400 :error :db/invalid-configuration}))))))))))
+                                {:status 400 :error :db/invalid-configuration})))))))))))
 
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]

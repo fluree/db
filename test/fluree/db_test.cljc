@@ -69,7 +69,7 @@
    (deftest load-from-file-test
      (testing "can load a file ledger with single cardinality predicates"
        (with-temp-dir [storage-path {}]
-         (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
+         (let [conn         @(fluree/connect-file {:storage-path {"defaultVal" (str storage-path)}})
                ledger-alias "load-from-file-test-single-card"
                db0          @(fluree/create conn ledger-alias)
                db           @(fluree/update
@@ -327,6 +327,25 @@
                            "where"    {"@id" "?s", "type" "ex:Bar"}}]
            (is (= @(fluree/query loaded q)
                   @(fluree/query db q))))))))
+
+#?(:clj
+   (deftest bad-ledger-identifier-test
+     (let [conn @(fluree/connect-memory)]
+       (is (= "Missing ledger specification."
+              (ex-message @(fluree/update! conn nil {"@context" {"ex" "http://example.com/"}
+                                                     "where" [{"@id" "?s" "@type" "ex:User"}]
+                                                     "insert" [{"@id" "?s" "@type" "ex:Foo"}]}))))
+       (is (= "Missing ledger specification."
+              (ex-message @(fluree/insert! conn nil {"@context" {"ex" "http://example.com/"}
+                                                     "@graph" [{"@id" "ex:foo" "@type" "ex:Foo"}]}))))
+       (is (= "Missing ledger specification."
+              (ex-message @(fluree/upsert! conn nil {"@context" {"ex" "http://example.com/"}
+                                                     "@graph" [{"@id" "ex:foo" "@type" "ex:Foo"}]}))))
+       (is (= "Missing ledger specification in connection query"
+              (ex-message @(fluree/query-connection conn {"@context" {"ex" "http://example.com/"}
+                                                          "where" [{"@id" "?s" "@type" "ex:User"}
+                                                                   {"@id" "?s" "?p" "?o"}]
+                                                          "select" ["?s" "?p" "?o"]})))))))
 
 #?(:clj
    (deftest load-from-memory-test

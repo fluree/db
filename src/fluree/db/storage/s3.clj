@@ -151,7 +151,7 @@
                          (sha256-hex payload))
                        (sha256-hex ""))
 
-        ;; Add required headers  
+        ;; Add required headers
         host-header (str bucket ".s3." region ".amazonaws.com")
         ;; Remove restricted headers that Java 11 HTTP client sets automatically
         headers-cleaned (dissoc headers "host" "Host" "content-length" "Content-Length")
@@ -204,7 +204,8 @@
     :or {method "GET"
          headers {}}}]
   (go-try
-    (let [;; Encode path segments for both URL and signature to match S3's encoding
+    (let [start (System/nanoTime)
+          ;; Encode path segments for both URL and signature to match S3's encoding
           encoded-path (encode-s3-path path)
           query-string (canonical-query-string query-params)
           url (str (build-s3-url bucket region encoded-path)
@@ -223,6 +224,7 @@
                            :query-params query-params})
 
           ;; Use xhttp for the actual request
+          _ (log/debug "s3-request start" {:method method :bucket bucket :path encoded-path :timeout request-timeout})
           response (<? (case method
                          "GET" (xhttp/get url {:headers signed-headers
                                                :request-timeout request-timeout})
@@ -231,7 +233,7 @@
                          "DELETE" (xhttp/delete url {:headers signed-headers
                                                      :request-timeout request-timeout})
                          (throw (ex-info "Unsupported HTTP method" {:method method}))))]
-
+      (log/debug "s3-request done" {:method method :bucket bucket :path encoded-path :duration-ms (long (/ (- (System/nanoTime) start) 1000000))})
       response)))
 
 (defn- tag-matches?
@@ -305,7 +307,10 @@
                              :body data
                              :credentials credentials
                              :request-timeout write-timeout-ms}))]
-    (async/pipe (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path})) ch)))
+    (go
+      (let [res (<? (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path})))]
+        (>! ch res)))
+    ch))
 
 (defn s3-list*
   "List objects in S3 with optional continuation token"
@@ -384,19 +389,36 @@
   storage/ContentAddressedStore
   (-content-write-bytes [this dir data]
     (go
-      (let [hash (crypto/sha2-256 data :base32)
-            bytes (if (string? data)
-                    (bytes/string->UTF8 data)
-                    data)
+      (let [hash     (crypto/sha2-256 data :base32)
+            bytes    (if (string? data)
+                       (bytes/string->UTF8 data)
+                       data)
             filename (str hash ".json")
-            path (str/join "/" [dir filename])
-            result (<! (write-s3-data this path bytes))]
+            path     (str/join "/" [dir filename])
+            result   (<! (write-s3-data this path bytes))]
         (if (instance? Throwable result)
           result
-          {:hash hash
-           :path path
-           :size (count bytes)
+          {:hash    hash
+           :path    path
+           :size    (count bytes)
            :address (s3-address identifier path)}))))
+
+  storage/ContentArchive
+  (-content-read-bytes [this address]
+    (go-try
+      (let [path (storage/get-local-path address)
+            resp (<? (read-s3-data this path))]
+        (when (not= resp ::not-found)
+          (:Body resp)))))
+
+  (get-hash [_ address]
+    (go
+      (-> address
+          storage/split-address
+          last
+          (str/split #"/")
+          last
+          storage/strip-extension)))
 
   storage/ByteStore
   (write-bytes [this path bytes]
@@ -412,16 +434,16 @@
   storage/EraseableStore
   (delete [_ address]
     (go-try
-      (let [path (storage/get-local-path address)
+      (let [path      (storage/get-local-path address)
             full-path (str prefix path)
-            policy {:max-retries max-retries
-                    :retry-base-delay-ms retry-base-delay-ms
-                    :retry-max-delay-ms retry-max-delay-ms}]
-        (<? (with-retries (fn [] (s3-request {:method "DELETE"
-                                              :bucket bucket
-                                              :region region
-                                              :path full-path
-                                              :credentials credentials
+            policy    {:max-retries         max-retries
+                       :retry-base-delay-ms retry-base-delay-ms
+                       :retry-max-delay-ms  retry-max-delay-ms}]
+        (<? (with-retries (fn [] (s3-request {:method          "DELETE"
+                                              :bucket          bucket
+                                              :region          region
+                                              :path            full-path
+                                              :credentials     credentials
                                               :request-timeout write-timeout-ms}))
               policy)))))
 
@@ -429,7 +451,7 @@
   (list-paths-recursive [this path-prefix]
     (go-try
       ;; Use existing s3-list function to list objects with the prefix
-      (let [results-ch (s3-list this path-prefix)
+      (let [results-ch  (s3-list this path-prefix)
             all-results (loop [acc []]
                           (let [batch (<! results-ch)]
                             (if batch
@@ -466,7 +488,7 @@
   "Runs thunk returning a channel; retries on retryable errors with backoff/jitter.
   policy may include :log-context with keys like {:method :bucket :path}"
   [thunk {:keys [max-retries retry-base-delay-ms retry-max-delay-ms log-context] :as _policy}]
-  (let [out (async/promise-chan)]
+  (let [out (async/chan 1)]
     (go-loop [attempt 0]
       (let [start (System/nanoTime)
             res (<! (thunk))
@@ -492,7 +514,8 @@
                               (ex-data res)
                               log-context)]
               (log/error "S3 request failed permanently" data)
-              (>! out res)))
+              (>! out res)
+              (async/close! out)))
           (do
             (when (pos? attempt)
               (log/info "S3 request succeeded after retries"
@@ -500,7 +523,8 @@
                                 :attempts (inc attempt)
                                 :duration-ms duration-ms}
                                log-context)))
-            (>! out res)))))
+            (>! out res)
+            (async/close! out)))))
     out))
 
 (defn open

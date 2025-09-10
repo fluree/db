@@ -136,7 +136,8 @@
                          [:pretty-print {:optional true} ::pretty-print]
                          [:did {:optional true} ::identity]
                          [:default-allow? {:optional true} ::default-allow?]
-                         [:parse-json {:optional true} ::parse-json]]
+                         [:parse-json {:optional true} ::parse-json]
+                         [:object-var-parsing {:optional true} :boolean]]
     ::stage-opts        [:map
                          [:meta {:optional true} ::meta]
                          [:max-fuel {:optional true} ::max-fuel]
@@ -146,7 +147,8 @@
                          [:context {:optional true} ::context]
                          [:raw-txn {:optional true} :any]
                          [:author {:optional true} ::identity]
-                         [:policy-values {:optional true} :any]]
+                         [:policy-values {:optional true} :any]
+                         [:object-var-parsing {:optional true} :boolean]]
     ::commit-opts       [:map
                          [:meta {:optional true} ::meta]
                          [:identity {:optional true} ::identity]

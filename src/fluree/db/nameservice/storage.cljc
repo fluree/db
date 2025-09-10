@@ -5,12 +5,15 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
 
 (defn local-filename
-  [resource-name]
-  (str "ns@v1/" resource-name ".json"))
+  ([resource-name]
+   (str "ns@v1/" resource-name ".json"))
+  ([ledger-alias branch]
+   (str "ns@v1/" ledger-alias "@" (or branch "main") ".json")))
 
 (defn publishing-address*
   [store ledger-alias]
@@ -18,12 +21,14 @@
       storage/location
       (storage/build-address ledger-alias)))
 
+;; Convert internal record map to JSON-LD for nameservice storage
 (defmulti record->json-ld
   "Converts a nameservice record to JSON-LD format"
   (fn [record]
-    (if (contains? record :vg-name)
-      :virtual-graph
-      :ledger)))
+    (cond
+      (contains? record :vg-name) :virtual-graph
+      (= (get record "type") "virtual-graph") :virtual-graph
+      :else :ledger)))
 
 (defmethod record->json-ld :ledger
   [record]
@@ -192,25 +197,20 @@
     (go-try
       ;; Use recursive listing to support ledger names with '/' characters
       (if (satisfies? storage/RecursiveListableStore store)
-        (if-let [list-paths-result (storage/list-paths-recursive store "ns@v1")]
-          (loop [remaining-paths (<? list-paths-result)
-                 records []]
-            (if-let [path (first remaining-paths)]
-              (let [file-content (<? (storage/read-bytes store path))]
-                (if file-content
-                  (let [content-str (if (string? file-content)
-                                      file-content
-                                      #?(:clj (let [^bytes bytes-content file-content]
-                                                (String. bytes-content "UTF-8"))
-                                         :cljs (js/String.fromCharCode.apply nil file-content)))
-                        record (json/parse content-str false)]
-                    (recur (rest remaining-paths) (conj records record)))
-                  (recur (rest remaining-paths) records)))
-              records))
-          [])
+        (loop [remaining-paths (<? (storage/list-paths-recursive store "ns@v1"))
+               records []]
+          (if-let [path (first remaining-paths)]
+            (if-let [file-content (<? (storage/read-bytes store path))]
+              (let [content-str (if (string? file-content)
+                                  file-content
+                                  (bytes/UTF8->string file-content))
+                    record (json/parse content-str false)]
+                (recur (rest remaining-paths) (conj records record)))
+              (recur (rest remaining-paths) records))
+            records))
         ;; Fallback for stores that don't support RecursiveListableStore
         (do
-          (log/warn "Storage backend does not support RecursiveListableStore protocol")
+          (log/debug "Storage backend does not support RecursiveListableStore protocol")
           [])))))
 
 (defn start

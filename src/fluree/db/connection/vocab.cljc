@@ -10,6 +10,9 @@
   [s]
   (str system-ns s))
 
+(def config-type
+  (system-iri "Configuration"))
+
 (def config-val-type
   (system-iri "ConfigurationValue"))
 
@@ -86,7 +89,7 @@
   (system-iri "parallelism"))
 
 (def cache-max-mb
-  (system-iri "cachMaxMb"))
+  (system-iri "cacheMaxMb"))
 
 (def commit-storage
   (system-iri "commitStorage"))
@@ -135,3 +138,6 @@
 
 (def connection
   (system-iri "connection"))
+
+(def connection-config
+  (system-iri "connectionConfig"))

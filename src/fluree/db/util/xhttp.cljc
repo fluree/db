@@ -76,7 +76,8 @@
     (ex-info message
              (cond-> {:url   url
                       :error error}
-               status (assoc :status status)))))
+               status (assoc :status status))
+             e)))
 
 #?(:clj
    (defn throw-if-timeout [error]
@@ -97,7 +98,7 @@
                         json? (assoc "Content-Type" "application/json")
                         token (assoc "Authorization" (str "Bearer " token)))]
     #?(:clj
-       (async/go
+       (async/thread
          (try
            (let [builder (-> (HttpRequest/newBuilder)
                              (.uri (URI/create url))
@@ -184,7 +185,7 @@
                         headers (merge headers)
                         token   (assoc "Authorization" (str "Bearer " token)))]
     #?(:clj
-       (async/go
+       (async/thread
          (try
            (let [builder (-> (HttpRequest/newBuilder)
                              (.uri (URI/create url))
@@ -258,7 +259,7 @@
          :or {request-timeout 5000}} opts
         response-chan (async/chan)]
     #?(:clj
-       (async/go
+       (async/thread
          (try
            (let [builder (-> (HttpRequest/newBuilder)
                              (.uri (URI/create url))
@@ -306,7 +307,7 @@
          :or {request-timeout 5000}} opts
         response-chan (async/chan)]
     #?(:clj
-       (async/go
+       (async/thread
          (try
            (let [builder (-> (HttpRequest/newBuilder)
                              (.uri (URI/create url))
