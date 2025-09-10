@@ -233,7 +233,7 @@
                   ;; Load the VG directly using the nameservice
                   (<? (vg-loader/load-virtual-graph-from-nameservice db primary-publisher vg-name)))
                 (throw (ex-info (str "Virtual graph has no ledger dependencies: " vg-name)
-                                {:status 400 :error :db/invalid-configuration})))))))))))
+                                {:status 400 :error :db/invalid-configuration}))))))))))
 
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
