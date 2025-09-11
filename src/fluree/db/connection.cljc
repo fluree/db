@@ -10,6 +10,7 @@
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
+            [fluree.db.nameservice.storage :as ns-storage]
             [fluree.db.nameservice.sub :as ns-subscribe]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
@@ -252,6 +253,11 @@
 (defn publishers
   [{:keys [primary-publisher secondary-publishers] :as _conn}]
   (cons primary-publisher secondary-publishers))
+
+(defn primary-publisher
+  "Returns the primary nameservice publisher for the connection"
+  [{:keys [primary-publisher] :as _conn}]
+  primary-publisher)
 
 (defn publications
   [conn]
@@ -563,6 +569,74 @@
           (<? (storage/delete storage index-address))))
       :index-dropped)))
 
+(defn- check-ledger-dependencies
+  "Checks if ledger has dependent virtual graphs"
+  [primary-pub ledger-alias]
+  (if primary-pub
+    ;; Check with alias:main as default branch using new delimiter
+    (let [ledger-with-branch (if (str/includes? ledger-alias ":")
+                               ledger-alias
+                               (str ledger-alias ":main"))]
+      (ns-storage/check-vg-dependencies primary-pub ledger-with-branch))
+    (do
+      (log/debug "No primary publisher, skipping dependency check")
+      #{})))
+
+(defn- throw-if-has-dependencies
+  "Throws exception if ledger has dependent virtual graphs"
+  [alias dependent-vgs]
+  (when (seq dependent-vgs)
+    (throw (ex-info (str "Cannot delete ledger '" alias
+                         "' - it has dependent virtual graphs: "
+                         (str/join ", " dependent-vgs)
+                         ". Delete the virtual graphs first.")
+                    {:status 400
+                     :error :db/ledger-has-dependencies
+                     :ledger alias
+                     :dependent-vgs dependent-vgs}))))
+
+(defn- get-branch-commit-info
+  "Retrieves branch commit and index addresses from nameservice record"
+  [ns-record]
+  {:branch         (get ns-record "f:branch" "main")
+   :commit-address (get-in ns-record ["f:commit" "@id"])
+   :index-address  (get-in ns-record ["f:index" "@id"])})
+
+(defn- load-latest-commit
+  "Loads and expands the latest commit if it exists"
+  [conn commit-address index-address]
+  (go-try
+    (when commit-address
+      (let [commit (<? (commit-storage/load-commit-with-metadata
+                        (:commit-catalog conn)
+                        commit-address
+                        index-address))]
+        (when commit
+          (json-ld/expand commit))))))
+
+(defn- drop-ledger-artifacts
+  "Drops all artifacts (index and commit) for a ledger"
+  [conn latest-commit]
+  (when latest-commit
+    (drop-index-artifacts conn latest-commit)
+    (drop-commit-artifacts conn latest-commit)))
+
+(defn- drop-ledger-from-publisher
+  "Drops a single ledger from a specific publisher"
+  [conn publisher alias]
+  (go-try
+    (let [ledger-addr  (<? (nameservice/publishing-address publisher alias))
+          ns-record    (<? (nameservice/lookup publisher ledger-addr))
+          {:keys [branch commit-address index-address]} (get-branch-commit-info ns-record)
+          latest-commit (<? (load-latest-commit conn commit-address index-address))
+          ;; Ensure we have the correct format for retract
+          full-alias (if (str/includes? alias ":")
+                       alias
+                       (str alias ":" branch))]
+      (log/debug "Dropping ledger" ledger-addr)
+      (drop-ledger-artifacts conn latest-commit)
+      (<? (nameservice/retract publisher full-alias)))))
+
 (defn drop-ledger
   [conn alias]
   (go
@@ -572,29 +646,28 @@
                     ;; Normalize alias to include branch if not present
                     (if (str/includes? alias ":")
                       alias
-                      (str alias ":main")))]
+                      (str alias ":main")))
+            primary-pub   (:primary-publisher conn)
+            dependent-vgs (check-ledger-dependencies primary-pub alias)]
+
+        (log/debug "drop-ledger starting" {:alias alias :has-dependencies? (seq dependent-vgs)})
+        (throw-if-has-dependencies alias dependent-vgs)
+        
         (loop [[publisher & r] (publishers conn)]
           (when publisher
-            (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
-                  ns-record     (<? (nameservice/lookup publisher ledger-addr))
-                  commit-address (get-in ns-record ["f:commit" "@id"])
-                  index-address  (get-in ns-record ["f:index" "@id"])
-                  latest-commit  (when commit-address
-                                   (let [commit (<? (commit-storage/load-commit-with-metadata
-                                                     (:commit-catalog conn)
-                                                     commit-address
-                                                     index-address))]
-                                     (when commit
-                                       (json-ld/expand commit))))]
-              (log/debug "Dropping ledger" ledger-addr)
-              (when latest-commit
-                (drop-index-artifacts conn latest-commit)
-                (drop-commit-artifacts conn latest-commit))
-              (<? (nameservice/retract publisher alias))
-              (recur r))))
+            (log/debug "Dropping from publisher" {:publisher (type publisher) :alias alias})
+            (<? (drop-ledger-from-publisher conn publisher alias))
+            (recur r)))
         (log/debug "Dropped ledger" alias)
         :dropped)
-      (catch* e (log/debug e "Failed to complete ledger deletion")))))
+      (catch* e
+        ;; Return dependency errors directly so they reach the caller through the channel
+        (if (= :db/ledger-has-dependencies (:error (ex-data e)))
+          e
+          (do
+            (log/error e "Failed to complete ledger deletion")
+            ;; Return the exception for other failures too
+            e))))))
 
 (defn resolve-txn
   "Reads a transaction from the commit catalog by address.

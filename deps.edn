@@ -35,7 +35,11 @@
         org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
         ;; SCI for GraalVM-compatible code evaluation
-        org.babashka/sci {:mvn/version "0.10.47"}}
+        org.babashka/sci {:mvn/version "0.10.47"}
+        
+        ;; r2rml 
+        org.clojure/java.jdbc             {:mvn/version "0.7.12"}
+        com.mysql/mysql-connector-j       {:mvn/version "8.0.33"}}
 
  :paths ["src" "resources" "target/classes"]
 
@@ -51,7 +55,8 @@
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.5.0"}
                  criterium/criterium               {:mvn/version "0.4.6"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
-                 thheller/shadow-cljs              {:mvn/version "2.28.15"}}}
+                 thheller/shadow-cljs              {:mvn/version "2.28.15"}
+                 com.h2database/h2                 {:mvn/version "2.2.224"}}}
 
   :cljtest
   {:extra-paths ["test" "dev-resources" "test-resources"]
@@ -61,7 +66,8 @@
                  babashka/fs                             {:mvn/version "0.5.20"}
                  clj-test-containers/clj-test-containers {:mvn/version "0.7.4"}
                  org.testcontainers/testcontainers       {:mvn/version "1.19.3"}
-                 org.testcontainers/localstack           {:mvn/version "1.19.3"}}
+                 org.testcontainers/localstack           {:mvn/version "1.19.3"}
+                 com.h2database/h2                       {:mvn/version "2.2.224"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/skip-meta [:pending :docker]}}
 
@@ -74,7 +80,8 @@
                  babashka/fs                           {:mvn/version "0.5.20"}
                  clj-test-containers/clj-test-containers {:mvn/version "0.7.4"}
                  org.testcontainers/testcontainers     {:mvn/version "1.19.3"}
-                 org.testcontainers/localstack         {:mvn/version "1.19.3"}}
+                 org.testcontainers/localstack         {:mvn/version "1.19.3"}
+                 com.h2database/h2                     {:mvn/version "2.2.224"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/focus-meta [:sci]}}
 

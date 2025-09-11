@@ -543,9 +543,10 @@
           p-iri  (get-s-iri db pid compact-fn)
           objs   (subject-block-pred db compact-fn list?
                                      p-flakes)
-          objs*  (cond-> objs
-                   list? handle-list-values
-                   (= 1 (count objs)) first)
+          objs*  (cond
+                   list? (handle-list-values objs)
+                   (= 1 (count objs)) (first objs)
+                   :else objs)
           acc'   (assoc acc p-iri objs*)]
       (if (seq r)
         (recur r acc')
