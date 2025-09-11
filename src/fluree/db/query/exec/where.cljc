@@ -10,7 +10,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.track :as track]
             [fluree.db.util :as util :refer [try* catch*]]
-            [fluree.db.util.async :refer [<?]]
+            [fluree.db.util.async :refer [<? empty-channel]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (clojure.lang MapEntry))))
@@ -487,10 +487,6 @@
   "A triple pattern with any match components that are empty optional vars."
   [triple-pattern]
   (not-empty (keep get-optional triple-pattern)))
-
-(def empty-channel
-  (doto (async/chan)
-    async/close!))
 
 (defn resolve-flake-range
   ([db tracker error-ch pattern]

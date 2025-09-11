@@ -52,6 +52,10 @@
            ~@body
            (catch Throwable t# t#))))))
 
+(def empty-channel
+  (doto (async/chan)
+    async/close!))
+
 (defn repartition-by
   [f ch]
   (let [xf     (comp cat (partition-by f))
