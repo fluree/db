@@ -521,16 +521,32 @@
   [s-mch attrs var-config context]
   (trampoline parse-statements* s-mch attrs var-config context))
 
+(defn specified-properties?
+  [attrs]
+  (every? v/specified-value? (keys attrs)))
+
+(defn variable-objects?
+  [attrs]
+  (every? v/query-variable? (vals attrs)))
+
+(defn simple-property-join?
+  [id attrs]
+  (and (>= (count attrs) 2)
+       (v/query-variable? id)
+       (specified-properties? attrs)
+       (variable-objects? attrs)))
+
 (defn parse-id-map-pattern
   [m var-config context]
-  (let [s-mch (-> m
-                  (get const/iri-id)
-                  (parse-subject context))
+  (let [id    (get m const/iri-id)
+        s-mch (parse-subject id context)
         attrs (dissoc m const/iri-id)]
     (if (empty? attrs)
       [(where/->pattern :id s-mch)]
       (let [statements (parse-statements s-mch attrs var-config context)]
-        (sort optimize/compare-triples statements)))))
+        (if (simple-property-join? id attrs)
+          [(where/->pattern :property-join statements)]
+          (sort optimize/compare-triples statements))))))
 
 (defn parse-node-map
   [m var-config context]
@@ -612,17 +628,20 @@
         (parse-where-clause var-config context))))
 
 (defn unwrap-tuple-patterns
-  "Construct accepts ::v/node-map patterns, which can produce :tuple patterns, :class
-  patterns, or :id patterns. We only need the pattern components as a template for
-  construct, the :id and :class patterns are for optimized query execution, so this
-  function unwraps :id and :class patterns and only returns the underlying components."
+  "Construct accepts node-map patterns, which can produce :tuple patterns, :class
+  patterns, or :id patterns. We only need the pattern components as a template
+  for construct, the :id and :class patterns are for optimized query execution,
+  so this function unwraps :id and :class patterns and only returns the
+  underlying components."
   [patterns]
-  (mapv (fn [[pattern-type component :as pattern]]
-          (case pattern-type
-            :class component
-            :id    [component]
-            pattern))
-        patterns))
+  (->> patterns
+       (mapcat (fn [[pattern-type component :as pattern]]
+                 (case pattern-type
+                   :class         [component]
+                   :property-join component
+                   :id            [[component]]
+                   [pattern])))
+       vec))
 
 (defn parse-construct
   [q context]
