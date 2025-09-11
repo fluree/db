@@ -7,7 +7,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.track :as track]
             [fluree.db.util :refer [try* catch*]]
-            [fluree.db.util.async :refer [<?]]
+            [fluree.db.util.async :refer [<? empty-channel]]
             [fluree.db.util.log :as log]
             [fluree.db.vector.scoring :refer [dot-product cosine-similarity euclidian-distance]]
             [fluree.db.virtual-graph.parse :as vg-parse]))
@@ -69,10 +69,13 @@
     (vg-parse/finalize (partial search db tracker dot-product reverse-result-sort) error-ch solution-ch))
 
   (-match-id [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    empty-channel)
 
   (-match-class [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    empty-channel)
+
+  (-match-properties [_ tracker solution triples error-ch]
+    (where/match-triples db tracker solution triples error-ch))
 
   (-activate-alias [_ alias']
     (where/-activate-alias db alias'))
@@ -93,10 +96,13 @@
     (vg-parse/finalize (partial search db tracker cosine-similarity reverse-result-sort) error-ch solution-ch))
 
   (-match-id [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    empty-channel)
 
   (-match-class [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    empty-channel)
+
+  (-match-properties [_ tracker solution triples error-ch]
+    (where/match-triples db tracker solution triples error-ch))
 
   (-activate-alias [_ alias']
     (where/-activate-alias db alias'))
@@ -117,10 +123,13 @@
     (vg-parse/finalize (partial search db tracker euclidian-distance result-sort) error-ch solution-ch))
 
   (-match-id [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    empty-channel)
 
   (-match-class [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    empty-channel)
+
+  (-match-properties [_ tracker solution triples error-ch]
+    (where/match-triples db tracker solution triples error-ch))
 
   (-activate-alias [_ alias']
     (where/-activate-alias db alias'))
