@@ -7,11 +7,11 @@
 (deftest ^:integration class-policy-query
   (testing "Policy class based query tests."
     (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "policy/class-policy-query")
+          db0 @(fluree/create conn "policy/class-policy-query")
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           db        @(fluree/update
-                      (fluree/db ledger)
+                      db0
                       {"@context" {"ex"     "http://example.org/ns/"
                                    "schema" "http://schema.org/"
                                    "f"      "https://ns.flur.ee/ledger#"}
@@ -57,7 +57,7 @@
                                                    ["http://example.org/ns/EmployeePolicy"]
                                                    ;; presumably values like this would come from upstream
                                                    ;; application or identity provider
-                                                   ["?$identity" [alice-did]])]
+                                                   ["?$identity" [{"@type" "@id" "@value" alice-did}]])]
 
           (testing "with direct select binding restricts"
             (is (= [["ex:alice" "111-11-1111"]]

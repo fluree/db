@@ -32,7 +32,8 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.time-travel :refer [TimeTravel]]
-            [fluree.db.util :as util :refer [try* catch* get-first get-first-value]]
+            [fluree.db.util :as util :refer [try* catch* get-id get-types get-list
+                                             get-first get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]
@@ -149,31 +150,31 @@
     t))
 
 (defn add-list-meta
-  [list-val]
-  (let [m {:i (-> list-val :idx last)}]
+  [idx list-val]
+  (let [m {:i idx}]
     (assoc list-val ::meta m)))
 
 (defn list-value?
   "returns true if json-ld value is a list object."
   [v]
   (and (map? v)
-       (= :list (-> v first key))))
+       (= const/iri-list (-> v first key))))
 
-(defn node?
-  "Returns true if a nested value is itself another node in the graph.
+(defn subject-node?
+  "Returns true if a nested value is itself another subject node in the graph.
   Only need to test maps that have :id - and if they have other properties they
   are defining then we know it is a node and have additional data to include."
   [mapx]
   (cond
-    (contains? mapx :value)
+    (contains? mapx const/iri-value)
     false
 
     (list-value? mapx)
     false
 
     (and
-     (contains? mapx :set)
-     (= #{:set :idx} (set (keys mapx))))
+     (contains? mapx const/iri-set)
+     (= 1 (count mapx)))
     false
 
     :else
@@ -181,9 +182,9 @@
 
 (defn value-map->flake
   [assert? db sid pid t v-map]
-  (let [ref-id (:id v-map)
+  (let [ref-id (get-id v-map)
         meta   (::meta v-map)]
-    (if (and ref-id (node? v-map))
+    (if (and ref-id (subject-node? v-map))
       (let [ref-sid (iri/encode-iri db ref-id)]
         (flake/create sid pid ref-sid const/$id t assert? meta))
       (let [[value dt] (datatype/from-expanded db v-map)]
@@ -194,27 +195,28 @@
   (let [v-maps (util/sequential value)]
     (mapcat (fn [v-map]
               (if (list-value? v-map)
-                (let [list-vals (:list v-map)]
+                (let [list-vals (get-list v-map)]
                   (into []
-                        (comp (map add-list-meta)
+                        (comp (map-indexed add-list-meta)
                               (map (partial value-map->flake assert? db sid pid t)))
                         list-vals))
                 [(value-map->flake assert? db sid pid t v-map)]))
             v-maps)))
 
 (defn- get-type-flakes
-  [assert? db t sid type]
+  [assert? db t sid types]
   (into []
         (map (fn [type-item]
                (let [type-sid (iri/encode-iri db type-item)]
                  (flake/create sid const/$rdf:type type-sid
                                const/$id t assert? nil))))
-        type))
+        types))
 
 (defn node->flakes
   [assert? db t node]
   (log/trace "node->flakes:" node "assert?" assert?)
-  (let [{:keys [id type]} node
+  (let [id              (get-id node)
+        types           (get-types node)
         sid             (if assert?
                           (iri/encode-iri db id)
                           (or (iri/encode-iri db id)
@@ -224,11 +226,11 @@
                                 {:status 400
                                  :error  :db/invalid-retraction
                                  :iri    id}))))
-        type-assertions (if (seq type)
-                          (get-type-flakes assert? db t sid type)
+        type-assertions (if (seq types)
+                          (get-type-flakes assert? db t sid types)
                           [])]
     (into type-assertions
-          (comp (remove #(-> % key keyword?))
+          (comp (remove #(-> % key #{const/iri-id const/iri-type}))
                 (mapcat
                  (fn [[prop value]]
                    (let [pid (if assert?
@@ -264,7 +266,7 @@
   [db commit-jsonld commit-data-jsonld]
   (go-try
     (let [t-new            (db-t commit-data-jsonld)
-          nses             (map :value
+          nses             (map util/get-value
                                 (get commit-data-jsonld const/iri-namespaces))
           db*              (with-namespaces db nses)
           asserted-flakes  (->> (db-assert commit-data-jsonld)
@@ -487,7 +489,7 @@
     (try*
       (<? (flake.transact/-merge-commit db commit-jsonld db-data-jsonld))
       (catch* e
-        (log/error e "Error merging commit")
+        (log/error e "Error merging novelty commit")
         (>! error-ch e)))))
 
 (defn merge-novelty-commits
@@ -549,13 +551,21 @@
                          (<? (index-storage/read-db-root index-catalog address))
                          (genesis-root-map ledger-alias))
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
+           ;; Ensure commit map reflects loaded index t when an index address exists
+           commit-map* (if (get-in commit-map [:index :address])
+                         (update commit-map :index
+                                 (fn [idx]
+                                   (let [existing-data (:data idx)
+                                         updated-data  (assoc (or existing-data {}) :t (:t root-map))]
+                                     (assoc idx :data updated-data))))
+                         commit-map)
            indexed-db  (-> root-map
                            (add-reindex-thresholds indexing-opts)
                            (assoc :index-catalog index-catalog
                                   :commit-catalog commit-catalog
                                   :alias ledger-alias
                                   :branch branch
-                                  :commit commit-map
+                                  :commit commit-map*
                                   :tt-id nil
                                   :comparators index/comparators
                                   :staged nil

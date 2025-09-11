@@ -3,11 +3,11 @@
                :cljs [fluree.db.storage.localstorage :as localstorage-store])
             #?(:clj [fluree.db.migrations.nameservice-v1 :as ns-migration])
             #?(:clj [fluree.db.storage.file :as file-storage])
-            [fluree.crypto :as crypto]
             [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]
             [fluree.db.connection.config :as config]
             [fluree.db.connection.vocab :as conn-vocab]
+            [fluree.db.constants :as const]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.nameservice.ipns :as ipns-nameservice]
             [fluree.db.nameservice.storage :as storage-nameservice]
@@ -52,8 +52,8 @@
 (defn reference?
   [node]
   (and (map? node)
-       (contains? node :id)
-       (-> node (dissoc :idx :id) empty?)))
+       (contains? node const/iri-id)
+       (-> node (dissoc const/iri-id) empty?)))
 
 (defn convert-reference
   [node]
@@ -77,7 +77,7 @@
                (assoc m id (convert-node-references node)))
              {} cfg))
 
-(defmethod ig/expand-key :fluree.db/connection
+(defmethod ig/expand-key :fluree.db/abstract-connection
   [k config]
   (let [cache-max-mb   (config/get-first-integer config conn-vocab/cache-max-mb)
         commit-storage (get config conn-vocab/commit-storage)
@@ -151,7 +151,7 @@
   (let [env-var     (get-first-value config-value-node conn-vocab/env-var)
         java-prop   (get-first-value config-value-node conn-vocab/java-prop)
         default-val (get-first-value config-value-node conn-vocab/default-val)]
-    {:value (get-priority-value env-var java-prop default-val)}))
+    {const/iri-value (get-priority-value env-var java-prop default-val)}))
 
 (defmethod ig/init-key :fluree.db/cache
   [_ max-mb]
@@ -179,8 +179,20 @@
      (let [identifier  (config/get-first-string config conn-vocab/address-identifier)
            s3-bucket   (config/get-first-string config conn-vocab/s3-bucket)
            s3-prefix   (config/get-first-string config conn-vocab/s3-prefix)
-           s3-endpoint (config/get-first-string config conn-vocab/s3-endpoint)]
-       (s3-storage/open identifier s3-bucket s3-prefix s3-endpoint))))
+           s3-endpoint (config/get-first-string config conn-vocab/s3-endpoint)
+           read-timeout-ms (config/get-first-long config conn-vocab/s3-read-timeout-ms)
+           write-timeout-ms (config/get-first-long config conn-vocab/s3-write-timeout-ms)
+           list-timeout-ms (config/get-first-long config conn-vocab/s3-list-timeout-ms)
+           max-retries (config/get-first-integer config conn-vocab/s3-max-retries)
+           retry-base-delay-ms (config/get-first-long config conn-vocab/s3-retry-base-delay-ms)
+           retry-max-delay-ms (config/get-first-long config conn-vocab/s3-retry-max-delay-ms)]
+       (s3-storage/open identifier s3-bucket s3-prefix s3-endpoint
+                        {:read-timeout-ms read-timeout-ms
+                         :write-timeout-ms write-timeout-ms
+                         :list-timeout-ms list-timeout-ms
+                         :max-retries max-retries
+                         :retry-base-delay-ms retry-base-delay-ms
+                         :retry-max-delay-ms retry-max-delay-ms}))))
 
 (defmethod ig/init-key :fluree.db.storage/ipfs
   [_ config]
@@ -223,53 +235,9 @@
   [_ _]
   (json-serde))
 
-(defn parse-identity
-  [defaults]
-  (when-let [identity (get-first defaults conn-vocab/identity)]
-    (let [public-key  (config/get-first-string identity conn-vocab/public-key)
-          private-key (config/get-first-string identity conn-vocab/private-key)
-          ;; Derive public key from private key if public key is missing
-          public-key* (if (and (nil? public-key) private-key)
-                        (crypto/public-key-from-private private-key)
-                        public-key)
-          result {:id      (get-id identity)
-                  :public  public-key*
-                  :private private-key}]
-      result)))
-
-(defn parse-index-options
-  [defaults]
-  (when-let [index-options (get-first defaults conn-vocab/index-options)]
-    {:reindex-min-bytes (config/get-first-long index-options conn-vocab/reindex-min-bytes)
-     :reindex-max-bytes (config/get-first-long index-options conn-vocab/reindex-max-bytes)
-     :max-old-indexes   (config/get-first-integer index-options conn-vocab/max-old-indexes)
-     :indexing-disabled (config/get-first-boolean index-options conn-vocab/indexing-disabled)}))
-
-(defn parse-defaults
-  [config]
-  (when-let [defaults (get-first config conn-vocab/defaults)]
-    (let [identity      (parse-identity defaults)
-          index-options (parse-index-options defaults)]
-      (cond-> nil
-        identity      (assoc :identity identity)
-        index-options (assoc :indexing index-options)))))
-
 (defmethod ig/init-key :fluree.db/connection
-  [_ {:keys [cache commit-catalog index-catalog serializer] :as config}]
-  (let [parallelism          (config/get-first-integer config conn-vocab/parallelism)
-        primary-publisher    (get-first config conn-vocab/primary-publisher)
-        secondary-publishers (get config conn-vocab/secondary-publishers)
-        remote-systems       (get config conn-vocab/remote-systems)
-        defaults             (parse-defaults config)]
-    (connection/connect {:parallelism          parallelism
-                         :cache                cache
-                         :commit-catalog       commit-catalog
-                         :index-catalog        index-catalog
-                         :primary-publisher    primary-publisher
-                         :secondary-publishers secondary-publishers
-                         :remote-systems       remote-systems
-                         :serializer           serializer
-                         :defaults             defaults})))
+  [_ config]
+  (-> config config/parse-connection-map connection/connect))
 
 (defn prepare
   [parsed-config]

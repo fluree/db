@@ -44,7 +44,7 @@
             pid       (iri/encode-iri db property)
             score-xf  (comp (map (partial score-flake score-fn target))
                             (remove nil?))
-            flake-xf  (->> [score-xf (when tracker (track/track-fuel! tracker error-ch))]
+            flake-xf  (->> [score-xf (track/track-fuel! tracker error-ch)]
                            (remove nil?)
                            (apply comp))
             ;; For now, pulling all matching values from full index once hitting

@@ -3,11 +3,11 @@
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 
-(deftest ^:integration aggregates-test
+(deftest ^:integration ^:sci aggregates-test
   (testing "aggregate queries"
     (let [conn   (test-utils/create-conn)
-          people (test-utils/load-people conn)
-          db     (fluree/db people)]
+          ledger-id (test-utils/load-people conn)
+          db     @(fluree/db conn ledger-id)]
       (testing "with explicit grouping"
         (let [qry     {:context  [test-utils/default-context
                                   {:ex "http://example.org/ns/"}]

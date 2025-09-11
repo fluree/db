@@ -83,19 +83,6 @@
                      result
                      [@db-vol result]))))))
 
-(defn create-virtual-graphs
-  "Creates a new virtual graph. If the virtual graph is invalid, an
-  exception will be thrown and the transaction will not complete."
-  [db add new-vgs]
-  (loop [[new-vg & r] new-vgs
-         db db]
-    (if new-vg
-      (let [vg-flakes (filter #(= (flake/s %) new-vg) add)
-            [db* alias vg-record] (vg/create db vg-flakes)]
-        ;; TODO - VG - ensure alias is not being used, throw if so
-        (recur r (assoc-in db* [:vg alias] vg-record)))
-      db)))
-
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an
   updated db."
@@ -125,15 +112,29 @@
     (let [allowed-db (<? (policy.modify/allowed? tracker staged-map))]
       allowed-db)))
 
+(defn max-novelty-error
+  "Returns an ExceptionInfo for max novelty exceeded with MBs in message."
+  [db]
+  (let [novelty-bytes     (long (get-in db [:novelty :size] 0))
+        max-novelty-bytes (long (:reindex-max-bytes db))
+        round2-mb         (fn [bytes]
+                            (let [mb (/ (double bytes) 1000000.0)]
+                              (/ (double (int (+ 0.5 (* mb 100.0)))) 100.0)))
+        novelty-mb-r      (round2-mb novelty-bytes)
+        max-novelty-mb-r  (round2-mb max-novelty-bytes)
+        msg               (str "Maximum novelty exceeded ("
+                               novelty-mb-r " MB > max " max-novelty-mb-r
+                               " MB). No transactions will be processed until indexing has completed.")]
+    (ex-info msg {:status 503, :error :db/max-novelty-exceeded})))
+
 (defn stage
   [db tracker context identity author annotation raw-txn parsed-txn]
   (go-try
     (when (novelty/max-novelty? db)
-      (throw (ex-info "Maximum novelty exceeded, no transactions will be processed until indexing has completed."
-                      {:status 503 :error :db/max-novelty-exceeded})))
+      (throw (max-novelty-error db)))
     (when (policy.modify/deny-all? db)
       (throw (ex-info "Database policy denies all modifications."
-                      {:status 403 :error :db/policy-exception})))
+                      {:status 403, :error :db/policy-exception})))
     (let [tx-state   (->tx-state :db db
                                  :context context
                                  :txn raw-txn

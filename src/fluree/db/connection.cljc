@@ -93,9 +93,9 @@
     [cached? p-chan]))
 
 (defn notify
-  [{:keys [commit-catalog] :as conn} address hash]
+  [{:keys [commit-catalog] :as conn} address]
   (go-try
-    (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address hash))]
+    (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
       (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
         (if-let [ledger-ch (ns-subscribe/cached-ledger conn ledger-alias)]
           (do (log/debug "Notification received for ledger" ledger-alias
@@ -187,6 +187,10 @@
     (let [json-data (<? (storage/read-json commit-catalog addr))]
       (assoc json-data "address" addr))))
 
+(defn parse-address-hash
+  [{:keys [commit-catalog] :as _conn} addr]
+  (storage/get-hash commit-catalog addr))
+
 (defn lookup-publisher-commit
   [conn ledger-address]
   (lookup-commit* ledger-address (publishers conn)))
@@ -226,6 +230,25 @@
       (if nsv
         (recur r (into addrs (<? (nameservice/known-addresses nsv ledger-alias))))
         addrs))))
+
+;; --- Branch resolution helpers ---
+
+(defn- branch-from-commit
+  "Extract branch from expanded commit JSON-LD, if present."
+  [expanded-commit]
+  (get-first-value expanded-commit const/iri-branch))
+
+(defn- branch-from-ns
+  "Extract branch from nameservice record, if present."
+  [ns-record]
+  (get ns-record "f:branch"))
+
+(defn- branch-from-alias
+  "Derive branch from an alias of the form 'alias@branch', if present."
+  [ledger-alias]
+  (when (and (string? ledger-alias)
+             (str/includes? ledger-alias "@"))
+    (subs ledger-alias (inc (str/last-index-of ledger-alias "@")))))
 
 (defn ledger-exists?
   "Checks nameservices on a connection and returns true if any nameservice
@@ -319,9 +342,10 @@
                                                                          index-address))
             expanded-commit (json-ld/expand commit)
             ledger-alias    (commit->ledger-alias conn address expanded-commit)
-            branch          (-> expanded-commit
-                                (get-first-value const/iri-branch)
-                                (or (throw-missing-branch address ledger-alias)))
+            ;; Determine branch using helpers in priority order
+            branch           (or (branch-from-commit expanded-commit)
+                                 (branch-from-ns ns-record)
+                                 (branch-from-alias ledger-alias))
 
             {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
             ledger (ledger/instantiate ledger-alias address branch commit-catalog index-catalog
@@ -478,11 +502,11 @@
 
 (defn trigger-ledger-index
   "Manually triggers indexing for a ledger/branch and waits for completion.
-   
+
    Options:
    - :branch - Branch name (defaults to main branch)
    - :timeout - Max wait time in ms (default 300000 / 5 minutes)
-   
+
    Returns the indexed database object or throws an exception on failure/timeout."
   [conn ledger-alias opts]
   (go-try

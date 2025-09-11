@@ -1,37 +1,45 @@
 (ns fluree.db.connection.config
   (:require [clojure.string :as str]
+            [fluree.crypto :as crypto]
             [fluree.db.connection.vocab :as conn-vocab]
+            [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.util :as util :refer [get-id get-first get-first-value
-                                             get-value try* catch*]]
+                                             get-value of-type? try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn type?
-  [node kind]
-  (-> node (get-first :type) (= kind)))
-
 (defn config-value?
   [node]
   (or (contains? node conn-vocab/env-var)
       (contains? node conn-vocab/java-prop)
       (contains? node conn-vocab/default-val)
-      (type? node conn-vocab/config-val-type)))
+      (of-type? node conn-vocab/config-val-type)))
 
 (defn connection?
   [node]
-  (type? node conn-vocab/connection-type))
+  (of-type? node conn-vocab/connection-type))
+
+(defn connection-config?
+  [node]
+  (or (of-type? node conn-vocab/config-type)
+      (and (not (contains? node :type))
+           (or (contains? node conn-vocab/primary-publisher)
+               (contains? node conn-vocab/secondary-publishers)
+               (contains? node conn-vocab/commit-storage)
+               (contains? node conn-vocab/index-storage)
+               (contains? node conn-vocab/parallelism)))))
 
 (defn system?
   [node]
-  (type? node conn-vocab/system-type))
+  (of-type? node conn-vocab/system-type))
 
 (defn publisher?
   [node]
-  (type? node conn-vocab/publisher-type))
+  (of-type? node conn-vocab/publisher-type))
 
 (defn storage-nameservice?
   [node]
@@ -46,13 +54,13 @@
 
 (defn storage?
   [node]
-  (type? node conn-vocab/storage-type))
+  (of-type? node conn-vocab/storage-type))
 
 (defn memory-storage?
   [node]
   (and (storage? node)
        (-> node
-           (dissoc :idx :id :type conn-vocab/address-identifier)
+           (dissoc const/iri-id const/iri-type conn-vocab/address-identifier)
            empty?)))
 
 (defn file-storage?
@@ -126,12 +134,16 @@
           (get-first-value k)
           get-boolean))
 
+(derive :fluree.db/connection :fluree.db/abstract-connection)
+(derive :fluree.db/connection-config :fluree.db/abstract-connection)
+
 (defn derive-node-id
   [node]
   (let [id (get-id node)]
     (cond
       (config-value? node)        (derive id :fluree.db/config-value)
       (connection? node)          (derive id :fluree.db/connection)
+      (connection-config? node)   (derive id :fluree.db/connection-config)
       (system? node)              (derive id :fluree.db/remote-system)
       (memory-storage? node)      (derive id :fluree.db.storage/memory)
       (file-storage? node)        (derive id :fluree.db.storage/file)
@@ -151,30 +163,27 @@
 (defn subject-node?
   [x]
   (and (map? x)
-       (not (contains? x :value))))
+       (not (contains? x const/iri-value))))
 
 (defn blank-node?
   [x]
   (and (subject-node? x)
-       (not (contains? x :id))))
+       (not (contains? x const/iri-id))))
 
 (defn ref-node?
   [x]
   (and (subject-node? x)
        (not (blank-node? x))
-       (-> x
-           (dissoc :idx)
-           count
-           (= 1))))
+       (-> x count (= 1))))
 
 (defn split-subject-node
   [node]
-  (let [node* (cond-> node
-                (blank-node? node) (assoc :id (iri/new-blank-node-id))
-                true               (dissoc :idx))]
+  (let [node* (if (blank-node? node)
+                (assoc node const/iri-id (iri/new-blank-node-id))
+                node)]
     (if (ref-node? node*)
       [node*]
-      (let [ref-node (select-keys node* [:id])]
+      (let [ref-node (select-keys node* [const/iri-id])]
         [ref-node node*]))))
 
 (defn flatten-sequence
@@ -194,7 +203,7 @@
 
 (defn flatten-node
   [node]
-  (loop [[[k v] & r] (dissoc node :idx)
+  (loop [[[k v] & r] node
          children    []
          flat-node   {}]
     (if k
@@ -257,7 +266,7 @@
 (defn keywordize-node-id
   [node]
   (if (subject-node? node)
-    (update node :id iri->kw)
+    (update node const/iri-id iri->kw)
     node))
 
 (defn keywordize-child-ids
@@ -306,3 +315,51 @@
                (map derive-fn)
                (map (juxt get-id identity)))
          (standardize cfg))))
+
+(defn parse-identity
+  [defaults]
+  (when-let [identity (get-first defaults conn-vocab/identity)]
+    (let [public-key  (get-first-string identity conn-vocab/public-key)
+          private-key (get-first-string identity conn-vocab/private-key)
+          ;; Derive public key from private key if public key is missing
+          public-key* (if (and (nil? public-key) private-key)
+                        (crypto/public-key-from-private private-key)
+                        public-key)
+          result {:id      (get-id identity)
+                  :public  public-key*
+                  :private private-key}]
+      result)))
+
+(defn parse-index-options
+  [defaults]
+  (when-let [index-options (get-first defaults conn-vocab/index-options)]
+    {:reindex-min-bytes (get-first-long index-options conn-vocab/reindex-min-bytes)
+     :reindex-max-bytes (get-first-long index-options conn-vocab/reindex-max-bytes)
+     :max-old-indexes   (get-first-integer index-options conn-vocab/max-old-indexes)
+     :indexing-disabled (get-first-boolean index-options conn-vocab/indexing-disabled)}))
+
+(defn parse-defaults
+  [config]
+  (when-let [defaults (get-first config conn-vocab/defaults)]
+    (let [identity      (parse-identity defaults)
+          index-options (parse-index-options defaults)]
+      (cond-> nil
+        identity      (assoc :identity identity)
+        index-options (assoc :indexing index-options)))))
+
+(defn parse-connection-map
+  [{:keys [cache commit-catalog index-catalog serializer] :as config}]
+  (let [parallelism          (get-first-integer config conn-vocab/parallelism)
+        primary-publisher    (get-first config conn-vocab/primary-publisher)
+        secondary-publishers (get config conn-vocab/secondary-publishers)
+        remote-systems       (get config conn-vocab/remote-systems)
+        defaults             (parse-defaults config)]
+    {:parallelism          parallelism
+     :cache                cache
+     :commit-catalog       commit-catalog
+     :index-catalog        index-catalog
+     :primary-publisher    primary-publisher
+     :secondary-publishers secondary-publishers
+     :remote-systems       remote-systems
+     :serializer           serializer
+     :defaults             defaults}))

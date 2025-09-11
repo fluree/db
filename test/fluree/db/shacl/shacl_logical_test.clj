@@ -6,13 +6,13 @@
 (deftest ^:integration shacl-not-test
   (testing "shacl basic not constraint works"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/a")
+          db0 @(fluree/create conn "shacl/a")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/UserShape
@@ -123,13 +123,13 @@
 
   (testing "shacl not w/ value ranges works"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/a")
+          db0 @(fluree/create conn "shacl/a")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/UserShape
@@ -266,13 +266,13 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
 
   (testing "shacl not w/ string constraints works"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/str")
+          db0 @(fluree/create conn "shacl/str")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/UserShape
@@ -426,9 +426,9 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
 
 (deftest ^:integration shacl-and-tests
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "shacl-and")
+        db0 @(fluree/create conn "shacl-and")
         context [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
-        db0     (fluree/db ledger)
+        db0     db0
         db1     @(fluree/update db0 {"@context" context
                                      "insert"
                                      {"@id" "ex:andShape"
@@ -474,9 +474,9 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
 
 (deftest ^:integration shacl-or-tests
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "shacl-or")
+        db0 @(fluree/create conn "shacl-or")
         context [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
-        db0     (fluree/db ledger)
+        db0     db0
         db1     @(fluree/update db0 {"@context" context
                                      "insert"
                                      {"@id" "ex:orShape"
@@ -521,9 +521,9 @@ Subject :ex/john violates constraint :sh/not of shape :ex/UserShape - :ex/john c
 
 (deftest ^:integration shacl-xone-tests
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "shacl-or")
+        db0 @(fluree/create conn "shacl-or")
         context [test-utils/default-str-context {"ex" "http://example.org/ns/"}]
-        db0     (fluree/db ledger)
+        db0     db0
         db1     @(fluree/update db0 {"@context" context
                                      "insert"
                                      {"@id"           "ex:orShape"

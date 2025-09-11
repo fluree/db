@@ -113,5 +113,5 @@
            prepped-q (prep-subqueries q)
            result-ch (execute ds tracker prepped-q error-ch)]
        (async/alt!
-         error-ch ([e] e)
+         error-ch ([e] (async/close! error-ch) e)
          result-ch ([result] result))))))

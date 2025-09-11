@@ -6,10 +6,10 @@
 (deftest ^:integration using-pre-defined-types-as-classes
   (testing "Class not used as class initially can still be used as one."
     (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "class/testing")
+          db0 @(fluree/create conn "class/testing")
           context   [test-utils/default-context {:ex "http://example.org/ns/"}]
           db1       @(fluree/update
-                      (fluree/db ledger)
+                      db0
                       {"@context" context
                        "insert"   {:id                 :ex/MyClass
                                    :schema/description "Just a basic object not used as a class"}})
@@ -29,13 +29,13 @@
 (deftest ^:integration shacl-cardinality-constraints
   (testing "shacl minimum and maximum cardinality"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/a")
+          db0 @(fluree/create conn "shacl/a")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/UserShape
@@ -118,13 +118,13 @@
 (deftest ^:integration shacl-datatype-constraints
   (testing "shacl datatype errors"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/b")
+          db0 @(fluree/create conn "shacl/b")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/UserShape
@@ -204,13 +204,13 @@
 (deftest ^:integration shacl-closed-shape
   (testing "shacl closed shape"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/c")
+          db0 @(fluree/create conn "shacl/c")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id                   :ex/UserShape
@@ -262,15 +262,15 @@
 
 (deftest ^:integration shacl-property-pairs
   (testing "shacl property pairs"
-    (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/pairs")
+    (let [conn       @(fluree/connect-memory)
+          db0        @(fluree/create conn "shacl/pairs")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}]
       (testing "single-cardinality equals"
         (let [db @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" context
                     "insert"
                     {:id             :ex/EqualNamesShape
@@ -321,7 +321,7 @@
                    @(fluree/query db-ok user-query))))))
       (testing "multi-cardinality equals"
         (let [db @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" context
                     "insert"
                     {:id             :ex/EqualNamesShape
@@ -470,7 +470,7 @@
                    @(fluree/query db-ok2 user-query))))))
       (testing "disjoint"
         (let [db @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" context
                     "insert"
                     {:id             :ex/DisjointShape
@@ -581,9 +581,9 @@
                   "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
               (is (= "Subject :ex/brian path [:ex/favNums] violates constraint :sh/disjoint of shape :ex/pshape1 - path [:ex/favNums] values 11, 17, 31 are not disjoint with :ex/luckyNums values 11, 13, 18."
                      (ex-message db-not-disjoint3)))))))
-      (testing "lessThan"
+      (testing "lessThan numeric"
         (let [db     @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/LessThanShape
@@ -764,9 +764,204 @@
                      (ex-data db-iris)))
               (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape :ex/pshape1 - path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john."
                      (ex-message db-iris)))))))
-      (testing "lessThanOrEquals"
+      (testing "lessThan time"
+        (let [db     @(fluree/update
+                       db0
+                       {"@context" context
+                        "insert"
+                        {:id             :ex/LessThanShape
+                         :type           :sh/NodeShape
+                         :sh/targetClass :ex/User
+                         :sh/property    [{:id          :ex/pshape1
+                                           :sh/path     :ex/p1
+                                           :sh/lessThan :ex/p2}]}})
+              db-ok1 @(fluree/update
+                       db
+                       {"@context" context
+                        "insert"
+                        {:id          :ex/alice
+                         :type        :ex/User
+                         :schema/name "Alice"
+                         :ex/p1       [{:type :xsd/date :value "2000-01-01"}
+                                       {:type :xsd/date :value "2000-02-01"}]
+                         :ex/p2       [{:type :xsd/date :value "2020-02-01"}
+                                       {:type :xsd/date :value "2020-02-01"}]}})
+
+              db-ok2 @(fluree/update
+                       db
+                       {"@context" context
+                        "insert"
+                        {:id          :ex/alice
+                         :type        :ex/User
+                         :schema/name "Alice"
+                         :ex/p1       [{:type :xsd/date :value "2000-01-01"}
+                                       {:type :xsd/date :value "2000-02-01"}]
+                         :ex/p2       [{:type :xsd/date :value "2020-02-01"}]}})]
+          (testing "values less than"
+            (is (= [{:id          :ex/alice
+                     :type        :ex/User,
+                     :schema/name "Alice",
+                     :ex/p1       [#time/date "2000-01-01" #time/date "2000-02-01"],
+                     :ex/p2       #time/date "2020-02-01"}]
+                   @(fluree/query db-ok1 user-query)))
+            (is (= [{:id          :ex/alice
+                     :type        :ex/User,
+                     :schema/name "Alice",
+                     :ex/p1       [#time/date "2000-01-01" #time/date "2000-02-01"],
+                     :ex/p2       #time/date "2020-02-01"}]
+                   @(fluree/query db-ok2 user-query))))
+          (testing "values not less than other value"
+            (let [db-fail1 @(fluree/update
+                             db
+                             {"@context" context
+                              "insert"
+                              {:id          :ex/alice
+                               :type        :ex/User
+                               :schema/name "Alice"
+                               :ex/p1       [{:type :xsd/date :value "2000-01-01"}
+                                             {:type :xsd/date :value "2000-02-01"}]
+                               :ex/p2       [{:type :xsd/date :value "2000-01-01"}]}})]
+              (is (= {:status 422,
+                      :error  :shacl/violation,
+                      :report
+                      {:type        :sh/ValidationReport,
+                       :sh/conforms false,
+                       :sh/result
+                       [{:sh/constraintComponent :sh/lessThan,
+                         :type                   :sh/ValidationResult,
+                         :sh/resultMessage       "path [:ex/p1] values 2000-01-01, 2000-02-01 are not all less than :ex/p2 values 2000-01-01",
+                         :sh/resultPath          [:ex/p1],
+                         :f/expectation          [#time/date "2000-01-01"],
+                         :sh/resultSeverity      :sh/Violation,
+                         :sh/value               [#time/date "2000-01-01" #time/date "2000-02-01"],
+                         :sh/sourceShape         :ex/pshape1,
+                         :sh/focusNode           :ex/alice}]}}
+                     (ex-data db-fail1)))
+              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape :ex/pshape1 - path [:ex/p1] values 2000-01-01, 2000-02-01 are not all less than :ex/p2 values 2000-01-01."
+                     (ex-message db-fail1)))))
+          (testing "values not comparable to other values"
+            (let [db-fail2 @(fluree/update
+                             db
+                             {"@context" context
+                              "insert"
+                              {:id          :ex/alice
+                               :type        :ex/User
+                               :schema/name "Alice"
+                               :ex/p1       [{:type :xsd/date :value "2020-01-01"}
+                                             {:type :xsd/date :value "2020-02-01"}]
+                               :ex/p2       ["1720-09-05" "hey"]}})]
+              (is (= {:status 422,
+                      :error  :shacl/violation,
+                      :report
+                      {:type        :sh/ValidationReport,
+                       :sh/conforms false,
+                       :sh/result
+                       [{:sh/constraintComponent :sh/lessThan,
+                         :type                   :sh/ValidationResult,
+                         :sh/resultMessage
+                         "path [:ex/p1] values 2020-01-01, 2020-02-01 are not all comparable with :ex/p2 values 1720-09-05, hey",
+                         :sh/resultPath          [:ex/p1],
+                         :f/expectation          ["1720-09-05" "hey"],
+                         :sh/resultSeverity      :sh/Violation,
+                         :sh/value               [#time/date "2020-01-01" #time/date "2020-02-01"],
+                         :sh/sourceShape         :ex/pshape1,
+                         :sh/focusNode           :ex/alice}]}}
+                     (ex-data db-fail2)))
+              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape :ex/pshape1 - path [:ex/p1] values 2020-01-01, 2020-02-01 are not all comparable with :ex/p2 values 1720-09-05, hey."
+                     (ex-message db-fail2)))))
+          (testing "values not less than all other values"
+            (let [db-fail3 @(fluree/update
+                             db
+                             {"@context" context
+                              "insert"
+                              {:id          :ex/alice
+                               :type        :ex/User
+                               :schema/name "Alice"
+                               :ex/p1       [{:type :xsd/date :value "2020-01-01"}
+                                             {:type :xsd/date :value "2020-02-01"}]
+                               :ex/p2       [{:type :xsd/date :value "1999-01-01"}
+                                             {:type :xsd/date :value "1999-02-01"}]}})]
+              (is (= {:status 422,
+                      :error  :shacl/violation,
+                      :report
+                      {:type        :sh/ValidationReport,
+                       :sh/conforms false,
+                       :sh/result
+                       [{:sh/constraintComponent :sh/lessThan,
+                         :type                   :sh/ValidationResult,
+                         :sh/resultMessage
+                         "path [:ex/p1] values 2020-01-01, 2020-02-01 are not all less than :ex/p2 values 1999-01-01, 1999-02-01",
+                         :sh/resultPath          [:ex/p1],
+                         :f/expectation          [#time/date "1999-01-01" #time/date "1999-02-01"],
+                         :sh/resultSeverity      :sh/Violation,
+                         :sh/value               [#time/date "2020-01-01" #time/date "2020-02-01"],
+                         :sh/sourceShape         :ex/pshape1,
+                         :sh/focusNode           :ex/alice}]}}
+                     (ex-data db-fail3)))
+              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape :ex/pshape1 - path [:ex/p1] values 2020-01-01, 2020-02-01 are not all less than :ex/p2 values 1999-01-01, 1999-02-01."
+                     (ex-message db-fail3)))))
+          (testing "values not less than all"
+            (let [db-fail4 @(fluree/update
+                             db
+                             {"@context" context
+                              "insert"
+                              {:id          :ex/alice
+                               :type        :ex/User
+                               :schema/name "Alice"
+                               :ex/p1       [{:type :xsd/date :value "2000-01-01"}
+                                             {:type :xsd/date :value "2000-06-01"}]
+                               :ex/p2       [{:type :xsd/date :value "2000-02-01"}
+                                             {:type :xsd/date :value "2000-10-01"}]}})]
+              (is (= {:status 422,
+                      :error  :shacl/violation,
+                      :report
+                      {:type        :sh/ValidationReport,
+                       :sh/conforms false,
+                       :sh/result
+                       [{:sh/constraintComponent :sh/lessThan,
+                         :type                   :sh/ValidationResult,
+                         :sh/resultMessage
+                         "path [:ex/p1] values 2000-01-01, 2000-06-01 are not all less than :ex/p2 values 2000-02-01, 2000-10-01",
+                         :sh/resultPath          [:ex/p1],
+                         :f/expectation          [#time/date "2000-02-01" #time/date "2000-10-01"],
+                         :sh/resultSeverity      :sh/Violation,
+                         :sh/value               [#time/date "2000-01-01" #time/date "2000-06-01"],
+                         :sh/sourceShape         :ex/pshape1,
+                         :sh/focusNode           :ex/alice}]}}
+                     (ex-data db-fail4)))
+              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape :ex/pshape1 - path [:ex/p1] values 2000-01-01, 2000-06-01 are not all less than :ex/p2 values 2000-02-01, 2000-10-01."
+                     (ex-message db-fail4)))))
+          (testing "not comparable with iris"
+            (let [db-iris @(fluree/update
+                            db
+                            {"@context" context
+                             "insert"
+                             {:id          :ex/alice
+                              :type        :ex/User
+                              :schema/name "Alice"
+                              :ex/p1       :ex/brian
+                              :ex/p2       :ex/john}})]
+              (is (= {:status 422,
+                      :error  :shacl/violation,
+                      :report
+                      {:type        :sh/ValidationReport,
+                       :sh/conforms false,
+                       :sh/result
+                       [{:type                   :sh/ValidationResult,
+                         :sh/resultSeverity      :sh/Violation
+                         :sh/focusNode           :ex/alice,
+                         :sh/constraintComponent :sh/lessThan,
+                         :sh/sourceShape         :ex/pshape1
+                         :sh/value               [:ex/brian],
+                         :f/expectation          [:ex/john],
+                         :sh/resultMessage       "path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john",
+                         :sh/resultPath          [:ex/p1]}]}}
+                     (ex-data db-iris)))
+              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThan of shape :ex/pshape1 - path [:ex/p1] values :ex/brian are not all comparable with :ex/p2 values :ex/john."
+                     (ex-message db-iris)))))))
+      (testing "lessThanOrEquals numeric"
         (let [db @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" context
                     "insert"
                     {:id             :ex/LessThanOrEqualsShape
@@ -918,19 +1113,184 @@
                          :sh/resultPath          [:ex/p1]}]}}
                      (ex-data db-fail4)))
               (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape :ex/pshape1 - path [:ex/p1] values 11, 17 are not all less than :ex/p2 values 12, 16."
+                     (ex-message db-fail4)))))))
+      (testing "lessThanOrEquals time"
+        (let [db @(fluree/update
+                   db0
+                   {"@context" context
+                    "insert"
+                    {:id             :ex/LessThanOrEqualsShape
+                     :type           :sh/NodeShape
+                     :sh/targetClass :ex/User
+                     :sh/property    [{:id                  :ex/pshape1
+                                       :sh/path             :ex/p1
+                                       :sh/lessThanOrEquals :ex/p2}]}})]
+          (testing "all values less than or equal"
+            (let [db-ok1 @(fluree/update
+                           db
+                           {"@context" context
+                            "insert"
+                            {:id          :ex/alice
+                             :type        :ex/User
+                             :schema/name "Alice"
+                             :ex/p1       [{:type :xsd/date :value "2000-01-01"}
+                                           {:type :xsd/date :value "2000-02-01"}]
+                             :ex/p2       [{:type :xsd/date :value "2020-01-01"}
+                                           {:type :xsd/date :value "2020-02-01"}]}})
+
+                  db-ok2 @(fluree/update
+                           db
+                           {"@context" context
+                            "insert"
+                            {:id          :ex/alice
+                             :type        :ex/User
+                             :schema/name "Alice"
+                             :ex/p1       [{:type :xsd/date :value "2000-01-01"}
+                                           {:type :xsd/date :value "2000-02-01"}]
+                             :ex/p2       {:type :xsd/date :value "2000-02-01"}}})]
+              (is (= [{:id          :ex/alice
+                       :type        :ex/User,
+                       :schema/name "Alice",
+                       :ex/p1       [#time/date "2000-01-01" #time/date "2000-02-01"],
+                       :ex/p2       [#time/date "2020-01-01" #time/date "2020-02-01"]}]
+                     @(fluree/query db-ok1 user-query)))
+              (is (= [{:id          :ex/alice
+                       :type        :ex/User,
+                       :schema/name "Alice",
+                       :ex/p1       [#time/date "2000-01-01" #time/date "2000-02-01"],
+                       :ex/p2       #time/date "2000-02-01"}]
+                     @(fluree/query db-ok2 user-query)))))
+          (testing "all values not less than other value"
+            (let [db-fail1 @(fluree/update
+                             db
+                             {"@context" context
+                              "insert"
+                              {:id          :ex/alice
+                               :type        :ex/User
+                               :schema/name "Alice"
+                               :ex/p1       [{:type :xsd/date :value "2020-01-01"}
+                                             {:type :xsd/date :value "2020-02-01"}]
+                               :ex/p2       {:type :xsd/date :value "1999-02-01"}}})]
+              (is (= {:status 422,
+                      :error  :shacl/violation,
+                      :report
+                      {:type        :sh/ValidationReport,
+                       :sh/conforms false,
+                       :sh/result
+                       [{:sh/constraintComponent :sh/lessThanOrEquals,
+                         :type                   :sh/ValidationResult,
+                         :sh/resultMessage       "path [:ex/p1] values 2020-01-01, 2020-02-01 are not all less than :ex/p2 values 1999-02-01",
+                         :sh/resultPath          [:ex/p1],
+                         :f/expectation          [#time/date "1999-02-01"],
+                         :sh/resultSeverity      :sh/Violation,
+                         :sh/value               [#time/date "2020-01-01" #time/date "2020-02-01"],
+                         :sh/sourceShape         :ex/pshape1,
+                         :sh/focusNode           :ex/alice}]}}
+                     (ex-data db-fail1)))
+              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape :ex/pshape1 - path [:ex/p1] values 2020-01-01, 2020-02-01 are not all less than :ex/p2 values 1999-02-01."
+                     (ex-message db-fail1)))))
+          (testing "all values not comparable with other values"
+            (let [db-fail2 @(fluree/update
+                             db
+                             {"@context" context
+                              "insert"
+                              {:id          :ex/alice
+                               :type        :ex/User
+                               :schema/name "Alice"
+                               :ex/p1       [{:type :xsd/date :value "2020-01-01"}
+                                             {:type :xsd/date :value "2020-02-01"}]
+                               :ex/p2       ["1720-09-05" "hey"]}})]
+              (is (= {:status 422,
+                      :error  :shacl/violation,
+                      :report
+                      {:type        :sh/ValidationReport,
+                       :sh/conforms false,
+                       :sh/result
+                       [{:sh/constraintComponent :sh/lessThanOrEquals,
+                         :type                   :sh/ValidationResult,
+                         :sh/resultMessage       "path [:ex/p1] values 2020-01-01, 2020-02-01 are not all comparable with :ex/p2 values 1720-09-05, hey",
+                         :sh/resultPath          [:ex/p1],
+                         :f/expectation          ["1720-09-05" "hey"],
+                         :sh/resultSeverity      :sh/Violation,
+                         :sh/value               [#time/date "2020-01-01" #time/date "2020-02-01"],
+                         :sh/sourceShape         :ex/pshape1,
+                         :sh/focusNode           :ex/alice}]}}
+                     (ex-data db-fail2)))
+              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape :ex/pshape1 - path [:ex/p1] values 2020-01-01, 2020-02-01 are not all comparable with :ex/p2 values 1720-09-05, hey."
+                     (ex-message db-fail2)))))
+          (testing "all values not less than other values"
+            (let [db-fail3 @(fluree/update
+                             db
+                             {"@context" context
+                              "insert"
+                              {:id          :ex/alice
+                               :type        :ex/User
+                               :schema/name "Alice"
+                               :ex/p1       [{:type :xsd/date :value "2020-01-01"}
+                                             {:type :xsd/date :value "2020-02-01"}]
+                               :ex/p2       [{:type :xsd/date :value "1999-01-01"}
+                                             {:type :xsd/date :value "1999-02-01"}]}})]
+              (is (= {:status 422,
+                      :error  :shacl/violation,
+                      :report
+                      {:type        :sh/ValidationReport,
+                       :sh/conforms false,
+                       :sh/result
+                       [{:sh/constraintComponent :sh/lessThanOrEquals,
+                         :type                   :sh/ValidationResult,
+                         :sh/resultMessage       "path [:ex/p1] values 2020-01-01, 2020-02-01 are not all less than :ex/p2 values 1999-01-01, 1999-02-01",
+                         :sh/resultPath          [:ex/p1],
+                         :f/expectation          [#time/date "1999-01-01" #time/date "1999-02-01"],
+                         :sh/resultSeverity      :sh/Violation,
+                         :sh/value               [#time/date "2020-01-01" #time/date "2020-02-01"],
+                         :sh/sourceShape         :ex/pshape1,
+                         :sh/focusNode           :ex/alice}]}}
+                     (ex-data db-fail3)))
+              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape :ex/pshape1 - path [:ex/p1] values 2020-01-01, 2020-02-01 are not all less than :ex/p2 values 1999-01-01, 1999-02-01."
+                     (ex-message db-fail3)))))
+          (testing "all values not less than all other values"
+            (let [db-fail4 @(fluree/update
+                             db
+                             {"@context" context
+                              "insert"
+                              {:id          :ex/alice
+                               :type        :ex/User
+                               :schema/name "Alice"
+                               :ex/p1       [{:type :xsd/date :value "2000-01-01"}
+                                             {:type :xsd/date :value "2000-06-01"}]
+                               :ex/p2       [{:type :xsd/date :value "2000-02-01"}
+                                             {:type :xsd/date :value "2000-10-01"}]}})]
+              (is (= {:status 422,
+                      :error  :shacl/violation,
+                      :report
+                      {:type        :sh/ValidationReport,
+                       :sh/conforms false,
+                       :sh/result
+                       [{:sh/constraintComponent :sh/lessThanOrEquals,
+                         :type                   :sh/ValidationResult,
+                         :sh/resultMessage
+                         "path [:ex/p1] values 2000-01-01, 2000-06-01 are not all less than :ex/p2 values 2000-02-01, 2000-10-01",
+                         :sh/resultPath          [:ex/p1],
+                         :f/expectation          [#time/date "2000-02-01" #time/date "2000-10-01"],
+                         :sh/resultSeverity      :sh/Violation,
+                         :sh/value               [#time/date "2000-01-01" #time/date "2000-06-01"],
+                         :sh/sourceShape         :ex/pshape1,
+                         :sh/focusNode           :ex/alice}]}}
+                     (ex-data db-fail4)))
+              (is (= "Subject :ex/alice path [:ex/p1] violates constraint :sh/lessThanOrEquals of shape :ex/pshape1 - path [:ex/p1] values 2000-01-01, 2000-06-01 are not all less than :ex/p2 values 2000-02-01, 2000-10-01."
                      (ex-message db-fail4))))))))))
 
 (deftest ^:integration shacl-value-range
   (testing "shacl value range constraints"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/value-range")
+          db0 @(fluree/create conn "shacl/value-range")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}]
       (testing "exclusive constraints"
         (let [db @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" context
                     "insert"
                     {:id             :ex/ExclusiveNumRangeShape
@@ -1006,7 +1366,7 @@
                      (ex-message db-too-high)))))))
       (testing "inclusive constraints"
         (let [db @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" context
                     "insert"
                     {:id             :ex/InclusiveNumRangeShape
@@ -1092,7 +1452,7 @@
                      (ex-message db-too-high)))))))
       (testing "non-numeric values"
         (let [db         @(fluree/update
-                           (fluree/db ledger)
+                           db0
                            {"@context" context
                             "insert"
                             {:id             :ex/NumRangeShape
@@ -1156,13 +1516,13 @@
 (deftest ^:integration shacl-string-length-constraints
   (testing "shacl string length constraint errors"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/str")
+          db0 @(fluree/create conn "shacl/str")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/UserShape
@@ -1304,13 +1664,13 @@
 (deftest ^:integration shacl-string-pattern-constraints
   (testing "shacl string regex constraint errors"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/str")
+          db0 @(fluree/create conn "shacl/str")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/UserShape
@@ -1435,10 +1795,10 @@ WORLD!")
 
 (deftest language-constraints
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "validation-report")
+        db0 @(fluree/create conn "validation-report")
         context [test-utils/default-str-context
                  {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)]
+        db0     db0]
     (testing "language-in"
       (let [db1 @(fluree/update db0 {"@context" context
                                      "insert"
@@ -1522,13 +1882,13 @@ WORLD!")
 (deftest ^:integration shacl-multiple-properties-test
   (testing "multiple properties works"
     (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/b")
+          db0 @(fluree/create conn "shacl/b")
           context    [test-utils/default-context {:ex "http://example.org/ns/"}]
           user-query {:context context
                       :select  {'?s [:*]}
                       :where   {:id '?s, :type :ex/User}}
           db         @(fluree/update
-                       (fluree/db ledger)
+                       db0
                        {"@context" context
                         "insert"
                         {:id             :ex/UserShape
@@ -1704,9 +2064,9 @@ WORLD!")
 
 (deftest ^:integration property-paths
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "propertypathstest")
+        db0 @(fluree/create conn "propertypathstest")
         context [test-utils/default-str-context {"ex" "http://example.com/"}]
-        db0     (fluree/db ledger)]
+        db0     db0]
     (testing "inverse path"
       (let [;; a valid Parent is anybody who is the object of a parent predicate
             db1          @(fluree/update db0 {"@context" context
@@ -1939,9 +2299,9 @@ WORLD!")
 
 (deftest ^:integration shacl-class-test
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "classtest")
+        db0 @(fluree/create conn "classtest")
         context test-utils/default-str-context
-        db0     (fluree/db ledger)
+        db0     db0
         db1     @(fluree/update db0 {"@context" context
                                      "insert"   [{"@type"          "sh:NodeShape"
                                                   "sh:targetClass" {"@id" "https://example.com/Country"}
@@ -2053,9 +2413,9 @@ WORLD!")
 (deftest ^:integration shacl-in-test
   (testing "value nodes"
     (let [conn    @(fluree/connect-memory)
-          ledger  @(fluree/create conn "shacl-in-test")
+          db0 @(fluree/create conn "shacl-in-test")
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-          db0     (fluree/db ledger)
+          db0     db0
           db1     @(fluree/update db0 {"@context" context
                                        "insert"   [{"type"           ["sh:NodeShape"]
                                                     "sh:targetClass" {"id" "ex:Pony"}
@@ -2087,8 +2447,8 @@ WORLD!")
              (ex-message db2)))))
   (testing "node refs"
     (let [conn    @(fluree/connect-memory)
-          ledger  @(fluree/create conn "shacl-in-test")
-          db0     (fluree/db ledger)
+          db0 @(fluree/create conn "shacl-in-test")
+          db0     db0
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1     @(fluree/update db0 {"@context" context
                                        "insert"   [{"type"           ["sh:NodeShape"]
@@ -2145,8 +2505,8 @@ WORLD!")
                  (update "ex:color" (partial sort-by #(get % "id"))))))))
   (testing "mixed values and refs"
     (let [conn    @(fluree/connect-memory)
-          ledger  @(fluree/create conn "shacl-in-test")
-          db0     (fluree/db ledger)
+          db0 @(fluree/create conn "shacl-in-test")
+          db0     db0
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1     @(fluree/update db0 {"@context" context
                                        "insert"   [{"type"           ["sh:NodeShape"]
@@ -2183,9 +2543,9 @@ WORLD!")
 
 (deftest ^:integration shacl-targetobjectsof-test
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "shacl-target-objects-of-test")
+        db0 @(fluree/create conn "shacl-target-objects-of-test")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)]
+        db0     db0]
     (testing "subject and object of constrained predicate in the same txn"
       (testing "datatype constraint"
         (let [db1                @(fluree/update db0
@@ -2453,8 +2813,8 @@ WORLD!")
 (deftest ^:integration shape-based-constraints
   (testing "sh:node"
     (let [conn    @(fluree/connect-memory)
-          ledger  @(fluree/create conn "shape-constaints")
-          db0     (fluree/db ledger)
+          db0 @(fluree/create conn "shape-constaints")
+          db0     db0
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
 
           db1            @(fluree/update db0 {"@context" context
@@ -2506,8 +2866,8 @@ WORLD!")
 
   (testing "sh:qualifiedValueShape property shape"
     (let [conn        @(fluree/connect-memory)
-          ledger      @(fluree/create conn "shape-constaints")
-          db0         (fluree/db ledger)
+          db0 @(fluree/create conn "shape-constaints")
+          db0         db0
           context     [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1         @(fluree/update db0 {"@context" context
                                            "insert"   [{"id"             "ex:KidShape"
@@ -2565,8 +2925,8 @@ WORLD!")
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShape node shape"
     (let [conn   @(fluree/connect-memory)
-          ledger @(fluree/create conn "shape-constaints")
-          db0    (fluree/db ledger)
+          db0 @(fluree/create conn "shape-constaints")
+          db0    db0
 
           context     [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1         @(fluree/update db0 {"@context" context
@@ -2629,8 +2989,8 @@ WORLD!")
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
     (let [conn   @(fluree/connect-memory)
-          ledger @(fluree/create conn "shape-constraints")
-          db0    (fluree/db ledger)
+          db0 @(fluree/create conn "shape-constraints")
+          db0    db0
 
           context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
           db1     @(fluree/update db0 {"@context" context
@@ -2721,8 +3081,8 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest fuel-test
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "shape-constaints")
-        db0     (fluree/db ledger)
+        db0 @(fluree/create conn "shape-constaints")
+        db0     db0
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
 
         ;; sh:node constraint needs to query the db, requiring fuel for validation
@@ -2757,9 +3117,9 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest ^:integration post-processing-validation
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "post-processing")
+        db0 @(fluree/create conn "post-processing")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)]
+        db0     db0]
     (testing "shacl-objects-of-test"
       (let [db1                 @(fluree/update db0
                                                 {"@context" context
@@ -2895,9 +3255,9 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest validation-report
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "validation-report")
+        db0 @(fluree/create conn "validation-report")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)]
+        db0     db0]
     (testing "severity"
       (testing "no severity specified defaults to sh:Violation"
         (let [db1 @(fluree/update db0 {"@context" context
@@ -2977,9 +3337,9 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest target-subjects-of
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "validation-report")
+        db0 @(fluree/create conn "validation-report")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)
+        db0     db0
 
         db1 @(fluree/update db0 {"@context" context
                                  "insert"
@@ -3001,9 +3361,9 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest target-node
   (let [conn    @(fluree/connect-memory)
-        ledger  @(fluree/create conn "validation-report")
+        db0 @(fluree/create conn "validation-report")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0     (fluree/db ledger)
+        db0     db0
 
         db1 @(fluree/update db0 {"@context" context
                                  "insert"
@@ -3025,9 +3385,9 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest alternative-path
   (let [conn @(fluree/connect-memory)
-        ledger @(fluree/create conn "validation-report")
+        db0 @(fluree/create conn "validation-report")
         context [test-utils/default-str-context {"ex" "http://example.com/ns/"}]
-        db0 (fluree/db ledger)
+        db0 db0
 
         db1 @(fluree/update db0 {"@context" context
                                  "insert"
@@ -3074,8 +3434,8 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest multiple-and-encumbered-targets
   (let [conn @(fluree/connect-memory)
-        ledger @(fluree/create conn "encumbered-targets")
-        db0 (fluree/db ledger)]
+        db0 @(fluree/create conn "encumbered-targets")
+        db0 db0]
     (testing "targetClass"
       (testing "with multiple targets"
         (let [db1 @(fluree/update db0 {"@context" test-utils/default-str-context
@@ -3164,8 +3524,8 @@ Subject ex:InvalidHand path [\"ex:digit\"] violates constraint sh:qualifiedValue
 
 (deftest path-segment-handling
   (let [conn @(fluree/connect-memory)
-        ledger @(fluree/create conn "shacl-pp")
-        db0  (fluree/db ledger)
+        db0 @(fluree/create conn "shacl-pp")
+        db0  db0
         db1 @(fluree/update db0 {"@context" {"ex" "http://example.org/",
                                              "schema" "http://schema.org/",
                                              "sh" "http://www.w3.org/ns/shacl#",

@@ -10,12 +10,12 @@
 (deftest ^:integration property-policy-tx-enforcement
   (testing "Restrict an entire class for modification"
     (let [conn              (test-utils/create-conn)
-          ledger            @(fluree/create conn "policy/property-policy-tx-enforcement")
+          db0 @(fluree/create conn "policy/property-policy-tx-enforcement")
           root-did          (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did         (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           john-did          (:id (did/private->did-map "d0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c99"))
           db                @(fluree/update
-                              (fluree/db ledger)
+                              db0
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
                                            "f"      "https://ns.flur.ee/ledger#"}
@@ -97,12 +97,12 @@
 (deftest ^:integration class-policy-tx-enforcement
   (testing "Restrict an entire class for modification"
     (let [conn              (test-utils/create-conn)
-          ledger            @(fluree/create conn "policy/class-policy-tx-enforcement")
+          db0 @(fluree/create conn "policy/class-policy-tx-enforcement")
           root-did          (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did         (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           john-did          (:id (did/private->did-map "d0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c99"))
           db                @(fluree/update
-                              (fluree/db ledger)
+                              db0
                               {"@context" {"ex"     "http://example.org/ns/"
                                            "schema" "http://schema.org/"
                                            "f"      "https://ns.flur.ee/ledger#"}
@@ -196,9 +196,9 @@
 (deftest ^:integration view-only-policy-restricts-tx
   (testing "A view-only policy should restrict all transactions"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "policy/view-only-tx-enforcement")
+          db0 @(fluree/create conn "policy/view-only-tx-enforcement")
           db     @(fluree/update
-                   (fluree/db ledger)
+                   db0
                    {"@context" {"ex"     "http://example.org/ns/"
                                 "schema" "http://schema.org/"}
                     "insert"   [{"@id"         "ex:alice"

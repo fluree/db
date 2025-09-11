@@ -28,6 +28,12 @@
     path
     (str "//" path)))
 
+(defn unsanitize-path
+  [path]
+  (if (str/starts-with? path "//")
+    (subs path 2)
+    path))
+
 (defn build-address
   ([location path]
    (let [path* (sanitize-path path)]
@@ -50,6 +56,12 @@
   [address]
   (let [i (str/last-index-of address ":")]
     [(subs address 0 i) (subs address (inc i))]))
+
+(defn strip-extension
+  [filename]
+  (if-let [idx (str/last-index-of filename ".")]
+    (subs filename 0 idx)
+    filename))
 
 (defn valid-identifier?
   [x]
@@ -105,6 +117,13 @@
     "Writes pre-serialized data `v` to store associated with key `k` and the
     hashed value of `v`. Returns value's address."))
 
+(defprotocol ContentArchive
+  (-content-read-bytes [store address]
+    "Reads the data associated with `address` within `store`.")
+
+  (get-hash [store address]
+    "Returns the hash of the data associated with `address` within `store`."))
+
 (defprotocol ByteStore
   "ByteStore is used by consensus to replicate files across servers"
   (write-bytes [store path bytes] "Async writes bytes to path in store.")
@@ -124,6 +143,12 @@
           bytes  (bytes/string->UTF8 json)
           result (<? (-content-write-bytes store path bytes))]
       (assoc result :json json))))
+
+(defn content-read-json
+  [store address]
+  (go-try
+    (let [bytes (<? (-content-read-bytes store address))]
+      (json/parse bytes false))))
 
 (defn read-json
   ([store address]
@@ -219,6 +244,17 @@
   (-content-write-bytes [clg k v]
     (let [store (get-content-store clg ::default)]
       (-content-write-bytes store k v)))
+
+  ContentArchive
+  (-content-read-bytes [clg address]
+    (if-let [store (locate-address clg address)]
+      (-content-read-bytes store address)
+      (async-location-error address)))
+
+  (get-hash [clg address]
+    (if-let [store (locate-address clg address)]
+      (get-hash store address)
+      (async-location-error address)))
 
   EraseableStore
   (delete [clg address]
