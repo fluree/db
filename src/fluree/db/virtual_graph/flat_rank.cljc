@@ -69,10 +69,10 @@
     (vg-parse/finalize (partial search db tracker dot-product reverse-result-sort) error-ch solution-ch))
 
   (-match-id [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    where/empty-channel)
 
   (-match-class [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    where/empty-channel)
 
   (-match-properties [_ tracker solution triples error-ch]
     (where/match-triples db tracker solution triples error-ch))
@@ -96,10 +96,10 @@
     (vg-parse/finalize (partial search db tracker cosine-similarity reverse-result-sort) error-ch solution-ch))
 
   (-match-id [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    where/empty-channel)
 
   (-match-class [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    where/empty-channel)
 
   (-match-properties [_ tracker solution triples error-ch]
     (where/match-triples db tracker solution triples error-ch))
@@ -123,10 +123,10 @@
     (vg-parse/finalize (partial search db tracker euclidian-distance result-sort) error-ch solution-ch))
 
   (-match-id [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    where/empty-channel)
 
   (-match-class [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    where/empty-channel)
 
   (-match-properties [_ tracker solution triples error-ch]
     (where/match-triples db tracker solution triples error-ch))

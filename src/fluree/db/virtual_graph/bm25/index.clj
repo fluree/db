@@ -254,10 +254,10 @@
     (vg-parse/finalize (partial search this) error-ch solution-ch))
 
   (-match-id [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    where/empty-channel)
 
   (-match-class [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    where/empty-channel)
 
   (-match-properties [this tracker solution triples error-ch]
     (where/match-triples this tracker solution triples error-ch))

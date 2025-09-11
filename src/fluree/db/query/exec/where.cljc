@@ -488,6 +488,10 @@
   [triple-pattern]
   (not-empty (keep get-optional triple-pattern)))
 
+(def empty-channel
+  (doto (async/chan)
+    async/close!))
+
 (defn resolve-flake-range
   ([db tracker error-ch pattern]
    (resolve-flake-range db tracker error-ch pattern nil))
@@ -502,7 +506,7 @@
              (not (comparable-iri? s))
              (not (comparable-iri? p)))
        ;; no flakes will ever match the given triple pattern
-       (async/onto-chan! (async/chan) [])
+       empty-channel
        (let [s-fn (::fn s-mch)
              p-fn (::fn p-mch)
              o-fn (::fn o-mch)
@@ -577,10 +581,6 @@
   (-> db
       (get-in [:schema :pred prop :childProps])
       not-empty))
-
-(def nil-channel
-  (doto (async/chan)
-    async/close!))
 
 (defmethod match-pattern :id
   [ds tracker solution pattern error-ch]
