@@ -38,20 +38,20 @@
   nameservice/Publisher
   (publish [_ data]
     (let [;; Extract data from compact JSON-LD format (both genesis and regular commits now use this)
-          ledger-alias   (get data "alias")
-          branch         (or (get data "branch")
+          ledger-alias (get data "alias")
+          branch       (or (get data "branch")
                              (when (and (string? ledger-alias)
                                         (str/includes? ledger-alias "@"))
                                (subs ledger-alias (inc (str/last-index-of ledger-alias "@"))))
                              "main")
-          commit-address (get data "address")
-          t-value        (get-in data ["data" "t"])
-          index-address  (get-in data ["index" "address"])
-          ns-metadata    (ns-record ledger-alias branch commit-address t-value index-address)
-          record-bytes   (json/stringify-UTF8 ns-metadata)
-          filename       (local-filename ledger-alias branch)]
+          filename     (local-filename ledger-alias branch)]
       (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :branch branch :filename filename})
-      (let [res (storage/write-bytes store filename record-bytes)]
+      (let [commit-address (get data "address")
+            t-value        (get-in data ["data" "t"])
+            index-address  (get-in data ["index" "address"])
+            ns-metadata    (ns-record ledger-alias branch commit-address t-value index-address)
+            record-bytes   (json/stringify-UTF8 ns-metadata)
+            res            (storage/write-bytes store filename record-bytes)]
         (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :branch branch :filename filename})
         res)))
 
@@ -69,8 +69,8 @@
   (lookup [_ ledger-address]
     (go-try
       (let [{:keys [alias branch]} (nameservice/resolve-address (storage/location store) ledger-address nil)
-            branch                  (or branch "main")
-            filename                (local-filename alias branch)]
+            branch                 (or branch "main")
+            filename               (local-filename alias branch)]
         (when-let [record-bytes (<? (storage/read-bytes store filename))]
           (json/parse record-bytes false)))))
 
@@ -87,7 +87,7 @@
       (if (satisfies? storage/RecursiveListableStore store)
         (if-let [list-paths-result (storage/list-paths-recursive store "ns@v1")]
           (loop [remaining-paths (<? list-paths-result)
-                 records []]
+                 records         []]
             (if-let [path (first remaining-paths)]
               (let [file-content (<? (storage/read-bytes store path))]
                 (if file-content
@@ -96,7 +96,7 @@
                                       #?(:clj (let [^bytes bytes-content file-content]
                                                 (String. bytes-content "UTF-8"))
                                          :cljs (js/String.fromCharCode.apply nil file-content)))
-                        record (json/parse content-str false)]
+                        record      (json/parse content-str false)]
                     (recur (rest remaining-paths) (conj records record)))
                   (recur (rest remaining-paths) records)))
               records))
