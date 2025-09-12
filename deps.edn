@@ -39,7 +39,14 @@
         
         ;; r2rml 
         org.clojure/java.jdbc             {:mvn/version "0.7.12"}
-        com.mysql/mysql-connector-j       {:mvn/version "8.0.33"}}
+        
+        ;; JDBC drivers for various databases
+        com.mysql/mysql-connector-j       {:mvn/version "8.0.33"}
+        org.postgresql/postgresql         {:mvn/version "42.7.3"}    ;; PostgreSQL, AWS RDS/Aurora
+        net.snowflake/snowflake-jdbc      {:mvn/version "3.14.3"}   ;; Snowflake
+        com.databricks/databricks-jdbc    {:mvn/version "2.6.36"}   ;; Databricks
+        com.microsoft.sqlserver/mssql-jdbc {:mvn/version "12.4.2.jre11"} ;; SQL Server, Azure SQL
+        com.simba.googlebigquery/googlebigquery-jdbc42 {:mvn/version "1.5.2.1005"}} ;; BigQuery
 
  :paths ["src" "resources" "target/classes"]
 
