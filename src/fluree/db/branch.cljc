@@ -124,12 +124,14 @@
       (when-let [{:keys [db index-files-ch complete-ch]} (<! queue)]
         (let [db* (use-latest-index db last-index-commit alias branch branch-state)
               result (try*
-                       (let [indexed-db (<? (indexer/index db* index-files-ch)) ;; indexer/index always returns a FlakeDB (never AsyncDB)
+                       (let [indexed-db (<? (indexer/index db* index-files-ch)) ; indexer/index always returns a FlakeDB (never AsyncDB)
                              [{prev-commit :commit} {indexed-commit :commit}]
                              (swap-vals! branch-state update-index indexed-db)]
-                         (when (not= prev-commit indexed-commit)
-                           (let [commit-jsonld (commit-data/->json-ld indexed-commit)]
-                             (nameservice/publish-to-all commit-jsonld publishers)))
+                         (if-not (= prev-commit indexed-commit)
+                           (do (log/debug "Publishing new index commit:" indexed-commit)
+                               (let [commit-jsonld (commit-data/->json-ld indexed-commit)]
+                                 (nameservice/publish-to-all commit-jsonld publishers)))
+                           (log/debug "Not publishing unchanged index commit:" indexed-commit))
                          {:status :success, :db indexed-db, :commit indexed-commit})
                        (catch* e
                          (log/error e "Error updating index")
