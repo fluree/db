@@ -7,8 +7,8 @@
 
 (deftest ^:integration manual-indexing-test
   (testing "Manual indexing API and transaction metadata"
-    (let [;; Create connection with auto-indexing disabled  
-          conn    @(fluree/connect-memory {:defaults {:indexing {:indexing-disabled true}}})
+    (let [;; Create connection with auto-indexing disabled
+          conn    @(fluree/connect-memory {:defaults {:indexing {:indexing-enabled false}}})
           _       @(fluree/create conn "test-indexing")
           db0     @(fluree/db conn "test-indexing")
 
@@ -37,7 +37,7 @@
 
       (testing "Transaction metadata includes indexing information"
         ;; Specific value checks
-        (is (true? (:indexing-disabled result)) "Response should indicate indexing is disabled")
+        (is (false? (:indexing-enabled result)) "Response should indicate indexing is disabled")
         (is (false? (:indexing-needed result)) "Should not need indexing with small data")
         (is (number? (:novelty-size result)) "Should have novelty size as a number")
         (is (< (:novelty-size result) 100000) "Novelty size should be below default threshold")))))
@@ -45,7 +45,7 @@
 (deftest ^:integration manual-indexing-blocking-test
   (testing "Manual indexing with blocking returns indexed database"
     (let [;; Create connection with auto-indexing disabled
-          conn    @(fluree/connect-memory {:defaults {:indexing {:indexing-disabled true
+          conn    @(fluree/connect-memory {:defaults {:indexing {:indexing-enabled false
                                                                  :reindex-min-bytes 1000}}})
           _       @(fluree/create conn "test-blocking-index")]
 
@@ -96,7 +96,7 @@
 
 (deftest ^:integration automatic-indexing-disabled-test
   (testing "When indexing is disabled, automatic indexing does not occur"
-    (let [conn    @(fluree/connect-memory {:defaults {:indexing {:indexing-disabled true
+    (let [conn    @(fluree/connect-memory {:defaults {:indexing {:indexing-enabled false
                                                                  :reindex-min-bytes 100}}})
           _       @(fluree/create conn "test-no-auto-index")]
 
@@ -123,7 +123,7 @@
 
 (deftest ^:integration manual-indexing-updates-branch-state-test
   (testing "Manual indexing updates branch state and subsequent queries use index"
-    (let [conn    @(fluree/connect-memory {:defaults {:indexing {:indexing-disabled true
+    (let [conn    @(fluree/connect-memory {:defaults {:indexing {:indexing-enabled false
                                                                  :reindex-min-bytes 100}}})
           _       @(fluree/create conn "test-branch-update")]
 
@@ -163,7 +163,7 @@
   (testing "Manual indexing with file storage and loading from disk"
     (with-temp-dir [storage-path {}]
       (let [conn    @(fluree/connect-file {:storage-path (str storage-path)
-                                           :defaults {:indexing {:indexing-disabled true
+                                           :defaults {:indexing {:indexing-enabled false
                                                                  :reindex-min-bytes 100}}})
             _       @(fluree/create conn "test-file-indexing")]
 
@@ -202,7 +202,7 @@
         (testing "Loading from disk with new connection"
           ;; Create a new connection to ensure we're not using cached data
           (let [conn2   @(fluree/connect-file {:storage-path (str storage-path)
-                                               :defaults {:indexing {:indexing-disabled true}}})
+                                               :defaults {:indexing {:indexing-enabled false}}})
                 _       @(fluree/load conn2 "test-file-indexing")
                 db      @(fluree/db conn2 "test-file-indexing")
                 query   {"@context" {"ex" "http://example.org/"}
