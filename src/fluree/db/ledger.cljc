@@ -22,6 +22,10 @@
       ;; default branch
       (get branches branch))))
 
+(defn indexing-enabled?
+  [ledger branch]
+  (-> ledger (get-branch-meta branch) branch/indexing-enabled?))
+
 (defn available-branches
   [{:keys [state] :as _ledger}]
   (-> @state :branches keys))
