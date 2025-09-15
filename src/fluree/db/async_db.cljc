@@ -19,7 +19,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(declare ->async-db deliver!)
+(declare deliver!)
 
 (defrecord AsyncDB [alias branch commit t db-chan
                     reindex-min-bytes
@@ -275,11 +275,17 @@
   (:db-chan async-db))
 
 (defn ->async-db
-  "Creates an async-db.
-  This is to be used in conjunction with `deliver!` that will deliver the
-  loaded db to the async-db."
-  [ledger-alias branch commit-map t]
-  (->AsyncDB ledger-alias branch commit-map t (async/promise-chan) nil nil nil))
+  "Creates an async-db from a flake-db when updating the index. The async db will receive
+  the flake db with the updated index reference on the :db-chan promise-chan."
+  [{:keys [alias branch commit t reindex-min-bytes reindex-max-bytes max-old-indexes] :as _flake-db}]
+  (map->AsyncDB {:alias             alias
+                 :branch            branch
+                 :commit            commit
+                 :t                 t
+                 :db-chan           (async/promise-chan)
+                 :reindex-min-bytes reindex-min-bytes
+                 :reindex-max-bytes reindex-max-bytes
+                 :max-old-indexes   max-old-indexes}))
 
 (defn load
   ([ledger-alias branch commit-catalog index-catalog commit-jsonld indexing-opts]

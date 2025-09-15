@@ -60,7 +60,7 @@
   (if (async-db/db? current-db)
     (dbproto/-index-update current-db index-map)
     (let [updated-commit (assoc commit :index index-map)
-          updated-db     (async-db/->async-db alias branch updated-commit t)]
+          updated-db     (async-db/->async-db (assoc current-db :commit updated-commit))]
       (go ;; update index in the background, return updated db immediately
         (->> (dbproto/-index-update current-db index-map)
              (async-db/deliver! updated-db)))
