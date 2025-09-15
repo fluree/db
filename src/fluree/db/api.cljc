@@ -19,6 +19,7 @@
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.log :as log]
+            [fluree.db.util.parse :as util.parse]
             [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge load range exists? update drop]))
 
@@ -583,8 +584,9 @@
    (wrap-policy db policy nil))
   ([db policy policy-values]
    (promise-wrap
-    (let [policy* (json-ld/expand policy)]
-      (policy/wrap-policy db policy* policy-values)))))
+    (let [policy* (json-ld/expand policy)
+          policy-values* (util.parse/normalize-values policy-values)]
+      (policy/wrap-policy db policy* policy-values*)))))
 
 (defn wrap-class-policy
   "Applies policy restrictions based on policy classes in the database.
@@ -600,7 +602,8 @@
    (wrap-class-policy db policy-classes nil))
   ([db policy-classes policy-values]
    (promise-wrap
-    (policy/wrap-class-policy db nil policy-classes policy-values))))
+    (let [policy-values* (util.parse/normalize-values policy-values)]
+      (policy/wrap-class-policy db nil policy-classes policy-values*)))))
 
 (defn wrap-identity-policy
   "Applies policy restrictions based on an identity's policy classes.
@@ -618,7 +621,8 @@
    (wrap-identity-policy db identity nil))
   ([db identity policy-values]
    (promise-wrap
-    (policy/wrap-identity-policy db nil identity policy-values))))
+    (let [policy-values* (util.parse/normalize-values policy-values)]
+      (policy/wrap-identity-policy db nil identity policy-values*)))))
 
 (defn dataset
   "Creates a composed dataset from multiple resolved graph databases.

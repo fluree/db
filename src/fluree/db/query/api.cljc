@@ -190,6 +190,13 @@
                  parse-t-val)]
       [alias nil])))
 
+(def ledger-specific-opts #{:policy-class :policy :policy-values})
+
+(defn ledger-opts-override
+  [{:keys [opts] :as q} {:keys [alias] :as _db}]
+  (let [ledger-opts (-> opts (get alias) (select-keys ledger-specific-opts))]
+    (update q :opts merge ledger-opts)))
+
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
   (go-try
@@ -198,7 +205,9 @@
             ledger       (<? (connection/load-ledger-alias conn alias))
             db           (ledger/current-db ledger)
             t*           (or explicit-t t)
-            query*       (assoc sanitized-query :t t*)]
+            query*       (-> sanitized-query
+                             (assoc :t t*)
+                             (ledger-opts-override db))]
         (<? (restrict-db db tracker query* conn)))
       (catch* e
         (throw (contextualize-ledger-400-error
