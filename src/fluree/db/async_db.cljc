@@ -19,9 +19,12 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(declare ->async-db ->AsyncDB deliver!)
+(declare ->async-db deliver!)
 
-(defrecord AsyncDB [alias branch commit t db-chan]
+(defrecord AsyncDB [alias branch commit t db-chan
+                    reindex-min-bytes
+                    reindex-max-bytes
+                    max-old-indexes]
   dbproto/IFlureeDb
   (-query [_ tracker query-map]
     (go-try
@@ -161,7 +164,7 @@
 
   (-as-of [_ t]
     (let [db-chan-at-t (async/promise-chan)
-          db-at-t      (->AsyncDB alias branch commit t db-chan-at-t)]
+          db-at-t      (->AsyncDB alias branch commit t db-chan-at-t nil nil nil)]
       (go
         (try*
           (let [db (<? db-chan)]
@@ -202,7 +205,7 @@
         (<? (policy/wrap-policy db tracker policy policy-values)))))
   (root [_]
     (let [root-ch (async/promise-chan)
-          root-db (->AsyncDB alias branch commit t root-ch)]
+          root-db (->AsyncDB alias branch commit t root-ch nil nil nil)]
       (go
         (try*
           (let [db (<? db-chan)]
@@ -255,7 +258,7 @@
   This is to be used in conjunction with `deliver!` that will deliver the
   loaded db to the async-db."
   [ledger-alias branch commit-map t]
-  (->AsyncDB ledger-alias branch commit-map t (async/promise-chan)))
+  (->AsyncDB ledger-alias branch commit-map t (async/promise-chan) nil nil nil))
 
 (defn load
   ([ledger-alias branch commit-catalog index-catalog commit-jsonld indexing-opts]
