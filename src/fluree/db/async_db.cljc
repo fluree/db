@@ -36,7 +36,14 @@
         (<? (dbproto/-class-ids db tracker subject)))))
   (-index-update [_ commit-index]
     (let [commit* (assoc commit :index commit-index)
-          updated-db (->async-db alias branch commit* t)]
+          updated-db (map->AsyncDB {:alias alias
+                                    :branch branch
+                                    :commit commit*
+                                    :t t
+                                    :db-chan (async/promise-chan)
+                                    :reindex-min-bytes reindex-min-bytes
+                                    :reindex-max-bytes reindex-max-bytes
+                                    :max-old-indexes max-old-indexes})]
       (go-try
         (let [db (<? db-chan)]
           (deliver! updated-db (dbproto/-index-update db commit-index))))
@@ -164,7 +171,14 @@
 
   (-as-of [_ t]
     (let [db-chan-at-t (async/promise-chan)
-          db-at-t      (->AsyncDB alias branch commit t db-chan-at-t nil nil nil)]
+          db-at-t      (map->AsyncDB {:alias alias
+                                      :branch branch
+                                      :commit commit
+                                      :t t
+                                      :db-chan db-chan-at-t
+                                      :reindex-min-bytes reindex-min-bytes
+                                      :reindex-max-bytes reindex-max-bytes
+                                      :max-old-indexes max-old-indexes})]
       (go
         (try*
           (let [db (<? db-chan)]
@@ -205,7 +219,14 @@
         (<? (policy/wrap-policy db tracker policy policy-values)))))
   (root [_]
     (let [root-ch (async/promise-chan)
-          root-db (->AsyncDB alias branch commit t root-ch nil nil nil)]
+          root-db (map->AsyncDB {:alias alias
+                                 :branch branch
+                                 :commit commit
+                                 :t t
+                                 :db-chan root-ch
+                                 :reindex-min-bytes reindex-min-bytes
+                                 :reindex-max-bytes reindex-max-bytes
+                                 :max-old-indexes max-old-indexes})]
       (go
         (try*
           (let [db (<? db-chan)]
@@ -264,14 +285,22 @@
   ([ledger-alias branch commit-catalog index-catalog commit-jsonld indexing-opts]
    (let [commit-map (commit-data/jsonld->clj commit-jsonld)]
      (load ledger-alias branch commit-catalog index-catalog commit-jsonld commit-map indexing-opts)))
-  ([ledger-alias branch commit-catalog index-catalog commit-jsonld commit-map indexing-opts]
+  ([ledger-alias branch commit-catalog index-catalog commit-jsonld commit-map
+    {:keys [reindex-min-bytes reindex-max-bytes max-old-indexes] :as indexing-opts}]
    (let [t        (-> commit-map :data :t)
          ;; Ensure AsyncDB commit reflects index t when an index address exists but :t is missing
          commit-map* (if (and (get-in commit-map [:index :address])
                               (nil? (get-in commit-map [:index :data :t])))
                        (assoc-in commit-map [:index :data :t] t)
                        commit-map)
-         async-db (->async-db ledger-alias branch commit-map* t)]
+         async-db    (map->AsyncDB {:alias ledger-alias
+                                    :branch branch
+                                    :commit commit-map*
+                                    :t t
+                                    :db-chan (async/promise-chan)
+                                    :reindex-min-bytes reindex-min-bytes
+                                    :reindex-max-bytes reindex-max-bytes
+                                    :max-old-indexes max-old-indexes})]
      (go
        (let [db (<! (flake-db/load ledger-alias commit-catalog index-catalog branch
                                    [commit-jsonld commit-map] indexing-opts))]
