@@ -291,8 +291,7 @@
                                       :indexing-disabled)
                index-t (commit-data/index-t commit-map)
                novelty-size (get-in db* [:novelty :size] 0)
-               ;; Always read threshold from realized FlakeDB; db* may be AsyncDB
-               reindex-min-bytes (or (:reindex-min-bytes db) 1000000)
+               reindex-min-bytes (:reindex-min-bytes db*)
                indexing-needed? (>= novelty-size reindex-min-bytes)]
            (-> write-result
                (select-keys [:address :hash :size])
