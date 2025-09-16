@@ -130,7 +130,7 @@ KilogramMeasurement(?x) → hasUnit(?x, kg)
 hasQualityScore(?x, "95"^^xsd:int) ↛ HighQuality(?x)
 ```
 
-**Workaround**: Use untyped literals or object properties where possible.
+**Workaround**: Use untyped literals (plain JSON-LD values with no "@type", e.g., `95` or `"95"` rather than `{"@value":95,"@type":"xsd:int"}`) or model the value as an object property where possible.
 
 #### Property Chains with Separately Defined Axioms
 **Status**: Partially supported  
