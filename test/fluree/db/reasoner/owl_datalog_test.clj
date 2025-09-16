@@ -55,12 +55,12 @@
           db-reasoned @(fluree/reason db-with-data :owl-datalog)]
 
       (testing "Instance with all intersection components should be inferred as DrugProduct"
-        (is (= #{"ex:DrugProduct" "ex:ManufacturedItem" "ex:SubstanceDefinition"}
-               (set @(fluree/query db-reasoned
-                                   {:context {"ex" "http://example.org/"}
-                                    :select  "?type"
-                                    :where   {"@id"   "ex:aspirin-tablet"
-                                              "@type" "?type"}})))
+        (is (= ["ex:DrugProduct" "ex:ManufacturedItem" "ex:SubstanceDefinition"]
+               @(fluree/query db-reasoned
+                              {:context {"ex" "http://example.org/"}
+                               :select  "?type"
+                               :where   {"@id"   "ex:aspirin-tablet"
+                                         "@type" "?type"}}))
             "ex:aspirin-tablet should be inferred as ex:DrugProduct")))))
 
 (deftest ^:integration someValuesFrom-in-equivalentClass-test
@@ -95,12 +95,12 @@
           db-reasoned @(fluree/reason db-with-data :owl-datalog)]
 
       (testing "Individual with property pointing to correct type should be inferred as Parent"
-        (is (contains? (set @(fluree/query db-reasoned
-                                           {:context {"ex" "http://example.org/"}
-                                            :select  "?type"
-                                            :where   {"@id"   "ex:john"
-                                                      "@type" "?type"}}))
-                       "ex:Parent")
+        (is (some #{"ex:Parent"}
+                  @(fluree/query db-reasoned
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?type"
+                                  :where   {"@id"   "ex:john"
+                                            "@type" "?type"}}))
             "ex:john should be inferred as ex:Parent")))))
 
 (deftest ^:integration blank-node-restrictions-test
@@ -132,12 +132,12 @@
           db-reasoned @(fluree/reason db-with-data :owl-datalog)]
 
       (testing "Product with validation should be inferred as ValidatedProduct"
-        (is (contains? (set @(fluree/query db-reasoned
-                                           {:context {"ex" "http://example.org/"}
-                                            :select  "?type"
-                                            :where   {"@id"   "ex:product1"
-                                                      "@type" "?type"}}))
-                       "ex:ValidatedProduct")
+        (is (some #{"ex:ValidatedProduct"}
+                  @(fluree/query db-reasoned
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?type"
+                                  :where   {"@id"   "ex:product1"
+                                            "@type" "?type"}}))
             "ex:product1 should be inferred as ex:ValidatedProduct")))))
 
 (deftest ^:integration nested-property-chains-test
@@ -181,12 +181,12 @@
             "Property chain should infer ex:active-ingredient ex:hasFormulation ex:formulation1"))
 
       (testing "Inferred property should trigger class inference"
-        (is (contains? (set @(fluree/query db-reasoned
-                                           {:context {"ex" "http://example.org/"}
-                                            :select  "?type"
-                                            :where   {"@id"   "ex:active-ingredient"
-                                                      "@type" "?type"}}))
-                       "ex:FormulatedSubstance")
+        (is (some #{"ex:FormulatedSubstance"}
+                  @(fluree/query db-reasoned
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?type"
+                                  :where   {"@id"   "ex:active-ingredient"
+                                            "@type" "?type"}}))
             "ex:active-ingredient should be inferred as ex:FormulatedSubstance")))))
 
 (deftest ^:integration multiple-intersection-levels-test
@@ -224,12 +224,12 @@
           db-reasoned @(fluree/reason db-with-data :owl-datalog)]
 
       (testing "Instance satisfying nested intersections should be inferred as ComplexProduct"
-        (is (contains? (set @(fluree/query db-reasoned
-                                           {:context {"ex" "http://example.org/"}
-                                            :select  "?type"
-                                            :where   {"@id"   "ex:product1"
-                                                      "@type" "?type"}}))
-                       "ex:ComplexProduct")
+        (is (some #{"ex:ComplexProduct"}
+                  @(fluree/query db-reasoned
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?type"
+                                  :where   {"@id"   "ex:product1"
+                                            "@type" "?type"}}))
             "ex:product1 should be inferred as ex:ComplexProduct")))))
 
 (deftest ^:integration unionOf-in-class-expressions-test
@@ -281,37 +281,37 @@
           db-reasoned @(fluree/reason db-with-data :owl-datalog)]
 
       (testing "Union of named classes"
-        (is (contains? (set @(fluree/query db-reasoned
-                                           {:context {"ex" "http://example.org/"}
-                                            :select  "?type"
-                                            :where   {"@id"   "ex:protein1"
-                                                      "@type" "?type"}}))
-                       "ex:DrugTarget")
+        (is (some #{"ex:DrugTarget"}
+                  @(fluree/query db-reasoned
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?type"
+                                  :where   {"@id"   "ex:protein1"
+                                            "@type" "?type"}}))
             "Protein should be inferred as DrugTarget")
 
-        (is (contains? (set @(fluree/query db-reasoned
-                                           {:context {"ex" "http://example.org/"}
-                                            :select  "?type"
-                                            :where   {"@id"   "ex:receptor1"
-                                                      "@type" "?type"}}))
-                       "ex:DrugTarget")
+        (is (some #{"ex:DrugTarget"}
+                  @(fluree/query db-reasoned
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?type"
+                                  :where   {"@id"   "ex:receptor1"
+                                            "@type" "?type"}}))
             "Receptor should be inferred as DrugTarget"))
 
       (testing "Union in someValuesFrom restriction"
-        (is (contains? (set @(fluree/query db-reasoned
-                                           {:context {"ex" "http://example.org/"}
-                                            :select  "?type"
-                                            :where   {"@id"   "ex:record1"
-                                                      "@type" "?type"}}))
-                       "ex:MedicationUser")
+        (is (some #{"ex:MedicationUser"}
+                  @(fluree/query db-reasoned
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?type"
+                                  :where   {"@id"   "ex:record1"
+                                            "@type" "?type"}}))
             "Record referring to Patient should be inferred as MedicationUser")
 
-        (is (contains? (set @(fluree/query db-reasoned
-                                           {:context {"ex" "http://example.org/"}
-                                            :select  "?type"
-                                            :where   {"@id"   "ex:record2"
-                                                      "@type" "?type"}}))
-                       "ex:MedicationUser")
+        (is (some #{"ex:MedicationUser"}
+                  @(fluree/query db-reasoned
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?type"
+                                  :where   {"@id"   "ex:record2"
+                                            "@type" "?type"}}))
             "Record referring to Participant should be inferred as MedicationUser")))))
 
 (deftest ^:integration inverse-roles-in-restrictions-test
@@ -375,27 +375,27 @@
           db-reasoned @(fluree/reason db-with-data :owl-datalog)]
 
       (testing "Inverse role in someValuesFrom"
-        (is (contains? (set @(fluree/query db-reasoned
-                                           {:context {"ex" "http://example.org/"}
-                                            :select  "?type"
-                                            :where   {"@id"   "ex:box1"
-                                                      "@type" "?type"}}))
-                       "ex:Container")
+        (is (some #{"ex:Container"}
+                  @(fluree/query db-reasoned
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?type"
+                                  :where   {"@id"   "ex:box1"
+                                            "@type" "?type"}}))
             "box1 should be inferred as Container because product1 is containedIn it")
 
-        (is (contains? (set @(fluree/query db-reasoned
-                                           {:context {"ex" "http://example.org/"}
-                                            :select  "?type"
-                                            :where   {"@id"   "ex:employee1"
-                                                      "@type" "?type"}}))
-                       "ex:Supervised")
+        (is (some #{"ex:Supervised"}
+                  @(fluree/query db-reasoned
+                                 {:context {"ex" "http://example.org/"}
+                                  :select  "?type"
+                                  :where   {"@id"   "ex:employee1"
+                                            "@type" "?type"}}))
             "employee1 should be inferred as Supervised because manager1 supervises them"))
 
       (testing "Inverse role in property chain"
-        (is (= #{"ex:item1" "ex:item2"}
-               (set @(fluree/query db-reasoned
-                                   {:context {"ex" "http://example.org/"}
-                                    :select  "?sibling"
-                                    :where   {"@id"              "ex:item1"
-                                              "ex:hasSiblingItem" "?sibling"}})))
+        (is (= ["ex:item1" "ex:item2"]
+               @(fluree/query db-reasoned
+                              {:context {"ex" "http://example.org/"}
+                               :select  "?sibling"
+                               :where   {"@id"              "ex:item1"
+                                         "ex:hasSiblingItem" "?sibling"}}))
             "Property chain with inverse should infer item1 hasSiblingItem item1 and item2 (things in same container)")))))

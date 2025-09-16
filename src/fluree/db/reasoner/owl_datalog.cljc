@@ -846,6 +846,70 @@
    []
    restrictions))
 
+(defn generate-all-values-rules
+  "Generate forward entailment rules for allValuesFrom restrictions in intersections."
+  [rule-class all-values]
+  (reduce (fn [acc* all-val-restriction]
+            (let [{:keys [property is-inverse?]} (extract-property-with-inverse all-val-restriction)
+                  target-class (util/get-first-id all-val-restriction const/iri-owl:allValuesFrom)]
+              (if (and property target-class)
+                (let [rule (if is-inverse?
+                             ;; For inverse: if x is rule-class and y has property x, then y is target-class
+                             {"where"  [{"@id"   "?x"
+                                         "@type" rule-class}
+                                        {"@id"    "?y"
+                                         property "?x"}]
+                              "insert" {"@id"   "?y"
+                                        "@type" target-class}}
+                             ;; Normal: if x is rule-class and x has property y, then y is target-class
+                             {"where"  [{"@id"   "?x"
+                                         "@type" rule-class}
+                                        {"@id"    "?x"
+                                         property "?y"}]
+                              "insert" {"@id"   "?y"
+                                        "@type" target-class}})]
+                  (conj acc* [(str rule-class "(owl:allValuesFrom-forward-" property ")") rule]))
+                acc*)))
+          []
+          all-values))
+
+(defn generate-has-value-rules
+  "Generate forward entailment rules for hasValue restrictions in intersections."
+  [rule-class has-value]
+  (reduce (fn [acc* has-val-restriction]
+            (let [{:keys [property is-inverse?]} (extract-property-with-inverse has-val-restriction)
+                  has-val  (util/get-first has-val-restriction const/iri-owl:hasValue)
+                  has-val* (cond
+                             (util/get-id has-val)
+                             {"@id" (util/get-id has-val)}
+
+                             ;; For typed data values, preserve the full object for matching
+                             (and (map? has-val) (contains? has-val "@value"))
+                             has-val
+
+                             ;; For simple values, use raw value
+                             :else
+                             (util/get-value has-val))]
+              (if (and property has-val*)
+                (let [rule (if is-inverse?
+                             ;; For inverse: if x is rule-class, then has-val has property x
+                             (when (map? has-val*)  ;; Can't do inverse for scalar values
+                               {"where"  {"@id"   "?x"
+                                          "@type" rule-class}
+                                "insert" {"@id"    (get has-val* "@id")
+                                          property "?x"}})
+                             ;; Normal: if x is rule-class, then x has property has-val
+                             {"where"  {"@id"   "?x"
+                                        "@type" rule-class}
+                              "insert" {"@id"    "?x"
+                                        property has-val*}})]
+                  (if rule
+                    (conj acc* [(str rule-class "(owl:hasValue-forward-" property ")") rule])
+                    acc*))
+                acc*)))
+          []
+          has-value))
+
 (defn equiv-intersection-of
   "Handles owl:intersectionOf - rules cls-int1, cls-int2"
   [rule-class intersection-of-statements inserts]
@@ -889,64 +953,10 @@
                                       "@type" (into [] class-list)}})
 
            ;; Generate forward entailment rules for allValuesFrom in intersections
-           all-values-rules (reduce (fn [acc* all-val-restriction]
-                                      (let [{:keys [property is-inverse?]} (extract-property-with-inverse all-val-restriction)
-                                            target-class (util/get-first-id all-val-restriction const/iri-owl:allValuesFrom)]
-                                        (if (and property target-class)
-                                          (let [rule (if is-inverse?
-                                                      ;; For inverse: if x is rule-class and y has property x, then y is target-class
-                                                       {"where"  [{"@id"   "?x"
-                                                                   "@type" rule-class}
-                                                                  {"@id"    "?y"
-                                                                   property "?x"}]
-                                                        "insert" {"@id"   "?y"
-                                                                  "@type" target-class}}
-                                                      ;; Normal: if x is rule-class and x has property y, then y is target-class
-                                                       {"where"  [{"@id"   "?x"
-                                                                   "@type" rule-class}
-                                                                  {"@id"    "?x"
-                                                                   property "?y"}]
-                                                        "insert" {"@id"   "?y"
-                                                                  "@type" target-class}})]
-                                            (conj acc* [(str rule-class "(owl:allValuesFrom-forward-" property ")") rule]))
-                                          acc*)))
-                                    []
-                                    all-values)
+           all-values-rules (generate-all-values-rules rule-class all-values)
 
            ;; Generate forward entailment rules for hasValue in intersections
-           has-value-rules (reduce (fn [acc* has-val-restriction]
-                                     (let [{:keys [property is-inverse?]} (extract-property-with-inverse has-val-restriction)
-                                           has-val  (util/get-first has-val-restriction const/iri-owl:hasValue)
-                                           has-val* (cond
-                                                      (util/get-id has-val)
-                                                      {"@id" (util/get-id has-val)}
-
-                                                    ;; For typed data values, preserve the full object for matching
-                                                      (and (map? has-val) (contains? has-val "@value"))
-                                                      has-val
-
-                                                    ;; For simple values, use raw value
-                                                      :else
-                                                      (util/get-value has-val))]
-                                       (if (and property has-val*)
-                                         (let [rule (if is-inverse?
-                                                    ;; For inverse: if x is rule-class, then has-val has property x
-                                                      (when (map? has-val*)  ;; Can't do inverse for scalar values
-                                                        {"where"  {"@id"   "?x"
-                                                                   "@type" rule-class}
-                                                         "insert" {"@id"    (get has-val* "@id")
-                                                                   property "?x"}})
-                                                    ;; Normal: if x is rule-class, then x has property has-val
-                                                      {"where"  {"@id"   "?x"
-                                                                 "@type" rule-class}
-                                                       "insert" {"@id"    "?x"
-                                                                 property has-val*}})]
-                                           (if rule
-                                             (conj acc* [(str rule-class "(owl:hasValue-forward-" property ")") rule])
-                                             acc*))
-                                         acc*)))
-                                   []
-                                   has-value)
+           has-value-rules (generate-has-value-rules rule-class has-value)
 
            triples       (reduce
                           (fn [triples* c]
@@ -998,8 +1008,9 @@
                                      []
                                      unions)
            {:keys [has-value]} (group-by equiv-class-type unions)
-           restrictions      (cond->> []
-                               has-value (into (has-value-condition "?y" has-value)))
+           restrictions      (if has-value
+                               (has-value-condition "?y" has-value)
+                               [])
            restriction-rules (map (fn [where]
                                     [(str rule-class "(owl:unionOf->owl:hasValue)#" (hash where))
                                      {"where"  where
@@ -1053,13 +1064,10 @@
   (let [c1 (util/get-id owl-statement) ;; the class which is the subject
         equiv-class-val (get owl-statement const/iri-owl:equivalentClass)
         unwrapped (util/unwrap-list equiv-class-val)
-        ;; Ensure unwrapped is always a sequence for group-by
-        unwrapped-seq (if (sequential? unwrapped) unwrapped [unwrapped])
         ;; combine with all other equivalent classes for a set of 2+ total classes
         {:keys [classes intersection-of union-of one-of
                 has-value some-values all-values
-                max-cardinality max-qual-cardinality]} (->> unwrapped-seq
-                                                            (group-by equiv-class-type))]
+                max-cardinality max-qual-cardinality]} (group-by equiv-class-type unwrapped)]
     (cond-> all-rules
       classes (into (equiv-class-rules c1 classes)) ;; cax-eqc1, cax-eqc2
       intersection-of (into (equiv-intersection-of c1 intersection-of inserts)) ;; cls-int1, cls-int2, scm-int
