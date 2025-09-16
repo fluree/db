@@ -39,7 +39,7 @@
   nameservice/Publisher
   (publish [_ data]
     (let [;; Extract data from compact JSON-LD format (both genesis and regular commits now use this)
-          ledger-alias   (get data "alias")  ;; Already includes @branch
+          ledger-alias   (get data "alias")  ;; Already includes :branch
           commit-address (get data "address")
           t-value        (get-in data ["data" "t"])
           index-address  (get-in data ["index" "address"])
@@ -65,7 +65,7 @@
   nameservice/iNameService
   (lookup [_ ledger-address]
     (go-try
-      ;; ledger-address is just the alias (potentially with @branch)
+      ;; ledger-address is just the alias (potentially with :branch)
       (let [filename (local-filename ledger-address)]
         (log/debug "StorageNameService lookup:" {:ledger-address ledger-address
                                                  :filename filename})

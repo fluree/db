@@ -199,7 +199,7 @@
 
 (defn hash->commit-id
   [hsh]
-  (str "fluree:commit:sha256:b" hsh))
+  (str iri/f-commit-256-b-ns hsh))
 
 (defn commit-json->commit-id
   [jld]

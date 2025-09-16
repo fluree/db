@@ -388,11 +388,10 @@
       (log/debug "sha->t looking up commit SHA:" sha)
       ;; Normalize the input - use only 'fluree:commit:sha256:b' prefix when present,
       ;; otherwise ensure the value starts with 'b'
-      (let [prefix-b "fluree:commit:sha256:b"
-            sha-normalized (cond
+      (let [sha-normalized (cond
                              ;; Input is a full commit IRI with ':b' segment - keep leading 'b'
-                             (str/starts-with? sha prefix-b)
-                             (subs sha (dec (count prefix-b)))
+                             (str/starts-with? sha iri/f-commit-256-b-ns)
+                             (subs sha (dec (count iri/f-commit-256-b-ns)))
 
                              ;; Already has correct format (starts with 'b')
                              (str/starts-with? sha "b")
@@ -420,7 +419,7 @@
 
           :else
           (let [;; sha-normalized already has 'b' prefix from normalization
-                commit-id-prefix (str "fluree:commit:sha256:" sha-normalized)
+                commit-id-prefix (str iri/f-commit-256-ns sha-normalized)
                 ;; Use the index to find commits with this SHA or prefix
                 start-sid (iri/encode-iri db commit-id-prefix)
                 end-sid   (iri/encode-iri db (str commit-id-prefix "~"))
