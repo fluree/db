@@ -16,6 +16,7 @@
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
+            [fluree.db.util.ledger :as ledger-util]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -245,7 +246,10 @@
 
 (defn ledger-opts-override
   [{:keys [opts] :as q} {:keys [alias] :as _db}]
-  (let [ledger-opts (-> opts (get alias) (select-keys ledger-specific-opts))]
+  (let [;; First try the full alias (ledger:branch), then fall back to ledger name only
+        base-name (ledger-util/ledger-base-name alias)
+        ledger-opts (or (some-> opts (get alias) (select-keys ledger-specific-opts))
+                        (some-> opts (get base-name) (select-keys ledger-specific-opts)))]
     (update q :opts merge ledger-opts)))
 
 (defn load-alias
