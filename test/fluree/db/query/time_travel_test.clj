@@ -146,9 +146,8 @@
                                                 "from" [(str ledger-name "@invalid:format")]}
                                                {})]
           (is (instance? Exception result) "Should return an exception")
-          (when (instance? Exception result)
-            (let [msg (ex-message result)]
-              (is (re-find #"Invalid time travel format" msg) "Error should mention invalid format")))))
+          (let [msg (ex-message result)]
+            (is (re-find #"Invalid time travel format" msg) "Error should mention invalid format"))))
 
       (testing "Missing value for time travel spec returns error"
         (doseq [spec ["@t:" "@iso:" "@sha:"]]
@@ -158,8 +157,7 @@
                                                   "from" [(str ledger-name spec)]}
                                                  {})]
             (is (instance? Exception result) (str "Should return an exception for spec " spec))
-            (when (instance? Exception result)
-              (is (re-find #"Missing value for time travel spec" (ex-message result)))))))
+            (is (re-find #"Missing value for time travel spec" (ex-message result))))))
 
       ;; Test ambiguous SHA prefix (would require multiple commits with similar prefixes)
       ;; This is hard to test reliably since we'd need to generate commits with specific SHA patterns
@@ -171,11 +169,10 @@
                                                 "from" [(str ledger-name "@sha:zzzzzz")]}
                                                {})]
           (is (instance? Exception result) "Should return an exception for non-existent SHA")
-          (when (instance? Exception result)
-            (let [msg (ex-message result)]
-              (is (or (re-find #"No commit found" msg)
-                      (re-find #"invalid-commit-sha" msg))
-                  "Error should mention commit not found")))))
+          (let [msg (ex-message result)]
+            (is (or (re-find #"No commit found" msg)
+                    (re-find #"invalid-commit-sha" msg))
+                "Error should mention commit not found"))))
 
       @(fluree/disconnect conn))))
 
@@ -320,10 +317,9 @@
                                                 "from" [(str ledger-name "@iso:" too-early-iso)]}
                                                {})]
           (is (instance? Exception result) "Should return an exception for time before data exists")
-          (when (instance? Exception result)
-            (let [msg (ex-message result)]
-              (is (re-find #"no data as of" msg)
-                  "Error should mention no data exists at that time")))))
+          (let [msg (ex-message result)]
+            (is (re-find #"no data as of" msg)
+                "Error should mention no data exists at that time"))))
 
       @(fluree/disconnect conn))))
 
