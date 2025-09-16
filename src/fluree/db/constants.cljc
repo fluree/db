@@ -5,6 +5,7 @@
 
 ;; Version
 (def ^:const data_version 4)
+(def ^:const ns-version "ns@v2")
 
 ;; iri constants
 (def ^:const iri-CommitProof (fluree-iri "CommitProof"))
