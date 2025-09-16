@@ -7,6 +7,7 @@
             [fluree.db.util :as util :refer [get-first get-first-id
                                              get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
@@ -145,21 +146,23 @@
     resp-ch))
 
 (defn write-jsonld
-  [storage ledger-alias jsonld]
-  (let [path (str/join "/" [ledger-alias "commit"])]
+  [storage ledger-name jsonld]
+  (let [path (str/join "/" [ledger-name "commit"])]
     (storage/content-write-json storage path jsonld)))
 
 (defn write-genesis-commit
-  [storage ledger-alias branch publish-addresses init-time]
+  [storage ledger-alias publish-addresses init-time]
   (go-try
-    (let [genesis-commit            (commit-data/blank-commit ledger-alias branch publish-addresses init-time)
+    (let [;; Use full alias for commit data, but base name for storage paths
+          ledger-base-name          (util.ledger/ledger-base-name ledger-alias)
+          genesis-commit            (commit-data/blank-commit ledger-alias publish-addresses init-time)
           initial-context           (get genesis-commit "@context")
           initial-db-data           (-> genesis-commit
                                         (get "data")
                                         (assoc "@context" initial-context))
-          {db-address :address}     (<? (write-jsonld storage ledger-alias initial-db-data))
+          {db-address :address}     (<? (write-jsonld storage ledger-base-name initial-db-data))
           genesis-commit*           (assoc-in genesis-commit ["data" "address"] db-address)
-          {commit-address :address} (<? (write-jsonld storage ledger-alias genesis-commit*))]
+          {commit-address :address} (<? (write-jsonld storage ledger-base-name genesis-commit*))]
       (-> genesis-commit*
           (assoc "address" commit-address)
           json-ld/expand))))

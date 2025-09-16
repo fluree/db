@@ -42,8 +42,8 @@
                                   (js->clj opts :keywordize-keys true))))
 
 (defn ^:export status
-  ([conn ledger-id] (clj->js (fluree/status conn ledger-id)))
-  ([conn ledger-id branch] (clj->js (fluree/status conn ledger-id branch))))
+  [conn ledger-id]
+  (clj->js (fluree/status conn ledger-id)))
 
 (defn ^:export db
   [conn ledger-id]

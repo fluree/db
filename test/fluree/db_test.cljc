@@ -1,10 +1,10 @@
 (ns fluree.db-test
-  (:require #?@(:clj  [[clojure.core.async :as async]
+  (:require #?@(:clj  [[babashka.fs :refer [with-temp-dir]]
+                       [clojure.core.async :as async]
                        [clojure.test :refer [deftest is testing]]
-                       [fluree.db.did :as did]
                        [fluree.db.async-db :as async-db]
-                       [fluree.db.util.filesystem :as fs]
-                       [babashka.fs :refer [with-temp-dir]]]
+                       [fluree.db.did :as did]
+                       [fluree.db.util.filesystem :as fs]]
                 :cljs [[cljs.test :refer-macros [deftest is testing async]]
                        [clojure.core.async :refer [go <!]]
                        [clojure.core.async.interop :refer [<p!]]])
@@ -1085,10 +1085,10 @@
          ;; wait for everything to be written
          (Thread/sleep 1000)
          (testing "before drop"
-           (is (= ["destined-for-drop" "ns@v1"]
+           (is (= ["destined-for-drop" "ns@v2"]
                   (sort (async/<!! (fs/list-files primary-path)))))
-           (is (= ["destined-for-drop@main.json"]
-                  (async/<!! (fs/list-files (str secondary-path "/ns@v1")))))
+           (is (= ["destined-for-drop"]
+                  (async/<!! (fs/list-files (str secondary-path "/ns@v2")))))
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
            ;; only store txns when signed
@@ -1120,10 +1120,13 @@
          (Thread/sleep 1000)
          (testing "after drop"
            ;; directories are not removed
-           (is (= ["destined-for-drop" "ns@v1"]
+           (is (= ["destined-for-drop" "ns@v2"]
                   (sort (async/<!! (fs/list-files primary-path)))))
+           ;; The destined-for-drop directory remains but should be empty
+           (is (= ["destined-for-drop"]
+                  (async/<!! (fs/list-files (str secondary-path "/ns@v2")))))
            (is (= []
-                  (async/<!! (fs/list-files (str secondary-path "/ns@v1")))))
+                  (async/<!! (fs/list-files (str secondary-path "/ns@v2/destined-for-drop")))))
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
            (is (= ["garbage" "opst" "post" "psot" "root" "spot" "tspo"]

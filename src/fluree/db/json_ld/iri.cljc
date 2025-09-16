@@ -12,6 +12,7 @@
 (def ^:const f-idx-ns "https://ns.flur.ee/index#")
 (def ^:const f-did-ns "did:key:")
 (def ^:const f-commit-256-ns "fluree:commit:sha256:")
+(def ^:const f-commit-256-b-ns "fluree:commit:sha256:b")
 (def ^:const fdb-256-ns "fluree:db:sha256:")
 (def ^:const f-mem-ns "fluree:memory://")
 (def ^:const f-file-ns "fluree:file://")

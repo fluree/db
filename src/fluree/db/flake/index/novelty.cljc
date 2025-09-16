@@ -394,13 +394,13 @@
 
           refresh-ch
           ([{:keys [garbage], refreshed-db :db, :as _status}]
-           (let [{:keys [index-catalog alias branch] :as refreshed-db*}
+           (let [{:keys [index-catalog alias] :as refreshed-db*}
                  (assoc-in refreshed-db [:stats :indexed] t)
                 ;; TODO - ideally issue garbage/root writes to RAFT together
                 ;;        as a tx, currently requires waiting for both
                 ;;        through raft sync
                  garbage-res   (when (seq garbage)
-                                 (let [write-res (<? (storage/write-garbage index-catalog alias branch t garbage))]
+                                 (let [write-res (<? (storage/write-garbage index-catalog alias t garbage))]
                                    (<! (notify-new-index-file write-res :garbage t changes-ch))
                                    write-res))
                  db-root-res   (<? (storage/write-db-root index-catalog refreshed-db* (:address garbage-res)))
