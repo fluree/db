@@ -69,7 +69,7 @@
    (deftest load-from-file-test
      (testing "can load a file ledger with single cardinality predicates"
        (with-temp-dir [storage-path {}]
-         (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
+         (let [conn         @(fluree/connect-file {:storage-path {"defaultVal" (str storage-path)}})
                ledger-alias "load-from-file-test-single-card"
                db0          @(fluree/create conn ledger-alias)
                db           @(fluree/update
@@ -1097,7 +1097,7 @@
            ;; initial create call generates an initial commit, each commit has two files
            (is (= (* 2 (inc tx-count))
                   (count (async/<!! (fs/list-files (str primary-path "/" alias "/commit"))))))
-           (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
+           (is (= ["garbage" "opst" "post" "psot" "root" "spot" "tspo"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias "/index"))))))
            ;; one new index root per tx
            (is (= tx-count
@@ -1129,7 +1129,7 @@
                   (async/<!! (fs/list-files (str secondary-path "/ns@v2/destined-for-drop")))))
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
-           (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
+           (is (= ["garbage" "opst" "post" "psot" "root" "spot" "tspo"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias "/index"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/txn"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/commit"))))))

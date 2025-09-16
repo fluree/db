@@ -96,7 +96,7 @@
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
   If it is not newer, returns original db."
-  [{:keys [commit] :as db} {data-map :data, :keys [spot post opst tspo] :as index-map}]
+  [{:keys [commit] :as db} {data-map :data, :keys [spot psot post opst tspo] :as index-map}]
   (if (newer-index? commit index-map)
     (let [index-t (:t data-map)
           commit* (assoc commit :index index-map)]
@@ -104,6 +104,7 @@
           (empty-novelty index-t)
           (assoc :commit commit*
                  :spot spot
+                 :psot psot
                  :post post
                  :opst opst
                  :tspo tspo)
@@ -312,6 +313,9 @@
   (-match-triple [db tracker solution triple-mch error-ch]
     (match/match-triple db tracker solution triple-mch error-ch))
 
+  (-match-properties [db tracker solution triple-mchs error-ch]
+    (match/match-properties db tracker solution triple-mchs error-ch))
+
   (-match-class [db tracker solution class-mch error-ch]
     (match/match-class db tracker solution class-mch error-ch))
 
@@ -509,10 +513,11 @@
 
 (defn genesis-root-map
   [ledger-alias]
-  (let [{spot-cmp :spot, post-cmp :post, opst-cmp :opst, tspo-cmp :tspo}
+  (let [{spot-cmp :spot, psot-cmp :psot, post-cmp :post, opst-cmp :opst, tspo-cmp :tspo}
         index/comparators]
     {:t               0
      :spot            (index/empty-branch ledger-alias spot-cmp)
+     :psot            (index/empty-branch ledger-alias psot-cmp)
      :post            (index/empty-branch ledger-alias post-cmp)
      :opst            (index/empty-branch ledger-alias opst-cmp)
      :tspo            (index/empty-branch ledger-alias tspo-cmp)

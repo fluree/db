@@ -101,9 +101,9 @@
     [cached? p-chan]))
 
 (defn notify
-  [{:keys [commit-catalog] :as conn} address hash]
+  [{:keys [commit-catalog] :as conn} address]
   (go-try
-    (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address hash))]
+    (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
       (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
         (if-let [ledger-ch (ns-subscribe/cached-ledger conn ledger-alias)]
           (do (log/debug "Notification received for ledger" ledger-alias
@@ -196,6 +196,10 @@
   (go-try
     (let [json-data (<? (storage/read-json commit-catalog addr))]
       (assoc json-data "address" addr))))
+
+(defn parse-address-hash
+  [{:keys [commit-catalog] :as _conn} addr]
+  (storage/get-hash commit-catalog addr))
 
 (defn lookup-publisher-commit
   [conn ledger-address]
@@ -423,15 +427,17 @@
                                 (util/get-first-value const/iri-address))]
       (when index-address
         (log/debug "Dropping index" index-address)
-        (let [{:keys [spot opst post tspo]} (<? (storage/read-json storage index-address true))
+        (let [{:keys [spot psot opst post tspo]} (<? (storage/read-json storage index-address true))
 
               garbage-ch (garbage/clean-garbage* index-catalog index-address 0)
               spot-ch    (drop-index-nodes storage (:id spot))
+              psot-ch    (drop-index-nodes storage (:id psot))
               post-ch    (drop-index-nodes storage (:id post))
               tspo-ch    (drop-index-nodes storage (:id tspo))
               opst-ch    (drop-index-nodes storage (:id opst))]
           (<? garbage-ch)
           (<? spot-ch)
+          (<? psot-ch)
           (<? post-ch)
           (<? tspo-ch)
           (<? opst-ch)
@@ -483,7 +489,6 @@
 
 (defn trigger-ledger-index
   "Manually triggers indexing for a ledger/branch and waits for completion.
-
    Options:
    - :timeout - Max wait time in ms (default 300000 / 5 minutes)
 

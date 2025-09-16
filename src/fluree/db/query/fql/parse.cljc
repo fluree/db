@@ -22,6 +22,24 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(def ^:dynamic *object-var-parsing*
+  "When true (default), bare object values like \"?x\" are parsed as variables.
+  When false, only an explicit object value map with '@variable' is parsed as
+  a variable. Keys and @id variable parsing are unaffected."
+  true)
+
+(defn var-parsing-config
+  "If present, bound-vars is a set containing all vars that are bound earlier in query
+  execution. In the `where` clause it is just the vars from the `values` clause. In
+  `insert` and `delete` clauses it also contains vars from the `where` clause.
+
+  If `:parse-object-vars` is false then we will not attempt to parse string literals in
+  the object position as variables, only specifically tagged @variable objects will be
+  parsed as variables."
+  [bound-vars opts]
+  {:bound-vars  (set bound-vars)
+   :parse-object-vars? (get opts :object-var-parsing true)})
+
 (defn parse-var-name
   "Returns x as a symbol if x is a valid variable, or nil otherwise. A valid
   variable is a string, symbol, or keyword whose name starts with '?'."
@@ -34,8 +52,8 @@
   (some-> x parse-var-name where/unmatched-var))
 
 (defn- parse-variable-if-allowed
-  [allowed-vars x]
-  (if (->> x symbol (contains? allowed-vars))
+  [var-config x]
+  (if (contains? (:bound-vars var-config) (symbol x))
     (parse-variable x)
     (throw
      (ex-info (str "variable " x " is not bound in where nor values clause")
@@ -198,16 +216,16 @@
   filter fn.
 
   There can be multiple vars in the filter function which can utilize the
-  original query's 'vars' map, however there should be exactly one var in the
-  filter fn that isn't in that map - which should be the var that will receive
+  original query's 'values' vars, however there should be exactly one 'fresh' var in the
+  filter fn that isn't in that set - which should be the var that will receive
   flake/o."
-  [params vars]
-  (let [non-assigned-vars (set/difference params vars)]
+  [params {:keys [bound-vars] :as _var-config}]
+  (let [non-assigned-vars (set/difference params bound-vars)]
     (case (count non-assigned-vars)
       1 (first non-assigned-vars)
       0 (throw (ex-info (str "Variable filter function has no variable assigned to it, all parameters "
                              "exist in the 'values' clause. Filter function params: " params ". "
-                             "Values assigned in query: " vars ".")
+                             "Values assigned in query: " bound-vars ".")
                         {:status 400
                          :error  :db/invalid-query}))
       (throw (ex-info (str "Vars used in a filter function are not included in the 'values' clause "
@@ -253,12 +271,12 @@
 
 (defn parse-filter-function
   "Evals and returns filter function."
-  [fltr fltr-var vars ctx]
+  [fltr fltr-var var-config ctx]
   (let [code      (parse-code fltr)
         code-vars (or (not-empty (variables code))
                       (throw (ex-info (str "Filter function must contain a valid variable. Provided: " code)
                                       {:status 400 :error :db/invalid-query})))
-        var-name  (find-filtered-var code-vars vars)]
+        var-name  (find-filtered-var code-vars var-config)]
     (if (= var-name fltr-var)
       (eval/compile-filter code var-name ctx)
       (throw (ex-info (str "Variable filter must only reference the variable bound in its value map: "
@@ -309,7 +327,7 @@
       where/->iri-ref))
 
 (defmulti parse-pattern
-  (fn [pattern _vars _context]
+  (fn [pattern _var-config _context]
     (v/where-pattern-type pattern)))
 
 (defn parse-bind-map
@@ -328,18 +346,18 @@
   (and (sequential? pattern) (keyword? (first pattern))))
 
 (defn parse-where-clause
-  [clause vars context]
+  [clause var-config context]
   ;; a single higher-order where pattern is already sequential, so we need to check if it needs wrapping
   (let [clause* (if (higher-order-pattern? clause)
                   [clause]
                   (util/sequential clause))]
     (->> clause*
          (mapcat (fn [pattern]
-                   (parse-pattern pattern vars context)))
+                   (parse-pattern pattern var-config context)))
          where/->where-clause)))
 
 (defn parse-variable-attributes
-  [var attrs vars context]
+  [var attrs var-config context]
   (if (and (contains? attrs const/iri-type)
            (contains? attrs const/iri-language))
     (throw (ex-info "Language tags are not allowed when the data type is specified."
@@ -353,7 +371,7 @@
           lang-matcher (some-> lang where/lang-matcher)
           filter-fn    (some-> attrs
                                (get const/iri-filter)
-                               (parse-filter-function var vars context))
+                               (parse-filter-function var var-config context))
           filters (cond->> [filter-fn]
                     (not (v/variable? t)) (cons t-matcher)
                     (not (v/variable? dt)) (cons dt-matcher)
@@ -436,15 +454,25 @@
     pattern))
 
 (defn parse-object-map
-  [s-mch p-mch o vars context]
-  (let [o* (expand-keys o context)]
-    (if-let [v (get o* const/iri-value)]
-      (let [attrs (dissoc o* const/iri-value)
-            o-mch (if-let [var (parse-var-name v)]
-                    (parse-variable-attributes var attrs vars context)
+  [s-mch p-mch o {:keys [parse-object-vars?] :as var-config} context]
+  (let [o* (expand-keys o context)
+        explicit-var (get o const/iri-variable)]
+    (cond
+      explicit-var
+      (let [attrs (-> o (dissoc const/iri-variable) (expand-keys context))
+            var   (parse-var-name explicit-var)
+            o-mch (parse-variable-attributes var attrs var-config context)]
+        [(flip-reverse-pattern [s-mch p-mch o-mch])])
+
+      (contains? o* const/iri-value)
+      (let [v     (get o* const/iri-value)
+            attrs (dissoc o* const/iri-value)
+            o-mch (if (and parse-object-vars? (parse-var-name v))
+                    (parse-variable-attributes (parse-var-name v) attrs var-config context)
                     (parse-value-attributes v attrs context))]
         [(flip-reverse-pattern [s-mch p-mch o-mch])])
-      ;; ref
+
+      :else ;;ref
       (let [id-map  (with-id o context) ; not o*, we can't use expanded or we'll lose @reverse
             o-mch   (-> id-map
                         (get const/iri-id)
@@ -453,21 +481,21 @@
         ;; return a thunk wrapping the recursive call to preserve stack
         ;; space by delaying execution
         #(into [(flip-reverse-pattern [s-mch p-mch o-mch])]
-               (parse-statements o-mch o-attrs vars context))))))
+               (parse-statements o-mch o-attrs var-config context))))))
 
 (defn parse-statement*
-  [s-mch p-mch o vars context]
+  [s-mch p-mch o var-config context]
   (cond
-    (v/query-variable? o)
+    (v/query-variable? o var-config)
     (let [o-mch (parse-variable o)]
       [(flip-reverse-pattern [s-mch p-mch o-mch])])
 
     (map? o)
-    (parse-object-map s-mch p-mch o vars context)
+    (parse-object-map s-mch p-mch o var-config context)
 
     (sequential? o)
     #(mapcat (fn [o*]
-               (parse-statement s-mch p-mch o* vars context))
+               (parse-statement s-mch p-mch o* var-config context))
              o)
 
     (type-pred-match? p-mch)
@@ -479,43 +507,59 @@
       [(flip-reverse-pattern [s-mch p-mch o-mch])])))
 
 (defn parse-statement
-  [s-mch p-mch o vars context]
-  (trampoline parse-statement* s-mch p-mch o vars context))
+  [s-mch p-mch o var-config context]
+  (trampoline parse-statement* s-mch p-mch o var-config context))
 
 (defn parse-statements*
-  [s-mch attrs vars context]
+  [s-mch attrs var-config context]
   #(mapcat (fn [[p o]]
              (let [p-mch (parse-predicate p context)]
-               (parse-statement s-mch p-mch o vars context)))
+               (parse-statement s-mch p-mch o var-config context)))
            attrs))
 
 (defn parse-statements
-  [s-mch attrs vars context]
-  (trampoline parse-statements* s-mch attrs vars context))
+  [s-mch attrs var-config context]
+  (trampoline parse-statements* s-mch attrs var-config context))
+
+(defn specified-properties?
+  [attrs]
+  (every? v/specified-value? (keys attrs)))
+
+(defn variable-objects?
+  [attrs]
+  (every? v/query-variable? (vals attrs)))
+
+(defn simple-property-join?
+  [id attrs]
+  (and (>= (count attrs) 2)
+       (v/query-variable? id)
+       (specified-properties? attrs)
+       (variable-objects? attrs)))
 
 (defn parse-id-map-pattern
-  [m vars context]
-  (let [s-mch (-> m
-                  (get const/iri-id)
-                  (parse-subject context))
+  [m var-config context]
+  (let [id    (get m const/iri-id)
+        s-mch (parse-subject id context)
         attrs (dissoc m const/iri-id)]
     (if (empty? attrs)
       [(where/->pattern :id s-mch)]
-      (let [statements (parse-statements s-mch attrs vars context)]
-        (sort optimize/compare-triples statements)))))
+      (let [statements (parse-statements s-mch attrs var-config context)]
+        (if (simple-property-join? id attrs)
+          [(where/->pattern :property-join statements)]
+          (sort optimize/compare-triples statements))))))
 
 (defn parse-node-map
-  [m vars context]
+  [m var-config context]
   (-> m
       (with-id context)
-      (parse-id-map-pattern vars context)))
+      (parse-id-map-pattern var-config context)))
 
 (defmethod parse-pattern :node
-  [m vars context]
-  (parse-node-map m vars context))
+  [m var-config context]
+  (parse-node-map m var-config context))
 
 (defmethod parse-pattern :filter
-  [[_ & codes] _vars context]
+  [[_ & codes] _var-config context]
   (let [f (->> codes
                (map parse-code)
                (map (fn [code] (comp (fn [tv] (:value tv))
@@ -524,39 +568,39 @@
     [(where/->pattern :filter (with-meta f {:fns codes}))]))
 
 (defmethod parse-pattern :union
-  [[_ & unions] vars context]
-  (let [parsed (mapv (fn [clause] (parse-where-clause clause vars context))
+  [[_ & unions] var-config context]
+  (let [parsed (mapv (fn [clause] (parse-where-clause clause var-config context))
                      unions)]
     [(where/->pattern :union parsed)]))
 
 (defmethod parse-pattern :optional
-  [[_ & optionals] vars context]
+  [[_ & optionals] var-config context]
   (into []
-        (comp (map (fn [clause] (parse-where-clause clause vars context)))
+        (comp (map (fn [clause] (parse-where-clause clause var-config context)))
               (map (partial where/->pattern :optional)))
         optionals))
 
 (defmethod parse-pattern :bind
-  [[_ & binds] _vars context]
+  [[_ & binds] _var-config context]
   (let [parsed (parse-bind-map binds context)]
     [(where/->pattern :bind parsed)]))
 
 (defmethod parse-pattern :values
-  [[_ values] _vars context]
+  [[_ values] _var-config context]
   (let [[_vars solutions] (parse-values values context)]
     [(where/->pattern :values solutions)]))
 
 (defmethod parse-pattern :exists
-  [[_ patterns] vars context]
-  [(where/->pattern :exists (parse-where-clause patterns vars context))])
+  [[_ patterns] var-config context]
+  [(where/->pattern :exists (parse-where-clause patterns var-config context))])
 
 (defmethod parse-pattern :not-exists
-  [[_ patterns] vars context]
-  [(where/->pattern :not-exists (parse-where-clause patterns vars context))])
+  [[_ patterns] var-config context]
+  [(where/->pattern :not-exists (parse-where-clause patterns var-config context))])
 
 (defmethod parse-pattern :minus
-  [[_ patterns] vars context]
-  [(where/->pattern :minus (parse-where-clause patterns vars context))])
+  [[_ patterns] var-config context]
+  [(where/->pattern :minus (parse-where-clause patterns var-config context))])
 
 ;; TODO: This function is only necessary because ledger aliases might not be
 ;; valid IRIs but virtual graph aliases are. We should require that all ledger
@@ -570,38 +614,41 @@
         graph))))
 
 (defmethod parse-pattern :graph
-  [[_ graph where] vars context]
+  [[_ graph where] var-config context]
   (let [graph* (or (parse-variable graph)
                    (parse-graph-string graph context))
-        where* (parse-where-clause where vars context)]
+        where* (parse-where-clause where var-config context)]
     [(where/->pattern :graph [graph* where*])]))
 
 (defn parse-where
-  [where vars context]
+  [where var-config context]
   (when where
     (-> where
         syntax/coerce-where
-        (parse-where-clause vars context))))
+        (parse-where-clause var-config context))))
 
 (defn unwrap-tuple-patterns
-  "Construct accepts ::v/node-map patterns, which can produce :tuple patterns, :class
-  patterns, or :id patterns. We only need the pattern components as a template for
-  construct, the :id and :class patterns are for optimized query execution, so this
-  function unwraps :id and :class patterns and only returns the underlying components."
+  "Construct accepts node-map patterns, which can produce :tuple patterns, :class
+  patterns, or :id patterns. We only need the pattern components as a template
+  for construct, the :id and :class patterns are for optimized query execution,
+  so this function unwraps :id and :class patterns and only returns the
+  underlying components."
   [patterns]
-  (mapv (fn [[pattern-type component :as pattern]]
-          (case pattern-type
-            :class component
-            :id    [component]
-            pattern))
-        patterns))
+  (->> patterns
+       (mapcat (fn [[pattern-type component :as pattern]]
+                 (case pattern-type
+                   :class         [component]
+                   :property-join component
+                   :id            [[component]]
+                   [pattern])))
+       vec))
 
 (defn parse-construct
   [q context]
   (when-let [construct (:construct q)]
     (-> construct
         syntax/coerce-where
-        (parse-where-clause nil context)
+        (parse-where-clause (var-parsing-config nil (:opts q)) context)
         unwrap-tuple-patterns
         select/construct-selector)))
 
@@ -768,7 +815,8 @@
          context       (cond->> (json-ld/parse-context orig-context)
                          parent-context (merge parent-context))
          [vars values] (parse-values (:values q) context)
-         where         (parse-where (:where q) vars context)
+         var-config    (var-parsing-config vars (:opts q))
+         where         (parse-where (:where q) var-config context)
          construct     (parse-construct q context)
          grouping      (parse-grouping q)
          ordering      (parse-ordering q)]
@@ -785,9 +833,10 @@
          parse-fuel))))
 
 (defmethod parse-pattern :query
-  [[_ sub-query] _vars context]
+  [[_ sub-query] var-config context]
   (let [sub-query* (-> sub-query
                        syntax/coerce-subquery
+                       (update :opts merge {:object-var-parsing (:parse-object-vars? var-config)})
                        (parse-query* context))]
     [(where/->pattern :query sub-query*)]))
 
@@ -807,31 +856,45 @@
           (where/match-meta metadata)))))
 
 (defn parse-obj-cmp
-  [allowed-vars context subj-cmp pred-cmp m triples v-map]
+  [var-config context subj-cmp pred-cmp m triples v-map]
   (let [id     (util/get-id v-map)
         v-list (util/get-list v-map)
         value  (util/get-value v-map)
         type   (util/get-types v-map)
-        lang   (util/get-lang v-map)]
+        lang   (util/get-lang v-map)
+        explicit-var (get v-map const/iri-variable)]
     (cond v-list
           (reduce (fn [triples [i list-item]]
-                    (parse-obj-cmp allowed-vars context subj-cmp pred-cmp {:i i} triples list-item))
+                    (parse-obj-cmp var-config context subj-cmp pred-cmp {:i i} triples list-item))
                   triples
                   (map vector (range) v-list))
+
+          explicit-var
+          (let [var-val    (cond
+                             (map? explicit-var) (util/get-value explicit-var)
+                             (sequential? explicit-var) (-> explicit-var first util/get-value)
+                             :else explicit-var)
+                var-mch    (parse-variable-if-allowed var-config var-val)
+                dt         (if (sequential? type) (first type) type)
+                dt-matcher (some-> dt (where/datatype-matcher context))
+                lang-mch   (some-> lang where/lang-matcher)
+                f          (combine-filters lang-mch dt-matcher)
+                obj-cmp    (cond-> var-mch f (where/with-filter f))]
+            (conj triples [subj-cmp pred-cmp obj-cmp]))
 
           ;; literal object
           (some? value)
           (let [m*      (cond-> m
                           lang (assoc :lang lang))
-                obj-cmp (if (v/variable? value)
-                          (parse-variable-if-allowed allowed-vars value)
+                obj-cmp (if (v/variable? value var-config)
+                          (parse-variable-if-allowed var-config value)
                           (parse-object-value value type context m*))]
             (conj triples [subj-cmp pred-cmp obj-cmp]))
 
           ;; ref object
           :else
-          (let [ref-obj (if (v/variable? id)
-                          (parse-variable-if-allowed allowed-vars id)
+          (let [ref-obj (if (v/variable? id var-config)
+                          (parse-variable-if-allowed var-config id)
                           (where/match-iri
                            (if (nil? id)
                              (iri/new-blank-node-id)
@@ -843,15 +906,15 @@
                           ;; project newly created bnode-id into v-map
                           (assoc v-map const/iri-id (where/get-iri ref-cmp))
                           v-map)]
-            (conj (parse-subj-cmp allowed-vars context triples v-map*)
+            (conj (parse-subj-cmp var-config context triples v-map*)
                   [subj-cmp pred-cmp ref-cmp])))))
 
 (defn parse-pred-cmp
-  [allowed-vars context subj-cmp triples [pred values]]
+  [var-config context subj-cmp triples [pred values]]
   (cond
     (v/variable? pred)
-    (let [pred-cmp (parse-variable-if-allowed allowed-vars pred)]
-      (reduce (partial parse-obj-cmp allowed-vars context subj-cmp pred-cmp nil)
+    (let [pred-cmp (parse-variable-if-allowed var-config pred)]
+      (reduce (partial parse-obj-cmp var-config context subj-cmp pred-cmp nil)
               triples
               values))
 
@@ -864,23 +927,23 @@
     (let [values*  (map (fn [typ] {const/iri-id typ})
                         values)
           pred-cmp (where/match-iri const/iri-rdf-type)]
-      (reduce (partial parse-obj-cmp allowed-vars context subj-cmp pred-cmp nil)
+      (reduce (partial parse-obj-cmp var-config context subj-cmp pred-cmp nil)
               triples
               values*))
 
     :else
     (let [pred-cmp (where/match-iri pred)]
-      (reduce (partial parse-obj-cmp allowed-vars context subj-cmp pred-cmp nil)
+      (reduce (partial parse-obj-cmp var-config context subj-cmp pred-cmp nil)
               triples
               values))))
 
 (defn parse-subj-cmp
-  [allowed-vars context triples node]
+  [var-config context triples node]
   (let [id       (util/get-id node)
-        subj-cmp (cond (v/variable? id) (parse-variable-if-allowed allowed-vars id)
+        subj-cmp (cond (v/variable? id) (parse-variable-if-allowed var-config id)
                        (nil? id)        (where/match-iri (iri/new-blank-node-id))
                        :else            (where/match-iri id))]
-    (reduce (partial parse-pred-cmp allowed-vars context subj-cmp)
+    (reduce (partial parse-pred-cmp var-config context subj-cmp)
             triples
             (->> (dissoc node const/iri-id)
                  ;; deterministic patterns for each pred
@@ -888,9 +951,9 @@
 
 (defn parse-triples
   "Flattens and parses expanded json-ld into update triples."
-  [expanded allowed-vars context]
+  [expanded var-config context]
   (try*
-    (reduce (partial parse-subj-cmp allowed-vars context)
+    (reduce (partial parse-subj-cmp var-config context)
             [] expanded)
     (catch* e
       (throw (ex-info (str "Parsing failure due to: " (ex-message e)
@@ -912,14 +975,13 @@
    will be expanded using the context inside the txn merged with the
    provided parsed-context, if not nil.
 
-   If bound-vars is non-nil, it will replace any variables in the document
-   assuming it is a valid variable placement, otherwise it will throw."
-  [jld bound-vars parsed-context]
+   Variable parsing is constrained by the var config allows (see `var-parsing-config`)."
+  [jld var-config parsed-context]
   (-> jld
       (json-ld/expand parsed-context)
       util/get-graph
       util/sequential
-      (parse-triples bound-vars parsed-context)))
+      (parse-triples var-config parsed-context)))
 
 (defn parse-update-txn
   ([txn]
@@ -929,13 +991,16 @@
                            (:context override-opts))
          [vars values] (-> (get-named txn "values")
                            (parse-values context))
+         var-config    (var-parsing-config vars override-opts)
          where         (-> (get-named txn "where")
-                           (parse-where vars context))
-         bound-vars    (-> where where/clause-variables (into vars))
+                           (parse-where var-config context))
+         var-config*   (cond-> (update var-config :bound-vars into (where/clause-variables where))
+                         ;; don't attempt variable parsing if there are no unified vars
+                         (not (or where vars))  (assoc :parse-object-vars? false))
          delete        (when-let [dlt (get-named txn "delete")]
-                         (jld->parsed-triples dlt bound-vars context))
+                         (jld->parsed-triples dlt var-config* context))
          insert        (when-let [ins (get-named txn "insert")]
-                         (jld->parsed-triples ins bound-vars context))
+                         (jld->parsed-triples ins var-config* context))
          annotation    (util/get-first-value txn const/iri-annotation)
          opts          (-> (get-named txn "opts")
                            (parse-txn-opts override-opts context))
@@ -998,10 +1063,12 @@
         context    (when-not turtle?
                      (or (ctx-util/txn-context txn)
                          context))
-        opts       (parse-txn-opts nil opts context)
+        opts       (-> (parse-txn-opts nil opts context)
+                       (assoc :object-var-parsing false))
+        var-config (var-parsing-config nil opts)
         parsed-txn (if turtle?
                      (turtle/parse txn)
-                     (jld->parsed-triples txn nil context))
+                     (jld->parsed-triples txn var-config context))
         {:keys [where delete]} (upsert-where-del parsed-txn)]
     {:opts    opts
      :context context
@@ -1013,7 +1080,7 @@
   [txn {:keys [format context] :as opts}]
   {:insert (if (= :turtle format)
              (turtle/parse txn)
-             (jld->parsed-triples txn nil context))
+             (jld->parsed-triples txn (var-parsing-config nil (assoc opts :object-var-parsing false)) context))
    :context context
    :opts opts})
 

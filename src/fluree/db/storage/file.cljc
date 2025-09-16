@@ -3,7 +3,7 @@
             #?@(:cljs [[fluree.db.platform :as platform]
                        ["fs" :as node-fs]
                        ["path" :as node-path]])
-            [clojure.core.async :as async]
+            [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.crypto.aes :as aes]
@@ -101,6 +101,20 @@
          :address (file-address identifier path)
          :hash    hash
          :size    original-size})))
+
+  storage/ContentArchive
+  (-content-read-bytes [_ address]
+    (let [path (storage-path root address)]
+      (fs/read-file path encryption-key)))
+
+  (get-hash [_ address]
+    (go
+      (-> address
+          storage/split-address
+          last
+          (str/split #"/")
+          last
+          storage/strip-extension)))
 
   storage/ByteStore
   (write-bytes [_ path bytes]
