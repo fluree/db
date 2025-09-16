@@ -1,7 +1,6 @@
 (ns fluree.db.api
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.core.async :as async :refer [go <!]]
-            [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.connection :as connection :refer [connection?]]
@@ -19,7 +18,9 @@
             [fluree.db.transact :as transact]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try <?]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
+            [fluree.db.util.parse :as util.parse]
             [fluree.db.virtual-graph.create :as vg-create]
             [fluree.db.virtual-graph.drop :as vg-drop]
             [fluree.json-ld :as json-ld])
@@ -251,8 +252,7 @@
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
    (validate-connection conn)
-   (when (and (string? ledger-alias) (str/includes? ledger-alias "@"))
-     (throw (ex-info "Ledger alias cannot contain '@' symbol" {:error :db/invalid-config :alias ledger-alias})))
+   (util.ledger/validate-ledger-name ledger-alias)
    (promise-wrap
     (go-try
       (log/info "Creating ledger" ledger-alias)
@@ -432,7 +432,7 @@
     opts - (optional) Options map for the commit operation
 
   The ledger-id is automatically extracted from the database object's
-  alias and branch fields (formatted as alias@branch).
+  alias and branch fields (formatted as alias:branch).
 
   Creates a new commit and notifies the nameservice of the new version.
   Returns promise resolving to the committed database."
@@ -579,24 +579,19 @@
     (transact-api/create-with-txn conn txn opts))))
 
 (defn status
-  "Returns current status of a ledger branch.
+  "Returns current status of a ledger.
 
   Parameters:
     conn - Connection object
-    ledger-id - Ledger alias or address
-    branch - (optional) Branch name (defaults to current branch)
+    ledger-id - Ledger alias (with optional :branch) or address
 
   Returns status map with commit and index information."
-  ([conn ledger-id]
-   (status conn ledger-id nil))
-  ([conn ledger-id branch]
-   (validate-connection conn)
-   (promise-wrap
-    (go-try
-      (let [ledger (<? (connection/load-ledger conn ledger-id))]
-        (if branch
-          (ledger/status ledger branch)
-          (ledger/status ledger)))))))
+  [conn ledger-id]
+  (validate-connection conn)
+  (promise-wrap
+   (go-try
+     (let [ledger (<? (connection/load-ledger conn ledger-id))]
+       (ledger/status ledger)))))
 
 ;; db operations
 
@@ -628,8 +623,9 @@
    (wrap-policy db policy nil))
   ([db policy policy-values]
    (promise-wrap
-    (let [policy* (json-ld/expand policy)]
-      (policy/wrap-policy db policy* policy-values)))))
+    (let [policy* (json-ld/expand policy)
+          policy-values* (util.parse/normalize-values policy-values)]
+      (policy/wrap-policy db policy* policy-values*)))))
 
 (defn wrap-class-policy
   "Applies policy restrictions based on policy classes in the database.
@@ -645,7 +641,8 @@
    (wrap-class-policy db policy-classes nil))
   ([db policy-classes policy-values]
    (promise-wrap
-    (policy/wrap-class-policy db nil policy-classes policy-values))))
+    (let [policy-values* (util.parse/normalize-values policy-values)]
+      (policy/wrap-class-policy db nil policy-classes policy-values*)))))
 
 (defn wrap-identity-policy
   "Applies policy restrictions based on an identity's policy classes.
@@ -663,7 +660,8 @@
    (wrap-identity-policy db identity nil))
   ([db identity policy-values]
    (promise-wrap
-    (policy/wrap-identity-policy db nil identity policy-values))))
+    (let [policy-values* (util.parse/normalize-values policy-values)]
+      (policy/wrap-identity-policy db nil identity policy-values*)))))
 
 (defn dataset
   "Creates a composed dataset from multiple resolved graph databases.
@@ -909,7 +907,10 @@
 
   Parameters:
     db - Database value
-    methods - Reasoner method or vector of methods (:datalog, :owl2rl)
+    methods - Reasoner method or vector of methods (:datalog, :owl2rl, :owl-datalog)
+              :datalog - Custom datalog rules
+              :owl2rl - OWL 2 RL profile rules  
+              :owl-datalog - Extended OWL 2 RL with additional Datalog-compatible constructs
     rule-sources - (optional) JSON-LD rules or nil to use rules from db
     opts - (optional) Options map
 
@@ -951,9 +952,8 @@
 
   Parameters:
     conn - Database connection
-    ledger-alias - The alias/name of the ledger to index
+    ledger-alias - The alias/name of the ledger to index (with optional :branch)
     opts - (optional) Options map:
-      :branch - Branch name (defaults to main branch)
       :timeout - Max wait time in ms (default 300000 / 5 minutes)
 
   Returns a promise that resolves to the indexed database object.
@@ -962,6 +962,11 @@
   Example:
     ;; Trigger indexing and wait for completion
     (let [indexed-db @(trigger-index conn \"my-ledger\")]
+      ;; Use indexed-db...
+      )
+    
+    ;; Trigger indexing for a specific branch
+    (let [indexed-db @(trigger-index conn \"my-ledger:main\")]
       ;; Use indexed-db...
       )"
   ([conn ledger-alias]

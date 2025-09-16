@@ -5,6 +5,8 @@
 
 ;; Version
 (def ^:const data_version 4)
+(def ^:const ns-version "ns@v2")
+(def ^:const default-branch-name "main")
 
 ;; iri constants
 (def ^:const iri-CommitProof (fluree-iri "CommitProof"))

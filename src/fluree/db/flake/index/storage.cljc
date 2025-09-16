@@ -10,7 +10,8 @@
             [fluree.db.serde.protocol :as serde]
             [fluree.db.storage :as storage]
             [fluree.db.util :as util]
-            [fluree.db.util.async :refer [<? go-try]]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -37,8 +38,9 @@
 
 (defn write-index-file
   [storage ledger-alias index-type serialized-data]
-  (let [index-name (name index-type)
-        path       (str/join "/" [ledger-alias "index" index-name])]
+  (let [ledger-name (util.ledger/ledger-base-name ledger-alias)
+        index-name  (name index-type)
+        path        (str/join "/" [ledger-name "index" index-name])]
     (storage/content-write-json storage path serialized-data)))
 
 (defn write-leaf
@@ -65,9 +67,8 @@
 
 (defn write-garbage
   "Writes garbage record out for latest index."
-  [{:keys [storage serializer] :as _index-catalog} ledger-alias branch t garbage]
+  [{:keys [storage serializer] :as _index-catalog} ledger-alias t garbage]
   (let [data       {:alias   ledger-alias
-                    :branch  branch
                     :t       t
                     :garbage garbage}
         serialized (serde/-serialize-garbage serializer data)]
@@ -76,7 +77,7 @@
 (defn write-db-root
   [{:keys [storage serializer] :as _index-catalog} db garbage-addr]
   (go-try
-    (let [{:keys [alias schema t stats spot post opst tspo commit namespace-codes
+    (let [{:keys [alias schema t stats spot psot post opst tspo commit namespace-codes
                   reindex-min-bytes reindex-max-bytes max-old-indexes]}
           db
 
@@ -88,6 +89,7 @@
                                  :schema          (vocab/serialize-schema schema)
                                  :stats           (select-keys stats [:flakes :size])
                                  :spot            (child-data spot)
+                                 :psot            (child-data psot)
                                  :post            (child-data post)
                                  :opst            (child-data opst)
                                  :tspo            (child-data tspo)

@@ -6,6 +6,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql.parse :as fql-parse]
             [fluree.db.query.turtle.parse :as turtle]
+            [fluree.db.util.async :refer [empty-channel]]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph :as vg]))
 
@@ -725,7 +726,11 @@
   where/Matcher
   (-match-id [_ _tracker _solution _s-mch _error-ch]
     ;; R2RML doesn't support direct subject ID matching
-    where/nil-channel)
+    empty-channel)
+
+  (-match-properties [_ _tracker _solution _triples _error-ch]
+    ;; R2RML doesn't support property matching in this way
+    empty-channel)
 
   (-match-triple [_this _tracker solution triple _error-ch]
     ;; Collect R2RML pattern information in the solution, like BM25 does

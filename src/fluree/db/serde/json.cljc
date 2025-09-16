@@ -147,9 +147,9 @@
    {} m))
 
 (defn serialize-garbage
-  [{:keys [alias branch t garbage]}]
+  [{:keys [alias t garbage]}]
+  ;; alias now includes branch in "ledger@branch" format, no separate branch needed
   {"alias"   alias
-   "branch"  (name branch)
    "t"       t
    "garbage" (vec garbage)})
 
@@ -163,7 +163,7 @@
                 (:stats :config :garbage :prev-index)
                 (util/stringify-keys v)
 
-                (:spot :post :opst :tspo)
+                (:spot :psot :post :opst :tspo)
                 (stringify-child v)
 
                 v)))

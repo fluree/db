@@ -14,11 +14,8 @@
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]))
 
-(def commit-version 1)
+(def commit-version 2)
 (def data-version 0)
-
-(def default-branch
-  "main")
 
 (def json-ld-base-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
@@ -140,7 +137,6 @@
   (let [id          (get-id jsonld)
         v           (get-first-value jsonld const/iri-v)
         alias       (get-first-value jsonld const/iri-alias)
-        branch      (get-first-value jsonld const/iri-branch)
         address     (-> jsonld
                         (get-first-value const/iri-address)
                         not-empty)
@@ -159,7 +155,6 @@
     (cond-> {:id     id
              :v      v
              :alias  alias
-             :branch branch
              :time   time
              :tag    (mapv get-value tags)
              :data   (parse-db-data data)
@@ -179,9 +174,9 @@
       issuer (assoc :issuer {:id (get-id issuer)}))))
 
 (defn update-index-roots
-  [commit-map {:keys [spot post opst tspo]}]
+  [commit-map {:keys [spot psot post opst tspo]}]
   (if (contains? commit-map :index)
-    (update commit-map :index assoc :spot spot, :post post, :opst opst, :tspo tspo)
+    (update commit-map :index assoc :spot spot, :psot psot, :post post, :opst opst, :tspo tspo)
     commit-map))
 
 (defn json-ld->map
@@ -201,7 +196,7 @@
 
 (defn hash->commit-id
   [hsh]
-  (str "fluree:commit:sha256:b" hsh))
+  (str iri/f-commit-256-b-ns hsh))
 
 (defn commit-json->commit-id
   [jld]
@@ -223,12 +218,9 @@
 
 (defn blank-commit
   "Creates a skeleton blank commit map."
-  [alias branch publish-addresses init-time]
+  [alias publish-addresses init-time]
   (let [commit-json  (->json-ld {:alias  alias
-                                 :v      0
-                                 :branch (if branch
-                                           (util/keyword->str branch)
-                                           default-branch)
+                                 :v      commit-version
                                  :data   {:t      0
                                           :flakes 0
                                           :size   0}
@@ -367,6 +359,8 @@
            ;; launch futures for parallellism on JVM
            flake-size  #?(:clj  (future (calc-flake-size add rem))
                           :cljs (calc-flake-size add rem))
+           psot        #?(:clj  (future (flake/revise (get-in db [:novelty :psot]) add rem))
+                          :cljs (flake/revise (get-in db [:novelty :psot]) add rem))
            post        #?(:clj  (future (flake/revise (get-in db [:novelty :post]) add rem))
                           :cljs (flake/revise (get-in db [:novelty :post]) add rem))
            opst        #?(:clj  (future (flake/revise (get-in db [:novelty :opst]) (ref-flakes add) (ref-flakes rem)))
@@ -374,6 +368,8 @@
        (-> db
            (update-in [:novelty :spot] flake/revise add rem)
            (update-in [:novelty :tspo] flake/revise add rem)
+           (assoc-in [:novelty :psot] #?(:clj  @psot
+                                         :cljs psot))
            (assoc-in [:novelty :post] #?(:clj  @post
                                          :cljs post))
            (assoc-in [:novelty :opst] #?(:clj  @opst
@@ -398,7 +394,7 @@
   data as its own entity."
   [db]
   (let [tt-id   (random-uuid)
-        indexes [:spot :post :opst :tspo]]
+        indexes [:spot :psot :post :opst :tspo]]
     (-> (reduce
          (fn [db* idx]
            (let [{:keys [children] :as node} (get db* idx)
@@ -416,7 +412,7 @@
   db-sid. Used when committing to an in-memory ledger value and when reifying
   a ledger from storage on load."
   [db t commit]
-  (let [{:keys [id address alias branch data time v previous author issuer message txn]} commit
+  (let [{:keys [id address alias data time v previous author issuer message txn]} commit
         {db-t :t, db-address :address, data-id :id, :keys [flakes size]} data
         commit-sid (iri/encode-iri db id)
         db-sid     (iri/encode-iri db data-id)]
@@ -426,8 +422,6 @@
       (flake/create commit-sid const/$_address address const/$xsd:string t true nil)
       ;; alias
       (flake/create commit-sid const/$_ledger:alias alias const/$xsd:string t true nil)
-      ;; branch
-      (flake/create commit-sid const/$_ledger:branch branch const/$xsd:string t true nil)
       ;; v
       (flake/create commit-sid const/$_v v const/$xsd:int t true nil)
       ;; time

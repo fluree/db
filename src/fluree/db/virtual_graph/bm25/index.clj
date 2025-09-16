@@ -7,6 +7,7 @@
             [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util :as util]
+            [fluree.db.util.async :refer [empty-channel]]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph :as vg]
             [fluree.db.virtual-graph.bm25.search :as bm25.search]
@@ -322,10 +323,13 @@
     (vg-parse/finalize (partial search this) error-ch solution-ch))
 
   (-match-id [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    empty-channel)
 
   (-match-class [_ _tracker _solution _s-mch _error-ch]
-    where/nil-channel)
+    empty-channel)
+
+  (-match-properties [this tracker solution triples error-ch]
+    (where/match-triples this tracker solution triples error-ch))
 
   ;; activate-alias returns the VG itself when the alias matches
   (-activate-alias [this alias']
@@ -353,10 +357,6 @@
     ;; BM25 indexes are updated through the UpdatableVirtualGraph protocol
     ;; This is a no-op for compatibility
     this))
-
-(defn bm25-iri?
-  [idx-rdf-type]
-  (some #(= % const/$fluree:index-BM25) idx-rdf-type))
 
 ;; TODO - VG - triggering updates only works for queries for single subject, no nested nodes
 ;; TODO - VG - future feature - weighted properties

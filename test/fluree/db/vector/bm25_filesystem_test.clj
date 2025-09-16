@@ -44,7 +44,7 @@
           (is (= "article-search" vg-name)))
 
         (testing "nameservice record persistence"
-          (let [ns-file (fs/file storage-path "ns@v1" "article-search.json")]
+          (let [ns-file (fs/file storage-path "ns@v2" "article-search.json")]
             (is (fs/exists? ns-file) "Nameservice file should exist")
 
             (when (fs/exists? ns-file)

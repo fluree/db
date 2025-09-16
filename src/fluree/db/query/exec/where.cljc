@@ -10,7 +10,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.track :as track]
             [fluree.db.util :as util :refer [try* catch*]]
-            [fluree.db.util.async :refer [<?]]
+            [fluree.db.util.async :refer [<? empty-channel]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (clojure.lang MapEntry))))
@@ -299,6 +299,7 @@
   (-match-id [s tracker solution s-match error-ch])
   (-match-triple [s tracker solution triple error-ch])
   (-match-class [s tracker solution triple error-ch])
+  (-match-properties [s tracker solution triples error-ch])
   (-activate-alias [s alias])
   (-aliases [s])
   (-finalize [s tracker error-ch solution-ch]))
@@ -456,10 +457,14 @@
   from the spot index when scanned, and this is necessary because the `p` value
   is `nil`."
   [db idx s p o o-fn]
-  (if (and (#{:spot} idx)
-           (nil? p)
-           s
-           o)
+  (if (or (and (#{:spot} idx)
+               (nil? p)
+               s
+               o)
+          (and (#{:psot} idx)
+               (nil? s)
+               p
+               o))
     (let [match-fn (fn [mch]
                      (when-let [v (or (get-value mch)
                                       (get-sid mch db))]
@@ -484,56 +489,59 @@
   (not-empty (keep get-optional triple-pattern)))
 
 (defn resolve-flake-range
-  [{:keys [t] :as db} tracker error-ch [s-mch p-mch o-mch :as triple-pattern]]
-  (let [s    (or (get-sid s-mch db)
+  ([db tracker error-ch pattern]
+   (resolve-flake-range db tracker error-ch pattern nil))
+  ([{:keys [t] :as db} tracker error-ch [s-mch p-mch o-mch :as triple-pattern] idx]
+   (if (unmatched-optional-vars? triple-pattern)
+     empty-channel
+     (let [s (or (get-sid s-mch db)
                  (get-value s-mch))
-        p    (or (get-sid p-mch db)
+           p (or (get-sid p-mch db)
                  (get-value p-mch))
-        o    (or (get-sid o-mch db)
-                 (get-value o-mch))]
-    (if (or (unmatched-optional-vars? triple-pattern)
-            (not (comparable-iri? s))
-            (not (comparable-iri? p)))
-      ;; no flakes will ever match the given triple pattern
-      (async/onto-chan! (async/chan) [])
+           o (or (get-value o-mch)
+                 (get-sid o-mch db))]
+       (if (or (not (comparable-iri? s))
+               (not (comparable-iri? p)))
+         ;; no flakes will ever match the given triple pattern
+         empty-channel
+         (let [s-fn (::fn s-mch)
+               p-fn (::fn p-mch)
+               o-fn (::fn o-mch)
+               o-dt (some->> o-mch get-datatype-iri (iri/encode-iri db))
 
-      (let [s-fn (::fn s-mch)
-            p-fn (::fn p-mch)
-            o-fn (::fn o-mch)
-            o-dt (some->> o-mch get-datatype-iri (iri/encode-iri db))
-
-            idx         (try* (index/for-components s p o o-dt)
-                              (catch* e
-                                (log/error e "Error resolving flake range")
-                                (async/put! error-ch e)))
-            [o* o-fn*]  (augment-object-fn db idx s p o o-fn)
-            start-flake (flake/create s p o* o-dt nil nil util/min-integer)
-            end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
-            track-fuel  (track/track-fuel! tracker error-ch)
-            subj-filter (when s-fn
-                          (filter (fn [f]
-                                    (-> unmatched
-                                        (match-subject db f)
-                                        s-fn))))
-            pred-filter (when p-fn
-                          (filter (fn [f]
-                                    (-> unmatched
-                                        (match-predicate db f)
-                                        p-fn))))
-            obj-filter  (when o-fn*
-                          (filter (fn [f]
-                                    (-> unmatched
-                                        (match-object db f)
-                                        o-fn*))))
-            flake-xf    (->> [subj-filter pred-filter obj-filter track-fuel]
-                             (remove nil?)
-                             (apply comp))
-            opts        {:idx         idx
-                         :to-t        t
-                         :start-flake start-flake
-                         :end-flake   end-flake
-                         :flake-xf    flake-xf}]
-        (query-range/resolve-flake-slices db tracker idx error-ch opts)))))
+               idx*        (or idx
+                               (try* (index/for-components s p o o-dt)
+                                     (catch* e
+                                       (log/error e "Error resolving flake range")
+                                       (async/put! error-ch e))))
+               [o* o-fn*]  (augment-object-fn db idx* s p o o-fn)
+               start-flake (flake/create s p o* o-dt nil nil util/min-integer)
+               end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
+               track-fuel  (track/track-fuel! tracker error-ch)
+               subj-filter (when s-fn
+                             (filter (fn [f]
+                                       (-> unmatched
+                                           (match-subject db f)
+                                           s-fn))))
+               pred-filter (when p-fn
+                             (filter (fn [f]
+                                       (-> unmatched
+                                           (match-predicate db f)
+                                           p-fn))))
+               obj-filter  (when o-fn*
+                             (filter (fn [f]
+                                       (-> unmatched
+                                           (match-object db f)
+                                           o-fn*))))
+               flake-xf    (->> [subj-filter pred-filter obj-filter track-fuel]
+                                (remove nil?)
+                                (apply comp))
+               opts        {:idx         idx*
+                            :to-t        t
+                            :start-flake start-flake
+                            :end-flake   end-flake
+                            :flake-xf    flake-xf}]
+           (query-range/resolve-flake-slices db tracker idx* error-ch opts)))))))
 
 (defn compute-sid
   [s-mch db]
@@ -571,10 +579,6 @@
       (get-in [:schema :pred prop :childProps])
       not-empty))
 
-(def nil-channel
-  (doto (async/chan)
-    async/close!))
-
 (defmethod match-pattern :id
   [ds tracker solution pattern error-ch]
   (let [s-mch (pattern-data pattern)]
@@ -589,6 +593,11 @@
   [ds tracker solution pattern error-ch]
   (let [triple (pattern-data pattern)]
     (-match-class ds tracker solution triple error-ch)))
+
+(defmethod match-pattern :property-join
+  [ds tracker solution pattern error-ch]
+  (let [triples (pattern-data pattern)]
+    (-match-properties ds tracker solution triples error-ch)))
 
 (defn filter-exception
   "Reformats raw filter exception to try to provide more useful feedback."
@@ -652,6 +661,20 @@
                           solution-ch)
     out-ch))
 
+(defn with-constraints
+  [ds tracker patterns error-ch solution-ch]
+  (reduce (fn [solution-ch pattern]
+            (with-constraint ds tracker pattern error-ch solution-ch))
+          solution-ch patterns))
+
+(defn match-triples
+  [ds tracker triples error-ch solution]
+  (let [[triple & r] triples
+        ;; get initial solution channel from first triple
+        solution-ch  (match-pattern ds tracker solution triple error-ch)]
+    ;; refine solution channel with subsequent triples
+    (with-constraints ds tracker r error-ch solution-ch)))
+
 (defn subquery?
   [pattern]
   (and (sequential? pattern)
@@ -662,14 +685,13 @@
   dataset `ds` extending from `solution` that also match all the patterns in the
   parsed where clause collection `clause`."
   [ds tracker solution clause error-ch]
-  (let [initial-ch (async/to-chan! [solution])
-        {subquery-patterns true
-         other-patterns false} (group-by subquery? clause)
-        result-ch (reduce (fn [solution-ch pattern]
-                            (with-constraint ds tracker pattern error-ch solution-ch))
-                          initial-ch
-                          ;; process subqueries before other patterns
-                          (into (vec subquery-patterns) other-patterns))]
+  (let [{subquery-patterns true
+         other-patterns    false} (group-by subquery? clause)
+
+        ;; process subqueries before other patterns
+        patterns    (into (vec subquery-patterns) other-patterns)
+        solution-ch (async/to-chan! [solution])
+        result-ch   (with-constraints ds tracker patterns error-ch solution-ch)]
     (-finalize ds tracker error-ch result-ch)))
 
 (defn match-alias
