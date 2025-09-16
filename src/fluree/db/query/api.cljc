@@ -1,8 +1,7 @@
 (ns fluree.db.query.api
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
-  (:require [clojure.string :as str]
-            [fluree.db.connection :as connection]
+  (:require [fluree.db.connection :as connection]
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.ledger :as ledger]
@@ -16,6 +15,7 @@
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
+            [fluree.db.util.ledger :as ledger-util]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -150,59 +150,37 @@
        e)
       e)))
 
-(defn query-str->map
-  "Converts the string query parameters of
-  k=v&k2=v2&k3=v3 into a map of {k v, k2 v2, k3 v3}"
-  [query-str]
-  (->> (str/split query-str #"&")
-       (map str/trim)
-       (map (fn [s]
-              (str/split s #"=")))
-       (reduce
-        (fn [acc [k v]]
-          (assoc acc k v))
-        {})))
-
-(defn parse-t-val
-  "If t-val is an integer in string form, coerces
-  it to an integer, otherwise assumes it is an
-  ISO-8601 datetime string and returns it as is."
-  [t-val]
-  (if (re-matches #"^\d+$" t-val)
-    (util/str->long t-val)
-    t-val))
-
 (defn extract-query-string-t
-  "This uses the http query string format to as a generic way to
-  select a specific 'db' that can be used in queries. For now there
-  is only one parameter/key we look for, and that is `t` which can
-  be used to specify the moment in time.
+  "Extracts time travel specification from ledger alias.
+  Delegates to util.ledger/parse-ledger-alias and returns in
+  the format expected by load-alias.
 
-  e.g.:
-   - my/db?t=42
-   - my/db?t=2020-01-01T00:00:00Z"
+  Returns [base-alias time-travel-value] where:
+   - base-alias includes ledger:branch if branch is present
+   - time-travel-value can be nil, Long, String, or {:sha ...} map"
   [alias]
-  (let [[alias query-str] (str/split alias #"\?")]
-    (if query-str
-      [alias (-> query-str
-                 query-str->map
-                 (get "t")
-                 parse-t-val)]
-      [alias nil])))
+  (let [{:keys [ledger branch t]} (ledger-util/parse-ledger-alias alias)
+        base-alias (if branch
+                     (str ledger ":" branch)
+                     ledger)]
+    [base-alias t]))
 
 (def ledger-specific-opts #{:policy-class :policy :policy-values})
 
 (defn ledger-opts-override
   [{:keys [opts] :as q} {:keys [alias] :as _db}]
-  (let [ledger-opts (-> opts (get alias) (select-keys ledger-specific-opts))]
+  (let [;; First try the full alias (ledger:branch), then fall back to ledger name only
+        base-name (ledger-util/ledger-base-name alias)
+        ledger-opts (or (some-> opts (get alias) (select-keys ledger-specific-opts))
+                        (some-> opts (get base-name) (select-keys ledger-specific-opts)))]
     (update q :opts merge ledger-opts)))
 
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
   (go-try
     (try*
-      (let [[alias explicit-t] (extract-query-string-t alias)
-            ledger       (<? (connection/load-ledger-alias conn alias))
+      (let [[base-alias explicit-t] (extract-query-string-t alias)
+            ledger       (<? (connection/load-ledger-alias conn base-alias))
             db           (ledger/current-db ledger)
             t*           (or explicit-t t)
             query*       (-> sanitized-query

@@ -17,9 +17,6 @@
 (def commit-version 2)
 (def data-version 0)
 
-(def default-branch
-  "main")
-
 (def json-ld-base-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
   [["@context" iri/fluree-context-url]
@@ -199,7 +196,7 @@
 
 (defn hash->commit-id
   [hsh]
-  (str "fluree:commit:sha256:b" hsh))
+  (str iri/f-commit-256-b-ns hsh))
 
 (defn commit-json->commit-id
   [jld]

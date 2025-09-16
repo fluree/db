@@ -1,6 +1,7 @@
 (ns fluree.db.util.ledger
   "Utility functions for working with ledger names and branches."
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [fluree.db.util :as util]))
 
 (defn ledger-base-name
   "Extracts the base ledger name from a ledger alias that may include a branch.
@@ -126,3 +127,108 @@
                      :branch-name branch-name}))
 
     :else branch-name))
+
+(defn- query-str->map
+  "Converts query string parameters from k=v&k2=v2 format to a map.
+  Private helper for parse-ledger-alias."
+  [query-str]
+  (->> (str/split query-str #"&")
+       (map str/trim)
+       (map #(str/split % #"="))
+       (reduce (fn [acc [k v]]
+                 (assoc acc k v))
+               {})))
+
+(defn- parse-t-val
+  "Parses a time value - converts numeric strings to longs,
+  leaves ISO strings as-is. Private helper for parse-ledger-alias."
+  [t-val]
+  (if (re-matches #"^\d+$" t-val)
+    (util/str->long t-val)
+    t-val))
+
+(defn- parse-time-travel-val
+  "Parses time travel value from @ syntax.
+  Supports:
+   - t:42 -> returns 42 as long
+   - iso:2025-07-01T00:00:00Z -> returns ISO string
+   - sha:abc123 -> returns {:sha \"abc123\"} map
+  Private helper for parse-ledger-alias."
+  [time-str]
+  (cond
+    (str/starts-with? time-str "t:")
+    (let [val (subs time-str 2)]
+      (when (str/blank? val)
+        (throw (ex-info "Missing value for time travel spec"
+                        {:status 400 :error :db/invalid-time-travel})))
+      (util/str->long val))
+
+    (str/starts-with? time-str "iso:")
+    (let [val (subs time-str 4)]
+      (when (str/blank? val)
+        (throw (ex-info "Missing value for time travel spec"
+                        {:status 400 :error :db/invalid-time-travel})))
+      val)
+
+    (str/starts-with? time-str "sha:")
+    (let [val (subs time-str 4)]
+      (when (str/blank? val)
+        (throw (ex-info "Missing value for time travel spec"
+                        {:status 400 :error :db/invalid-time-travel})))
+      (when (< (count val) 6)
+        (throw (ex-info "SHA prefix must be at least 6 characters"
+                        {:status 400 :error :db/invalid-commit-sha :min 6})))
+      {:sha val})
+
+    :else
+    (throw (ex-info (str "Invalid time travel format: " time-str
+                         ". Expected t:, iso:, or sha: prefix")
+                    {:status 400 :error :db/invalid-time-travel}))))
+
+(defn parse-ledger-alias
+  "Parses a ledger alias string that may contain branch and time-travel information.
+
+  Supports formats:
+   - 'my-ledger' -> {:ledger 'my-ledger' :branch nil :t nil}
+   - 'my-ledger:main' -> {:ledger 'my-ledger' :branch 'main' :t nil}
+   - 'my-ledger?t=42' -> {:ledger 'my-ledger' :branch nil :t 42}
+   - 'my-ledger:main?t=42' -> {:ledger 'my-ledger' :branch 'main' :t 42}
+   - 'my-ledger@t:42' -> {:ledger 'my-ledger' :branch nil :t 42}
+   - 'my-ledger:main@iso:2025-01-01' -> {:ledger 'my-ledger' :branch 'main' :t '2025-01-01'}
+   - 'my-ledger@sha:abc123' -> {:ledger 'my-ledger' :branch nil :t {:sha 'abc123'}}
+
+  The @ syntax takes precedence over ? syntax for time travel.
+
+  Returns a map with keys:
+   - :ledger - the base ledger name (always present)
+   - :branch - the branch name (may be nil)
+   - :t - time travel value (may be nil, Long, String, or {:sha ...} map)"
+  [alias]
+  (let [;; First extract time travel if present
+        [base-with-branch time-val]
+        (cond
+          ;; @ syntax takes precedence
+          (str/includes? alias "@")
+          (let [at-idx (str/index-of alias "@")
+                base (subs alias 0 at-idx)
+                time-str (subs alias (inc at-idx))]
+            [base (parse-time-travel-val time-str)])
+
+          ;; ? query string syntax
+          (str/includes? alias "?")
+          (let [[base query-str] (str/split alias #"\?" 2)]
+            [base (some-> query-str
+                          query-str->map
+                          (get "t")
+                          parse-t-val)])
+
+          ;; No time travel
+          :else
+          [alias nil])
+
+        ;; Then extract ledger and branch
+        [ledger-name branch-name] (ledger-parts base-with-branch)]
+
+    {:ledger ledger-name
+     :branch branch-name
+     :t time-val}))

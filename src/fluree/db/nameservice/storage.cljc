@@ -16,7 +16,7 @@
    Returns path like 'ns@v2/ledger-name/branch.json'."
   [ledger-alias]
   (let [[ledger-name branch] (util.ledger/ledger-parts ledger-alias)
-        branch (or branch "main")]
+        branch (or branch const/default-branch-name)]
     (str const/ns-version "/" ledger-name "/" branch ".json")))
 
 (defn ns-record
@@ -24,7 +24,7 @@
    Expects ledger-alias to be in format 'ledger:branch'."
   [ledger-alias commit-address t index-address]
   (let [[alias branch] (util.ledger/ledger-parts ledger-alias)
-        branch (or branch "main")]
+        branch (or branch const/default-branch-name)]
     (cond-> {"@context"     {"f" iri/f-ns}
              "@id"          ledger-alias  ;; Already includes :branch
              "@type"        ["f:Database" "f:PhysicalDatabase"]
@@ -39,14 +39,17 @@
   nameservice/Publisher
   (publish [_ data]
     (let [;; Extract data from compact JSON-LD format (both genesis and regular commits now use this)
-          ledger-alias   (get data "alias")  ;; Already includes @branch
+          ledger-alias   (get data "alias")  ;; Already includes :branch
           commit-address (get data "address")
           t-value        (get-in data ["data" "t"])
           index-address  (get-in data ["index" "address"])
           ns-metadata    (ns-record ledger-alias commit-address t-value index-address)
           record-bytes   (json/stringify-UTF8 ns-metadata)
           filename       (local-filename ledger-alias)]
-      (storage/write-bytes store filename record-bytes)))
+      (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :filename filename})
+      (let [res (storage/write-bytes store filename record-bytes)]
+        (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :filename filename})
+        res)))
 
   (retract [_ ledger-alias]
     (let [filename (local-filename ledger-alias)
@@ -62,7 +65,7 @@
   nameservice/iNameService
   (lookup [_ ledger-address]
     (go-try
-      ;; ledger-address is just the alias (potentially with @branch)
+      ;; ledger-address is just the alias (potentially with :branch)
       (let [filename (local-filename ledger-address)]
         (log/debug "StorageNameService lookup:" {:ledger-address ledger-address
                                                  :filename filename})

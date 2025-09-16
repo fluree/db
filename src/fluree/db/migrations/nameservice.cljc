@@ -33,6 +33,7 @@
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.filesystem :as fs]
             [fluree.db.util.json :as json]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
 (defn needs-migration?
@@ -125,7 +126,7 @@
         ;; Extract values from the nested commit structure
         ledger-alias   (or (get old-commit-data "ledgerAlias")
                            (get commit-data "alias"))
-        branch         (or (get commit-data "branch") "main")
+        branch         (or (get commit-data "branch") const/default-branch-name)
         commit-address (get commit-data "address")
         t-value        (get-in commit-data ["data" "t"])
         ;; Extract index address if present in old format
@@ -151,8 +152,9 @@
             new-record (ns-storage/ns-record full-alias commit-address t-value index-address)
             record-bytes (json/stringify-UTF8 new-record)
             ;; Write to current ns version nested path (ns@v2/...)
-            new-filename (str const/ns-version "/" (first (str/split full-alias #":" 2)) "/"
-                              (or (second (str/split full-alias #":" 2)) "main") ".json")]
+            [ledger-name branch-name] (util.ledger/ledger-parts full-alias)
+            new-filename (str const/ns-version "/" ledger-name "/"
+                              (or branch-name const/default-branch-name) ".json")]
 
         ;; Write to new location using storage interface
         (<? (storage/write-bytes file-store new-filename record-bytes))
