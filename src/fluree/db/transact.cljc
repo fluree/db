@@ -221,6 +221,10 @@
                :max-namespace-code max-ns-code)
         (commit-data/add-commit-flakes))))
 
+(defn indexing-needed?
+  [novelty-size min-size]
+  (>= novelty-size min-size))
+
 (defn commit!
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
@@ -288,23 +292,18 @@
        (log/debug "commit!: publish-commit done" {:ledger ledger-alias})
 
        (if (track/track-txn? opts)
-         (let [indexing-disabled? (-> ledger
-                                      (ledger/get-branch-meta branch)
-                                      :indexing-opts
-                                      :indexing-disabled)
-               index-t (commit-data/index-t commit-map)
+         (let [index-t (commit-data/index-t commit-map)
                novelty-size (get-in db* [:novelty :size] 0)
                ;; Always read threshold from realized FlakeDB; db* may be AsyncDB
-               reindex-min-bytes (or (:reindex-min-bytes db) 1000000)
-               indexing-needed? (>= novelty-size reindex-min-bytes)]
+               reindex-min-bytes (or (:reindex-min-bytes db) 1000000)]
            (-> write-result
                (select-keys [:address :hash :size])
                (assoc :ledger-id ledger-alias
                       :t t
                       :db db*
-                      :indexing-needed indexing-needed?
+                      :indexing-needed (indexing-needed? novelty-size reindex-min-bytes)
                       :index-t index-t
-                      :indexing-disabled indexing-disabled?
+                      :indexing-enabled (ledger/indexing-enabled? ledger branch)
                       :novelty-size novelty-size)))
          db*)))))
 

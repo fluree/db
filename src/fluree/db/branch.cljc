@@ -210,16 +210,23 @@
                                "'.")
                           {:status 400 :error :db/invalid-commit}))))))
 
+(defn indexing-disabled?
+  [branch-map]
+  (-> branch-map :indexing-opts :indexing-enabled false?))
+
+(def indexing-enabled?
+  (complement indexing-disabled?))
+
 (defn update-commit!
   "There are 3 t values, the db's t, the 'commit' attached to the db's t, and
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
   should be the same at this point (just after committing the db). The ledger's latest
   't' should be the same (if just updating an index) or after the db's 't' value."
-  [{:keys [state index-queue indexing-opts] :as branch-map} new-db index-files-ch]
+  [{:keys [state index-queue] :as branch-map} new-db index-files-ch]
   (let [updated-db (-> state
                        (swap! update-commit (policy/root-db new-db))
                        :current-db)]
-    (when-not (:indexing-disabled indexing-opts)
+    (when (indexing-enabled? branch-map)
       (enqueue-index! index-queue updated-db index-files-ch))
     branch-map))
 
