@@ -16,7 +16,7 @@
    Returns path like 'ns@v2/ledger-name/branch.json'."
   [ledger-alias]
   (let [[ledger-name branch] (util.ledger/ledger-parts ledger-alias)
-        branch (or branch "main")]
+        branch (or branch const/default-branch-name)]
     (str const/ns-version "/" ledger-name "/" branch ".json")))
 
 (defn ns-record
@@ -24,7 +24,7 @@
    Expects ledger-alias to be in format 'ledger:branch'."
   [ledger-alias commit-address t index-address]
   (let [[alias branch] (util.ledger/ledger-parts ledger-alias)
-        branch (or branch "main")]
+        branch (or branch const/default-branch-name)]
     (cond-> {"@context"     {"f" iri/f-ns}
              "@id"          ledger-alias  ;; Already includes :branch
              "@type"        ["f:Database" "f:PhysicalDatabase"]

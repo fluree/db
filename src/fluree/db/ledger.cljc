@@ -58,7 +58,7 @@
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
   ([ledger]
-   (status ledger commit-data/default-branch))
+   (status ledger const/default-branch-name))
   ([{:keys [address alias] :as ledger} requested-branch]
    (let [branch-data (get-branch-meta ledger requested-branch)
          current-db  (branch/current-db branch-data)
@@ -132,7 +132,7 @@
   [alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
    indexing-opts did latest-commit]
   (let [[_ branch] (util.ledger/ledger-parts alias)
-        branch (or branch "main")
+        branch (or branch const/default-branch-name)
         publishers (cons primary-publisher secondary-publishers)
         branches {branch (branch/state-map alias branch commit-catalog index-catalog
                                            publishers latest-commit indexing-opts)}]

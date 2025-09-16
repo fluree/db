@@ -5,7 +5,6 @@
             [clojure.string :as str]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
-            [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
@@ -74,7 +73,7 @@
   [ledger-alias]
   (if (clojure.string/includes? ledger-alias ":")
     ledger-alias
-    (str ledger-alias ":" commit-data/default-branch)))
+    (str ledger-alias ":" const/default-branch-name)))
 
 (defn register-ledger
   "Creates a promise-chan and saves it in a cache of ledgers being held

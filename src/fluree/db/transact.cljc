@@ -312,7 +312,7 @@
   [ledger parsed-txn]
   (go-try
     (let [{:keys [branch] :as parsed-opts,
-           :or   {branch commit-data/default-branch}}
+           :or   {branch const/default-branch-name}}
           (:opts parsed-txn)
 
           db       (ledger/current-db ledger branch)

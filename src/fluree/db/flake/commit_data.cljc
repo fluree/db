@@ -17,9 +17,6 @@
 (def commit-version 2)
 (def data-version 0)
 
-(def default-branch
-  "main")
-
 (def json-ld-base-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
   [["@context" iri/fluree-context-url]
