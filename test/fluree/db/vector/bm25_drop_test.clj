@@ -73,7 +73,7 @@
                                                   "select" ["?doc"]})]
             (is (instance? Exception result) "Should return an exception when querying deleted VG")
             (when (instance? Exception result)
-              (is (re-find #"Load for movie-search failed" (ex-message result))
+              (is (re-find #"Load for movie-search(:main)? failed" (ex-message result))
                   (str "Error message doesn't match. Got: " (ex-message result))))))
 
         ;; Verify we can recreate a VG with the same name

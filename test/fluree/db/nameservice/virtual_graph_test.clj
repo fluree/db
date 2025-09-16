@@ -49,7 +49,7 @@
             (is (contains? (set (get vg-record "@type")) "fidx:BM25"))
             (is (= "ready" (get vg-record "f:status")))
             (is (= "article-search" (get vg-record "f:name")))
-            (is (= [{"@id" "test-vg@main"}] (get vg-record "f:dependencies"))))))
+            (is (= [{"@id" "test-vg:main"}] (get vg-record "f:dependencies"))))))
 
       (testing "Cannot create duplicate virtual graph"
         (let [result @(fluree/create-virtual-graph

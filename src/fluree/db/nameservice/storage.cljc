@@ -1,34 +1,41 @@
 (ns fluree.db.nameservice.storage
   (:require [clojure.core.async :refer [go]]
             [clojure.string :as str]
+            [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
 (defn local-filename
-  ([resource-name]
-   (str "ns@v1/" resource-name ".json"))
-  ([ledger-alias branch]
-   (str "ns@v1/" ledger-alias "@" (or branch "main") ".json")))
-
-(defn publishing-address*
-  [store ledger-alias]
-  (-> store
-      storage/location
-      (storage/build-address ledger-alias)))
+  "Returns the local filename for a ledger's nameservice record.
+   Can handle both resource names (for VG) and ledger aliases.
+   For ledgers, expects ledger-alias to be in format 'ledger:branch'.
+   Returns path like 'ns@v2/ledger-name/branch.json' for ledgers
+   or 'ns@v2/resource-name.json' for virtual graphs."
+  [resource-name]
+  (if (str/includes? resource-name ":")
+    ;; It's a ledger alias with branch
+    (let [[ledger-name branch] (util.ledger/ledger-parts resource-name)
+          branch (or branch const/default-branch-name)]
+      (str const/ns-version "/" ledger-name "/" branch ".json"))
+    ;; It's a virtual graph or other resource
+    (str const/ns-version "/" resource-name ".json")))
 
 (defn ns-record
-  "Generates nameservice metadata map for JSON storage using new minimal format"
-  [ledger-alias branch commit-address t index-address]
-  (let [branch (or branch "main")]
+  "Generates nameservice metadata map for JSON storage using new minimal format.
+   Expects ledger-alias to be in format 'ledger:branch'."
+  [ledger-alias commit-address t index-address]
+  (let [[alias branch] (util.ledger/ledger-parts ledger-alias)
+        branch (or branch const/default-branch-name)]
     (cond-> {"@context"     {"f" iri/f-ns}
-             "@id"          (str ledger-alias "@" branch)
+             "@id"          ledger-alias  ;; Already includes :branch
              "@type"        ["f:Database" "f:PhysicalDatabase"]
-             "f:ledger"     {"@id" ledger-alias}
+             "f:ledger"     {"@id" alias}  ;; Just the ledger name without branch
              "f:branch"     branch
              "f:commit"     {"@id" commit-address}
              "f:t"          t
@@ -46,10 +53,10 @@
 
 (defmethod record->json-ld :ledger
   [record]
-  (let [{:strs [alias branch address]
+  (let [{:strs [alias address]
          {:strs [t]} "data"
          {index-address "address"} "index"} record]
-    (ns-record alias branch address t index-address)))
+    (ns-record alias address t index-address)))
 
 (defmethod record->json-ld :virtual-graph
   [{:keys [vg-name vg-type status dependencies config] :as _record}]
@@ -140,7 +147,7 @@
     (go-try
       (let [filename (if-let [vg-name (:vg-name record)]
                        (local-filename vg-name)
-                       (local-filename (str (get record "alias") "@" (get record "branch"))))
+                       (local-filename (get record "alias")))  ;; alias already includes :branch
             json-ld (record->json-ld record)
             result (->> json-ld
                         json/stringify-UTF8
@@ -154,8 +161,8 @@
 
   (retract [this target]
     (go-try
-      (let [;; Check if target is a ledger (contains @) or VG (no @)
-            ledger? (str/includes? target "@")
+      (let [;; Check if target is a ledger (contains :) or VG (no :)
+            ledger? (str/includes? target ":")
             address (-> store
                         storage/location
                         (storage/build-address (local-filename target)))]
@@ -167,13 +174,16 @@
         (<? (storage/delete store address)))))
 
   (publishing-address [_ ledger-alias]
-    (go (publishing-address* store ledger-alias)))
+    ;; Just return the alias - lookup will handle branch extraction via local-filename
+    (go ledger-alias))
 
   nameservice/iNameService
   (lookup [_ ledger-address]
     (go-try
-      (let [{:keys [alias branch]} (nameservice/resolve-address (storage/location store) ledger-address nil)
-            filename                (local-filename (str alias "@" branch))]
+      ;; ledger-address is just the alias (potentially with :branch)
+      (let [filename (local-filename ledger-address)]
+        (log/debug "StorageNameService lookup:" {:ledger-address ledger-address
+                                                 :filename filename})
         (when-let [record-bytes (<? (storage/read-bytes store filename))]
           (json/parse record-bytes false)))))
 
@@ -188,17 +198,20 @@
     (go-try
       ;; Use recursive listing to support ledger names with '/' characters
       (if (satisfies? storage/RecursiveListableStore store)
-        (loop [remaining-paths (<? (storage/list-paths-recursive store "ns@v1"))
-               records []]
-          (if-let [path (first remaining-paths)]
-            (if-let [file-content (<? (storage/read-bytes store path))]
-              (let [content-str (if (string? file-content)
-                                  file-content
-                                  (bytes/UTF8->string file-content))
-                    record (json/parse content-str false)]
-                (recur (rest remaining-paths) (conj records record)))
-              (recur (rest remaining-paths) records))
-            records))
+        (if-let [list-paths-result (storage/list-paths-recursive store const/ns-version)]
+          (loop [remaining-paths (<? list-paths-result)
+                 records []]
+            (if-let [path (first remaining-paths)]
+              (let [file-content (<? (storage/read-bytes store path))]
+                (if file-content
+                  (let [content-str (if (string? file-content)
+                                      file-content
+                                      (bytes/UTF8->string file-content))
+                        record (json/parse content-str false)]
+                    (recur (rest remaining-paths) (conj records record)))
+                  (recur (rest remaining-paths) records)))
+              records))
+          [])
         ;; Fallback for stores that don't support RecursiveListableStore
         (do
           (log/debug "Storage backend does not support RecursiveListableStore protocol")

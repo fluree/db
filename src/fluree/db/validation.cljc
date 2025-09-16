@@ -44,6 +44,9 @@
    (or (variable? x var-config)
        (bnode-variable? x))))
 
+(def specified-value?
+  (complement query-variable?))
+
 (defn property-path?
   [x]
   (when-let [path-iri (cond (string? x)  x

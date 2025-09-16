@@ -63,7 +63,7 @@
      :vg-type "fidx:BM25"
      :config config
      :dependencies (or dependencies
-                       (mapv #(str % "@main") ledgers))}))
+                       (mapv #(str % ":main") ledgers))}))
 
 (defn- load-and-validate-ledgers
   "Loads all ledgers and validates they exist. Returns loaded ledgers."
