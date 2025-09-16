@@ -3,7 +3,8 @@
             [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.db.storage :as storage]
-            [fluree.db.util.json :as json]))
+            [fluree.db.util.json :as json]
+            [fluree.db.util.log :as log]))
 
 (def method-name "memory")
 
@@ -58,6 +59,7 @@
   storage/ByteStore
   (write-bytes [_ path bytes]
     (go
+      (log/debug "Memory store writing to path:" path "bytes length:" (count bytes))
       (swap! contents assoc path bytes)))
 
   (read-bytes [_ path]
