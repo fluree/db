@@ -1,8 +1,7 @@
 (ns fluree.db.query.api
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
-  (:require [clojure.string :as str]
-            [fluree.db.connection :as connection]
+  (:require [fluree.db.connection :as connection]
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.ledger :as ledger]
@@ -151,96 +150,20 @@
        e)
       e)))
 
-(defn query-str->map
-  "Converts the string query parameters of
-  k=v&k2=v2&k3=v3 into a map of {k v, k2 v2, k3 v3}"
-  [query-str]
-  (->> (str/split query-str #"&")
-       (map str/trim)
-       (map (fn [s]
-              (str/split s #"=")))
-       (reduce
-        (fn [acc [k v]]
-          (assoc acc k v))
-        {})))
-
-(defn parse-t-val
-  "If t-val is an integer in string form, coerces
-  it to an integer, otherwise assumes it is an
-  ISO-8601 datetime string and returns it as is."
-  [t-val]
-  (if (re-matches #"^\d+$" t-val)
-    (util/str->long t-val)
-    t-val))
-
-(defn parse-time-travel-val
-  "Parses time travel value from @ syntax.
-  Supports:
-   - t:42 -> returns 42 as long
-   - iso:2025-07-01T00:00:00Z -> returns ISO string
-   - sha:abc123 -> returns {:sha \"abc123\"} map"
-  [time-str]
-  (cond
-    (str/starts-with? time-str "t:")
-    (let [val (subs time-str 2)]
-      (when (str/blank? val)
-        (throw (ex-info "Missing value for time travel spec"
-                        {:status 400 :error :db/invalid-time-travel})))
-      (util/str->long val))
-
-    (str/starts-with? time-str "iso:")
-    (let [val (subs time-str 4)]
-      (when (str/blank? val)
-        (throw (ex-info "Missing value for time travel spec"
-                        {:status 400 :error :db/invalid-time-travel})))
-      val)
-
-    (str/starts-with? time-str "sha:")
-    (let [val (subs time-str 4)]
-      (when (str/blank? val)
-        (throw (ex-info "Missing value for time travel spec"
-                        {:status 400 :error :db/invalid-time-travel})))
-      (when (< (count val) 6)
-        (throw (ex-info "SHA prefix must be at least 6 characters"
-                        {:status 400 :error :db/invalid-commit-sha :min 6})))
-      {:sha val})
-
-    :else
-    (throw (ex-info (str "Invalid time travel format: " time-str
-                         ". Expected t:, iso:, or sha: prefix")
-                    {:status 400 :error :db/invalid-time-travel}))))
-
 (defn extract-query-string-t
   "Extracts time travel specification from ledger alias.
-  Supports two formats:
-   1. HTTP query string format: my/db?t=42 or my/db?t=2020-01-01T00:00:00Z
-   2. @ syntax: my/db@t:42, my/db@iso:2025-07-01T00:00:00Z, my/db@sha:abc123
-  
-  Returns [base-alias time-travel-value] where time-travel-value can be:
-   - nil (no time travel)
-   - Long (t value)
-   - String (ISO datetime)
-   - Map with :sha key (commit SHA)"
+  Delegates to util.ledger/parse-ledger-alias and returns in
+  the format expected by load-alias.
+
+  Returns [base-alias time-travel-value] where:
+   - base-alias includes ledger:branch if branch is present
+   - time-travel-value can be nil, Long, String, or {:sha ...} map"
   [alias]
-  (cond
-    ;; Check for @ syntax first (takes precedence)
-    (str/includes? alias "@")
-    (let [at-idx (str/index-of alias "@")
-          base-alias (subs alias 0 at-idx)
-          time-str (subs alias (inc at-idx))]
-      [base-alias (parse-time-travel-val time-str)])
-
-    ;; Fall back to ? query string syntax
-    (str/includes? alias "?")
-    (let [[base-alias query-str] (str/split alias #"\?")]
-      [base-alias (-> query-str
-                      query-str->map
-                      (get "t")
-                      parse-t-val)])
-
-    ;; No time travel specification
-    :else
-    [alias nil]))
+  (let [{:keys [ledger branch t]} (ledger-util/parse-ledger-alias alias)
+        base-alias (if branch
+                     (str ledger ":" branch)
+                     ledger)]
+    [base-alias t]))
 
 (def ledger-specific-opts #{:policy-class :policy :policy-values})
 
