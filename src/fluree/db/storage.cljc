@@ -132,8 +132,14 @@
 
 (defprotocol ByteStore
   "ByteStore is used by consensus to replicate files across servers"
-  (write-bytes [store path bytes] "Async writes bytes to path in store.")
-  (read-bytes [store path] "Async read bytes from path in store."))
+  (write-bytes [store path bytes]
+    "Async writes bytes to path in store.")
+  (read-bytes [store path]
+    "Async read bytes from path in store.")
+  (swap-bytes [store path f]
+    "Atomically replace the contents at `path` using the supplied function `f`.
+    `f` is called with the current contents at `path` (or `nil` if the path
+    doesn't exist) and should return the new bytes to store."))
 
 (defprotocol EraseableStore
   (delete [store address] "Remove value associated with `address` from the store."))
