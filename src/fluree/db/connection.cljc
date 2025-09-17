@@ -13,6 +13,7 @@
             [fluree.db.storage :as storage]
             [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
@@ -66,14 +67,6 @@
         state (atom blank-state)]
     (->Connection id state parallelism commit-catalog index-catalog primary-publisher
                   secondary-publishers remote-systems serializer cache defaults)))
-
-(defn normalize-ledger-alias
-  "Ensures ledger alias includes branch. 
-  If no : symbol present, appends :main as default branch."
-  [ledger-alias]
-  (if (clojure.string/includes? ledger-alias ":")
-    ledger-alias
-    (str ledger-alias ":" const/default-branch-name)))
 
 (defn register-ledger
   "Creates a promise-chan and saves it in a cache of ledgers being held
@@ -173,7 +166,7 @@
   ledger alias"
   [{:keys [primary-publisher] :as _conn} ledger-alias]
   (->> ledger-alias
-       normalize-ledger-alias
+       util.ledger/ensure-ledger-branch
        (nameservice/publishing-address primary-publisher)))
 
 (defn lookup-commit*
@@ -280,7 +273,7 @@
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn} ledger-alias opts]
   (go-try
     (let [;; Normalize ledger-alias to include branch
-          normalized-alias (normalize-ledger-alias ledger-alias)]
+          normalized-alias (util.ledger/ensure-ledger-branch ledger-alias)]
       (if (<? (ledger-exists? conn normalized-alias))
         (throw-ledger-exists normalized-alias)
         (let [[cached? ledger-chan] (register-ledger conn normalized-alias)]
@@ -356,7 +349,7 @@
   [conn alias]
   (go-try
     (let [;; Normalize ledger-alias to include branch
-          normalized-alias (normalize-ledger-alias alias)
+          normalized-alias (util.ledger/ensure-ledger-branch alias)
           [cached? ledger-chan] (register-ledger conn normalized-alias)]
       (if cached?
         (<? ledger-chan)
@@ -450,7 +443,7 @@
       (let [alias (if (fluree-address? alias)
                     (nameservice/address-path alias)
                     ;; Normalize alias to include branch if not present
-                    (normalize-ledger-alias alias))]
+                    (util.ledger/ensure-ledger-branch alias))]
         (loop [[publisher & r] (publishers conn)]
           (when publisher
             (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
