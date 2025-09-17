@@ -1,6 +1,7 @@
 (ns fluree.db.util.ledger
   "Utility functions for working with ledger names and branches."
   (:require [clojure.string :as str]
+            [fluree.db.constants :as const]
             [fluree.db.util :as util]))
 
 (defn ledger-base-name
@@ -232,3 +233,11 @@
     {:ledger ledger-name
      :branch branch-name
      :t time-val}))
+
+(defn normalize-ledger-alias
+  "Ensures ledger alias includes branch.
+  If no : symbol present, appends :main as default branch."
+  [ledger-alias]
+  (if (str/includes? ledger-alias ":")
+    ledger-alias
+    (str ledger-alias ":" const/default-branch-name)))

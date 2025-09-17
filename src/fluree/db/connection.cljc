@@ -13,6 +13,7 @@
             [fluree.db.storage :as storage]
             [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :refer [normalize-ledger-alias]]
             [fluree.db.util.log :as log :include-macros true])
   #?(:clj (:import (java.io Writer))))
 
@@ -65,14 +66,6 @@
         state (atom blank-state)]
     (->Connection id state parallelism commit-catalog index-catalog primary-publisher
                   secondary-publishers remote-systems serializer cache defaults)))
-
-(defn normalize-ledger-alias
-  "Ensures ledger alias includes branch.
-  If no : symbol present, appends :main as default branch."
-  [ledger-alias]
-  (if (clojure.string/includes? ledger-alias ":")
-    ledger-alias
-    (str ledger-alias ":" const/default-branch-name)))
 
 (defn register-ledger
   "Creates a promise-chan and saves it in a cache of ledgers being held
