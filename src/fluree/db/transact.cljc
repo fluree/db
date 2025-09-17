@@ -15,6 +15,7 @@
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
@@ -144,20 +145,22 @@
       parse-data-helpers))
 
 (defn save-txn!
-  ([{:keys [commit-catalog] ledger-alias :alias :as _ledger} txn]
-   (save-txn! commit-catalog ledger-alias txn))
-  ([commit-catalog ledger-alias txn]
-   (let [path (str/join "/" [ledger-alias "txn"])]
+  ([{:keys [commit-catalog alias] :as _ledger} txn]
+   (let [ledger-name (util.ledger/ledger-base-name alias)]
+     (save-txn! commit-catalog ledger-name txn)))
+  ([commit-catalog ledger-name txn]
+   (let [path (str/join "/" [ledger-name "txn"])]
      (storage/content-write-json commit-catalog path txn))))
 
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
 ;; TODO - however this is really a concern of "commit", not staging and I don't think the db should be handling any of it
 (defn write-transaction!
-  [ledger staged]
+  [ledger ledger-name staged]
   (go-try
-    (let [{:keys [txn author annotation]} staged]
+    (let [{:keys [txn author annotation]} staged
+          {:keys [commit-catalog]} ledger]
       (if txn
-        (let [{txn-id :address} (<? (save-txn! ledger txn))]
+        (let [{txn-id :address} (<? (save-txn! commit-catalog ledger-name txn))]
           {:txn-id     txn-id
            :author     author
            :annotation annotation})
@@ -228,12 +231,13 @@
   returns a db with an updated :commit."
   ([ledger db]
    (commit! ledger db {}))
-  ([{ledger-alias :alias, :as ledger}
+  ([{ledger-alias :alias :as ledger}
     {:keys [branch t stats commit] :as staged-db}
     opts]
    (log/debug "commit!: write-transaction start" {:ledger ledger-alias})
    (go-try
      (let [{:keys [commit-catalog]} ledger
+           ledger-name (util.ledger/ledger-base-name ledger-alias)
 
            {:keys [tag time message did private commit-data-opts index-files-ch]
             :or   {time (util/current-time-iso)}}
@@ -243,14 +247,13 @@
            (commit-data/db->jsonld staged-db commit-data-opts)
 
            {:keys [txn-id author annotation]}
-           (<? (write-transaction! ledger staged-txn))
+           (<? (write-transaction! ledger ledger-name staged-txn))
 
            _ (log/debug "commit!: write-jsonld(db) start" {:ledger ledger-alias})
 
-           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-alias db-jsonld))
+           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-name db-jsonld))
 
            _ (log/debug "commit!: write-jsonld(db) done" {:ledger ledger-alias :db-address (:address data-write-result)})
-
            db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
            dbid              (commit-data/hash->db-id (:hash data-write-result))
            keypair           {:did did, :private private}
@@ -272,7 +275,7 @@
            _ (log/debug "commit!: write-commit start" {:ledger ledger-alias})
 
            {:keys [commit-map commit-jsonld write-result]}
-           (<? (write-commit commit-catalog ledger-alias keypair new-commit))
+           (<? (write-commit commit-catalog ledger-name keypair new-commit))
 
            _ (log/debug "commit!: write-commit done" {:ledger ledger-alias :commit-address (:address write-result)})
 
@@ -308,7 +311,7 @@
   [ledger parsed-txn]
   (go-try
     (let [{:keys [branch] :as parsed-opts,
-           :or   {branch commit-data/default-branch}}
+           :or   {branch const/default-branch-name}}
           (:opts parsed-txn)
 
           db       (ledger/current-db ledger branch)

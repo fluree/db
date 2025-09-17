@@ -5,7 +5,6 @@
             [clojure.string :as str]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
-            [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
@@ -14,6 +13,7 @@
             [fluree.db.storage :as storage]
             [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :refer [normalize-ledger-alias]]
             [fluree.db.util.log :as log :include-macros true])
   #?(:clj (:import (java.io Writer))))
 
@@ -164,7 +164,9 @@
   "From a connection, lookup primary address from nameservice(s) for a given
   ledger alias"
   [{:keys [primary-publisher] :as _conn} ledger-alias]
-  (nameservice/publishing-address primary-publisher ledger-alias))
+  (->> ledger-alias
+       normalize-ledger-alias
+       (nameservice/publishing-address primary-publisher)))
 
 (defn lookup-commit*
   "Returns commit address from first matching nameservice on a conn
@@ -215,6 +217,7 @@
 (defn published-ledger?
   [conn ledger-alias]
   (go-try
+    (log/debug "published-ledger? checking for:" ledger-alias)
     (loop [[nsv & r] (publishers conn)]
       (if nsv
         (or (<? (nameservice/published-ledger? nsv ledger-alias))
@@ -229,25 +232,6 @@
       (if nsv
         (recur r (into addrs (<? (nameservice/known-addresses nsv ledger-alias))))
         addrs))))
-
-;; --- Branch resolution helpers ---
-
-(defn- branch-from-commit
-  "Extract branch from expanded commit JSON-LD, if present."
-  [expanded-commit]
-  (get-first-value expanded-commit const/iri-branch))
-
-(defn- branch-from-ns
-  "Extract branch from nameservice record, if present."
-  [ns-record]
-  (get ns-record "f:branch"))
-
-(defn- branch-from-alias
-  "Derive branch from an alias of the form 'alias@branch', if present."
-  [ledger-alias]
-  (when (and (string? ledger-alias)
-             (str/includes? ledger-alias "@"))
-    (subs ledger-alias (inc (str/last-index-of ledger-alias "@")))))
 
 (defn ledger-exists?
   "Checks nameservices on a connection and returns true if any nameservice
@@ -272,13 +256,11 @@
     (-> conn :defaults :identity)))
 
 (defn parse-ledger-options
-  [conn {:keys [did branch indexing]
-         :or   {branch commit-data/default-branch}}]
+  [conn {:keys [did indexing]}]
   (let [did*           (parse-identity conn did)
         ledger-default (-> conn :defaults :indexing)
         indexing*      (merge ledger-default indexing)]
     {:did      did*
-     :branch   branch
      :indexing indexing*}))
 
 (defn throw-ledger-exists
@@ -289,26 +271,28 @@
 (defn create-ledger
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn} ledger-alias opts]
   (go-try
-    (if (<? (ledger-exists? conn ledger-alias))
-      (throw-ledger-exists ledger-alias)
-      (let [[cached? ledger-chan] (register-ledger conn ledger-alias)]
-        (if  cached?
-          (throw-ledger-exists ledger-alias)
-          (let [addr          (<? (primary-address conn ledger-alias))
-                publish-addrs (<? (publishing-addresses conn ledger-alias))
-                ledger-opts   (parse-ledger-options conn opts)
-                ledger        (<! (ledger/create {:alias                ledger-alias
-                                                  :primary-address      addr
-                                                  :publish-addresses    publish-addrs
-                                                  :commit-catalog       commit-catalog
-                                                  :index-catalog        index-catalog
-                                                  :primary-publisher    primary-publisher
-                                                  :secondary-publishers secondary-publishers}
-                                                 ledger-opts))]
-            (when (util/exception? ledger)
-              (ns-subscribe/release-ledger conn ledger-alias))
-            (async/put! ledger-chan ledger)
-            ledger))))))
+    (let [;; Normalize ledger-alias to include branch
+          normalized-alias (normalize-ledger-alias ledger-alias)]
+      (if (<? (ledger-exists? conn normalized-alias))
+        (throw-ledger-exists normalized-alias)
+        (let [[cached? ledger-chan] (register-ledger conn normalized-alias)]
+          (if  cached?
+            (throw-ledger-exists normalized-alias)
+            (let [addr          (<? (primary-address conn normalized-alias))
+                  publish-addrs (<? (publishing-addresses conn normalized-alias))
+                  ledger-opts   (parse-ledger-options conn opts)
+                  ledger        (<! (ledger/create {:alias                normalized-alias
+                                                    :primary-address      addr
+                                                    :publish-addresses    publish-addrs
+                                                    :commit-catalog       commit-catalog
+                                                    :index-catalog        index-catalog
+                                                    :primary-publisher    primary-publisher
+                                                    :secondary-publishers secondary-publishers}
+                                                   ledger-opts))]
+              (when (util/exception? ledger)
+                (ns-subscribe/release-ledger conn normalized-alias))
+              (async/put! ledger-chan ledger)
+              ledger)))))))
 
 (defn commit->ledger-alias
   "Returns ledger alias from commit map, if present. If not present
@@ -334,14 +318,12 @@
                                                                           commit-address
                                                                           index-address))
             ledger-alias    (commit->ledger-alias conn address expanded-commit)
-            ;; Determine branch using helpers in priority order
-            branch           (or (branch-from-commit expanded-commit)
-                                 (branch-from-ns ns-record)
-                                 (branch-from-alias ledger-alias))
 
-            {:keys [did branch indexing]} (parse-ledger-options conn {:branch branch})
-            ledger (ledger/instantiate ledger-alias address branch commit-catalog index-catalog
-                                       primary-publisher secondary-publishers indexing did expanded-commit)]
+            {:keys [did indexing]} (parse-ledger-options conn {})
+            ledger                 (ledger/instantiate ledger-alias address commit-catalog
+                                                       index-catalog primary-publisher
+                                                       secondary-publishers indexing did
+                                                       expanded-commit)]
         (ns-subscribe/subscribe-ledger conn ledger-alias)
         (async/put! ledger-chan ledger)
         ledger)
@@ -366,18 +348,22 @@
 (defn load-ledger-alias
   [conn alias]
   (go-try
-    (let [[cached? ledger-chan] (register-ledger conn alias)]
+    (let [;; Normalize ledger-alias to include branch
+          normalized-alias (normalize-ledger-alias alias)
+          [cached? ledger-chan] (register-ledger conn normalized-alias)]
       (if cached?
         (<? ledger-chan)
-        (loop [[addr & r] (<? (current-addresses conn alias))]
-          (if addr
-            (or (<? (try-load-address conn ledger-chan alias addr))
-                (recur r))
-            (do (ns-subscribe/release-ledger conn alias)
-                (let [ex (ex-info (str "Load for " alias " failed due to failed address lookup.")
-                                  {:status 404, :error :db/unkown-ledger})]
-                  (async/put! ledger-chan ex)
-                  (throw ex)))))))))
+        (let [addresses (<? (current-addresses conn normalized-alias))]
+          (log/debug "load-ledger-alias: Looking for" normalized-alias "found addresses:" addresses)
+          (loop [[addr & r] addresses]
+            (if addr
+              (or (<? (try-load-address conn ledger-chan normalized-alias addr))
+                  (recur r))
+              (do (ns-subscribe/release-ledger conn normalized-alias)
+                  (let [ex (ex-info (str "Load for " normalized-alias " failed due to failed address lookup.")
+                                    {:status 404, :error :db/unkown-ledger})]
+                    (async/put! ledger-chan ex)
+                    (throw ex))))))))))
 
 (defn load-ledger
   [conn alias-or-address]
@@ -456,7 +442,8 @@
     (try*
       (let [alias (if (fluree-address? alias)
                     (nameservice/address-path alias)
-                    alias)]
+                    ;; Normalize alias to include branch if not present
+                    (normalize-ledger-alias alias))]
         (loop [[publisher & r] (publishers conn)]
           (when publisher
             (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
@@ -492,18 +479,16 @@
 
 (defn trigger-ledger-index
   "Manually triggers indexing for a ledger/branch and waits for completion.
-
    Options:
-   - :branch - Branch name (defaults to main branch)
    - :timeout - Max wait time in ms (default 300000 / 5 minutes)
 
    Returns the indexed database object or throws an exception on failure/timeout."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [branch timeout]
+    (let [{:keys [timeout]
            :or {timeout 300000}} opts
           ledger (<? (load-ledger-alias conn ledger-alias))
-          complete-ch (ledger/trigger-index! ledger branch)
+          complete-ch (ledger/trigger-index! ledger)
           timeout-ch (async/timeout timeout)]
       (async/alt!
         complete-ch ([result] result)

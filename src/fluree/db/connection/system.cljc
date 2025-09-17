@@ -1,7 +1,7 @@
 (ns fluree.db.connection.system
   (:require #?(:clj  [fluree.db.storage.s3 :as s3-storage]
                :cljs [fluree.db.storage.localstorage :as localstorage-store])
-            #?(:clj [fluree.db.migrations.nameservice-v1 :as ns-migration])
+            #?(:clj [fluree.db.migrations.nameservice :as ns-migration])
             #?(:clj [fluree.db.storage.file :as file-storage])
             [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]

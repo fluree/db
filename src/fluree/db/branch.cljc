@@ -44,9 +44,9 @@
   (-> commit-map commit-data/->json-ld json-ld/expand))
 
 (defn load-db
-  [alias branch commit-catalog index-catalog commit-map]
+  [alias commit-catalog index-catalog commit-map]
   (let [commit-jsonld (commit-map->commit-jsonld commit-map)]
-    (async-db/load alias branch commit-catalog index-catalog
+    (async-db/load alias commit-catalog index-catalog
                    commit-jsonld commit-map nil)))
 
 (defn update-index-async
@@ -56,11 +56,11 @@
   return immediately - and for a large amount of novelty,
   updating the db to reflect the latest index can take some time
   which would lead to atom contention."
-  [{:keys [alias commit branch t] :as current-db} index-map]
+  [{:keys [alias commit t] :as current-db} index-map]
   (if (async-db/db? current-db)
     (dbproto/-index-update current-db index-map)
     (let [updated-commit (assoc commit :index index-map)
-          updated-db     (async-db/->async-db alias branch updated-commit t)]
+          updated-db     (async-db/->async-db alias updated-commit t)]
       (go ;; update index in the background, return updated db immediately
         (->> (dbproto/-index-update current-db index-map)
              (async-db/deliver! updated-db)))
@@ -89,9 +89,9 @@
           current-state))))
 
 (defn reload-with-index
-  [{:keys [commit-catalog index-catalog commit] :as _db} alias branch index]
+  [{:keys [commit-catalog index-catalog commit alias] :as _db} index]
   (let [indexed-commit (assoc commit :index index)]
-    (load-db alias branch commit-catalog index-catalog indexed-commit)))
+    (load-db alias commit-catalog index-catalog indexed-commit)))
 
 (defn use-latest-db
   "Returns the most recent db from branch-state if it matches
@@ -107,22 +107,22 @@
       latest-db)))
 
 (defn use-latest-index
-  [{db-commit :commit, :as db} idx-commit alias branch branch-state]
+  [{db-commit :commit, :as db} idx-commit branch-state]
   (if (newer-index? idx-commit db-commit)
     (let [updated-db (or (use-latest-db db idx-commit branch-state)
                          (try* (dbproto/-index-update db (:index idx-commit))
                                (catch* e (log/error e "Exception updating db with new index, attempting full reload. Exception:" (ex-message e))
-                                       (reload-with-index db alias branch (:index idx-commit)))))]
+                                       (reload-with-index db (:index idx-commit)))))]
       updated-db)
     db))
 
 (defn index-queue
-  [alias branch publishers branch-state]
+  [publishers branch-state]
   (let [buf   (async/sliding-buffer 1)
         queue (async/chan buf)]
     (go-loop [last-index-commit nil]
       (when-let [{:keys [db index-files-ch complete-ch]} (<! queue)]
-        (let [db* (use-latest-index db last-index-commit alias branch branch-state)
+        (let [db* (use-latest-index db last-index-commit branch-state)
               result (try*
                        (let [indexed-db (<? (indexer/index db* index-files-ch)) ; indexer/index always returns a FlakeDB (never AsyncDB)
                              [{prev-commit :commit} {indexed-commit :commit}]
@@ -151,17 +151,17 @@
 
 (defn state-map
   "Returns a branch map for specified branch name at supplied commit"
-  ([ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld]
-   (state-map ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld nil))
-  ([ledger-alias branch-name commit-catalog index-catalog publishers commit-jsonld indexing-opts]
+  ([alias branch-name commit-catalog index-catalog publishers commit-jsonld]
+   (state-map alias branch-name commit-catalog index-catalog publishers commit-jsonld nil))
+  ([alias branch-name commit-catalog index-catalog publishers commit-jsonld indexing-opts]
    (let [commit-map (commit-data/jsonld->clj commit-jsonld)
-         initial-db (async-db/load ledger-alias branch-name commit-catalog index-catalog
+         initial-db (async-db/load alias commit-catalog index-catalog
                                    commit-jsonld commit-map indexing-opts)
          state      (atom {:commit     commit-map
                            :current-db initial-db})
-         idx-q      (index-queue ledger-alias branch-name publishers state)]
+         idx-q      (index-queue publishers state)]
      {:name          branch-name
-      :alias         ledger-alias
+      :alias         alias
       :state         state
       :index-queue   idx-q
       :indexing-opts indexing-opts})))
