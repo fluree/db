@@ -897,7 +897,7 @@
                           {:status 400 :error :db/invalid-update}))
           (= (count graph-patterns) 1)
           (let [[[_ graph-iri data]] graph-patterns]
-            [[:ledger graph-iri] [:insert data]])
+            [[:ledger graph-iri] [:delete data]])
           :else
           [[:delete default-patterns]])))
 
