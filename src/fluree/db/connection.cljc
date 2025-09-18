@@ -332,7 +332,7 @@
 
 (defn load-ledger-address
   [conn address]
-  (let [alias (nameservice/address-path address)
+  (let [alias (storage/get-local-path address)
         [cached? ledger-chan] (register-ledger conn alias)]
     (if cached?
       ledger-chan
@@ -440,13 +440,12 @@
   [conn alias]
   (go
     (try*
-      (let [alias (if (fluree-address? alias)
-                    (nameservice/address-path alias)
-                    ;; Normalize alias to include branch if not present
-                    (util.ledger/ensure-ledger-branch alias))]
+      (let [alias* (cond-> alias
+                     (fluree-address? alias) storage/get-local-path
+                     true util.ledger/ensure-ledger-branch)]
         (loop [[publisher & r] (publishers conn)]
           (when publisher
-            (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
+            (let [ledger-addr   (<? (nameservice/publishing-address publisher alias*))
                   ns-record     (<? (nameservice/lookup publisher ledger-addr))
                   commit-address (get-in ns-record ["f:commit" "@id"])
                   index-address  (get-in ns-record ["f:index" "@id"])
@@ -461,9 +460,9 @@
               (when latest-commit
                 (drop-index-artifacts conn latest-commit)
                 (drop-commit-artifacts conn latest-commit))
-              (<? (nameservice/retract publisher alias))
+              (<? (nameservice/retract publisher alias*))
               (recur r))))
-        (log/debug "Dropped ledger" alias)
+        (log/debug "Dropped ledger" alias*)
         :dropped)
       (catch* e (log/debug e "Failed to complete ledger deletion")))))
 
