@@ -2,53 +2,73 @@
   (:require [clojure.core.async :as async]
             [clojure.test :refer [deftest testing is]]
             [fluree.db.util.websocket :as ws])
-  (:import [java.net.http WebSocket]))
+  (:import [java.net.http WebSocket]
+           [java.nio ByteBuffer]
+           [java.util.concurrent CompletableFuture]))
 
-(deftest test-websocket-connection
-  (testing "WebSocket basic functionality"
-    ;; Test with a public echo WebSocket server
-    (let [echo-url "wss://echo.websocket.org/"
-          msg-in   (async/chan 10)
-          msg-out  (async/chan 10)
-          result   (async/<!! (ws/websocket echo-url
-                                            {:msg-in msg-in
-                                             :msg-out msg-out
-                                             :connect-timeout 5000}))]
+(deftest test-socket-publish-loop-sends-text
+  (testing "socket-publish-loop sends text messages via WebSocket"
+    (let [sent (atom [])
+          mock-ws (reify WebSocket
+                    (^CompletableFuture sendText [this ^CharSequence data ^boolean _last]
+                      (swap! sent conj (str data))
+                      (CompletableFuture/completedFuture this))
+                    (^CompletableFuture sendPing [this ^ByteBuffer _msg]
+                      (CompletableFuture/completedFuture this))
+                    (^CompletableFuture sendPong [this ^ByteBuffer _msg]
+                      (CompletableFuture/completedFuture this))
+                    (^CompletableFuture sendClose [this ^int _code ^String _reason]
+                      (CompletableFuture/completedFuture this))
+                    (^void request [_this ^long _n]
+                      nil)
+                    ;; Unused methods in this test can be no-ops or return defaults
+                    (^String getSubprotocol [_] "")
+                    (^boolean isOutputClosed [_] false)
+                    (^boolean isInputClosed [_] false)
+                    (^void abort [_]))
+          msg-out (async/chan 1)]
+      ;; start the publish loop
+      (ws/socket-publish-loop mock-ws msg-out)
+      ;; enqueue a message and wait for it to be processed
+      (async/>!! msg-out ["hello" nil])
+      ;; small yield to allow go-loop to run
+      (Thread/sleep 50)
+      (is (= ["hello"] @sent))
+      (async/close! msg-out))))
 
-      (if (instance? Throwable result)
-        ;; If connection fails (e.g., in CI), just skip the test
-        (do
-          (println "WebSocket test skipped - could not connect to echo server:" (.getMessage ^Throwable result))
-          (is (= true true)))
-
-        (try
-          (is (instance? WebSocket result))
-
-          ;; Test sending a message
-          (async/>!! msg-out ["Hello, WebSocket!" nil])
-
-          ;; Wait for echo response
-          (let [[event-type message _] (async/<!! msg-in)]
-            (is (= :on-message event-type))
-            ;; Echo server may return different types of messages
-            ;; Just verify we got something back
-            (is (not (nil? message))))
-
-          ;; Test ping functionality
-          (ws/send-ping! result (java.nio.ByteBuffer/wrap (.getBytes "ping")))
-
-          ;; Wait for pong (may take a moment)
-          (let [timeout-ch (async/timeout 3000)
-                [val ch] (async/alts!! [msg-in timeout-ch])]
-            (when (= ch msg-in)
-              (let [[event-type _] val]
-                (is (= :on-pong event-type)))))
-
-          (finally
-            ;; Clean up
-            (ws/close! result)
-            (async/close! msg-in)
-            (async/close! msg-out)))))))
+(deftest test-listener-emits-events
+  (testing "listener emits :on-message and :on-ping and auto-pongs"
+    (let [events (async/chan 10)
+          ponged? (atom false)
+          mock-ws (reify WebSocket
+                    (^CompletableFuture sendPong [this ^ByteBuffer _msg]
+                      (reset! ponged? true)
+                      (CompletableFuture/completedFuture this))
+                    (^void request [_this ^long _n]
+                      nil)
+                    (^CompletableFuture sendText [this ^CharSequence _d ^boolean _l]
+                      (CompletableFuture/completedFuture this))
+                    (^CompletableFuture sendPing [this ^ByteBuffer _m]
+                      (CompletableFuture/completedFuture this))
+                    (^CompletableFuture sendClose [this ^int _c ^String _r]
+                      (CompletableFuture/completedFuture this))
+                    (^String getSubprotocol [_] "")
+                    (^boolean isOutputClosed [_] false)
+                    (^boolean isInputClosed [_] false)
+                    (^void abort [_]))
+          listener (@#'ws/create-listener {:msg-chan events})]
+      ;; onText complete message
+      (.onText ^java.net.http.WebSocket$Listener listener mock-ws "abc" true)
+      (let [[etype msg last?] (async/<!! events)]
+        (is (= :on-message etype))
+        (is (= "abc" msg))
+        (is (true? last?)))
+      ;; onPing should emit and also sendPong
+      (.onPing ^java.net.http.WebSocket$Listener listener mock-ws (ByteBuffer/allocate 0))
+      (let [[etype _] (async/<!! events)]
+        (is (= :on-ping etype)))
+      (is (true? @ponged?))
+      (async/close! events))))
 
 (deftest test-close-status-codes
   (testing "WebSocket close status codes"
