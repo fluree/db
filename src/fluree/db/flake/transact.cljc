@@ -61,12 +61,33 @@
 
 (defn into-flakeset
   [tracker error-ch flake-ch]
-  (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)
-        error-xf (halt-when util/exception?)
-        flake-xf (if-let [track-fuel (track/track-fuel! tracker error-ch)]
-                   (comp error-xf track-fuel)
-                   error-xf)]
-    (async/transduce flake-xf (completing conj) flakeset flake-ch)))
+  (let [flakeset    (flake/sorted-set-by flake/cmp-flakes-spot)
+        error-xf    (halt-when util/exception?)
+        flake-xf    (if-let [track-fuel (track/track-fuel! tracker error-ch)]
+                      (comp error-xf track-fuel)
+                      error-xf)
+        retractions (volatile! [])]
+    (async/transduce
+     flake-xf
+     (completing
+      (fn [acc f]
+        (when (false? (flake/op f))
+          (vswap! retractions conj f))
+        (conj acc f))
+      (fn [acc]
+        (if (seq @retractions)
+          (reduce (fn [s r]
+                    (let [a (flake/flip-flake r)]
+                      (if (contains? s a)
+                        (-> s
+                            (disj a)
+                            (disj r))
+                        s)))
+                  acc
+                  (distinct @retractions))
+          acc)))
+     flakeset
+     flake-ch)))
 
 (defn generate-flakes
   [db tracker parsed-txn tx-state]
