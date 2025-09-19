@@ -86,5 +86,5 @@
                   "insert"   [{"@id"   "ex:bad"
                                "@type" [{"@value" "not-a-iri"
                                          "@type"  "xsd:string"}]}]}
-          res    (ex-data @(fluree/update db0 txn))]  
+          res    (ex-data @(fluree/update db0 txn))]
       (is (= 400 (:status res)) "Status should indicate a bad request"))))
