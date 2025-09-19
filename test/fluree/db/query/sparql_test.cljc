@@ -1091,9 +1091,37 @@
                       (done))))))
 
        :clj
-       (let [conn   @(fluree/connect-memory)
-             db0 @(fluree/create conn "people")
-             db     @(fluree/update db0 txn {:format :sparql})]
+       (let [conn @(fluree/connect-memory)
+             db0  @(fluree/create conn "people")
+             db   @(fluree/update db0 txn {:format :sparql})]
+         (testing "DELETE DATA removes specified triples"
+           (let [delete-txn "PREFIX person: <http://example.org/Person#>
+                             DELETE DATA {
+                               ex:jdoe person:favNums 3 .
+                               ex:jdoe person:favNums 7 .
+                             }"
+                 query "PREFIX person: <http://example.org/Person#>
+                        SELECT ?favNum
+                        WHERE { ex:jdoe person:favNums ?favNum }
+                        ORDER BY ?favNum"
+                 db2 @(fluree/update db delete-txn {:format :sparql})]
+             (is (= [[42] [99]]
+                    @(fluree/query db2 query {:format :sparql})))))
+         (testing "DELETE DATA with GRAPH removes triples from named graph"
+           (let [delete-txn "PREFIX person: <http://example.org/Person#>
+                             DELETE DATA {
+                               GRAPH <http://example.org/people> {
+                                 ex:jdoe person:favNums 3 .
+                                 ex:jdoe person:favNums 7 .
+                               }
+                             }"
+                 query "PREFIX person: <http://example.org/Person#>
+                        SELECT ?favNum
+                        WHERE { ex:jdoe person:favNums ?favNum }
+                        ORDER BY ?favNum"
+                 db2 @(fluree/update db delete-txn {:format :sparql})]
+             (is (= [[42] [99]]
+                    @(fluree/query db2 query {:format :sparql})))))
          (testing "basic query works"
            (let [query "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?fullName
