@@ -59,6 +59,20 @@
      :reasoner-max  10 ; maximum number of reasoner iterations before exception
      :reasoned      reasoned-from-iri}))
 
+(defn remove-cancelable-flakes
+  "If an identical flake is retracted and re-asserted, removes both flakes as they can be cancelled out.
+   If not removed, the replay of flakes to a time 't' can result in flakes not appearing properly."
+  [flakeset retractions]
+  (reduce (fn [s r]
+            (let [a (flake/flip-flake r)]
+              (if (contains? s a)
+                (-> s
+                    (disj a)
+                    (disj r))
+                s)))
+          flakeset
+          retractions))
+
 (defn into-flakeset
   [tracker error-ch flake-ch]
   (let [flakeset    (flake/sorted-set-by flake/cmp-flakes-spot)
@@ -76,15 +90,7 @@
         (conj acc f))
       (fn [flakeset]
         (if (seq @retractions)
-          (reduce (fn [s r]
-                    (let [a (flake/flip-flake r)]
-                      (if (contains? s a)
-                        (-> s
-                            (disj a)
-                            (disj r))
-                        s)))
-                  flakeset
-                  @retractions)
+          (remove-cancelable-flakes flakeset @retractions)
           flakeset)))
      flakeset
      flake-ch)))
