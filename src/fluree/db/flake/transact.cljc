@@ -74,7 +74,7 @@
         (when (false? (flake/op f))
           (vswap! retractions conj f))
         (conj acc f))
-      (fn [acc]
+      (fn [flakeset]
         (if (seq @retractions)
           (reduce (fn [s r]
                     (let [a (flake/flip-flake r)]
@@ -83,9 +83,9 @@
                             (disj a)
                             (disj r))
                         s)))
-                  acc
-                  (distinct @retractions))
-          acc)))
+                  flakeset
+                  @retractions)
+          flakeset)))
      flakeset
      flake-ch)))
 
