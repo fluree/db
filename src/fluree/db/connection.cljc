@@ -14,8 +14,7 @@
             [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.ledger :as util.ledger]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.json-ld :as json-ld])
+            [fluree.db.util.log :as log :include-macros true])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -314,16 +313,17 @@
             index-address  (get-in ns-record ["f:index" "@id"])
 
             ;; Load full commit from disk
-            _              (log/debug "Attempting to load from address:" address)
-            commit         (<? (commit-storage/load-commit-with-metadata commit-catalog
-                                                                         commit-address
-                                                                         index-address))
-            expanded-commit (json-ld/expand commit)
-            ledger-alias  (commit->ledger-alias conn address expanded-commit)
+            _               (log/debug "Attempting to load from address:" address)
+            expanded-commit (<? (commit-storage/load-commit-with-metadata commit-catalog
+                                                                          commit-address
+                                                                          index-address))
+            ledger-alias    (commit->ledger-alias conn address expanded-commit)
 
             {:keys [did indexing]} (parse-ledger-options conn {})
-            ledger (ledger/instantiate ledger-alias address commit-catalog index-catalog
-                                       primary-publisher secondary-publishers indexing did expanded-commit)]
+            ledger                 (ledger/instantiate ledger-alias address commit-catalog
+                                                       index-catalog primary-publisher
+                                                       secondary-publishers indexing did
+                                                       expanded-commit)]
         (ns-subscribe/subscribe-ledger conn ledger-alias)
         (async/put! ledger-chan ledger)
         ledger)
@@ -450,12 +450,10 @@
                   commit-address (get-in ns-record ["f:commit" "@id"])
                   index-address  (get-in ns-record ["f:index" "@id"])
                   latest-commit  (when commit-address
-                                   (let [commit (<? (commit-storage/load-commit-with-metadata
-                                                     (:commit-catalog conn)
-                                                     commit-address
-                                                     index-address))]
-                                     (when commit
-                                       (json-ld/expand commit))))]
+                                   (<? (commit-storage/load-commit-with-metadata
+                                        (:commit-catalog conn)
+                                        commit-address
+                                        index-address)))]
               (log/debug "Dropping ledger" ledger-addr)
               (when latest-commit
                 (drop-index-artifacts conn latest-commit)

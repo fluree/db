@@ -39,15 +39,15 @@
   nameservice/Publisher
   (publish [_ data]
     (let [;; Extract data from compact JSON-LD format (both genesis and regular commits now use this)
-          ledger-alias   (get data "alias")  ;; Already includes :branch
-          commit-address (get data "address")
-          t-value        (get-in data ["data" "t"])
-          index-address  (get-in data ["index" "address"])
-          ns-metadata    (ns-record ledger-alias commit-address t-value index-address)
-          record-bytes   (json/stringify-UTF8 ns-metadata)
-          filename       (local-filename ledger-alias)]
+          ledger-alias (get data "alias")  ;; Already includes :branch
+          filename     (local-filename ledger-alias)]
       (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :filename filename})
-      (let [res (storage/write-bytes store filename record-bytes)]
+      (let [commit-address (get data "address")
+            t-value        (get-in data ["data" "t"])
+            index-address  (get-in data ["index" "address"])
+            ns-metadata    (ns-record ledger-alias commit-address t-value index-address)
+            record-bytes   (json/stringify-UTF8 ns-metadata)
+            res            (storage/write-bytes store filename record-bytes)]
         (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :filename filename})
         res)))
 
@@ -68,7 +68,7 @@
       ;; ledger-address is just the alias (potentially with :branch)
       (let [filename (local-filename ledger-address)]
         (log/debug "StorageNameService lookup:" {:ledger-address ledger-address
-                                                 :filename filename})
+                                                 :filename       filename})
         (when-let [record-bytes (<? (storage/read-bytes store filename))]
           (json/parse record-bytes false)))))
 
@@ -85,7 +85,7 @@
       (if (satisfies? storage/RecursiveListableStore store)
         (if-let [list-paths-result (storage/list-paths-recursive store const/ns-version)]
           (loop [remaining-paths (<? list-paths-result)
-                 records []]
+                 records         []]
             (if-let [path (first remaining-paths)]
               (let [file-content (<? (storage/read-bytes store path))]
                 (if file-content
@@ -94,7 +94,7 @@
                                       #?(:clj (let [^bytes bytes-content file-content]
                                                 (String. bytes-content "UTF-8"))
                                          :cljs (js/String.fromCharCode.apply nil file-content)))
-                        record (json/parse content-str false)]
+                        record      (json/parse content-str false)]
                     (recur (rest remaining-paths) (conj records record)))
                   (recur (rest remaining-paths) records)))
               records))

@@ -286,12 +286,15 @@
   [write-response file-type t changes-ch]
   (go
     (when changes-ch
-      (>! changes-ch {:event     :new-index-file
-                      :file-type file-type
-                      :data      write-response
-                      :address   (:address write-response)
-                      :t         t})
-      true)))
+      (let [event {:event     :new-index-file
+                   :file-type file-type
+                   :data      write-response
+                   :address   (:address write-response)
+                   :t         t}]
+        (log/debug "Broadcasting new index file event:" event)
+        (>! changes-ch event)
+        (log/debug "New index file event broadcast success for address:" (:address event))
+        true))))
 
 (defn write-node
   "Writes `node` to storage, and puts any errors onto the `error-ch`"
