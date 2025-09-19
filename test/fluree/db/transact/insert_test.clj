@@ -75,3 +75,16 @@
                                :select '?name
                                :where  {:schema/name '?name}})))
         (is (= 2 (:t db)))))))
+
+(deftest ^:integration insert-invalid-type-literal
+  (testing "Inserting a node with @type as a literal (non-IRI) should error"
+    (let [conn   (test-utils/create-conn)
+          db0    @(fluree/create conn "tx/invalid-type-literal")
+          txn    {"@context" [test-utils/default-str-context
+                              {"ex"  "http://example.org/ns/"
+                               "xsd" "http://www.w3.org/2001/XMLSchema#"}]
+                  "insert"   [{"@id"   "ex:bad"
+                               "@type" [{"@value" "not-a-iri"
+                                         "@type"  "xsd:string"}]}]}
+          res    (ex-data @(fluree/update db0 txn))]  
+      (is (= 400 (:status res)) "Status should indicate a bad request"))))
