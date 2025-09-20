@@ -35,21 +35,9 @@
         end-flake   (query-range/resolve-match-flake end-test s2 p2 o2 t2 op2 m2)]
     [start-flake end-flake]))
 
-(defn rdf-type?
-  [pid]
-  (= const/$rdf:type pid))
-
 (defn list-element?
   [flake]
   (-> flake flake/m (contains? :i)))
-
-(defn type-value
-  [db cache compact-fn type-flakes]
-  (->> type-flakes
-       (into [] (comp (map flake/o)
-                      (map (partial cache-sid->iri db cache compact-fn))
-                      (map :as)))
-       util/unwrap-singleton))
 
 (defn format-reference
   [db spec sid]
@@ -78,14 +66,12 @@
                         (when wildcard?
                           (cache-sid->iri db cache compact-fn pid)))]
       (let [p-iri (:as spec)
-            v     (if (rdf-type? pid)
-                    (type-value db cache compact-fn p-flakes)
-                    (let [p-flakes* (if (list-element? ff)
-                                      (sort-by (comp :i flake/m) p-flakes)
-                                      p-flakes)]
-                      (->> p-flakes*
-                           (mapv (partial format-object db spec))
-                           (util/unwrap-singleton p-iri context))))]
+            v     (let [p-flakes* (if (list-element? ff)
+                                    (sort-by (comp :i flake/m) p-flakes)
+                                    p-flakes)]
+                    (->> p-flakes*
+                         (mapv (partial format-object db spec))
+                         (util/unwrap-singleton p-iri context)))]
         [p-iri v]))))
 
 (defn format-subject-xf

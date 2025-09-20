@@ -4,20 +4,6 @@
             [fluree.db.constants :as const]
             [fluree.db.util :as util]))
 
-(defn ledger-base-name
-  "Extracts the base ledger name from a ledger alias that may include a branch.
-   e.g., 'my-ledger:main' -> 'my-ledger'"
-  [ledger-alias]
-  (first (str/split ledger-alias #":" 2)))
-
-(defn ledger-branch
-  "Extracts the branch name from a ledger alias.
-   Returns the branch name or nil if no branch is specified.
-   e.g., 'my-ledger:main' -> 'main'
-         'my-ledger' -> nil"
-  [ledger-alias]
-  (second (str/split ledger-alias #":" 2)))
-
 (defn ledger-parts
   "Splits a ledger alias into [ledger-name branch-name].
    e.g., 'my-ledger:main' -> ['my-ledger' 'main']
@@ -25,6 +11,30 @@
   [ledger-alias]
   (let [parts (str/split ledger-alias #":" 2)]
     [(first parts) (second parts)]))
+
+(defn ledger-base-name
+  "Extracts the base ledger name from a ledger alias that may include a branch.
+   e.g., 'my-ledger:main' -> 'my-ledger'"
+  [ledger-alias]
+  (first (ledger-parts ledger-alias)))
+
+(defn ledger-branch
+  "Extracts the branch name from a ledger alias.
+   Returns the branch name or nil if no branch is specified.
+   e.g., 'my-ledger:main' -> 'main'
+         'my-ledger' -> nil"
+  [ledger-alias]
+  (second (ledger-parts ledger-alias)))
+
+(defn ensure-ledger-branch
+  "Ensures a ledger alias includes a branch.
+   If no : symbol present, appends :main as default branch.
+   e.g., 'my-ledger' -> 'my-ledger:main'
+         'my-ledger:branch' -> 'my-ledger:branch'"
+  [ledger-alias]
+  (if (ledger-branch ledger-alias)
+    ledger-alias
+    (str ledger-alias ":" const/default-branch-name)))
 
 (defn validate-ledger-name
   "Validates a ledger name for creation. Throws if invalid.
@@ -233,11 +243,3 @@
     {:ledger ledger-name
      :branch branch-name
      :t time-val}))
-
-(defn normalize-ledger-alias
-  "Ensures ledger alias includes branch.
-  If no : symbol present, appends :main as default branch."
-  [ledger-alias]
-  (if (str/includes? ledger-alias ":")
-    ledger-alias
-    (str ledger-alias ":" const/default-branch-name)))

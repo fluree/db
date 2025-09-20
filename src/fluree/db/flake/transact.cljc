@@ -59,14 +59,41 @@
      :reasoner-max  10 ; maximum number of reasoner iterations before exception
      :reasoned      reasoned-from-iri}))
 
+(defn remove-cancelable-flakes
+  "If an identical flake is retracted and re-asserted, removes both flakes as they can be cancelled out.
+   If not removed, the replay of flakes to a time 't' can result in flakes not appearing properly."
+  [flakeset retractions]
+  (reduce (fn [s r]
+            (let [a (flake/flip-flake r)]
+              (if (contains? s a)
+                (-> s
+                    (disj a)
+                    (disj r))
+                s)))
+          flakeset
+          retractions))
+
 (defn into-flakeset
   [tracker error-ch flake-ch]
-  (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)
-        error-xf (halt-when util/exception?)
-        flake-xf (if-let [track-fuel (track/track-fuel! tracker error-ch)]
-                   (comp error-xf track-fuel)
-                   error-xf)]
-    (async/transduce flake-xf (completing conj) flakeset flake-ch)))
+  (let [flakeset    (flake/sorted-set-by flake/cmp-flakes-spot)
+        error-xf    (halt-when util/exception?)
+        flake-xf    (if-let [track-fuel (track/track-fuel! tracker error-ch)]
+                      (comp error-xf track-fuel)
+                      error-xf)
+        retractions (volatile! [])]
+    (async/transduce
+     flake-xf
+     (completing
+      (fn [acc f]
+        (when (false? (flake/op f))
+          (vswap! retractions conj f))
+        (conj acc f))
+      (fn [flakeset]
+        (if (seq @retractions)
+          (remove-cancelable-flakes flakeset @retractions)
+          flakeset)))
+     flakeset
+     flake-ch)))
 
 (defn generate-flakes
   [db tracker parsed-txn tx-state]

@@ -162,7 +162,7 @@
   (let [{:keys [ledger branch t]} (ledger-util/parse-ledger-alias alias)
         base-alias (if branch
                      (str ledger ":" branch)
-                     ledger)]
+                     (ledger-util/ensure-ledger-branch ledger))]
     [base-alias t]))
 
 (def ledger-specific-opts #{:policy-class :policy :policy-values})
