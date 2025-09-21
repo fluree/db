@@ -6,9 +6,59 @@
             [clojure.core.async :as async]
             [fluree.crypto.aes :as aes]
             [fluree.db.util.log :as log])
-  #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
+  #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException File)
+                   (java.nio ByteBuffer)
+                   (java.nio.channels FileChannel)
+                   (java.nio.file Paths))))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+#?(:clj
+   (def empty-path-array
+     (into-array [])))
+
+#?(:clj
+   (defn open-file-channel
+     [path-str]
+     (let [path (Paths/get path-str empty-path-array)]
+       (FileChannel/open path))))
+
+#?(:clj
+   (defn read-file-channel
+     [^FileChannel file-ch]
+     (let [size (.size file-ch)
+           buf  (ByteBuffer/allocate (int size))]
+       (doto file-ch
+         (.position 0)
+         (.read buf))
+       (.flip buf)
+       (let [bs (byte-array (.remaining buf))]
+         (.get buf bs)
+         bs))))
+
+#?(:clj
+   (defn write-file-channel
+     [^FileChannel file-ch bs]
+     (let [buf (ByteBuffer/wrap bs)]
+       (doto file-ch
+         (.truncate 0)
+         (.position 0)
+         (.write buf)))))
+
+#?(:clj
+   (defn with-file-lock
+     [path f]
+     (async/thread
+       (with-open [file-ch (open-file-channel path)]
+         (let [file-lock (.lock file-ch)]
+           (try
+             (let [result (-> file-ch read-file-channel f)]
+               (write-file-channel file-ch result)
+               result)
+             (catch Exception e
+               e)
+             (finally
+               (.release file-lock))))))))
 
 (defn write-file
   "Write bytes to disk at the given file path."
