@@ -76,6 +76,13 @@
                       ledger-obj)]
     (= ledger-name ledger-alias)))
 
+(defn- main-branch?
+  "Check if a branch name represents the main/default branch.
+   Returns true for 'main' or nil (which defaults to main)."
+  [branch-name]
+  (or (= branch-name const/default-branch-name)
+      (nil? branch-name)))
+
 (defn list-branches
   "Lists all available branches for a ledger.
   
@@ -124,7 +131,7 @@
   (go-try
     (let [branch-spec* (util.ledger/ensure-ledger-branch branch-spec)
           [_ledger-id branch] (util.ledger/ledger-parts branch-spec*)
-          _ (when (= branch const/default-branch-name)
+          _ (when (main-branch? branch)
               (throw (ex-info "Cannot delete the main branch. Use the drop API to remove the entire ledger."
                               {:status 400 :error :db/cannot-delete-main-branch})))
           ledger (<? (connection/load-ledger conn branch-spec*))
@@ -160,7 +167,7 @@
         (throw (ex-info "Cannot rename branch across different ledgers"
                         {:status 400 :error :db/invalid-branch-operation})))
 
-      (when (= old-branch const/default-branch-name)
+      (when (main-branch? old-branch)
         (throw (ex-info "Cannot rename the main branch"
                         {:status 400 :error :db/cannot-rename-main-branch})))
 
