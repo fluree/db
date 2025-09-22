@@ -3,7 +3,7 @@
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util :as util]
-            [fluree.db.util.async :refer [<? go-try]]))
+            [fluree.db.util.async :refer [<? empty-channel go-try]]))
 
 (defrecord DataSet [named default active])
 
@@ -57,7 +57,7 @@
                     (where/-match-id db tracker solution s-mch error-ch)))
              async/merge)
         (where/-match-id active-graph tracker solution s-mch error-ch))
-      where/nil-channel))
+      empty-channel))
 
   (-match-triple [ds tracker solution triple error-ch]
     (if-let [active-graph (get-active-graph ds)]
@@ -67,7 +67,7 @@
                     (where/-match-triple db tracker solution triple error-ch)))
              async/merge)
         (where/-match-triple active-graph tracker solution triple error-ch))
-      where/nil-channel))
+      empty-channel))
 
   (-match-class [ds tracker solution triple error-ch]
     (if-let [active-graph (get-active-graph ds)]
@@ -77,7 +77,14 @@
                     (where/-match-class db tracker solution triple error-ch)))
              async/merge)
         (where/-match-class active-graph tracker solution triple error-ch))
-      where/nil-channel))
+      empty-channel))
+
+  (-match-properties [ds tracker solution triples error-ch]
+    (if-let [active-graph (get-active-graph ds)]
+      (if (sequential? active-graph)
+        (where/match-triples ds tracker solution triples error-ch)
+        (where/-match-properties active-graph tracker solution triples error-ch))
+      empty-channel))
 
   (-activate-alias [ds alias]
     (go-try

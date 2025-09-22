@@ -20,9 +20,16 @@
     v))
 
 (defn variable?
-  [x]
-  (and (or (string? x) (symbol? x) (keyword? x))
-       (-> x name first (= \?))))
+  ([x]
+   (and (or (string? x) (symbol? x) (keyword? x))
+        (-> x name first (= \?))
+        (if (string? x)
+          (re-matches #"^\?\S+$" x)
+          true)))
+  ([x {:keys [parse-object-vars?] :as _var-config}]
+   (if parse-object-vars?
+     (variable? x)
+     false)))
 
 (defn bnode-variable?
   [x]
@@ -30,9 +37,15 @@
        (->> x name (take 2) (= [\_ \:]))))
 
 (defn query-variable?
-  [x]
-  (or (variable? x)
-      (bnode-variable? x)))
+  ([x]
+   (or (variable? x)
+       (bnode-variable? x)))
+  ([x var-config]
+   (or (variable? x var-config)
+       (bnode-variable? x))))
+
+(def specified-value?
+  (complement query-variable?))
 
 (defn property-path?
   [x]

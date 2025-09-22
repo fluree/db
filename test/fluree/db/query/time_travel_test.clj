@@ -46,18 +46,23 @@
           db-t3 @(fluree/db conn ledger-name)
           t3 (:t db-t3)
 
-          ;; Get commit SHA for t1 to test SHA-based time travel
-          commit-query {"select" ["?commit"]
+          ;; Get commit id for t1 by selecting commit for this ledger where its data.t = t1
+          ;; Note: The property is ledger#data not commit#data, and ledger#t not commitdata#t
+          ;; Also note: The alias includes ":main" branch suffix
+          full-alias (str ledger-name ":main")
+          commit-query {"select" ["?commit" "?data" "?t"]
                         "where" [{"@id" "?commit"
-                                  "@type" "fluree:Commit"
-                                  "https://ns.flur.ee/ledger#v" t1}]}
+                                  "https://ns.flur.ee/ledger#alias" full-alias
+                                  "https://ns.flur.ee/ledger#data" "?data"}
+                                 {"@id" "?data"
+                                  "https://ns.flur.ee/ledger#t" "?t"}]}
           commit-result @(fluree/query db-t3 commit-query {})
-          commit-id (ffirst commit-result)
+          ;; Filter for the specific t value 
+          t1-result (filter #(= (nth % 2) t1) commit-result)
+          commit-id (ffirst t1-result)]
 
-          ;; Extract just the hash part after "fluree:commit:sha256:b"
-          commit-sha (when (and commit-id (string/starts-with? commit-id "fluree:commit:sha256:b"))
-                       (let [full-hash (subs commit-id (count "fluree:commit:sha256:b"))]
-                         (subs full-hash 0 (min 7 (count full-hash)))))]
+      (is commit-id "Expected a commit id for t1 commit")
+      (is (string/starts-with? commit-id "fluree:commit:sha256:") "Commit id should have the expected prefix")
 
       (testing "Query with @t: syntax returns correct historical data"
         ;; Query at t1 - should only see Alice 
@@ -99,37 +104,40 @@
               "At current ISO time: Should see all three people")))
 
       ;; Test SHA-based time travel
-      (when commit-sha
-        (testing "Query with @sha: syntax returns correct historical data"
-          ;; Test with short SHA prefix (git-style)
-          (let [query-short {"select" ["?name"]
+      (testing "Query with @sha: syntax returns correct historical data"
+                  ;; Test with short SHA prefix (git-style)
+        (let [commit-sha (let [full-hash (subs commit-id (count "fluree:commit:sha256:"))]
+                           (subs full-hash 0 (min 7 (count full-hash))))
+              query-short {"select" ["?name"]
+                           "where" [{"@id" "?s" "name" "?name"}]
+                           "from" [(str ledger-name "@sha:" commit-sha)]
+                           "orderBy" ["?name"]}
+              result-short @(fluree/query-connection conn query-short {})]
+          (is (= [["Alice"]] result-short)
+              "At commit SHA prefix (7 chars) for t1: Should only see Alice"))
+
+                  ;; Test with full SHA
+        (let [full-sha (let [extracted (subs commit-id (count "fluree:commit:sha256:"))]
+                         ;; Ensure exactly 52 characters for base32 SHA-256 with 'b' prefix
+                         (subs extracted 0 (min 52 (count extracted))))
+              query-full {"select" ["?name"]
+                          "where" [{"@id" "?s" "name" "?name"}]
+                          "from" [(str ledger-name "@sha:" full-sha)]
+                          "orderBy" ["?name"]}
+              result-full @(fluree/query-connection conn query-full {})]
+          (is (= [["Alice"]] result-full)
+              "At full commit SHA for t1: Should only see Alice"))
+
+                  ;; Test with minimum SHA prefix length enforcement (6 chars)
+        (let [short-sha-6 (let [full-hash (subs commit-id (count "fluree:commit:sha256:"))]
+                            (subs full-hash 0 6))
+              query-short-6 {"select" ["?name"]
                              "where" [{"@id" "?s" "name" "?name"}]
-                             "from" [(str ledger-name "@sha:" commit-sha)]
+                             "from" [(str ledger-name "@sha:" short-sha-6)]
                              "orderBy" ["?name"]}
-                result-short @(fluree/query-connection conn query-short {})]
-            (is (= [["Alice"]] result-short)
-                "At commit SHA prefix (7 chars) for t1: Should only see Alice"))
-
-          ;; Test with full SHA if we can extract it
-          (when (and commit-id (string/starts-with? commit-id "fluree:commit:sha256:b"))
-            (let [full-sha (subs commit-id (count "fluree:commit:sha256:b"))
-                  query-full {"select" ["?name"]
-                              "where" [{"@id" "?s" "name" "?name"}]
-                              "from" [(str ledger-name "@sha:" full-sha)]
-                              "orderBy" ["?name"]}
-                  result-full @(fluree/query-connection conn query-full {})]
-              (is (= [["Alice"]] result-full)
-                  "At full commit SHA for t1: Should only see Alice")))
-
-          ;; Test with minimum SHA prefix length enforcement (6 chars)
-          (let [short-sha-6 (subs commit-sha 0 6)
-                query-short-6 {"select" ["?name"]
-                               "where" [{"@id" "?s" "name" "?name"}]
-                               "from" [(str ledger-name "@sha:" short-sha-6)]
-                               "orderBy" ["?name"]}
-                result-short-6 @(fluree/query-connection conn query-short-6 {})]
-            (is (= [["Alice"]] result-short-6)
-                "At commit SHA prefix (6 chars) for t1: Should only see Alice"))))
+              result-short-6 @(fluree/query-connection conn query-short-6 {})]
+          (is (= [["Alice"]] result-short-6)
+              "At commit SHA prefix (6 chars) for t1: Should only see Alice")))
 
       (testing "Invalid time travel format returns error"
         (let [result @(fluree/query-connection conn
@@ -138,9 +146,8 @@
                                                 "from" [(str ledger-name "@invalid:format")]}
                                                {})]
           (is (instance? Exception result) "Should return an exception")
-          (when (instance? Exception result)
-            (let [msg (ex-message result)]
-              (is (re-find #"Invalid time travel format" msg) "Error should mention invalid format")))))
+          (let [msg (ex-message result)]
+            (is (re-find #"Invalid time travel format" msg) "Error should mention invalid format"))))
 
       (testing "Missing value for time travel spec returns error"
         (doseq [spec ["@t:" "@iso:" "@sha:"]]
@@ -150,8 +157,7 @@
                                                   "from" [(str ledger-name spec)]}
                                                  {})]
             (is (instance? Exception result) (str "Should return an exception for spec " spec))
-            (when (instance? Exception result)
-              (is (re-find #"Missing value for time travel spec" (ex-message result)))))))
+            (is (re-find #"Missing value for time travel spec" (ex-message result))))))
 
       ;; Test ambiguous SHA prefix (would require multiple commits with similar prefixes)
       ;; This is hard to test reliably since we'd need to generate commits with specific SHA patterns
@@ -163,11 +169,10 @@
                                                 "from" [(str ledger-name "@sha:zzzzzz")]}
                                                {})]
           (is (instance? Exception result) "Should return an exception for non-existent SHA")
-          (when (instance? Exception result)
-            (let [msg (ex-message result)]
-              (is (or (re-find #"No commit found" msg)
-                      (re-find #"invalid-commit-sha" msg))
-                  "Error should mention commit not found")))))
+          (let [msg (ex-message result)]
+            (is (or (re-find #"No commit found" msg)
+                    (re-find #"invalid-commit-sha" msg))
+                "Error should mention commit not found"))))
 
       @(fluree/disconnect conn))))
 
@@ -312,10 +317,9 @@
                                                 "from" [(str ledger-name "@iso:" too-early-iso)]}
                                                {})]
           (is (instance? Exception result) "Should return an exception for time before data exists")
-          (when (instance? Exception result)
-            (let [msg (ex-message result)]
-              (is (re-find #"no data as of" msg)
-                  "Error should mention no data exists at that time")))))
+          (let [msg (ex-message result)]
+            (is (re-find #"no data as of" msg)
+                "Error should mention no data exists at that time"))))
 
       @(fluree/disconnect conn))))
 

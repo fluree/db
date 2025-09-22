@@ -256,6 +256,7 @@
   [jsonld rdf-type]
   (->> jsonld
        get-types
+       sequential
        (some #(= % rdf-type))))
 
 (defn get-value
@@ -315,15 +316,15 @@
   or in single-cardinality form:
   {ex:someProperty {@list [ex:val1 ex:val2]}}
 
-  If @list is not present, return original 'vals' argument."
+  If @list is not present, return original 'vals' argument wrapped in a sequence if not already.
+  Always returns a sequence."
   [vals]
   (let [first-val (if (sequential? vals)
                     (first vals)
                     vals)
         list-vals (when (map? first-val)
                     (get first-val "@list"))]
-    (or list-vals
-        vals)))
+    (sequential (or list-vals vals))))
 
 (defn get-all-ids
   "Returns all @id values for a given key in a jsonld node.

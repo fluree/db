@@ -1,6 +1,8 @@
 (ns fluree.db.transact.upsert-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
+            [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.test-utils :as test-utils]))
 
@@ -46,7 +48,7 @@
 
 (deftest upsert-parsing
   (testing "Parsed upsert txn is identical to long-form update txn"
-    (is (= (parse/parse-upsert-txn sample-upsert-txn {})
+    (is (= (update (parse/parse-upsert-txn sample-upsert-txn {}) :opts dissoc :object-var-parsing)
            (parse/parse-update-txn sample-update-txn {})))))
 
 (deftest ^:integration upsert-data
@@ -135,6 +137,37 @@
                  @(fluree/query db2 {"@context" {"ex" "http://example.org/ns/"}
                                      "where"    [{"@id" "?s" "@type" "ex:User"}]
                                      "select"   {"?s" ["*"]}}))))))))
+
+(deftest ^:integration upsert-cancels-identical-pairs-in-novelty
+  (testing "Upsert cancels identical retract/assert pairs at same t in novelty"
+    (let [conn (test-utils/create-conn)
+          ledger-name "tx/upsert-cancel-pairs"
+          _  @(fluree/create conn ledger-name)
+          ctx  {"ex" "http://example.org/ns/"
+                "schema" "http://schema.org/"}
+          _  @(fluree/insert! conn ledger-name
+                              {"@context" ctx
+                               "@graph"   [{"@id"         "ex:alice"
+                                            "@type"        "ex:User"
+                                            "schema:name"  "Alice"
+                                            "ex:nums"      [1 2]}]})
+          ;; Upsert unchanged schema:name and add one new ex:nums value
+          db2  @(fluree/upsert! conn ledger-name
+                                {"@context" ctx
+                                 "@graph"   [{"@id"         "ex:alice"
+                                              "schema:name"  "Alice2"
+                                              "ex:nums"      [1 2 3]}]})
+          spot (get-in db2 [:novelty :spot])
+          s    (iri/encode-iri db2 "http://example.org/ns/alice")
+          p-name (iri/encode-iri db2 "http://schema.org/name")
+          p-nums (iri/encode-iri db2 "http://example.org/ns/nums")
+          alice-flakes (filter #(= s (flake/s %)) spot)
+          name-flakes (filter #(= p-name (flake/p %)) alice-flakes)
+          nums-flakes (filter #(= p-nums (flake/p %)) alice-flakes)]
+      (is (= 3 (count name-flakes))
+          "schema:name asserts Alice, then retracts Alice and asserts Alice2 - so three flakes total")
+      (is (= 3 (count nums-flakes))
+          "ex:nums went from [1 2] to [1 2 3] so only an assertions for total of 3 flakes"))))
 
 (deftest upsert-and-commit
   (let [conn    @(fluree/connect-memory)

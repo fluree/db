@@ -121,43 +121,53 @@
     ::meta              [:orn
                          [:all :boolean]
                          [:specific [:map-of :keyword :boolean]]]
-    ::opts              [:map
-                         [:max-fuel {:optional true} ::max-fuel]
-                         [:identity {:optional true} ::identity]
-                         [:policy {:optional true} :any]
-                         [:policy-class {:optional true} :any]
-                         [:policy-values {:optional true} :any]
-                         [:meta {:optional true} ::meta]
-                         [:format {:optional true} ::format]
-                         [:output {:optional true} [:enum :sparql :fql]]
-                         ;; deprecated
-                         [:role {:optional true} ::role]
-                         [:issuer {:optional true} ::issuer]
-                         [:pretty-print {:optional true} ::pretty-print]
-                         [:did {:optional true} ::identity]
-                         [:default-allow? {:optional true} ::default-allow?]
-                         [:parse-json {:optional true} ::parse-json]]
-    ::stage-opts        [:map
-                         [:meta {:optional true} ::meta]
-                         [:max-fuel {:optional true} ::max-fuel]
-                         [:identity {:optional true} ::identity]
-                         [:format {:optional true} ::format]
-                         [:did {:optional true} ::identity]
-                         [:context {:optional true} ::context]
-                         [:raw-txn {:optional true} :any]
-                         [:author {:optional true} ::identity]
-                         [:policy-values {:optional true} :any]]
-    ::commit-opts       [:map
-                         [:meta {:optional true} ::meta]
-                         [:identity {:optional true} ::identity]
-                         [:context {:optional true} ::context]
-                         [:raw-txn {:optional true} :any]
-                         [:author {:optional true} ::identity]
-                         [:private {:optional true} :string]
-                         [:message {:optional true} :string]
-                         [:tag {:optional true} :string]
-                         [:index-files-ch {:optional true} :any]
-                         [:time {:optional true} :string]]
+    ::deprecated-query-opts [:map
+                             [:role {:optional true} ::role]
+                             [:issuer {:optional true} ::issuer]
+                             [:pretty-print {:optional true} ::pretty-print]
+                             [:did {:optional true} ::identity]
+                             [:default-allow? {:optional true} ::default-allow?]
+                             [:parse-json {:optional true} ::parse-json]]
+
+    ::ledger-specific-query-opts [:map
+                                  [:policy {:optional true} :any]
+                                  [:policy-class {:optional true} :any]
+                                  [:policy-values {:optional true} :any]]
+
+    ::query-specific-opts [:map
+                           [:max-fuel {:optional true} ::max-fuel]
+                           [:identity {:optional true} ::identity]
+                           [:meta {:optional true} ::meta]
+                           [:format {:optional true} ::format]
+                           [:output {:optional true} [:enum :sparql :fql]]
+                           [:object-var-parsing {:optional true} :boolean]]
+
+    ::opts              [:or
+                         [:and
+                          ::query-specific-opts
+                          ::ledger-specific-query-opts
+                          ::deprecated-query-opts]
+                         [:and
+                          ::query-specific-opts
+                          ::ledger-specific-query-opts
+                          ::deprecated-query-opts
+                          [:map-of ::ledger ::ledger-specific-query-opts]]]
+
+    ::stage-opts        [:and
+                         ::opts
+                         [:map
+                          [:context {:optional true} ::context]
+                          [:raw-txn {:optional true} :any]
+                          [:author {:optional true} ::identity]]]
+
+    ::commit-opts       [:and
+                         ::stage-opts
+                         [:map
+                          [:private {:optional true} :string]
+                          [:message {:optional true} :string]
+                          [:tag {:optional true} :string]
+                          [:index-files-ch {:optional true} :any]
+                          [:time {:optional true} :string]]]
     ::ledger-opts       [:map
                          [:did {:optional true} ::identity]
                          [:identity {:optional true} ::identity]
@@ -169,6 +179,7 @@
     ::function          ::v/function
     ::as-function       ::v/as-function
     ::wildcard          [:fn wildcard?]
+    ::ledger            ::v/ledger
     ::var               ::v/var
     ::iri               ::v/iri
     ::subject           ::v/subject

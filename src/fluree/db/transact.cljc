@@ -1,5 +1,6 @@
 (ns fluree.db.transact
   (:require [clojure.string :as str]
+            [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.did :as did]
@@ -155,12 +156,12 @@
 ;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
 ;; TODO - however this is really a concern of "commit", not staging and I don't think the db should be handling any of it
 (defn write-transaction!
-  [ledger db-alias staged]
+  [ledger ledger-name staged]
   (go-try
     (let [{:keys [txn author annotation]} staged
           {:keys [commit-catalog]} ledger]
       (if txn
-        (let [{txn-id :address} (<? (save-txn! commit-catalog db-alias txn))]
+        (let [{txn-id :address} (<? (save-txn! commit-catalog ledger-name txn))]
           {:txn-id     txn-id
            :author     author
            :annotation annotation})
@@ -207,21 +208,10 @@
 
 (defn publish-commit
   "Publishes commit to all nameservices registered with the ledger."
-  [{:keys [primary-publisher secondary-publishers alias] :as _ledger} commit-jsonld]
+  [{:keys [primary-publisher secondary-publishers] :as _ledger} commit-jsonld]
   (go-try
-    (let [existing-record (when primary-publisher
-                            (<? (nameservice/lookup primary-publisher alias)))
-          branch-metadata (when existing-record
-                            {:created-at (get existing-record "f:createdAt")
-                             :created-from (get existing-record "f:createdFrom")
-                             :protected (get existing-record "f:protected")
-                             :description (get existing-record "f:description")})
-          ;; Add branch metadata to commit if it exists
-          commit-with-metadata (if branch-metadata
-                                 (assoc commit-jsonld "branchMetadata" branch-metadata)
-                                 commit-jsonld)
-          result (<? (nameservice/publish primary-publisher commit-with-metadata))]
-      (nameservice/publish-to-all commit-with-metadata secondary-publishers)
+    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
+      (nameservice/publish-to-all commit-jsonld secondary-publishers)
       result)))
 
 (defn formalize-commit
@@ -233,6 +223,10 @@
                :prev-commit prev-commit
                :max-namespace-code max-ns-code)
         (commit-data/add-commit-flakes))))
+
+(defn indexing-needed?
+  [novelty-size min-size]
+  (>= novelty-size min-size))
 
 (defn commit!
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
@@ -303,21 +297,21 @@
        (log/debug "commit!: publish-commit done" {:ledger ledger-alias})
 
        (if (track/track-txn? opts)
-         (let [indexing-disabled? (-> ledger
-                                      :indexing-opts
-                                      :indexing-disabled)
-               index-t (commit-data/index-t commit-map)
+         (let [index-t (commit-data/index-t commit-map)
                novelty-size (get-in db* [:novelty :size] 0)
-               reindex-min-bytes (:reindex-min-bytes db*)
-               indexing-needed? (>= novelty-size reindex-min-bytes)]
+               ;; Always read threshold from realized FlakeDB; db* may be AsyncDB
+               reindex-min-bytes (or (:reindex-min-bytes db) 1000000)
+               ;; Get indexing-enabled from the ledger's state (which contains the single branch-map)
+               indexing-enabled? (when-let [state (:state ledger)]
+                                   (branch/indexing-enabled? @state))]
            (-> write-result
                (select-keys [:address :hash :size])
                (assoc :ledger-id ledger-alias
                       :t t
                       :db db*
-                      :indexing-needed indexing-needed?
+                      :indexing-needed (indexing-needed? novelty-size reindex-min-bytes)
                       :index-t index-t
-                      :indexing-disabled indexing-disabled?
+                      :indexing-enabled indexing-enabled?
                       :novelty-size novelty-size)))
          db*)))))
 
