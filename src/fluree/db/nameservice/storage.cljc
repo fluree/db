@@ -90,7 +90,8 @@
 
         (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :path path})
         (let [res (<? (storage/write-bytes store path record-bytes))]
-          (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :path path})
+          (log/debug "nameservice.storage/publish wrote"
+                     {:ledger ledger-alias :path path :bytes (alength ^bytes record-bytes)})
           res))))
 
   (retract [_ ledger-alias]
@@ -98,6 +99,8 @@
           address  (-> store
                        storage/location
                        (storage/build-address path))]
+      (log/debug "nameservice.storage/retract start"
+                 {:alias ledger-alias :path path :address address})
       (storage/delete store address)))
 
   (publishing-address [_ ledger-alias]
