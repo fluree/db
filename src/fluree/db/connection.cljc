@@ -450,12 +450,7 @@
               ;; Also clean up cuckoo filter files for all branches
               cuckoo-ch  (when ledger-alias
                            (let [ledger-name (first (str/split ledger-alias #":" 2))]
-                             ;; Dynamic require to avoid circular dependency
-                             (when-let [delete-fn (try
-                                                    (require 'fluree.db.indexer.cuckoo)
-                                                    (resolve 'fluree.db.indexer.cuckoo/delete-all-filters)
-                                                    (catch #?(:clj Exception :cljs js/Error) _e nil))]
-                               (delete-fn index-catalog ledger-name))))]
+                             (cuckoo/delete-all-filters index-catalog ledger-name)))]
           (<? garbage-ch)
           (<? spot-ch)
           (<? psot-ch)

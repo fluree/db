@@ -136,18 +136,20 @@
           (do
             (log/info "Starting garbage collection of oldest"
                       (count to-clean*) "indexes.")
-            ;; Cache other-branch filters per ledger to avoid repeated I/O
+            ;; Cache other-branch filters per [ledger branch] to avoid repeated I/O
             (let [ledger-filter-cache (atom {})]
               (doseq [next-garbage to-clean*]
                 ;; Read garbage record once
                 (let [garbage-data (<! (storage/read-garbage index-catalog (:address next-garbage)))
                       {:keys [alias]} garbage-data
-                      [ledger-name _] (util.ledger/ledger-parts alias)
-                      ;; Get cached filters or load them once for this ledger
-                      other-filters (or (get @ledger-filter-cache ledger-name)
+                      [ledger-name branch-name] (util.ledger/ledger-parts alias)
+                      current-branch (or branch-name "main")
+                      cache-key [ledger-name current-branch]
+                      ;; Get cached filters or load them once for this ledger/branch
+                      other-filters (or (get @ledger-filter-cache cache-key)
                                         (let [filters (<! (cuckoo/load-other-branch-filters
-                                                           index-catalog ledger-name nil))]
-                                          (swap! ledger-filter-cache assoc ledger-name filters)
+                                                           index-catalog ledger-name current-branch))]
+                                          (swap! ledger-filter-cache assoc cache-key filters)
                                           filters))]
                   (<! (clean-garbage-record index-catalog next-garbage other-filters garbage-data)))))
             (log/info "Finished garbage collection of oldest"

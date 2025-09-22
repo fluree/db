@@ -393,9 +393,10 @@
             storage  (:storage index-catalog)
             store    (if (satisfies? store/EraseableStore storage)
                        storage
-                       (store/get-content-store storage ::store/default))]
+                       (store/get-content-store storage ::store/default))
+            address  (store/build-address (store/location store) filename)]
         (try*
-          (<? (store/delete store filename))
+          (<? (store/delete store address))
           (catch* _e
             ;; Filter might not exist, that's ok
             nil))))))
@@ -418,7 +419,8 @@
           (when-let [files (<? (store/list-paths-recursive store cuckoo-dir))]
             (doseq [file files]
               (try*
-                (<? (store/delete store file))
+                (let [address (store/build-address (store/location store) file)]
+                  (<? (store/delete store address)))
                 (catch* _e
                   ;; Continue even if one file fails
                   nil))))
