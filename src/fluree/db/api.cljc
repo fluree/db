@@ -658,9 +658,7 @@
      :from '...' :to '...'
      :strategy '3-way'
      :commits {:merged [...] :conflicts [...]}
-     :new-commit 'sha'}
-     
-  Phase 2 - Not yet implemented."
+     :new-commit 'sha'}"
   ([conn from to]
    (merge! conn from to {}))
   ([conn from to opts]
@@ -670,10 +668,10 @@
 
 (defn rebase!
   "Rebases source branch onto target branch (updates source branch).
-  
+
   NOTE: True rebase is not yet implemented. Currently redirects to merge!
   which updates the target branch instead of source branch.
-  
+
   Parameters:
     conn - Connection object
     from - Source branch spec to rebase (will be updated)
@@ -684,24 +682,15 @@
         :only - Only allow fast-forward (fail otherwise)
         :never - Never fast-forward, always replay
       :squash? - Combine all commits into one (default false)
-      :atomic? - All-or-nothing vs apply-until-conflict (default true)
-      :selector - Which commits to include (default nil = all after LCA)
-        nil - All commits after LCA
-        {:t {:from 42 :to 44}} - Specific t-value range
-        {:t {:from 42 :until :conflict}} - Until conflict
-        {:shas ['sha1' 'sha2']} - Specific commits
       :preview? - Dry run without making changes (default false)
-      
+
   Returns promise resolving to:
     {:status :success|:conflict|:error
      :operation :rebase
      :from '...' :to '...'
      :strategy 'fast-forward'|'squash'|'replay'
      :commits {:applied [...] :skipped [...] :conflicts [...]}
-     :new-commit 'sha'}
-     
-  Phase 1 implements: fast-forward and squash modes.
-  Phase 2 will add: cherry-pick and non-atomic modes."
+     :new-commit 'sha'}"
   ([conn from to]
    (rebase! conn from to {}))
   ([conn from to opts]
@@ -710,12 +699,11 @@
     (merge/rebase! conn from to opts))))
 
 (defn reset-branch!
-  "Resets a branch to a previous state.
-  
-  Two modes available:
-  - Safe mode (default): Creates new commit reverting to target state
-  - Hard mode: Moves branch pointer (rewrites history)
-  
+  "Resets a branch to a previous state using safe reset (non-destructive).
+
+  Creates a new commit that reverts the branch to the target state
+  while preserving the full commit history.
+
   Parameters:
     conn - Connection object
     branch - Target branch to reset (e.g., 'ledger:main')
@@ -723,68 +711,23 @@
       {:t 90} - Reset to transaction t-value
       {:sha 'abc123'} - Reset to specific commit SHA
     opts - Map with optional reset options:
-      :mode - Reset mode (default :safe)
-        :safe - Create revert commit (non-destructive)
-        :hard - Move branch pointer (destructive)
-      :archive - How to archive on hard reset (default {:as :tag})
-        {:as :tag :name 'backup'} - Create tag at old HEAD
-        {:as :branch :name 'backup'} - Create branch at old HEAD
-        {:as :none} - No archive (requires force?)
-      :force? - Required for hard reset without archive (default false)
-      :message - Commit message for safe mode (auto-generated if not provided)
+      :message - Commit message (auto-generated if not provided)
       :preview? - Dry run without making changes (default false)
-      
+
   Returns promise resolving to:
     {:status :success|:error
      :operation :reset
      :branch '...'
-     :mode :safe|:hard
+     :mode :safe
      :reset-to {:t 90}|{:sha '...'}
-     :new-commit 'sha'  ; For safe mode
-     :archived {:type :tag :name '...'}  ; For hard mode
-     :previous-head 'sha'}
-     
-  Phase 1 implements: safe reset only.
-  Phase 2 will add: hard reset with archiving."
+     :new-commit 'sha'
+     :previous-head 'sha'}"
   ([conn branch to]
    (reset-branch! conn branch to {}))
   ([conn branch to opts]
    (validate-connection conn)
    (promise-wrap
     (merge/reset-branch! conn branch to opts))))
-
-;; Legacy API - Deprecated, use rebase! instead
-(defn merge-branches!
-  "DEPRECATED - Use rebase! instead.
-  
-  Legacy merge API maintained for backwards compatibility.
-  Maps to rebase! with appropriate options."
-  ([conn source-branch-spec target-branch-spec]
-   (merge-branches! conn source-branch-spec target-branch-spec {}))
-  ([conn source-branch-spec target-branch-spec opts]
-   (validate-connection conn)
-   ;; Map legacy API to new rebase! API
-   (let [strategy (:strategy opts :auto)
-         new-opts (clojure.core/merge
-                   (case strategy
-                     :fast-forward {:ff :only}
-                     :flatten {:squash? true}
-                     :auto {:ff :auto}
-                     :no-ff {:ff :never}
-                     {})
-                   (dissoc opts :strategy))
-         result @(rebase! conn source-branch-spec target-branch-spec new-opts)]
-     ;; Map new response format to legacy format for backwards compatibility
-     (promise-wrap
-      (go-try
-        (if (= :success (:status result))
-          (assoc result
-                 :type (case (:strategy result)
-                         "fast-forward" :fast-forward
-                         "squash" :flatten
-                         "replay" :rebase
-                         :rebase))
-          result))))))
 
 (defn branch-divergence
   "Analyzes divergence between two branches.
