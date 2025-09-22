@@ -1,6 +1,7 @@
 (ns fluree.db.util.filesystem
   (:refer-clojure :exclude [exists?])
-  (:require #?(:clj [clojure.java.io :as io])
+  (:require #?@(:clj [[clojure.core.cache :as cache]
+                      [clojure.java.io :as io]])
             #?@(:cljs [["fs" :as fs]
                        ["path" :as path]])
             [clojure.core.async :as async]
@@ -13,23 +14,28 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-#?(:clj
-   (def jvm-file-locks
-     (atom {})))
+(def lock-cache-size
+  4096)
 
 #?(:clj
-   (defn ensure-jvm-lock
+   (def local-lock-cache
+     (-> {}
+         (cache/lru-cache-factory :threshold lock-cache-size)
+         atom)))
+
+#?(:clj
+   (defn ensure-local-lock
      [m path]
-     (if (contains? m path)
-       m
-       (assoc m path (Object.)))))
+     (if (cache/has? m path)
+       (cache/hit m path)
+       (cache/miss m path (Object.)))))
 
-#(:clj
-  (defn get-jvm-lock
-    [path]
-    (-> jvm-file-locks
-        (swap! ensure-jvm-lock path)
-        (get path))))
+#?(:clj
+   (defn get-local-lock
+     [path]
+     (-> local-lock-cache
+         (swap! ensure-local-lock path)
+         (cache/lookup path))))
 
 #?(:clj
    (def empty-path-array
@@ -67,7 +73,7 @@
    (defn with-file-lock
      [path f]
      (async/thread
-       (locking (get-jvm-lock path)
+       (locking (get-local-lock path)
          (with-open [file-ch (open-file-channel path)]
            (let [file-lock (.lock file-ch)]
              (try
