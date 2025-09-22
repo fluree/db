@@ -10,7 +10,7 @@
   #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException File)
                    (java.nio ByteBuffer)
                    (java.nio.channels FileChannel)
-                   (java.nio.file Paths))))
+                   (java.nio.file OpenOption Paths StandardOpenOption))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -42,10 +42,15 @@
      (into-array [])))
 
 #?(:clj
+   (def writable-open-options
+     (into-array OpenOption [StandardOpenOption/CREATE StandardOpenOption/READ
+                             StandardOpenOption/SYNC StandardOpenOption/WRITE])))
+
+#?(:clj
    (defn open-file-channel
      [path-str]
      (let [path (Paths/get path-str empty-path-array)]
-       (FileChannel/open path))))
+       (FileChannel/open path writable-open-options))))
 
 #?(:clj
    (defn read-file-channel
@@ -75,7 +80,7 @@
      (async/thread
        (locking (get-local-lock path)
          (with-open [file-ch (open-file-channel path)]
-           (let [file-lock (.lock file-ch)]
+           (let [os-lock (.lock file-ch)]
              (try
                (let [result (-> file-ch read-file-channel f)]
                  (write-file-channel file-ch result)
@@ -83,7 +88,7 @@
                (catch Exception e
                  e)
                (finally
-                 (.release file-lock)))))))))
+                 (.release os-lock)))))))))
 
 (defn write-file
   "Write bytes to disk at the given file path."
