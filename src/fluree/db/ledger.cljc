@@ -19,7 +19,7 @@
   "Returns the current database for this ledger.
   Since each ledger now represents a single branch, no branch parameter is needed."
   [ledger]
-  (when-let [state (:state ledger)]
+  (let [state (:state ledger)]
     (branch/current-db @state)))
 
 (defn update-commit!
@@ -31,9 +31,6 @@
    (update-commit! ledger db nil))
   ([{:keys [state alias] :as _ledger} db index-files-ch]
    (log/debug "Attempting to update ledger:" alias "with new commit to t" (:t db))
-   (when-not state
-     (throw (ex-info "Unable to update commit - ledger has no state"
-                     {:status 400, :error :db/invalid-ledger})))
    (-> @state
        (branch/update-commit! db index-files-ch)
        branch/current-db)))
@@ -41,19 +38,19 @@
 (defn status
   "Returns current commit metadata for this ledger"
   [{:keys [address alias state]}]
-  (when state
-    (let [current-db  (branch/current-db @state)
-          {:keys [commit stats t]} current-db
-          {:keys [size flakes]} stats
-          ;; Extract branch from alias
-          branch (or (util.ledger/ledger-branch alias) "main")]
-      {:address address
-       :alias   alias
-       :branch  branch
-       :t       t
-       :size    size
-       :flakes  flakes
-       :commit  commit})))
+  (let [alias*      (util.ledger/ensure-ledger-branch alias)
+        current-db  (branch/current-db @state)
+        {:keys [commit stats t]} current-db
+        {:keys [size flakes]} stats
+        ;; Extract branch from normalized alias
+        branch      (util.ledger/ledger-branch alias*)]
+    {:address address
+     :alias   alias*
+     :branch  branch
+     :t       t
+     :size    size
+     :flakes  flakes
+     :commit  commit}))
 
 (defn notify
   "Returns false if provided commit update did not result in an update to the ledger because
@@ -160,7 +157,7 @@
    Returns a channel that will receive the result when indexing completes.
    Since each ledger now represents a single branch, no branch parameter is needed."
   [ledger]
-  (when-let [state (:state ledger)]
+  (let [state (:state ledger)]
     (branch/trigger-index! @state)))
 
 ;; Branch operations are now handled at the connection/nameservice level

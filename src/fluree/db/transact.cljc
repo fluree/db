@@ -15,7 +15,6 @@
             [fluree.db.track :as track]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.branch :as util.branch]
             [fluree.db.util.context :as context]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
@@ -209,18 +208,10 @@
 
 (defn publish-commit
   "Publishes commit to all nameservices registered with the ledger."
-  [{:keys [primary-publisher secondary-publishers alias] :as _ledger} commit-jsonld]
+  [{:keys [primary-publisher secondary-publishers] :as _ledger} commit-jsonld]
   (go-try
-    (let [existing-record (when primary-publisher
-                            (<? (nameservice/lookup primary-publisher alias)))
-          ;; Preserve branch metadata from existing record
-          existing-metadata (when existing-record
-                              (util.branch/extract-branch-metadata existing-record))
-          commit-with-metadata (if existing-metadata
-                                 (util.branch/augment-commit-with-metadata commit-jsonld existing-metadata)
-                                 commit-jsonld)
-          result (<? (nameservice/publish primary-publisher commit-with-metadata))]
-      (nameservice/publish-to-all commit-with-metadata secondary-publishers)
+    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
+      (nameservice/publish-to-all commit-jsonld secondary-publishers)
       result)))
 
 (defn formalize-commit
