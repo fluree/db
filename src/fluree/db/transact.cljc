@@ -1,5 +1,6 @@
 (ns fluree.db.transact
   (:require [clojure.string :as str]
+            [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.did :as did]
@@ -184,7 +185,9 @@
 (defn write-commit
   [commit-storage alias {:keys [did private]} commit]
   (go-try
-    (let [commit-jsonld (commit-data/->json-ld commit)
+    (let [;; Extract base ledger name for storage path
+          ledger-name   (util.ledger/ledger-base-name alias)
+          commit-jsonld (commit-data/->json-ld commit)
           ;; For credential/generate, we need a DID map with public key
           did-map (when (and did private)
                     (if (map? did)
@@ -193,7 +196,7 @@
           signed-commit (if did-map
                           (<? (credential/generate commit-jsonld private did-map))
                           commit-jsonld)
-          commit-res    (<? (commit-storage/write-jsonld commit-storage alias signed-commit))
+          commit-res    (<? (commit-storage/write-jsonld commit-storage ledger-name signed-commit))
 
           [commit* commit-jsonld*]
           (-> [commit commit-jsonld]
@@ -232,7 +235,7 @@
   ([ledger db]
    (commit! ledger db {}))
   ([{ledger-alias :alias :as ledger}
-    {:keys [branch t stats commit] :as staged-db}
+    {:keys [t stats commit] :as staged-db}
     opts]
    (log/debug "commit!: write-transaction start" {:ledger ledger-alias})
    (go-try
@@ -258,7 +261,9 @@
            dbid              (commit-data/hash->db-id (:hash data-write-result))
            keypair           {:did did, :private private}
 
-           new-commit (commit-data/new-db-commit-map {:old-commit commit
+           ;; Ensure the commit has the correct alias for this branch
+           old-commit-with-alias (assoc commit :alias ledger-alias)
+           new-commit (commit-data/new-db-commit-map {:old-commit old-commit-with-alias
                                                       :issuer     did
                                                       :message    message
                                                       :tag        tag
@@ -275,7 +280,7 @@
            _ (log/debug "commit!: write-commit start" {:ledger ledger-alias})
 
            {:keys [commit-map commit-jsonld write-result]}
-           (<? (write-commit commit-catalog ledger-name keypair new-commit))
+           (<? (write-commit commit-catalog ledger-alias keypair new-commit))
 
            _ (log/debug "commit!: write-commit done" {:ledger ledger-alias :commit-address (:address write-result)})
 
@@ -283,7 +288,7 @@
 
            _ (log/debug "commit!: ledger/update-commit! start" {:ledger ledger-alias :t t})
 
-           db* (ledger/update-commit! ledger branch db index-files-ch)]
+           db* (ledger/update-commit! ledger db index-files-ch)]
 
        (log/debug "commit!: ledger/update-commit! done, publish-commit start" {:ledger ledger-alias :t t :at time})
 
@@ -295,7 +300,10 @@
          (let [index-t (commit-data/index-t commit-map)
                novelty-size (get-in db* [:novelty :size] 0)
                ;; Always read threshold from realized FlakeDB; db* may be AsyncDB
-               reindex-min-bytes (or (:reindex-min-bytes db) 1000000)]
+               reindex-min-bytes (or (:reindex-min-bytes db) 1000000)
+               ;; Get indexing-enabled from the ledger's state (which contains the single branch-map)
+               indexing-enabled? (when-let [state (:state ledger)]
+                                   (branch/indexing-enabled? @state))]
            (-> write-result
                (select-keys [:address :hash :size])
                (assoc :ledger-id ledger-alias
@@ -303,18 +311,15 @@
                       :db db*
                       :indexing-needed (indexing-needed? novelty-size reindex-min-bytes)
                       :index-t index-t
-                      :indexing-enabled (ledger/indexing-enabled? ledger branch)
+                      :indexing-enabled indexing-enabled?
                       :novelty-size novelty-size)))
          db*)))))
 
 (defn transact-ledger!
   [ledger parsed-txn]
   (go-try
-    (let [{:keys [branch] :as parsed-opts,
-           :or   {branch const/default-branch-name}}
-          (:opts parsed-txn)
-
-          db       (ledger/current-db ledger branch)
+    (let [parsed-opts (:opts parsed-txn)
+          db       (ledger/current-db ledger)
           staged   (<? (stage-triples db parsed-txn))
           ;; commit API takes a did-map and parsed context as opts
           ;; whereas stage API takes a did IRI and unparsed context.
