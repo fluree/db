@@ -11,8 +11,8 @@
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
-(defn local-filename
-  "Returns the local filename for a ledger's nameservice record.
+(defn local-path
+  "Returns the local path for a ledger's nameservice record.
    Expects ledger-alias to be in format 'ledger:branch'.
    Returns path like 'ns@v2/ledger-name/branch.json'."
   [ledger-alias]
@@ -39,19 +39,38 @@
      (cond-> (merge base-record (util.branch/metadata->flat-fields metadata))
        index-address (assoc "f:index" {"@id" index-address})))))
 
+(defn- validate-publish
+  "Validates whether a publish operation is allowed based on existing records.
+  Throws an exception if the operation is invalid."
+  [ledger-alias t-value existing-record is-branch-creation]
+  (when existing-record
+    (let [existing-t (get existing-record "f:t")]
+      (cond
+        ;; Branch creation: if this is a new branch creation and t matches existing, this is invalid
+        (and is-branch-creation (= t-value existing-t))
+        (throw (ex-info (str "Cannot create branch - it already exists with t=" existing-t)
+                        {:status 409 :error :db/branch-exists
+                         :alias ledger-alias :existing-t existing-t}))
+
+        ;; Normal commit: new t must be greater than or equal to existing t
+        ;; Allow same t for updates (e.g., index updates)
+        (< t-value existing-t)
+        (throw (ex-info (str "Cannot publish commit with t=" t-value
+                             " - current HEAD is at t=" existing-t)
+                        {:status 409 :error :db/invalid-commit-sequence
+                         :alias ledger-alias :new-t t-value :existing-t existing-t}))))))
+
 (defrecord StorageNameService [store]
   nameservice/Publisher
   (publish [this data]
     (go-try
-      (let [;; Extract data from compact JSON-LD format (both genesis and regular commits now use this)
-            ledger-alias   (get data "alias")  ;; Already includes :branch
+      (let [ledger-alias   (get data "alias")  ;; Already includes :branch
             commit-address (get data "address")
             t-value        (get-in data ["data" "t"])
             index-address  (get-in data ["index" "address"])
             ;; Extract metadata from incoming data and existing record
             new-metadata (util.branch/extract-branch-metadata data)
             existing-record (<? (nameservice/lookup this ledger-alias))
-            existing-t      (when existing-record (get existing-record "f:t"))
             existing-metadata (when existing-record (util.branch/extract-branch-metadata existing-record))
 
             ;; Merge metadata, preserving existing values when not provided
@@ -59,54 +78,40 @@
 
             ;; Check if this is a branch creation (has source metadata)
             is-branch-creation (and (:source-branch new-metadata) (:source-commit new-metadata))
-            _ (log/info "StorageNameService/publish called with alias:" ledger-alias
-                        "commit-address:" commit-address "t:" t-value
-                        "is-branch-creation?" is-branch-creation)
-
-            ;; Validation logic
-            _ (when existing-record
-                (cond
-                  ;; Branch creation: if this is a new branch creation and t matches existing, this is invalid
-                  (and is-branch-creation (= t-value existing-t))
-                  (throw (ex-info (str "Cannot create branch - it already exists with t=" existing-t)
-                                  {:status 409 :error :db/branch-exists
-                                   :alias ledger-alias :existing-t existing-t}))
-
-                  ;; Normal commit: new t must be greater than or equal to existing t
-                  ;; Allow same t for updates (e.g., index updates)
-                  (< t-value existing-t)
-                  (throw (ex-info (str "Cannot publish commit with t=" t-value
-                                       " - current HEAD is at t=" existing-t)
-                                  {:status 409 :error :db/invalid-commit-sequence
-                                   :alias ledger-alias :new-t t-value :existing-t existing-t}))))
+            _ (log/debug "StorageNameService/publish called with alias:" ledger-alias
+                         "commit-address:" commit-address "t:" t-value
+                         "is-branch-creation?" is-branch-creation)
 
             ns-metadata    (ns-record ledger-alias commit-address t-value index-address metadata)
             record-bytes   (json/stringify-UTF8 ns-metadata)
-            filename       (local-filename ledger-alias)]
-        (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :filename filename})
-        (let [res (<? (storage/write-bytes store filename record-bytes))]
-          (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :filename filename})
+            path           (local-path ledger-alias)]
+
+        (validate-publish ledger-alias t-value existing-record is-branch-creation)
+
+        (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :path path})
+        (let [res (<? (storage/write-bytes store path record-bytes))]
+          (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :path path})
           res))))
 
   (retract [_ ledger-alias]
-    (let [filename (local-filename ledger-alias)
+    (let [path (local-path ledger-alias)
           address  (-> store
                        storage/location
-                       (storage/build-address filename))]
+                       (storage/build-address path))]
       (storage/delete store address)))
 
   (publishing-address [_ ledger-alias]
-    ;; Just return the alias - lookup will handle branch extraction via local-filename
+    ;; Just return the alias - lookup will handle branch extraction via local-path
     (go ledger-alias))
 
   nameservice/iNameService
   (lookup [_ ledger-address]
     (go-try
       ;; ledger-address is just the alias (potentially with :branch)
-      (let [filename (local-filename ledger-address)]
+      (let [path (local-path ledger-address)]
         (log/info "StorageNameService lookup:" {:ledger-address ledger-address
-                                                :filename       filename})
-        (when-let [record-bytes (<? (storage/read-bytes store filename))]
+                                                :path           path})
+        (when-let [record-bytes (<? (storage/read-bytes store path))]
           (log/info "StorageNameService lookup found record for" ledger-address)
           (json/parse record-bytes false)))))
 
