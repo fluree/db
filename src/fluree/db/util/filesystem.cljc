@@ -14,6 +14,24 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 #?(:clj
+   (def jvm-file-locks
+     (atom {})))
+
+#?(:clj
+   (defn ensure-jvm-lock
+     [m path]
+     (if (contains? m path)
+       m
+       (assoc m path (Object.)))))
+
+#(:clj
+  (defn get-jvm-lock
+    [path]
+    (-> jvm-file-locks
+        (swap! ensure-jvm-lock path)
+        (get path))))
+
+#?(:clj
    (def empty-path-array
      (into-array [])))
 
@@ -49,16 +67,17 @@
    (defn with-file-lock
      [path f]
      (async/thread
-       (with-open [file-ch (open-file-channel path)]
-         (let [file-lock (.lock file-ch)]
-           (try
-             (let [result (-> file-ch read-file-channel f)]
-               (write-file-channel file-ch result)
-               result)
-             (catch Exception e
-               e)
-             (finally
-               (.release file-lock))))))))
+       (locking (get-jvm-lock path)
+         (with-open [file-ch (open-file-channel path)]
+           (let [file-lock (.lock file-ch)]
+             (try
+               (let [result (-> file-ch read-file-channel f)]
+                 (write-file-channel file-ch result)
+                 result)
+               (catch Exception e
+                 e)
+               (finally
+                 (.release file-lock)))))))))
 
 (defn write-file
   "Write bytes to disk at the given file path."
