@@ -56,14 +56,30 @@
                      {:status 400
                       :error  :db/websocket-error})))))))
 
-(defn remote-read
-  "Returns a core async channel with value of remote resource."
-  [system-state commit-key keywordize-keys?]
-  (log/debug "Remote read initiated for: " commit-key)
+(defn remote-read-json
+  "Returns a core async channel with value of remote resources."
+  [system-state resource-key keywordize-keys?]
+  (log/debug "Remote read json initiated for: " resource-key)
   (let [server-host (pick-server system-state)]
     (xhttp/post-json (str server-host "/fluree/remote/resource")
-                     {:resource commit-key}
+                     {:resource resource-key}
                      {:keywordize-keys keywordize-keys?})))
+
+(defn remote-read-bytes
+  [system-state resource-key]
+  (log/debug "Remote read json initiated for: " resource-key)
+  (let [server-host (pick-server system-state)]
+    (xhttp/post (str server-host "/fluree/remote/resource")
+                {:resource resource-key}
+                {:keywordize-keys false})))
+
+(defn remote-get-hash
+  [system-state address]
+  (log/debug "Remote get hash initiated for: " address)
+  (let [server-host (pick-server system-state)]
+    (xhttp/post-json (str server-host "/fluree/remote/hash")
+                     {:address address}
+                     {:keywordize-keys false})))
 
 (defn not-found-error?
   [e]
@@ -127,7 +143,17 @@
 (defrecord RemoteSystem [system-state address-identifiers msg-in pub msg-out]
   storage/JsonArchive
   (-read-json [_ address keywordize?]
-    (remote-read system-state address keywordize?))
+    (remote-read-json system-state address keywordize?))
+
+  storage/ContentArchive
+  (-content-read-bytes [_ address]
+    (go-try
+      (let [read-result (<? (remote-read-json system-state address false))]
+        (json/stringify read-result))))
+  (get-hash [_ address]
+    (go-try
+      (let [hash-result (<? (remote-get-hash system-state address))]
+        (json/stringify hash-result))))
 
   storage/Identifiable
   (identifiers [_]

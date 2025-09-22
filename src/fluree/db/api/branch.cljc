@@ -52,8 +52,14 @@
 
             ;; Publish to nameservice
             primary-publisher (:primary-publisher conn)
+            _ (log/debug "create-branch! publishing commit for" new-branch-spec
+                         "with primary-publisher?" (boolean primary-publisher))
             _ (when primary-publisher
-                (<? (nameservice/publish primary-publisher compact-commit)))]
+                (log/debug "Publishing commit with alias:" (get compact-commit "alias")
+                           "address:" (get compact-commit "address")
+                           "t:" (get-in compact-commit ["data" "t"]))
+                (<? (nameservice/publish primary-publisher compact-commit))
+                (log/debug "Published commit for" new-branch-spec))]
 
         {:name new-branch
          :created-at created-at

@@ -38,25 +38,26 @@
 (defn read-verified-commit
   [storage commit-address]
   (go-try
-    (when-let [commit-data (<? (storage/read-json storage commit-address))]
+    (when-let [commit-data (<? (storage/content-read-json storage commit-address))]
       (log/trace "read-commit at:" commit-address "data:" commit-data)
-      (let [addr-key-path (if (contains? commit-data "credentialSubject")
-                            ["credentialSubject" "address"]
-                            ["address"])]
-        (-> commit-data
-            (assoc-in addr-key-path commit-address)
-            json-ld/expand
-            verify-commit)))))
+      (let [addr-key-path  (if (contains? commit-data "credentialSubject")
+                             ["credentialSubject" "address"]
+                             ["address"])
+            [commit proof] (-> commit-data
+                               (assoc-in addr-key-path commit-address)
+                               json-ld/expand
+                               verify-commit)
+            commit-hash    (<? (storage/get-hash storage commit-address))
+            commit-id      (commit-data/hash->commit-id commit-hash)
+            commit*        (assoc commit const/iri-id commit-id)]
+        [commit* proof]))))
 
 ;; TODO: Verify hash
 (defn read-commit-jsonld
-  [storage commit-address commit-hash]
+  [storage commit-address]
   (go-try
     (when-let [[commit _proof] (<? (read-verified-commit storage commit-address))]
-      (let [commit-id (commit-data/hash->commit-id commit-hash)]
-        (assoc commit
-               const/iri-id commit-id
-               const/iri-address commit-address)))))
+      commit)))
 
 (defn read-data-jsonld
   [storage address]
@@ -98,21 +99,21 @@
                                       (str (subs (str commit) 0 500) "...")
                                       (str commit))})))))
 
+(defn with-index-address
+  [commit index-address]
+  (if index-address
+    (let [index-reference {const/iri-address index-address}]
+      (assoc commit const/iri-index [index-reference]))
+    commit))
+
 (defn load-commit-with-metadata
   "Loads commit from disk and merges nameservice metadata (address, index)"
   [storage commit-address index-address]
   (go-try
     (log/debug "commit.storage/load-commit-with-metadata start" {:address commit-address :index-address index-address})
-    (when-let [commit-data (<? (storage/read-json storage commit-address))]
-      (let [addr-key-path (if (contains? commit-data "credentialSubject")
-                            ["credentialSubject" "address"]
-                            ["address"])
-            index-key-path (if (contains? commit-data "credentialSubject")
-                             ["credentialSubject" "index" "address"]
-                             ["index" "address"])
-            result (-> commit-data
-                       (assoc-in addr-key-path commit-address)
-                       (cond-> index-address (assoc-in index-key-path index-address)))]
+    (when-let [verified-commit (<? (read-verified-commit storage commit-address))]
+      (let [[commit _proof] verified-commit
+            result          (with-index-address commit index-address)]
         (log/debug "commit.storage/load-commit-with-metadata done" {:address commit-address})
         result))))
 
@@ -124,8 +125,8 @@
     (go
       (try*
         (loop [[commit proof] (verify-commit latest-commit)
-               last-t        nil
-               commit-tuples (list)] ;; note 'conj' will put at beginning of list (smallest 't' first)
+               last-t         nil
+               commit-tuples  (list)] ;; note 'conj' will put at beginning of list (smallest 't' first)
           (let [prev-commit-addr (-> commit
                                      (get-first const/iri-previous)
                                      (get-first-value const/iri-address))

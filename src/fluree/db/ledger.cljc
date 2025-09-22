@@ -1,6 +1,5 @@
 (ns fluree.db.ledger
-  (:require [clojure.string :as str]
-            [fluree.db.branch :as branch]
+  (:require [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
@@ -67,8 +66,9 @@
                         (get-first-value const/iri-fluree-t))
           db        (current-db ledger)
           current-t (:t db)]
-      (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
-                 "where current cached db t value is:" current-t)
+      (log/debug "notify of new commit for ledger:" (:alias ledger)
+                 "at t value:" commit-t "where current cached db t value is:"
+                 current-t)
       ;; note, index updates will have same t value as current one, so still need to check if t = current-t
       (cond
         (= commit-t (flake/next-t current-t))
@@ -105,10 +105,10 @@
   context."
   [combined-alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
    indexing-opts did latest-commit & [branch-metadata]]
-  (let [;; Parse ledger name and branch from combined alias
-        branch (or (util.ledger/ledger-branch combined-alias) "main")
+  (let [alias* (util.ledger/ensure-ledger-branch combined-alias)
+        branch (util.ledger/ledger-branch alias*)
         publishers (cons primary-publisher secondary-publishers)
-        branch-state (branch/state-map combined-alias branch commit-catalog index-catalog
+        branch-state (branch/state-map alias* branch commit-catalog index-catalog
                                        publishers latest-commit indexing-opts)
         ;; Add branch metadata
         ;; When creating new ledger (no branch-metadata), it's always main branch
@@ -124,7 +124,7 @@
     (map->Ledger {:id                   (random-uuid)
                   :did                  did
                   :state                (atom branch-state-with-meta)  ;; Just the branch state directly
-                  :alias                combined-alias  ;; Full alias including branch
+                  :alias                alias*  ;; Full alias including branch
                   :address              ledger-address
                   :commit-catalog       commit-catalog
                   :index-catalog        index-catalog
@@ -134,14 +134,6 @@
                   :reasoner             #{}
                   :indexing-opts        indexing-opts})))
 
-(defn normalize-alias
-  "For a ledger alias, removes any preceding '/' or '#' if exists."
-  [ledger-alias]
-  (if (or (str/starts-with? ledger-alias "/")
-          (str/starts-with? ledger-alias "#"))
-    (subs ledger-alias 1)
-    ledger-alias))
-
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
@@ -149,22 +141,17 @@
            primary-publisher secondary-publishers]}
    {:keys [did indexing] :as _opts}]
   (go-try
-    (let [normalized-alias  (normalize-alias alias)
-          ;; Add :main if no branch is specified
-          ledger-alias   (if (str/includes? normalized-alias ":")
-                           normalized-alias
-                           (str normalized-alias ":main"))
-          ;; internal-only opt used for migrating ledgers without genesis commits
+    (let [;; internal-only opt used for migrating ledgers without genesis commits
           init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit
-                              commit-catalog ledger-alias publish-addresses init-time))
+                              commit-catalog alias publish-addresses init-time))
           ;; Publish genesis commit to nameservice - convert expanded to compact format first
           _              (when primary-publisher
                            (let [;; Convert expanded genesis commit to compact JSON-ld format
                                  commit-map (commit-data/json-ld->map genesis-commit nil)
                                  compact-commit (commit-data/->json-ld commit-map)]
                              (<? (nameservice/publish primary-publisher compact-commit))))]
-      (instantiate ledger-alias primary-address commit-catalog index-catalog
+      (instantiate alias primary-address commit-catalog index-catalog
                    primary-publisher secondary-publishers indexing did genesis-commit))))
 
 (defn trigger-index!

@@ -34,6 +34,19 @@
      #fluree/SID [5 "datatype"] [#fluree/SID [2 "string"]]
      #fluree/SID [5 "path"] [#fluree/SID [17 "email"]]}]})
 
+(defn property-ns-code
+  "Returns namespace code for the property of the flake"
+  [flake]
+  (-> flake
+      flake/p
+      iri/get-ns-code))
+
+(def ^:const shacl-ns-code (get iri/default-namespaces iri/shacl-ns))
+
+(defn shacl-flake?
+  [f]
+  (= shacl-ns-code (property-ns-code f)))
+
 (def numeric-types
   #{const/$xsd:int
     const/$xsd:short
@@ -101,7 +114,9 @@
    (build-shape-node db tracker shape-sid #{shape-sid} 0))
   ([db tracker shape-sid built-nodes depth]
    (go-try
-     (let [flakes (<? (query-range/index-range db tracker :spot = [shape-sid] {}))]
+     (let [flakes (<? (query-range/index-range db tracker :spot = [shape-sid]
+                                               ;; only pull in shape-related flakes
+                                               {:flake-xf (filter shacl-flake?)}))]
        (if (seq flakes)
          (loop [[f & r] (sort-by (comp :i flake/m) flakes)
                 node {const/$id shape-sid}]
@@ -717,20 +732,33 @@
           expect-vals (mapv display less-than-objects)
           values      (mapv (fn [[v _dt]] (display v)) value-nodes)
 
-          result (assoc result :value values :expect expect-vals)]
-      (if (or (and (every? (fn [f] (contains? numeric-types (flake/dt f))) less-than-flakes)
-                   (every? (fn [[_v dt]] (contains? numeric-types dt)) value-nodes))
-              (and (every? (fn [f] (contains? time-types (flake/dt f))) less-than-flakes)
-                   (every? (fn [[_v dt]] (contains? time-types dt)) value-nodes)))
-        (when-not (every? (fn [o] (apply < o (sort less-than-objects))) focus-objects)
-          [(assoc result :message (or (:message result)
-                                      (str "path " iri-path " values " (str/join ", " (sort values))
-                                           " are not all less than " (display less-than)
-                                           " values " (str/join ", " (sort expect-vals)))))])
-        [(assoc result :message (or (:message result)
-                                    (str "path " iri-path " values " (str/join ", " (sort values))
-                                         " are not all comparable with " (display less-than)
-                                         " values " (str/join ", " (sort expect-vals)))))]))))
+          result       (assoc result :value values :expect expect-vals)
+          false-result (assoc result :message (or (:message result)
+                                                  (str "path " iri-path " values " (str/join ", " (sort values))
+                                                       " are not all less than " (display less-than)
+                                                       " values " (str/join ", " (sort expect-vals)))))]
+      (cond (and (every? (fn [f] (contains? numeric-types (flake/dt f))) less-than-flakes)
+                 (every? (fn [[_v dt]] (contains? numeric-types dt)) value-nodes))
+            ;; compare numeric types with `<`
+            (when-not (every? (fn [o] (apply < o (sort less-than-objects))) focus-objects)
+              [false-result])
+
+            (and (every? (fn [f] (contains? time-types (flake/dt f))) less-than-flakes)
+                 (every? (fn [[_v dt]] (contains? time-types dt)) value-nodes))
+            ;; compare time types with `compare`
+            (let [sorted-less-than-objects (sort less-than-objects)]
+              (when-not (->> focus-objects
+                             (map (fn [o] (->> (map (partial compare o) sorted-less-than-objects)
+                                               (every? neg?))))
+                             (every? true?))
+                [false-result]))
+
+            :else
+            ;; incomparable results
+            [(assoc result :message (or (:message result)
+                                        (str "path " iri-path " values " (str/join ", " (sort values))
+                                             " are not all comparable with " (display less-than)
+                                             " values " (str/join ", " (sort expect-vals)))))]))))
 
 (defmethod validate-constraint const/sh_lessThanOrEquals
   [{:keys [data-db display tracker] :as v-ctx} shape constraint focus-node value-nodes]
@@ -742,24 +770,37 @@
           less-than-objects (into #{} (map flake/o) less-than-flakes)
           focus-objects     (into #{} (map first) value-nodes)
 
-          result      (base-result v-ctx shape constraint focus-node)
-          iri-path    (:path result)
-          expect-vals (mapv display less-than-objects)
-          values      (mapv (fn [[v _dt]] (display v)) value-nodes)
-          result      (assoc result :value values :expect expect-vals)]
-      (if (or (and (every? (fn [f] (contains? numeric-types (flake/dt f))) less-than-flakes)
-                   (every? (fn [[_ dt]] (contains? numeric-types dt)) value-nodes))
-              (and (every? (fn [f] (contains? time-types (flake/dt f))) less-than-flakes)
-                   (every? (fn [[_ dt]] (contains? time-types dt)) value-nodes)))
-        (when-not (every? (fn [o] (apply <= o (sort less-than-objects))) focus-objects)
-          [(assoc result :message (or (:message result)
-                                      (str "path " iri-path " values " (str/join ", " (sort values))
-                                           " are not all less than " (display less-than)
-                                           " values " (str/join ", " (sort expect-vals)))))])
-        [(assoc result :message (or (:message result)
-                                    (str "path " iri-path " values " (str/join ", " (sort values))
-                                         " are not all comparable with " (display less-than)
-                                         " values " (str/join ", " (sort expect-vals)))))]))))
+          result       (base-result v-ctx shape constraint focus-node)
+          iri-path     (:path result)
+          expect-vals  (mapv display less-than-objects)
+          values       (mapv (fn [[v _dt]] (display v)) value-nodes)
+          result       (assoc result :value values :expect expect-vals)
+          false-result (assoc result :message (or (:message result)
+                                                  (str "path " iri-path " values " (str/join ", " (sort values))
+                                                       " are not all less than " (display less-than)
+                                                       " values " (str/join ", " (sort expect-vals)))))]
+      (cond (and (every? (fn [f] (contains? numeric-types (flake/dt f))) less-than-flakes)
+                 (every? (fn [[_ dt]] (contains? numeric-types dt)) value-nodes))
+            ;; compare numeric types with `<=`
+            (when-not (every? (fn [o] (apply <= o (sort less-than-objects))) focus-objects)
+              [false-result])
+
+            (and (every? (fn [f] (contains? time-types (flake/dt f))) less-than-flakes)
+                 (every? (fn [[_ dt]] (contains? time-types dt)) value-nodes))
+            ;; compare time types with `compare`
+            (let [sorted-less-than-objects (sort less-than-objects)]
+              (when-not (->> focus-objects
+                             (map (fn [o] (->> (map (partial compare o) sorted-less-than-objects)
+                                               (every? #(or (neg? %) (zero? %))))))
+                             (every? true?))
+                [false-result]))
+
+            :else
+            ;; incomparable results
+            [(assoc result :message (or (:message result)
+                                        (str "path " iri-path " values " (str/join ", " (sort values))
+                                             " are not all comparable with " (display less-than)
+                                             " values " (str/join ", " (sort expect-vals)))))]))))
 
 ;; logical constraints
 (defn validate-logical-shape
@@ -1143,20 +1184,10 @@
             (recur r (assoc shapes shape-sid shape))))
         shapes))))
 
-(defn property-ns-code
-  "Returns namespace code for the property of the flake"
-  [flake]
-  (-> flake
-      flake/p
-      iri/get-ns-code))
-
-(def ^:const shacl-ns-code (get iri/default-namespaces iri/shacl-ns))
-
 (defn modified-shape?
-  "All SHACL rules have property IRIs in the S."
-  [flake]
-  (let [p-ns (property-ns-code flake)]
-    (= p-ns shacl-ns-code)))
+  "All SHACL rules have property IRIs in the SHACL namespace."
+  [flakes]
+  (some shacl-flake? flakes))
 
 (defn hydrate-shape-cache!
   ([db]
@@ -1178,7 +1209,7 @@
   `modified-subjects` is a sequence of s-flakes of modified subjects."
   [data-db tracker new-flakes context]
   (go-try
-    (let [shapes (if (some modified-shape? new-flakes)
+    (let [shapes (if (modified-shape? new-flakes)
                    (<? (extract-shapes data-db tracker))
                    (cached-shapes data-db))]
       (if (empty? shapes)

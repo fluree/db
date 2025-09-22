@@ -1,20 +1,23 @@
 (ns fluree.db.nameservice.storage
   (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
+            [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.json :as json]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
 (defn local-filename
   "Returns the local filename for a ledger's nameservice record.
    Expects ledger-alias to be in format 'ledger:branch'.
-   Returns path like 'ns@v1/ledger-name/branch.json'."
+   Returns path like 'ns@v2/ledger-name/branch.json'."
   [ledger-alias]
-  (let [[ledger-name branch] (str/split ledger-alias #":" 2)]
-    (str "ns@v1/" ledger-name "/" branch ".json")))
+  (let [[ledger-name branch] (util.ledger/ledger-parts ledger-alias)
+        branch (or branch const/default-branch-name)]
+    (str const/ns-version "/" ledger-name "/" branch ".json")))
 
 (defn ns-record
   "Generates nameservice metadata map for JSON storage using new minimal format.
@@ -22,7 +25,8 @@
   ([ledger-alias commit-address t index-address]
    (ns-record ledger-alias commit-address t index-address nil))
   ([ledger-alias commit-address t index-address metadata]
-   (let [[alias branch] (str/split ledger-alias #":" 2)]
+   (let [[alias branch] (util.ledger/ledger-parts ledger-alias)
+         branch (or branch const/default-branch-name)]
      (cond-> {"@context"     {"f" iri/f-ns}
               "@id"          ledger-alias  ;; Already includes :branch
               "@type"        ["f:Database" "f:PhysicalDatabase"]
@@ -47,6 +51,9 @@
             t-value        (get-in data ["data" "t"])
             index-address  (get-in data ["index" "address"])
             branch-metadata (get data "branchMetadata")
+            _ (log/info "StorageNameService/publish called with alias:" ledger-alias
+                        "commit-address:" commit-address "t:" t-value
+                        "has-branch-metadata?" (boolean branch-metadata))
 
             ;; Check if this branch already exists
             existing-record (<? (nameservice/lookup this ledger-alias))
@@ -101,9 +108,10 @@
     (go-try
       ;; ledger-address is just the alias (potentially with :branch)
       (let [filename (local-filename ledger-address)]
-        (log/debug "StorageNameService lookup:" {:ledger-address ledger-address
-                                                 :filename filename})
+        (log/info "StorageNameService lookup:" {:ledger-address ledger-address
+                                                :filename       filename})
         (when-let [record-bytes (<? (storage/read-bytes store filename))]
+          (log/info "StorageNameService lookup found record for" ledger-address)
           (json/parse record-bytes false)))))
 
   (alias [_ ledger-address]
@@ -115,34 +123,27 @@
 
   (all-records [_]
     (go-try
-      ;; Read all JSON files from ns@v1 directory structure
-      (let [base-dir "ns@v1/"
-            all-files (<? (storage/list-paths-recursive store base-dir))]
-        ;; Use pipeline for parallel reading and parsing
-        (if (seq all-files)
-          (let [input-ch (async/chan 100 (filter #(str/ends-with? % ".json")))
-                _ (async/onto-chan! input-ch all-files)
-                output-ch (async/chan 100)
-                ;; Function to read and parse a single file
-                read-and-parse (fn [file-path out-ch]
-                                 (go
-                                   (try
-                                     (when-let [record-bytes (<? (storage/read-bytes store file-path))]
-                                       (let [record (json/parse record-bytes false)]
-                                         (async/>! out-ch record)))
-                                     #?(:clj (catch Exception e
-                                               (log/error e "Error reading/parsing file:" file-path))
-                                        :cljs (catch :default e
-                                                (log/error e "Error reading/parsing file:" file-path))))
-                                   (async/close! out-ch)))
-                ;; Set up pipeline with parallelism
-                _ (async/pipeline-async 10 ; parallelism level
-                                        output-ch
-                                        read-and-parse
-                                        input-ch)]
-            ;; Collect all results into a vector
-            (<? (async/into [] output-ch)))
-          ;; No files found
+      ;; Use recursive listing to support ledger names with '/' characters
+      (if (satisfies? storage/RecursiveListableStore store)
+        (if-let [list-paths-result (storage/list-paths-recursive store const/ns-version)]
+          (loop [remaining-paths (<? list-paths-result)
+                 records         []]
+            (if-let [path (first remaining-paths)]
+              (let [file-content (<? (storage/read-bytes store path))]
+                (if file-content
+                  (let [content-str (if (string? file-content)
+                                      file-content
+                                      #?(:clj (let [^bytes bytes-content file-content]
+                                                (String. bytes-content "UTF-8"))
+                                         :cljs (js/String.fromCharCode.apply nil file-content)))
+                        record      (json/parse content-str false)]
+                    (recur (rest remaining-paths) (conj records record)))
+                  (recur (rest remaining-paths) records)))
+              records))
+          [])
+        ;; Fallback for stores that don't support ListableStore
+        (do
+          (log/warn "Storage backend does not support RecursiveListableStore protocol")
           [])))))
 
 (defn published-ledger?

@@ -44,9 +44,9 @@
   (-> commit-map commit-data/->json-ld json-ld/expand))
 
 (defn load-db
-  [combined-alias commit-catalog index-catalog commit-map]
+  [alias commit-catalog index-catalog commit-map]
   (let [commit-jsonld (commit-map->commit-jsonld commit-map)]
-    (async-db/load combined-alias commit-catalog index-catalog
+    (async-db/load alias commit-catalog index-catalog
                    commit-jsonld commit-map nil)))
 
 (defn update-index-async
@@ -124,12 +124,14 @@
       (when-let [{:keys [db index-files-ch complete-ch]} (<! queue)]
         (let [db* (use-latest-index db last-index-commit branch-state)
               result (try*
-                       (let [indexed-db (<? (indexer/index db* index-files-ch)) ;; indexer/index always returns a FlakeDB (never AsyncDB)
+                       (let [indexed-db (<? (indexer/index db* index-files-ch)) ; indexer/index always returns a FlakeDB (never AsyncDB)
                              [{prev-commit :commit} {indexed-commit :commit}]
                              (swap-vals! branch-state update-index indexed-db)]
-                         (when (not= prev-commit indexed-commit)
-                           (let [commit-jsonld (commit-data/->json-ld indexed-commit)]
-                             (nameservice/publish-to-all commit-jsonld publishers)))
+                         (if-not (= prev-commit indexed-commit)
+                           (do (log/debug "Publishing new index commit:" indexed-commit)
+                               (let [commit-jsonld (commit-data/->json-ld indexed-commit)]
+                                 (nameservice/publish-to-all commit-jsonld publishers)))
+                           (log/debug "Not publishing unchanged index commit:" indexed-commit))
                          {:status :success, :db indexed-db, :commit indexed-commit})
                        (catch* e
                          (log/error e "Error updating index")
@@ -149,34 +151,42 @@
 
 (defn state-map
   "Returns a branch map for specified branch name at supplied commit"
-  ([combined-alias branch-name commit-catalog index-catalog publishers commit-jsonld]
-   (state-map combined-alias branch-name commit-catalog index-catalog publishers commit-jsonld nil))
-  ([combined-alias branch-name commit-catalog index-catalog publishers commit-jsonld indexing-opts]
+  ([alias branch-name commit-catalog index-catalog publishers commit-jsonld]
+   (state-map alias branch-name commit-catalog index-catalog publishers commit-jsonld nil))
+  ([alias branch-name commit-catalog index-catalog publishers commit-jsonld indexing-opts]
    (let [commit-map (commit-data/jsonld->clj commit-jsonld)
-         initial-db (async-db/load combined-alias commit-catalog index-catalog
+         initial-db (async-db/load alias commit-catalog index-catalog
                                    commit-jsonld commit-map indexing-opts)
          state      (atom {:commit     commit-map
                            :current-db initial-db})
          idx-q      (index-queue publishers state)]
      {:name          branch-name
-      :alias         combined-alias
+      :alias         alias
       :state         state
       :index-queue   idx-q
       :indexing-opts indexing-opts})))
 
-(defn next-commit?
+(defn next-t?
   [current-commit new-commit]
   (let [current-t (commit-data/t current-commit)
         new-t     (commit-data/t new-commit)]
-    (and (or (nil? current-t)
-             (= new-t (inc current-t)))
-         (= (-> new-commit :previous :id)
-            (:id current-commit)))))
+    (or (nil? current-t)
+        (= new-t (inc current-t)))))
+
+(defn previous-id
+  [commit]
+  (-> commit :previous :id))
+
+(defn previous-id?
+  [current-commit new-commit]
+  (= (previous-id new-commit)
+     (:id current-commit)))
 
 (defn update-commit
   [{current-commit :commit, :as current-state}
    {new-commit :commit, :as new-db}]
-  (if (next-commit? current-commit new-commit)
+  (if (and (next-t? current-commit new-commit)
+           (previous-id? current-commit new-commit))
     (if (newer-index? current-commit new-commit)
       (let [latest-db (update-index-async new-db (:index current-commit))]
         (assoc current-state
@@ -185,27 +195,40 @@
       (assoc current-state
              :commit     new-commit
              :current-db new-db))
-    (do
-      (log/warn "Commit update failure.\n  Current commit:" current-commit
-                "\n  New commit:" new-commit)
-      (throw (ex-info (str "Commit failed, latest committed db is "
-                           (commit-data/t current-commit)
-                           " and you are trying to commit at db at t value of: "
-                           (commit-data/t new-commit)
-                           ". These should be one apart. Likely db was "
-                           "updated by another user or process.")
-                      {:status 400 :error :db/invalid-commit})))))
+    (do (log/warn "Commit update failure.\n  Current commit:" current-commit
+                  "\n  New commit:" new-commit)
+        (if-not (next-t? current-commit new-commit)
+          (throw (ex-info (str "Commit failed, latest committed db t is "
+                               (commit-data/t current-commit)
+                               " and you are trying to commit at db at t value of: "
+                               (commit-data/t new-commit)
+                               ". These should be one apart. Likely db was "
+                               "updated by another user or process.")
+                          {:status 400 :error :db/invalid-commit}))
+          (throw (ex-info (str "Commit failed, The previous commit id of the new commit: '"
+                               (previous-id new-commit)
+                               "' does not match the current commit id: '"
+                               (:id new-commit)
+                               "'.")
+                          {:status 400 :error :db/invalid-commit}))))))
+
+(defn indexing-disabled?
+  [branch-map]
+  (-> branch-map :indexing-opts :indexing-enabled false?))
+
+(def indexing-enabled?
+  (complement indexing-disabled?))
 
 (defn update-commit!
   "There are 3 t values, the db's t, the 'commit' attached to the db's t, and
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
   should be the same at this point (just after committing the db). The ledger's latest
   't' should be the same (if just updating an index) or after the db's 't' value."
-  [{:keys [state index-queue indexing-opts] :as branch-map} new-db index-files-ch]
+  [{:keys [state index-queue] :as branch-map} new-db index-files-ch]
   (let [updated-db (-> state
                        (swap! update-commit (policy/root-db new-db))
                        :current-db)]
-    (when-not (:indexing-disabled indexing-opts)
+    (when (indexing-enabled? branch-map)
       (enqueue-index! index-queue updated-db index-files-ch))
     branch-map))
 

@@ -59,14 +59,41 @@
      :reasoner-max  10 ; maximum number of reasoner iterations before exception
      :reasoned      reasoned-from-iri}))
 
+(defn remove-cancelable-flakes
+  "If an identical flake is retracted and re-asserted, removes both flakes as they can be cancelled out.
+   If not removed, the replay of flakes to a time 't' can result in flakes not appearing properly."
+  [flakeset retractions]
+  (reduce (fn [s r]
+            (let [a (flake/flip-flake r)]
+              (if (contains? s a)
+                (-> s
+                    (disj a)
+                    (disj r))
+                s)))
+          flakeset
+          retractions))
+
 (defn into-flakeset
   [tracker error-ch flake-ch]
-  (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)
-        error-xf (halt-when util/exception?)
-        flake-xf (if-let [track-fuel (track/track-fuel! tracker error-ch)]
-                   (comp error-xf track-fuel)
-                   error-xf)]
-    (async/transduce flake-xf (completing conj) flakeset flake-ch)))
+  (let [flakeset    (flake/sorted-set-by flake/cmp-flakes-spot)
+        error-xf    (halt-when util/exception?)
+        flake-xf    (if-let [track-fuel (track/track-fuel! tracker error-ch)]
+                      (comp error-xf track-fuel)
+                      error-xf)
+        retractions (volatile! [])]
+    (async/transduce
+     flake-xf
+     (completing
+      (fn [acc f]
+        (when (false? (flake/op f))
+          (vswap! retractions conj f))
+        (conj acc f))
+      (fn [flakeset]
+        (if (seq @retractions)
+          (remove-cancelable-flakes flakeset @retractions)
+          flakeset)))
+     flakeset
+     flake-ch)))
 
 (defn generate-flakes
   [db tracker parsed-txn tx-state]
@@ -112,15 +139,29 @@
     (let [allowed-db (<? (policy.modify/allowed? tracker staged-map))]
       allowed-db)))
 
+(defn max-novelty-error
+  "Returns an ExceptionInfo for max novelty exceeded with MBs in message."
+  [db]
+  (let [novelty-bytes     (long (get-in db [:novelty :size] 0))
+        max-novelty-bytes (long (:reindex-max-bytes db))
+        round2-mb         (fn [bytes]
+                            (let [mb (/ (double bytes) 1000000.0)]
+                              (/ (double (int (+ 0.5 (* mb 100.0)))) 100.0)))
+        novelty-mb-r      (round2-mb novelty-bytes)
+        max-novelty-mb-r  (round2-mb max-novelty-bytes)
+        msg               (str "Maximum novelty exceeded ("
+                               novelty-mb-r " MB > max " max-novelty-mb-r
+                               " MB). No transactions will be processed until indexing has completed.")]
+    (ex-info msg {:status 503, :error :db/max-novelty-exceeded})))
+
 (defn stage
   [db tracker context identity author annotation raw-txn parsed-txn]
   (go-try
     (when (novelty/max-novelty? db)
-      (throw (ex-info "Maximum novelty exceeded, no transactions will be processed until indexing has completed."
-                      {:status 503 :error :db/max-novelty-exceeded})))
+      (throw (max-novelty-error db)))
     (when (policy.modify/deny-all? db)
       (throw (ex-info "Database policy denies all modifications."
-                      {:status 403 :error :db/policy-exception})))
+                      {:status 403, :error :db/policy-exception})))
     (let [tx-state   (->tx-state :db db
                                  :context context
                                  :txn raw-txn
