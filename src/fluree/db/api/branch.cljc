@@ -8,6 +8,7 @@
             [fluree.db.nameservice.sub :as ns-subscribe]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.branch :as util.branch]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
@@ -37,21 +38,20 @@
             source-commit-id (or from-commit (get-in source-db [:commit :id]))
 
             ;; Create branch metadata
-            created-at (util/current-time-iso)
-            branch-metadata {:created-at created-at
-                             :created-from {"f:branch" from-branch
-                                            "f:commit" {"@id" source-commit-id}}}
+            metadata {:created-at (util/current-time-iso)
+                      :source-branch from-branch
+                      :source-commit source-commit-id}
 
-            ;; Prepare commit for new branch
+            ;; Prepare commit for new branch with flat metadata fields
             source-commit-map (:commit source-db)
             compact-commit (-> source-commit-map
                                commit-data/->json-ld
                                (assoc "alias" new-branch-spec
-                                      "branch" new-branch
-                                      "branchMetadata" branch-metadata))
+                                      "branch" new-branch)
+                               (util.branch/augment-commit-with-metadata metadata))
 
-            ;; Publish to nameservice
             primary-publisher (:primary-publisher conn)
+            secondary-publishers (:secondary-publishers conn)
             _ (log/debug "create-branch! publishing commit for" new-branch-spec
                          "with primary-publisher?" (boolean primary-publisher))
             _ (when primary-publisher
@@ -59,13 +59,11 @@
                            "address:" (get compact-commit "address")
                            "t:" (get-in compact-commit ["data" "t"]))
                 (<? (nameservice/publish primary-publisher compact-commit))
-                (log/debug "Published commit for" new-branch-spec))]
+                (log/debug "Published commit for" new-branch-spec)
+                ;; Also publish to secondary publishers asynchronously
+                (nameservice/publish-to-all compact-commit secondary-publishers))]
 
-        {:name new-branch
-         :created-at created-at
-         :created-from {:branch from-branch :commit source-commit-id}
-         ;; Return head as the commit id for consistency across storage systems
-         :head source-commit-id}))))
+        (util.branch/branch-creation-response new-branch metadata source-commit-id)))))
 
 (defn list-branches
   "Lists all available branches for a ledger.
@@ -186,11 +184,9 @@
             updated-commit (-> source-commit-map
                                commit-data/->json-ld
                                (assoc "alias" new-branch-spec
-                                      "branch" new-branch
-                                    ;; Preserve branch metadata
-                                      "branchMetadata" (select-keys branch-info
-                                                                    [:created-at :created-from
-                                                                     :protected :description])))
+                                      "branch" new-branch)
+                               ;; Preserve branch metadata
+                               (util.branch/augment-commit-with-metadata branch-info))
 
             ;; Publish new branch and retract old
             primary-publisher (:primary-publisher conn)]

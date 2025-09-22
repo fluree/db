@@ -13,6 +13,7 @@
             [fluree.db.storage :as storage]
             [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.branch :as util.branch]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log :include-macros true])
   #?(:clj (:import (java.io Writer))))
@@ -335,10 +336,7 @@
 
             {:keys [did indexing]} (parse-ledger-options conn {})
             ;; Extract branch metadata from ns-record
-            branch-metadata {:created-at (get ns-record "f:createdAt")
-                             :created-from (get ns-record "f:createdFrom")
-                             :protected (get ns-record "f:protected")
-                             :description (get ns-record "f:description")}
+            branch-metadata (util.branch/extract-branch-metadata ns-record)
             ledger                 (ledger/instantiate ledger-alias ledger-address commit-catalog
                                                        index-catalog primary-publisher
                                                        secondary-publishers indexing did

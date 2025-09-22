@@ -8,6 +8,7 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util :as util :refer [get-first get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.branch :as util.branch]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
@@ -173,22 +174,18 @@
     (let [current-branch (or (util.ledger/ledger-branch alias) "main")]
       ;; Get nameservice record for branch if available, otherwise get from state
       (if primary-publisher
-        (let [ns-record (<? (nameservice/lookup primary-publisher alias))]
-          {:name current-branch
-           :head (get-in ns-record ["f:commit" "@id"])
-           :t (get ns-record "f:t")
-           :created-at (get ns-record "f:createdAt")
-           :created-from (get ns-record "f:createdFrom")
-           :protected (get ns-record "f:protected")
-           :description (get ns-record "f:description")})
+        (let [ns-record (<? (nameservice/lookup primary-publisher alias))
+              metadata (util.branch/extract-branch-metadata ns-record)]
+          (merge {:name current-branch
+                  :head (get-in ns-record ["f:commit" "@id"])
+                  :t (get ns-record "f:t")}
+                 metadata))
         ;; No publisher, return info from in-memory state
         (when state
           (let [branch-meta @state
                 current-db (branch/current-db branch-meta)]
-            {:name current-branch
-             :head (get-in current-db [:commit :address])
-             :t (:t current-db)
-             :created-at (:created-at branch-meta)
-             :created-from (:created-from branch-meta)
-             :protected (:protected branch-meta)
-             :description (:description branch-meta)}))))))
+            (merge {:name current-branch
+                    :head (get-in current-db [:commit :address])
+                    :t (:t current-db)}
+                   (select-keys branch-meta [:created-at :source-branch :source-commit
+                                             :protected :description]))))))))

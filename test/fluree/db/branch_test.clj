@@ -29,8 +29,9 @@
         (testing "Create feature branch from main"
           (let [branch-result @(fluree/create-branch! conn "test-ledger:feature-branch" "test-ledger:main")]
             (is (= "feature-branch" (:name branch-result)))
-            (is (= "main" (get-in branch-result [:created-from :branch])))
+            (is (= "main" (:source-branch branch-result)))
             (is (some? (:created-at branch-result)))
+            (is (some? (:source-commit branch-result)))
             (is (some? (:head branch-result))))
 
           (testing "Add data to feature branch"
@@ -65,7 +66,7 @@
                 (is (= "feature-branch" (:name feature-info)))
                 (is (some? (:head feature-info)))
                 (is (some? (:created-at feature-info)))
-                (is (= "main" (get-in feature-info [:created-from "f:branch"]))))))
+                (is (= "main" (:source-branch feature-info))))))
 
           (testing "Branch deletion"
             @(fluree/delete-branch! conn "test-ledger:feature-branch")

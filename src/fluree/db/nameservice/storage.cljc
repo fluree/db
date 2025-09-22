@@ -6,6 +6,7 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.branch :as util.branch]
             [fluree.db.util.json :as json]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
@@ -26,20 +27,17 @@
    (ns-record ledger-alias commit-address t index-address nil))
   ([ledger-alias commit-address t index-address metadata]
    (let [[alias branch] (util.ledger/ledger-parts ledger-alias)
-         branch (or branch const/default-branch-name)]
-     (cond-> {"@context"     {"f" iri/f-ns}
-              "@id"          ledger-alias  ;; Already includes :branch
-              "@type"        ["f:Database" "f:PhysicalDatabase"]
-              "f:ledger"     {"@id" alias}  ;; Just the ledger name without branch
-              "f:branch"     branch
-              "f:commit"     {"@id" commit-address}
-              "f:t"          t
-              "f:status"     "ready"}
-       index-address (assoc "f:index" {"@id" index-address})
-       (:created-at metadata) (assoc "f:createdAt" (:created-at metadata))
-       (:created-from metadata) (assoc "f:createdFrom" (:created-from metadata))
-       (:protected metadata) (assoc "f:protected" (:protected metadata))
-       (:description metadata) (assoc "f:description" (:description metadata))))))
+         branch (or branch const/default-branch-name)
+         base-record {"@context"     {"f" iri/f-ns}
+                      "@id"          ledger-alias  ;; Already includes :branch
+                      "@type"        ["f:Database" "f:PhysicalDatabase"]
+                      "f:ledger"     {"@id" alias}  ;; Just the ledger name without branch
+                      "f:branch"     branch
+                      "f:commit"     {"@id" commit-address}
+                      "f:t"          t
+                      "f:status"     "ready"}]
+     (cond-> (merge base-record (util.branch/metadata->flat-fields metadata))
+       index-address (assoc "f:index" {"@id" index-address})))))
 
 (defrecord StorageNameService [store]
   nameservice/Publisher
@@ -50,28 +48,26 @@
             commit-address (get data "address")
             t-value        (get-in data ["data" "t"])
             index-address  (get-in data ["index" "address"])
-            branch-metadata (get data "branchMetadata")
-            _ (log/info "StorageNameService/publish called with alias:" ledger-alias
-                        "commit-address:" commit-address "t:" t-value
-                        "has-branch-metadata?" (boolean branch-metadata))
-
-            ;; Check if this branch already exists
+            ;; Extract metadata from incoming data and existing record
+            new-metadata (util.branch/extract-branch-metadata data)
             existing-record (<? (nameservice/lookup this ledger-alias))
             existing-t      (when existing-record (get existing-record "f:t"))
+            existing-metadata (when existing-record (util.branch/extract-branch-metadata existing-record))
 
-            ;; Preserve existing branch metadata if not provided in this publish
-            preserved-metadata (if (and existing-record (not branch-metadata))
-                                 {:created-at (get existing-record "f:createdAt")
-                                  :created-from (get existing-record "f:createdFrom")
-                                  :protected (get existing-record "f:protected")
-                                  :description (get existing-record "f:description")}
-                                 branch-metadata)
+            ;; Merge metadata, preserving existing values when not provided
+            metadata (merge existing-metadata new-metadata)
+
+            ;; Check if this is a branch creation (has source metadata)
+            is-branch-creation (and (:source-branch new-metadata) (:source-commit new-metadata))
+            _ (log/info "StorageNameService/publish called with alias:" ledger-alias
+                        "commit-address:" commit-address "t:" t-value
+                        "is-branch-creation?" is-branch-creation)
 
             ;; Validation logic
             _ (when existing-record
                 (cond
-                  ;; Branch creation: if branchMetadata exists and t matches existing, this is invalid
-                  (and branch-metadata (= t-value existing-t))
+                  ;; Branch creation: if this is a new branch creation and t matches existing, this is invalid
+                  (and is-branch-creation (= t-value existing-t))
                   (throw (ex-info (str "Cannot create branch - it already exists with t=" existing-t)
                                   {:status 409 :error :db/branch-exists
                                    :alias ledger-alias :existing-t existing-t}))
@@ -84,7 +80,7 @@
                                   {:status 409 :error :db/invalid-commit-sequence
                                    :alias ledger-alias :new-t t-value :existing-t existing-t}))))
 
-            ns-metadata    (ns-record ledger-alias commit-address t-value index-address preserved-metadata)
+            ns-metadata    (ns-record ledger-alias commit-address t-value index-address metadata)
             record-bytes   (json/stringify-UTF8 ns-metadata)
             filename       (local-filename ledger-alias)]
         (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :filename filename})

@@ -15,6 +15,7 @@
             [fluree.db.track :as track]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.branch :as util.branch]
             [fluree.db.util.context :as context]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
@@ -212,14 +213,11 @@
   (go-try
     (let [existing-record (when primary-publisher
                             (<? (nameservice/lookup primary-publisher alias)))
-          branch-metadata (when existing-record
-                            {:created-at (get existing-record "f:createdAt")
-                             :created-from (get existing-record "f:createdFrom")
-                             :protected (get existing-record "f:protected")
-                             :description (get existing-record "f:description")})
-          ;; Add branch metadata to commit if it exists
-          commit-with-metadata (if branch-metadata
-                                 (assoc commit-jsonld "branchMetadata" branch-metadata)
+          ;; Preserve branch metadata from existing record
+          existing-metadata (when existing-record
+                              (util.branch/extract-branch-metadata existing-record))
+          commit-with-metadata (if existing-metadata
+                                 (util.branch/augment-commit-with-metadata commit-jsonld existing-metadata)
                                  commit-jsonld)
           result (<? (nameservice/publish primary-publisher commit-with-metadata))]
       (nameservice/publish-to-all commit-with-metadata secondary-publishers)
