@@ -394,7 +394,9 @@
             store    (if (satisfies? store/EraseableStore storage)
                        storage
                        (store/get-content-store storage ::store/default))
-            address  (store/build-address (store/location store) filename)]
+            ;; Build a full address for deletion from the default content store
+            loc      (store/location (store/get-content-store storage ::store/default))
+            address  (store/build-address loc filename)]
         (try*
           (<? (store/delete store address))
           (catch* _e
@@ -413,13 +415,14 @@
             store      (if (and (satisfies? store/RecursiveListableStore storage)
                                 (satisfies? store/EraseableStore storage))
                          storage
-                         (store/get-content-store storage ::store/default))]
+                         (store/get-content-store storage ::store/default))
+            loc        (store/location (store/get-content-store storage ::store/default))]
         (try*
           ;; List all filter files in the cuckoo directory
           (when-let [files (<? (store/list-paths-recursive store cuckoo-dir))]
             (doseq [file files]
               (try*
-                (let [address (store/build-address (store/location store) file)]
+                (let [address (store/build-address loc file)]
                   (<? (store/delete store address)))
                 (catch* _e
                   ;; Continue even if one file fails

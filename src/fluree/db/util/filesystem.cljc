@@ -117,7 +117,7 @@
   #?(:clj
      (async/thread
        (try
-         (io/delete-file (io/file path))
+         (io/delete-file (io/file path) true)
          :deleted
          (catch Exception e
            (log/trace (str "Failed to delete file: " path))
@@ -128,8 +128,11 @@
          (fs/unlinkSync path)
          :deleted
          (catch :default e
-           (log/trace (str "Failed to delete file: " path))
-           e)))))
+           (if (= (.-code e) "ENOENT")
+             :deleted
+             (do
+               (log/warn e (str "Failed to delete file: " path))
+               e)))))))
 
 (defn list-files
   [path]

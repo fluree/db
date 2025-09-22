@@ -461,6 +461,27 @@
           (<? (storage/delete storage index-address))))
       :index-dropped)))
 
+(defn- retract-with-retry
+  "Attempt to retract the nameservice record with small retries to avoid
+  transient file lock/race conditions. Returns the retract result or throws
+  after max-attempts."
+  [publisher alias* max-attempts]
+  (go-try
+    (loop [attempt 1]
+      (let [result (try*
+                     (<? (nameservice/retract publisher alias*))
+                     :ok
+                     (catch* e
+                       (if (< attempt max-attempts)
+                         (do (log/warn e "Nameservice retract failed; retrying" {:attempt attempt :alias alias*})
+                             (<! (async/timeout 50))
+                             :retry)
+                         (do (log/error e "Nameservice retract failed after retries" {:attempt attempt :alias alias*})
+                             (throw e)))))]
+        (if (= result :retry)
+          (recur (inc attempt))
+          result)))))
+
 (defn drop-ledger
   [conn alias]
   (go
@@ -480,14 +501,19 @@
                                         commit-address
                                         index-address)))]
               (log/debug "Dropping ledger" ledger-addr)
+              ;; Retract nameservice FIRST so the ledger can no longer be reloaded elsewhere.
+              ;; Use small retries to avoid transient file locks.
+              (<? (retract-with-retry publisher alias* 3))
               (when latest-commit
                 (drop-index-artifacts conn latest-commit)
                 (drop-commit-artifacts conn latest-commit))
-              (<? (nameservice/retract publisher alias*))
               (recur r))))
         (log/debug "Dropped ledger" alias*)
         :dropped)
-      (catch* e (log/debug e "Failed to complete ledger deletion")))))
+      (catch* e
+        (log/error e "Exception during ledger deletion.")
+        ;; Ensure we always return a value to the caller
+        :incomplete))))
 
 (defn resolve-txn
   "Reads a transaction from the commit catalog by address.
