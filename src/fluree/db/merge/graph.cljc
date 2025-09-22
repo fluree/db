@@ -68,12 +68,9 @@
                 ;; Load parent commit if exists
                 parent-commit (when (and parent-address commit-catalog)
                                 (try
-                                  (let [;; Extract hash from parent address (address format is usually hash-based)
-                                        parent-hash (last (str/split parent-address #"/"))
-                                        parent-jsonld (<? (commit-storage/read-commit-jsonld
+                                  (let [parent-jsonld (<? (commit-storage/read-commit-jsonld
                                                            commit-catalog
-                                                           parent-address
-                                                           parent-hash))]
+                                                           parent-address))]
                                     (commit-data/json-ld->map parent-jsonld nil))
                                   (catch #?(:clj Exception :cljs js/Error) _
                                     ;; If we can't load parent, stop the chain
