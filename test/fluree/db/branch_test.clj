@@ -27,12 +27,13 @@
             (is (= ["Alice"] results) "Should find Alice in main branch")))
 
         (testing "Create feature branch from main"
-          (let [branch-result @(fluree/create-branch! conn "test-ledger:feature-branch" "test-ledger:main")]
-            (is (= "feature-branch" (:name branch-result)))
-            (is (= "main" (:source-branch branch-result)))
-            (is (some? (:created-at branch-result)))
-            (is (some? (:source-commit branch-result)))
-            (is (some? (:head branch-result))))
+          (with-redefs [fluree.db.util/current-time-iso (constantly "2024-01-01T00:00:00.00000Z")]
+            (let [branch-result @(fluree/create-branch! conn "test-ledger:feature-branch" "test-ledger:main")]
+              (is (= "feature-branch" (:name branch-result)))
+              (is (= "main" (:source-branch branch-result)))
+              (is (= "2024-01-01T00:00:00.00000Z" (:created-at branch-result)))
+              (is (some? (:source-commit branch-result)))
+              (is (some? (:head branch-result)))))
 
           (testing "Add data to feature branch"
             @(fluree/insert! conn "test-ledger:feature-branch"
@@ -54,7 +55,7 @@
                     feature-results @(fluree/query feature-db {"@context" {"ex" "http://example.org/"}
                                                                "select" "?name"
                                                                "where" {"@id" "?id" "ex:name" "?name"}})]
-                (is (= (set feature-results) #{"Alice" "Bob"})
+                (is (= ["Alice" "Bob"] feature-results)
                     "Feature branch should have both Alice and Bob"))))
 
           (testing "Branch info and metadata"
@@ -73,13 +74,16 @@
             ;; Verify branch is deleted by attempting to load it
             (let [result @(fluree/load conn "test-ledger:feature-branch")]
               (is (util/exception? result) "Should return an exception when loading deleted branch")
-              (when (util/exception? result)
-                (is (= :db/unknown-ledger (:error (ex-data result))) "Should have correct error code"))))
+              (is (= :db/unknown-ledger (:error (ex-data result))) "Should have correct error code")
+              (is (re-find #"failed due to failed address lookup" (ex-message result))
+                  "Error message should indicate address lookup failed")))
 
           (testing "Cannot delete main branch"
             (let [result @(fluree/delete-branch! conn "test-ledger:main")]
               (is (util/exception? result))
-              (is (re-find #"Cannot delete the main branch" (ex-message result))))))
+              (is (re-find #"Cannot delete the main branch" (ex-message result)))
+              (is (re-find #"Use the drop API" (ex-message result))
+                  "Error should suggest using drop API"))))
 
         (finally
           @(fluree/disconnect conn))))))
@@ -153,7 +157,7 @@
                                                         "where" {"@id" "?id"
                                                                  "@type" "ex:Person"
                                                                  "ex:name" "?name"}})]
-          (is (= #{"Alice" "Bob"} (set feature-result)) "Feature branch should have both Alice and Bob"))))))
+          (is (= ["Alice" "Bob"] feature-result) "Feature branch should have both Alice and Bob"))))))
 
 (deftest ^:integration branch-multiple-branches-test
   (testing "Create and manage multiple branches"

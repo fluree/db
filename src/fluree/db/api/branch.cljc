@@ -125,7 +125,7 @@
     (let [branch-spec* (util.ledger/ensure-ledger-branch branch-spec)
           [_ledger-id branch] (util.ledger/ledger-parts branch-spec*)
           _ (when (= branch const/default-branch-name)
-              (throw (ex-info "Cannot delete the main branch"
+              (throw (ex-info "Cannot delete the main branch. Use the drop API to remove the entire ledger."
                               {:status 400 :error :db/cannot-delete-main-branch})))
           ledger (<? (connection/load-ledger conn branch-spec*))
           branch-info (<? (ledger/branch-info ledger))]
