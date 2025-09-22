@@ -38,41 +38,26 @@
 (defn read-verified-commit
   [storage commit-address]
   (go-try
-    (when-let [commit-json (<? (storage/read-json storage commit-address))]
-      (log/trace "read-commit at:" commit-address "data:" commit-json)
-      (let [cred?         (contains? commit-json "credentialSubject")
-            subject-path  (if cred? ["credentialSubject"] [])
-            addr-path     (conj subject-path "address")
-            subject-json  (if cred? (get commit-json "credentialSubject") commit-json)
-            ;; Prefer commit id from address/hash; fallback to computing from JSON only if needed
-            existing-id   (get subject-json "id")
-            ;; Extract base32 hash-like token from the address if present
-            addr-str      (str commit-address)
-            hash-token    (last (clojure.string/split addr-str #"/"))
-            normalized-b  (when (and hash-token (clojure.string/starts-with? hash-token "b")) hash-token)
-            id-from-addr  (when normalized-b (str "fluree:commit:sha256:" normalized-b))
-            computed-id   (or id-from-addr (commit-data/commit-json->commit-id subject-json))
-            subject-json* (cond-> subject-json
-                            (or (nil? existing-id)
-                                (and (string? existing-id) (clojure.string/blank? existing-id)))
-                            (assoc "id" computed-id))
-            commit-json*  (if cred?
-                            (assoc commit-json "credentialSubject" subject-json*)
-                            subject-json*)
-            commit-json** (assoc-in commit-json* addr-path commit-address)]
-        (-> commit-json**
-            json-ld/expand
-            verify-commit)))))
+    (when-let [commit-data (<? (storage/content-read-json storage commit-address))]
+      (log/trace "read-commit at:" commit-address "data:" commit-data)
+      (let [addr-key-path  (if (contains? commit-data "credentialSubject")
+                             ["credentialSubject" "address"]
+                             ["address"])
+            [commit proof] (-> commit-data
+                               (assoc-in addr-key-path commit-address)
+                               json-ld/expand
+                               verify-commit)
+            commit-hash    (<? (storage/get-hash storage commit-address))
+            commit-id      (commit-data/hash->commit-id commit-hash)
+            commit*        (assoc commit const/iri-id commit-id)]
+        [commit* proof]))))
 
 ;; TODO: Verify hash
 (defn read-commit-jsonld
-  [storage commit-address commit-hash]
+  [storage commit-address]
   (go-try
     (when-let [[commit _proof] (<? (read-verified-commit storage commit-address))]
-      (let [commit-id (commit-data/hash->commit-id commit-hash)]
-        (assoc commit
-               const/iri-id commit-id
-               const/iri-address commit-address)))))
+      commit)))
 
 (defn read-data-jsonld
   [storage address]
@@ -114,21 +99,21 @@
                                       (str (subs (str commit) 0 500) "...")
                                       (str commit))})))))
 
+(defn with-index-address
+  [commit index-address]
+  (if index-address
+    (let [index-reference {const/iri-address index-address}]
+      (assoc commit const/iri-index [index-reference]))
+    commit))
+
 (defn load-commit-with-metadata
   "Loads commit from disk and merges nameservice metadata (address, index)"
   [storage commit-address index-address]
   (go-try
     (log/debug "commit.storage/load-commit-with-metadata start" {:address commit-address :index-address index-address})
-    (when-let [commit-data (<? (storage/read-json storage commit-address))]
-      (let [addr-key-path (if (contains? commit-data "credentialSubject")
-                            ["credentialSubject" "address"]
-                            ["address"])
-            index-key-path (if (contains? commit-data "credentialSubject")
-                             ["credentialSubject" "index" "address"]
-                             ["index" "address"])
-            result (-> commit-data
-                       (assoc-in addr-key-path commit-address)
-                       (cond-> index-address (assoc-in index-key-path index-address)))]
+    (when-let [verified-commit (<? (read-verified-commit storage commit-address))]
+      (let [[commit _proof] verified-commit
+            result          (with-index-address commit index-address)]
         (log/debug "commit.storage/load-commit-with-metadata done" {:address commit-address})
         result))))
 
@@ -140,8 +125,8 @@
     (go
       (try*
         (loop [[commit proof] (verify-commit latest-commit)
-               last-t        nil
-               commit-tuples (list)] ;; note 'conj' will put at beginning of list (smallest 't' first)
+               last-t         nil
+               commit-tuples  (list)] ;; note 'conj' will put at beginning of list (smallest 't' first)
           (let [prev-commit-addr (-> commit
                                      (get-first const/iri-previous)
                                      (get-first-value const/iri-address))

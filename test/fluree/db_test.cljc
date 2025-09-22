@@ -1,10 +1,10 @@
 (ns fluree.db-test
-  (:require #?@(:clj  [[clojure.core.async :as async]
+  (:require #?@(:clj  [[babashka.fs :refer [with-temp-dir]]
+                       [clojure.core.async :as async]
                        [clojure.test :refer [deftest is testing]]
-                       [fluree.db.did :as did]
                        [fluree.db.async-db :as async-db]
-                       [fluree.db.util.filesystem :as fs]
-                       [babashka.fs :refer [with-temp-dir]]]
+                       [fluree.db.did :as did]
+                       [fluree.db.util.filesystem :as fs]]
                 :cljs [[cljs.test :refer-macros [deftest is testing async]]
                        [clojure.core.async :refer [go <!]]
                        [clojure.core.async.interop :refer [<p!]]])
@@ -66,165 +66,178 @@
                   (done)))))))
 
 #?(:clj
-   (deftest load-from-file-test
-     (testing "can load a file ledger with single cardinality predicates"
-       (with-temp-dir [storage-path {}]
-         (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
-               ledger-alias "load-from-file-test-single-card"
-               db0          @(fluree/create conn ledger-alias)
-               db           @(fluree/update
-                              db0
-                              {"@context" ["https://ns.flur.ee"
-                                           test-utils/default-context
-                                           {:ex "http://example.org/ns/"}]
-                               "insert"
-                               [{:id           :ex/brian
-                                 :type         :ex/User
-                                 :schema/name  "Brian"
-                                 :schema/email "brian@example.org"
-                                 :schema/age   50
-                                 :ex/favNums   7
-                                 :ex/height    6.2}
+   (deftest load-from-file-single-card-test
+     (with-temp-dir [storage-path {}]
+       (let [conn         @(fluree/connect-file {:storage-path {"defaultVal" (str storage-path)}})
+             ledger-alias "load-from-file-test-single-card"]
+         (try
+           (let [db0          @(fluree/create conn ledger-alias)
+                 db           @(fluree/update
+                                db0
+                                {"@context" ["https://ns.flur.ee"
+                                             test-utils/default-context
+                                             {:ex "http://example.org/ns/"}]
+                                 "insert"
+                                 [{:id           :ex/brian
+                                   :type         :ex/User
+                                   :schema/name  "Brian"
+                                   :schema/email "brian@example.org"
+                                   :schema/age   50
+                                   :ex/favNums   7
+                                   :ex/height    6.2}
 
-                                {:id           :ex/cam
-                                 :type         :ex/User
-                                 :schema/name  "Cam"
-                                 :schema/email "cam@example.org"
-                                 :schema/age   34
-                                 :ex/favNums   5
-                                 :ex/friend    :ex/brian}]})
-               db        @(fluree/commit! conn db)
-               db        @(fluree/update
-                           db
-                           {"@context" ["https://ns.flur.ee"
-                                        test-utils/default-context
-                                        {:ex "http://example.org/ns/"}]
-                            "insert"
-                            {:id         :ex/brian
-                             :ex/favNums 7}})
-               db        @(fluree/commit! conn db)
-               target-t  (:t db)
-               ;; TODO: Replace this w/ :syncTo equivalent once we have it
-               loaded-db (test-utils/load-to-t conn ledger-alias target-t 100)]
-           (is (= target-t (:t loaded-db))))))
+                                  {:id           :ex/cam
+                                   :type         :ex/User
+                                   :schema/name  "Cam"
+                                   :schema/email "cam@example.org"
+                                   :schema/age   34
+                                   :ex/favNums   5
+                                   :ex/friend    :ex/brian}]})
+                 db        @(fluree/commit! conn db)
+                 db        @(fluree/update
+                             db
+                             {"@context" ["https://ns.flur.ee"
+                                          test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                              "insert"
+                              {:id         :ex/brian
+                               :ex/favNums 7}})
+                 db        @(fluree/commit! conn db)
+                 target-t  (:t db)
+                 loaded-db (test-utils/load-to-t conn ledger-alias target-t 100)]
+             (is (= target-t (:t loaded-db))))
+           (finally
+             @(fluree/disconnect conn)))))))
 
-     (testing "can load a file ledger with multi-cardinality predicates"
-       (with-temp-dir [storage-path {}]
-         (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
-               ledger-alias "load-from-file-test-multi-card"
-               db0          @(fluree/create conn ledger-alias)
-               db           @(fluree/update
-                              db0
-                              {"@context" ["https://ns.flur.ee"
-                                           test-utils/default-context
-                                           {:ex "http://example.org/ns/"}]
-                               "insert"
-                               [{:id           :ex/brian
-                                 :type         :ex/User
-                                 :schema/name  "Brian"
-                                 :schema/email "brian@example.org"
-                                 :schema/age   50
-                                 :ex/favNums   7}
+#?(:clj
+   (deftest load-from-file-multi-card-test
+     (with-temp-dir [storage-path {}]
+       (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
+             ledger-alias "load-from-file-test-multi-card"]
+         (try
+           (let [db0          @(fluree/create conn ledger-alias)
+                 db           @(fluree/update
+                                db0
+                                {"@context" ["https://ns.flur.ee"
+                                             test-utils/default-context
+                                             {:ex "http://example.org/ns/"}]
+                                 "insert"
+                                 [{:id           :ex/brian
+                                   :type         :ex/User
+                                   :schema/name  "Brian"
+                                   :schema/email "brian@example.org"
+                                   :schema/age   50
+                                   :ex/favNums   7}
 
-                                {:id           :ex/alice
-                                 :type         :ex/User
-                                 :schema/name  "Alice"
-                                 :schema/email "alice@example.org"
-                                 :schema/age   50
-                                 :ex/favNums   [42 76 9]}
+                                  {:id           :ex/alice
+                                   :type         :ex/User
+                                   :schema/name  "Alice"
+                                   :schema/email "alice@example.org"
+                                   :schema/age   50
+                                   :ex/favNums   [42 76 9]}
 
-                                {:id           :ex/cam
-                                 :type         :ex/User
-                                 :schema/name  "Cam"
-                                 :schema/email "cam@example.org"
-                                 :schema/age   34
-                                 :ex/favNums   [5 10]
-                                 :ex/friend    [:ex/brian :ex/alice]}]})
-               db        @(fluree/commit! conn db)
-               db        @(fluree/update
-                           db
-                           ;; test a multi-cardinality retraction
-                           {"@context" ["https://ns.flur.ee"
-                                        test-utils/default-context
-                                        {:ex "http://example.org/ns/"}]
-                            "insert"
-                            [{:id         :ex/alice
-                              :ex/favNums [42 76 9]}]})
-               db        @(fluree/commit! conn db)
-               target-t  (:t db)
-               ;; TODO: Replace this w/ :syncTo equivalent once we have it
-               loaded-db (test-utils/load-to-t conn ledger-alias target-t 100)]
-           (is (= target-t (:t loaded-db))))))
+                                  {:id           :ex/cam
+                                   :type         :ex/User
+                                   :schema/name  "Cam"
+                                   :schema/email "cam@example.org"
+                                   :schema/age   34
+                                   :ex/favNums   [5 10]
+                                   :ex/friend    [:ex/brian :ex/alice]}]})
+                 db        @(fluree/commit! conn db)
+                 db        @(fluree/update
+                             db
+                             {"@context" ["https://ns.flur.ee"
+                                          test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                              "insert"
+                              [{:id         :ex/alice
+                                :ex/favNums [42 76 9]}]})
+                 db        @(fluree/commit! conn db)
+                 target-t  (:t db)
+                 loaded-db (test-utils/load-to-t conn ledger-alias target-t 100)]
+             (is (= target-t (:t loaded-db))))
+           (finally
+             @(fluree/disconnect conn)))))))
 
-     (testing "query returns the correct results from a loaded ledger"
-       (with-temp-dir [storage-path {}]
-         (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
-               ledger-alias "load-from-file-query"
-               db0          @(fluree/create conn ledger-alias)
-               db           @(fluree/update
-                              db0
-                              {"@context" ["https://ns.flur.ee"
-                                           {:id     "@id"
-                                            :type   "@type"
-                                            :ex     "http://example.com/"
-                                            :schema "http://schema.org/"}]
-                               "insert"
-                               [{:id          :ex/Andrew
-                                 :type        :schema/Person
-                                 :schema/name "Andrew"
-                                 :ex/friend   {:id          :ex/Jonathan
-                                               :type        :schema/Person
-                                               :schema/name "Jonathan"}}]})
-               query        {:context {:ex "http://example.com/"}
-                             :select  {:ex/Andrew [:*]}}
-               res1         @(fluree/query db query)
-               _            @(fluree/commit! conn db)
-               loaded-db    (test-utils/retry-load conn ledger-alias 100)
-               res2         @(fluree/query loaded-db query)]
-           (is (= res1 res2)))))
+#?(:clj
+   (deftest load-from-file-query-test
+     (with-temp-dir [storage-path {}]
+       (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
+             ledger-alias "load-from-file-query"]
+         (try
+           (let [db0          @(fluree/create conn ledger-alias)
+                 db           @(fluree/update
+                                db0
+                                {"@context" ["https://ns.flur.ee"
+                                             {:id     "@id"
+                                              :type   "@type"
+                                              :ex     "http://example.com/"
+                                              :schema "http://schema.org/"}]
+                                 "insert"
+                                 [{:id          :ex/Andrew
+                                   :type        :schema/Person
+                                   :schema/name "Andrew"
+                                   :ex/friend   {:id          :ex/Jonathan
+                                                 :type        :schema/Person
+                                                 :schema/name "Jonathan"}}]})
+                 query        {:context {:ex "http://example.com/"}
+                               :select  {:ex/Andrew [:*]}}
+                 res1         @(fluree/query db query)
+                 _            @(fluree/commit! conn db)
+                 loaded-db    (test-utils/retry-load conn ledger-alias 100)
+                 res2         @(fluree/query loaded-db query)]
+             (is (= res1 res2)))
+           (finally
+             @(fluree/disconnect conn)))))))
 
-     (testing "can load a ledger with `list` values"
-       (with-temp-dir [storage-path {}]
-         (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
-               ledger-alias "load-lists-test"
-               db0 @(fluree/create conn ledger-alias
-                                   {:reindex-min-bytes 0}) ; force reindex on every commit
-               db           @(fluree/update
-                              db0
-                              {"@context" ["https://ns.flur.ee"
-                                           test-utils/default-context
-                                           {:ex "http://example.org/ns/"}]
-                               "insert"
-                               [{:id         :ex/alice,
-                                 :type       :ex/User,
-                                 :ex/friends {:list [:ex/john :ex/cam]}}
-                                {:id         :ex/cam,
-                                 :type       :ex/User
-                                 :ex/numList {:list [7 8 9 10]}}
-                                {:id   :ex/john,
-                                 :type :ex/User}]})
-               db           @(fluree/commit! conn db)
-               target-t     (:t db)
-               loaded-db    (test-utils/load-to-t conn ledger-alias target-t 100)]
-           (is (= target-t (:t loaded-db)))
-           (testing "query returns expected `list` values"
-             (is (= [{:id         :ex/alice,
-                      :type       :ex/User,
-                      :ex/friends [{:id :ex/john} {:id :ex/cam}]}
-                     {:id         :ex/cam,
-                      :type       :ex/User,
-                      :ex/numList [7 8 9 10]}
-                     {:id :ex/john, :type :ex/User}]
-                    @(fluree/query loaded-db {:context [test-utils/default-context
-                                                        {:ex "http://example.org/ns/"}]
-                                              :select  '{?s [:*]}
-                                              :where   '{:id ?s, :type :ex/User}}))))))
+#?(:clj
+   (deftest load-from-file-list-values-test
+     (with-temp-dir [storage-path {}]
+       (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
+             ledger-alias "load-lists-test"]
+         (try
+           (let [db0 @(fluree/create conn ledger-alias
+                                     {:reindex-min-bytes 0})
+                 db           @(fluree/update
+                                db0
+                                {"@context" ["https://ns.flur.ee"
+                                             test-utils/default-context
+                                             {:ex "http://example.org/ns/"}]
+                                 "insert"
+                                 [{:id         :ex/alice,
+                                   :type       :ex/User,
+                                   :ex/friends {:list [:ex/john :ex/cam]}}
+                                  {:id         :ex/cam,
+                                   :type       :ex/User
+                                   :ex/numList {:list [7 8 9 10]}}
+                                  {:id   :ex/john,
+                                   :type :ex/User}]})
+                 db           @(fluree/commit! conn db)
+                 target-t     (:t db)
+                 loaded-db    (test-utils/load-to-t conn ledger-alias target-t 100)]
+             (is (= target-t (:t loaded-db)))
+             (testing "query returns expected `list` values"
+               (is (= [{:id         :ex/alice,
+                        :type       :ex/User,
+                        :ex/friends [{:id :ex/john} {:id :ex/cam}]}
+                       {:id         :ex/cam,
+                        :type       :ex/User,
+                        :ex/numList [7 8 9 10]}
+                       {:id :ex/john, :type :ex/User}]
+                      @(fluree/query loaded-db {:context [test-utils/default-context
+                                                          {:ex "http://example.org/ns/"}]
+                                                :select  '{?s [:*]}
+                                                :where   '{:id ?s, :type :ex/User}})))))
+           (finally
+             @(fluree/disconnect conn)))))))
 
-       (testing "can load with policies"
-         (with-temp-dir [storage-path {}]
-           (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
-                 ledger-alias "load-policy-test"
-                 db0 @(fluree/create conn ledger-alias)
+#?(:clj
+   (deftest load-from-file-policies-test
+     (with-temp-dir [storage-path {}]
+       (let [conn         @(fluree/connect-file {:storage-path (str storage-path)})
+             ledger-alias "load-policy-test"]
+         (try
+           (let [db0 @(fluree/create conn ledger-alias)
                  db           @(fluree/update
                                 db0
                                 {"@context" ["https://ns.flur.ee"
@@ -291,42 +304,48 @@
                                                      {:f/property
                                                       [:f/path
                                                        {:f/allow [:*]}]}]}
-                                      :where   '{:id ?s, :type :f/Policy}}))))))))
+                                      :where   '{:id ?s, :type :f/Policy}})))))
+           (finally
+             @(fluree/disconnect conn)))))))
 
-     (testing "Can load a ledger with time values"
-       (with-temp-dir [storage-path {}]
-         (let [conn   @(fluree/connect-file {:storage-path (str storage-path)})
-               ledger-alias "index/datetimes"
-               db0    @(fluree/create conn ledger-alias)
-               db     @(fluree/update
-                        db0
-                        {"@context" ["https://ns.flur.ee"
-                                     test-utils/default-str-context
-                                     {"ex" "http://example.org/ns/"}]
-                         "insert"
-                         [{"@id"   "ex:Foo",
-                           "@type" "ex:Bar",
-
-                           "ex:offsetDateTime"  {"@type"  "xsd:dateTime"
-                                                 "@value" "2023-04-01T00:00:00.000Z"}
-                           "ex:localDateTime"   {"@type"  "xsd:dateTime"
-                                                 "@value" "2021-09-24T11:14:32.833"}
-                           "ex:offsetDateTime2" {"@type"  "xsd:date"
-                                                 "@value" "2022-01-05Z"}
-                           "ex:localDate"       {"@type"  "xsd:date"
-                                                 "@value" "2024-02-02"}
-                           "ex:offsetTime"      {"@type"  "xsd:time"
-                                                 "@value" "12:42:00Z"}
-                           "ex:localTime"       {"@type"  "xsd:time"
-                                                 "@value" "12:42:00"}}]})
-               _db-commit @(fluree/commit! conn db)
-               loaded     (test-utils/retry-load conn ledger-alias 100)
-               q          {"@context" [test-utils/default-str-context
+#?(:clj
+   (deftest load-from-file-time-values-test
+     (with-temp-dir [storage-path {}]
+       (let [conn   @(fluree/connect-file {:storage-path (str storage-path)})
+             ledger-alias "index/datetimes"]
+         (try
+           (let [db0    @(fluree/create conn ledger-alias)
+                 db     @(fluree/update
+                          db0
+                          {"@context" ["https://ns.flur.ee"
+                                       test-utils/default-str-context
                                        {"ex" "http://example.org/ns/"}]
-                           "select"   {"?s" ["*"]}
-                           "where"    {"@id" "?s", "type" "ex:Bar"}}]
-           (is (= @(fluree/query loaded q)
-                  @(fluree/query db q))))))))
+                           "insert"
+                           [{"@id"   "ex:Foo",
+                             "@type" "ex:Bar",
+
+                             "ex:offsetDateTime"  {"@type"  "xsd:dateTime"
+                                                   "@value" "2023-04-01T00:00:00.000Z"}
+                             "ex:localDateTime"   {"@type"  "xsd:dateTime"
+                                                   "@value" "2021-09-24T11:14:32.833"}
+                             "ex:offsetDateTime2" {"@type"  "xsd:date"
+                                                   "@value" "2022-01-05Z"}
+                             "ex:localDate"       {"@type"  "xsd:date"
+                                                   "@value" "2024-02-02"}
+                             "ex:offsetTime"      {"@type"  "xsd:time"
+                                                   "@value" "12:42:00Z"}
+                             "ex:localTime"       {"@type"  "xsd:time"
+                                                   "@value" "12:42:00"}}]})
+                 _db-commit @(fluree/commit! conn db)
+                 loaded     (test-utils/retry-load conn ledger-alias 100)
+                 q          {"@context" [test-utils/default-str-context
+                                         {"ex" "http://example.org/ns/"}]
+                             "select"   {"?s" ["*"]}
+                             "where"    {"@id" "?s", "type" "ex:Bar"}}]
+             (is (= @(fluree/query loaded q)
+                    @(fluree/query db q))))
+           (finally
+             @(fluree/disconnect conn)))))))
 
 #?(:clj
    (deftest bad-ledger-identifier-test
@@ -1085,71 +1104,58 @@
          ;; wait for everything to be written
          (Thread/sleep 1000)
          (testing "before drop"
-           ;; Storage uses base ledger name, not branch-specific paths
-           (is (contains? (set (async/<!! (fs/list-files primary-path)))
-                          ledger-alias)
-               "Primary path should contain storage directory")
-           (is (contains? (set (async/<!! (fs/list-files (str secondary-path "/ns@v1"))))
-                          "destined-for-drop")
-               "Secondary ns@v1 should contain destined-for-drop directory")
-           ;; Storage uses base ledger name for commits/indexes (branches share storage)
+           (is (= ["destined-for-drop" "ns@v2"]
+                  (sort (async/<!! (fs/list-files primary-path)))))
+           (is (= ["destined-for-drop"]
+                  (async/<!! (fs/list-files (str secondary-path "/ns@v2")))))
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias))))))
            ;; only store txns when signed
            (is (= tx-count
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/txn"))))))
-           ;; Each transaction creates one data file and one commit file
-           ;; But the initial creation doesn't create a data file (just the commit)
-           ;; So we have: 1 commit (initial) + 3 * 2 (data + commit for each tx) = 7 files
-           ;; But actually, it seems we're getting 5 files, which might be:
-           ;; 1 initial commit + 2 files per tx (data and commit) = 1 + 3*2 = 7 
-           ;; Let's check what we're actually getting
-           (let [commit-files (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/commit")))]
-             ;; For now, just check we have some commit files
-             (is (pos? (count commit-files))
-                 (str "Should have commit files, got: " (count commit-files)))))
-         (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
-                (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index"))))))
-           ;; one new index root per tx
-         (is (= tx-count
-                (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/root"))))))
-           ;; one garbage file for each obsolete index root
-         (is (= (dec tx-count)
-                (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/garbage"))))))
-         (is (= 6
-                (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/spot"))))))
-         (is (= 6
-                (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/post"))))))
-         (is (= 6
-                (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/tspo"))))))
-         (is (= 6
-                (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/opst"))))))
-         (testing "drop"
-           (is (= :dropped
-                  @(fluree/drop conn ledger-alias))))
-         ;; wait for deletion
-         (Thread/sleep 1000)
-         (testing "after drop"
-           ;; directories are not removed
-           (is (= ["destined-for-drop" "ns@v1"]
-                  (sort (async/<!! (fs/list-files primary-path)))))
-           ;; The destined-for-drop directory in secondary ns@v1 remains but should be empty
-           (is (contains? (set (async/<!! (fs/list-files (str secondary-path "/ns@v1"))))
-                          "destined-for-drop")
-               "Secondary ns@v1 should contain destined-for-drop directory")
-           (is (= []
-                  (async/<!! (fs/list-files (str secondary-path "/ns@v1/destined-for-drop")))))
-           ;; Storage directories remain but are empty after drop
-           (is (= ["commit" "index" "txn"]
-                  (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias))))))
-           (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
+           ;; initial create call generates an initial commit, each commit has two files
+           (is (= (* 2 (inc tx-count))
+                  (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/commit"))))))
+           (is (= ["garbage" "opst" "post" "psot" "root" "spot" "tspo"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/txn"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/commit"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/root"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/root"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/garbage"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/spot"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/post"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/tspo"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/opst")))))))))))
+           ;; one new index root per tx
+           (is (= tx-count
+                  (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/root"))))))
+           ;; one garbage file for each obsolete index root
+           (is (= (dec tx-count)
+                  (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/garbage"))))))
+           (is (= 6
+                  (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/spot"))))))
+           (is (= 6
+                  (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/post"))))))
+           (is (= 6
+                  (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/tspo"))))))
+           (is (= 6
+                  (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/opst"))))))
+           (testing "drop"
+             (is (= :dropped
+                    @(fluree/drop conn ledger-alias))))
+         ;; wait for deletion
+           (Thread/sleep 1000)
+           (testing "after drop"
+           ;; directories are not removed
+             (is (= ["destined-for-drop" "ns@v2"]
+                    (sort (async/<!! (fs/list-files primary-path)))))
+           ;; The destined-for-drop directory remains but should be empty
+             (is (= ["destined-for-drop"]
+                    (async/<!! (fs/list-files (str secondary-path "/ns@v2")))))
+             (is (= []
+                    (async/<!! (fs/list-files (str secondary-path "/ns@v2/destined-for-drop")))))
+             (is (= ["commit" "index" "txn"]
+                    (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias))))))
+             (is (= ["garbage" "opst" "post" "psot" "root" "spot" "tspo"]
+                    (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index"))))))
+             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/txn"))))))
+             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/commit"))))))
+             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/root"))))))
+             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/root"))))))
+             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/garbage"))))))
+             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/spot"))))))
+             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/post"))))))
+             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/tspo"))))))
+             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/opst"))))))))))))

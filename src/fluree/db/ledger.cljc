@@ -1,6 +1,5 @@
 (ns fluree.db.ledger
-  (:require [clojure.string :as str]
-            [fluree.db.branch :as branch]
+  (:require [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
@@ -9,6 +8,7 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util :as util :refer [get-first get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.branch :as util.branch]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
@@ -19,7 +19,7 @@
   "Returns the current database for this ledger.
   Since each ledger now represents a single branch, no branch parameter is needed."
   [ledger]
-  (when-let [state (:state ledger)]
+  (let [state (:state ledger)]
     (branch/current-db @state)))
 
 (defn update-commit!
@@ -31,9 +31,6 @@
    (update-commit! ledger db nil))
   ([{:keys [state alias] :as _ledger} db index-files-ch]
    (log/debug "Attempting to update ledger:" alias "with new commit to t" (:t db))
-   (when-not state
-     (throw (ex-info "Unable to update commit - ledger has no state"
-                     {:status 400, :error :db/invalid-ledger})))
    (-> @state
        (branch/update-commit! db index-files-ch)
        branch/current-db)))
@@ -41,19 +38,19 @@
 (defn status
   "Returns current commit metadata for this ledger"
   [{:keys [address alias state]}]
-  (when state
-    (let [current-db  (branch/current-db @state)
-          {:keys [commit stats t]} current-db
-          {:keys [size flakes]} stats
-          ;; Extract branch from alias
-          branch (or (util.ledger/ledger-branch alias) "main")]
-      {:address address
-       :alias   alias
-       :branch  branch
-       :t       t
-       :size    size
-       :flakes  flakes
-       :commit  commit})))
+  (let [alias*      (util.ledger/ensure-ledger-branch alias)
+        current-db  (branch/current-db @state)
+        {:keys [commit stats t]} current-db
+        {:keys [size flakes]} stats
+        ;; Extract branch from normalized alias
+        branch      (util.ledger/ledger-branch alias*)]
+    {:address address
+     :alias   alias*
+     :branch  branch
+     :t       t
+     :size    size
+     :flakes  flakes
+     :commit  commit}))
 
 (defn notify
   "Returns false if provided commit update did not result in an update to the ledger because
@@ -67,8 +64,9 @@
                         (get-first-value const/iri-fluree-t))
           db        (current-db ledger)
           current-t (:t db)]
-      (log/debug "notify of new commit for ledger:" (:alias ledger) "at t value:" commit-t
-                 "where current cached db t value is:" current-t)
+      (log/debug "notify of new commit for ledger:" (:alias ledger)
+                 "at t value:" commit-t "where current cached db t value is:"
+                 current-t)
       ;; note, index updates will have same t value as current one, so still need to check if t = current-t
       (cond
         (= commit-t (flake/next-t current-t))
@@ -105,10 +103,10 @@
   context."
   [combined-alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
    indexing-opts did latest-commit & [branch-metadata]]
-  (let [;; Parse ledger name and branch from combined alias
-        branch (or (util.ledger/ledger-branch combined-alias) "main")
+  (let [alias* (util.ledger/ensure-ledger-branch combined-alias)
+        branch (util.ledger/ledger-branch alias*)
         publishers (cons primary-publisher secondary-publishers)
-        branch-state (branch/state-map combined-alias branch commit-catalog index-catalog
+        branch-state (branch/state-map alias* branch commit-catalog index-catalog
                                        publishers latest-commit indexing-opts)
         ;; Add branch metadata
         ;; When creating new ledger (no branch-metadata), it's always main branch
@@ -124,7 +122,7 @@
     (map->Ledger {:id                   (random-uuid)
                   :did                  did
                   :state                (atom branch-state-with-meta)  ;; Just the branch state directly
-                  :alias                combined-alias  ;; Full alias including branch
+                  :alias                alias*  ;; Full alias including branch
                   :address              ledger-address
                   :commit-catalog       commit-catalog
                   :index-catalog        index-catalog
@@ -134,14 +132,6 @@
                   :reasoner             #{}
                   :indexing-opts        indexing-opts})))
 
-(defn normalize-alias
-  "For a ledger alias, removes any preceding '/' or '#' if exists."
-  [ledger-alias]
-  (if (or (str/starts-with? ledger-alias "/")
-          (str/starts-with? ledger-alias "#"))
-    (subs ledger-alias 1)
-    ledger-alias))
-
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
@@ -149,22 +139,17 @@
            primary-publisher secondary-publishers]}
    {:keys [did indexing] :as _opts}]
   (go-try
-    (let [normalized-alias  (normalize-alias alias)
-          ;; Add :main if no branch is specified
-          ledger-alias   (if (str/includes? normalized-alias ":")
-                           normalized-alias
-                           (str normalized-alias ":main"))
-          ;; internal-only opt used for migrating ledgers without genesis commits
+    (let [;; internal-only opt used for migrating ledgers without genesis commits
           init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit
-                              commit-catalog ledger-alias publish-addresses init-time))
+                              commit-catalog alias publish-addresses init-time))
           ;; Publish genesis commit to nameservice - convert expanded to compact format first
           _              (when primary-publisher
                            (let [;; Convert expanded genesis commit to compact JSON-ld format
                                  commit-map (commit-data/json-ld->map genesis-commit nil)
                                  compact-commit (commit-data/->json-ld commit-map)]
                              (<? (nameservice/publish primary-publisher compact-commit))))]
-      (instantiate ledger-alias primary-address commit-catalog index-catalog
+      (instantiate alias primary-address commit-catalog index-catalog
                    primary-publisher secondary-publishers indexing did genesis-commit))))
 
 (defn trigger-index!
@@ -172,7 +157,7 @@
    Returns a channel that will receive the result when indexing completes.
    Since each ledger now represents a single branch, no branch parameter is needed."
   [ledger]
-  (when-let [state (:state ledger)]
+  (let [state (:state ledger)]
     (branch/trigger-index! @state)))
 
 ;; Branch operations are now handled at the connection/nameservice level
@@ -186,22 +171,18 @@
     (let [current-branch (or (util.ledger/ledger-branch alias) "main")]
       ;; Get nameservice record for branch if available, otherwise get from state
       (if primary-publisher
-        (let [ns-record (<? (nameservice/lookup primary-publisher alias))]
-          {:name current-branch
-           :head (get-in ns-record ["f:commit" "@id"])
-           :t (get ns-record "f:t")
-           :created-at (get ns-record "f:createdAt")
-           :created-from (get ns-record "f:createdFrom")
-           :protected (get ns-record "f:protected")
-           :description (get ns-record "f:description")})
+        (let [ns-record (<? (nameservice/lookup primary-publisher alias))
+              metadata (util.branch/extract-branch-metadata ns-record)]
+          (merge {:name current-branch
+                  :head (get-in ns-record ["f:commit" "@id"])
+                  :t (get ns-record "f:t")}
+                 metadata))
         ;; No publisher, return info from in-memory state
         (when state
           (let [branch-meta @state
                 current-db (branch/current-db branch-meta)]
-            {:name current-branch
-             :head (get-in current-db [:commit :address])
-             :t (:t current-db)
-             :created-at (:created-at branch-meta)
-             :created-from (:created-from branch-meta)
-             :protected (:protected branch-meta)
-             :description (:description branch-meta)}))))))
+            (merge {:name current-branch
+                    :head (get-in current-db [:commit :address])
+                    :t (:t current-db)}
+                   (select-keys branch-meta [:created-at :source-branch :source-commit
+                                             :protected :description]))))))))

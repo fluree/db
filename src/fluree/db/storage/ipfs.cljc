@@ -1,5 +1,6 @@
 (ns fluree.db.storage.ipfs
-  (:require [clojure.string :as str]
+  (:require [clojure.core.async :refer [go]]
+            [clojure.string :as str]
             [fluree.db.method.ipfs.xhttp :as ipfs]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
@@ -51,7 +52,21 @@
         {:path    hash
          :hash    hash
          :address (ipfs-address identifier hash)
-         :size    size}))))
+         :size    size})))
+
+  storage/ContentArchive
+  (-content-read-bytes [_ address]
+    (go-try
+      (let [{:keys [ns method local]} (storage/parse-address address)
+            path                      (build-ipfs-path method local)]
+        (when-not (and (= "fluree" ns)
+                       (#{"ipfs" "ipns"} method))
+          (throw (ex-info (str "Invalid file type or method: " address)
+                          {:status 500 :error :db/invalid-address})))
+        (<? (ipfs/cat endpoint path false)))))
+
+  (get-hash [_ address]
+    (go (-> address storage/split-address last))))
 
 (defn open
   ([endpoint]
