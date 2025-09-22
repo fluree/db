@@ -1,10 +1,10 @@
 (ns fluree.db.util.filesystem
   (:refer-clojure :exclude [exists?])
-  (:require #?@(:clj [[clojure.core.cache :as cache]
-                      [clojure.java.io :as io]])
+  (:require #?(:clj [clojure.java.io :as io])
             #?@(:cljs [["fs-ext" :as fs]
                        ["path" :as path]])
             [clojure.core.async :as async]
+            [clojure.core.cache :as cache]
             [fluree.crypto.aes :as aes]
             [fluree.db.util.log :as log])
   #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException File)
@@ -17,25 +17,23 @@
 (def lock-cache-size
   4096)
 
-#?(:clj
-   (def local-lock-cache
-     (-> {}
-         (cache/lru-cache-factory :threshold lock-cache-size)
-         atom)))
+(def local-lock-cache
+  (-> {}
+      (cache/lru-cache-factory :threshold lock-cache-size)
+      atom))
 
-#?(:clj
-   (defn ensure-local-lock
-     [m path]
-     (if (cache/has? m path)
-       (cache/hit m path)
-       (cache/miss m path (Object.)))))
+(defn ensure-local-lock
+  [m path]
+  (if (cache/has? m path)
+    (cache/hit m path)
+    (cache/miss m path #?(:clj  (Object.)
+                          :cljs (js-obj)))))
 
-#?(:clj
-   (defn get-local-lock
-     [path]
-     (-> local-lock-cache
-         (swap! ensure-local-lock path)
-         (cache/lookup path))))
+(defn get-local-lock
+  [path]
+  (-> local-lock-cache
+      (swap! ensure-local-lock path)
+      (cache/lookup path)))
 
 #?(:clj
    (def empty-path-array
