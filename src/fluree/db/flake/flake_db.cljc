@@ -405,10 +405,11 @@
         (log/debug "sha->t normalized SHA:" sha-normalized "length:" sha-length)
 
         (cond
-          ;; Too long to be a valid SHA (52 = 'b' + 51 char hash)
-          (> sha-length 52)
+          ;; Too long to be a valid SHA (53 = 'bb' + 51 char hash) 
+          ;; Fluree uses 'bb' prefix for base32 encoded commit IDs
+          (> sha-length 53)
           (throw (ex-info (str "Invalid SHA: too long (" sha-length " chars). "
-                               "SHA-256 in base32 with 'b' prefix should be 52 characters.")
+                               "SHA-256 in base32 with 'bb' prefix should be 53 characters.")
                           {:status 400 :error :db/invalid-commit-sha
                            :sha sha :normalized sha-normalized :length sha-length}))
 
