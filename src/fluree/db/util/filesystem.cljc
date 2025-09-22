@@ -2,7 +2,7 @@
   (:refer-clojure :exclude [exists?])
   (:require #?@(:clj [[clojure.core.cache :as cache]
                       [clojure.java.io :as io]])
-            #?@(:cljs [["fs" :as fs]
+            #?@(:cljs [["fs-ext" :as fs]
                        ["path" :as path]])
             [clojure.core.async :as async]
             [fluree.crypto.aes :as aes]
