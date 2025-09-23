@@ -37,7 +37,7 @@
 
 #?(:clj
    (def empty-path-array
-     (into-array [])))
+     (into-array String [])))
 
 #?(:clj
    (def writable-open-options
