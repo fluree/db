@@ -86,7 +86,13 @@
                (catch Exception e
                  e)
                (finally
-                 (.release os-lock)))))))))
+                 (.release os-lock))))))))
+   :cljs
+   (defn with-file-lock
+     [_path _f]
+     (async/go
+       ;;TODO: Implement for CLJS
+       ::todo)))
 
 (defn write-file
   "Write bytes to disk at the given file path."
