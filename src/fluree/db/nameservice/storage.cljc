@@ -19,7 +19,7 @@
         branch (or branch const/default-branch-name)]
     (str const/ns-version "/" ledger-name "/" branch ".json")))
 
-(defn ns-record
+(defn new-ns-record
   "Generates nameservice metadata map for JSON storage using new minimal format.
    Expects ledger-alias to be in format 'ledger:branch'."
   [ledger-alias commit-address t index-address]
@@ -45,7 +45,7 @@
       (let [commit-address (get data "address")
             t-value        (get-in data ["data" "t"])
             index-address  (get-in data ["index" "address"])
-            ns-metadata    (ns-record ledger-alias commit-address t-value index-address)
+            ns-metadata    (new-ns-record ledger-alias commit-address t-value index-address)
             record-bytes   (json/stringify-UTF8 ns-metadata)
             res            (storage/write-bytes store filename record-bytes)]
         (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :filename filename})
