@@ -10,7 +10,8 @@
   #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException File)
                    (java.nio ByteBuffer)
                    (java.nio.channels FileChannel)
-                   (java.nio.file OpenOption Paths StandardOpenOption))))
+                   (java.nio.file Files OpenOption Paths StandardOpenOption)
+                   (java.nio.file.attribute FileAttribute PosixFilePermissions))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -45,9 +46,20 @@
                              StandardOpenOption/SYNC StandardOpenOption/WRITE])))
 
 #?(:clj
+   (def parent-attributes
+     (into-array FileAttribute
+                 (-> "rwxr-x---"
+                     PosixFilePermissions/fromString
+                     PosixFilePermissions/asFileAttribute
+                     vector))))
+
+#?(:clj
    (defn open-file-channel ^FileChannel
      [path-str]
-     (let [path (Paths/get path-str empty-path-array)]
+     (let [path   (Paths/get path-str empty-path-array)
+           parent (.getParent path)]
+       (when (some? parent)
+         (Files/createDirectories parent parent-attributes))
        (FileChannel/open path writable-open-options))))
 
 #?(:clj
