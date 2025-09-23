@@ -36,6 +36,45 @@
       index-address (assoc "f:index" {"@id" index-address
                                       "f:t" index-t}))))
 
+(defn get-t
+  [ns-record]
+  (get ns-record "f:t" 0))
+
+(defn get-index-t
+  [ns-record]
+  (get-in ns-record ["f:index" "f:t"] 0))
+
+(defn update-commit-address
+  [ns-record commit-address commit-t]
+  (if (and commit-address commit-t)
+    (let [prev-t (get-t ns-record)]
+      (if (< prev-t commit-t)
+        (assoc ns-record
+               "f:t" commit-t
+               "f:commit" {"@id" commit-address})
+        ns-record))
+    ns-record))
+
+(defn update-index-address
+  [ns-record index-address index-t]
+  (if index-address
+    (let [prev-t (get-index-t ns-record)]
+      (if (or (nil? index-t) (< prev-t index-t))
+        (let [index-record (cond-> {"@id" index-address}
+                             index-t (assoc "f:t" index-t))]
+          (assoc ns-record "f:index" index-record))
+        ns-record))
+    ns-record))
+
+(defn update-ns-record
+  [ns-record ledger-alias commit-address commit-t index-address index-t]
+  (if (some? ns-record)
+    (-> ns-record
+      (update-commit-address commit-address commit-t)
+      (update-index-address index-address index-t))
+    (new-ns-record ledger-alias commit-address commit-t
+                   index-address index-t)))
+
 (defrecord StorageNameService [store]
   nameservice/Publisher
   (publish [_ data]
@@ -47,9 +86,10 @@
             commit-t       (get-in data ["data" "t"])
             index-address  (get-in data ["index" "address"])
             index-t        (get-in data ["index" "data" "t"])
-            ns-metadata    (new-ns-record ledger-alias commit-address commit-t index-address index-t)
-            record-bytes   (json/stringify-UTF8 ns-metadata)
-            res            (storage/write-bytes store filename record-bytes)]
+            record-updater (fn [ns-record]
+                             (update-ns-record ns-record ledger-alias commit-address commit-t
+                                               index-address index-t))
+            res            (storage/swap-json store filename record-updater)]
         (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :filename filename})
         res)))
 
