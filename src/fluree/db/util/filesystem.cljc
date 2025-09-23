@@ -45,7 +45,7 @@
                              StandardOpenOption/SYNC StandardOpenOption/WRITE])))
 
 #?(:clj
-   (defn open-file-channel
+   (defn open-file-channel ^FileChannel
      [path-str]
      (let [path (Paths/get path-str empty-path-array)]
        (FileChannel/open path writable-open-options))))
