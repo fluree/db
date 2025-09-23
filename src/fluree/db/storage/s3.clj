@@ -264,49 +264,65 @@
                     :size (get-xml-text "Size" obj-content)
                     :last-modified (get-xml-text "LastModified" obj-content)}))}))
 
+(defn not-found?
+  [e]
+  (-> e ex-data :status (= 404)))
+
+(defn s3-read-request
+  [bucket region path credentials timeout]
+  (s3-request {:method          "GET"
+               :bucket          bucket
+               :region          region
+               :path            path
+               :credentials     credentials
+               :request-timeout timeout}))
+
 (defn read-s3-data
   "Read an object from S3"
-  [client path]
-  (let [{:keys [credentials bucket region prefix read-timeout-ms max-retries retry-base-delay-ms retry-max-delay-ms]} client
-        ch (async/promise-chan)
+  [{:keys [credentials bucket region prefix read-timeout-ms max-retries
+           retry-base-delay-ms retry-max-delay-ms] :as _client}
+   path]
+  (let [ch        (async/promise-chan)
         full-path (str prefix path)
-        policy {:max-retries max-retries
-                :retry-base-delay-ms retry-base-delay-ms
-                :retry-max-delay-ms retry-max-delay-ms}
-        thunk (fn []
-                (s3-request {:method "GET"
-                             :bucket bucket
-                             :region region
-                             :path full-path
-                             :credentials credentials
-                             :request-timeout read-timeout-ms}))]
+        policy    {:max-retries         max-retries
+                   :retry-base-delay-ms retry-base-delay-ms
+                   :retry-max-delay-ms  retry-max-delay-ms}
+        thunk     (fn []
+                    (s3-read-request bucket region full-path credentials
+                                     read-timeout-ms))]
     (go
       (try
         (let [response (<? (with-retries thunk (assoc policy :log-context {:method "GET" :bucket bucket :path full-path})))]
           (>! ch {:Body response}))
         (catch Exception e
-          (if (and (ex-data e) (= 404 (:status (ex-data e))))
+          (if (not-found? e)
             (>! ch ::not-found)
             (>! ch e)))))
     ch))
 
+(defn s3-write-request
+  [bucket region path data credentials timeout]
+  (s3-request {:method          "PUT"
+               :bucket          bucket
+               :region          region
+               :path            path
+               :body            data
+               :credentials     credentials
+               :request-timeout timeout}))
+
 (defn write-s3-data
   "Write an object to S3"
-  [client path data]
-  (let [{:keys [credentials bucket region prefix write-timeout-ms max-retries retry-base-delay-ms retry-max-delay-ms]} client
-        ch (async/promise-chan)
+  [{:keys [credentials bucket region prefix write-timeout-ms max-retries
+           retry-base-delay-ms retry-max-delay-ms]}
+   path data]
+  (let [ch        (async/promise-chan)
         full-path (str prefix path)
-        policy {:max-retries max-retries
-                :retry-base-delay-ms retry-base-delay-ms
-                :retry-max-delay-ms retry-max-delay-ms}
-        thunk (fn []
-                (s3-request {:method "PUT"
-                             :bucket bucket
-                             :region region
-                             :path full-path
-                             :body data
-                             :credentials credentials
-                             :request-timeout write-timeout-ms}))]
+        policy    {:max-retries         max-retries
+                   :retry-base-delay-ms retry-base-delay-ms
+                   :retry-max-delay-ms  retry-max-delay-ms}
+        thunk     (fn []
+                    (s3-write-request bucket region path data credentials
+                                      write-timeout-ms))]
     (go
       (let [res (<? (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path})))]
         (>! ch res)))
