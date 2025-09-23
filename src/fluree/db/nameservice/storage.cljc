@@ -22,7 +22,7 @@
 (defn new-ns-record
   "Generates nameservice metadata map for JSON storage using new minimal format.
    Expects ledger-alias to be in format 'ledger:branch'."
-  [ledger-alias commit-address t index-address]
+  [ledger-alias commit-address t index-address index-t]
   (let [[alias branch] (util.ledger/ledger-parts ledger-alias)
         branch (or branch const/default-branch-name)]
     (cond-> {"@context"     {"f" iri/f-ns}
@@ -33,7 +33,8 @@
              "f:commit"     {"@id" commit-address}
              "f:t"          t
              "f:status"     "ready"}
-      index-address (assoc "f:index" {"@id" index-address}))))
+      index-address (assoc "f:index" {"@id" index-address
+                                      "f:t" index-t}))))
 
 (defrecord StorageNameService [store]
   nameservice/Publisher
@@ -43,9 +44,10 @@
           filename     (local-filename ledger-alias)]
       (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :filename filename})
       (let [commit-address (get data "address")
-            t-value        (get-in data ["data" "t"])
+            commit-t       (get-in data ["data" "t"])
             index-address  (get-in data ["index" "address"])
-            ns-metadata    (new-ns-record ledger-alias commit-address t-value index-address)
+            index-t        (get-in data ["index" "data" "t"])
+            ns-metadata    (new-ns-record ledger-alias commit-address commit-t index-address index-t)
             record-bytes   (json/stringify-UTF8 ns-metadata)
             res            (storage/write-bytes store filename record-bytes)]
         (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :filename filename})
