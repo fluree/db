@@ -70,8 +70,8 @@
   [ns-record ledger-alias commit-address commit-t index-address index-t]
   (if (some? ns-record)
     (-> ns-record
-      (update-commit-address commit-address commit-t)
-      (update-index-address index-address index-t))
+        (update-commit-address commit-address commit-t)
+        (update-index-address index-address index-t))
     (new-ns-record ledger-alias commit-address commit-t
                    index-address index-t)))
 
