@@ -447,6 +447,10 @@
           (when-let [body (:Body resp)]
             (.getBytes ^String body))))))
 
+  (swap-bytes [_this _path _f]
+    ;;TODO: Implement for S3
+    ::todo)
+
   storage/EraseableStore
   (delete [_ address]
     (go-try
