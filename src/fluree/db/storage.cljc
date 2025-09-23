@@ -168,6 +168,17 @@
   ([store address keywordize?]
    (-read-json store address keywordize?)))
 
+(defn swap-json
+  [store path f]
+  (let [f* (fn [bs]
+             (-> bs
+                 bytes/UTF8->string
+                 (json/parse false)
+                 f
+                 json/stringify
+                 bytes/string->UTF8))]
+    (swap-bytes store path f*)))
+
 (defrecord Catalog [])
 
 (defn display-catalog
