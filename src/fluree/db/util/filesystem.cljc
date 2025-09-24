@@ -1,10 +1,12 @@
 (ns fluree.db.util.filesystem
   (:refer-clojure :exclude [exists?])
-  (:require #?(:clj [clojure.java.io :as io])
-            #?@(:cljs [["fs-ext" :as fs]
+  (:require #?@(:clj [[clojure.java.io :as io]
+                      [clojure.core.cache :as cache]])
+            #?@(:cljs [[cljs.cache :as cache]
+                       ["fs" :as fs]
+                       ["fs-ext" :refer [flockSync]]
                        ["path" :as path]])
             [clojure.core.async :as async]
-            [clojure.core.cache :as cache]
             [fluree.crypto.aes :as aes]
             [fluree.db.util.log :as log])
   #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException File)
@@ -84,9 +86,28 @@
          (.position 0)
          (.write buf)))))
 
-#?(:clj
-   (defn with-file-lock
-     [path f]
+#?(:cljs
+   (defn with-locked-fd
+     "Replace the contents of the file descriptor `fd` by applying function `f`
+     with an exclusive lock"
+     [fd f]
+     (flockSync fd "ex")
+     (try
+       (let [stats  (fs/fstatSync fd)
+             size   (.-size stats)
+             buffer (js/Buffer.alloc size)
+             _      (fs/readSync fd buffer 0 size 0)
+             result (f buffer)]
+         (fs/ftruncateSync fd 0)
+         (fs/writeSync fd result 0)
+         result)
+       (finally
+         (flockSync fd "un")
+         (fs/closeSync fd)))))
+
+(defn with-file-lock
+  [path f]
+  #?(:clj
      (async/thread
        (locking (get-local-lock path)
          (with-open [file-ch (open-file-channel path)]
@@ -98,13 +119,22 @@
                (catch Exception e
                  e)
                (finally
-                 (.release os-lock))))))))
-   :cljs
-   (defn with-file-lock
-     [_path _f]
+                 (.release os-lock)))))))
+     :cljs
      (async/go
-       ;;TODO: Implement for CLJS
-       ::todo)))
+       (locking (get-local-lock path)
+         (try
+           (let [fd (fs/openSync path "r+")]
+             (with-locked-fd fd f))
+           (catch :default e
+             (if (= "ENOENT" (.-code e))
+               (try
+                 (fs/mkdirSync (path/dirname path) #js{:recursive true})
+                 (let [fd (fs/openSync path "w+")]
+                   (with-locked-fd fd f))
+                 (catch :default create-e
+                   create-e))
+               e)))))))
 
 (defn write-file
   "Write bytes to disk at the given file path."
