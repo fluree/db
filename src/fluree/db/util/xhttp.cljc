@@ -79,11 +79,6 @@
                status (assoc :status status))
              e)))
 
-#?(:clj
-   (defn throw-if-timeout [error]
-     (when (instance? TimeoutException error)
-       (throw error))))
-
 (defn post
   "Posts pre-formatted message (e.g. already stringified JSON)."
   [url message opts]
