@@ -201,39 +201,46 @@
 (defn s3-request
   "Make an S3 REST API request"
   [{:keys [method bucket region path headers body credentials query-params request-timeout]
-    :or {method "GET"
-         headers {}}}]
+    :or   {method  "GET"
+           headers {}}}]
   (go-try
-    (let [start (System/nanoTime)
+    (let [start                     (System/nanoTime)
           ;; Encode path segments for both URL and signature to match S3's encoding
-          encoded-path (encode-s3-path path)
-          query-string (canonical-query-string query-params)
-          url (str (build-s3-url bucket region encoded-path)
-                   (when query-string (str "?" query-string)))
+          encoded-path              (encode-s3-path path)
+          query-string              (canonical-query-string query-params)
+          url                       (str (build-s3-url bucket region encoded-path)
+                                         (when query-string (str "?" query-string)))
           headers-with-content-type (if (and (= method "PUT") body)
                                       (assoc headers "Content-Type" "application/octet-stream")
                                       headers)
-          signed-headers (sign-request
-                          {:method method
-                           :path encoded-path  ;; Use encoded path for signature
-                           :headers headers-with-content-type
-                           :payload body
-                           :region region
-                           :bucket bucket
-                           :credentials credentials
-                           :query-params query-params})
+          signed-headers            (sign-request
+                                     {:method       method
+                                      :path         encoded-path  ;; Use encoded path for signature
+                                      :headers      headers-with-content-type
+                                      :payload      body
+                                      :region       region
+                                      :bucket       bucket
+                                      :credentials  credentials
+                                      :query-params query-params})
 
           ;; Use xhttp for the actual request
-          _ (log/debug "s3-request start" {:method method :bucket bucket :path encoded-path :timeout request-timeout})
+          _        (log/debug "s3-request start" {:method  method
+                                                  :bucket  bucket
+                                                  :path    encoded-path
+                                                  :timeout request-timeout})
           response (<? (case method
-                         "GET" (xhttp/get url {:headers signed-headers
-                                               :request-timeout request-timeout})
-                         "PUT" (xhttp/put url body {:headers signed-headers
-                                                    :request-timeout request-timeout})
-                         "DELETE" (xhttp/delete url {:headers signed-headers
-                                                     :request-timeout request-timeout})
+                         "GET"    (xhttp/get-response url {:headers         signed-headers
+                                                           :request-timeout request-timeout})
+                         "PUT"    (xhttp/put-response url body {:headers         signed-headers
+                                                                :request-timeout request-timeout})
+                         "DELETE" (xhttp/delete-response url {:headers         signed-headers
+                                                              :request-timeout request-timeout})
                          (throw (ex-info "Unsupported HTTP method" {:method method}))))]
-      (log/debug "s3-request done" {:method method :bucket bucket :path encoded-path :duration-ms (long (/ (- (System/nanoTime) start) 1000000))})
+      (log/debug "s3-request done" {:method      method
+                                    :bucket      bucket
+                                    :path        encoded-path
+                                    :duration-ms (long (/ (- (System/nanoTime) start)
+                                                          1000000))})
       response)))
 
 (defn- tag-matches?
@@ -268,65 +275,69 @@
   [e]
   (-> e ex-data :status (= 404)))
 
-(defn s3-read-request
-  [bucket region path credentials timeout]
-  (s3-request {:method          "GET"
-               :bucket          bucket
-               :region          region
-               :path            path
-               :credentials     credentials
-               :request-timeout timeout}))
-
 (defn read-s3-data
   "Read an object from S3"
-  [{:keys [credentials bucket region prefix read-timeout-ms max-retries
-           retry-base-delay-ms retry-max-delay-ms] :as _client}
-   path]
-  (let [ch        (async/promise-chan)
-        full-path (str prefix path)
-        policy    {:max-retries         max-retries
-                   :retry-base-delay-ms retry-base-delay-ms
-                   :retry-max-delay-ms  retry-max-delay-ms}
-        thunk     (fn []
-                    (s3-read-request bucket region full-path credentials
-                                     read-timeout-ms))]
-    (go
-      (try
-        (let [response (<? (with-retries thunk (assoc policy :log-context {:method "GET" :bucket bucket :path full-path})))]
-          (>! ch {:Body response}))
-        (catch Exception e
-          (if (not-found? e)
-            (>! ch ::not-found)
-            (>! ch e)))))
-    ch))
+  ([client path]
+   (read-s3-data client path {}))
+  ([client path headers]
+   (let [{:keys [credentials bucket region prefix read-timeout-ms max-retries
+                 retry-base-delay-ms retry-max-delay-ms]}
+         client
 
-(defn s3-write-request
-  [bucket region path data credentials timeout]
-  (s3-request {:method          "PUT"
-               :bucket          bucket
-               :region          region
-               :path            path
-               :body            data
-               :credentials     credentials
-               :request-timeout timeout}))
+         ch        (async/promise-chan)
+         full-path (str prefix path)
+         policy    {:max-retries         max-retries
+                    :retry-base-delay-ms retry-base-delay-ms
+                    :retry-max-delay-ms  retry-max-delay-ms}
+         thunk     (fn []
+                     (let [req (cond-> {:method          "GET"
+                                        :bucket          bucket
+                                        :region          region
+                                        :path            path
+                                        :credentials     credentials
+                                        :request-timeout timeout}
+                                 (seq headers) (assoc :headers headers))]
+                       (s3-request req)))]
+     (go
+       (try
+         (let [response (<? (with-retries thunk (assoc policy :log-context {:method "GET" :bucket bucket :path full-path})))]
+           (>! ch response))
+         (catch Exception e
+           (if (not-found? e)
+             (>! ch ::not-found)
+             (>! ch e)))))
+     ch)))
 
 (defn write-s3-data
   "Write an object to S3"
-  [{:keys [credentials bucket region prefix write-timeout-ms max-retries
-           retry-base-delay-ms retry-max-delay-ms]}
-   path data]
-  (let [ch        (async/promise-chan)
-        full-path (str prefix path)
-        policy    {:max-retries         max-retries
-                   :retry-base-delay-ms retry-base-delay-ms
-                   :retry-max-delay-ms  retry-max-delay-ms}
-        thunk     (fn []
-                    (s3-write-request bucket region path data credentials
-                                      write-timeout-ms))]
-    (go
-      (let [res (<? (with-retries thunk (assoc policy :log-context {:method "PUT" :bucket bucket :path full-path})))]
-        (>! ch res)))
-    ch))
+  ([client path data]
+   (write-s3-data client path data {}))
+  ([client path data headers]
+   (let [{:keys [credentials bucket region prefix write-timeout-ms max-retries
+                 retry-base-delay-ms retry-max-delay-ms]}
+         client
+
+         ch        (async/promise-chan)
+         full-path (str prefix path)
+         policy    {:max-retries         max-retries
+                    :retry-base-delay-ms retry-base-delay-ms
+                    :retry-max-delay-ms  retry-max-delay-ms}
+         thunk     (fn []
+                     (let [req (cond-> {:method          "PUT"
+                                        :bucket          bucket
+                                        :region          region
+                                        :path            path
+                                        :body            data
+                                        :credentials     credentials
+                                        :request-timeout timeout}
+                                 (seq headers) (assoc :headers headers))]
+                       (s3-request req)))]
+     (go
+       (let [res (<? (with-retries thunk (assoc policy :log-context {:method "PUT"
+                                                                     :bucket bucket
+                                                                     :path   full-path})))]
+         (>! ch (:body res))))
+     ch)))
 
 (defn s3-list*
   "List objects in S3 with optional continuation token"
@@ -352,7 +363,7 @@
                                :retry-base-delay-ms retry-base-delay-ms
                                :retry-max-delay-ms retry-max-delay-ms
                                :log-context {:method "LIST" :bucket bucket :path full-path}}))
-               parsed (parse-list-objects-response response)]
+               parsed (parse-list-objects-response (:body response))]
            (>! ch (update parsed :contents
                           (fn [contents]
                             (mapv #(select-keys % [:key]) contents)))))
@@ -400,7 +411,7 @@
       (let [path (storage/get-local-path address)
             resp (<? (read-s3-data this path))]
         (when (not= resp ::not-found)
-          (some-> resp :Body (json/parse keywordize?))))))
+          (some-> (:body resp) (json/parse keywordize?))))))
 
   storage/ContentAddressedStore
   (-content-write-bytes [this dir data]
@@ -425,7 +436,7 @@
       (let [path (storage/get-local-path address)
             resp (<? (read-s3-data this path))]
         (when (not= resp ::not-found)
-          (:Body resp)))))
+          (:body resp)))))
 
   (get-hash [_ address]
     (go
@@ -443,13 +454,39 @@
   (read-bytes [this path]
     (go-try
       (let [resp (<? (read-s3-data this path))]
-        (when (not= resp ::not-found)
-          (when-let [body (:Body resp)]
-            (.getBytes ^String body))))))
+        (when-not (or (= resp ::not-found)
+                      (nil? resp))
+          (.getBytes ^String (:body resp))))))
 
-  (swap-bytes [_this _path _f]
-    ;;TODO: Implement for S3
-    ::todo)
+  (swap-bytes [this path f]
+    (go-try
+      (let [swap-thunk (fn []
+                         (go-try
+                           (try
+                             (let [read-resp     (<? (read-s3-data this path))
+                                   current-bytes (when-not (= read-resp ::not-found)
+                                                   (.getBytes ^String (:body read-resp)))
+                                   etag          (when-not (= read-resp ::not-found)
+                                                   (get-in read-resp [:headers "etag"]))
+                                   new-bytes     (f current-bytes)]
+                               (when new-bytes
+                                 (let [headers (if etag
+                                                 {"If-Match" etag}
+                                                 {"If-None-Match" "*"})]
+                                   (<? (write-s3-data this path new-bytes headers)))))
+                             (catch Exception e
+                               (if (not-found? e)
+                                 (let [new-bytes (f nil)]
+                                   (when new-bytes
+                                     (<? (write-s3-data this path new-bytes {"If-None-Match" "*"}))))
+                                 ;; Other error, re-throw
+                                 (throw e))))))]
+        (<? (with-retries swap-thunk {:max-retries         max-retries
+                                      :retry-base-delay-ms retry-base-delay-ms
+                                      :retry-max-delay-ms  retry-max-delay-ms
+                                      :log-context         {:method "SWAP"
+                                                            :bucket bucket
+                                                            :path   path}})))))
 
   storage/EraseableStore
   (delete [_ address]
@@ -458,14 +495,15 @@
             full-path (str prefix path)
             policy    {:max-retries         max-retries
                        :retry-base-delay-ms retry-base-delay-ms
-                       :retry-max-delay-ms  retry-max-delay-ms}]
-        (<? (with-retries (fn [] (s3-request {:method          "DELETE"
-                                              :bucket          bucket
-                                              :region          region
-                                              :path            full-path
-                                              :credentials     credentials
-                                              :request-timeout write-timeout-ms}))
-              policy)))))
+                       :retry-max-delay-ms  retry-max-delay-ms}
+            response  (<? (with-retries (fn [] (s3-request {:method          "DELETE"
+                                                           :bucket          bucket
+                                                           :region          region
+                                                           :path            full-path
+                                                           :credentials     credentials
+                                                           :request-timeout write-timeout-ms}))
+                           policy))]
+        (:body response))))
 
   storage/RecursiveListableStore
   (list-paths-recursive [this path-prefix]
