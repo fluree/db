@@ -19,13 +19,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(comment
- ;; state machine looks like this:
-  {:ledger        {"ledger-a" {;; map of branches, along with current/default branch
-                               :branches {}
-                               :branch   {}}}
-   :subscriptions {}})
-
 (def blank-state
   "Initial connection state"
   {:ledger        {}
