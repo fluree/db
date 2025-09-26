@@ -295,7 +295,7 @@
                                         :region          region
                                         :path            path
                                         :credentials     credentials
-                                        :request-timeout timeout}
+                                        :request-timeout read-timeout-ms}
                                  (seq headers) (assoc :headers headers))]
                        (s3-request req)))]
      (go
@@ -329,7 +329,7 @@
                                         :path            path
                                         :body            data
                                         :credentials     credentials
-                                        :request-timeout timeout}
+                                        :request-timeout write-timeout-ms}
                                  (seq headers) (assoc :headers headers))]
                        (s3-request req)))]
      (go
