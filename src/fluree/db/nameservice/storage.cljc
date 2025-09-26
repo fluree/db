@@ -19,10 +19,10 @@
         branch (or branch const/default-branch-name)]
     (str const/ns-version "/" ledger-name "/" branch ".json")))
 
-(defn ns-record
+(defn new-ns-record
   "Generates nameservice metadata map for JSON storage using new minimal format.
    Expects ledger-alias to be in format 'ledger:branch'."
-  [ledger-alias commit-address t index-address]
+  [ledger-alias commit-address t index-address index-t]
   (let [[alias branch] (util.ledger/ledger-parts ledger-alias)
         branch (or branch const/default-branch-name)]
     (cond-> {"@context"     {"f" iri/f-ns}
@@ -33,7 +33,47 @@
              "f:commit"     {"@id" commit-address}
              "f:t"          t
              "f:status"     "ready"}
-      index-address (assoc "f:index" {"@id" index-address}))))
+      index-address (assoc "f:index" {"@id" index-address
+                                      "f:t" index-t}))))
+
+(defn get-t
+  [ns-record]
+  (get ns-record "f:t" 0))
+
+(defn get-index-t
+  [ns-record]
+  (get-in ns-record ["f:index" "f:t"] 0))
+
+(defn update-commit-address
+  [ns-record commit-address commit-t]
+  (if (and commit-address commit-t)
+    (let [prev-t (get-t ns-record)]
+      (if (< prev-t commit-t)
+        (assoc ns-record
+               "f:t" commit-t
+               "f:commit" {"@id" commit-address})
+        ns-record))
+    ns-record))
+
+(defn update-index-address
+  [ns-record index-address index-t]
+  (if index-address
+    (let [prev-t (get-index-t ns-record)]
+      (if (or (nil? index-t) (< prev-t index-t))
+        (let [index-record (cond-> {"@id" index-address}
+                             index-t (assoc "f:t" index-t))]
+          (assoc ns-record "f:index" index-record))
+        ns-record))
+    ns-record))
+
+(defn update-ns-record
+  [ns-record ledger-alias commit-address commit-t index-address index-t]
+  (if (some? ns-record)
+    (-> ns-record
+        (update-commit-address commit-address commit-t)
+        (update-index-address index-address index-t))
+    (new-ns-record ledger-alias commit-address commit-t
+                   index-address index-t)))
 
 (defrecord StorageNameService [store]
   nameservice/Publisher
@@ -43,11 +83,13 @@
           filename     (local-filename ledger-alias)]
       (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :filename filename})
       (let [commit-address (get data "address")
-            t-value        (get-in data ["data" "t"])
+            commit-t       (get-in data ["data" "t"])
             index-address  (get-in data ["index" "address"])
-            ns-metadata    (ns-record ledger-alias commit-address t-value index-address)
-            record-bytes   (json/stringify-UTF8 ns-metadata)
-            res            (storage/write-bytes store filename record-bytes)]
+            index-t        (get-in data ["index" "data" "t"])
+            record-updater (fn [ns-record]
+                             (update-ns-record ns-record ledger-alias commit-address commit-t
+                                               index-address index-t))
+            res            (storage/swap-json store filename record-updater)]
         (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :filename filename})
         res)))
 

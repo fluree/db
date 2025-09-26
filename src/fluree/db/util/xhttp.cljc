@@ -1,12 +1,13 @@
 (ns fluree.db.util.xhttp
   (:refer-clojure :exclude [get])
-  (:require #?(:cljs [clojure.string :as str])
-            #?@(:clj [[fluree.db.util.websocket :as jws]])
+  (:require #?@(:clj [[fluree.db.util.websocket :as jws]])
             #?@(:cljs [["axios" :as axios]
                        ["ws" :as NodeWebSocket]
                        [fluree.db.platform :as platform]])
             [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.db.util :as util :refer [try* catch*]]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true])
   #?(:clj
@@ -22,8 +23,8 @@
 
 #?(:clj
    (defn create-http-client
-     "Creates a new HTTP client instance. For GraalVM compatibility, this is a function
-      rather than a top-level def to avoid initialization at build time."
+     "Creates a new HTTP client instance. For GraalVM compatibility, this is a
+     function rather than a top-level def to avoid initialization at build time."
      []
      (-> (HttpClient/newBuilder)
          (.connectTimeout (Duration/ofSeconds 10))
@@ -78,11 +79,6 @@
                       :error error}
                status (assoc :status status))
              e)))
-
-#?(:clj
-   (defn throw-if-timeout [error]
-     (when (instance? TimeoutException error)
-       (throw error))))
 
 (defn post
   "Posts pre-formatted message (e.g. already stringified JSON)."
@@ -167,14 +163,25 @@
                    (json/stringify message))]
     (post url base-req (assoc opts :json? true))))
 
-(defn get
-  "Returns result body as a string, or an exception.
+(defn get-headers
+  [^HttpResponse response]
+  (reduce-kv (fn [m k v]
+               (let [k* (str/lower-case k)
+                     v* (vec v)]
+                 (assoc m k* v*)))
+             {} (-> response .headers .map)))
 
-  If opts contains :body,
-  It is assumed body is already in a format that can be sent directly in request (already encoded).
+(defn get-response
+  "Returns full HTTP response as a map with :status, :headers, and :body keys,
+  or an exception.
+
+  If opts contains :body, It is assumed body is already in a format that can be
+  sent directly in request (already encoded).
 
   Options
-  - output-format - can be :text, :json, :edn or :binary (default :text), or special format (wikidata) to handle wikidata errors, which come back as html."
+  - output-format - can be :text, :json, :edn or :binary (default :text), or
+                    special format (wikidata) to handle wikidata errors, which
+                    come back as html."
   [url opts]
   (let [{:keys [request-timeout token headers output-format]
          :or   {request-timeout 5000
@@ -199,12 +206,14 @@
              (when-let [body (:body opts)]
                (.method builder "GET" (HttpRequest$BodyPublishers/ofString body)))
 
-             (let [request (.build builder)
-                   ^HttpClient client @http-client
+             (let [request                (.build builder)
+                   ^HttpClient client     @http-client
                    ^HttpResponse response (.send client request (HttpResponse$BodyHandlers/ofString))
-                   status (.statusCode response)
-                   body (.body response)]
-               (if (< 299 status)
+
+                   status  (.statusCode response)
+                   body    (.body response)
+                   headers (get-headers response)]
+               (if (< 300 status)
                  (if (= :wikidata output-format)
                    (let [error {:status  status
                                 :message body
@@ -214,10 +223,12 @@
                                (ex-info (str "HTTP error response: " body)
                                         {:status status :body body :url url})))
                  (async/put! response-chan
-                             (case output-format
-                               (:text :json)    body
-                               (:edn :wikidata) (json/parse body)
-                               body)))))
+                             {:status  status
+                              :headers headers
+                              :body    (case output-format
+                                         (:text :json)    body
+                                         (:edn :wikidata) (json/parse body)
+                                         body)}))))
            (catch TimeoutException e
              (async/put! response-chan
                          (format-error-response url e)))
@@ -230,15 +241,35 @@
                                      :timeout request-timeout
                                      :headers headers}))
                  (.then (fn [resp]
-                          (let [data (:data (js->clj resp :keywordize-keys true))]
+                          (let [resp-data (js->clj resp :keywordize-keys true)
+                                data      (:data resp-data)
+                                status    (:status resp-data)
+                                headers   (js->clj (.-headers resp) :keywordize-keys false)]
                             (async/put! response-chan
-                                        (case output-format
-                                          :text data
-                                          :json (json/stringify data)
-                                          (throw (ex-info "http get only supports output formats of json and text." {})))))))
+                                        {:status  status
+                                         :headers headers
+                                         :body    (case output-format
+                                                    :text data
+                                                    :json (json/stringify data)
+                                                    (throw (ex-info "http get only supports output formats of json and text." {})))}))))
                  (.catch (fn [err]
                            (async/put! response-chan (format-error-response url err))))))
     response-chan))
+
+(defn get
+  "Returns result body as a string, or an exception.
+
+  If opts contains :body,
+  It is assumed body is already in a format that can be sent directly in
+  request (already encoded).
+
+  Options
+  - output-format - can be :text, :json, :edn or :binary (default :text),
+                    or special format (wikidata) to handle wikidata errors,
+                    which come back as html."
+  [url opts]
+  (go-try
+    (:body (<? (get-response url opts)))))
 
 (defn get-json
   "http get with JSON response.
@@ -252,11 +283,13 @@
                 (:body opts) (assoc :body (json/stringify (:body opts))))]
     (get url opts*)))
 
-(defn put
-  "http PUT request"
+(defn put-response
+  "http PUT request returning full response map"
   [url body opts]
   (let [{:keys [request-timeout headers]
-         :or {request-timeout 5000}} opts
+         :or   {request-timeout 5000}}
+        opts
+
         response-chan (async/chan)]
     #?(:clj
        (async/thread
@@ -272,15 +305,20 @@
                                     builder
                                     headers)
                  request (.build ^HttpRequest$Builder builder)
-                 ^HttpClient client @http-client
+
+                 ^HttpClient client     @http-client
                  ^HttpResponse response (.send client request (HttpResponse$BodyHandlers/ofString))
-                 status (.statusCode response)
-                 body-resp (.body response)]
-             (if (< 299 status)
+
+                 status    (.statusCode response)
+                 body-resp (.body response)
+                 headers   (get-headers response)]
+             (if (< 300 status)
                (async/put! response-chan
                            (ex-info (str "HTTP error response: " body-resp)
                                     {:status status :body body-resp :url url}))
-               (async/put! response-chan body-resp)))
+               (async/put! response-chan {:status  status
+                                          :headers headers
+                                          :body    body-resp})))
            (catch TimeoutException e
              (async/put! response-chan
                          (format-error-response url e)))
@@ -288,46 +326,61 @@
              (async/put! response-chan
                          (format-error-response url e)))))
        :cljs (-> axios
-                 (.request (clj->js {:url url
-                                     :method "put"
-                                     :data body
+                 (.request (clj->js {:url     url
+                                     :method  "put"
+                                     :data    body
                                      :timeout request-timeout
                                      :headers headers}))
                  (.then (fn [resp]
-                          (let [data (:data (js->clj resp :keywordize-keys true))]
-                            (async/put! response-chan data))))
+                          (let [resp-data (js->clj resp :keywordize-keys true)
+                                data      (:data resp-data)
+                                status    (:status resp-data)
+                                headers   (js->clj (.-headers resp) :keywordize-keys false)]
+                            (async/put! response-chan {:status  status
+                                                       :headers headers
+                                                       :body    data}))))
                  (.catch (fn [err]
                            (async/put! response-chan (format-error-response url err))))))
     response-chan))
 
-(defn delete
-  "http DELETE request"
+(defn put
+  "http PUT request returning response body or an error."
+  [url body opts]
+  (go-try
+    (:body (<? (put-response url body opts)))))
+
+(defn delete-response
+  "http DELETE request returning full response map"
   [url opts]
   (let [{:keys [request-timeout headers]
-         :or {request-timeout 5000}} opts
+         :or   {request-timeout 5000}}
+        opts
         response-chan (async/chan)]
     #?(:clj
        (async/thread
          (try
-           (let [builder (-> (HttpRequest/newBuilder)
-                             (.uri (URI/create url))
-                             (.timeout (Duration/ofMillis request-timeout))
-                             (.DELETE))
-                 builder (reduce-kv (fn [^HttpRequest$Builder b k v]
-                                      (.header b k v))
-                                    builder
-                                    headers)
-                 request (.build ^HttpRequest$Builder builder)
-                 ^HttpClient client @http-client
+           (let [builder                (-> (HttpRequest/newBuilder)
+                                            (.uri (URI/create url))
+                                            (.timeout (Duration/ofMillis request-timeout))
+                                            (.DELETE))
+                 builder                (reduce-kv (fn [^HttpRequest$Builder b k v]
+                                                     (.header b k v))
+                                                   builder
+                                                   headers)
+                 request                (.build ^HttpRequest$Builder builder)
+                 ^HttpClient client     @http-client
                  ^HttpResponse response (.send client request (HttpResponse$BodyHandlers/ofString))
-                 status (.statusCode response)
-                 body (.body response)]
+                 status                 (.statusCode response)
+                 body                   (.body response)
+                 headers                (get-headers response)]
              (if (< 299 status)
                (async/put! response-chan
                            (format-error-response url
                                                   (ex-info "HTTP error response"
                                                            {:status status :body body})))
-               (async/put! response-chan body)))
+               (async/put! response-chan {:status  status
+                                          :headers headers
+                                          :body    body})))
            (catch TimeoutException e
              (async/put! response-chan
                          (format-error-response url e)))
@@ -335,16 +388,28 @@
              (async/put! response-chan
                          (format-error-response url e)))))
        :cljs (-> axios
-                 (.request (clj->js {:url url
-                                     :method "delete"
+                 (.request (clj->js {:url     url
+                                     :method  "delete"
                                      :timeout request-timeout
                                      :headers headers}))
                  (.then (fn [resp]
-                          (let [data (:data (js->clj resp :keywordize-keys true))]
-                            (async/put! response-chan data))))
+                          (let [resp-data (js->clj resp :keywordize-keys true)
+                                data      (:data resp-data)
+                                status    (:status resp-data)
+                                headers   (js->clj (.-headers resp) :keywordize-keys false)]
+                            (async/put! response-chan {:status  status
+                                                       :headers headers
+                                                       :body    data}))))
                  (.catch (fn [err]
                            (async/put! response-chan (format-error-response url err))))))
     response-chan))
+
+(defn delete
+  "http DELETE request returning just the body.
+  Uses delete-response internally for backward compatibility."
+  [url opts]
+  (go-try
+    (:body (<? (delete-response url opts)))))
 
 (def ws-close-status-codes
   {:normal-close {:code 1000 :reason "Normal closure"}

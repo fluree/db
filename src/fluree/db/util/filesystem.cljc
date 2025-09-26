@@ -1,14 +1,140 @@
 (ns fluree.db.util.filesystem
   (:refer-clojure :exclude [exists?])
-  (:require #?(:clj [clojure.java.io :as io])
-            #?@(:cljs [["fs" :as fs]
+  (:require #?@(:clj [[clojure.java.io :as io]
+                      [clojure.core.cache :as cache]])
+            #?@(:cljs [[cljs.cache :as cache]
+                       ["fs" :as fs]
+                       ["fs-ext" :refer [flockSync]]
                        ["path" :as path]])
             [clojure.core.async :as async]
             [fluree.crypto.aes :as aes]
             [fluree.db.util.log :as log])
-  #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
+  #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException File)
+                   (java.nio ByteBuffer)
+                   (java.nio.channels FileChannel)
+                   (java.nio.file Files OpenOption Paths StandardOpenOption)
+                   (java.nio.file.attribute FileAttribute PosixFilePermissions))))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(def lock-cache-size
+  4096)
+
+(def local-lock-cache
+  (-> {}
+      (cache/lru-cache-factory :threshold lock-cache-size)
+      atom))
+
+(defn ensure-local-lock
+  [m path]
+  (if (cache/has? m path)
+    (cache/hit m path)
+    (cache/miss m path #?(:clj  (Object.)
+                          :cljs (js-obj)))))
+
+(defn get-local-lock
+  [path]
+  (-> local-lock-cache
+      (swap! ensure-local-lock path)
+      (cache/lookup path)))
+
+#?(:clj
+   (def empty-path-array
+     (into-array String [])))
+
+#?(:clj
+   (def writable-open-options
+     (into-array OpenOption [StandardOpenOption/CREATE StandardOpenOption/READ
+                             StandardOpenOption/SYNC StandardOpenOption/WRITE])))
+
+#?(:clj
+   (def parent-attributes
+     (into-array FileAttribute
+                 (-> "rwxr-x---"
+                     PosixFilePermissions/fromString
+                     PosixFilePermissions/asFileAttribute
+                     vector))))
+
+#?(:clj
+   (defn open-file-channel ^FileChannel
+     [path-str]
+     (let [path   (Paths/get path-str empty-path-array)
+           parent (.getParent path)]
+       (when (some? parent)
+         (Files/createDirectories parent parent-attributes))
+       (FileChannel/open path writable-open-options))))
+
+#?(:clj
+   (defn read-file-channel
+     [^FileChannel file-ch]
+     (let [size (.size file-ch)
+           buf  (ByteBuffer/allocate (int size))]
+       (doto file-ch
+         (.position 0)
+         (.read buf))
+       (.flip buf)
+       (let [bs (byte-array (.remaining buf))]
+         (.get buf bs)
+         bs))))
+
+#?(:clj
+   (defn write-file-channel
+     [^FileChannel file-ch bs]
+     (let [buf (ByteBuffer/wrap bs)]
+       (doto file-ch
+         (.truncate 0)
+         (.position 0)
+         (.write buf)))))
+
+#?(:cljs
+   (defn with-locked-fd
+     "Replace the contents of the file descriptor `fd` by applying function `f`
+     with an exclusive lock"
+     [fd f]
+     (flockSync fd "ex")
+     (try
+       (let [stats  (fs/fstatSync fd)
+             size   (.-size stats)
+             buffer (js/Buffer.alloc size)
+             _      (fs/readSync fd buffer 0 size 0)
+             result (f buffer)]
+         (fs/ftruncateSync fd 0)
+         (fs/writeSync fd result 0)
+         result)
+       (finally
+         (flockSync fd "un")
+         (fs/closeSync fd)))))
+
+(defn with-file-lock
+  [path f]
+  #?(:clj
+     (async/thread
+       (locking (get-local-lock path)
+         (with-open [file-ch (open-file-channel path)]
+           (let [os-lock (.lock file-ch)]
+             (try
+               (let [result (-> file-ch read-file-channel f)]
+                 (write-file-channel file-ch result)
+                 result)
+               (catch Exception e
+                 e)
+               (finally
+                 (.release os-lock)))))))
+     :cljs
+     (async/go
+       (locking (get-local-lock path)
+         (try
+           (let [fd (fs/openSync path "r+")]
+             (with-locked-fd fd f))
+           (catch :default e
+             (if (= "ENOENT" (.-code e))
+               (try
+                 (fs/mkdirSync (path/dirname path) #js{:recursive true})
+                 (let [fd (fs/openSync path "w+")]
+                   (with-locked-fd fd f))
+                 (catch :default create-e
+                   create-e))
+               e)))))))
 
 (defn write-file
   "Write bytes to disk at the given file path."
