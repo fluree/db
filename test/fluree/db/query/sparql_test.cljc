@@ -757,6 +757,22 @@
       (is (= {"foaf" "http://xmlns.com/foaf/0.1/"
               "ex"   "http://example.org/ns/"}
              context))))
+  (testing "PREFIX :"
+    (let [query "PREFIX : <http://example.com/>
+                 SELECT ?foo
+                 WHERE {?s :foo ?foo }"]
+      (is (= {:context {":" "http://example.com/"}
+              :select ["?foo"]
+              :where [{"@id" "?s" ":foo" "?foo"}]}
+             (sparql/->fql query)))))
+  (testing "BASE"
+    (let [query "BASE <http://example.com/>
+                 SELECT ?foo
+                 WHERE {?s <foo> ?foo }"]
+      (is (= {:context {"@base" "http://example.com/" "@vocab" "http://example.com/"}
+              :select ["?foo"],
+              :where [{"@id" "?s" "foo" "?foo"}]}
+             (sparql/->fql query)))))
   (testing "comments"
     (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
                  PREFIX ex: <http://example.org/ns/>
