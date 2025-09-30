@@ -332,7 +332,7 @@
                  }"
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?s", "?pred" "?o"}
-              [:filter "(not= \"schema:pred\" ?pred)"]]
+              [:filter "(not= {\"@id\" \"schema:pred\"} ?pred)"]]
              where)
           "filter string values"))
     (let [query "SELECT ?s
@@ -629,8 +629,8 @@
                 [:bind "?floor" "(floor 1.8)"]
                 [:bind "?hours" "(hours \"2024-4-1T14:45:13.815-05:00\")"]
                 [:bind "?if" "(if \"true\" \"yes\" \"no\")"]
-                [:bind "?in" "(in ?age [1 2 3 \"foo\" \"ex:bar\"])"]
-                [:bind "?notIn" "(not (in ?age [1 2 3 \"foo\" \"ex:bar\"]))"]
+                [:bind "?in" "(in ?age [1 2 3 \"foo\" {\"@id\" \"ex:bar\"}])"]
+                [:bind "?notIn" "(not (in ?age [1 2 3 \"foo\" {\"@id\" \"ex:bar\"}]))"]
                 [:bind "?iri" "(iri \"http://example.com\")"]
                 [:bind "?lang" "(lang \"Robert\"\"@en\")"]
                 [:bind "?langMatches" "(langMatches ?lang \"FR\")"]

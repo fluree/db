@@ -259,7 +259,7 @@
   (when arglist
     (throw (ex-info "Unsupported syntax."
                     {:status 400 :error :db/invalid-query :term arglist})))
-  (parse-term iri))
+  {const/iri-id (parse-term iri)})
 
 (defmethod parse-term :UnaryExpression
   [[_ op-or-expr expr]]
@@ -527,13 +527,7 @@
   [[_ & bindings]]
   ;; bindings come in as val, var; need to be reversed to var, val.
   (into [:bind] (->> bindings
-                     (mapv (fn [term]
-                             (let [terms (into #{} (flatten term))
-                                   parsed (parse-term term)]
-                               (if (and (terms :iriOrFunction) (not= \( (first parsed)))
-                                 ;; static iri
-                                 {const/iri-id parsed}
-                                 (parse-term term)))))
+                     (mapv parse-term)
                      (partition-all 2)
                      (mapcat reverse))))
 
