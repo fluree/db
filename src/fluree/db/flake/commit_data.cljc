@@ -11,6 +11,7 @@
             [fluree.db.util :as util :refer [get-id get-first get-first-value
                                              get-value try* catch*]]
             [fluree.db.util.json :as json]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]))
 
@@ -136,7 +137,9 @@
   [jsonld]
   (let [id          (get-id jsonld)
         v           (get-first-value jsonld const/iri-v)
-        alias       (get-first-value jsonld const/iri-alias)
+        alias       (-> jsonld
+                        (get-first-value const/iri-alias)
+                        util.ledger/ensure-ledger-branch)
         address     (-> jsonld
                         (get-first-value const/iri-address)
                         not-empty)
