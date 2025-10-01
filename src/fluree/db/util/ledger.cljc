@@ -36,7 +36,8 @@
     (if (ledger-branch ledger-alias)
       ledger-alias
       (str ledger-alias ":" const/default-branch-name))
-    ledger-alias))
+    (throw (ex-info "Missing ledger name"
+                    {:status 400, :error :db/invalid-ledger-name}))))
 
 (defn validate-ledger-name
   "Validates a ledger name for creation. Throws if invalid.
