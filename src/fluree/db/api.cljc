@@ -15,7 +15,6 @@
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
-            [fluree.db.transact :as transact]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.ledger :as util.ledger]

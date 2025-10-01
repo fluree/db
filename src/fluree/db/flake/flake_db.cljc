@@ -32,6 +32,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.time-travel :refer [TimeTravel]]
+            [fluree.db.transact :as transact]
             [fluree.db.util :as util :refer [try* catch* get-id get-types get-list
                                              get-first get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
@@ -332,7 +333,7 @@
   (-finalize [_ _ _ solution-ch]
     solution-ch)
 
-  flake.transact/Transactable
+  transact/Transactable
   (-stage-txn [db tracker context identity author annotation raw-txn parsed-txn]
     (flake.transact/stage db tracker context identity author annotation raw-txn parsed-txn))
   (-merge-commit [db commit-jsonld commit-data-jsonld]
@@ -555,7 +556,7 @@
   [db error-ch [commit-jsonld db-data-jsonld]]
   (go
     (try*
-      (<? (flake.transact/-merge-commit db commit-jsonld db-data-jsonld))
+      (<? (transact/-merge-commit db commit-jsonld db-data-jsonld))
       (catch* e
         (log/error e "Error merging novelty commit")
         (>! error-ch e)))))
