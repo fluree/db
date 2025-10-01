@@ -145,11 +145,11 @@
   context."
   [alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
    indexing-opts did latest-commit]
-  (let [alias* (util.ledger/ensure-ledger-branch alias)
-        branch (util.ledger/ledger-branch alias*)
+  (let [alias*     (util.ledger/ensure-ledger-branch alias)
+        branch     (util.ledger/ledger-branch alias*)
         publishers (cons primary-publisher secondary-publishers)
-        branches {branch (branch/state-map alias branch commit-catalog index-catalog
-                                           publishers latest-commit indexing-opts)}]
+        branches   {branch (branch/state-map alias* branch commit-catalog index-catalog
+                                             publishers latest-commit indexing-opts)}]
     (map->Ledger {:id                   (random-uuid)
                   :did                  did
                   :state                (atom (initial-state branches branch))
