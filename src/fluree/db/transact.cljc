@@ -1,27 +1,16 @@
 (ns fluree.db.transact
-  (:require [clojure.string :as str]
-            [fluree.db.commit.storage :as commit-storage]
-            [fluree.db.constants :as const]
-            [fluree.db.did :as did]
-            [fluree.db.flake.commit-data :as commit-data]
-            [fluree.db.flake.transact :as flake.transact]
-            [fluree.db.json-ld.credential :as credential]
-            [fluree.db.json-ld.iri :as iri]
+  (:require [fluree.db.constants :as const]
             [fluree.db.json-ld.policy :as policy]
-            [fluree.db.ledger :as ledger]
-            [fluree.db.nameservice :as nameservice]
-            [fluree.db.storage :as storage]
             [fluree.db.track :as track]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.context :as context]
-            [fluree.db.util.ledger :as util.ledger]
-            [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(def f-context {"f" "https://ns.flur.ee/ledger#"})
+(defprotocol Transactable
+  (-stage-txn [db tracker context identity author annotation raw-txn parsed-txn])
+  (-merge-commit [db commit-jsonld commit-data-jsonld]))
 
 (defn nested-nodes?
   "Returns truthy if the provided node has any nested nodes."
@@ -70,7 +59,7 @@
      (let [{:keys [context raw-txn author]} parsed-opts
 
            annotation (extract-annotation context parsed-txn parsed-opts)]
-       (<? (flake.transact/-stage-txn db tracker context identity author annotation raw-txn parsed-txn))))))
+       (<? (-stage-txn db tracker context identity author annotation raw-txn parsed-txn))))))
 
 (defn stage-triples
   "Stages a new transaction that is already parsed into the
@@ -106,222 +95,3 @@
   (if (string? opts)
     {:message opts}
     (select-keys opts [:context :did :private :message :tag :index-files-ch])))
-
-(defn parse-commit-context
-  [context]
-  (let [parsed-context (if context
-                         (-> context
-                             json-ld/parse-context
-                             (json-ld/parse-context f-context))
-                         (json-ld/parse-context f-context))]
-    (context/stringify parsed-context)))
-
-(defn parse-keypair
-  [ledger {:keys [did private] :as opts}]
-  (let [private* (or private
-                     (:private did)
-                     (-> ledger :did :private))
-        did*     (or (some-> private* did/private->did)
-                     did
-                     (-> ledger :did :id))]
-    (assoc opts :did did*, :private private*)))
-
-(defn parse-data-helpers
-  [{:keys [context] :as opts}]
-  (let [ctx-used-atom (atom {})
-        compact-fn    (json-ld/compact-fn context ctx-used-atom)]
-    (assoc opts
-           :commit-data-opts {:compact-fn    compact-fn
-                              :compact       (fn [iri] (json-ld/compact iri compact-fn))
-                              :id-key        (json-ld/compact const/iri-id compact-fn)
-                              :type-key      (json-ld/compact const/iri-type compact-fn)
-                              :ctx-used-atom ctx-used-atom})))
-
-(defn parse-commit-opts
-  [ledger opts]
-  (-> opts
-      (update :context parse-commit-context)
-      (->> (parse-keypair ledger))
-      parse-data-helpers))
-
-(defn save-txn!
-  ([{:keys [commit-catalog alias] :as _ledger} txn]
-   (let [ledger-name (util.ledger/ledger-base-name alias)]
-     (save-txn! commit-catalog ledger-name txn)))
-  ([commit-catalog ledger-name txn]
-   (let [path (str/join "/" [ledger-name "txn"])]
-     (storage/content-write-json commit-catalog path txn))))
-
-;; TODO - as implemented the db handles 'staged' data as per below (annotation, raw txn)
-;; TODO - however this is really a concern of "commit", not staging and I don't think the db should be handling any of it
-(defn write-transaction!
-  [ledger ledger-name staged]
-  (go-try
-    (let [{:keys [txn author annotation]} staged
-          {:keys [commit-catalog]} ledger]
-      (if txn
-        (let [{txn-id :address} (<? (save-txn! commit-catalog ledger-name txn))]
-          {:txn-id     txn-id
-           :author     author
-           :annotation annotation})
-        staged))))
-
-(defn update-commit-address
-  "Once a commit address is known, which might be after the commit is written
-  if IPFS, add the final address into the commit map."
-  [[commit-map commit-jsonld] commit-address]
-  [(assoc commit-map :address commit-address)
-   (assoc commit-jsonld "address" commit-address)])
-
-(defn update-commit-id
-  "Once a commit address is known, which might be after the commit is written
-  if IPFS, add the final address into the commit map."
-  [[commit-map commit-jsonld] commit-hash]
-  (let [commit-id (commit-data/hash->commit-id commit-hash)]
-    [(assoc commit-map :id commit-id)
-     (assoc commit-jsonld "id" commit-id)]))
-
-(defn write-commit
-  [commit-storage alias {:keys [did private]} commit]
-  (go-try
-    (let [commit-jsonld (commit-data/->json-ld commit)
-          ;; For credential/generate, we need a DID map with public key
-          did-map (when (and did private)
-                    (if (map? did)
-                      did
-                      (did/private->did-map private)))
-          signed-commit (if did-map
-                          (<? (credential/generate commit-jsonld private did-map))
-                          commit-jsonld)
-          commit-res    (<? (commit-storage/write-jsonld commit-storage alias signed-commit))
-
-          [commit* commit-jsonld*]
-          (-> [commit commit-jsonld]
-              (update-commit-id (:hash commit-res))
-              (update-commit-address (:address commit-res)))]
-      {:commit-map    commit*
-       :commit-jsonld commit-jsonld*
-       :write-result  commit-res})))
-
-(defn publish-commit
-  "Publishes commit to all nameservices registered with the ledger."
-  [{:keys [primary-publisher secondary-publishers] :as _ledger} commit-jsonld]
-  (go-try
-    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
-      (nameservice/publish-to-all commit-jsonld secondary-publishers)
-      result)))
-
-(defn formalize-commit
-  [{prev-commit :commit :as staged-db} new-commit]
-  (let [max-ns-code (-> staged-db :namespace-codes iri/get-max-namespace-code)]
-    (-> staged-db
-        (assoc :commit new-commit
-               :staged nil
-               :prev-commit prev-commit
-               :max-namespace-code max-ns-code)
-        (commit-data/add-commit-flakes))))
-
-(defn indexing-needed?
-  [novelty-size min-size]
-  (>= novelty-size min-size))
-
-(defn commit!
-  "Finds all uncommitted transactions and wraps them in a Commit document as the subject
-  of a VerifiableCredential. Persists according to the :ledger :conn :method and
-  returns a db with an updated :commit."
-  ([ledger db]
-   (commit! ledger db {}))
-  ([{ledger-alias :alias :as ledger}
-    {:keys [branch t stats commit] :as staged-db}
-    opts]
-   (log/debug "commit!: write-transaction start" {:ledger ledger-alias})
-   (go-try
-     (let [{:keys [commit-catalog]} ledger
-           ledger-name (util.ledger/ledger-base-name ledger-alias)
-
-           {:keys [tag time message did private commit-data-opts index-files-ch]
-            :or   {time (util/current-time-iso)}}
-           (parse-commit-opts ledger opts)
-
-           {:keys [db-jsonld staged-txn]}
-           (commit-data/db->jsonld staged-db commit-data-opts)
-
-           {:keys [txn-id author annotation]}
-           (<? (write-transaction! ledger ledger-name staged-txn))
-
-           _ (log/debug "commit!: write-jsonld(db) start" {:ledger ledger-alias})
-
-           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-name db-jsonld))
-
-           _ (log/debug "commit!: write-jsonld(db) done" {:ledger ledger-alias :db-address (:address data-write-result)})
-           db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
-           dbid              (commit-data/hash->db-id (:hash data-write-result))
-           keypair           {:did did, :private private}
-
-           new-commit (commit-data/new-db-commit-map {:old-commit commit
-                                                      :issuer     did
-                                                      :message    message
-                                                      :tag        tag
-                                                      :dbid       dbid
-                                                      :t          t
-                                                      :time       time
-                                                      :db-address db-address
-                                                      :author     author
-                                                      :annotation annotation
-                                                      :txn-id     txn-id
-                                                      :flakes     (:flakes stats)
-                                                      :size       (:size stats)})
-
-           _ (log/debug "commit!: write-commit start" {:ledger ledger-alias})
-
-           {:keys [commit-map commit-jsonld write-result]}
-           (<? (write-commit commit-catalog ledger-name keypair new-commit))
-
-           _ (log/debug "commit!: write-commit done" {:ledger ledger-alias :commit-address (:address write-result)})
-
-           db  (formalize-commit staged-db commit-map)
-
-           _ (log/debug "commit!: ledger/update-commit! start" {:ledger ledger-alias :t t})
-
-           db* (ledger/update-commit! ledger branch db index-files-ch)]
-
-       (log/debug "commit!: ledger/update-commit! done, publish-commit start" {:ledger ledger-alias :t t :at time})
-
-       (<? (publish-commit ledger commit-jsonld))
-
-       (log/debug "commit!: publish-commit done" {:ledger ledger-alias})
-
-       (if (track/track-txn? opts)
-         (let [index-t (commit-data/index-t commit-map)
-               novelty-size (get-in db* [:novelty :size] 0)
-               ;; Always read threshold from realized FlakeDB; db* may be AsyncDB
-               reindex-min-bytes (or (:reindex-min-bytes db) 1000000)]
-           (-> write-result
-               (select-keys [:address :hash :size])
-               (assoc :ledger-id ledger-alias
-                      :t t
-                      :db db*
-                      :indexing-needed (indexing-needed? novelty-size reindex-min-bytes)
-                      :index-t index-t
-                      :indexing-enabled (ledger/indexing-enabled? ledger branch)
-                      :novelty-size novelty-size)))
-         db*)))))
-
-(defn transact-ledger!
-  [ledger parsed-txn]
-  (go-try
-    (let [{:keys [branch] :as parsed-opts,
-           :or   {branch const/default-branch-name}}
-          (:opts parsed-txn)
-
-          db       (ledger/current-db ledger branch)
-          staged   (<? (stage-triples db parsed-txn))
-          ;; commit API takes a did-map and parsed context as opts
-          ;; whereas stage API takes a did IRI and unparsed context.
-          ;; Dissoc them until deciding at a later point if they can carry through.
-          cmt-opts (dissoc parsed-opts :context :identity)]
-      (if (track/track-txn? parsed-opts)
-        (let [staged-db     (:db staged)
-              commit-result (<? (commit! ledger staged-db cmt-opts))]
-          (merge staged commit-result))
-        (<? (commit! ledger staged cmt-opts))))))

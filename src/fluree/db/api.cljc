@@ -404,7 +404,7 @@
             ;; For newly created ledgers, we need to commit through the alias
             ;; not the full ledger-id, as the branch info may not be in nameservice yet
             ledger (<? (connection/load-ledger conn alias))]
-        (<? (transact/commit! ledger db opts)))))))
+        (<? (ledger/commit! ledger db opts)))))))
 
 (defn ^:deprecated transact!
   "Deprecated: Use `update!` instead.
@@ -867,7 +867,7 @@
     db - Database value
     methods - Reasoner method or vector of methods (:datalog, :owl2rl, :owl-datalog)
               :datalog - Custom datalog rules
-              :owl2rl - OWL 2 RL profile rules  
+              :owl2rl - OWL 2 RL profile rules
               :owl-datalog - Extended OWL 2 RL with additional Datalog-compatible constructs
     rule-sources - (optional) JSON-LD rules or nil to use rules from db
     opts - (optional) Options map
@@ -922,7 +922,7 @@
     (let [indexed-db @(trigger-index conn \"my-ledger\")]
       ;; Use indexed-db...
       )
-    
+
     ;; Trigger indexing for a specific branch
     (let [indexed-db @(trigger-index conn \"my-ledger:main\")]
       ;; Use indexed-db...
