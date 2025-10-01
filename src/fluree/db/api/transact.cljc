@@ -59,7 +59,7 @@
                             {:status 409 :error :db/ledger-not-exists}
                             ledger))
             (throw ledger))
-          (<? (ledger/transact-ledger! ledger parsed-txn))))
+          (<? (ledger/transact! ledger parsed-txn))))
       (throw (ex-info "Missing ledger specification."
                       {:ledger-id ledger-id
                        :status 400})))))
@@ -134,7 +134,7 @@
            ledger-opts (-> parsed-txn :opts syntax/coerce-ledger-opts)
            _           (util.ledger/validate-ledger-name ledger-id)
            ledger      (<? (connection/create-ledger conn ledger-id ledger-opts))]
-       (<? (ledger/transact-ledger! ledger parsed-txn))))))
+       (<? (ledger/transact! ledger parsed-txn))))))
 
 (defn credential-create-with-txn!
   [conn txn]

@@ -396,7 +396,7 @@
                       :novelty-size novelty-size)))
          db*)))))
 
-(defn transact-ledger!
+(defn transact!
   [ledger parsed-txn]
   (go-try
     (let [{:keys [branch] :as parsed-opts,
