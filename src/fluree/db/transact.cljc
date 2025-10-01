@@ -100,13 +100,6 @@
                           db)]
           (<? (stage policy-db identity parsed-txn parsed-opts)))))))
 
-(defn sanitize-commit-options
-  "Parses the commit options and removes non-public opts."
-  [opts]
-  (if (string? opts)
-    {:message opts}
-    (select-keys opts [:context :did :private :message :tag :index-files-ch])))
-
 (defn parse-commit-context
   [context]
   (let [parsed-context (if context
