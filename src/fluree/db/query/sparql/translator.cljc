@@ -362,15 +362,15 @@
   ;; PrefixDecl ::= <'PREFIX'> WS PNAME_NS WS IRIREF
   ;; [:PrefixDecl "e" "x" ":" [:IRIREF "<http://example.com/>"]]
   [[_ & prefix-decl]]
-  (let [prefix (->> (drop-last 2 prefix-decl) vec str/join not-empty
-                    ;; sometimes no prefix is specified: PREFIX : <my:IRI> and all IRIs
-                    ;; are just prefixed with a colon
-                    (or ":"))
-        iri    (->> prefix-decl
-                    (drop-while (comp not sequential?))
-                    first
-                    parse-term)]
-    [[prefix iri]]))
+  (let [prefix  (->> (drop-last 2 prefix-decl) vec str/join not-empty)
+        ;; sometimes no prefix is specified: PREFIX : <my:IRI> and
+        ;; all IRIs are just prefixed with a colon
+        prefix* (or prefix ":")
+        iri     (->> prefix-decl
+                     (drop-while (comp not sequential?))
+                     first
+                     parse-term)]
+    [[prefix* iri]]))
 
 (defmethod parse-rule :BaseDecl
   ;; BaseDecl ::= <'BASE'> WS IRIREF
