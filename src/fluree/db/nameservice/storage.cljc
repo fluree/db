@@ -20,78 +20,101 @@
         branch (or branch const/default-branch-name)]
     (str const/ns-version "/" ledger-name "/" branch ".json")))
 
-(defn ns-record
-  "Generates nameservice metadata map for JSON storage using new minimal format.
-   Expects ledger-alias to be in format 'ledger:branch' with metadata support."
-  ([ledger-alias commit-address t index-address]
-   (ns-record ledger-alias commit-address t index-address nil))
-  ([ledger-alias commit-address t index-address metadata]
-   (let [[alias branch] (util.ledger/ledger-parts ledger-alias)
-         branch (or branch const/default-branch-name)
-         base-record {"@context"     {"f" iri/f-ns}
-                      "@id"          ledger-alias  ;; Already includes :branch
-                      "@type"        ["f:Database" "f:PhysicalDatabase"]
-                      "f:ledger"     {"@id" alias}  ;; Just the ledger name without branch
-                      "f:branch"     branch
-                      "f:commit"     {"@id" commit-address}
-                      "f:t"          t
-                      "f:status"     "ready"}]
-     (cond-> (merge base-record (util.branch/metadata->flat-fields metadata))
-       index-address (assoc "f:index" {"@id" index-address})))))
+(defn new-ns-record
+  "Generates nameservice metadata map for JSON storage with branch metadata support.
+   Expects ledger-alias to be in format 'ledger:branch'."
+  [ledger-alias commit-address t index-address metadata]
+  (let [[alias branch] (util.ledger/ledger-parts ledger-alias)
+        branch (or branch const/default-branch-name)
+        base-record {"@context"     {"f" iri/f-ns}
+                     "@id"          ledger-alias  ;; Already includes :branch
+                     "@type"        ["f:Database" "f:PhysicalDatabase"]
+                     "f:ledger"     {"@id" alias}  ;; Just the ledger name without branch
+                     "f:branch"     branch
+                     "f:commit"     {"@id" commit-address}
+                     "f:t"          t
+                     "f:status"     "ready"}]
+    (cond-> (merge base-record (util.branch/metadata->flat-fields metadata))
+      index-address (assoc "f:index" {"@id" index-address}))))
 
-(defn- validate-publish
-  "Validates whether a publish operation is allowed based on existing records.
-  Throws an exception if the operation is invalid."
-  [ledger-alias t-value existing-record is-branch-creation]
-  (when existing-record
-    (let [existing-t (get existing-record "f:t")]
+(defn get-t
+  [ns-record]
+  (get ns-record "f:t" 0))
+
+(defn update-commit-address
+  "Updates commit address if new t is greater than existing t.
+   For branch creation, also validates that branch doesn't already exist."
+  [ns-record ledger-alias commit-address commit-t is-branch-creation]
+  (if (and commit-address commit-t)
+    (let [prev-t (get-t ns-record)]
       (cond
         ;; Branch creation: if this is a new branch creation and t matches existing, this is invalid
-        (and is-branch-creation (= t-value existing-t))
-        (throw (ex-info (str "Cannot create branch - it already exists with t=" existing-t)
+        (and is-branch-creation (= commit-t prev-t))
+        (throw (ex-info (str "Cannot create branch - it already exists with t=" prev-t)
                         {:status 409 :error :db/branch-exists
-                         :alias ledger-alias :existing-t existing-t}))
+                         :alias ledger-alias :existing-t prev-t}))
 
-        ;; Normal commit: new t must be greater than or equal to existing t
-        ;; Allow same t for updates (e.g., index updates)
-        (< t-value existing-t)
-        (throw (ex-info (str "Cannot publish commit with t=" t-value
-                             " - current HEAD is at t=" existing-t)
+        ;; Normal commit: new t must be greater than existing t
+        (< commit-t prev-t)
+        (throw (ex-info (str "Cannot publish commit with t=" commit-t
+                             " - current HEAD is at t=" prev-t)
                         {:status 409 :error :db/invalid-commit-sequence
-                         :alias ledger-alias :new-t t-value :existing-t existing-t}))))))
+                         :alias ledger-alias :new-t commit-t :existing-t prev-t}))
+
+        ;; Allow same t for updates (e.g., index updates)
+        (>= commit-t prev-t)
+        (assoc ns-record
+               "f:t" commit-t
+               "f:commit" {"@id" commit-address})))
+    ns-record))
+
+(defn update-index-address
+  [ns-record index-address]
+  (if index-address
+    (assoc ns-record "f:index" {"@id" index-address})
+    ns-record))
+
+(defn update-metadata
+  "Merges branch metadata, preserving existing values when not provided."
+  [ns-record new-metadata]
+  (let [existing-metadata (util.branch/extract-branch-metadata ns-record)
+        merged-metadata (merge existing-metadata new-metadata)]
+    (merge ns-record (util.branch/metadata->flat-fields merged-metadata))))
+
+(defn update-ns-record
+  "Atomically updates nameservice record with validation."
+  [ns-record ledger-alias commit-address commit-t index-address metadata is-branch-creation]
+  (if (some? ns-record)
+    (-> ns-record
+        (update-commit-address ledger-alias commit-address commit-t is-branch-creation)
+        (update-index-address index-address)
+        (update-metadata metadata))
+    ;; New record
+    (new-ns-record ledger-alias commit-address commit-t index-address metadata)))
 
 (defrecord StorageNameService [store]
   nameservice/Publisher
-  (publish [this data]
-    (go-try
-      (let [ledger-alias   (get data "alias")  ;; Already includes :branch
-            commit-address (get data "address")
-            t-value        (get-in data ["data" "t"])
+  (publish [_ data]
+    (let [ledger-alias   (get data "alias")  ;; Already includes :branch
+          path           (local-path ledger-alias)]
+      (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :path path})
+      (let [commit-address (get data "address")
+            commit-t       (get-in data ["data" "t"])
             index-address  (get-in data ["index" "address"])
-            ;; Extract metadata from incoming data and existing record
-            new-metadata (util.branch/extract-branch-metadata data)
-            existing-record (<? (nameservice/lookup this ledger-alias))
-            existing-metadata (when existing-record (util.branch/extract-branch-metadata existing-record))
-
-            ;; Merge metadata, preserving existing values when not provided
-            metadata (merge existing-metadata new-metadata)
-
+            ;; Extract metadata from incoming data
+            new-metadata   (util.branch/extract-branch-metadata data)
             ;; Check if this is a branch creation (has source metadata)
             is-branch-creation (and (:source-branch new-metadata) (:source-commit new-metadata))
-            _ (log/debug "StorageNameService/publish called with alias:" ledger-alias
-                         "commit-address:" commit-address "t:" t-value
-                         "is-branch-creation?" is-branch-creation)
-
-            ns-metadata    (ns-record ledger-alias commit-address t-value index-address metadata)
-            record-bytes   (json/stringify-UTF8 ns-metadata)
-            path           (local-path ledger-alias)]
-
-        (validate-publish ledger-alias t-value existing-record is-branch-creation)
-
-        (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :path path})
-        (let [res (<? (storage/write-bytes store path record-bytes))]
-          (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :path path})
-          res))))
+            _ (log/debug "StorageNameService/publish" {:alias ledger-alias
+                                                       :commit-address commit-address
+                                                       :t commit-t
+                                                       :is-branch-creation? is-branch-creation})
+            record-updater (fn [ns-record]
+                             (update-ns-record ns-record ledger-alias commit-address commit-t
+                                               index-address new-metadata is-branch-creation))
+            res            (storage/swap-json store path record-updater)]
+        (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :path path})
+        res)))
 
   (retract [_ ledger-alias]
     (let [path (local-path ledger-alias)
