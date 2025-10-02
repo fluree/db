@@ -12,6 +12,7 @@
             [fluree.db.storage :as storage]
             [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.branch :as util.branch]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log :include-macros true])
   #?(:clj (:import (java.io Writer))))
@@ -273,9 +274,11 @@
     (loop [[nsv & r] (publishers conn)
            addrs     []]
       (if nsv
-        (if (<? (nameservice/published-ledger? nsv ledger-alias))
-          (recur r (conj addrs (<? (nameservice/publishing-address nsv ledger-alias))))
-          (recur r addrs))
+        (let [published? (<? (nameservice/published-ledger? nsv ledger-alias))]
+          (log/info "published-addresses: checking" ledger-alias "published?" published?)
+          (if published?
+            (recur r (conj addrs (<? (nameservice/publishing-address nsv ledger-alias))))
+            (recur r addrs)))
         addrs))))
 
 (defn published-ledger?
@@ -320,10 +323,15 @@
     (-> conn :defaults :identity)))
 
 (defn parse-ledger-options
-  [conn {:keys [did indexing]}]
-  (let [did*           (parse-identity conn did)
-        ledger-default (-> conn :defaults :indexing)
-        indexing*      (merge ledger-default indexing)]
+  [conn {:keys [did indexing] :as opts}]
+  (let [did*                 (parse-identity conn did)
+        ledger-default       (-> conn :defaults :indexing)
+        ;; Support flat indexing keys passed directly to create opts
+        flat-indexing-opts   (select-keys opts [:reindex-min-bytes
+                                                :reindex-max-bytes
+                                                :max-old-indexes
+                                                :indexing-enabled])
+        indexing*            (merge ledger-default flat-indexing-opts indexing)]
     {:did      did*
      :indexing indexing*}))
 
@@ -369,30 +377,35 @@
 
 (defn load-ledger*
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn}
-   ledger-chan address]
+   ledger-chan ledger-address]
   (go-try
-    (if-let [ns-record (<? (lookup-commit conn address))]
+    (log/info "load-ledger*: Loading from address" ledger-address)
+    (if-let [ns-record (<? (lookup-commit conn ledger-address))]
       (let [;; Extract minimal data from nameservice
             commit-address (get-in ns-record ["f:commit" "@id"])
             index-address  (get-in ns-record ["f:index" "@id"])
+            _ (log/info "load-ledger*: Found ns-record with commit" commit-address "for" ledger-address)
 
             ;; Load full commit from disk
-            _               (log/debug "Attempting to load from address:" address)
+            _               (log/debug "Attempting to load from address:" ledger-address)
             expanded-commit (<? (commit-storage/load-commit-with-metadata commit-catalog
                                                                           commit-address
                                                                           index-address))
-            ledger-alias    (commit->ledger-alias conn address expanded-commit)
+            ;; ledger-address already contains the full alias with branch
+            ledger-alias    ledger-address
 
             {:keys [did indexing]} (parse-ledger-options conn {})
-            ledger                 (ledger/instantiate ledger-alias address commit-catalog
+            ;; Extract branch metadata from ns-record
+            branch-metadata (util.branch/extract-branch-metadata ns-record)
+            ledger                 (ledger/instantiate ledger-alias ledger-address commit-catalog
                                                        index-catalog primary-publisher
                                                        secondary-publishers indexing did
-                                                       expanded-commit)]
+                                                       expanded-commit branch-metadata)]
         (subscribe-ledger conn ledger-alias)
         (async/put! ledger-chan ledger)
         ledger)
-      (throw (ex-info (str "Unable to load. No record of ledger at address: " address " exists.")
-                      {:status 404, :error :db/unkown-address})))))
+      (throw (ex-info (str "Unable to load. No record of ledger at address: " ledger-address " exists.")
+                      {:status 404, :error :db/unknown-address})))))
 
 (defn load-ledger-address
   [conn address]
@@ -418,14 +431,14 @@
       (if cached?
         (<? ledger-chan)
         (let [addresses (<? (current-addresses conn normalized-alias))]
-          (log/debug "load-ledger-alias: Looking for" normalized-alias "found addresses:" addresses)
+          (log/info "load-ledger-alias: Looking for" normalized-alias "found addresses:" addresses)
           (loop [[addr & r] addresses]
             (if addr
               (or (<? (try-load-address conn ledger-chan normalized-alias addr))
                   (recur r))
               (do (release-ledger conn normalized-alias)
                   (let [ex (ex-info (str "Load for " normalized-alias " failed due to failed address lookup.")
-                                    {:status 404, :error :db/unkown-ledger})]
+                                    {:status 404, :error :db/unknown-ledger})]
                     (async/put! ledger-chan ex)
                     (throw ex))))))))))
 

@@ -8,74 +8,49 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util :as util :refer [get-first get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.branch :as util.branch]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn get-branch-meta
-  "Retrieves branch metadata from ledger state"
-  [{:keys [state] :as _ledger} requested-branch]
-  (let [{:keys [branch branches]} @state]
-    (if requested-branch
-      (get branches requested-branch)
-      ;; default branch
-      (get branches branch))))
-
-(defn indexing-enabled?
-  [ledger branch]
-  (-> ledger (get-branch-meta branch) branch/indexing-enabled?))
-
-(defn available-branches
-  [{:keys [state] :as _ledger}]
-  (-> @state :branches keys))
-
 ;; TODO - no time travel, only latest db on a branch thus far
 (defn current-db
-  ([ledger]
-   (current-db ledger nil))
-  ([ledger branch]
-   (if-let [branch-meta (get-branch-meta ledger branch)] ; if branch is nil, will return default
-     (branch/current-db branch-meta)
-     (throw (ex-info (str "Invalid branch: " branch " is not one of:"
-                          (available-branches ledger))
-                     {:status 400, :error :db/invalid-branch})))))
+  "Returns the current database for this ledger.
+  Since each ledger now represents a single branch, no branch parameter is needed."
+  [ledger]
+  (let [state (:state ledger)]
+    (branch/current-db @state)))
 
 (defn update-commit!
   "Updates both latest db and commit db. If latest registered index is
   newer than provided db, updates index before storing.
 
   If index in provided db is newer, updates latest index held in ledger state."
-  ([ledger branch-name db]
-   (update-commit! ledger branch-name db nil))
-  ([{:keys [state] :as ledger} branch-name db index-files-ch]
-   (log/debug "Attempting to update ledger:" (:alias ledger)
-              "and branch:" branch-name "with new commit to t" (:t db))
-   (if-let [branch-meta (get-branch-meta ledger branch-name)]
-     (-> branch-meta
-         (branch/update-commit! db index-files-ch)
-         branch/current-db)
-     (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
-                          "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
-                     {:status 400, :error :db/invalid-branch})))))
+  ([ledger db]
+   (update-commit! ledger db nil))
+  ([{:keys [state alias] :as _ledger} db index-files-ch]
+   (log/debug "Attempting to update ledger:" alias "with new commit to t" (:t db))
+   (-> @state
+       (branch/update-commit! db index-files-ch)
+       branch/current-db)))
 
 (defn status
-  "Returns current commit metadata for specified branch (or default branch if nil)"
-  ([ledger]
-   (status ledger const/default-branch-name))
-  ([{:keys [address alias] :as ledger} requested-branch]
-   (let [branch-data (get-branch-meta ledger requested-branch)
-         current-db  (branch/current-db branch-data)
-         {:keys [commit stats t]} current-db
-         {:keys [size flakes]} stats
-         branch (or requested-branch (:branch @(:state ledger)))]
-     {:address address
-      :alias   alias
-      :branch  branch
-      :t       t
-      :size    size
-      :flakes  flakes
-      :commit  commit})))
+  "Returns current commit metadata for this ledger"
+  [{:keys [address alias state]}]
+  (let [alias*      (util.ledger/ensure-ledger-branch alias)
+        current-db  (branch/current-db @state)
+        {:keys [commit stats t]} current-db
+        {:keys [size flakes]} stats
+        ;; Extract branch from normalized alias
+        branch      (util.ledger/ledger-branch alias*)]
+    {:address address
+     :alias   alias*
+     :branch  branch
+     :t       t
+     :size    size
+     :flakes  flakes
+     :commit  commit}))
 
 (defn notify
   "Returns false if provided commit update did not result in an update to the ledger because
@@ -84,11 +59,10 @@
   If commit successful, returns successfully updated db."
   [ledger expanded-commit expanded-data]
   (go-try
-    (let [branch    (get-first-value expanded-commit const/iri-branch)
-          commit-t  (-> expanded-commit
+    (let [commit-t  (-> expanded-commit
                         (get-first const/iri-data)
                         (get-first-value const/iri-fluree-t))
-          db        (current-db ledger branch)
+          db        (current-db ledger)
           current-t (:t db)]
       (log/debug "notify of new commit for ledger:" (:alias ledger)
                  "at t value:" commit-t "where current cached db t value is:"
@@ -97,7 +71,7 @@
       (cond
         (= commit-t (flake/next-t current-t))
         (let [updated-db (<? (flake.transact/-merge-commit db expanded-commit expanded-data))]
-          (update-commit! ledger branch updated-db)
+          (update-commit! ledger updated-db)
           ::updated)
 
         ;; missing some updates, dump in-memory ledger forcing a reload
@@ -124,25 +98,30 @@
 (defrecord Ledger [id address alias did state cache commit-catalog
                    index-catalog reasoner primary-publisher secondary-publishers indexing-opts])
 
-(defn initial-state
-  [branches current-branch]
-  {:branches branches
-   :branch   current-branch
-   :graphs   {}})
-
 (defn instantiate
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
-   indexing-opts did latest-commit]
-  (let [alias*     (util.ledger/ensure-ledger-branch alias)
-        branch     (util.ledger/ledger-branch alias*)
+  [combined-alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
+   indexing-opts did latest-commit & [branch-metadata]]
+  (let [alias* (util.ledger/ensure-ledger-branch combined-alias)
+        branch (util.ledger/ledger-branch alias*)
         publishers (cons primary-publisher secondary-publishers)
-        branches   {branch (branch/state-map alias* branch commit-catalog index-catalog
-                                             publishers latest-commit indexing-opts)}]
+        branch-state (branch/state-map alias* branch commit-catalog index-catalog
+                                       publishers latest-commit indexing-opts)
+        ;; Add branch metadata
+        ;; When creating new ledger (no branch-metadata), it's always main branch
+        ;; When loading existing ledger, branch-metadata comes from nameservice
+        branch-state-with-meta (if branch-metadata
+                                 ;; Loading existing ledger - use metadata from nameservice
+                                 (merge branch-state branch-metadata)
+                                 ;; Creating new ledger - always main branch
+                                 (assoc branch-state
+                                        :created-at (util/current-time-iso)
+                                        :created-from nil ;; main branch has no parent
+                                        :protected true))]  ;; main branch is protected
     (map->Ledger {:id                   (random-uuid)
                   :did                  did
-                  :state                (atom (initial-state branches branch))
+                  :state                (atom branch-state-with-meta)  ;; Just the branch state directly
                   :alias                alias*  ;; Full alias including branch
                   :address              ledger-address
                   :commit-catalog       commit-catalog
@@ -174,14 +153,36 @@
                    primary-publisher secondary-publishers indexing did genesis-commit))))
 
 (defn trigger-index!
-  "Manually triggers indexing for a ledger on the specified branch.
-   Uses the current db for that branch. Returns a channel that will receive
-   the result when indexing completes.
+  "Manually triggers indexing for this ledger.
+   Returns a channel that will receive the result when indexing completes.
+   Since each ledger now represents a single branch, no branch parameter is needed."
+  [ledger]
+  (let [state (:state ledger)]
+    (branch/trigger-index! @state)))
 
-   Options:
-   - branch: Branch name (defaults to main branch if not specified)"
-  ([ledger]
-   (trigger-index! ledger nil))
-  ([ledger branch]
-   (let [branch-meta (get-branch-meta ledger branch)]
-     (branch/trigger-index! branch-meta))))
+;; Branch operations are now handled at the connection/nameservice level
+;; Each branch is a separate ledger object
+
+(defn branch-info
+  "Returns detailed information about this ledger's branch"
+  [{:keys [primary-publisher alias state] :as _ledger}]
+  (go-try
+    ;; Extract branch from alias
+    (let [current-branch (or (util.ledger/ledger-branch alias) "main")]
+      ;; Get nameservice record for branch if available, otherwise get from state
+      (if primary-publisher
+        (let [ns-record (<? (nameservice/lookup primary-publisher alias))
+              metadata (util.branch/extract-branch-metadata ns-record)]
+          (merge {:name current-branch
+                  :head (get-in ns-record ["f:commit" "@id"])
+                  :t (get ns-record "f:t")}
+                 metadata))
+        ;; No publisher, return info from in-memory state
+        (when state
+          (let [branch-meta @state
+                current-db (branch/current-db branch-meta)]
+            (merge {:name current-branch
+                    :head (get-in current-db [:commit :address])
+                    :t (:t current-db)}
+                   (select-keys branch-meta [:created-at :source-branch :source-commit
+                                             :protected :description]))))))))
