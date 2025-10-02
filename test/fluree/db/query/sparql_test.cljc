@@ -332,7 +332,7 @@
                  }"
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?s", "?pred" "?o"}
-              [:filter "(not= \"schema:pred\" ?pred)"]]
+              [:filter "(not= {\"@id\" \"schema:pred\"} ?pred)"]]
              where)
           "filter string values"))
     (let [query "SELECT ?s
@@ -629,8 +629,8 @@
                 [:bind "?floor" "(floor 1.8)"]
                 [:bind "?hours" "(hours \"2024-4-1T14:45:13.815-05:00\")"]
                 [:bind "?if" "(if \"true\" \"yes\" \"no\")"]
-                [:bind "?in" "(in ?age [1 2 3 \"foo\" \"ex:bar\"])"]
-                [:bind "?notIn" "(not (in ?age [1 2 3 \"foo\" \"ex:bar\"]))"]
+                [:bind "?in" "(in ?age [1 2 3 \"foo\" {\"@id\" \"ex:bar\"}])"]
+                [:bind "?notIn" "(not (in ?age [1 2 3 \"foo\" {\"@id\" \"ex:bar\"}]))"]
                 [:bind "?iri" "(iri \"http://example.com\")"]
                 [:bind "?lang" "(lang \"Robert\"\"@en\")"]
                 [:bind "?langMatches" "(langMatches ?lang \"FR\")"]
@@ -725,7 +725,7 @@
                     } GROUP BY ?y
                   }
                 }"]
-      (is (= {:context {"" "http://people.example/"},
+      (is (= {:context {":" "http://people.example/"},
               :select ["?y" "?minName"],
               :where
               [{"@id" ":alice", ":knows" "?y"}
@@ -757,6 +757,22 @@
       (is (= {"foaf" "http://xmlns.com/foaf/0.1/"
               "ex"   "http://example.org/ns/"}
              context))))
+  (testing "PREFIX :"
+    (let [query "PREFIX : <http://example.com/>
+                 SELECT ?foo
+                 WHERE {?s :foo ?foo }"]
+      (is (= {:context {":" "http://example.com/"}
+              :select ["?foo"]
+              :where [{"@id" "?s" ":foo" "?foo"}]}
+             (sparql/->fql query)))))
+  (testing "BASE"
+    (let [query "BASE <http://example.com/>
+                 SELECT ?foo
+                 WHERE {?s <foo> ?foo }"]
+      (is (= {:context {"@base" "http://example.com/" "@vocab" "http://example.com/"}
+              :select ["?foo"],
+              :where [{"@id" "?s" "foo" "?foo"}]}
+             (sparql/->fql query)))))
   (testing "comments"
     (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
                  PREFIX ex: <http://example.org/ns/>
