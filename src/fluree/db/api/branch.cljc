@@ -26,8 +26,10 @@
   Returns the new branch metadata."
   [conn new-branch-spec from-branch-spec from-commit]
   (go-try
-    (let [[ledger-id new-branch] (util.ledger/ledger-parts new-branch-spec)
-          [from-ledger-id from-branch] (util.ledger/ledger-parts from-branch-spec)]
+    (let [new-branch-spec* (util.ledger/ensure-ledger-branch new-branch-spec)
+          from-branch-spec* (util.ledger/ensure-ledger-branch from-branch-spec)
+          [ledger-id new-branch] (util.ledger/ledger-parts new-branch-spec*)
+          [from-ledger-id from-branch] (util.ledger/ledger-parts from-branch-spec*)]
 
       (when (not= ledger-id from-ledger-id)
         (throw (ex-info "Cannot create branch across different ledgers"
@@ -43,10 +45,8 @@
                       :source-branch from-branch
                       :source-commit source-commit-id}
 
-            ;; Copy cuckoo filter from source branch to new branch (if storage supports it)
             index-catalog (:index-catalog source-db)
             _ (when (and index-catalog (:storage index-catalog))
-                ;; Read the source branch's filter and copy it if it exists
                 (when-let [source-filter (<? (cuckoo/read-filter index-catalog ledger-id from-branch))]
                   (<? (cuckoo/write-filter index-catalog ledger-id new-branch
                                            (:t source-db) source-filter))))

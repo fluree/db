@@ -446,18 +446,17 @@
               psot-ch    (drop-index-nodes storage (:id psot))
               post-ch    (drop-index-nodes storage (:id post))
               tspo-ch    (drop-index-nodes storage (:id tspo))
-              opst-ch    (drop-index-nodes storage (:id opst))
-              ;; Also clean up cuckoo filter files for all branches
-              cuckoo-ch  (when ledger-alias
-                           (let [ledger-name (first (str/split ledger-alias #":" 2))]
-                             (cuckoo/delete-all-filters index-catalog ledger-name)))]
+              opst-ch    (drop-index-nodes storage (:id opst))]
           (<? garbage-ch)
           (<? spot-ch)
           (<? psot-ch)
           (<? post-ch)
           (<? tspo-ch)
           (<? opst-ch)
-          (when cuckoo-ch (<? cuckoo-ch))
+          ;; Clean up cuckoo filter files for all branches - after gc to avoid race condition
+          (when ledger-alias
+            (let [ledger-name (first (str/split ledger-alias #":" 2))]
+              (<? (cuckoo/delete-all-filters index-catalog ledger-name))))
           (<? (storage/delete storage index-address))))
       :index-dropped)))
 

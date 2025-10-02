@@ -382,6 +382,23 @@
         async/merge
         (async/reduce tally {:db db, :indexes [], :garbage #{}, :new-segments []}))))
 
+(defn update-branch-filter-with-segments
+  "Updates the cuckoo filter for a branch with new index segments and root file."
+  [index-catalog alias t new-segments db-root-res]
+  (go-try
+    (let [alias* (util.ledger/ensure-ledger-branch alias)
+          [ledger-id branch-name] (util.ledger/ledger-parts alias*)
+          existing-filter (<? (cuckoo/read-filter index-catalog ledger-id branch-name))
+          filter (or existing-filter (cuckoo/create-filter-chain))
+          segment-hashes (mapv cuckoo/extract-hash-part new-segments)
+          all-hashes (cond-> segment-hashes
+                       (:address db-root-res)
+                       (conj (cuckoo/extract-hash-part (:address db-root-res))))
+          updated-filter (if (seq all-hashes)
+                           (cuckoo/batch-add-chain filter all-hashes)
+                           filter)]
+      (<? (cuckoo/write-filter index-catalog ledger-id branch-name t updated-filter)))))
+
 (defn refresh
   [{:keys [novelty t alias] :as db} changes-ch max-old-indexes]
   (go-try
@@ -413,21 +430,7 @@
                                    write-res))
                  db-root-res   (<? (storage/write-db-root index-catalog refreshed-db* (:address garbage-res)))
                  _             (<! (notify-new-index-file db-root-res :root t changes-ch))
-
-                 ;; Update cuckoo filter with new segments
-                 _ (let [[ledger-id branch-name] (util.ledger/ledger-parts alias)
-                                              ;; Read existing filter or create new one
-                         existing-filter (<? (cuckoo/read-filter index-catalog ledger-id branch-name))
-                         filter (or existing-filter (cuckoo/create-filter-chain))
-                                              ;; Add new segments and db-root (but NOT garbage file)
-                         all-segments (cond-> new-segments
-                                        (:address db-root-res)
-                                        (conj (last (str/split (:address db-root-res) #"/"))))
-                         updated-filter (if (seq all-segments)
-                                          (cuckoo/batch-add-chain filter all-segments)
-                                          filter)]
-                                          ;; Always write the filter (even if empty) to ensure it exists
-                     (<? (cuckoo/write-filter index-catalog ledger-id branch-name t updated-filter)))
+                 _             (<? (update-branch-filter-with-segments index-catalog alias t new-segments db-root-res))
 
                  index-address (:address db-root-res)
                  index-id      (str "fluree:index:sha256:" (:hash db-root-res))

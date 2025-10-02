@@ -1118,21 +1118,23 @@
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/commit"))))))
            (is (= ["cuckoo" "garbage" "opst" "post" "psot" "root" "spot" "tspo"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index"))))))
-           ;; one new index root per tx
-           (is (= tx-count
+           ;; With reindex-min-bytes of 100, only 2 indexes are created (t=1 and t=3)
+           ;; t=2's novelty is small enough to be batched with t=3
+           (is (= 2
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/root"))))))
-           ;; one garbage file for each obsolete index root
-           (is (= (dec tx-count)
+           ;; one garbage file for the obsolete first index root
+           (is (= 1
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/garbage"))))))
-           (is (= 6
+           ;; With 2 indexes, expect 4 segment files per index type (2 from each index)
+           (is (= 4
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/spot"))))))
-           (is (= 6
+           (is (= 4
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/post"))))))
-           (is (= 6
+           (is (= 4
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/psot"))))))
-           (is (= 6
+           (is (= 4
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/tspo"))))))
-           (is (= 6
+           (is (= 4
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/opst"))))))
            (testing "drop"
              (is (= :dropped

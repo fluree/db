@@ -51,7 +51,10 @@
         ;; No other branches, safe to delete all
         garbage-items
         ;; Check each item against other branch filters
-        (remove #(cuckoo/any-branch-uses? filters %)
+        ;; Extract hash from address for checking
+        (remove (fn [garbage-address]
+                  (let [hash (cuckoo/extract-hash-part garbage-address)]
+                    (cuckoo/any-branch-uses? filters hash)))
                 garbage-items)))))
 
 (defn clean-garbage-record
@@ -74,7 +77,9 @@
           _ (when (and (:storage index-catalog) (seq garbage))
               (let [filter (<! (cuckoo/read-filter index-catalog ledger-name branch-name))]
                 (when filter
-                  (let [filter' (cuckoo/batch-remove-chain filter garbage)]
+                  ;; Extract hashes from garbage addresses before removing from filter
+                  (let [garbage-hashes (mapv cuckoo/extract-hash-part garbage)
+                        filter' (cuckoo/batch-remove-chain filter garbage-hashes)]
                     (<! (cuckoo/write-filter index-catalog ledger-name branch-name t filter'))))))
 
           ;; Check which items can actually be deleted from disk

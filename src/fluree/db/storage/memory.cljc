@@ -64,6 +64,16 @@
     (go
       (get @contents path)))
 
+  (write-bytes-ext [_ path bytes extension]
+    (go
+      (let [path-with-ext (str path "." extension)]
+        (swap! contents assoc path-with-ext bytes))))
+
+  (read-bytes-ext [_ path extension]
+    (go
+      (let [path-with-ext (str path "." extension)]
+        (get @contents path-with-ext))))
+
   storage/RecursiveListableStore
   (list-paths-recursive [_ prefix]
     ;; Memory storage already stores flat paths, so recursive is the same as regular listing
@@ -71,7 +81,8 @@
       (->> @contents
            keys
            (filter #(and (str/starts-with? % prefix)
-                         (str/ends-with? % ".json")))
+                         (or (str/ends-with? % ".json")
+                             (str/ends-with? % ".cbor"))))
            vec))))
 
 (defn open

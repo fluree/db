@@ -7,6 +7,7 @@
     "@peculiar/webcrypto": "^1.4.5",
     "axios": "^1.5.1",
     "bufferutil": "^4.0.7",
+    "cbor": "^9.0.2",
     "form-data": "^4.0.0",
     "jsonld": "8.3.3",
     "seedrandom": "^3.0.5",

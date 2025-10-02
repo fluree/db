@@ -1,6 +1,6 @@
 (ns fluree.db.indexer.cuckoo
   "Cuckoo filter implementation for cross-branch index garbage collection.
-  
+
   Uses cuckoo filters to efficiently check if index nodes marked as garbage
   by one branch are still in use by other branches."
   (:require [alphabase.core :as alphabase]
@@ -8,8 +8,7 @@
             [fluree.db.storage :as store]
             [fluree.db.util :refer [try* catch*]]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.util.bytes :as bytes]
-            [fluree.db.util.json :as json]
+            [fluree.db.util.cbor :as cbor]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -221,23 +220,16 @@
 
 ;; Chain management functions
 
-(defn serialize-single
-  "Serialize a single filter. Public for testing."
+(defn- serialize-filter
+  "Serialize a filter to map format for storage in chain."
   [{:keys [buckets num-buckets fingerprint-bits count]}]
   {:f fingerprint-bits
    :buckets (encode-buckets buckets fingerprint-bits)
    :num-buckets num-buckets
    :count count})
 
-(defn single-filter->chain
-  "Convert a single filter to chain format. Public for testing."
-  [filter]
-  {:version 2
-   :t nil  ; Will be set when persisting
-   :filters [(serialize-single filter)]})
-
-(defn- deserialize-single
-  "Deserialize a single filter."
+(defn- deserialize-filter
+  "Deserialize a filter from map format back to CuckooFilter record."
   [{:keys [buckets num-buckets f count]}]
   (let [decoded-buckets (decode-buckets buckets)]
     (->CuckooFilter decoded-buckets num-buckets f count)))
@@ -248,9 +240,9 @@
   [{:keys [filters] :as filter-chain} sha256-hash]
   (loop [idx 0]
     (if (< idx (count filters))
-      (let [current-filter (deserialize-single (nth filters idx))]
+      (let [current-filter (deserialize-filter (nth filters idx))]
         (if-let [updated (add-item-internal current-filter sha256-hash)]
-          (let [updated-serialized (serialize-single updated)
+          (let [updated-serialized (serialize-filter updated)
                 ;; Check if this filter is now at 90% capacity
                 load-factor (/ (double (:count updated))
                                (* (:num-buckets updated) bucket-size))
@@ -258,7 +250,7 @@
                 filters' (if (and (= idx (dec (count filters)))
                                   (>= load-factor 0.9))
                            (conj (assoc filters idx updated-serialized)
-                                 (serialize-single (create-filter default-filter-capacity)))
+                                 (serialize-filter (create-filter default-filter-capacity)))
                            (assoc filters idx updated-serialized))]
             (assoc filter-chain :filters filters'))
           (recur (inc idx))))
@@ -266,28 +258,28 @@
       (let [new-filter (create-filter default-filter-capacity)
             updated (add-item-internal new-filter sha256-hash)]
         (if updated
-          (assoc filter-chain :filters (conj filters (serialize-single updated)))
+          (assoc filter-chain :filters (conj filters (serialize-filter updated)))
           filter-chain)))))
 
 (defn contains-hash-chain?
   "Check if hash exists in any filter in the chain."
   [{:keys [filters]} sha256-hash]
-  (some #(contains-hash-internal? (deserialize-single %) sha256-hash) filters))
+  (some #(contains-hash-internal? (deserialize-filter %) sha256-hash) filters))
 
 (defn remove-item-chain
   "Remove item from whichever filter contains it, removing empty filters."
   [{:keys [filters] :as filter-chain} sha256-hash]
   (let [updated-filters
         (vec (for [f filters]
-               (let [filter (deserialize-single f)]
+               (let [filter (deserialize-filter f)]
                  (if (contains-hash-internal? filter sha256-hash)
-                   (serialize-single (remove-item-internal filter sha256-hash))
+                   (serialize-filter (remove-item-internal filter sha256-hash))
                    f))))
         ;; Remove empty filters (count = 0), but keep at least one
         cleaned-filters (vec (remove #(zero? (:count %)) updated-filters))
         ;; Ensure we always have at least one filter
         final-filters (if (empty? cleaned-filters)
-                        [(serialize-single (create-filter default-filter-capacity))]
+                        [(serialize-filter (create-filter default-filter-capacity))]
                         cleaned-filters)]
     (assoc filter-chain :filters final-filters)))
 
@@ -306,15 +298,10 @@
   []
   {:version 2
    :t nil
-   :filters [(serialize-single (create-filter default-filter-capacity))]})
-
-(defn serialize
-  "Serialize filter chain for storage."
-  [filter-chain]
-  filter-chain)
+   :filters [(serialize-filter (create-filter default-filter-capacity))]})
 
 (defn deserialize
-  "Deserialize filter from storage."
+  "Deserialize filter chain from storage, converting serialized filters back to CuckooFilter records."
   [data]
   (cond
     (= (:version data) 2) data
@@ -324,62 +311,43 @@
 ;; Storage integration
 
 (defn filter-storage-path
-  "Get the storage path for a branch's cuckoo filter.
-  Returns path like 'ledger-name/index/cuckoo/branch.json'."
+  "Returns storage path without extension: 'ledger-alias/index/cuckoo/branch-name'."
   [ledger-alias branch-name]
-  (str ledger-alias "/index/cuckoo/" branch-name ".json"))
+  (str ledger-alias "/index/cuckoo/" branch-name))
 
 (defn write-filter
-  "Persist a cuckoo filter to storage using explicit filename."
+  "Writes cuckoo filter to storage as CBOR binary data."
   [index-catalog ledger-alias branch-name t filter]
   (go-try
     (when (and index-catalog (:storage index-catalog) filter)
-      (let [serialized (-> (serialize filter)
-                           (assoc :t t))
-            json-str   (json/stringify serialized)
-            bytes      (bytes/string->UTF8 json-str)
-            filename   (filter-storage-path ledger-alias branch-name)
-            ;; Get the actual store from catalog (usually the default store)
+      (let [serialized (assoc filter :t t)
+            cbor-bytes (cbor/encode serialized)
+            path       (filter-storage-path ledger-alias branch-name)
             storage    (:storage index-catalog)
             store      (if (satisfies? store/ByteStore storage)
                          storage
                          (store/get-content-store storage ::store/default))]
-        (<? (store/write-bytes store filename bytes))))))
+        (<? (store/write-bytes-ext store path cbor-bytes "cbor"))))))
 
 (defn read-filter
-  "Read a cuckoo filter from storage using explicit filename.
+  "Reads cuckoo filter from storage, decoding CBOR binary data.
   Returns nil if filter doesn't exist."
   [index-catalog ledger-alias branch-name]
   (go-try
-    (log/debug "read-filter called for" ledger-alias "/" branch-name)
-    (if (and index-catalog
-             (:storage index-catalog)
-             ledger-alias
-             branch-name)
-      (let [filename (filter-storage-path ledger-alias branch-name)
-            _ (log/debug "Looking for filter at:" filename)
-            ;; Get the actual store from catalog (usually the default store)
-            storage  (:storage index-catalog)
-            store    (if (satisfies? store/ByteStore storage)
-                       storage
-                       (store/get-content-store storage ::store/default))]
+    (when (and index-catalog (:storage index-catalog) ledger-alias branch-name)
+      (let [path    (filter-storage-path ledger-alias branch-name)
+            storage (:storage index-catalog)
+            store   (if (satisfies? store/ByteStore storage)
+                      storage
+                      (store/get-content-store storage ::store/default))]
         (try*
-          (when-let [bytes (<? (store/read-bytes store filename))]
-            (log/debug "Found filter file, size:" (count bytes) "type:" (type bytes))
-            (let [json-str (if (string? bytes)
-                             bytes  ; Already a string, don't convert
-                             (bytes/UTF8->string bytes))
-                  data     (json/parse json-str true)]
-              (deserialize data)))
-          (catch* e
-            ;; Filter doesn't exist or error reading it
-            (log/debug "Error reading filter:" (ex-message e))
-            nil)))
-      (log/debug "Skipping filter read - missing requirements"
-                 "catalog:" (boolean index-catalog)
-                 "storage:" (boolean (:storage index-catalog))
-                 "ledger:" ledger-alias
-                 "branch:" branch-name))))
+          (when-let [cbor-bytes (<? (store/read-bytes-ext store path "cbor"))]
+            (let [decoded (cbor/decode cbor-bytes)]
+              (deserialize decoded)))
+          (catch* _e
+            ;; Return nil if filter doesn't exist or can't be read - this is expected
+            ;; for new branches or when filters haven't been created yet
+            nil))))))
 
 ;; Cleanup functions
 
@@ -388,19 +356,16 @@
   [index-catalog ledger-alias branch-name]
   (go-try
     (when (and index-catalog (:storage index-catalog))
-      (let [filename (filter-storage-path ledger-alias branch-name)
-            ;; Get the actual store from catalog (usually the default store)
+      (let [path     (str (filter-storage-path ledger-alias branch-name) ".cbor")
             storage  (:storage index-catalog)
             store    (if (satisfies? store/EraseableStore storage)
                        storage
                        (store/get-content-store storage ::store/default))
-            ;; Build a full address for deletion from the default content store
             loc      (store/location (store/get-content-store storage ::store/default))
-            address  (store/build-address loc filename)]
+            address  (store/build-address loc path)]
         (try*
           (<? (store/delete store address))
           (catch* _e
-            ;; Filter might not exist, that's ok
             nil))))))
 
 (defn delete-all-filters
@@ -432,21 +397,24 @@
             nil))))))
 
 (defn discover-branches
-  "Discover all branches for a ledger by scanning storage."
+  "Discover all branches for a ledger by scanning storage for cuckoo filter files.
+
+  Note: This scans storage rather than nameservice because it's used by garbage
+  collection, which only needs to protect segments used by branches that have
+  indexed (i.e., have cuckoo filters). Branches in nameservice without filters
+  have no index segments to protect."
   [storage ledger-alias]
   (go-try
-    ;; List all cuckoo filter files under ledger-alias/index/cuckoo/
     (let [cuckoo-path (str ledger-alias "/index/cuckoo/")
-          ;; Get the actual store from catalog if needed
           store (if (satisfies? store/RecursiveListableStore storage)
                   storage
                   (store/get-content-store storage ::store/default))]
       (when-let [files (<? (store/list-paths-recursive store cuckoo-path))]
         (->> files
-             (filter #(str/ends-with? % ".json"))
+             (filter #(str/ends-with? % ".cbor"))
              (map #(-> %
                        (str/replace cuckoo-path "")
-                       (str/replace ".json" "")))
+                       (str/replace ".cbor" "")))
              distinct
              vec)))))
 
@@ -499,7 +467,7 @@
   "Get comprehensive statistics from a filter chain."
   [filter-chain]
   (when (and (:version filter-chain) (seq (:filters filter-chain)))
-    (let [filters (map deserialize-single (:filters filter-chain))
+    (let [filters (map deserialize-filter (:filters filter-chain))
           total-count (reduce + (map :count filters))
           total-capacity (reduce + (map #(* (:num-buckets %) bucket-size) filters))
           filter-stats (map (fn [f]
@@ -517,34 +485,3 @@
        :filters filter-stats
        :fingerprint-bits (:fingerprint-bits (first filters))})))
 
-;; Simplified API functions for testing
-;; These are thin wrappers that delegate to chain operations
-
-(defn add-item
-  "Add item to filter chain. For testing."
-  [filter-or-chain sha256-hash]
-  (if (:version filter-or-chain)
-    (add-item-chain filter-or-chain sha256-hash)
-    ;; Support for single filter in tests
-    (add-item-internal filter-or-chain sha256-hash)))
-
-(defn contains-hash?
-  "Check if hash exists in filter. For testing."
-  [filter-or-chain sha256-hash]
-  (if (:version filter-or-chain)
-    (contains-hash-chain? filter-or-chain sha256-hash)
-    ;; Support for single filter in tests
-    (contains-hash-internal? filter-or-chain sha256-hash)))
-
-(defn remove-item
-  "Remove item from filter chain. For testing."
-  [filter-or-chain sha256-hash]
-  (if (:version filter-or-chain)
-    (remove-item-chain filter-or-chain sha256-hash)
-    ;; Support for single filter in tests
-    (remove-item-internal filter-or-chain sha256-hash)))
-
-(defn batch-add
-  "Add multiple items to filter."
-  [filter-or-chain sha256-hashes]
-  (reduce add-item filter-or-chain sha256-hashes))

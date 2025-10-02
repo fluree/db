@@ -133,7 +133,14 @@
 (defprotocol ByteStore
   "ByteStore is used by consensus to replicate files across servers"
   (write-bytes [store path bytes] "Async writes bytes to path in store.")
-  (read-bytes [store path] "Async read bytes from path in store."))
+  (read-bytes [store path] "Async read bytes from path in store.")
+  (write-bytes-ext [store path bytes extension]
+    "Async writes bytes to path with specified extension (e.g., 'cbor', 'bin').
+    Path should NOT include extension - it will be appended.
+    Returns address with extension.")
+  (read-bytes-ext [store path extension]
+    "Async reads bytes from path with specified extension.
+    Returns raw bytes without text decoding."))
 
 (defprotocol EraseableStore
   (delete [store address] "Remove value associated with `address` from the store."))
