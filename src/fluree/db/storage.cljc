@@ -140,7 +140,11 @@
     Returns address with extension.")
   (read-bytes-ext [store path extension]
     "Async reads bytes from path with specified extension.
-    Returns raw bytes without text decoding."))
+    Returns raw bytes without text decoding.")
+  (swap-bytes [store path f]
+    "Atomically replace the contents at `path` using the supplied function `f`.
+    `f` is called with the current contents at `path` (or `nil` if the path
+    doesn't exist) and should return the new bytes to store."))
 
 (defprotocol EraseableStore
   (delete [store address] "Remove value associated with `address` from the store."))
@@ -168,6 +172,30 @@
    (-read-json store address false))
   ([store address keywordize?]
    (-read-json store address keywordize?)))
+
+(defn ->json-string
+  [s]
+  (or (not-empty s)
+      "null"))
+
+(defn <-json-string
+  [json]
+  (if (= json "null")
+    ""
+    json))
+
+(defn swap-json
+  [store path f]
+  (let [f* (fn [bs]
+             (-> bs
+                 bytes/UTF8->string
+                 ->json-string
+                 (json/parse false)
+                 f
+                 json/stringify
+                 <-json-string
+                 bytes/string->UTF8))]
+    (swap-bytes store path f*)))
 
 (defrecord Catalog [])
 

@@ -9,7 +9,6 @@
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.nameservice.sub :as ns-subscribe]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
             [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
@@ -20,13 +19,6 @@
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(comment
- ;; state machine looks like this:
-  {:ledger        {"ledger-a" {;; map of branches, along with current/default branch
-                               :branches {}
-                               :branch   {}}}
-   :subscriptions {}})
 
 (def blank-state
   "Initial connection state"
@@ -93,12 +85,53 @@
     (log/debug "Registering ledger: " ledger-alias " cached? " cached?)
     [cached? p-chan]))
 
+(defn cached-ledger
+  "Returns a cached ledger from the connection if it is cached, else nil"
+  [{:keys [state] :as _conn} ledger-alias]
+  (get-in @state [:ledger ledger-alias]))
+
+(defn release-ledger
+  "Opposite of register-ledger. Removes reference to a ledger from conn"
+  [{:keys [state] :as _conn} ledger-alias]
+  (swap! state update :ledger dissoc ledger-alias)
+  nil)
+
+(defn all-publications
+  [{:keys [remote-systems] :as _conn}]
+  remote-systems)
+
+(defn subscribe-all
+  [publications ledger-alias]
+  (->> publications
+       (map (fn [pub]
+              (nameservice/subscribe pub ledger-alias)))
+       async/merge))
+
+(defn subscribed?
+  [current-state ledger-alias]
+  (contains? (:subscriptions current-state) ledger-alias))
+
+(defn get-subscription
+  [current-state ledger-alias]
+  (get-in current-state [:subscriptions ledger-alias]))
+
+(defn add-subscription
+  [current-state publications ledger-alias]
+  (if-not (subscribed? current-state ledger-alias)
+    (let [sub-ch (subscribe-all publications ledger-alias)]
+      (assoc-in current-state [:subscriptions ledger-alias] sub-ch))
+    current-state))
+
+(defn remove-subscription
+  [current-state ledger-alias]
+  (update current-state :subscriptions dissoc ledger-alias))
+
 (defn notify
   [{:keys [commit-catalog] :as conn} address]
   (go-try
     (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
       (if-let [ledger-alias (get-first-value expanded-commit const/iri-alias)]
-        (if-let [ledger-ch (ns-subscribe/cached-ledger conn ledger-alias)]
+        (if-let [ledger-ch (cached-ledger conn ledger-alias)]
           (do (log/debug "Notification received for ledger" ledger-alias
                          "of new commit:" expanded-commit)
               (let [ledger        (<? ledger-ch)
@@ -113,11 +146,42 @@
 
                   ::ledger/stale
                   (do (log/debug "Dropping state for stale ledger:" ledger-alias)
-                      (ns-subscribe/release-ledger conn ledger-alias)))))
+                      (release-ledger conn ledger-alias)))))
           (log/debug "No cached ledger found for commit: " expanded-commit))
         (log/warn "Notify called with a data that does not have a ledger alias."
                   "Are you sure it is a commit?: " expanded-commit))
       (log/warn "No commit found for address:" address))))
+
+;; TODO; Were subscribing to every remote system for every ledger we load.
+;; Perhaps we should ensure that a remote system manages a particular ledger
+;; before subscribing
+(defn subscribe-ledger
+  "Initiates subscription requests for a ledger into all remote systems on a
+  connection."
+  [{:keys [state] :as conn} ledger-alias]
+  (let [pubs                   (all-publications conn)
+        [prev-state new-state] (swap-vals! state add-subscription pubs ledger-alias)]
+    (when-not (subscribed? prev-state ledger-alias)
+      (let [sub-ch (get-subscription new-state ledger-alias)]
+        (go-loop []
+          (when-let [msg (<! sub-ch)]
+            (log/info "Subscribed ledger:" ledger-alias "received subscription message:" msg)
+            (let [action (get msg "action")]
+              (if (= "new-commit" action)
+                (let [{:keys [address]} (get msg "data")]
+                  (notify conn address))
+                (log/info "New subscrition message with action: " action "received, ignored.")))
+            (recur)))
+        :subscribed))))
+
+(defn unsubscribe-ledger
+  "Initiates unsubscription requests for a ledger into all namespaces on a connection."
+  [{:keys [state] :as conn} ledger-alias]
+  (->> (all-publications conn)
+       (map (fn [pub]
+              (nameservice/unsubscribe pub ledger-alias)))
+       dorun)
+  (swap! state remove-subscription ledger-alias))
 
 (defn publishers
   [{:keys [primary-publisher secondary-publishers] :as _conn}]
@@ -277,6 +341,15 @@
   (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
                   {:status 409, :error :db/ledger-exists})))
 
+(defn commit->ledger-alias
+  "Returns ledger alias from commit map, if present. If not present
+  then tries to resolve the ledger alias from the nameservice."
+  [conn db-alias commit-map]
+  (or (get-first-value commit-map const/iri-alias)
+      (->> (all-nameservices conn)
+           (some (fn [ns]
+                   (nameservice/alias ns db-alias))))))
+
 (defn create-ledger
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn} ledger-alias opts]
   (go-try
@@ -299,23 +372,9 @@
                                                     :secondary-publishers secondary-publishers}
                                                    ledger-opts))]
               (when (util/exception? ledger)
-                (ns-subscribe/release-ledger conn normalized-alias))
+                (release-ledger conn normalized-alias))
               (async/put! ledger-chan ledger)
               ledger)))))))
-
-(defn commit->ledger-alias
-  "Returns the ledger alias to use when loading a ledger.
-
-  If a relative alias (e.g., ledger:branch) was provided, prefer it (normalized to include a branch).
-  If an absolute address (e.g., fluree:...) was provided, derive from the commit's alias,
-  falling back to the nameservice if necessary."
-  [conn address-or-alias commit-map]
-  (if (relative-ledger-alias? address-or-alias)
-    (util.ledger/ensure-ledger-branch address-or-alias)
-    (or (get-first-value commit-map const/iri-alias)
-        (->> (all-nameservices conn)
-             (some (fn [ns]
-                     (nameservice/alias ns address-or-alias)))))))
 
 (defn load-ledger*
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn}
@@ -333,7 +392,8 @@
             expanded-commit (<? (commit-storage/load-commit-with-metadata commit-catalog
                                                                           commit-address
                                                                           index-address))
-            ledger-alias    (commit->ledger-alias conn ledger-address expanded-commit)
+            ;; ledger-address already contains the full alias with branch
+            ledger-alias    ledger-address
 
             {:keys [did indexing]} (parse-ledger-options conn {})
             ;; Extract branch metadata from ns-record
@@ -342,7 +402,7 @@
                                                        index-catalog primary-publisher
                                                        secondary-publishers indexing did
                                                        expanded-commit branch-metadata)]
-        (ns-subscribe/subscribe-ledger conn ledger-alias)
+        (subscribe-ledger conn ledger-alias)
         (async/put! ledger-chan ledger)
         ledger)
       (throw (ex-info (str "Unable to load. No record of ledger at address: " ledger-address " exists.")
@@ -377,7 +437,7 @@
             (if addr
               (or (<? (try-load-address conn ledger-chan normalized-alias addr))
                   (recur r))
-              (do (ns-subscribe/release-ledger conn normalized-alias)
+              (do (release-ledger conn normalized-alias)
                   (let [ex (ex-info (str "Load for " normalized-alias " failed due to failed address lookup.")
                                     {:status 404, :error :db/unknown-ledger})]
                     (async/put! ledger-chan ex)

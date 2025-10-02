@@ -145,6 +145,11 @@
           (full-path path-with-ext)
           (fs/read-binary-file encryption-key))))
 
+  (swap-bytes [_ path f]
+    (-> root
+        (full-path path)
+        (fs/with-file-lock f)))
+
   storage/RecursiveListableStore
   (list-paths-recursive [_ prefix]
     (go-try

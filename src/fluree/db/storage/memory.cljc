@@ -74,6 +74,10 @@
       (let [path-with-ext (str path "." extension)]
         (get @contents path-with-ext))))
 
+  (swap-bytes [_ path f]
+    (go
+      (swap! contents update path f)))
+
   storage/RecursiveListableStore
   (list-paths-recursive [_ prefix]
     ;; Memory storage already stores flat paths, so recursive is the same as regular listing

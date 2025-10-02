@@ -259,7 +259,7 @@
   (when arglist
     (throw (ex-info "Unsupported syntax."
                     {:status 400 :error :db/invalid-query :term arglist})))
-  (parse-term iri))
+  {const/iri-id (parse-term iri)})
 
 (defmethod parse-term :UnaryExpression
   [[_ op-or-expr expr]]
@@ -362,12 +362,15 @@
   ;; PrefixDecl ::= <'PREFIX'> WS PNAME_NS WS IRIREF
   ;; [:PrefixDecl "e" "x" ":" [:IRIREF "<http://example.com/>"]]
   [[_ & prefix-decl]]
-  (let [prefix (->> (drop-last 2 prefix-decl) vec str/join)
-        iri    (->> prefix-decl
-                    (drop-while (comp not sequential?))
-                    first
-                    parse-term)]
-    [[prefix iri]]))
+  (let [prefix  (->> (drop-last 2 prefix-decl) vec str/join not-empty)
+        ;; sometimes no prefix is specified: PREFIX : <my:IRI> and
+        ;; all IRIs are just prefixed with a colon
+        prefix* (or prefix ":")
+        iri     (->> prefix-decl
+                     (drop-while (comp not sequential?))
+                     first
+                     parse-term)]
+    [[prefix* iri]]))
 
 (defmethod parse-rule :BaseDecl
   ;; BaseDecl ::= <'BASE'> WS IRIREF
@@ -524,13 +527,7 @@
   [[_ & bindings]]
   ;; bindings come in as val, var; need to be reversed to var, val.
   (into [:bind] (->> bindings
-                     (mapv (fn [term]
-                             (let [terms (into #{} (flatten term))
-                                   parsed (parse-term term)]
-                               (if (and (terms :iriOrFunction) (not= \( (first parsed)))
-                                 ;; static iri
-                                 {const/iri-id parsed}
-                                 (parse-term term)))))
+                     (mapv parse-term)
                      (partition-all 2)
                      (mapcat reverse))))
 
