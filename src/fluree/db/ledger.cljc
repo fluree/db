@@ -5,6 +5,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.transact :as flake.transact]
+            [fluree.db.indexer.cuckoo :as cuckoo]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util :as util :refer [get-first get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
@@ -13,6 +14,14 @@
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(defn- initialize-cuckoo-filter
+  "Initialize empty cuckoo filter for a new ledger/branch if storage supports it."
+  [index-catalog ledger-name branch-name]
+  (go-try
+    (when (and index-catalog (:storage index-catalog))
+      (let [empty-filter (cuckoo/create-filter-chain)]
+        (<? (cuckoo/write-filter index-catalog ledger-name branch-name 0 empty-filter))))))
 
 ;; TODO - no time travel, only latest db on a branch thus far
 (defn current-db
@@ -139,10 +148,13 @@
            primary-publisher secondary-publishers]}
    {:keys [did indexing] :as _opts}]
   (go-try
-    (let [;; internal-only opt used for migrating ledgers without genesis commits
+    (let [[ledger-name branch-name] (util.ledger/ledger-parts alias)
+          branch-name    (or branch-name "main")  ; Default to "main" if no branch specified
+          ;; internal-only opt used for migrating ledgers without genesis commits
           init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit
                               commit-catalog alias publish-addresses init-time))
+          _              (<? (initialize-cuckoo-filter index-catalog ledger-name branch-name))
           ;; Publish genesis commit to nameservice - convert expanded to compact format first
           _              (when primary-publisher
                            (let [;; Convert expanded genesis commit to compact JSON-ld format
@@ -153,9 +165,8 @@
                    primary-publisher secondary-publishers indexing did genesis-commit))))
 
 (defn trigger-index!
-  "Manually triggers indexing for this ledger.
-   Returns a channel that will receive the result when indexing completes.
-   Since each ledger now represents a single branch, no branch parameter is needed."
+  "Manually triggers indexing for this ledger's current database.
+   Returns a channel that will receive the result when indexing completes."
   [ledger]
   (let [state (:state ledger)]
     (branch/trigger-index! @state)))

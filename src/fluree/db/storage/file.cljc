@@ -130,6 +130,21 @@
         (full-path path)
         (fs/read-file encryption-key)))
 
+  (write-bytes-ext [_ path bytes extension]
+    (let [path-with-ext (str path "." extension)
+          final-bytes (if encryption-key
+                        (aes/encrypt bytes encryption-key {:output-format :none})
+                        bytes)]
+      (-> root
+          (full-path path-with-ext)
+          (fs/write-file final-bytes))))
+
+  (read-bytes-ext [_ path extension]
+    (let [path-with-ext (str path "." extension)]
+      (-> root
+          (full-path path-with-ext)
+          (fs/read-binary-file encryption-key))))
+
   (swap-bytes [_ path f]
     (-> root
         (full-path path)
@@ -143,9 +158,11 @@
           (let [all-files (<? (list-files-recursive prefix-path))
                 base-path (str (fs/local-path root) "/")
                 relative-files (map #(str/replace % base-path "") all-files)
-                ;; Filter for .json files only
-                json-files (filter #(str/ends-with? % ".json") relative-files)]
-            json-files)
+                ;; Filter for .json and .cbor files
+                data-files (filter #(or (str/ends-with? % ".json")
+                                        (str/ends-with? % ".cbor"))
+                                   relative-files)]
+            data-files)
           [])))))
 
 (defn open

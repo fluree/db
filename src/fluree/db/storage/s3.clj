@@ -488,6 +488,18 @@
                                                             :bucket bucket
                                                             :path   path}})))))
 
+  (write-bytes-ext [this path bytes extension]
+    (let [path-with-ext (str path "." extension)]
+      (write-s3-data this path-with-ext bytes)))
+
+  (read-bytes-ext [this path extension]
+    (go-try
+      (let [path-with-ext (str path "." extension)
+            resp (<? (read-s3-data this path-with-ext))]
+        (when (not= resp ::not-found)
+          (when-let [body (:Body resp)]
+            (.getBytes ^String body))))))
+
   storage/EraseableStore
   (delete [_ address]
     (go-try
@@ -516,9 +528,10 @@
                               (let [contents (:contents batch)]
                                 (recur (into acc (map :key contents))))
                               acc)))]
-        ;; Filter for .json files and return relative paths
+        ;; Filter for .json and .cbor files and return relative paths
         (->> all-results
-             (filter #(str/ends-with? % ".json"))
+             (filter #(or (str/ends-with? % ".json")
+                          (str/ends-with? % ".cbor")))
              vec)))))
 
 (defn- jitter

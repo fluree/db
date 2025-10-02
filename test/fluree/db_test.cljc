@@ -1116,21 +1116,25 @@
            ;; initial create call generates an initial commit, each commit has two files
            (is (= (* 2 (inc tx-count))
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/commit"))))))
-           (is (= ["garbage" "opst" "post" "psot" "root" "spot" "tspo"]
+           (is (= ["cuckoo" "garbage" "opst" "post" "psot" "root" "spot" "tspo"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index"))))))
-           ;; one new index root per tx
-           (is (= tx-count
+           ;; With reindex-min-bytes of 100, only 2 indexes are created (t=1 and t=3)
+           ;; t=2's novelty is small enough to be batched with t=3
+           (is (= 2
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/root"))))))
-           ;; one garbage file for each obsolete index root
-           (is (= (dec tx-count)
+           ;; one garbage file for the obsolete first index root
+           (is (= 1
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/garbage"))))))
-           (is (= 6
+           ;; With 2 indexes, expect 4 segment files per index type (2 from each index)
+           (is (= 4
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/spot"))))))
-           (is (= 6
+           (is (= 4
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/post"))))))
-           (is (= 6
+           (is (= 4
+                  (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/psot"))))))
+           (is (= 4
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/tspo"))))))
-           (is (= 6
+           (is (= 4
                   (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/opst"))))))
            (testing "drop"
              (is (= :dropped
@@ -1138,24 +1142,52 @@
          ;; wait for deletion
            (Thread/sleep 1000)
            (testing "after drop"
-           ;; directories are not removed
+          ;; directories are not removed (updated to ns@v2)
              (is (= ["destined-for-drop" "ns@v2"]
                     (sort (async/<!! (fs/list-files primary-path)))))
-           ;; The destined-for-drop directory remains but should be empty
-             (is (= ["destined-for-drop"]
-                    (async/<!! (fs/list-files (str secondary-path "/ns@v2")))))
+          ;; The destined-for-drop directory in secondary ns@v2 remains but should be empty
+             (is (contains? (set (async/<!! (fs/list-files (str secondary-path "/ns@v2"))))
+                            "destined-for-drop")
+                 "Secondary ns@v2 should contain destined-for-drop directory")
              (is (= []
                     (async/<!! (fs/list-files (str secondary-path "/ns@v2/destined-for-drop")))))
+           ;; Storage directories remain but are empty after drop
              (is (= ["commit" "index" "txn"]
                     (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias))))))
-             (is (= ["garbage" "opst" "post" "psot" "root" "spot" "tspo"]
+             (is (= ["cuckoo" "garbage" "opst" "post" "psot" "root" "spot" "tspo"]
                     (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index"))))))
-             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/txn"))))))
-             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/commit"))))))
-             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/root"))))))
+          ;; after drop, storage directories remain but should be empty
              (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/root"))))))
              (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/garbage"))))))
              (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/spot"))))))
              (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/post"))))))
              (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/tspo"))))))
-             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/opst"))))))))))))
+             (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/opst"))))))
+             (testing "drop"
+               (is (= :dropped
+                      @(fluree/drop conn ledger-alias))))
+         ;; wait for deletion
+             (Thread/sleep 1000)
+             (testing "after drop"
+           ;; directories are not removed
+               (is (= ["destined-for-drop" "ns@v2"]
+                      (sort (async/<!! (fs/list-files primary-path)))))
+           ;; The destined-for-drop directory remains but should be empty
+               (is (= ["destined-for-drop"]
+                      (async/<!! (fs/list-files (str secondary-path "/ns@v2")))))
+               (is (= []
+                      (async/<!! (fs/list-files (str secondary-path "/ns@v2/destined-for-drop")))))
+               (is (= ["commit" "index" "txn"]
+                      (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias))))))
+               (is (= ["cuckoo" "garbage" "opst" "post" "psot" "root" "spot" "tspo"]
+                      (sort (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index"))))))
+               (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/txn"))))))
+               (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/commit"))))))
+               (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/root"))))))
+               (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/garbage"))))))
+               (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/spot"))))))
+               (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/post"))))))
+               (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/psot"))))))
+               (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/tspo"))))))
+               (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/opst"))))))
+               (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" ledger-alias "/index/cuckoo")))))))))))))

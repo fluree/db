@@ -4,6 +4,7 @@
   (:require [fluree.db.connection :as connection]
             [fluree.db.constants :as const]
             [fluree.db.flake.commit-data :as commit-data]
+            [fluree.db.indexer.cuckoo :as cuckoo]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util :as util]
@@ -14,18 +15,20 @@
 
 (defn create-branch!
   "Creates a new branch from an existing branch.
-  
+
   Parameters:
     conn - Connection object
     new-branch-spec - Full branch spec (e.g., 'ledger:new-branch')
     from-branch-spec - Source branch spec (e.g., 'ledger:old-branch')
-    from-commit - (optional) Specific commit id (sha256 URI) to branch from, defaults to latest
-    
+    from-commit - (optional) Specific commit ID to branch from, defaults to latest
+
   Returns the new branch metadata."
   [conn new-branch-spec from-branch-spec from-commit]
   (go-try
-    (let [[ledger-id new-branch] (util.ledger/ledger-parts new-branch-spec)
-          [from-ledger-id from-branch] (util.ledger/ledger-parts from-branch-spec)]
+    (let [new-branch-spec* (util.ledger/ensure-ledger-branch new-branch-spec)
+          from-branch-spec* (util.ledger/ensure-ledger-branch from-branch-spec)
+          [ledger-id new-branch] (util.ledger/ledger-parts new-branch-spec*)
+          [from-ledger-id from-branch] (util.ledger/ledger-parts from-branch-spec*)]
 
       (when (not= ledger-id from-ledger-id)
         (throw (ex-info "Cannot create branch across different ledgers"
@@ -34,13 +37,18 @@
       ;; Load source ledger to get its current commit
       (let [source-ledger (<? (connection/load-ledger conn from-branch-spec))
             source-db (ledger/current-db source-ledger)
-            ;; Prefer commit ID (sha256 URI) for lineage as it's consistent across storage backends
             source-commit-id (or from-commit (get-in source-db [:commit :id]))
 
             ;; Create branch metadata
             metadata {:created-at (util/current-time-iso)
                       :source-branch from-branch
                       :source-commit source-commit-id}
+
+            index-catalog (:index-catalog source-db)
+            _ (when (and index-catalog (:storage index-catalog))
+                (when-let [source-filter (<? (cuckoo/read-filter index-catalog ledger-id from-branch))]
+                  (<? (cuckoo/write-filter index-catalog ledger-id new-branch
+                                           (:t source-db) source-filter))))
 
             ;; Prepare commit for new branch with flat metadata fields
             source-commit-map (:commit source-db)
@@ -119,29 +127,34 @@
 
 (defn delete-branch!
   "Deletes a branch.
-  
+
   Parameters:
     conn - Connection object
     branch-spec - Full branch spec to delete (e.g., \"ledger:branch\")
-    
+
   Cannot delete the default branch or protected branches.
   Returns when deletion is complete."
   [conn branch-spec]
   (go-try
     (let [branch-spec* (util.ledger/ensure-ledger-branch branch-spec)
-          [_ledger-id branch] (util.ledger/ledger-parts branch-spec*)
+          [ledger-id branch] (util.ledger/ledger-parts branch-spec*)
           _ (when (main-branch? branch)
               (throw (ex-info "Cannot delete the main branch. Use the drop API to remove the entire ledger."
                               {:status 400 :error :db/cannot-delete-main-branch})))
           ledger (<? (connection/load-ledger conn branch-spec*))
-          branch-info (<? (ledger/branch-info ledger))]
+          branch-info (<? (ledger/branch-info ledger))
+          ;; Also get the index catalog for cuckoo filter deletion
+          index-catalog (:index-catalog ledger)]
       (when (:protected branch-info)
         (throw (ex-info (str "Cannot delete protected branch: " branch)
                         {:status 400 :error :db/cannot-delete-protected-branch})))
       (if-let [primary-publisher (:primary-publisher conn)]
         (do
           (<? (nameservice/retract primary-publisher branch-spec*))
-          (connection/release-ledger conn branch-spec*))
+          (connection/release-ledger conn branch-spec*)
+          ;; Delete the cuckoo filter file for this branch
+          (when (and index-catalog (:storage index-catalog))
+            (<? (cuckoo/delete-filter index-catalog ledger-id branch))))
         (throw (ex-info "No nameservice available for branch deletion"
                         {:status 400 :error :db/no-nameservice})))
       {:deleted branch-spec*})))

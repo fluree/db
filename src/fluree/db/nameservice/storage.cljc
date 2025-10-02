@@ -121,6 +121,8 @@
           address  (-> store
                        storage/location
                        (storage/build-address path))]
+      (log/debug "nameservice.storage/retract start"
+                 {:alias ledger-alias :path path :address address})
       (storage/delete store address)))
 
   (publishing-address [_ ledger-alias]

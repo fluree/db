@@ -237,13 +237,66 @@
                         "code"    (.-code e)
                         "path"    (.-path e)}))))))))
 
+(defn read-binary-file
+  "Read raw bytes from disk at `path`. Returns nil if file does not exist.
+   If encryption-key is provided, expects file to be encrypted and will decrypt it."
+  ([path] (read-binary-file path nil))
+  ([path encryption-key]
+   #?(:clj
+      (async/thread
+        (try
+          (with-open [xin  (io/input-stream path)
+                      xout (ByteArrayOutputStream.)]
+            (io/copy xin xout)
+            (let [raw-bytes (.toByteArray xout)]
+              (if encryption-key
+                (try
+                  (aes/decrypt raw-bytes encryption-key
+                               {:input-format :none
+                                :output-format :none})
+                  (catch Exception e
+                    (ex-info (str "Failed to decrypt file: " path)
+                             {:status 500
+                              :error :db/storage-error
+                              :path path}
+                             e)))
+                raw-bytes)))
+          (catch FileNotFoundException _
+            nil)
+          (catch Exception e
+            e)))
+      :cljs
+      (async/go
+        (try
+          (let [buffer (fs/readFileSync path)]
+            (if encryption-key
+              (try
+                (aes/decrypt buffer encryption-key
+                             {:input-format :none
+                              :output-format :none})
+                (catch :default e
+                  (ex-info (str "Failed to decrypt file: " path)
+                           {:status 500
+                            :error :db/storage-error
+                            :path path}
+                           e)))
+              buffer))
+          (catch :default e
+            (if (= "ENOENT" (.-code e))
+              nil
+              (ex-info "Error reading file."
+                       {"errno"   ^String (.-errno e)
+                        "syscall" ^String (.-syscall e)
+                        "code"    (.-code e)
+                        "path"    (.-path e)}))))))))
+
 (defn delete-file
   "Delete the file at `path`."
   [path]
   #?(:clj
      (async/thread
        (try
-         (io/delete-file (io/file path))
+         (io/delete-file (io/file path) true)
          :deleted
          (catch Exception e
            (log/trace (str "Failed to delete file: " path))
@@ -254,8 +307,11 @@
          (fs/unlinkSync path)
          :deleted
          (catch :default e
-           (log/trace (str "Failed to delete file: " path))
-           e)))))
+           (if (= (.-code e) "ENOENT")
+             :deleted
+             (do
+               (log/warn e (str "Failed to delete file: " path))
+               e)))))))
 
 (defn list-files
   [path]

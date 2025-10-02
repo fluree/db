@@ -5,6 +5,7 @@
             [clojure.string :as str]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
+            [fluree.db.indexer.cuckoo :as cuckoo]
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
@@ -493,7 +494,9 @@
   (go-try
     (let [storage       (:storage index-catalog)
           index-address (some-> (util/get-first latest-commit const/iri-index)
-                                (util/get-first-value const/iri-address))]
+                                (util/get-first-value const/iri-address))
+          ;; Extract ledger alias from the commit
+          ledger-alias  (util/get-first-value latest-commit const/iri-alias)]
       (when index-address
         (log/debug "Dropping index" index-address)
         (let [{:keys [spot psot opst post tspo]} (<? (storage/read-json storage index-address true))
@@ -510,8 +513,33 @@
           (<? post-ch)
           (<? tspo-ch)
           (<? opst-ch)
+          ;; Clean up cuckoo filter files for all branches - after gc to avoid race condition
+          (when ledger-alias
+            (let [[ledger-name _] (util.ledger/ledger-parts ledger-alias)]
+              (<? (cuckoo/delete-all-filters index-catalog ledger-name))))
           (<? (storage/delete storage index-address))))
       :index-dropped)))
+
+(defn- retract-with-retry
+  "Attempt to retract the nameservice record with small retries to avoid
+  transient file lock/race conditions. Returns the retract result or throws
+  after max-attempts."
+  [publisher alias* max-attempts]
+  (go-try
+    (loop [attempt 1]
+      (let [result (try*
+                     (<? (nameservice/retract publisher alias*))
+                     :ok
+                     (catch* e
+                       (if (< attempt max-attempts)
+                         (do (log/warn e "Nameservice retract failed; retrying" {:attempt attempt :alias alias*})
+                             (<! (async/timeout 50))
+                             :retry)
+                         (do (log/error e "Nameservice retract failed after retries" {:attempt attempt :alias alias*})
+                             (throw e)))))]
+        (if (= result :retry)
+          (recur (inc attempt))
+          result)))))
 
 (defn drop-ledger
   [conn alias]
@@ -532,14 +560,19 @@
                                         commit-address
                                         index-address)))]
               (log/debug "Dropping ledger" ledger-addr)
+              ;; Retract nameservice FIRST so the ledger can no longer be reloaded elsewhere.
+              ;; Use small retries to avoid transient file locks.
+              (<? (retract-with-retry publisher alias* 3))
               (when latest-commit
                 (drop-index-artifacts conn latest-commit)
                 (drop-commit-artifacts conn latest-commit))
-              (<? (nameservice/retract publisher alias*))
               (recur r))))
         (log/debug "Dropped ledger" alias*)
         :dropped)
-      (catch* e (log/debug e "Failed to complete ledger deletion")))))
+      (catch* e
+        (log/error e "Exception during ledger deletion.")
+        ;; Ensure we always return a value to the caller
+        :incomplete))))
 
 (defn resolve-txn
   "Reads a transaction from the commit catalog by address.
@@ -555,6 +588,7 @@
 
 (defn trigger-ledger-index
   "Manually triggers indexing for a ledger/branch and waits for completion.
+
    Options:
    - :timeout - Max wait time in ms (default 300000 / 5 minutes)
 
