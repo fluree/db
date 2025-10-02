@@ -11,6 +11,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.ledger :as ledger]
+            [fluree.db.merge :as merge]
             [fluree.db.nameservice.query :as ns-query]
             [fluree.db.query.api :as query-api]
             [fluree.db.query.fql.parse :as parse]
@@ -628,6 +629,159 @@
   (validate-connection conn)
   (promise-wrap
    (api.branch/rename-branch! conn old-branch-spec new-branch-spec)))
+
+;; Branch operations (merge, rebase, reset)
+
+(defn merge!
+  "Merges commits from source branch into target branch.
+  
+  Updates the target branch with changes from the source branch.
+  Supports fast-forward, squash, and regular merge modes.
+  
+  Parameters:
+    conn - Connection object
+    from - Source branch spec (e.g., 'ledger:feature')
+    to - Target branch spec (e.g., 'ledger:main')
+    opts - Map with optional merge options:
+      :ff - Fast-forward behavior (default :auto)
+        :auto - Fast-forward when possible
+        :only - Only allow fast-forward (fail otherwise)
+        :never - Never fast-forward, always create merge commit
+      :squash? - Combine all commits into one (default false)
+        :schema-aware - Use schema rules to resolve
+        function - Custom conflict resolution
+      :preview? - Dry run without making changes (default false)
+      
+  Returns promise resolving to:
+    {:status :success|:conflict|:error
+     :operation :merge
+     :from '...' :to '...'
+     :strategy '3-way'
+     :commits {:merged [...] :conflicts [...]}
+     :new-commit 'sha'}"
+  ([conn from to]
+   (merge! conn from to {}))
+  ([conn from to opts]
+   (validate-connection conn)
+   (promise-wrap
+    (merge/merge! conn from to opts))))
+
+(defn rebase!
+  "Rebases source branch onto target branch (updates source branch).
+
+  NOTE: True rebase is not yet implemented. Currently redirects to merge!
+  which updates the target branch instead of source branch.
+
+  Parameters:
+    conn - Connection object
+    from - Source branch spec to rebase (will be updated)
+    to - Target branch spec to rebase onto (unchanged)
+    opts - Map with optional rebase options:
+      :ff - Fast-forward behavior (default :auto)
+        :auto - Fast-forward when possible
+        :only - Only allow fast-forward (fail otherwise)
+        :never - Never fast-forward, always replay
+      :squash? - Combine all commits into one (default false)
+      :preview? - Dry run without making changes (default false)
+
+  Returns promise resolving to:
+    {:status :success|:conflict|:error
+     :operation :rebase
+     :from '...' :to '...'
+     :strategy 'fast-forward'|'squash'|'replay'
+     :commits {:applied [...] :skipped [...] :conflicts [...]}
+     :new-commit 'sha'}"
+  ([conn from to]
+   (rebase! conn from to {}))
+  ([conn from to opts]
+   (validate-connection conn)
+   (promise-wrap
+    (merge/rebase! conn from to opts))))
+
+(defn reset-branch!
+  "Resets a branch to a previous state using safe reset (non-destructive).
+
+  Creates a new commit that reverts the branch to the target state
+  while preserving the full commit history.
+
+  Parameters:
+    conn - Connection object
+    branch - Target branch to reset (e.g., 'ledger:main')
+    to - Target state:
+      {:t 90} - Reset to transaction t-value
+      {:sha 'abc123'} - Reset to specific commit SHA
+    opts - Map with optional reset options:
+      :message - Commit message (auto-generated if not provided)
+      :preview? - Dry run without making changes (default false)
+
+  Returns promise resolving to:
+    {:status :success|:error
+     :operation :reset
+     :branch '...'
+     :mode :safe
+     :reset-to {:t 90}|{:sha '...'}
+     :new-commit 'sha'
+     :previous-head 'sha'}"
+  ([conn branch to]
+   (reset-branch! conn branch to {}))
+  ([conn branch to opts]
+   (validate-connection conn)
+   (promise-wrap
+    (merge/reset-branch! conn branch to opts))))
+
+(defn branch-divergence
+  "Analyzes divergence between two branches.
+  
+  Parameters:
+    conn - Connection object
+    branch1-spec - First branch spec
+    branch2-spec - Second branch spec
+    
+  Returns promise resolving to divergence analysis including:
+    :common-ancestor - Commit ID of common ancestor
+    :branch1-ahead - Number of commits branch1 is ahead
+    :branch2-ahead - Number of commits branch2 is ahead
+    :can-fast-forward - Boolean if one can fast-forward to the other"
+  [conn branch1-spec branch2-spec]
+  (validate-connection conn)
+  (promise-wrap
+   (merge/branch-divergence conn branch1-spec branch2-spec)))
+
+(defn branch-graph
+  "Returns a graph representation of branches and their relationships.
+  
+  Useful for visualizing branch history and relationships in UIs.
+  
+  Parameters:
+    conn - Connection object
+    ledger-spec - Ledger specification (e.g., 'myledger')
+    opts - Options map:
+      :format - Output format (default :json)
+        :json - Structured data for UI rendering
+        :ascii - ASCII art representation
+      :depth - Number of commits to show (default 20)
+        integer - Show N most recent commits
+        :all - Show entire history
+      :branches - Which branches to include (default :all)
+        :all - Include all branches
+        [\"main\" \"feature\"] - Only specified branches
+  
+  Returns promise resolving to:
+    - For :json format: Map with :branches, :commits, and :merges
+    - For :ascii format: String with ASCII art graph
+    
+  Example:
+    ;; Get JSON data for UI
+    @(branch-graph conn \"mydb\" {:format :json :depth 50})
+    
+    ;; Get ASCII visualization
+    @(branch-graph conn \"mydb\" {:format :ascii :branches [\"main\" \"feature\"]})"
+  ([conn ledger-spec]
+   (branch-graph conn ledger-spec {}))
+  ([conn ledger-spec opts]
+   (validate-connection conn)
+   (promise-wrap
+    (merge/branch-graph conn ledger-spec opts))))
 
 ;; db operations
 
