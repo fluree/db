@@ -515,7 +515,7 @@
           (<? opst-ch)
           ;; Clean up cuckoo filter files for all branches - after gc to avoid race condition
           (when ledger-alias
-            (let [ledger-name (first (str/split ledger-alias #":" 2))]
+            (let [[ledger-name _] (util.ledger/ledger-parts ledger-alias)]
               (<? (cuckoo/delete-all-filters index-catalog ledger-name))))
           (<? (storage/delete storage index-address))))
       :index-dropped)))

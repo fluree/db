@@ -72,8 +72,7 @@
           ;; Normalize branch name - nil means "main"
           branch-name (or branch "main")
 
-          ;; ALWAYS remove ALL garbage from this branch's cuckoo filter
-          ;; This ensures we don't block other branches from deleting these segments
+          ;; Remove garbage from this branch's filter to avoid blocking deletion by other branches
           _ (when (and (:storage index-catalog) (seq garbage))
               (let [filter (<! (cuckoo/read-filter index-catalog ledger-name branch-name))]
                 (when filter
