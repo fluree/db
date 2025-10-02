@@ -406,7 +406,7 @@
         (async/put! ledger-chan ledger)
         ledger)
       (throw (ex-info (str "Unable to load. No record of ledger at address: " ledger-address " exists.")
-                      {:status 404, :error :db/unkown-address})))))
+                      {:status 404, :error :db/unknown-address})))))
 
 (defn load-ledger-address
   [conn address]
