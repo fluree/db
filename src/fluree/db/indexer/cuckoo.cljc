@@ -316,10 +316,12 @@
   (str ledger-alias "/index/cuckoo/" branch-name))
 
 (defn write-filter
-  "Writes cuckoo filter to storage as CBOR binary data."
+  "Writes cuckoo filter to storage as CBOR binary data.
+  No-op in CLJS environments without CBOR support."
   [index-catalog ledger-alias branch-name t filter]
   (go-try
-    (when (and index-catalog (:storage index-catalog) filter)
+    (when (and cbor/cbor-available?
+               index-catalog (:storage index-catalog) filter)
       (let [serialized (assoc filter :t t)
             cbor-bytes (cbor/encode serialized)
             path       (filter-storage-path ledger-alias branch-name)
@@ -331,10 +333,11 @@
 
 (defn read-filter
   "Reads cuckoo filter from storage, decoding CBOR binary data.
-  Returns nil if filter doesn't exist."
+  Returns nil if filter doesn't exist or in CLJS environments without CBOR support."
   [index-catalog ledger-alias branch-name]
   (go-try
-    (when (and index-catalog (:storage index-catalog) ledger-alias branch-name)
+    (when (and cbor/cbor-available?
+               index-catalog (:storage index-catalog) ledger-alias branch-name)
       (let [path    (filter-storage-path ledger-alias branch-name)
             storage (:storage index-catalog)
             store   (if (satisfies? store/ByteStore storage)
