@@ -9,7 +9,6 @@
             [fluree.db.merge.flake :as merge-flake]
             [fluree.db.merge.graph :as merge-graph]
             [fluree.db.merge.operations :as ops]
-            [fluree.db.nameservice.sub :as ns-subscribe]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.ledger :as util.ledger]))
@@ -92,7 +91,7 @@
          conn branch-spec temp-branch
          (assoc branch-metadata :from-commit new-commit-id)))
     ;; Ensure subsequent loads see fresh state
-    (ns-subscribe/release-ledger conn branch-spec)))
+    (connection/release-ledger conn branch-spec)))
 
 (defn rebase!
   "Rebases source branch onto target branch (updates source branch).

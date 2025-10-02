@@ -10,7 +10,6 @@
             [fluree.db.merge.flake :as merge-flake]
             [fluree.db.merge.response :as merge-response]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.nameservice.sub :as ns-subscribe]
             [fluree.db.transact :as transact]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.ledger :as util.ledger]
@@ -35,7 +34,7 @@
                         {:status 400 :error :db/no-nameservice})))
       (<? (nameservice/publish publisher compact))
       ;; Ensure subsequent loads see fresh state
-      (ns-subscribe/release-ledger conn to)
+      (connection/release-ledger conn to)
       {:status :success
        :operation :rebase
        :from from
