@@ -15,8 +15,8 @@
                   (doseq [[k v] x]
                     (.put m (if (keyword? k) (name k) k) (clj->java v)))
                   m)
-       (vector? x) (java.util.ArrayList. (map clj->java x))
-       (sequential? x) (java.util.ArrayList. (map clj->java x))
+       (vector? x) (java.util.ArrayList. ^java.util.Collection (map clj->java x))
+       (sequential? x) (java.util.ArrayList. ^java.util.Collection (map clj->java x))
        (keyword? x) (name x)
        :else x)))
 
@@ -25,7 +25,7 @@
      [x]
      (cond
        (instance? java.util.Map x)
-       (into {} (for [e (.entrySet ^java.util.Map x)]
+       (into {} (for [^java.util.Map$Entry e (.entrySet ^java.util.Map x)]
                   [(keyword (.getKey e)) (java->clj* (.getValue e))]))
 
        (instance? java.util.List x)
