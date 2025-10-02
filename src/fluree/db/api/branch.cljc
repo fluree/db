@@ -6,7 +6,6 @@
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.nameservice.sub :as ns-subscribe]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.branch :as util.branch]
@@ -142,7 +141,7 @@
       (if-let [primary-publisher (:primary-publisher conn)]
         (do
           (<? (nameservice/retract primary-publisher branch-spec*))
-          (ns-subscribe/release-ledger conn branch-spec*))
+          (connection/release-ledger conn branch-spec*))
         (throw (ex-info "No nameservice available for branch deletion"
                         {:status 400 :error :db/no-nameservice})))
       {:deleted branch-spec*})))

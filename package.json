@@ -8,6 +8,7 @@
     "axios": "^1.5.1",
     "bufferutil": "^4.0.7",
     "form-data": "^4.0.0",
+    "fs-ext": "^2.1.1",
     "jsonld": "8.3.3",
     "seedrandom": "^3.0.5",
     "source-map-support": "^0.5.21",

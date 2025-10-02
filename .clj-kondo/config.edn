@@ -4,5 +4,6 @@
  :lint-as        {instaparse.core/defparser clojure.core/def
                   babashka.fs/with-temp-dir clojure.core/let}
  :config-in-call {cljs.core/pr-sequential-writer {:ignore [:private-call]}}
- :config-in-ns   {fluree.db.json-ld.api {:ignore true}}
+ :config-in-ns   {fluree.db.json-ld.api     {:ignore true}
+                  fluree.db.util.filesystem {:ignore [:locking-suspicious-lock]}}
  :output         {:pattern "::{{level}} file={{filename}},line={{row}},col={{col}}::{{message}}"}}

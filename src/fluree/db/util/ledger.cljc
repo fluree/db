@@ -32,9 +32,12 @@
    e.g., 'my-ledger' -> 'my-ledger:main'
          'my-ledger:branch' -> 'my-ledger:branch'"
   [ledger-alias]
-  (if (ledger-branch ledger-alias)
-    ledger-alias
-    (str ledger-alias ":" const/default-branch-name)))
+  (if (not-empty ledger-alias)
+    (if (ledger-branch ledger-alias)
+      ledger-alias
+      (str ledger-alias ":" const/default-branch-name))
+    (throw (ex-info "Missing ledger name"
+                    {:status 400, :error :db/invalid-ledger-name}))))
 
 (defn validate-ledger-name
   "Validates a ledger name for creation. Throws if invalid.
