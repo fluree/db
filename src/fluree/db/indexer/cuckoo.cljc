@@ -342,11 +342,17 @@
                       (store/get-content-store storage ::store/default))]
         (try*
           (when-let [cbor-bytes (<? (store/read-bytes-ext store path "cbor"))]
-            (let [decoded (cbor/decode cbor-bytes)]
-              (deserialize decoded)))
+            (try*
+              (let [decoded (cbor/decode cbor-bytes)]
+                (deserialize decoded))
+              (catch* e
+                ;; CBOR exists but is corrupted - next index operation will rebuild the filter automatically
+                (log/warn "Corrupted cuckoo filter detected for" ledger-alias "branch" branch-name
+                          "- Recommend reindexing the ledger to ensure no disruptions."
+                          "Error:" (ex-message e))
+                nil)))
           (catch* _e
-            ;; Return nil if filter doesn't exist or can't be read - this is expected
-            ;; for new branches or when filters haven't been created yet
+            ;; Filter doesn't exist - this is expected for new branches
             nil))))))
 
 ;; Cleanup functions

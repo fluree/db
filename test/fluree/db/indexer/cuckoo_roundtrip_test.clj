@@ -104,6 +104,38 @@
             result (read-filter-from-disk storage-str "nonexistent" "branch")]
         (is (nil? result) "Should return nil for non-existent filter")))))
 
+(deftest cuckoo-filter-corrupted-cbor-test
+  (testing "Reading corrupted CBOR filter logs warning and returns nil"
+    (with-temp-dir [storage-path {}]
+      (let [storage-str (str storage-path)
+            storage (file-storage/open storage-str)
+            index-catalog {:storage storage}
+            ledger-id "test-ledger"
+            branch-name "main"
+            filter-dir (io/file storage-str ledger-id "index" "cuckoo")]
+
+        ;; Create directory and write corrupted CBOR
+        (.mkdirs filter-dir)
+        (let [filter-path (io/file filter-dir (str branch-name ".cbor"))]
+          (with-open [out (io/output-stream filter-path)]
+            ;; Write invalid CBOR bytes - use byte array with invalid CBOR header
+            (.write out (byte-array [0xFF 0xFF 0xFF 0xFF 0xFF]))))
+
+        (testing "read-filter returns nil for corrupted data"
+          (let [result (<!! (cuckoo/read-filter index-catalog ledger-id branch-name))]
+            (is (nil? result) "Should return nil when CBOR is corrupted")))
+
+        (testing "Corrupted filter can be rebuilt by writing new one"
+          (let [new-filter (cuckoo/create-filter-chain)
+                test-hash "beyc5cjwueyz5fbuwlpvehpgvy33cbawx5kvsb3ife6obdfevqrz"
+                filter-with-data (cuckoo/add-item-chain new-filter test-hash)]
+            (<!! (cuckoo/write-filter index-catalog ledger-id branch-name 1 filter-with-data))
+
+            (let [recovered-filter (<!! (cuckoo/read-filter index-catalog ledger-id branch-name))]
+              (is (some? recovered-filter) "Should successfully write and read new filter")
+              (is (cuckoo/contains-hash-chain? recovered-filter test-hash)
+                  "Recovered filter should contain the test hash"))))))))
+
 (deftest hash-extraction-test
   (testing "extract-hash-part normalizes various address formats to same hash"
     (let [hash "bykti63xio62lhycjy44x75a3hu5xigsdks5npyk6btazgjqivfm"]
