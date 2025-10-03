@@ -1,5 +1,6 @@
 (ns fluree.db.virtual-graph.bm25.index
   (:require [clojure.core.async :as async :refer [go alts! put! promise-chan <! >!]]
+            [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
@@ -109,6 +110,9 @@
                 (throw (ex-info "No search target for virtual graph. Did you forget @context in your query?"
                                 {:status 400 :error
                                  :db/invalid-query})))
+            ;; Guard against empty/blank targets
+            _ (when (and (string? target) (str/blank? target))
+                (async/onto-chan! out-ch []))
             {:keys [pending-ch index]} @index-state
 
             ;; TODO - check for "sync" options and don't wait for pending-ch if sync is false

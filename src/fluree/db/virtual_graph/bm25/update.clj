@@ -57,7 +57,8 @@
          (reduce
           (fn [all-text sentence]
             (cond
-              (string? sentence)
+              (and (string? sentence)
+                   (not (str/blank? sentence)))
               (str all-text " " sentence)
 
                ;; nested map is a referred node
@@ -76,7 +77,8 @@
 
               :else ;; stringify other data types
               (str all-text " " sentence)))
-          ""))
+          "")
+         str/trim)
     (catch Exception e
       (let [msg (str "Error extracting text for BM25 from item: " item
                      " - " (ex-message e))]
