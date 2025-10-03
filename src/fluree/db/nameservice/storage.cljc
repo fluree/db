@@ -205,7 +205,7 @@
               record-updater (fn [ns-record]
                                (update-ns-record ns-record ledger-alias commit-address commit-t
                                                  index-address index-t))
-              res            (storage/swap-json store filename record-updater)]
+              res            (<? (storage/swap-json store filename record-updater))]
           (log/debug "Nameservice published ledger:" {:ledger ledger-alias :filename filename})
           res))))
 
