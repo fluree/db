@@ -60,11 +60,11 @@
               (string? sentence)
               (str all-text " " sentence)
 
-            ;; nested map is a referred node
+               ;; nested map is a referred node
               (map? sentence)
               (str all-text " " (extract-text sentence))
 
-            ;; multiple items, can be anything
+               ;; multiple items, can be anything
               (sequential? sentence)
               (str/join " "
                         (cons all-text (map #(if (map? %)
@@ -75,10 +75,8 @@
               all-text
 
               :else ;; stringify other data types
-              (str all-text " " sentence))
-            (if (sequential? sentence)
-              (apply str all-text " " sentence)
-              (str all-text " " sentence)))))
+              (str all-text " " sentence)))
+          ""))
     (catch Exception e
       (let [msg (str "Error extracting text for BM25 from item: " item
                      " - " (ex-message e))]

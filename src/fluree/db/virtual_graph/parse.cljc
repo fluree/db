@@ -74,18 +74,12 @@
             solution))
 
         (= const/iri-index-score p-iri)
-        ;; Handle both direct score and score on result nodes  
-        (let [subj-var (-> triple first ::where/var)]
-          (if (= subj-var (get-in solution [::virtual-graph ::result-node-var]))
-            (assoc-in solution [::virtual-graph ::result ::score] (obj-var triple))
-            (assoc-in solution [::virtual-graph ::result ::score] (obj-var triple))))
+        ;; Set score var for result (works for both direct and nested result nodes)
+        (assoc-in solution [::virtual-graph ::result ::score] (obj-var triple))
 
         (= const/iri-index-vector p-iri)
-        ;; Handle both direct vector and vector on result nodes
-        (let [subj-var (-> triple first ::where/var)]
-          (if (= subj-var (get-in solution [::virtual-graph ::result-node-var]))
-            (assoc-in solution [::virtual-graph ::result ::vector] (obj-var triple))
-            (assoc-in solution [::virtual-graph ::result ::vector] (obj-var triple))))
+        ;; Set vector var for result (works for both direct and nested result nodes)
+        (assoc-in solution [::virtual-graph ::result ::vector] (obj-var triple))
 
         :else
         solution))))
