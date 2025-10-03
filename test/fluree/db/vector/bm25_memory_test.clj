@@ -66,11 +66,9 @@
           (testing "results contain expected articles"
             (let [article-ids (set (map first search-results))]
               (println "Article IDs found:" article-ids)
-              (is (or (contains? article-ids "http://example.org/article1")
-                      (contains? article-ids "ex:article1"))
+              (is (contains? article-ids "ex:article1")
                   "Should find article1 mentioning 'Fluree'")
-              (is (or (contains? article-ids "http://example.org/article3")
-                      (contains? article-ids "ex:article3"))
+              (is (contains? article-ids "ex:article3")
                   "Should find article3 mentioning 'Fluree'")))
 
           (testing "results include BM25 scores"
@@ -128,6 +126,5 @@
           (testing "blockchain search finds correct article"
             (let [article-ids (set (map first blockchain-results))]
               (println "Blockchain search article IDs:" article-ids)
-              (is (or (contains? article-ids "http://example.org/article3")
-                      (contains? article-ids "ex:article3"))
+              (is (contains? article-ids "http://example.org/article3")
                   "Should find article3 about blockchain"))))))))

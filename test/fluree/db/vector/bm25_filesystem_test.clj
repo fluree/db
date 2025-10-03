@@ -80,8 +80,7 @@
 
             (testing "results contain expected articles"
               (let [article-ids (set (map first search-results))]
-                (is (or (contains? article-ids "ex:article1")
-                        (contains? article-ids "http://example.org/article1"))
+                (is (contains? article-ids "ex:article1")
                     "Should find article1 mentioning 'Fluree'")))
 
             (testing "results include BM25 scores"
@@ -105,6 +104,5 @@
 
             (testing "blockchain search finds correct article"
               (let [article-ids (set (map first blockchain-results))]
-                (is (or (contains? article-ids "ex:article3")
-                        (contains? article-ids "http://example.org/article3"))
+                (is (contains? article-ids "ex:article3")
                     "Should find article3 about blockchain")))))))))
