@@ -26,10 +26,10 @@
     ;; It's a virtual graph or other resource
     (str const/ns-version "/" resource-name ".json")))
 
-(defn ns-record
+(defn new-ns-record
   "Generates nameservice metadata map for JSON storage using new minimal format.
    Expects ledger-alias to be in format 'ledger:branch'."
-  [ledger-alias commit-address t index-address]
+  [ledger-alias commit-address t index-address index-t]
   (let [[alias branch] (util.ledger/ledger-parts ledger-alias)
         branch (or branch const/default-branch-name)]
     (cond-> {"@context"     {"f" iri/f-ns}
@@ -40,7 +40,47 @@
              "f:commit"     {"@id" commit-address}
              "f:t"          t
              "f:status"     "ready"}
-      index-address (assoc "f:index" {"@id" index-address}))))
+      index-address (assoc "f:index" {"@id" index-address
+                                      "f:t" index-t}))))
+
+(defn get-t
+  [ns-record]
+  (get ns-record "f:t" 0))
+
+(defn get-index-t
+  [ns-record]
+  (get-in ns-record ["f:index" "f:t"] 0))
+
+(defn update-commit-address
+  [ns-record commit-address commit-t]
+  (if (and commit-address commit-t)
+    (let [prev-t (get-t ns-record)]
+      (if (< prev-t commit-t)
+        (assoc ns-record
+               "f:t" commit-t
+               "f:commit" {"@id" commit-address})
+        ns-record))
+    ns-record))
+
+(defn update-index-address
+  [ns-record index-address index-t]
+  (if index-address
+    (let [prev-t (get-index-t ns-record)]
+      (if (or (nil? index-t) (< prev-t index-t))
+        (let [index-record (cond-> {"@id" index-address}
+                             index-t (assoc "f:t" index-t))]
+          (assoc ns-record "f:index" index-record))
+        ns-record))
+    ns-record))
+
+(defn update-ns-record
+  [ns-record ledger-alias commit-address commit-t index-address index-t]
+  (if (some? ns-record)
+    (-> ns-record
+        (update-commit-address commit-address commit-t)
+        (update-index-address index-address index-t))
+    (new-ns-record ledger-alias commit-address commit-t
+                   index-address index-t)))
 
 ;; Convert internal record map to JSON-LD for nameservice storage
 (defmulti record->json-ld
@@ -55,8 +95,9 @@
   [record]
   (let [{:strs [alias address]
          {:strs [t]} "data"
-         {index-address "address"} "index"} record]
-    (ns-record alias address t index-address)))
+         {index-address "address"
+          {:strs [index-t]} "data"} "index"} record]
+    (new-ns-record alias address t index-address index-t)))
 
 (defmethod record->json-ld :virtual-graph
   [{:keys [vg-name vg-type status dependencies config] :as _record}]
@@ -145,19 +186,30 @@
   nameservice/Publisher
   (publish [this record]
     (go-try
-      (let [filename (if-let [vg-name (:vg-name record)]
-                       (local-filename vg-name)
-                       (local-filename (get record "alias")))  ;; alias already includes :branch
-            json-ld (record->json-ld record)
-            result (->> json-ld
-                        json/stringify-UTF8
-                        (storage/write-bytes store filename)
-                        <?)]
-        (log/debug "Nameservice published:" filename)
-        (when (is-virtual-graph-record? json-ld)
-          ;; If this is a virtual graph, register dependencies
-          (register-dependencies this json-ld))
-        result)))
+      (if-let [vg-name (:vg-name record)]
+        ;; Virtual Graph: use write-bytes (non-atomic, but VGs aren't concurrently updated)
+        (let [filename (local-filename vg-name)
+              json-ld (record->json-ld record)
+              result (->> json-ld
+                          json/stringify-UTF8
+                          (storage/write-bytes store filename)
+                          <?)]
+          (log/debug "Nameservice published VG:" filename)
+          (register-dependencies this json-ld)
+          result)
+        ;; Ledger: use swap-json for atomic updates
+        (let [ledger-alias (get record "alias")  ;; Already includes :branch
+              filename     (local-filename ledger-alias)
+              commit-address (get record "address")
+              commit-t       (get-in record ["data" "t"])
+              index-address  (get-in record ["index" "address"])
+              index-t        (get-in record ["index" "data" "t"])
+              record-updater (fn [ns-record]
+                               (update-ns-record ns-record ledger-alias commit-address commit-t
+                                                 index-address index-t))
+              res            (storage/swap-json store filename record-updater)]
+          (log/debug "Nameservice published ledger:" {:ledger ledger-alias :filename filename})
+          res))))
 
   (retract [this target]
     (go-try
@@ -183,7 +235,7 @@
       ;; ledger-address is just the alias (potentially with :branch)
       (let [filename (local-filename ledger-address)]
         (log/debug "StorageNameService lookup:" {:ledger-address ledger-address
-                                                 :filename filename})
+                                                 :filename       filename})
         (when-let [record-bytes (<? (storage/read-bytes store filename))]
           (json/parse record-bytes false)))))
 
@@ -200,7 +252,7 @@
       (if (satisfies? storage/RecursiveListableStore store)
         (if-let [list-paths-result (storage/list-paths-recursive store const/ns-version)]
           (loop [remaining-paths (<? list-paths-result)
-                 records []]
+                 records         []]
             (if-let [path (first remaining-paths)]
               (let [file-content (<? (storage/read-bytes store path))]
                 (if file-content
