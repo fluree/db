@@ -19,11 +19,9 @@
    or 'ns@v2/resource-name.json' for virtual graphs."
   [resource-name]
   (if (str/includes? resource-name ":")
-    ;; It's a ledger alias with branch
     (let [[ledger-name branch] (util.ledger/ledger-parts resource-name)
           branch (or branch const/default-branch-name)]
       (str const/ns-version "/" ledger-name "/" branch ".json"))
-    ;; It's a virtual graph or other resource
     (str const/ns-version "/" resource-name ".json")))
 
 (defn new-ns-record

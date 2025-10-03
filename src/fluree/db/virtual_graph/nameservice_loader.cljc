@@ -74,27 +74,17 @@
   [db nameservice vg-name]
   (go-try
     (log/debug "Loading virtual graph from nameservice:" vg-name)
-    ;; First check if VG is already loaded
     (if-let [existing-vg (get-in db [:vg vg-name])]
       (do
         (log/debug "Virtual graph already loaded:" vg-name)
         existing-vg)
-      ;; Load from nameservice
-      (do
-        (log/debug "Loading VG config from nameservice...")
-        (let [vg-record (<? (load-vg-config-from-nameservice nameservice vg-name))
-              _ (log/debug "VG record loaded:" vg-record)
-              vg-config (vg-record->config vg-record)
-              _ (log/debug "VG config parsed:" vg-config)
-              vg-instance (create-vg-instance db vg-config)
-              _ (log/debug "VG instance created, initializing...")
-              ;; Initialize the VG with current db state
-              initialized-vg (<? (vg/initialize vg-instance db))]
-          (log/debug "VG initialized successfully")
-          ;; Return the initialized VG instance directly
-          initialized-vg)))))
+      (let [vg-record (<? (load-vg-config-from-nameservice nameservice vg-name))
+            vg-config (vg-record->config vg-record)
+            vg-instance (create-vg-instance db vg-config)
+            initialized-vg (<? (vg/initialize vg-instance db))]
+        (log/debug "VG initialized successfully")
+        initialized-vg))))
 
-;; Register BM25 implementation
 #?(:clj
    (defmethod create-vg-impl :bm25
      [db vg-opts _vg-config]

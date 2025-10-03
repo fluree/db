@@ -508,14 +508,11 @@
       :index-dropped)))
 
 (defn- check-ledger-dependencies
-  "Checks if ledger has dependent virtual graphs"
+  "Checks if ledger has dependent virtual graphs.
+   Expects ledger-alias in 'ledger:branch' format."
   [primary-pub ledger-alias]
   (when primary-pub
-    ;; Ensure we have the proper ledger:branch format
-    (let [ledger-with-branch (if (str/includes? ledger-alias ":")
-                               ledger-alias
-                               (str ledger-alias ":" const/default-branch-name))]
-      (ns-storage/check-vg-dependencies primary-pub ledger-with-branch))))
+    (ns-storage/check-vg-dependencies primary-pub ledger-alias)))
 
 (defn- throw-if-has-dependencies
   "Throws exception if ledger has dependent virtual graphs"

@@ -35,7 +35,6 @@
     (validate-common-config config)
     (<? (create-vg conn config))))
 
-;; BM25 implementation
 (defn- validate-bm25-config
   "Validates BM25-specific configuration."
   [{:keys [config]}]
@@ -84,7 +83,7 @@
    Returns the loaded virtual graph instance."
   [loaded-ledgers publisher vg-name]
   (go-try
-    ;; Since we only support single ledger for now, we can return the VG directly
+    ;; Single ledger support only for now
     (let [[_alias ledger] (first loaded-ledgers)
           db (ledger/current-db ledger)
           vg (<? (vg-loader/load-virtual-graph-from-nameservice db publisher vg-name))]
@@ -106,16 +105,10 @@
                         {:error :db/invalid-config
                          :vg-name vg-name})))
 
-      ;; Load and validate ledgers exist before publishing
       (let [loaded-ledgers (<? (load-and-validate-ledgers conn ledger-aliases))]
-
-        ;; Publish to nameservice only after ledgers are validated
         (<? (nameservice/publish publisher full-config))
-
-        ;; Initialize the virtual graph with pre-loaded ledgers and return the VG instance
         (<? (initialize-bm25-for-ledgers loaded-ledgers publisher vg-name))))))
 
-;; Default implementation for unknown types
 (defmethod create-vg :default
   [_conn {:keys [type]}]
   (go-try
