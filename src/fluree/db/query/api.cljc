@@ -204,9 +204,7 @@
         (do
           (log/debug "Virtual graph not found in nameservice:" vg-name)
           nil)
-        ;; This is a virtual graph - need to instantiate it
-        ;; For now, we need to get a ledger to associate with the VG
-        ;; In the future, VGs could be completely independent
+        ;; Instantiate virtual graph (currently requires an associated ledger; future VGs may be independent)
         (let [dependencies (get vg-record "f:dependencies")
               ;; Find first ledger dependency
               primary-ledger (extract-primary-ledger-name dependencies)]
@@ -215,7 +213,6 @@
             (let [ledger (<? (connection/load-ledger-alias conn primary-ledger))
                   db (ledger/current-db ledger)]
               (log/debug "Loading VG from nameservice...")
-              ;; Load the VG directly using the nameservice
               (<? (vg-loader/load-virtual-graph-from-nameservice db primary-publisher vg-name)))
             (throw (ex-info (str "Virtual graph has no ledger dependencies: " vg-name)
                             {:status 400 :error :db/invalid-configuration}))))))))
