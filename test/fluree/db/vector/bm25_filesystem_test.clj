@@ -1,9 +1,11 @@
 (ns fluree.db.vector.bm25-filesystem-test
   (:require [babashka.fs :as fs]
+            [clojure.core.async :refer [<!!]]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph :as vg]))
 
 (deftest ^:integration bm25-filesystem-test
   (testing "BM25 virtual graph with filesystem storage"
@@ -53,8 +55,8 @@
                 (is (some #{"f:VirtualGraphDatabase"} (get ns-content "@type")))
                 (is (some #{"fidx:BM25"} (get ns-content "@type")))))))
 
-        ;; Allow time for BM25 index building
-        (Thread/sleep 3000)
+        ;; Wait for BM25 index initialization to complete to avoid flaky assertions
+        (<!! (vg/sync vg-obj nil))
 
         (testing "BM25 index file creation"
           (let [vg-dir (fs/file storage-path "virtual-graphs")]
@@ -101,6 +103,10 @@
 
             (testing "blockchain search returns results"
               (is (seq blockchain-results) "Should find articles about blockchain"))
+
+            (testing "blockchain scores are numeric"
+              (is (every? #(number? (second %)) blockchain-results)
+                  "All results should have numeric scores"))
 
             (testing "blockchain search finds correct article"
               (let [article-ids (set (map first blockchain-results))]

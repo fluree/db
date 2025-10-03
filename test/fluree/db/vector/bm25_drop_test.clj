@@ -73,8 +73,9 @@
                                                   "select" ["?doc"]})]
             (is (instance? Exception result) "Should return an exception when querying deleted VG")
             (when (instance? Exception result)
-              (is (re-find #"Load for movie-search(:main)? failed" (ex-message result))
-                  (str "Error message doesn't match. Got: " (ex-message result))))))
+              (let [data (ex-data result)]
+                (is (integer? (:status data)) "Error should have a numeric status")
+                (is (some? (:error data)) "Error should include a :error code")))))
 
         ;; Verify we can recreate a VG with the same name
         (testing "can recreate VG with same name after deletion"

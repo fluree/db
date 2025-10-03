@@ -58,14 +58,13 @@
                                                         "idx:score" "?score"}}]
                                 "select" ["?article" "?score"]})]
 
-          (log/warn "Search results for 'fluree':" search-results)
+          (log/debug "Search results for 'fluree':" search-results)
 
           (testing "search returns results"
             (is (seq search-results) "Should return search results"))
 
           (testing "results contain expected articles"
             (let [article-ids (set (map first search-results))]
-              (println "Article IDs found:" article-ids)
               (is (contains? article-ids "ex:article1")
                   "Should find article1 mentioning 'Fluree'")
               (is (contains? article-ids "ex:article3")
@@ -77,6 +76,19 @@
           (testing "scores are properly ordered"
             (let [scores (map second search-results)]
               (is (= scores (sort > scores)) "Scores should be in descending order")))))
+
+      (testing "blank search target returns empty results"
+        (let [empty-results @(fluree/query-connection
+                              conn
+                              {"@context" {"idx" "https://ns.flur.ee/index#"}
+                               "from" ["doc-search"]
+                               "where" [{"@id" "?x"
+                                         "idx:target" ""
+                                         "idx:limit" 10
+                                         "idx:result" {"idx:id" "?article"}}]
+                               "select" ["?article"]})]
+          (is (vector? empty-results) "Should return a vector of results")
+          (is (empty? empty-results) "Blank target should return no results")))
 
       (testing "federated query with ledger and virtual graph"
         (let [federated-results @(fluree/query-connection
@@ -125,6 +137,5 @@
 
           (testing "blockchain search finds correct article"
             (let [article-ids (set (map first blockchain-results))]
-              (println "Blockchain search article IDs:" article-ids)
               (is (contains? article-ids "http://example.org/article3")
                   "Should find article3 about blockchain"))))))))
