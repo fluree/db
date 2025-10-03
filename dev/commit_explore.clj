@@ -12,11 +12,18 @@
        (filter #(.isFile %))
        (map #(.getName %))))
 
+(defn parse-file
+  [source-dir file-name]
+  (-> source-dir
+      (io/file file-name)
+      slurp
+      (json/parse false)))
+
 (defn parsed-files
   "Lazily returns every file in a directory as a parsed json object"
   [source-dir]
   (let [files (list-files source-dir)]
-    (map #(json/parse (slurp (io/file source-dir %)) false) files)))
+    (map (partial parse-file source-dir) files)))
 
 (defn data-file?
   "Truthy if the parsed file is a data file (@type = f:DB)"
