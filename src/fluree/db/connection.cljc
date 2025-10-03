@@ -8,12 +8,14 @@
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
+            [fluree.db.nameservice.storage :as ns-storage]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
             [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.ledger :as util.ledger]
-            [fluree.db.util.log :as log :include-macros true])
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -184,6 +186,11 @@
 (defn publishers
   [{:keys [primary-publisher secondary-publishers] :as _conn}]
   (cons primary-publisher secondary-publishers))
+
+(defn primary-publisher
+  "Returns the primary nameservice publisher for the connection"
+  [{:keys [primary-publisher] :as _conn}]
+  primary-publisher)
 
 (defn publications
   [conn]
@@ -500,33 +507,70 @@
           (<? (storage/delete storage index-address))))
       :index-dropped)))
 
+(defn- check-ledger-dependencies
+  "Checks if ledger has dependent virtual graphs.
+   Expects ledger-alias in 'ledger:branch' format."
+  [primary-pub ledger-alias]
+  (when primary-pub
+    (ns-storage/check-vg-dependencies primary-pub ledger-alias)))
+
+(defn- throw-if-has-dependencies
+  "Throws exception if ledger has dependent virtual graphs"
+  [alias dependent-vgs]
+  (when (seq dependent-vgs)
+    (throw (ex-info (str "Cannot delete ledger '" alias
+                         "' - it has dependent virtual graphs: "
+                         (str/join ", " dependent-vgs)
+                         ". Delete the virtual graphs first.")
+                    {:status 400
+                     :error :db/ledger-has-dependencies
+                     :ledger alias
+                     :dependent-vgs dependent-vgs}))))
+
+(defn- drop-ledger-artifacts
+  "Drops all artifacts (index and commit) for a ledger"
+  [conn latest-commit]
+  (when latest-commit
+    (drop-index-artifacts conn latest-commit)
+    (drop-commit-artifacts conn latest-commit)))
+
+(defn- drop-ledger-from-publisher
+  "Drops a single ledger from a specific publisher"
+  [conn publisher alias]
+  (go-try
+    (let [ledger-addr  (<? (nameservice/publishing-address publisher alias))
+          ns-record    (<? (nameservice/lookup publisher ledger-addr))
+          commit-address (get-in ns-record ["f:commit" "@id"])
+          index-address  (get-in ns-record ["f:index" "@id"])
+          latest-commit  (when commit-address
+                           (let [commit (<? (commit-storage/load-commit-with-metadata
+                                             (:commit-catalog conn)
+                                             commit-address
+                                             index-address))]
+                             (when commit
+                               (json-ld/expand commit))))]
+      (log/debug "Dropping ledger" ledger-addr)
+      (drop-ledger-artifacts conn latest-commit)
+      (<? (nameservice/retract publisher alias)))))
+
 (defn drop-ledger
+  "Drops a ledger and all its associated data from all publishers"
   [conn alias]
-  (go
-    (try*
-      (let [alias* (cond-> alias
-                     (fluree-address? alias) storage/get-local-path
-                     true util.ledger/ensure-ledger-branch)]
-        (loop [[publisher & r] (publishers conn)]
-          (when publisher
-            (let [ledger-addr   (<? (nameservice/publishing-address publisher alias*))
-                  ns-record     (<? (nameservice/lookup publisher ledger-addr))
-                  commit-address (get-in ns-record ["f:commit" "@id"])
-                  index-address  (get-in ns-record ["f:index" "@id"])
-                  latest-commit  (when commit-address
-                                   (<? (commit-storage/load-commit-with-metadata
-                                        (:commit-catalog conn)
-                                        commit-address
-                                        index-address)))]
-              (log/debug "Dropping ledger" ledger-addr)
-              (when latest-commit
-                (drop-index-artifacts conn latest-commit)
-                (drop-commit-artifacts conn latest-commit))
-              (<? (nameservice/retract publisher alias*))
-              (recur r))))
-        (log/debug "Dropped ledger" alias*)
-        :dropped)
-      (catch* e (log/debug e "Failed to complete ledger deletion")))))
+  (go-try
+    (let [alias* (cond-> alias
+                   (fluree-address? alias) storage/get-local-path
+                   true util.ledger/ensure-ledger-branch)
+          primary-pub   (:primary-publisher conn)
+          dependent-vgs (check-ledger-dependencies primary-pub alias*)]
+
+      (throw-if-has-dependencies alias* dependent-vgs)
+
+      (loop [[publisher & r] (publishers conn)]
+        (when publisher
+          (<? (drop-ledger-from-publisher conn publisher alias*))
+          (recur r)))
+      (log/debug "Dropped ledger" alias*)
+      :dropped)))
 
 (defn resolve-txn
   "Reads a transaction from the commit catalog by address.

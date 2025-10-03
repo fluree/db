@@ -5,6 +5,7 @@
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.ledger :as ledger]
+            [fluree.db.nameservice.virtual-graph :as ns-vg]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.history :as history]
@@ -16,7 +17,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
             [fluree.db.util.ledger :as ledger-util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph.nameservice-loader :as vg-loader]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -175,21 +177,70 @@
                         (some-> opts (get base-name) (select-keys ledger-specific-opts)))]
     (update q :opts merge ledger-opts)))
 
+(defn- extract-primary-ledger-name
+  "Extracts the primary ledger alias from a collection of dependencies.
+  Looks for the first dependency with a ledger reference pattern (e.g., 'mydb:main')
+  and returns the full alias (e.g., 'mydb:main')."
+  [dependencies]
+  (some->> dependencies
+           (map #(get % "@id"))
+           ;; Filter for valid ledger aliases (those containing ':')
+           (filter #(and (string? %)
+                        ;; Verify it's a valid ledger alias by checking if we can parse it
+                         (let [[ledger branch] (ledger-util/ledger-parts %)]
+                           (and ledger branch))))
+           first))
+
+(defn load-virtual-graph
+  "Loads a virtual graph from nameservice and returns it as a DB-like object."
+  [conn vg-name]
+  (go-try
+    (log/debug "load-virtual-graph called for:" vg-name)
+    (let [primary-publisher (connection/primary-publisher conn)
+          vg-record (<? (ns-vg/get-virtual-graph primary-publisher vg-name))]
+      (log/debug "VG record from nameservice:" vg-record)
+      (if (= :not-found vg-record)
+        ;; Not a virtual graph, return nil
+        (do
+          (log/debug "Virtual graph not found in nameservice:" vg-name)
+          nil)
+        ;; Instantiate virtual graph (currently requires an associated ledger; future VGs may be independent)
+        (let [dependencies (get vg-record "f:dependencies")
+              ;; Find first ledger dependency
+              primary-ledger (extract-primary-ledger-name dependencies)]
+          (log/debug "Dependencies:" dependencies "Primary ledger:" primary-ledger)
+          (if primary-ledger
+            (let [ledger (<? (connection/load-ledger-alias conn primary-ledger))
+                  db (ledger/current-db ledger)]
+              (log/debug "Loading VG from nameservice...")
+              (<? (vg-loader/load-virtual-graph-from-nameservice db primary-publisher vg-name)))
+            (throw (ex-info (str "Virtual graph has no ledger dependencies: " vg-name)
+                            {:status 400 :error :db/invalid-configuration}))))))))
+
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
   (go-try
     (try*
-      (let [[base-alias explicit-t] (extract-query-string-t alias)
-            ledger       (<? (connection/load-ledger-alias conn base-alias))
-            db           (ledger/current-db ledger)
-            t*           (or explicit-t t)
-            query*       (-> sanitized-query
-                             (assoc :t t*)
-                             (ledger-opts-override db))]
-        (<? (restrict-db db tracker query* conn)))
+      (log/debug "load-alias called with:" alias)
+      ;; First try to load as a virtual graph
+      (if-let [vg (<? (load-virtual-graph conn alias))]
+        (do
+          (log/debug "Loaded virtual graph successfully:" alias)
+          vg)
+        ;; Not a virtual graph, load as regular ledger
+        (do
+          (log/debug "Loading as ledger:" alias)
+          (let [[base-alias explicit-t] (extract-query-string-t alias)
+                ledger       (<? (connection/load-ledger-alias conn base-alias))
+                db           (ledger/current-db ledger)
+                t*           (or explicit-t t)
+                query*       (-> sanitized-query
+                                 (assoc :t t*)
+                                 (ledger-opts-override db))]
+            (<? (restrict-db db tracker query* conn)))))
       (catch* e
         (throw (contextualize-ledger-400-error
-                (str "Error loading ledger " alias ": ")
+                (str "Error loading resource " alias ": ")
                 e))))))
 
 (defn load-aliases
@@ -207,7 +258,7 @@
     (loop [[alias & r] aliases
            db-map      {}]
       (if alias
-       ;; TODO: allow restricting federated dataset components individually by t
+        ;; TODO: allow restricting federated dataset components individually by t
         (let [db      (<? (load-alias conn tracker alias sanitized-query))
               db-map* (assoc db-map alias db)]
           (recur r db-map*))
@@ -243,9 +294,11 @@
           tracker         (track/init opts)
           default-aliases (some-> sanitized-query :from util/sequential)
           named-aliases   (some-> sanitized-query :from-named util/sequential)]
+      (log/debug "query-connection-fql - from:" default-aliases "from-named:" named-aliases)
       (if (or (seq default-aliases)
               (seq named-aliases))
         (let [ds            (<? (load-dataset conn tracker default-aliases named-aliases sanitized-query))
+              _ (log/debug "Loaded dataset:" (type ds) "for aliases:" default-aliases)
               trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel)]
           (if (track/track-query? opts)
             (<? (track-execution ds tracker #(fql/query ds tracker trimmed-query)))

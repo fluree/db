@@ -18,7 +18,7 @@
     "Returns a channel containing all nameservice records for building in-memory query ledger"))
 
 (defprotocol Publisher
-  (publish [publisher commit-jsonld]
+  (publish [publisher commit-map]
     "Publishes new commit.")
   (retract [publisher ledger-alias]
     "Remove the nameservice record for the ledger.")
@@ -38,12 +38,12 @@
   (known-addresses [publication ledger-alias]))
 
 (defn publish-to-all
-  [commit-jsonld publishers]
+  [commit-map publishers]
   (->> publishers
        (map (fn [ns]
               (go
                 (try*
-                  (<? (publish ns commit-jsonld))
+                  (<? (publish ns commit-map))
                   (catch* e
                     (log/warn e "Publisher failed to publish commit")
                     ::publishing-error)))))
