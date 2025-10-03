@@ -356,15 +356,6 @@
    (cmp-op (op f1) (op f2))
    (cmp-meta (m f1) (m f2))))
 
-(defn cmp-flakes-psot [f1 f2]
-  (combine-cmp
-   (cmp-pred (p f1) (p f2))
-   (cmp-subj (s f1) (s f2))
-   (cmp-obj (o f1) (dt f1) (o f2) (dt f2))
-   (cmp-tx (t f1) (t f2))
-   (cmp-op (op f1) (op f2))
-   (cmp-meta (m f1) (m f2))))
-
 (defn cmp-flakes-post [f1 f2]
   (combine-cmp
    (cmp-pred (p f1) (p f2))

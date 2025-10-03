@@ -313,9 +313,6 @@
   (-match-triple [db tracker solution triple-mch error-ch]
     (match/match-triple db tracker solution triple-mch error-ch))
 
-  (-match-properties [db tracker solution triple-mchs error-ch]
-    (match/match-properties db tracker solution triple-mchs error-ch))
-
   (-match-class [db tracker solution class-mch error-ch]
     (match/match-class db tracker solution class-mch error-ch))
 

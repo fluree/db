@@ -79,13 +79,6 @@
         (where/-match-class active-graph tracker solution triple error-ch))
       empty-channel))
 
-  (-match-properties [ds tracker solution triples error-ch]
-    (if-let [active-graph (get-active-graph ds)]
-      (if (sequential? active-graph)
-        (where/match-triples ds tracker solution triples error-ch)
-        (where/-match-properties active-graph tracker solution triples error-ch))
-      empty-channel))
-
   (-activate-alias [ds alias]
     (go-try
       (activate ds alias)))

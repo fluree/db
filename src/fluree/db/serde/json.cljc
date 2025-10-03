@@ -163,7 +163,7 @@
                 (:stats :config :garbage :prev-index)
                 (util/stringify-keys v)
 
-                (:spot :psot :post :opst :tspo)
+                (:spot :post :opst :tspo)
                 (stringify-child v)
 
                 v)))
