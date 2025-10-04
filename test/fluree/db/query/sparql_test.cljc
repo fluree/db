@@ -89,6 +89,11 @@
                    }
                    GROUP BY ?author"]
         (is (= ["?author" "(as (groupconcat ?title \", \") ?books)"]
+               (:select (sparql/->fql query))))))
+    (testing "ROUND"
+      (let [query "SELECT (ROUND(?foo) * 100 AS ?bar)
+                   WHERE { ?s <ex:foo> ?foo . }"]
+        (is (= ["(as (* (round ?foo) 100) ?bar)"]
                (:select (sparql/->fql query))))))))
 
 (deftest parse-construct

@@ -133,7 +133,7 @@ As ::= WS <('AS' | 'as')> WS
 <AdditiveExpression>	  ::=  	MultiplicativeExpression (WS '+' WS MultiplicativeExpression | WS '-' WS MultiplicativeExpression | ( NumericLiteralPositive | NumericLiteralNegative ) ( (WS '*' WS UnaryExpression ) | (WS '/' WS UnaryExpression ) )* )*
 
 
-MultiplicativeExpression ::= UnaryExpression ( '*' WS UnaryExpression | '/' WS UnaryExpression )*
+MultiplicativeExpression ::= UnaryExpression WS ( '*' WS UnaryExpression WS | '/' WS UnaryExpression WS )*
 UnaryExpression ::= '!' PrimaryExpression
 | '+' PrimaryExpression
 | '-' PrimaryExpression
