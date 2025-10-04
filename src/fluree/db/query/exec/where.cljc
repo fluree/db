@@ -304,7 +304,6 @@
   (-match-id [s tracker solution s-match error-ch])
   (-match-triple [s tracker solution triple error-ch])
   (-match-class [s tracker solution triple error-ch])
-  (-match-properties [s tracker solution triples error-ch])
   (-activate-alias [s alias])
   (-aliases [s])
   (-finalize [s tracker error-ch solution-ch]))
@@ -593,11 +592,6 @@
   [ds tracker solution pattern error-ch]
   (let [triple (pattern-data pattern)]
     (-match-class ds tracker solution triple error-ch)))
-
-(defmethod match-pattern :property-join
-  [ds tracker solution pattern error-ch]
-  (let [triples (pattern-data pattern)]
-    (-match-properties ds tracker solution triples error-ch)))
 
 (defn filter-exception
   "Reformats raw filter exception to try to provide more useful feedback."

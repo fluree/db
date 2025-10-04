@@ -228,8 +228,10 @@
   (let [updated-db (-> state
                        (swap! update-commit (policy/root-db new-db))
                        :current-db)]
-    (when (indexing-enabled? branch-map)
-      (enqueue-index! index-queue updated-db index-files-ch))
+    (if (indexing-enabled? branch-map)
+      (do (log/debug "Enqueueing new commit reindex for branch:" branch-map)
+          (enqueue-index! index-queue updated-db index-files-ch))
+      (log/debug "Indexing disabled for branch:" branch-map))
     branch-map))
 
 (defn current-db

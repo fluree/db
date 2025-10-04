@@ -529,13 +529,6 @@
   [attrs]
   (every? v/query-variable? (vals attrs)))
 
-(defn simple-property-join?
-  [id attrs]
-  (and (>= (count attrs) 2)
-       (v/query-variable? id)
-       (specified-properties? attrs)
-       (variable-objects? attrs)))
-
 (defn parse-id-map-pattern
   [m var-config context]
   (let [id    (get m const/iri-id)
@@ -544,9 +537,7 @@
     (if (empty? attrs)
       [(where/->pattern :id s-mch)]
       (let [statements (parse-statements s-mch attrs var-config context)]
-        (if (simple-property-join? id attrs)
-          [(where/->pattern :property-join statements)]
-          (sort optimize/compare-triples statements))))))
+        (sort optimize/compare-triples statements)))))
 
 (defn parse-node-map
   [m var-config context]
