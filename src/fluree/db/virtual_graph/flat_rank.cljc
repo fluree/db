@@ -74,9 +74,6 @@
   (-match-class [_ _tracker _solution _s-mch _error-ch]
     empty-channel)
 
-  (-match-properties [_ tracker solution triples error-ch]
-    (where/match-triples db tracker solution triples error-ch))
-
   (-activate-alias [_ alias']
     (where/-activate-alias db alias'))
 
@@ -101,9 +98,6 @@
   (-match-class [_ _tracker _solution _s-mch _error-ch]
     empty-channel)
 
-  (-match-properties [_ tracker solution triples error-ch]
-    (where/match-triples db tracker solution triples error-ch))
-
   (-activate-alias [_ alias']
     (where/-activate-alias db alias'))
 
@@ -127,9 +121,6 @@
 
   (-match-class [_ _tracker _solution _s-mch _error-ch]
     empty-channel)
-
-  (-match-properties [_ tracker solution triples error-ch]
-    (where/match-triples db tracker solution triples error-ch))
 
   (-activate-alias [_ alias']
     (where/-activate-alias db alias'))

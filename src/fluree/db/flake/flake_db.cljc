@@ -315,9 +315,6 @@
   (-match-triple [db tracker solution triple-mch error-ch]
     (match/match-triple db tracker solution triple-mch error-ch))
 
-  (-match-properties [db tracker solution triple-mchs error-ch]
-    (match/match-properties db tracker solution triple-mchs error-ch))
-
   (-match-class [db tracker solution class-mch error-ch]
     (match/match-class db tracker solution class-mch error-ch))
 
@@ -353,8 +350,10 @@
   indexer/Indexable
   (index [db changes-ch]
     (if (novelty/min-novelty? db)
-      (novelty/refresh db changes-ch max-old-indexes)
-      (go db)))
+      (do (log/debug "minimum reindex novelty exceeded for:" (:alias db) ". starting reindex")
+          (novelty/refresh db changes-ch max-old-indexes))
+      (do (log/debug "minimum reindex novelty size not met for:" (:alias db) ". skipping reindex")
+          (go db))))
 
   TimeTravel
   (datetime->t [db datetime]
