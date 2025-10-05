@@ -8,8 +8,8 @@
 
 (defn- list-json-files [dir]
   (->> (file-seq (io/file dir))
-       (filter #(.isFile %))
-       (filter #(str/ends-with? (.getName %) ".json"))))
+       (filter #(.isFile ^java.io.File %))
+       (filter #(str/ends-with? (.getName ^java.io.File %) ".json"))))
 
 (defn- read-json [f]
   (json/parse (slurp f) false))
@@ -32,8 +32,8 @@
         (if (.isDirectory f)
           (java.nio.file.Files/createDirectories tgt (make-array java.nio.file.attribute.FileAttribute 0))
           (do
-            (java.nio.file.Files/createDirectories (.getParent tgt) (make-array java.nio.file.attribute.FileAttribute 0))
-            (java.nio.file.Files/copy (.toPath f) tgt (into-array java.nio.file.CopyOption [java.nio.file.StandardCopyOption/REPLACE_EXISTING])))))))
+            (java.nio.file.Files/createDirectories (.getParent ^java.nio.file.Path tgt) (make-array java.nio.file.attribute.FileAttribute 0))
+            (java.nio.file.Files/copy (.toPath f) tgt ^"[Ljava.nio.file.CopyOption;" (into-array java.nio.file.CopyOption [java.nio.file.StandardCopyOption/REPLACE_EXISTING])))))))
   dst)
 
 (deftest ^:integration f-assert-contains-only-inserted-nodes

@@ -628,6 +628,60 @@
           (<? (storage/delete storage index-address))))
       :index-dropped)))
 
+(defn- stop-ledger-indexing
+  "Stops background indexing for a cached ledger to prevent race conditions during drop."
+  [conn alias*]
+  (go
+    (when-let [ledger-ch (cached-ledger conn alias*)]
+      (try*
+        (let [ledger (<? ledger-ch)]
+          (log/debug "Stopping indexing for cached ledger before drop" {:alias alias*})
+          (doseq [branch-name (ledger/available-branches ledger)]
+            (when-let [branch-meta (ledger/get-branch-meta ledger branch-name)]
+              (when-let [idx-q (:index-queue branch-meta)]
+                (async/close! idx-q)))))
+        (catch* e
+          (log/debug e "Failed to stop indexing for cached ledger" {:alias alias*}))))))
+
+(defn- read-nameservice-records-for-drop
+  "Reads and caches all nameservice records before deletion to ensure cleanup metadata is available."
+  [publishers alias*]
+  (go-try
+    (loop [remaining-pubs publishers
+           records []]
+      (if-let [publisher (first remaining-pubs)]
+        (let [record (try*
+                       (let [ledger-addr (<? (nameservice/publishing-address publisher alias*))]
+                         (when-let [ns-rec (<? (nameservice/lookup publisher ledger-addr))]
+                           {:publisher publisher
+                            :ledger-addr ledger-addr
+                            :ns-record ns-rec}))
+                       (catch* e
+                         (log/debug e "Failed to read nameservice record during drop" {:publisher publisher :alias alias*})
+                         nil))]
+          (recur (rest remaining-pubs)
+                 (if record (conj records record) records)))
+        records))))
+
+(defn- delete-ledger-artifacts
+  "Deletes commit and index artifacts for all cached nameservice records."
+  [conn ns-records alias*]
+  (go-try
+    (doseq [{:keys [ns-record ledger-addr]} ns-records]
+      (try*
+        (let [commit-address (get-in ns-record ["f:commit" "@id"])
+              index-address  (get-in ns-record ["f:index" "@id"])
+              latest-commit  (when commit-address
+                               (<? (commit-storage/load-commit-with-metadata
+                                    (:commit-catalog conn)
+                                    commit-address
+                                    index-address)))]
+          (log/debug "Dropping ledger artifacts" {:ledger-address ledger-addr})
+          (when latest-commit
+            (<? (drop-index-artifacts conn latest-commit))
+            (<? (drop-commit-artifacts conn latest-commit))))
+        (catch* e (log/debug e "Failed to drop artifacts for publisher during drop" {:alias alias*}))))))
+
 (defn drop-ledger
   [conn alias]
   (go
@@ -636,28 +690,19 @@
                      (fluree-address? alias) storage/get-local-path
                      true util.ledger/ensure-ledger-branch)
             pubs   (vec (publishers conn))]
-        ;; First pass: retract nameservice records for ALL publishers
-        (doseq [publisher pubs]
-          (try*
-            (<? (nameservice/retract publisher alias*))
-            (catch* e (log/debug e "Failed to retract nameservice record during drop" {:publisher publisher :alias alias*}))))
-        ;; Second pass: attempt artifact cleanup per publisher; continue on errors
-        (doseq [publisher pubs]
-          (try*
-            (let [ledger-addr    (<? (nameservice/publishing-address publisher alias*))
-                  ns-record      (<? (nameservice/lookup publisher ledger-addr))
-                  commit-address (get-in ns-record ["f:commit" "@id"])
-                  index-address  (get-in ns-record ["f:index" "@id"])
-                  latest-commit  (when commit-address
-                                   (<? (commit-storage/load-commit-with-metadata
-                                        (:commit-catalog conn)
-                                        commit-address
-                                        index-address)))]
-              (log/debug "Dropping ledger artifacts" {:ledger-address ledger-addr})
-              (when latest-commit
-                (<? (drop-index-artifacts conn latest-commit))
-                (<? (drop-commit-artifacts conn latest-commit))))
-            (catch* e (log/debug e "Failed to drop artifacts for publisher during drop" {:publisher publisher :alias alias*}))))
+
+        (<? (stop-ledger-indexing conn alias*))
+
+        (let [ns-records (<? (read-nameservice-records-for-drop pubs alias*))]
+          (<? (delete-ledger-artifacts conn ns-records alias*))
+
+          (doseq [publisher pubs]
+            (try*
+              (<? (nameservice/retract publisher alias*))
+              (catch* e (log/debug e "Failed to retract nameservice record during drop" {:publisher publisher :alias alias*}))))
+
+          (release-ledger conn alias*))
+
         (log/debug "Dropped ledger" alias*)
         :dropped)
       (catch* e (log/debug e "Failed to complete ledger deletion")))))
