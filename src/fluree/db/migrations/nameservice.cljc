@@ -1,9 +1,9 @@
 (ns fluree.db.migrations.nameservice
   "Nameservice Migration to ns@v2 Format
-  
+
   This migration handles the transition from the legacy nameservice formats (pre-ns@v1 and
   ns@v1) to the new ns@v2 directory structure with minimal storage records.
-  
+
   WHAT IT DOES:
   - Detects old nameservice files stored at root level (e.g., ledger-name.json)
   - Extracts essential metadata from full commit JSON-LD records
@@ -12,10 +12,10 @@
   - Cleans up old files after successful migration
   - Additionally: migrates prior ns@v1 flat files (ledger@branch.json) and nested files
     (ledger/branch.json) to ns@v2 nested layout
-  
+
   WHEN IT RUNS:
   - Automatically at file storage initialization (legacy and flat->nested checks are independent)
-  
+
   SAFETY:
   - Read-only detection phase before any modifications
   - Sequential processing with proper error handling
@@ -95,7 +95,7 @@
           ;; Find all .json files recursively, excluding ns@v1 and commit directories
           all-json-files (find-json-files-recursively root-path)
           ;; Filter to only nameservice files (those that match ledger naming pattern)
-          ;; clj-kondo false positive - ledger-path is used in the clj branch  
+          ;; clj-kondo false positive - ledger-path is used in the clj branch
           ns-files
           (filter (fn [path]
                     (let [relative-path (str/replace path (str root-path "/") "")
@@ -126,7 +126,7 @@
         ;; Extract values from the nested commit structure
         ledger-alias   (or (get old-commit-data "ledgerAlias")
                            (get commit-data "alias"))
-        branch         (or (get commit-data "branch") "main")
+        branch         (or (get commit-data "branch") const/default-branch-name)
         commit-address (get commit-data "address")
         t-value        (get-in commit-data ["data" "t"])
         ;; Extract index address if present in old format
@@ -149,11 +149,13 @@
 
             ;; Create new minimal record using existing function
             full-alias (str ledger-alias ":" branch)
-            new-record (ns-storage/ns-record full-alias commit-address t-value index-address)
+            new-record (ns-storage/new-ns-record full-alias commit-address t-value
+                                                 index-address nil)
             record-bytes (json/stringify-UTF8 new-record)
+            ;; Write to current ns version nested path (ns@v2/...)
             [ledger-name branch-name] (util.ledger/ledger-parts full-alias)
-            branch-name (or branch-name "main")
-            new-filename (str const/ns-version "/" ledger-name "/" branch-name ".json")]
+            new-filename (str const/ns-version "/" ledger-name "/"
+                              (or branch-name const/default-branch-name) ".json")]
 
         ;; Write to new location using storage interface
         (<? (storage/write-bytes file-store new-filename record-bytes))

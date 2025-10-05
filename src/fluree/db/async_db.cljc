@@ -80,6 +80,19 @@
             (>! error-ch e))))
       match-ch))
 
+  (-match-properties [_ tracker solution triples error-ch]
+    (let [match-ch (async/chan)]
+      (go
+        (try*
+          (let [db (<? db-chan)]
+            (-> db
+                (where/-match-properties tracker solution triples error-ch)
+                (async/pipe match-ch)))
+          (catch* e
+            (log/error e "Error loading database")
+            (>! error-ch e))))
+      match-ch))
+
   (-activate-alias [_ alias']
     (go-try
       (let [db (<? db-chan)]
@@ -147,6 +160,11 @@
 
   (latest-t [_]
     t)
+
+  (sha->t [_ sha]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (time-travel/sha->t db sha)))))
 
   (-as-of [_ t]
     (let [db-chan-at-t (async/promise-chan)

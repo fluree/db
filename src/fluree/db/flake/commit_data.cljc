@@ -11,14 +11,12 @@
             [fluree.db.util :as util :refer [get-id get-first get-first-value
                                              get-value try* catch*]]
             [fluree.db.util.json :as json]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]))
 
 (def commit-version 2)
 (def data-version 0)
-
-(def default-branch
-  "main")
 
 (def json-ld-base-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
@@ -139,7 +137,9 @@
   [jsonld]
   (let [id          (get-id jsonld)
         v           (get-first-value jsonld const/iri-v)
-        alias       (get-first-value jsonld const/iri-alias)
+        alias       (-> jsonld
+                        (get-first-value const/iri-alias)
+                        util.ledger/ensure-ledger-branch)
         address     (-> jsonld
                         (get-first-value const/iri-address)
                         not-empty)
@@ -177,9 +177,9 @@
       issuer (assoc :issuer {:id (get-id issuer)}))))
 
 (defn update-index-roots
-  [commit-map {:keys [spot post opst tspo]}]
+  [commit-map {:keys [spot psot post opst tspo]}]
   (if (contains? commit-map :index)
-    (update commit-map :index assoc :spot spot, :post post, :opst opst, :tspo tspo)
+    (update commit-map :index assoc :spot spot, :psot psot, :post post, :opst opst, :tspo tspo)
     commit-map))
 
 (defn json-ld->map
@@ -199,7 +199,7 @@
 
 (defn hash->commit-id
   [hsh]
-  (str "fluree:commit:sha256:b" hsh))
+  (str iri/f-commit-256-b-ns hsh))
 
 (defn commit-json->commit-id
   [jld]
@@ -362,6 +362,8 @@
            ;; launch futures for parallellism on JVM
            flake-size  #?(:clj  (future (calc-flake-size add rem))
                           :cljs (calc-flake-size add rem))
+           psot        #?(:clj  (future (flake/revise (get-in db [:novelty :psot]) add rem))
+                          :cljs (flake/revise (get-in db [:novelty :psot]) add rem))
            post        #?(:clj  (future (flake/revise (get-in db [:novelty :post]) add rem))
                           :cljs (flake/revise (get-in db [:novelty :post]) add rem))
            opst        #?(:clj  (future (flake/revise (get-in db [:novelty :opst]) (ref-flakes add) (ref-flakes rem)))
@@ -369,6 +371,8 @@
        (-> db
            (update-in [:novelty :spot] flake/revise add rem)
            (update-in [:novelty :tspo] flake/revise add rem)
+           (assoc-in [:novelty :psot] #?(:clj  @psot
+                                         :cljs psot))
            (assoc-in [:novelty :post] #?(:clj  @post
                                          :cljs post))
            (assoc-in [:novelty :opst] #?(:clj  @opst
@@ -393,7 +397,7 @@
   data as its own entity."
   [db]
   (let [tt-id   (random-uuid)
-        indexes [:spot :post :opst :tspo]]
+        indexes [:spot :psot :post :opst :tspo]]
     (-> (reduce
          (fn [db* idx]
            (let [{:keys [children] :as node} (get db* idx)
@@ -543,9 +547,10 @@
           p-iri  (get-s-iri db pid compact-fn)
           objs   (subject-block-pred db compact-fn list?
                                      p-flakes)
-          objs*  (cond-> objs
-                   list? handle-list-values
-                   (= 1 (count objs)) first)
+          objs*  (cond
+                   list? (handle-list-values objs)
+                   (= 1 (count objs)) (first objs)
+                   :else objs)
           acc'   (assoc acc p-iri objs*)]
       (if (seq r)
         (recur r acc')

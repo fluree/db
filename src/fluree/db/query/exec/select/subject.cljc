@@ -1,5 +1,5 @@
 (ns fluree.db.query.exec.select.subject
-  (:require [clojure.core.async :as async :refer [<! >! go]]
+  (:require [clojure.core.async :as async :refer [<! >! go go-loop]]
             [fluree.db.constants :as const]
             [fluree.db.query.exec.select.literal :as literal]
             [fluree.db.util :as util :refer [try* catch*]]
@@ -99,39 +99,59 @@
   (let [{::keys [spec] :as attrs} (::literal v)]
     (display-literal attrs spec cache compact-fn)))
 
+(defn resolve-seq
+  [ds cache context compact-fn select-spec current-depth tracker error-ch values]
+  (go-loop [[value & r]     values
+            resolved-values []]
+    (if value
+      (cond
+        (reference? value)
+        (if-let [resolved (<! (resolve-reference ds cache context compact-fn select-spec current-depth tracker error-ch value))]
+          (recur r (conj resolved-values resolved))
+          (recur r resolved-values))
+
+        (literal? value)
+        (recur r (conj resolved-values (resolve-literal cache compact-fn value)))
+
+        :else value)
+      (not-empty resolved-values))))
+
+(defn resolve-rdf-type
+  "Special handling for JSON-LD @type values to extract IRIs directly
+   and bypass policy restriction."
+  [compact-fn v]
+  (if (sequential? v)
+    (mapv (fn [value]
+            (let [{::keys [iri]} (::reference value)]
+              (compact-fn iri)))
+          v)
+    (let [{::keys [iri]} (::reference v)] (compact-fn iri))))
+
 (defn resolve-properties
   [ds cache context compact-fn select-spec current-depth tracker error-ch attr-ch]
   (go (when-let [attrs (<! attr-ch)]
-        (loop [[[prop v] & r] attrs
-               resolved-attrs {}]
-          (if prop
-            (let [v' (if (sequential? v)
-                       (loop [[value & r]     v
-                              resolved-values []]
-                         (if value
-                           (cond
-                             (reference? value)
-                             (if-let [resolved (<! (resolve-reference ds cache context compact-fn select-spec current-depth tracker error-ch value))]
-                               (recur r (conj resolved-values resolved))
-                               (recur r resolved-values))
+        (let [type-key (compact-fn const/iri-type)]
+          (loop [[[prop v] & r] attrs
+                 resolved-attrs {}]
+            (if prop
+              (let [v' (cond
+                         (= prop type-key) ;; @type: skip policy resolution; extract IRIs directly
+                         (resolve-rdf-type compact-fn v)
 
-                             (literal? value)
-                             (recur r (conj resolved-values (resolve-literal cache compact-fn value)))
+                         (sequential? v)
+                         (<! (resolve-seq ds cache context compact-fn select-spec current-depth tracker error-ch v))
 
-                             :else value)
-                           (not-empty resolved-values)))
-                       (cond
                          (reference? v)
                          (<! (resolve-reference ds cache context compact-fn select-spec current-depth tracker error-ch v))
 
                          (literal? v)
                          (resolve-literal cache compact-fn v)
 
-                         :else v))]
-              (if (some? v')
-                (recur r (assoc resolved-attrs prop v'))
-                (recur r resolved-attrs)))
-            resolved-attrs)))))
+                         :else v)]
+                (if (some? v')
+                  (recur r (assoc resolved-attrs prop v'))
+                  (recur r resolved-attrs)))
+              resolved-attrs))))))
 
 (defn format-reverse-properties
   [ds iri reverse-map context tracker error-ch]

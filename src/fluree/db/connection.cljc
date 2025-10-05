@@ -6,27 +6,21 @@
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.nameservice.sub :as ns-subscribe]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
             [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(comment
- ;; state machine looks like this:
-  {:ledger        {"ledger-a" {;; map of branches, along with current/default branch
-                               :branches {}
-                               :branch   {}}}
-   :subscriptions {}})
+(declare notify* plan-ns-update commit->ns-info)
 
 (def blank-state
   "Initial connection state"
@@ -69,14 +63,6 @@
     (->Connection id state parallelism commit-catalog index-catalog primary-publisher
                   secondary-publishers remote-systems serializer cache defaults)))
 
-(defn normalize-ledger-alias
-  "Ensures ledger alias includes branch. 
-  If no : symbol present, appends :main as default branch."
-  [ledger-alias]
-  (if (clojure.string/includes? ledger-alias ":")
-    ledger-alias
-    (str ledger-alias ":" commit-data/default-branch)))
-
 (defn register-ledger
   "Creates a promise-chan and saves it in a cache of ledgers being held
   in-memory on the conn.
@@ -100,6 +86,75 @@
         cached?    (not= p-chan new-p-chan)]
     (log/debug "Registering ledger: " ledger-alias " cached? " cached?)
     [cached? p-chan]))
+
+(defn cached-ledger
+  "Returns a cached ledger from the connection if it is cached, else nil"
+  [{:keys [state] :as _conn} ledger-alias]
+  (get-in @state [:ledger ledger-alias]))
+
+(defn release-ledger
+  "Opposite of register-ledger. Removes reference to a ledger from conn"
+  [{:keys [state] :as _conn} ledger-alias]
+  (swap! state update :ledger dissoc ledger-alias)
+  nil)
+
+(defn all-publications
+  [{:keys [remote-systems] :as _conn}]
+  remote-systems)
+
+(defn subscribe-all
+  [publications ledger-alias]
+  (->> publications
+       (map (fn [pub]
+              (nameservice/subscribe pub ledger-alias)))
+       async/merge))
+
+(defn subscribed?
+  [current-state ledger-alias]
+  (contains? (:subscriptions current-state) ledger-alias))
+
+(defn get-subscription
+  [current-state ledger-alias]
+  (get-in current-state [:subscriptions ledger-alias]))
+
+(defn add-subscription
+  [current-state publications ledger-alias]
+  (if-not (subscribed? current-state ledger-alias)
+    (let [sub-ch (subscribe-all publications ledger-alias)]
+      (assoc-in current-state [:subscriptions ledger-alias] sub-ch))
+    current-state))
+
+(defn remove-subscription
+  [current-state ledger-alias]
+  (update current-state :subscriptions dissoc ledger-alias))
+
+(defn notify
+  "Notifies the connection of an update to keep cached db state current.
+
+  Parameters (2-arity overload):
+    - conn: Connection
+    - update: either
+      - a nameservice record map (possibly compacted), or
+      - a commit address string (content-addressed)
+
+  Behavior:
+    - If `update` is a map, it is treated as a nameservice record and the
+      minimal action is applied (index/commit/none), based on plan-ns-update.
+    - If `update` is a string, it is treated as a commit address; the commit is
+      read and applied to the cached ledger if newer."
+  [conn update]
+  (go-try
+    (if (map? update)
+      (let [ns-info (ledger/expand-and-extract-ns update)]
+        (<? (notify* conn ns-info nil)))
+      (let [{:keys [commit-catalog]} conn
+            address update]
+        (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
+          (let [ns-info (commit->ns-info expanded-commit)]
+            (log/debug "Notification received for ledger" (:ledger-alias ns-info)
+                       "of new commit:" expanded-commit)
+            (<? (notify* conn ns-info expanded-commit)))
+          (log/warn "No commit found for address:" address))))))
 
 (defn plan-ns-update
   "Decides minimal action based on cached db and nameservice info.
@@ -141,6 +196,20 @@
                                  :action action})
     action))
 
+(defn- commit->ns-info
+  "Builds an ns-info-like map from an expanded commit.
+   Used to unify logic between nameservice record and direct commit notifications."
+  [expanded-commit]
+  {:ledger-alias   (get-first-value expanded-commit const/iri-alias)
+   :branch         (get-first-value expanded-commit const/iri-branch)
+   :ns-t           (-> expanded-commit
+                       (get-first const/iri-data)
+                       (get-first-value const/iri-fluree-t))
+   :commit-address (get-first-value expanded-commit const/iri-address)
+   :index-address  (-> expanded-commit
+                       (get-first const/iri-index)
+                       (get-first-value const/iri-id))})
+
 (defn- notify*
   "Internal notify logic shared by both forms.
   Takes a connection, ns-info map, and optionally pre-loaded expanded-commit."
@@ -153,7 +222,7 @@
                                              :commit-address commit-address
                                              :index-address index-address
                                              :expanded-commit? (boolean expanded-commit)})
-      (if-let [ledger-ch (and ledger-alias (ns-subscribe/cached-ledger conn ledger-alias))]
+      (if-let [ledger-ch (and ledger-alias (cached-ledger conn ledger-alias))]
         (let [ledger  (<? ledger-ch)
               db      (ledger/current-db ledger branch)
               action  (plan-ns-update db ns-info)]
@@ -176,7 +245,7 @@
                                   ::ledger/stale))]
                   (log/debug "notify-index result" {:ledger-alias ledger-alias :result res})
                   (when (= res ::ledger/stale)
-                    (ns-subscribe/release-ledger conn ledger-alias))
+                    (release-ledger conn ledger-alias))
                   res))
 
             :commit
@@ -200,58 +269,52 @@
                       true)
                   ::ledger/stale
                   (do (log/debug "Dropping state for stale ledger:" ledger-alias)
-                      (ns-subscribe/release-ledger conn ledger-alias)))))
+                      (release-ledger conn ledger-alias)))))
 
             :stale
             (do (log/debug "Dropping state for stale ledger:" ledger-alias)
-                (ns-subscribe/release-ledger conn ledger-alias))))
+                (release-ledger conn ledger-alias))))
         (log/debug "Ledger not currently loaded:" ledger-alias "; skipping notify of changes.")))))
 
-(defn- commit->ns-info
-  "Builds an ns-info-like map from an expanded commit.
-   Used to unify logic between nameservice record and direct commit notifications."
-  [expanded-commit]
-  {:ledger-alias   (get-first-value expanded-commit const/iri-alias)
-   :branch         (get-first-value expanded-commit const/iri-branch)
-   :ns-t           (-> expanded-commit
-                       (get-first const/iri-data)
-                       (get-first-value const/iri-fluree-t))
-   :commit-address (get-first-value expanded-commit const/iri-address)
-   :index-address  (-> expanded-commit
-                       (get-first const/iri-index)
-                       (get-first-value const/iri-id))})
+;; TODO; Were subscribing to every remote system for every ledger we load.
+;; Perhaps we should ensure that a remote system manages a particular ledger
+;; before subscribing
+(defn subscribe-ledger
+  "Initiates subscription requests for a ledger into all remote systems on a
+  connection."
+  [{:keys [state] :as conn} ledger-alias]
+  (let [pubs                   (all-publications conn)
+        [prev-state new-state] (swap-vals! state add-subscription pubs ledger-alias)]
+    (when-not (subscribed? prev-state ledger-alias)
+      (let [sub-ch (get-subscription new-state ledger-alias)]
+        (go-loop []
+          (when-let [msg (<! sub-ch)]
+            (log/info "Subscribed ledger:" ledger-alias "received subscription message:" msg)
+            (let [action (get msg "action")]
+              (if (= "new-commit" action)
+                (let [{:keys [address]} (get msg "data")]
+                  (notify conn address))
+                (log/info "New subscrition message with action: " action "received, ignored.")))
+            (recur)))
+        :subscribed))))
 
-(defn notify
-  "Notifies the connection of an update to keep cached db state current.
-
-  Parameters (2-arity overload):
-    - conn: Connection
-    - update: either
-      - a nameservice record map (possibly compacted), or
-      - a commit address string (content-addressed)
-
-  Behavior:
-    - If `update` is a map, it is treated as a nameservice record and the
-      minimal action is applied (index/commit/none), based on plan-ns-update.
-    - If `update` is a string, it is treated as a commit address; the commit is
-      read and applied to the cached ledger if newer."
-  [conn update]
-  (go-try
-    (if (map? update)
-      (let [ns-info (ledger/expand-and-extract-ns update)]
-        (<? (notify* conn ns-info nil)))
-      (let [{:keys [commit-catalog]} conn
-            address update]
-        (if-let [expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog address))]
-          (let [ns-info (commit->ns-info expanded-commit)]
-            (log/debug "Notification received for ledger" (:ledger-alias ns-info)
-                       "of new commit:" expanded-commit)
-            (<? (notify* conn ns-info expanded-commit)))
-          (log/warn "No commit found for address:" address))))))
+(defn unsubscribe-ledger
+  "Initiates unsubscription requests for a ledger into all namespaces on a connection."
+  [{:keys [state] :as conn} ledger-alias]
+  (->> (all-publications conn)
+       (map (fn [pub]
+              (nameservice/unsubscribe pub ledger-alias)))
+       dorun)
+  (swap! state remove-subscription ledger-alias))
 
 (defn publishers
   [{:keys [primary-publisher secondary-publishers] :as _conn}]
-  (cons primary-publisher secondary-publishers))
+  (->> (concat [primary-publisher]
+               (cond
+                 (sequential? secondary-publishers) secondary-publishers
+                 (some? secondary-publishers)      [secondary-publishers]
+                 :else                              []))
+       (remove nil?)))
 
 (defn publications
   [conn]
@@ -297,7 +360,7 @@
   ledger alias"
   [{:keys [primary-publisher] :as _conn} ledger-alias]
   (->> ledger-alias
-       normalize-ledger-alias
+       util.ledger/ensure-ledger-branch
        (nameservice/publishing-address primary-publisher)))
 
 (defn lookup-commit*
@@ -400,11 +463,20 @@
   (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
                   {:status 409, :error :db/ledger-exists})))
 
+(defn commit->ledger-alias
+  "Returns ledger alias from commit map, if present. If not present
+  then tries to resolve the ledger alias from the nameservice."
+  [conn db-alias commit-map]
+  (or (get-first-value commit-map const/iri-alias)
+      (->> (all-nameservices conn)
+           (some (fn [ns]
+                   (nameservice/alias ns db-alias))))))
+
 (defn create-ledger
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn} ledger-alias opts]
   (go-try
     (let [;; Normalize ledger-alias to include branch
-          normalized-alias (normalize-ledger-alias ledger-alias)]
+          normalized-alias (util.ledger/ensure-ledger-branch ledger-alias)]
       (if (<? (ledger-exists? conn normalized-alias))
         (throw-ledger-exists normalized-alias)
         (let [[cached? ledger-chan] (register-ledger conn normalized-alias)]
@@ -422,18 +494,9 @@
                                                     :secondary-publishers secondary-publishers}
                                                    ledger-opts))]
               (when (util/exception? ledger)
-                (ns-subscribe/release-ledger conn normalized-alias))
+                (release-ledger conn normalized-alias))
               (async/put! ledger-chan ledger)
               ledger)))))))
-
-(defn commit->ledger-alias
-  "Returns ledger alias from commit map, if present. If not present
-  then tries to resolve the ledger alias from the nameservice."
-  [conn db-alias commit-map]
-  (or (get-first-value commit-map const/iri-alias)
-      (->> (all-nameservices conn)
-           (some (fn [ns]
-                   (nameservice/alias ns db-alias))))))
 
 (defn load-ledger*
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn}
@@ -453,7 +516,7 @@
             {:keys [did indexing]} (parse-ledger-options conn {})
             ledger (ledger/instantiate combined-alias address commit-catalog index-catalog
                                        primary-publisher secondary-publishers indexing did expanded-commit)]
-        (ns-subscribe/subscribe-ledger conn combined-alias)
+        (subscribe-ledger conn combined-alias)
         (async/put! ledger-chan ledger)
         ledger)
       (throw (ex-info (str "Unable to load. No record of ledger at address: " address " exists.")
@@ -461,7 +524,7 @@
 
 (defn load-ledger-address
   [conn address]
-  (let [alias (nameservice/address-path address)
+  (let [alias (storage/get-local-path address)
         [cached? ledger-chan] (register-ledger conn alias)]
     (if cached?
       ledger-chan
@@ -478,7 +541,7 @@
   [conn alias]
   (go-try
     (let [;; Normalize ledger-alias to include branch
-          normalized-alias (normalize-ledger-alias alias)
+          normalized-alias (util.ledger/ensure-ledger-branch alias)
           [cached? ledger-chan] (register-ledger conn normalized-alias)]
       (if cached?
         (<? ledger-chan)
@@ -488,7 +551,7 @@
             (if addr
               (or (<? (try-load-address conn ledger-chan normalized-alias addr))
                   (recur r))
-              (do (ns-subscribe/release-ledger conn normalized-alias)
+              (do (release-ledger conn normalized-alias)
                   (let [ex (ex-info (str "Load for " normalized-alias " failed due to failed address lookup.")
                                     {:status 404, :error :db/unkown-ledger})]
                     (async/put! ledger-chan ex)
@@ -548,15 +611,17 @@
                                 (util/get-first-value const/iri-address))]
       (when index-address
         (log/debug "Dropping index" index-address)
-        (let [{:keys [spot opst post tspo]} (<? (storage/read-json storage index-address true))
+        (let [{:keys [spot psot opst post tspo]} (<? (storage/read-json storage index-address true))
 
               garbage-ch (garbage/clean-garbage* index-catalog index-address 0)
               spot-ch    (drop-index-nodes storage (:id spot))
+              psot-ch    (drop-index-nodes storage (:id psot))
               post-ch    (drop-index-nodes storage (:id post))
               tspo-ch    (drop-index-nodes storage (:id tspo))
               opst-ch    (drop-index-nodes storage (:id opst))]
           (<? garbage-ch)
           (<? spot-ch)
+          (<? psot-ch)
           (<? post-ch)
           (<? tspo-ch)
           (<? opst-ch)
@@ -567,32 +632,33 @@
   [conn alias]
   (go
     (try*
-      (let [alias (if (fluree-address? alias)
-                    (nameservice/address-path alias)
-                    ;; Normalize alias to include branch if not present
-                    (if (str/includes? alias ":")
-                      alias
-                      (str alias ":main")))]
-        (loop [[publisher & r] (publishers conn)]
-          (when publisher
-            (let [ledger-addr   (<? (nameservice/publishing-address publisher alias))
-                  ns-record     (<? (nameservice/lookup publisher ledger-addr))
+      (let [alias* (cond-> alias
+                     (fluree-address? alias) storage/get-local-path
+                     true util.ledger/ensure-ledger-branch)
+            pubs   (vec (publishers conn))]
+        ;; First pass: retract nameservice records for ALL publishers
+        (doseq [publisher pubs]
+          (try*
+            (<? (nameservice/retract publisher alias*))
+            (catch* e (log/debug e "Failed to retract nameservice record during drop" {:publisher publisher :alias alias*}))))
+        ;; Second pass: attempt artifact cleanup per publisher; continue on errors
+        (doseq [publisher pubs]
+          (try*
+            (let [ledger-addr    (<? (nameservice/publishing-address publisher alias*))
+                  ns-record      (<? (nameservice/lookup publisher ledger-addr))
                   commit-address (get-in ns-record ["f:commit" "@id"])
                   index-address  (get-in ns-record ["f:index" "@id"])
                   latest-commit  (when commit-address
-                                   (let [commit (<? (commit-storage/load-commit-with-metadata
-                                                     (:commit-catalog conn)
-                                                     commit-address
-                                                     index-address))]
-                                     (when commit
-                                       (json-ld/expand commit))))]
-              (log/debug "Dropping ledger" ledger-addr)
+                                   (<? (commit-storage/load-commit-with-metadata
+                                        (:commit-catalog conn)
+                                        commit-address
+                                        index-address)))]
+              (log/debug "Dropping ledger artifacts" {:ledger-address ledger-addr})
               (when latest-commit
-                (drop-index-artifacts conn latest-commit)
-                (drop-commit-artifacts conn latest-commit))
-              (<? (nameservice/retract publisher alias))
-              (recur r))))
-        (log/debug "Dropped ledger" alias)
+                (<? (drop-index-artifacts conn latest-commit))
+                (<? (drop-commit-artifacts conn latest-commit))))
+            (catch* e (log/debug e "Failed to drop artifacts for publisher during drop" {:publisher publisher :alias alias*}))))
+        (log/debug "Dropped ledger" alias*)
         :dropped)
       (catch* e (log/debug e "Failed to complete ledger deletion")))))
 

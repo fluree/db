@@ -75,7 +75,7 @@
              :commit     indexed-commit
              :current-db indexed-db)
       current-state)
-    (if (newer-commit? current-commit indexed-commit)
+    (if (and current-commit indexed-commit (newer-commit? current-commit indexed-commit))
       (if (newer-index? indexed-commit current-commit)
         (let [latest-db (update-index-async current-db (:index indexed-commit))]
           (assoc current-state
@@ -83,7 +83,7 @@
                  :current-db latest-db))
         current-state)
       (do (log/warn "Rejecting index update for future commit at transaction:"
-                    (commit-data/t indexed-commit)
+                    (when indexed-commit (commit-data/t indexed-commit))
                     "because it is after the current transaction value:"
                     (commit-data/t current-commit))
           current-state))))
@@ -124,12 +124,14 @@
       (when-let [{:keys [db index-files-ch complete-ch]} (<! queue)]
         (let [db* (use-latest-index db last-index-commit branch-state)
               result (try*
-                       (let [indexed-db (<? (indexer/index db* index-files-ch)) ;; indexer/index always returns a FlakeDB (never AsyncDB)
+                       (let [indexed-db (<? (indexer/index db* index-files-ch)) ; indexer/index always returns a FlakeDB (never AsyncDB)
                              [{prev-commit :commit} {indexed-commit :commit}]
                              (swap-vals! branch-state update-index indexed-db)]
-                         (when (not= prev-commit indexed-commit)
-                           (let [commit-jsonld (commit-data/->json-ld indexed-commit)]
-                             (nameservice/publish-to-all commit-jsonld publishers)))
+                         (if-not (= prev-commit indexed-commit)
+                           (do (log/debug "Publishing new index commit:" indexed-commit)
+                               (let [commit-jsonld (commit-data/->json-ld indexed-commit)]
+                                 (nameservice/publish-to-all commit-jsonld publishers)))
+                           (log/debug "Not publishing unchanged index commit:" indexed-commit))
                          {:status :success, :db indexed-db, :commit indexed-commit})
                        (catch* e
                          (log/error e "Error updating index")
@@ -197,40 +199,40 @@
       (assoc current-state
              :commit     new-commit
              :current-db new-db))
-    (let [current-t   (commit-data/t current-commit)
-          new-t       (commit-data/t new-commit)
-          t-ok?       (or (nil? current-t)
-                          (= new-t (inc current-t)))
-          current-id  (:id current-commit)
-          new-prev-id (-> new-commit :previous :id)
-          prev-ok?    (= new-prev-id current-id)]
-      (log/warn "Commit update failure detail"
-                {:current-t current-t
-                 :new-t new-t
-                 :t-ok? t-ok?
-                 :current-id current-id
-                 :new-prev-id new-prev-id
-                 :prev-ok? prev-ok?
-                 :current-commit current-commit
-                 :new-commit new-commit})
-      (throw (ex-info (str "Commit failed, latest committed db is "
-                           (commit-data/t current-commit)
-                           " and you are trying to commit at db at t value of: "
-                           (commit-data/t new-commit)
-                           ". These should be one apart. Likely db was "
-                           "updated by another user or process.")
-                      {:status 400 :error :db/invalid-commit})))))
+    (do (log/warn "Commit update failure.\n  Current commit:" current-commit
+                  "\n  New commit:" new-commit)
+        (if-not (next-t? current-commit new-commit)
+          (throw (ex-info (str "Commit failed, latest committed db t is "
+                               (commit-data/t current-commit)
+                               " and you are trying to commit at db at t value of: "
+                               (commit-data/t new-commit)
+                               ". These should be one apart. Likely db was "
+                               "updated by another user or process.")
+                          {:status 400 :error :db/invalid-commit}))
+          (throw (ex-info (str "Commit failed, The previous commit id of the new commit: '"
+                               (previous-id new-commit)
+                               "' does not match the current commit id: '"
+                               (:id new-commit)
+                               "'.")
+                          {:status 400 :error :db/invalid-commit}))))))
+
+(defn indexing-disabled?
+  [branch-map]
+  (-> branch-map :indexing-opts :indexing-enabled false?))
+
+(def indexing-enabled?
+  (complement indexing-disabled?))
 
 (defn update-commit!
   "There are 3 t values, the db's t, the 'commit' attached to the db's t, and
   then the ledger's latest commit t (in branch-data). The db 't' and db commit 't'
   should be the same at this point (just after committing the db). The ledger's latest
   't' should be the same (if just updating an index) or after the db's 't' value."
-  [{:keys [state index-queue indexing-opts] :as branch-map} new-db index-files-ch]
+  [{:keys [state index-queue] :as branch-map} new-db index-files-ch]
   (let [updated-db (-> state
                        (swap! update-commit (policy/root-db new-db))
                        :current-db)]
-    (when-not (:indexing-disabled indexing-opts)
+    (when (indexing-enabled? branch-map)
       (enqueue-index! index-queue updated-db index-files-ch))
     branch-map))
 

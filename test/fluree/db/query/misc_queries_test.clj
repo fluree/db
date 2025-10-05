@@ -59,6 +59,22 @@
              @(fluree/query db {"@context" []
                                 :select    {"http://example.org/ns/dan" ["*"]}}))
           "empty context vector"))
+
+    (testing "@type returns all values in select graph crawl"
+      (let [conn2         (test-utils/create-conn)
+            ledger2       "query-multitype"
+            _             @(fluree/create conn2 ledger2)
+            db2           @(fluree/update @(fluree/db conn2 ledger2)
+                                          {"@context" [test-utils/default-context
+                                                       {:ex "http://example.org/ns/"}]
+                                           "insert"   [{:id   :ex/item
+                                                        :type [:ex/Foo :ex/Bar]}]})
+            db2           @(fluree/commit! conn2 db2)
+            res           @(fluree/query db2 {:context [test-utils/default-context
+                                                        {:ex "http://example.org/ns/"}]
+                                              :select  {:ex/item ["*"]}})]
+        (is (= [{:id :ex/item, :type [:ex/Bar :ex/Foo]}]
+               res))))
     (testing "history query"
       (is (= [{:f/t       1
                :f/assert  [{:id :ex/dan :ex/x 1}]

@@ -223,14 +223,27 @@
     ;; build policy wrapper attached to db containing parsed policies
     (async/reduce (build-wrapper db) {} policy-ch)))
 
+(defn ensure-ground-identity
+  "A policy must never have a \"fresh\" ?$identity variable, otherwise it may match any
+  identity in the db. This ensures the ?$identity is always provided as a \"ground\"
+  value."
+  [[vars :as policy-values]]
+  (if (contains? (set vars) "?$identity")
+    ;; already has a ground value for $?identity
+    policy-values
+    ;; bind ?$identity to a ground value that will never match anything
+    (policy/inject-value-binding policy-values "?$identity" {const/iri-value (str ":" (random-uuid))
+                                                             const/iri-type const/iri-id})))
+
 (defn wrap-policy
   ([db policy-rules policy-values]
    (wrap-policy db nil policy-rules policy-values))
   ([db tracker policy-rules policy-values]
    (async/go
-     (let [error-ch (async/chan)
-           [wrapper _] (async/alts! [error-ch
-                                     (parse-policies db tracker error-ch policy-values (util/sequential policy-rules))])]
+     (let [error-ch       (async/chan)
+           policy-values* (ensure-ground-identity policy-values)
+           [wrapper _]    (async/alts! [error-ch (parse-policies db tracker error-ch policy-values*
+                                                                 (util/sequential policy-rules))])]
        (if (util/exception? wrapper)
          wrapper
-         (assoc db :policy (assoc wrapper :cache (atom {}), :policy-values policy-values)))))))
+         (assoc db :policy (assoc wrapper :cache (atom {}), :policy-values policy-values*)))))))

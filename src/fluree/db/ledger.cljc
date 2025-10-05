@@ -27,6 +27,10 @@
       ;; default branch
       (get branches branch))))
 
+(defn indexing-enabled?
+  [ledger branch]
+  (-> ledger (get-branch-meta branch) branch/indexing-enabled?))
+
 (defn available-branches
   [{:keys [state] :as _ledger}]
   (-> @state :branches keys))
@@ -63,7 +67,7 @@
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
   ([ledger]
-   (status ledger commit-data/default-branch))
+   (status ledger const/default-branch-name))
   ([{:keys [address alias] :as ledger} requested-branch]
    (let [branch-data (get-branch-meta ledger requested-branch)
          current-db  (branch/current-db branch-data)
@@ -239,15 +243,15 @@
   context."
   [combined-alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
    indexing-opts did latest-commit]
-  (let [;; Parse ledger name and branch from combined alias
-        [_ branch] (util.ledger/ledger-parts combined-alias)
+  (let [alias*     (util.ledger/ensure-ledger-branch combined-alias)
+        branch     (util.ledger/ledger-branch alias*)
         publishers (cons primary-publisher secondary-publishers)
-        branches {branch (branch/state-map combined-alias branch commit-catalog index-catalog
-                                           publishers latest-commit indexing-opts)}]
+        branches   {branch (branch/state-map alias* branch commit-catalog index-catalog
+                                             publishers latest-commit indexing-opts)}]
     (map->Ledger {:id                   (random-uuid)
                   :did                  did
                   :state                (atom (initial-state branches branch))
-                  :alias                combined-alias  ;; Full alias including branch
+                  :alias                alias*  ;; Full alias including branch
                   :address              ledger-address
                   :commit-catalog       commit-catalog
                   :index-catalog        index-catalog
