@@ -40,17 +40,27 @@
   (go-try
     (when-let [commit-data (<? (storage/content-read-json storage commit-address))]
       (log/trace "read-commit at:" commit-address "data:" commit-data)
-      (let [addr-key-path  (if (contains? commit-data "credentialSubject")
+      (let [commit-hash    (<? (storage/get-hash storage commit-address))
+            commit-id      (commit-data/hash->commit-id commit-hash)
+            _              (log/debug "read-verified-commit: computed commit-id"
+                                      {:address commit-address
+                                       :hash commit-hash
+                                       :commit-id commit-id})
+            is-credential? (contains? commit-data "credentialSubject")
+            addr-key-path  (if is-credential?
                              ["credentialSubject" "address"]
                              ["address"])
-            [commit proof] (-> commit-data
-                               (assoc-in addr-key-path commit-address)
+            id-key-path    (if is-credential?
+                             ["credentialSubject" "id"]
+                             ["id"])
+            ;; Inject the commit-id into the compact JSON before expanding
+            commit-data*   (-> commit-data
+                               (assoc-in id-key-path commit-id)
+                               (assoc-in addr-key-path commit-address))
+            [commit proof] (-> commit-data*
                                json-ld/expand
-                               verify-commit)
-            commit-hash    (<? (storage/get-hash storage commit-address))
-            commit-id      (commit-data/hash->commit-id commit-hash)
-            commit*        (assoc commit const/iri-id commit-id)]
-        [commit* proof]))))
+                               verify-commit)]
+        [commit proof]))))
 
 ;; TODO: Verify hash
 (defn read-commit-jsonld
