@@ -18,7 +18,7 @@
       (when (= :not-found vg-record)
         (throw (ex-info (str "Virtual graph not found in nameservice: " vg-name)
                         {:status 404
-                         :error :db/invalid-query})))
+                         :error :db/virtual-graph-not-found})))
       vg-record)))
 
 (defn vg-record->config

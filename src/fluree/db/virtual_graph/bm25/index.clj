@@ -8,7 +8,7 @@
             [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util :as util]
-            [fluree.db.util.async :refer [empty-channel]]
+            [fluree.db.util.async :refer [empty-channel <?]]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph :as vg]
             [fluree.db.virtual-graph.bm25.search :as bm25.search]
@@ -145,45 +145,45 @@
 
 (defn bm25-upsert*
   [{:keys [index-state] :as bm25} {:keys [t alias namespaces namespace-codes] :as _db} items-count items-ch]
-  (let [{:keys [pending-ch index] :as prior-idx-state} @index-state
-        new-pending-ch  (promise-chan)
-        new-index-state (atom (assoc prior-idx-state :pending-ch new-pending-ch))]
+  (let [{:keys [pending-ch index]} @index-state
+        new-pending-ch (promise-chan)]
+
+    ;; Update the existing atom with new pending-ch
+    (swap! index-state assoc :pending-ch new-pending-ch)
 
     ;; following go-block happens asynchronously in the background
-    ;; TODO - VG - capture error conditions in async/<! or other opts below and resolve the response with an error.
     (go
       (try
         (let [latest-index  (if pending-ch
-                              (<! pending-ch)
+                              (<? pending-ch)
                               index)
               status-update (fn [status]
-                              (swap! new-index-state assoc :pending-status status))
-              new-index     (<! (bm25.update/upsert-items bm25 latest-index items-count items-ch status-update))
+                              (swap! index-state assoc :pending-status status))
+              new-index     (<? (bm25.update/upsert-items bm25 latest-index items-count items-ch status-update))
               catalog       (:index-catalog bm25)]
           ;; reset index state atom once index is complete, remove pending-ch
-          (swap! new-index-state (fn [idx-state]
-                                   (assoc idx-state :index new-index
-                                          :pending-ch nil)))
+          (swap! index-state (fn [idx-state]
+                               (assoc idx-state :index new-index
+                                      :pending-ch nil)))
           (log/debug "BM25 index update complete, writing to storage...")
           ;; Persist the updated BM25 index to storage
           (when catalog
-            (let [updated-bm25 (assoc bm25 :index-state new-index-state :t t)]
+            (let [updated-bm25 (assoc bm25 :t t)
+                  write-result (<! (vg/write-vg catalog updated-bm25))]
               (log/debug "Writing BM25 index to storage for VG:" (:alias updated-bm25))
-              (try
-                (<! (vg/write-vg catalog updated-bm25))
-                (catch Exception e
-                  (log/error e "Failed to write BM25 index to storage")))))
+              (when (util/exception? write-result)
+                (log/error write-result "Failed to write BM25 index to storage"))))
           (>! new-pending-ch new-index))
         (catch Exception e
-          (log/error e "Error in BM25 index update"))))
+          (log/error e "Error in BM25 index update")
+          (>! new-pending-ch e))))
 
     ;; new bm25 record returned to get attached to db
     (assoc bm25 :t t
            :namespaces namespaces
            :namespace-codes namespace-codes
                 ;; unlikely, but in case db's alias has been changed keep in sync
-           :db-alias alias
-           :index-state new-index-state)))
+           :db-alias alias)))
 
 (defn property-dependencies
   [vg]
@@ -270,14 +270,13 @@
             ;; Wait for the async indexing to complete
             pending-ch (get @index-state :pending-ch)]
         (when pending-ch
-          (<! pending-ch))
+          (<? pending-ch))
         ;; Now write to storage
         (when index-catalog
-          (try
-            (<! (vg/write-vg index-catalog initialized-bm25))
-            (log/debug "Successfully wrote initial BM25 index to storage")
-            (catch Exception e
-              (log/error e "Failed to write initial BM25 index to storage"))))
+          (let [write-result (<! (vg/write-vg index-catalog initialized-bm25))]
+            (if (util/exception? write-result)
+              (log/error write-result "Failed to write initial BM25 index to storage")
+              (log/debug "Successfully wrote initial BM25 index to storage"))))
         initialized-bm25)))
 
   vg/SyncableVirtualGraph
