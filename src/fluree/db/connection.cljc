@@ -250,9 +250,8 @@
 
             :commit
             (let [expanded-commit (or expanded-commit
-                                      (-> (<? (commit-storage/load-commit-with-metadata
-                                               commit-catalog commit-address index-address))
-                                          json-ld/expand))
+                                      (<? (commit-storage/load-commit-with-metadata
+                                           commit-catalog commit-address index-address)))
                   expanded-data   (let [db-address (-> expanded-commit
                                                        (get-first const/iri-data)
                                                        (get-first-value const/iri-address))]
