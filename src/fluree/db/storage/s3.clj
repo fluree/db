@@ -416,73 +416,36 @@
   storage/ContentAddressedStore
   (-content-write-bytes [this dir data]
     (go
-      (log/debug "S3 content-write-bytes: START" {:dir dir})
       (let [hash     (crypto/sha2-256 data :base32)
-            _        (log/debug "S3 content-write-bytes: computed hash"
-                                {:hash hash
-                                 :hash-length (count hash)
-                                 :hash-starts-with (subs hash 0 (min 10 (count hash)))})
             bytes    (if (string? data)
                        (bytes/string->UTF8 data)
                        data)
             filename (str hash ".json")
             path     (str/join "/" [dir filename])
-            _        (log/debug "S3 content-write-bytes: writing to S3"
-                                {:path path
-                                 :filename filename
-                                 :size (count bytes)})
-            result   (<! (write-s3-data this path bytes))
-            address  (s3-address identifier path)
-            _        (log/debug "S3 content-write-bytes: write complete"
-                                {:hash hash
-                                 :address address
-                                 :error? (instance? Throwable result)})]
+            result   (<! (write-s3-data this path bytes))]
         (if (instance? Throwable result)
           result
           {:hash    hash
            :path    path
            :size    (count bytes)
-           :address address}))))
+           :address (s3-address identifier path)}))))
 
   storage/ContentArchive
   (-content-read-bytes [this address]
     (go-try
-      (log/debug "S3 content-read-bytes: START" {:address address})
       (let [path (storage/get-local-path address)
-            _    (log/debug "S3 content-read-bytes: extracted local path"
-                            {:address address
-                             :path path})
-            resp (<? (read-s3-data this path))
-            _    (log/debug "S3 content-read-bytes: read response from S3"
-                            {:path path
-                             :response-type (type resp)
-                             :not-found? (= resp ::not-found)
-                             :has-body? (and (map? resp) (contains? resp :body))
-                             :body-length (when (and (map? resp) (:body resp))
-                                            (count (:body resp)))})]
+            resp (<? (read-s3-data this path))]
         (when (not= resp ::not-found)
           (:body resp)))))
 
   (get-hash [_ address]
     (go
-      (let [split-result (storage/split-address address)
-            _            (log/debug "S3 get-hash: split-address result"
-                                    {:address address
-                                     :split-result split-result})
-            path         (last split-result)
-            _            (log/debug "S3 get-hash: extracted path"
-                                    {:path path})
-            path-parts   (str/split path #"/")
-            _            (log/debug "S3 get-hash: split path by /"
-                                    {:path-parts path-parts})
-            filename     (last path-parts)
-            _            (log/debug "S3 get-hash: extracted filename"
-                                    {:filename filename})
-            hash         (storage/strip-extension filename)
-            _            (log/debug "S3 get-hash: stripped extension to get hash"
-                                    {:hash hash
-                                     :hash-length (count hash)})]
-        hash)))
+      (-> address
+          storage/split-address
+          last
+          (str/split #"/")
+          last
+          storage/strip-extension)))
 
   storage/ByteStore
   (write-bytes [this path bytes]
