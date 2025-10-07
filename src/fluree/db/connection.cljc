@@ -8,7 +8,6 @@
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.nameservice.storage :as ns-storage]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
             [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
@@ -512,7 +511,7 @@
    Expects ledger-alias in 'ledger:branch' format."
   [primary-pub ledger-alias]
   (when primary-pub
-    (ns-storage/check-vg-dependencies primary-pub ledger-alias)))
+    (nameservice/check-vg-dependencies primary-pub ledger-alias)))
 
 (defn- throw-if-has-dependencies
   "Throws exception if ledger has dependent virtual graphs"
