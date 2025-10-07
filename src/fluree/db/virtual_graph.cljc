@@ -3,6 +3,13 @@
   (:require [clojure.string :as str]
             [fluree.db.json-ld.iri :as iri]))
 
+(defn parse-vg-type-string
+  "Parses a namespaced type string like 'fidx:bm25' to extract the type 'bm25'.
+  Returns nil if type-str is nil."
+  [type-str]
+  (when type-str
+    (-> type-str (str/split #":") second str/lower-case)))
+
 (defprotocol UpdatableVirtualGraph
   (upsert [this source-db new-flakes remove-flakes] "Updates the virtual graph with the provided flakes. Returns async chan with new updated VirtualGraph or exception.")
   (initialize [this source-db] "Initialize a new virtual graph based on the provided db - returns promise chan of eventual result"))
@@ -31,13 +38,12 @@
       (let [type-str (->> vg-type
                           (filter #(str/starts-with? % "fidx:"))
                           first)]
-        (when type-str
-          (-> type-str (str/split #":") second str/lower-case)))
+        (parse-vg-type-string type-str))
 
       ;; Handle single string type
       (string? vg-type)
       (if (str/includes? vg-type ":")
-        (-> vg-type (str/split #":") second str/lower-case)
+        (parse-vg-type-string vg-type)
         (str/lower-case vg-type))
 
       :else

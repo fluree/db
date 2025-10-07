@@ -126,8 +126,6 @@
    "fidx:config" {"@type" "@json"
                   "@value" config}})
 
-;; NOTE: Primary StorageNameService defined later; this earlier definition was removed to avoid duplication
-
 (defn get-commit
   "Returns the minimal nameservice record."
   ([record]

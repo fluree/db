@@ -112,7 +112,7 @@
                                  :db/invalid-query})))
             ;; Guard against empty/blank targets
             _ (when (and (string? target) (str/blank? target))
-                (async/onto-chan! out-ch []))
+                (async/close! out-ch))
             {:keys [pending-ch index]} @index-state
 
             ;; TODO - check for "sync" options and don't wait for pending-ch if sync is false

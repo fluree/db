@@ -20,11 +20,15 @@
     (throw (ex-info "Virtual graph requires :name"
                     {:error :db/invalid-config :config config}))
 
+    (not (string? name))
+    (throw (ex-info "Virtual graph :name must be a string"
+                    {:error :db/invalid-config :name name :type (type name)}))
+
     (not type)
     (throw (ex-info "Virtual graph requires :type"
                     {:error :db/invalid-config :config config}))
 
-    (and (string? name) (str/includes? name "@"))
+    (str/includes? name "@")
     (throw (ex-info "Virtual graph name cannot contain '@' symbol"
                     {:error :db/invalid-config :name name}))))
 
@@ -46,23 +50,14 @@
                        :ledgers ledgers
                        :count (count ledgers)})))))
 
-(defn- ensure-string-name
-  "Converts keyword names to strings."
-  [name]
-  (if (keyword? name)
-    (clojure.core/name name)
-    name))
-
 (defn- prepare-bm25-config
   "Prepares the BM25 configuration for publishing."
   [{:keys [name config dependencies]}]
-  (let [vg-name (ensure-string-name name)
-        ledgers (get-in config [:ledgers] [])]
-    {:vg-name vg-name
-     :vg-type "fidx:BM25"
-     :config config
-     :dependencies (or dependencies
-                       (mapv #(str % ":main") ledgers))}))
+  {:vg-name name
+   :vg-type "fidx:BM25"
+   :config config
+   :dependencies (or dependencies
+                     (mapv #(str % ":main") (get-in config [:ledgers] [])))})
 
 (defn- load-and-validate-ledgers
   "Loads all ledgers and validates they exist. Returns loaded ledgers."
