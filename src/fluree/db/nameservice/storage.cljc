@@ -11,18 +11,34 @@
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
-(defn local-filename
+(defn ledger-alias?
+  "Returns true if the target is a ledger alias (contains branch separator :).
+  Virtual graph names do not contain the separator."
+  [target]
+  (str/includes? target ":"))
+
+(defn ledger-filename
   "Returns the local filename for a ledger's nameservice record.
-   Can handle both resource names (for VG) and ledger aliases.
-   For ledgers, expects ledger-alias to be in format 'ledger:branch'.
-   Returns path like 'ns@v2/ledger-name/branch.json' for ledgers
-   or 'ns@v2/resource-name.json' for virtual graphs."
+   Expects ledger-alias to be in format 'ledger:branch'.
+   Returns path like 'ns@v2/ledger-name/branch.json'."
+  [ledger-alias]
+  (let [[ledger-name branch] (util.ledger/ledger-parts ledger-alias)
+        branch (or branch const/default-branch-name)]
+    (str const/ns-version "/" ledger-name "/" branch ".json")))
+
+(defn vg-filename
+  "Returns the local filename for a virtual graph's nameservice record.
+   Returns path like 'ns@v2/vg-name.json'."
+  [vg-name]
+  (str const/ns-version "/" vg-name ".json"))
+
+(defn local-filename
+  "Returns the local filename for either a ledger or virtual graph nameservice record.
+   Dispatches to ledger-filename or vg-filename based on presence of branch separator ':'."
   [resource-name]
-  (if (str/includes? resource-name ":")
-    (let [[ledger-name branch] (util.ledger/ledger-parts resource-name)
-          branch (or branch const/default-branch-name)]
-      (str const/ns-version "/" ledger-name "/" branch ".json"))
-    (str const/ns-version "/" resource-name ".json")))
+  (if (ledger-alias? resource-name)
+    (ledger-filename resource-name)
+    (vg-filename resource-name)))
 
 (defn new-ns-record
   "Generates nameservice metadata map for JSON storage using new minimal format.
@@ -126,7 +142,7 @@
     (go-try
       (if-let [vg-name (:vg-name record)]
         ;; Virtual Graph: use write-bytes (non-atomic, but VGs aren't concurrently updated)
-        (let [filename (local-filename vg-name)
+        (let [filename (vg-filename vg-name)
               json-ld (record->json-ld record)
               result (->> json-ld
                           json/stringify-UTF8
@@ -137,7 +153,7 @@
           result)
         ;; Ledger: use swap-json for atomic updates
         (let [ledger-alias (get record "alias")  ;; Already includes :branch
-              filename     (local-filename ledger-alias)
+              filename     (ledger-filename ledger-alias)
               commit-address (get record "address")
               commit-t       (get-in record ["data" "t"])
               index-address  (get-in record ["index" "address"])
@@ -151,14 +167,12 @@
 
   (retract [this target]
     (go-try
-      (let [;; Check if target is a ledger (contains :) or VG (no :)
-            ledger? (str/includes? target ":")
-            address (-> store
+      (let [address (-> store
                         storage/location
                         (storage/build-address (local-filename target)))]
 
         ;; If this is a VG, unregister dependencies first
-        (when-not ledger?
+        (when-not (ledger-alias? target)
           (nameservice/unregister-vg-dependencies this target))
 
         (<? (storage/delete store address)))))
@@ -187,28 +201,27 @@
   (all-records [_]
     (go-try
       ;; Use recursive listing to support ledger names with '/' characters
-      (if (satisfies? storage/RecursiveListableStore store)
-        (if-let [list-paths-result (storage/list-paths-recursive store const/ns-version)]
-          (loop [remaining-paths (<? list-paths-result)
-                 records         []]
-            (if-let [path (first remaining-paths)]
-              (let [file-content (<? (storage/read-bytes store path))]
-                (if file-content
-                  (let [content-str (if (string? file-content)
-                                      file-content
-                                      (bytes/UTF8->string file-content))
-                        record (json/parse content-str false)]
-                    (recur (rest remaining-paths) (conj records record)))
-                  (recur (rest remaining-paths) records)))
-              records))
-          [])
-        ;; Fallback for stores that don't support RecursiveListableStore
-        (do
-          (log/debug "Storage backend does not support RecursiveListableStore protocol")
-          [])))))
+      (if-let [list-paths-result (storage/list-paths-recursive store const/ns-version)]
+        (loop [remaining-paths (<? list-paths-result)
+               records         []]
+          (if-let [path (first remaining-paths)]
+            (let [file-content (<? (storage/read-bytes store path))]
+              (if file-content
+                (let [content-str (if (string? file-content)
+                                    file-content
+                                    (bytes/UTF8->string file-content))
+                      record (json/parse content-str false)]
+                  (recur (rest remaining-paths) (conj records record)))
+                (recur (rest remaining-paths) records)))
+            records))
+        []))))
 
 (defn start
   [store]
+  (when-not (satisfies? storage/RecursiveListableStore store)
+    (throw (ex-info "Storage backend must support RecursiveListableStore protocol for nameservice"
+                    {:protocol storage/RecursiveListableStore
+                     :store (type store)})))
   (let [publisher (->StorageNameService store (atom {}))]
     ;; Initialize VG dependencies from existing records asynchronously (fire and forget)
     (go-try
