@@ -513,18 +513,17 @@
   (when primary-pub
     (nameservice/check-vg-dependencies primary-pub ledger-alias)))
 
-(defn- throw-if-has-dependencies
-  "Throws exception if ledger has dependent virtual graphs"
+(defn- existing-dependency-error
+  "Constructs an exception for when a ledger has dependent virtual graphs"
   [alias dependent-vgs]
-  (when (seq dependent-vgs)
-    (throw (ex-info (str "Cannot delete ledger '" alias
-                         "' - it has dependent virtual graphs: "
-                         (str/join ", " dependent-vgs)
-                         ". Delete the virtual graphs first.")
-                    {:status 400
-                     :error :db/ledger-has-dependencies
-                     :ledger alias
-                     :dependent-vgs dependent-vgs}))))
+  (ex-info (str "Cannot delete ledger '" alias
+                "' - it has dependent virtual graphs: "
+                (str/join ", " dependent-vgs)
+                ". Delete the virtual graphs first.")
+           {:status 400
+            :error :db/ledger-has-dependencies
+            :ledger alias
+            :dependent-vgs dependent-vgs}))
 
 (defn- drop-ledger-artifacts
   "Drops all artifacts (index and commit) for a ledger"
@@ -562,7 +561,8 @@
           primary-pub   (:primary-publisher conn)
           dependent-vgs (check-ledger-dependencies primary-pub alias*)]
 
-      (throw-if-has-dependencies alias* dependent-vgs)
+      (when (seq dependent-vgs)
+        (throw (existing-dependency-error alias* dependent-vgs)))
 
       (loop [[publisher & r] (publishers conn)]
         (when publisher
