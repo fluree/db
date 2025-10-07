@@ -4,7 +4,6 @@
             [fluree.db.connection :as connection]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.nameservice.virtual-graph :as ns-vg]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.virtual-graph.nameservice-loader :as vg-loader]))
 
@@ -95,7 +94,7 @@
           ledger-aliases (get-in vg-config [:config :ledgers] [])]
 
       ;; Check if virtual graph already exists
-      (when (<? (ns-vg/virtual-graph-exists? publisher vg-name))
+      (when (<? (nameservice/lookup publisher vg-name))
         (throw (ex-info (str "Virtual graph already exists: " vg-name)
                         {:error :db/invalid-config
                          :vg-name vg-name})))

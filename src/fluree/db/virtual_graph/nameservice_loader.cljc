@@ -1,7 +1,7 @@
 (ns fluree.db.virtual-graph.nameservice-loader
   (:require ;; Register VG type loaders
    #?(:clj [fluree.db.virtual-graph.bm25.index :as bm25])
-   [fluree.db.nameservice.virtual-graph :as ns-vg]
+   [fluree.db.nameservice :as nameservice]
    [fluree.db.util.async :refer [<? go-try]]
    [fluree.db.util.json :as json]
    [fluree.db.util.log :as log]
@@ -12,10 +12,10 @@
 
 (defn load-vg-config-from-nameservice
   "Loads a virtual graph configuration from the nameservice"
-  [nameservice vg-name]
+  [nameservice-publisher vg-name]
   (go-try
-    (let [vg-record (<? (ns-vg/get-virtual-graph nameservice vg-name))]
-      (when (= :not-found vg-record)
+    (let [vg-record (<? (nameservice/lookup nameservice-publisher vg-name))]
+      (when-not vg-record
         (throw (ex-info (str "Virtual graph not found in nameservice: " vg-name)
                         {:status 404
                          :error :db/virtual-graph-not-found})))

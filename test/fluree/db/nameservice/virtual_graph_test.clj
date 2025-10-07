@@ -3,7 +3,7 @@
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.connection :as connection]
-            [fluree.db.nameservice.virtual-graph :as ns-vg]))
+            [fluree.db.nameservice :as nameservice]))
 
 (deftest create-virtual-graph-test
   (testing "Creating a BM25 virtual graph via API"
@@ -35,16 +35,11 @@
               vg-name (:vg-name vg-obj)]
           (is (= "article-search" vg-name))
 
-          ;; Verify the virtual graph exists
-          (is (true? (async/<!! (ns-vg/virtual-graph-exists?
-                                 (connection/primary-publisher conn)
-                                 "article-search"))))
-
           ;; Verify we can retrieve the VG record
-          (let [vg-record (async/<!! (ns-vg/get-virtual-graph
+          (let [vg-record (async/<!! (nameservice/lookup
                                       (connection/primary-publisher conn)
                                       "article-search"))]
-            (is (not= :not-found vg-record))
+            (is (some? vg-record))
             (is (= "article-search" (get vg-record "@id")))
             (is (contains? (set (get vg-record "@type")) "fidx:BM25"))
             (is (= "ready" (get vg-record "f:status")))
@@ -61,8 +56,9 @@
           (is (re-find #"Virtual graph already exists" (.getMessage ^Exception result)))))
 
       (testing "List all virtual graphs"
-        (let [vgs (async/<!! (ns-vg/list-virtual-graphs
-                              (connection/primary-publisher conn)))]
+        (let [all-records (async/<!! (nameservice/all-records
+                                      (connection/primary-publisher conn)))
+              vgs (filter #(some #{"f:VirtualGraphDatabase"} (get % "@type")) all-records)]
           (is (= 1 (count vgs)))
           (is (= "article-search" (get (first vgs) "@id")))))
 

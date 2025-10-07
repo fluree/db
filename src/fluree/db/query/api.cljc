@@ -5,7 +5,7 @@
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.ledger :as ledger]
-            [fluree.db.nameservice.virtual-graph :as ns-vg]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.history :as history]
@@ -197,9 +197,9 @@
   (go-try
     (log/debug "load-virtual-graph called for:" vg-name)
     (let [primary-publisher (connection/primary-publisher conn)
-          vg-record (<? (ns-vg/get-virtual-graph primary-publisher vg-name))]
+          vg-record (<? (nameservice/lookup primary-publisher vg-name))]
       (log/debug "VG record from nameservice:" vg-record)
-      (if (= :not-found vg-record)
+      (if-not vg-record
         ;; Not a virtual graph, return nil
         (do
           (log/debug "Virtual graph not found in nameservice:" vg-name)
