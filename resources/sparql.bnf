@@ -139,7 +139,7 @@ UnaryExpression ::= '!' PrimaryExpression
 | '-' PrimaryExpression
 | PrimaryExpression
 <PrimaryExpression>	  ::=  	BrackettedExpression | BuiltInCall | iriOrFunction | RDFLiteral | NumericLiteral | BooleanLiteral | Var
-BrackettedExpression	  ::=  	<'('> WS Expression WS <')'>
+BrackettedExpression	  ::=  	<'('> WS Expression WS <')'> WS
 
 <BuiltInCall> ::= Aggregate
 | ExistsFunc
