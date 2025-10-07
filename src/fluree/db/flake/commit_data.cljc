@@ -161,35 +161,34 @@
         prev-commit (get-first jsonld const/iri-previous)
         data        (get-first jsonld const/iri-data)
         ns          (get-first jsonld const/iri-ns)
-        index       (get-first jsonld const/iri-index)]
-
-    (let [result (cond-> {:id     id
-                          :v      v
-                          :alias  alias
-                          :time   time
-                          :tag    (mapv get-value tags)
-                          :data   (parse-db-data data)
-                          :author author}
-                   txn (assoc :txn txn)
-                   address (assoc :address address)
-                   prev-commit (assoc :previous {:id      (get-id prev-commit)
-                                                 :address (get-first-value prev-commit const/iri-address)})
-                   message (assoc :message message)
-                   ns (assoc :ns (->> ns
-                                      util/sequential
-                                      (mapv (fn [namespace]
-                                              {:id (get-id namespace)}))))
-                   index (assoc :index {:id      (get-id index)
-                                        :address (get-first-value index const/iri-address)
-                                        :data    (parse-db-data (get-first index const/iri-data))})
-                   issuer (assoc :issuer {:id (get-id issuer)}))]
-      (log/debug "jsonld->clj: COMPLETE - returning commit map"
-                 {:commit-id (:id result)
-                  :commit-id-blank? (= "" (:id result))
-                  :commit-address (:address result)
-                  :has-previous? (some? (:previous result))
-                  :previous-id (get-in result [:previous :id])})
-      result)))
+        index       (get-first jsonld const/iri-index)
+        result (cond-> {:id     id
+                        :v      v
+                        :alias  alias
+                        :time   time
+                        :tag    (mapv get-value tags)
+                        :data   (parse-db-data data)
+                        :author author}
+                 txn (assoc :txn txn)
+                 address (assoc :address address)
+                 prev-commit (assoc :previous {:id      (get-id prev-commit)
+                                               :address (get-first-value prev-commit const/iri-address)})
+                 message (assoc :message message)
+                 ns (assoc :ns (->> ns
+                                    util/sequential
+                                    (mapv (fn [namespace]
+                                            {:id (get-id namespace)}))))
+                 index (assoc :index {:id      (get-id index)
+                                      :address (get-first-value index const/iri-address)
+                                      :data    (parse-db-data (get-first index const/iri-data))})
+                 issuer (assoc :issuer {:id (get-id issuer)}))]
+    (log/debug "jsonld->clj: COMPLETE - returning commit map"
+               {:commit-id (:id result)
+                :commit-id-blank? (= "" (:id result))
+                :commit-address (:address result)
+                :has-previous? (some? (:previous result))
+                :previous-id (get-in result [:previous :id])})
+    result))
 
 (defn update-index-roots
   [commit-map {:keys [spot post opst tspo]}]
