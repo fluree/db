@@ -57,7 +57,7 @@
 
 ;; Virtual Graph Dependency Tracking Functions
 
-(defn is-virtual-graph-record?
+(defn virtual-graph-record?
   "Checks if a nameservice record is a virtual graph"
   [record]
   (some #{"f:VirtualGraphDatabase"} (get record "@type" [])))
@@ -90,7 +90,7 @@
   [publisher]
   (go-try
     (let [all-records (<? (all-records publisher))
-          vg-records (filter is-virtual-graph-record? all-records)]
+          vg-records (filter virtual-graph-record? all-records)]
 
       (log/debug "Initializing VG dependencies from" (count vg-records) "virtual graph records")
 

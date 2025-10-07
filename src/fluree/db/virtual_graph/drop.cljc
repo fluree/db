@@ -10,22 +10,24 @@
   "Deletes all storage artifacts for a virtual graph"
   [{:keys [index-catalog] :as _conn} vg-name]
   (go-try
-    (let [storage (:storage index-catalog)
-          vg-path (str "virtual-graphs/" vg-name "/")]
+    (let [vg-path (str "virtual-graphs/" vg-name "/")]
       (log/debug "Dropping VG artifacts for" vg-name "at path" vg-path)
-      (if (satisfies? storage/RecursiveListableStore storage)
-        (let [vg-files (<? (storage/list-paths-recursive storage vg-path))]
-          (log/debug "Found" (count vg-files) "VG files to delete")
-          (doseq [file-path vg-files]
-            (log/debug "Deleting VG file:" file-path)
-            (<? (storage/delete storage file-path)))
-          ;; Try to delete the directory itself (may not work on all storage types)
-          (try*
-            (<? (storage/delete storage vg-path))
-            (catch* e
-              nil)))
-        (log/warn "Storage backend does not support listing files, cannot clean up VG artifacts"))
-      :vg-artifacts-dropped)))
+      (if (satisfies? storage/RecursiveListableStore index-catalog)
+        (do
+          (let [vg-files (<? (storage/list-paths-recursive index-catalog vg-path))]
+            (log/debug "Found" (count vg-files) "VG files to delete")
+            (doseq [file-path vg-files]
+              (log/debug "Deleting VG file:" file-path)
+              (<? (storage/delete index-catalog file-path)))
+            ;; Try to delete the directory itself (may not work on all storage types)
+            (try*
+              (<? (storage/delete index-catalog vg-path))
+              (catch* e
+                nil)))
+          :vg-artifacts-dropped)
+        (do
+          (log/warn "Storage backend does not support listing files, cannot clean up VG artifacts")
+          :vg-artifacts-not-dropped)))))
 
 (defn drop-virtual-graph
   "Drops a virtual graph and all its associated data"
