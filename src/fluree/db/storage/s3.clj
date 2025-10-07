@@ -466,8 +466,9 @@
                              (let [read-resp     (<? (read-s3-data this path))
                                    current-bytes (when-not (= read-resp ::not-found)
                                                    (.getBytes ^String (:body read-resp)))
+                                   ;; etag header value is a vector from xhttp, extract first element
                                    etag          (when-not (= read-resp ::not-found)
-                                                   (get-in read-resp [:headers "etag"]))
+                                                   (first (get-in read-resp [:headers "etag"])))
                                    new-bytes     (f current-bytes)]
                                (when new-bytes
                                  (let [headers (if etag
