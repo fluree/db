@@ -135,7 +135,15 @@
 
 (defn jsonld->clj
   [jsonld]
-  (let [id          (get-id jsonld)
+  (let [_           (log/debug "jsonld->clj: START - converting expanded JSON-LD to Clojure map"
+                               {:has-id-key? (contains? jsonld "@id")
+                                :id-key-value (get jsonld "@id")
+                                :jsonld-keys (keys jsonld)})
+        id          (get-id jsonld)
+        _           (log/debug "jsonld->clj: extracted commit @id from expanded JSON-LD"
+                               {:extracted-id id
+                                :id-blank? (= "" id)
+                                :id-nil? (nil? id)})
         v           (get-first-value jsonld const/iri-v)
         alias       (-> jsonld
                         (get-first-value const/iri-alias)
@@ -155,26 +163,33 @@
         ns          (get-first jsonld const/iri-ns)
         index       (get-first jsonld const/iri-index)]
 
-    (cond-> {:id     id
-             :v      v
-             :alias  alias
-             :time   time
-             :tag    (mapv get-value tags)
-             :data   (parse-db-data data)
-             :author author}
-      txn (assoc :txn txn)
-      address (assoc :address address)
-      prev-commit (assoc :previous {:id      (get-id prev-commit)
-                                    :address (get-first-value prev-commit const/iri-address)})
-      message (assoc :message message)
-      ns (assoc :ns (->> ns
-                         util/sequential
-                         (mapv (fn [namespace]
-                                 {:id (get-id namespace)}))))
-      index (assoc :index {:id      (get-id index)
-                           :address (get-first-value index const/iri-address)
-                           :data    (parse-db-data (get-first index const/iri-data))})
-      issuer (assoc :issuer {:id (get-id issuer)}))))
+    (let [result (cond-> {:id     id
+                          :v      v
+                          :alias  alias
+                          :time   time
+                          :tag    (mapv get-value tags)
+                          :data   (parse-db-data data)
+                          :author author}
+                   txn (assoc :txn txn)
+                   address (assoc :address address)
+                   prev-commit (assoc :previous {:id      (get-id prev-commit)
+                                                 :address (get-first-value prev-commit const/iri-address)})
+                   message (assoc :message message)
+                   ns (assoc :ns (->> ns
+                                      util/sequential
+                                      (mapv (fn [namespace]
+                                              {:id (get-id namespace)}))))
+                   index (assoc :index {:id      (get-id index)
+                                        :address (get-first-value index const/iri-address)
+                                        :data    (parse-db-data (get-first index const/iri-data))})
+                   issuer (assoc :issuer {:id (get-id issuer)}))]
+      (log/debug "jsonld->clj: COMPLETE - returning commit map"
+                 {:commit-id (:id result)
+                  :commit-id-blank? (= "" (:id result))
+                  :commit-address (:address result)
+                  :has-previous? (some? (:previous result))
+                  :previous-id (get-in result [:previous :id])})
+      result)))
 
 (defn update-index-roots
   [commit-map {:keys [spot post opst tspo]}]
@@ -412,8 +427,15 @@
   a ledger from storage on load."
   [db t commit]
   (let [{:keys [id address alias data time v previous author issuer message txn]} commit
+        _          (log/debug "commit-metadata-flakes: creating flakes from commit"
+                              {:commit-id id
+                               :commit-address address
+                               :t t})
         {db-t :t, db-address :address, data-id :id, :keys [flakes size]} data
         commit-sid (iri/encode-iri db id)
+        _          (log/debug "commit-metadata-flakes: encoded commit sid"
+                              {:commit-id id
+                               :commit-sid commit-sid})
         db-sid     (iri/encode-iri db data-id)]
     (cond->
      [;; commit flakes

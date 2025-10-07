@@ -38,9 +38,19 @@
 (defn read-verified-commit
   [storage commit-address]
   (go-try
+    (log/debug "read-verified-commit: START" {:address commit-address})
     (when-let [commit-data (<? (storage/content-read-json storage commit-address))]
+      (log/debug "read-verified-commit: loaded commit data from storage"
+                 {:address commit-address
+                  :has-id? (contains? commit-data "id")
+                  :id-value (get commit-data "id")
+                  :has-credentialSubject? (contains? commit-data "credentialSubject")})
       (log/trace "read-commit at:" commit-address "data:" commit-data)
       (let [commit-hash    (<? (storage/get-hash storage commit-address))
+            _              (log/debug "read-verified-commit: extracted hash from address"
+                                      {:address commit-address
+                                       :hash commit-hash
+                                       :hash-length (count commit-hash)})
             commit-id      (commit-data/hash->commit-id commit-hash)
             _              (log/debug "read-verified-commit: computed commit-id"
                                       {:address commit-address
@@ -57,9 +67,25 @@
             commit-data*   (-> commit-data
                                (assoc-in id-key-path commit-id)
                                (assoc-in addr-key-path commit-address))
+            _              (log/debug "read-verified-commit: injected commit-id into compact JSON"
+                                      {:commit-id commit-id
+                                       :id-key-path id-key-path
+                                       :addr-key-path addr-key-path
+                                       :compact-has-id? (some? (get-in commit-data* id-key-path))
+                                       :compact-id-value (get-in commit-data* id-key-path)
+                                       :compact-has-address? (some? (get-in commit-data* addr-key-path))})
             [commit proof] (-> commit-data*
                                json-ld/expand
-                               verify-commit)]
+                               verify-commit)
+            expanded-id    (-> commit (get "@id") first)
+            _              (log/debug "read-verified-commit: after expansion"
+                                      {:expanded-id expanded-id
+                                       :expanded-id-type (type expanded-id)
+                                       :matches-computed? (= expanded-id commit-id)
+                                       :commit-keys (keys commit)})
+            _              (log/debug "read-verified-commit: COMPLETE - returning expanded commit"
+                                      {:has-expanded-id? (some? expanded-id)
+                                       :expanded-id expanded-id})]
         [commit proof]))))
 
 ;; TODO: Verify hash

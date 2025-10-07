@@ -159,8 +159,9 @@
 (defn content-read-json
   [store address]
   (go-try
-    (let [bytes (<? (-content-read-bytes store address))]
-      (json/parse bytes false))))
+    (let [bytes  (<? (-content-read-bytes store address))
+          parsed (json/parse bytes false)]
+      parsed)))
 
 (defn read-json
   ([store address]

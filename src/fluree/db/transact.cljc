@@ -171,6 +171,10 @@
   if IPFS, add the final address into the commit map."
   [[commit-map commit-jsonld] commit-hash]
   (let [commit-id (commit-data/hash->commit-id commit-hash)]
+    (log/debug "update-commit-id: updating commit with hash"
+               {:commit-hash commit-hash
+                :commit-id commit-id
+                :old-id (:id commit-map)})
     [(assoc commit-map :id commit-id)
      (assoc commit-jsonld "id" commit-id)]))
 
