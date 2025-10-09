@@ -170,6 +170,17 @@
            (let [oq (<? (optimize/optimize ds pq))]
              (<? (exec/query ds tracker oq)))))))))
 
+(defn query-stream
+  "Parses query and delegates to exec/query-stream. Returns channel emitting
+   individual results. Caching not supported for streaming."
+  ([ds query-map]
+   (query-stream ds nil query-map))
+  ([ds tracker query-map]
+   (go-try
+     (let [pq (parse/parse-query query-map)
+           oq (<? (optimize/optimize ds pq))]
+       (exec/query-stream ds tracker oq)))))
+
 (defn explain
   "Returns query execution plan without executing the query.
   Returns core async channel with query plan or exception."
