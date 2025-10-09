@@ -13,7 +13,7 @@
 
 (defn- validate-common-config
   "Validates common configuration parameters for all virtual graph types."
-  [{:keys [name type] :as config}]
+  [{vg-type :type :keys [name] :as config}]
   (cond
     (not name)
     (throw (ex-info "Virtual graph requires :name"
@@ -23,7 +23,7 @@
     (throw (ex-info "Virtual graph :name must be a string"
                     {:error :db/invalid-config :name name :type (type name)}))
 
-    (not type)
+    (not vg-type)
     (throw (ex-info "Virtual graph requires :type"
                     {:error :db/invalid-config :config config}))
 

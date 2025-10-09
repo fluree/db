@@ -74,16 +74,12 @@
   [db nameservice vg-name]
   (go-try
     (log/debug "Loading virtual graph from nameservice:" vg-name)
-    (if-let [existing-vg (get-in db [:vg vg-name])]
-      (do
-        (log/debug "Virtual graph already loaded:" vg-name)
-        existing-vg)
-      (let [vg-record (<? (load-vg-config-from-nameservice nameservice vg-name))
-            vg-config (vg-record->config vg-record)
-            vg-instance (create-vg-instance db vg-config)
-            initialized-vg (<? (vg/initialize vg-instance db))]
-        (log/debug "VG initialized successfully")
-        initialized-vg))))
+    (let [vg-record (<? (load-vg-config-from-nameservice nameservice vg-name))
+          vg-config (vg-record->config vg-record)
+          vg-instance (create-vg-instance db vg-config)
+          initialized-vg (<? (vg/initialize vg-instance db))]
+      (log/debug "VG initialized successfully")
+      initialized-vg)))
 
 #?(:clj
    (defmethod create-vg-impl :bm25

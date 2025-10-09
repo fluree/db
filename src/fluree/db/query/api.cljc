@@ -1,7 +1,9 @@
 (ns fluree.db.query.api
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
-  (:require [fluree.db.connection :as connection]
+  (:require [clojure.core.async :as async]
+            [clojure.string :as str]
+            [fluree.db.connection :as connection]
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.ledger :as ledger]
@@ -192,17 +194,17 @@
            first))
 
 (defn load-virtual-graph
-  "Loads a virtual graph from nameservice and returns it as a DB-like object."
+  "Loads a virtual graph from nameservice and returns it as a DB-like object.
+  Returns nil if the alias is not a virtual graph."
   [conn vg-name]
   (go-try
     (log/debug "load-virtual-graph called for:" vg-name)
     (let [primary-publisher (connection/primary-publisher conn)
           vg-record (<? (nameservice/lookup primary-publisher vg-name))]
       (log/debug "VG record from nameservice:" vg-record)
-      (if-not vg-record
-        ;; Not a virtual graph, return nil
+      (if (not (nameservice/virtual-graph-record? vg-record))
         (do
-          (log/debug "Virtual graph not found in nameservice:" vg-name)
+          (log/debug "Not a virtual graph:" vg-name)
           nil)
         ;; Instantiate virtual graph (currently requires an associated ledger; future VGs may be independent)
         (let [dependencies (get vg-record "f:dependencies")
@@ -220,28 +222,38 @@
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
   (go-try
-    (try*
-      (log/debug "load-alias called with:" alias)
-      ;; First try to load as a virtual graph
-      (if-let [vg (<? (load-virtual-graph conn alias))]
-        (do
-          (log/debug "Loaded virtual graph successfully:" alias)
-          vg)
-        ;; Not a virtual graph, load as regular ledger
-        (do
-          (log/debug "Loading as ledger:" alias)
-          (let [[base-alias explicit-t] (extract-query-string-t alias)
-                ledger       (<? (connection/load-ledger-alias conn base-alias))
-                db           (ledger/current-db ledger)
-                t*           (or explicit-t t)
-                query*       (-> sanitized-query
-                                 (assoc :t t*)
-                                 (ledger-opts-override db))]
-            (<? (restrict-db db tracker query* conn)))))
-      (catch* e
-        (throw (contextualize-ledger-400-error
-                (str "Error loading resource " alias ": ")
-                e))))))
+    (log/debug "load-alias called with:" alias)
+    (let [[base-alias explicit-t] (extract-query-string-t alias)
+          ;; Normalize to ensure branch (e.g., "docs" -> "docs:main")
+          normalized-alias (ledger-util/ensure-ledger-branch base-alias)
+          ;; Try to load as a ledger (most common case) - use <! to get result or exception
+          ledger-result    (async/<! (connection/load-ledger-alias conn normalized-alias))
+          valid-ledger?    (not (util/exception? ledger-result))]
+      (if valid-ledger?
+        ;; Successfully loaded ledger
+        (let [ledger ledger-result
+              db     (ledger/current-db ledger)
+              t*     (or explicit-t t)
+              query* (-> sanitized-query
+                         (assoc :t t*)
+                         (ledger-opts-override db))]
+          (<? (restrict-db db tracker query* conn)))
+        ;; Ledger load failed. If original alias has no ':', try as virtual graph
+        (if (not (str/includes? alias ":"))
+          (do
+            (log/debug "Ledger load failed, trying as virtual graph:" alias)
+            (if-let [vg (<? (load-virtual-graph conn alias))]
+              (do
+                (log/debug "Loaded virtual graph successfully:" alias)
+                vg)
+              ;; Neither ledger nor VG worked, throw original ledger error
+              (throw (contextualize-ledger-400-error
+                      (str "Error loading resource " alias ": ")
+                      ledger-result))))
+          ;; Original alias had ':', so it was meant to be a ledger - throw error
+          (throw (contextualize-ledger-400-error
+                  (str "Error loading ledger " alias ": ")
+                  ledger-result)))))))
 
 (defn load-aliases
   [conn tracker aliases sanitized-query]
