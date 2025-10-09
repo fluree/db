@@ -788,6 +788,148 @@
         (throw (ex-info "No nameservice available for querying"
                         {:status 400 :error :db/no-nameservice})))))))
 
+;; Streaming Query APIs
+
+(defn query-stream
+  "Executes a streaming query against a database or dataset.
+
+  Returns a core.async channel that emits individual result items as they are
+  produced, rather than collecting all results into a vector. This is useful for:
+  - Large result sets (reduces memory pressure)
+  - Progressive UI updates (display results as they arrive)
+  - Streaming HTTP responses (NDJSON, Server-Sent Events, etc.)
+
+  Parameters:
+    ds - Database value or dataset
+    q - Query map (JSON-LD or analytical)
+    opts - (optional) Options map
+
+  All query features are supported (ORDER BY, GROUP BY, aggregates), but queries
+  using these features will collect results before emitting, so they won't benefit
+  from streaming's memory efficiency. This allows apps to use a single streaming
+  endpoint for all query types.
+
+  Query tracking (:meta option) is supported. When enabled, a final metadata map
+  will be emitted after all results with the format:
+    {:_fluree-meta {:fuel 123, :time \"5ms\", :policy {...}, :status 200}}
+  Consumers can detect this by checking for the :_fluree-meta key.
+
+  Limitations:
+    - Caching not supported
+
+  The returned channel will:
+    - Emit individual result vectors for SELECT queries
+    - Emit single result vector for SELECT ONE queries
+    - Emit individual graph node maps for CONSTRUCT queries (without @graph wrapper)
+    - Emit final metadata map if :meta tracking enabled
+    - Close when all results and metadata have been emitted
+    - Emit an exception if an error occurs during query execution
+
+  CONSTRUCT queries emit individual graph nodes as produced. The same subject may
+  appear in multiple results with different properties. Results are NOT grouped by
+  subject or wrapped in @graph. For complete JSON-LD documents, use the standard
+  query function.
+
+  Returns a core.async channel emitting individual results.
+
+  Example:
+    (require '[clojure.core.async :as async])
+
+    ;; Stream query results
+    (let [result-ch (query-stream db {\"select\" [\"?name\" \"?age\"]
+                                      \"where\"  [{\"@id\" \"?person\"
+                                                   \"ex:name\" \"?name\"
+                                                   \"ex:age\" \"?age\"}]})]
+      ;; Process results as they arrive
+      (async/go-loop []
+        (when-some [result (async/<! result-ch)]
+          (if (util/exception? result)
+            (println \"Error:\" (ex-message result))
+            (do
+              (println \"Got result:\" result)
+              (recur))))))"
+  ([ds q]
+   (query-stream ds q {}))
+  ([ds q opts]
+   (cond
+     (util/exception? ds)
+     (async/to-chan! [ds])
+
+     (:cache opts)
+     (async/to-chan! [(ex-info "Streaming queries do not support caching"
+                               {:status 400
+                                :error :db/invalid-query
+                                :message "Remove :cache option or use non-streaming query API"})])
+
+     :else
+     (query-api/query-stream ds q opts))))
+
+(defn query-connection-stream
+  "Executes a streaming query using the connection's query engine.
+
+  Returns a core.async channel that emits individual result vectors as they are
+  produced. This is the main entry point for streaming queries from server layers
+  and applications that need to stream large result sets.
+
+  Parameters:
+    conn - Connection object
+    q - Query map with 'from' key specifying ledger(s)
+    opts - (optional) Options map
+
+  All query features are supported (ORDER BY, GROUP BY, aggregates), but queries
+  using these features will collect results before emitting, so they won't benefit
+  from streaming's memory efficiency. This allows apps to use a single streaming
+  endpoint for all query types.
+
+  Query tracking (:meta option) is supported. When enabled, a final metadata map
+  will be emitted after all results with the format:
+    {:_fluree-meta {:fuel 123, :time \"5ms\", :policy {...}, :status 200}}
+  Consumers can detect this by checking for the :_fluree-meta key.
+
+  Limitations:
+    - Caching not supported
+
+  Uses the current database state at query time.
+  Returns a core.async channel emitting individual results.
+
+  Example:
+    (require '[clojure.core.async :as async])
+
+    ;; Stream results from a ledger query
+    (let [result-ch (query-connection-stream conn
+                                             {\"from\" \"my-ledger\"
+                                              \"select\" [\"?name\"]
+                                              \"where\" [{\"@id\" \"?person\"
+                                                          \"ex:name\" \"?name\"}]})]
+      ;; Convert to NDJSON for HTTP streaming
+      (defn ndjson-body [ch]
+        (reify
+          StreamableResponseBody
+          (write-body-to-stream [_ _ output-stream]
+            (with-open [writer (io/writer output-stream)]
+              (async/go-loop []
+                (when-some [result (async/<! ch)]
+                  (if (util/exception? result)
+                    (log/error result \"Query error\")
+                    (do
+                      (.write writer (json/generate-string result))
+                      (.write writer \"\\n\")
+                      (.flush writer)
+                      (recur)))))))))
+
+      {:status 200
+       :headers {\"content-type\" \"application/x-ndjson\"}
+       :body (ndjson-body result-ch)})"
+  ([conn q] (query-connection-stream conn q {}))
+  ([conn q opts]
+   (validate-connection conn)
+   (if (:cache opts)
+     (async/to-chan! [(ex-info "Streaming queries do not support caching"
+                               {:status 400
+                                :error :db/invalid-query
+                                :message "Remove :cache option or use non-streaming query API"})])
+     (query-api/query-connection-stream conn q opts))))
+
 (defn history
   "Queries the history of entities across commits.
 

@@ -53,3 +53,16 @@
        (if (util/exception? q)
          (async/to-chan! [q])
          (exec/query ds tracker q))))))
+
+(defn query-stream
+  "Parses query and delegates to exec/query-stream. Returns channel emitting
+   individual results. Caching not supported for streaming."
+  ([ds query-map]
+   (query-stream ds nil query-map))
+  ([ds tracker query-map]
+   (let [q (try*
+             (parse/parse-query query-map)
+             (catch* e e))]
+     (if (util/exception? q)
+       (async/to-chan! [q])
+       (exec/query-stream ds tracker q)))))
