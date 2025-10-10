@@ -227,23 +227,29 @@
           (recur r new-solutions*))
         new-solutions))))
 
+(defn psot-indexed?
+  [db]
+  (contains? db :psot))
+
 (defn match-properties
   [db tracker solution triples error-ch]
-  (let [triples* (->> triples
-                      (map (fn [triple]
-                             (where/assign-matched-values triple solution)))
-                      (map (partial where/compute-sids db)))]
-    (if (every? some? triples*)
-      (let [property-ranges (->> triples*
-                                 (map (fn [triple]
-                                        (where/resolve-flake-range db tracker error-ch triple :psot)))
-                                 (repartition-each-by flake/s))
-            extract-sid     (comp flake/s first)
-            join-xf         (mapcat (fn [join]
-                                      (match-join solution triples* db join)))]
-        (inner-join-by flake/cmp-sid extract-sid 2 join-xf property-ranges))
-      (doto (async/chan)
-        (async/close!)))))
+  (if (psot-indexed? db)
+    (let [triples* (->> triples
+                        (map (fn [triple]
+                               (where/assign-matched-values triple solution)))
+                        (map (partial where/compute-sids db)))]
+      (if (every? some? triples*)
+        (let [property-ranges (->> triples*
+                                   (map (fn [triple]
+                                          (where/resolve-flake-range db tracker error-ch triple :psot)))
+                                   (repartition-each-by flake/s))
+              extract-sid     (comp flake/s first)
+              join-xf         (mapcat (fn [join]
+                                        (match-join solution triples* db join)))]
+          (inner-join-by flake/cmp-sid extract-sid 2 join-xf property-ranges))
+        (doto (async/chan)
+          (async/close!))))
+    (where/match-triples db tracker solution triples error-ch)))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
