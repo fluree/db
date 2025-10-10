@@ -70,3 +70,16 @@
 (defn sparql-format?
   [opts]
   (= :sparql (:format opts)))
+
+(defn context->prefixes
+  [context]
+  (reduce-kv (fn [prefixes k v]
+               (let [prefix (if (keyword? k) (name k) k)]
+                 (if (string? v)
+                   (if (= "@base" prefix)
+                     (conj prefixes (str "BASE <" v ">"))
+                     (conj prefixes (str "PREFIX "  prefix ": <" v ">")))
+                   ;; skip non-prefix context definitions
+                   prefixes)))
+             []
+             context))
