@@ -46,8 +46,7 @@
 
 (defn empty-all-novelty
   [db]
-  (let [cleared (->> index/types
-                     (filter (partial contains? db))
+  (let [cleared (->> (index/indexes-for db)
                      (reduce (fn [db* idx]
                                (update-in db* [:novelty idx] empty))
                              db))]
@@ -67,7 +66,7 @@
     (empty-all-novelty db)
 
     (flake/t-before? t (:t db))
-    (let [indexes (filter (partial contains? db) index/types)
+    (let [indexes (index/indexes-for db)
           novelty (reduce (fn [acc idx]
                             (assoc acc idx
                                    #?(:clj  (future (novelty-after-t db t idx))

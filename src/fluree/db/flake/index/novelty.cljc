@@ -368,8 +368,7 @@
   ([db error-ch]
    (refresh-all db nil error-ch))
   ([db changes-ch error-ch]
-   (->> index/types
-        (filter (partial contains? db))
+   (->> (index/indexes-for db)
         (map (partial extract-root db))
         (map (partial refresh-index db changes-ch error-ch))
         async/merge

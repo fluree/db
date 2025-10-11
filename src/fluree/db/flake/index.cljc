@@ -23,6 +23,10 @@
   and transaction flake attributes"
   (-> comparators keys vec))
 
+(defn indexes-for
+  [db]
+  (filter (partial contains? db) types))
+
 (defn reference?
   [dt]
   (= dt const/$id))
