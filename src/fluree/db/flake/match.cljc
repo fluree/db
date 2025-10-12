@@ -7,7 +7,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.util :as util :refer [vswap!]]
-            [fluree.db.util.async :refer [<? go-try inner-join-by
+            [fluree.db.util.async :refer [<? empty-channel go-try inner-join-by
                                           repartition-each-by]]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -247,8 +247,7 @@
               join-xf         (mapcat (fn [join]
                                         (match-join solution triples* db join)))]
           (inner-join-by flake/cmp-sid extract-sid 2 join-xf property-ranges))
-        (doto (async/chan)
-          (async/close!))))
+        empty-channel))
     (where/match-triples db tracker solution triples error-ch)))
 
 (defn with-distinct-subjects
