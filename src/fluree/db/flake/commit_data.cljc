@@ -3,6 +3,7 @@
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
@@ -177,9 +178,10 @@
       issuer (assoc :issuer {:id (get-id issuer)}))))
 
 (defn update-index-roots
-  [commit-map {:keys [spot psot post opst tspo]}]
+  [commit-map index-roots]
   (if (contains? commit-map :index)
-    (update commit-map :index assoc :spot spot, :psot psot, :post post, :opst opst, :tspo tspo)
+    (let [index-roots* (select-keys index-roots index/types)]
+      (update commit-map :index merge index-roots*))
     commit-map))
 
 (defn json-ld->map
