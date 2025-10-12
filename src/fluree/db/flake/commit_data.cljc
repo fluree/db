@@ -352,39 +352,50 @@
     add (+ (flake/size-bytes add))
     rem (- (flake/size-bytes rem))))
 
+(defn revise-novelty-set
+  [novelty add rem]
+  #?(:clj  (future (flake/revise novelty add rem))
+     :cljs (flake/revise novelty add rem)))
+
+(defn revise-index-novelty
+  [novelty add rem]
+  (let [index-novelty (select-keys novelty index/types)]
+    (reduce-kv (fn [m idx novelty]
+                 (let [novelty* (if (= :opst idx)
+                                  (revise-novelty-set novelty (ref-flakes add) (ref-flakes rem))
+                                  (revise-novelty-set novelty add rem))]
+                   (assoc m idx novelty*)))
+               {} index-novelty)))
+
+(defn merge-index-novelty
+  [db index-novelty]
+  (reduce-kv (fn [db* idx novelty]
+               (assoc-in db* [:novelty idx] #?(:clj  @novelty
+                                               :cljs novelty)))
+             db index-novelty))
+
 (defn update-novelty
   ([db add]
    (update-novelty db add []))
 
-  ([{:keys [t] :as db} add rem]
+  ([{:keys [t novelty] :as db} add rem]
    (try*
      (let [flake-count (cond-> 0
                          add (+ (count add))
                          rem (- (count rem)))
+
            ;; launch futures for parallellism on JVM
-           flake-size  #?(:clj  (future (calc-flake-size add rem))
-                          :cljs (calc-flake-size add rem))
-           psot        #?(:clj  (future (flake/revise (get-in db [:novelty :psot]) add rem))
-                          :cljs (flake/revise (get-in db [:novelty :psot]) add rem))
-           post        #?(:clj  (future (flake/revise (get-in db [:novelty :post]) add rem))
-                          :cljs (flake/revise (get-in db [:novelty :post]) add rem))
-           opst        #?(:clj  (future (flake/revise (get-in db [:novelty :opst]) (ref-flakes add) (ref-flakes rem)))
-                          :cljs (flake/revise (get-in db [:novelty :opst]) (ref-flakes add) (ref-flakes rem)))]
+           flake-size    #?(:clj  (future (calc-flake-size add rem))
+                            :cljs (calc-flake-size add rem))
+           index-novelty (revise-index-novelty novelty add rem)]
        (-> db
-           (update-in [:novelty :spot] flake/revise add rem)
-           (update-in [:novelty :tspo] flake/revise add rem)
-           (assoc-in [:novelty :psot] #?(:clj  @psot
-                                         :cljs psot))
-           (assoc-in [:novelty :post] #?(:clj  @post
-                                         :cljs post))
-           (assoc-in [:novelty :opst] #?(:clj  @opst
-                                         :cljs opst))
            (update-in [:novelty :size] + #?(:clj  @flake-size
                                             :cljs flake-size))
            (assoc-in [:novelty :t] t)
            (update-in [:stats :size] + #?(:clj  @flake-size
                                           :cljs flake-size))
-           (update-in [:stats :flakes] + flake-count)))
+           (update-in [:stats :flakes] + flake-count)
+           (merge-index-novelty index-novelty)))
      (catch* e
        (log/error (str "Update novelty unexpected error while attempting to updated db: "
                        (pr-str db) " due to exception: " (ex-message e))
