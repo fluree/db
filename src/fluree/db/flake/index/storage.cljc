@@ -100,7 +100,7 @@
                                  :t               t
                                  :v               1 ;; version of db root file
                                  :schema          (vocab/serialize-schema schema)
-                                 :stats           (select-keys stats [:flakes :size :property-counts :class-counts])
+                                 :stats           (select-keys stats [:flakes :size :properties :classes])
                                  :spot            (child-data spot)
                                  :post            (child-data post)
                                  :opst            (child-data opst)

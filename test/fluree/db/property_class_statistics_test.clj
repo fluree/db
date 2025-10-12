@@ -44,12 +44,12 @@
             loaded     (test-utils/retry-load conn ledger-id 100)]
 
         (testing "Reified database has property and class counts"
-          (let [property-counts (get-in loaded [:stats :property-counts])
-                class-counts    (get-in loaded [:stats :class-counts])
-                ;; Helper to get count for a specific IRI (stats use SIDs as keys)
+          (let [property-counts (get-in loaded [:stats :properties])
+                class-counts    (get-in loaded [:stats :classes])
+                ;; Helper to get count for a specific IRI (stats use SIDs as keys with nested :count)
                 get-count (fn [stats-map iri-str]
                             (let [sid (iri/encode-iri loaded iri-str)]
-                              (get stats-map sid)))]
+                              (get-in stats-map [sid :count])))]
 
             (is (map? property-counts) "Property counts should be a map")
             (is (map? class-counts) "Class counts should be a map")
@@ -76,14 +76,14 @@
             (is (some? root-data) "Should be able to read index root")
 
             (let [stats (get root-data :stats)]
-              (is (map? (:property-counts stats)) "Serialized stats should have property-counts")
-              (is (map? (:class-counts stats)) "Serialized stats should have class-counts")
+              (is (map? (:properties stats)) "Serialized stats should have property-counts")
+              (is (map? (:classes stats)) "Serialized stats should have class-counts")
 
-              (is (= (count (get-in loaded [:stats :property-counts]))
-                     (count (:property-counts stats)))
+              (is (= (count (get-in loaded [:stats :properties]))
+                     (count (:properties stats)))
                   "Serialized property counts should have same entry count as reified")
-              (is (= (count (get-in loaded [:stats :class-counts]))
-                     (count (:class-counts stats)))
+              (is (= (count (get-in loaded [:stats :classes]))
+                     (count (:classes stats)))
                   "Serialized class counts should have same entry count as reified"))))))))
 
 (deftest ^:integration property-class-statistics-with-retracts-test
@@ -125,10 +125,10 @@
             loaded   (test-utils/retry-load conn ledger-id 100)]
 
         (testing "Class count decremented after delete"
-          (let [class-counts (get-in loaded [:stats :class-counts])
+          (let [class-counts (get-in loaded [:stats :classes])
                 get-count (fn [stats-map iri]
                             (let [sid (iri/encode-iri loaded iri)]
-                              (get stats-map sid)))]
+                              (get-in stats-map [sid :count])))]
 
             (is (map? class-counts) "Class counts should be a map")
 
@@ -136,10 +136,10 @@
                 "Person class should have count 2 after deleting Bob")))
 
         (testing "Property counts decremented for deleted properties"
-          (let [property-counts (get-in loaded [:stats :property-counts])
+          (let [property-counts (get-in loaded [:stats :properties])
                 get-count (fn [stats-map iri]
                             (let [sid (iri/encode-iri loaded iri)]
-                              (get stats-map sid)))]
+                              (get-in stats-map [sid :count])))]
 
             (is (map? property-counts) "Property counts should be a map")
 
@@ -173,11 +173,11 @@
           indexed-db @(fluree/db conn ledger-id)]
 
       (testing "Memory-based index has statistics"
-        (let [property-counts (get-in indexed-db [:stats :property-counts])
-              class-counts    (get-in indexed-db [:stats :class-counts])
+        (let [property-counts (get-in indexed-db [:stats :properties])
+              class-counts    (get-in indexed-db [:stats :classes])
               get-count (fn [stats-map iri]
                           (let [sid (iri/encode-iri indexed-db iri)]
-                            (get stats-map sid)))]
+                            (get-in stats-map [sid :count])))]
 
           (is (map? property-counts) "Property counts should be a map")
           (is (map? class-counts) "Class counts should be a map")
@@ -227,11 +227,11 @@
             loaded   (test-utils/retry-load conn ledger-id 100)]
 
         (testing "Zero-count properties/classes are preserved"
-          (let [property-counts (get-in loaded [:stats :property-counts])
-                class-counts    (get-in loaded [:stats :class-counts])
+          (let [property-counts (get-in loaded [:stats :properties])
+                class-counts    (get-in loaded [:stats :classes])
                 get-count (fn [stats-map iri]
                             (let [sid (iri/encode-iri loaded iri)]
-                              (get stats-map sid)))]
+                              (get-in stats-map [sid :count])))]
 
             (is (= 0 (get-count class-counts "http://example.org/TempClass"))
                 "TempClass should have count 0 after deletion")
@@ -273,21 +273,21 @@
           (is (some? (:flakes info)) "Should have flakes")
           (is (some? (:commit info)) "Should have commit"))
 
-        (testing "ledger-info includes statistics with decoded IRIs"
-          (let [prop-counts  (:property-counts info)
-                class-counts (:class-counts info)]
-            (is (map? prop-counts) "Should have property-counts map")
-            (is (map? class-counts) "Should have class-counts map")
-            (is (pos? (count prop-counts)) "Should have property counts")
-            (is (pos? (count class-counts)) "Should have class counts")
+        (testing "ledger-info includes statistics with decoded IRIs and nested structure"
+          (let [properties (:properties info)
+                classes    (:classes info)]
+            (is (map? properties) "Should have properties map")
+            (is (map? classes) "Should have classes map")
+            (is (pos? (count properties)) "Should have property entries")
+            (is (pos? (count classes)) "Should have class entries")
 
-            (is (= 2 (get class-counts "http://example.org/Person"))
+            (is (= 2 (get-in classes ["http://example.org/Person" :count]))
                 "Should have exactly 2 Person entities")
 
-            (is (= 2 (get prop-counts "http://example.org/name"))
+            (is (= 2 (get-in properties ["http://example.org/name" :count]))
                 "Should have exactly 2 ex:name properties")
 
-            (is (every? string? (keys prop-counts))
+            (is (every? string? (keys properties))
                 "All property keys should be decoded IRIs (strings)")
-            (is (every? string? (keys class-counts))
+            (is (every? string? (keys classes))
                 "All class keys should be decoded IRIs (strings)")))))))

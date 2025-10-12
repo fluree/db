@@ -324,20 +324,20 @@
 (defn- compute-stats-from-novelty
   "Core logic for computing property and class counts from novelty flakes.
    Increments for assertions (op=true), decrements for retracts (op=false)."
-  [novelty-flakes prev-property-counts prev-class-counts]
+  [novelty-flakes prev-properties prev-classes]
   (loop [[f & r] novelty-flakes
-         property-counts prev-property-counts
-         class-counts prev-class-counts]
+         properties prev-properties
+         classes prev-classes]
     (if f
       (let [p     (flake/p f)
             delta (if (flake/op f) 1 -1)
-            property-counts* (update property-counts p (fnil + 0) delta)
-            class-counts*    (if (flake/class-flake? f)
-                               (update class-counts (flake/o f) (fnil + 0) delta)
-                               class-counts)]
-        (recur r property-counts* class-counts*))
-      {:property-counts property-counts
-       :class-counts    class-counts})))
+            properties* (update-in properties [p :count] (fnil + 0) delta)
+            classes*    (if (flake/class-flake? f)
+                          (update-in classes [(flake/o f) :count] (fnil + 0) delta)
+                          classes)]
+        (recur r properties* classes*))
+      {:properties properties
+       :classes    classes})))
 
 (defn compute-novelty-stats
   "Computes property and class counts from novelty flakes in a separate thread/go block.
@@ -345,31 +345,27 @@
 
    Uses async/thread on JVM for true parallelism (not limited by go block thread pool).
    Falls back to go block on ClojureScript."
-  [novelty-flakes prev-property-counts prev-class-counts]
+  [novelty-flakes prev-properties prev-classes]
   #?(:clj
      (async/thread
-       (compute-stats-from-novelty novelty-flakes prev-property-counts prev-class-counts))
+       (compute-stats-from-novelty novelty-flakes prev-properties prev-classes))
      :cljs
      (go
-       (compute-stats-from-novelty novelty-flakes prev-property-counts prev-class-counts))))
+       (compute-stats-from-novelty novelty-flakes prev-properties prev-classes))))
 
 (defn current-stats
-  "Computes current property and class statistics by taking indexed stats and
-   replaying novelty flakes. Works with both FlakeDB and AsyncDB.
-
-   Returns the full stats map with updated :property-counts and :class-counts.
-   For AsyncDB, returns a channel; for FlakeDB, returns the stats map directly."
+  "Compute current property and class statistics."
   [db]
   (let [indexed-stats     (get db :stats {})
-        indexed-prop      (get indexed-stats :property-counts {})
-        indexed-class     (get indexed-stats :class-counts {})
+        indexed-prop      (get indexed-stats :properties {})
+        indexed-class     (get indexed-stats :classes {})
         spot-novelty      (get-in db [:novelty :spot])]
     (if spot-novelty
       ;; Synchronous computation for both FlakeDB and AsyncDB
       (let [novelty-updates (compute-stats-from-novelty spot-novelty indexed-prop indexed-class)]
         (assoc indexed-stats
-               :property-counts (:property-counts novelty-updates)
-               :class-counts    (:class-counts novelty-updates)))
+               :properties (:properties novelty-updates)
+               :classes    (:classes novelty-updates)))
       ;; No novelty, return indexed stats as-is
       indexed-stats)))
 
@@ -422,9 +418,9 @@
   ([db changes-ch error-ch]
    ;; Kick off parallel stats computation from :spot novelty
    (let [spot-novelty      (get-in db [:novelty :spot])
-         prev-prop-counts  (get-in db [:stats :property-counts] {})
-         prev-class-counts (get-in db [:stats :class-counts] {})
-         stats-ch          (compute-novelty-stats spot-novelty prev-prop-counts prev-class-counts)]
+         prev-properties   (get-in db [:stats :properties] {})
+         prev-classes      (get-in db [:stats :classes] {})
+         stats-ch          (compute-novelty-stats spot-novelty prev-properties prev-classes)]
      (go-try
        (let [;; Wait for both indexing and stats to complete
              index-result (<? (->> index/types
@@ -434,10 +430,10 @@
                                    (async/reduce tally {:db      db
                                                         :indexes []
                                                         :garbage #{}})))
-             {:keys [property-counts class-counts]} (<! stats-ch)]
+             {:keys [properties classes]} (<! stats-ch)]
          (-> index-result
-             (assoc :property-counts property-counts)
-             (assoc :class-counts class-counts)))))))
+             (assoc :properties properties)
+             (assoc :classes classes)))))))
 
 (defn refresh
   [{:keys [novelty t alias] :as db} changes-ch max-old-indexes]
@@ -458,12 +454,12 @@
            (throw e))
 
           refresh-ch
-          ([{:keys [garbage property-counts class-counts], refreshed-db :db, :as _status}]
+          ([{:keys [garbage properties classes], refreshed-db :db, :as _status}]
            (let [{:keys [index-catalog alias] :as refreshed-db*}
                  (-> refreshed-db
                      (assoc-in [:stats :indexed] t)
-                     (assoc-in [:stats :property-counts] property-counts)
-                     (assoc-in [:stats :class-counts] class-counts))
+                     (assoc-in [:stats :properties] properties)
+                     (assoc-in [:stats :classes] classes))
                 ;; TODO - ideally issue garbage/root writes to RAFT together
                 ;;        as a tx, currently requires waiting for both
                 ;;        through raft sync

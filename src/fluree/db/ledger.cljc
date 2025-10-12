@@ -102,25 +102,21 @@
          branch      (or requested-branch (:branch @(:state ledger)))
          ;; Compute current stats by replaying novelty
          current-stats (novelty/current-stats current-db)
-         ;; Decode SIDs to IRIs
-         decode-map (fn [sid-count-map]
-                      (into {}
-                            (map (fn [[sid count]]
-                                   [(iri/sid->iri sid namespace-codes) count]))
-                            sid-count-map))]
-     (cond-> {:address address
-              :alias   alias
-              :branch  branch
-              :t       t
-              :size    size
-              :flakes  flakes
-              :commit  commit}
-       ;; Add property/class counts if available, with decoded IRIs
-       (:property-counts current-stats)
-       (assoc :property-counts (decode-map (:property-counts current-stats)))
-
-       (:class-counts current-stats)
-       (assoc :class-counts (decode-map (:class-counts current-stats)))))))
+         decode-nested-map (fn [sid-nested-map]
+                             (reduce-kv (fn [m sid nested]
+                                          (assoc m (iri/sid->iri sid namespace-codes) nested))
+                                        {}
+                                        sid-nested-map))]
+     {:address    address
+      :alias      alias
+      :branch     branch
+      :t          t
+      :size       size
+      :flakes     flakes
+      :commit     commit
+      ;; Decode SIDs to IRIs for properties and classes
+      :properties (decode-nested-map (:properties current-stats))
+      :classes    (decode-nested-map (:classes current-stats))})))
 
 (defn notify
   "Returns false if provided commit update did not result in an update to the ledger because
