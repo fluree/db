@@ -25,7 +25,9 @@
 
 (defn indexes-for
   [db]
-  (filter (partial contains? db) types))
+  (filter (fn [idx]
+            (-> db (get idx) some?))
+          types))
 
 (defn reference?
   [dt]
