@@ -5,6 +5,17 @@
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 
+(defn- strip-inputs
+  "Remove :inputs field from explain output for backward-compatible testing.
+   The :inputs field contains detailed stats (per QUERY_STATS_AND_HLL.md lines 277-296)
+   but legacy tests don't expect it."
+  [plan-data]
+  (-> plan-data
+      (update :original (fn [patterns]
+                          (mapv #(dissoc % :inputs) patterns)))
+      (update :optimized (fn [patterns]
+                           (mapv #(dissoc % :inputs) patterns)))))
+
 (deftest ^:integration explain-no-optimization-test
   (testing "Explain API with equal selectivity patterns (no reordering)"
     (let [conn      @(fluree/connect-memory {:defaults
@@ -72,11 +83,12 @@
                            :selectivity 2
                            :optimizable :tuple}]}
              (-> (:plan plan)
-                 (select-keys [:optimization :changed? :statistics :original :optimized])))
+                 (select-keys [:optimization :changed? :statistics :original :optimized])
+                 strip-inputs))
           "Explain should not reorder when both patterns have equal selectivity (2 = 2)"))))
 
 (deftest ^:integration explain-value-lookup-optimization-test
-  (testing "Explain API reorders based on specific value lookup (selectivity 0)"
+  (testing "Explain API reorders based on NDV-estimated bound-object selectivity"
     (let [conn      @(fluree/connect-memory {:defaults
                                              {:indexing {:reindex-min-bytes 100
                                                          :reindex-max-bytes 10000000}}})
@@ -135,14 +147,14 @@
                           :pattern {:subject "?person"
                                     :property "ex:email"
                                     :object "rare@example.org"}
-                          :selectivity 0        ;; Specific value lookup (most selective)
+                          :selectivity 2        ;; NDV-based: max(1, ceil(100/~99)) = 2
                           :optimizable :tuple}]
-              ;; Optimized order: email first (0), then class (100)
+              ;; Optimized order: email first (2), then class (100)
               :optimized [{:type :tuple
                            :pattern {:subject "?person"
                                      :property "ex:email"
                                      :object "rare@example.org"}
-                           :selectivity 0
+                           :selectivity 2
                            :optimizable :tuple}
                           {:type :class
                            :pattern {:subject "?person"
@@ -151,8 +163,9 @@
                            :selectivity 100
                            :optimizable :class}]}
              (-> (:plan plan)
-                 (select-keys [:optimization :changed? :statistics :original :optimized])))
-          "Explain should reorder patterns from [class, email] to [email, class] based on selectivity (0 < 100)"))))
+                 (select-keys [:optimization :changed? :statistics :original :optimized])
+                 strip-inputs))
+          "Explain should reorder patterns from [class, email] to [email, class] based on NDV selectivity (2 < 100)"))))
 
 (deftest ^:integration explain-property-count-optimization-test
   (testing "Explain API reorders based on property counts (property scan vs class scan)"
@@ -229,8 +242,84 @@
                            :selectivity 50
                            :optimizable :class}]}
              (-> (:plan plan)
-                 (select-keys [:optimization :changed? :statistics :original :optimized])))
+                 (select-keys [:optimization :changed? :statistics :original :optimized])
+                 strip-inputs))
           "Explain should reorder patterns from [class, badge] to [badge, class] based on property count (5 < 50)"))))
+
+(deftest ^:integration explain-inputs-field-test
+  (testing "Explain API :inputs field structure and flags (QUERY_STATS_AND_HLL.md lines 277-296)"
+    (let [conn      @(fluree/connect-memory {:defaults
+                                             {:indexing {:reindex-min-bytes 100
+                                                         :reindex-max-bytes 10000000}}})
+          ledger-id "test/inputs"
+          db0       @(fluree/create conn ledger-id)
+
+          ;; Insert data to generate statistics
+          txn       {"@context" {"ex" "http://example.org/"}
+                     "insert" (for [i (range 20)]
+                                {"@id" (str "ex:person" i)
+                                 "@type" "ex:Person"
+                                 "ex:name" (str "Person" i)
+                                 "ex:email" (str "person" i "@example.org")})}
+          db1       @(fluree/update db0 txn)
+
+          index-ch  (async/chan 10)
+          _         @(fluree/commit! conn db1 {:index-files-ch index-ch})
+          _         (<!! (test-utils/block-until-index-complete index-ch))
+
+          db        @(fluree/db conn ledger-id)
+
+          query-map {:context {"ex" "http://example.org/"}
+                     :select  ["?person"]
+                     :where   [{"@id" "?person"
+                                "@type" "ex:Person"}
+                               {"@id" "?person"
+                                "ex:email" "person0@example.org"}]}
+
+          plan      @(fluree/explain db query-map)
+          original  (get-in plan [:plan :original])
+          optimized (get-in plan [:plan :optimized])]
+
+      ;; Test that :inputs field exists for all patterns
+      (is (every? #(contains? % :inputs) original)
+          "All original patterns should have :inputs field")
+
+      (is (every? #(contains? % :inputs) optimized)
+          "All optimized patterns should have :inputs field")
+
+      ;; Test class pattern inputs structure
+      (let [class-pattern (first (filter #(= :class (:type %)) original))
+            inputs (:inputs class-pattern)]
+        (is (= :class (:type inputs))
+            "Class pattern should have :type :class")
+        (is (contains? inputs :classSid)
+            "Class pattern should have :classSid")
+        (is (contains? inputs :classCount)
+            "Class pattern should have :classCount"))
+
+      ;; Test bound-object pattern inputs structure and NDV flag
+      (let [email-pattern (first (filter #(and (= :tuple (:type %))
+                                               (some-> % :pattern :property (= "ex:email")))
+                                         original))
+            inputs (:inputs email-pattern)]
+        (is (= :tuple (:type inputs))
+            "Bound-object pattern should have :type :tuple")
+        (is (= :bound-object (:pattern inputs))
+            "Bound-object pattern should have :pattern :bound-object")
+        (is (contains? inputs :propertySid)
+            "Bound-object pattern should have :propertySid")
+        (is (contains? inputs :count)
+            "Bound-object pattern should have :count")
+        (is (contains? inputs :ndvValues)
+            "Bound-object pattern should have :ndvValues")
+        (is (contains? inputs :usedValuesNDV?)
+            "Bound-object pattern should have :usedValuesNDV? flag")
+        (is (boolean? (:usedValuesNDV? inputs))
+            "usedValuesNDV? flag should be a boolean")
+        (is (:usedValuesNDV? inputs)
+            "Bound-object pattern should use NDV when available")
+        (is (contains? inputs :clampedToOne?)
+            "Bound-object pattern should have :clampedToOne? flag")))))
 
 (deftest ^:integration explain-no-stats-test
   (testing "Explain API without statistics (no indexing)"

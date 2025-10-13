@@ -144,7 +144,32 @@
             (is (map? property-counts) "Property counts should be a map")
 
             (is (= 2 (get-count property-counts "http://example.org/name"))
-                "ex:name should have count 2 after deleting Bob")))))))
+                "ex:name should have count 2 after deleting Bob")))
+
+        (testing "Counts are clamped at zero for excess retracts"
+          ;; Delete Bob's data again (already deleted) - should not go negative
+          (let [db-after-idx2 @(fluree/db conn ledger-id)
+                txn3    (merge context
+                               {"delete" {"@id"   "ex:bob"
+                                          "@type" "ex:Person"
+                                          "ex:name" "Bob"}})
+                db3      @(fluree/update db-after-idx2 txn3)
+                index-ch3 (async/chan 10)
+                _        @(fluree/commit! conn db3 {:index-files-ch index-ch3})
+                _        (<!! (test-utils/block-until-index-complete index-ch3))
+                loaded3  (test-utils/retry-load conn ledger-id 100)
+
+                class-counts (get-in loaded3 [:stats :classes])
+                property-counts (get-in loaded3 [:stats :properties])
+                get-count (fn [stats-map iri]
+                            (let [sid (iri/encode-iri loaded3 iri)]
+                              (get-in stats-map [sid :count])))]
+
+            (is (= 2 (get-count class-counts "http://example.org/Person"))
+                "Person class count should remain at 2 (not negative) after duplicate delete")
+
+            (is (= 2 (get-count property-counts "http://example.org/name"))
+                "ex:name count should remain at 2 (not negative) after duplicate delete")))))))
 
 (deftest ^:integration property-class-statistics-memory-storage-test
   (testing "Statistics work with in-memory storage"
@@ -291,3 +316,134 @@
                 "All property keys should be decoded IRIs (strings)")
             (is (every? string? (keys classes))
                 "All class keys should be decoded IRIs (strings)")))))))
+
+(deftest ^:integration ndv-computation-test
+  (testing "NDV (Number of Distinct Values) is computed via HLL and persisted"
+    (with-temp-dir [storage-path {}]
+      (let [conn    @(fluree/connect-file {:storage-path (str storage-path)
+                                           :defaults
+                                           {:indexing {:reindex-min-bytes 100
+                                                       :reindex-max-bytes 10000000}}})
+            ledger-id "test/ndv"
+            context {"@context" {"ex" "http://example.org/"}}
+            db0     @(fluree/create conn ledger-id)
+
+            ;; Insert data with varying cardinalities
+            ;; - ex:email: 100 distinct values (unique per person)
+            ;; - ex:department: 3 distinct values (low cardinality)
+            ;; - ex:name: 100 distinct values
+            txn     (merge context
+                           {"insert" (into []
+                                           (for [i (range 100)]
+                                             {"@id"         (str "ex:person" i)
+                                              "@type"       "ex:Person"
+                                              "ex:name"     (str "Person" i)
+                                              "ex:email"    (str "person" i "@example.org")
+                                              "ex:department" (condp = (mod i 3)
+                                                                0 "Engineering"
+                                                                1 "Sales"
+                                                                2 "Marketing")}))})
+            db1      @(fluree/update db0 txn)
+
+            index-ch (async/chan 10)
+            _        @(fluree/commit! conn db1 {:index-files-ch index-ch})
+            _        (<!! (test-utils/block-until-index-complete index-ch))
+
+            loaded   (test-utils/retry-load conn ledger-id 100)]
+
+        (testing "Properties have NDV values computed"
+          (let [properties (get-in loaded [:stats :properties])
+                get-ndv (fn [prop-iri]
+                          (let [sid (iri/encode-iri loaded prop-iri)]
+                            (get-in properties [sid :ndv-values])))
+                get-ndv-subjects (fn [prop-iri]
+                                   (let [sid (iri/encode-iri loaded prop-iri)]
+                                     (get-in properties [sid :ndv-subjects])))]
+
+            (is (some? properties) "Properties map should exist")
+
+            ;; Check NDV(values|p) - distinct object values
+            (let [email-ndv (get-ndv "http://example.org/email")
+                  dept-ndv  (get-ndv "http://example.org/department")
+                  name-ndv  (get-ndv "http://example.org/name")]
+
+              (is (some? email-ndv) "ex:email should have ndv-values")
+              (is (some? dept-ndv) "ex:department should have ndv-values")
+              (is (some? name-ndv) "ex:name should have ndv-values")
+
+              ;; HLL with p=8 has ~6.5% error, so allow 10% tolerance
+              (is (< 90 email-ndv 110)
+                  (str "ex:email should have ~100 distinct values, got " email-ndv))
+              (is (< 2 dept-ndv 5)
+                  (str "ex:department should have ~3 distinct values, got " dept-ndv))
+              (is (< 90 name-ndv 110)
+                  (str "ex:name should have ~100 distinct values, got " name-ndv)))
+
+            ;; Check NDV(subjects|p) - distinct subjects per property
+            (let [email-ndv-subj (get-ndv-subjects "http://example.org/email")
+                  dept-ndv-subj  (get-ndv-subjects "http://example.org/department")]
+
+              (is (some? email-ndv-subj) "ex:email should have ndv-subjects")
+              (is (some? dept-ndv-subj) "ex:department should have ndv-subjects")
+
+              ;; All 100 people have each property, so NDV(subjects) should be ~100
+              (is (< 90 email-ndv-subj 110)
+                  (str "ex:email should have ~100 distinct subjects, got " email-ndv-subj))
+              (is (< 90 dept-ndv-subj 110)
+                  (str "ex:department should have ~100 distinct subjects, got " dept-ndv-subj)))))
+
+        (testing "Prop-metrics are built from properties"
+          (let [prop-metrics (get-in loaded [:stats :prop-metrics])
+                get-metrics (fn [prop-iri]
+                              (let [sid (iri/encode-iri loaded prop-iri)]
+                                (get prop-metrics sid)))]
+
+            (is (map? prop-metrics) "Prop-metrics should be a map")
+
+            (let [email-metrics (get-metrics "http://example.org/email")]
+              (is (some? email-metrics) "ex:email should have metrics")
+              (is (pos? (:count email-metrics)) "Metrics should have count")
+              (is (pos? (:ndvValues email-metrics)) "Metrics should have ndvValues")
+              (is (pos? (:ndvSubjects email-metrics)) "Metrics should have ndvSubjects")
+              (is (pos? (:avgPerSubject email-metrics)) "Metrics should have avgPerSubject")
+              (is (<= 0 (:uniqueRatio email-metrics) 1.0) "Unique ratio should be between 0 and 1"))
+
+            (let [dept-metrics (get-metrics "http://example.org/department")]
+              (is (some? dept-metrics) "ex:department should have metrics")
+              (is (< (:uniqueRatio dept-metrics) 0.1)
+                  "Department should have low uniqueRatio (3 distinct / 100 total)"))))
+
+        (testing "NDV values are monotone across index cycles"
+          ;; Add more data with overlapping values
+          (let [db-after-idx1 @(fluree/db conn ledger-id)
+                txn2    (merge context
+                               {"insert" [{"@id"         "ex:person200"
+                                           "@type"       "ex:Person"
+                                           "ex:name"     "Person200"
+                                           "ex:email"    "person0@example.org"  ;; Duplicate email
+                                           "ex:department" "Engineering"}]})      ;; Duplicate dept
+                db2      @(fluree/update db-after-idx1 txn2)
+                index-ch2 (async/chan 10)
+                _        @(fluree/commit! conn db2 {:index-files-ch index-ch2})
+                _        (<!! (test-utils/block-until-index-complete index-ch2))
+
+                loaded2  (test-utils/retry-load conn ledger-id 100)
+                get-ndv  (fn [db prop-iri]
+                           (let [sid (iri/encode-iri db prop-iri)]
+                             (get-in db [:stats :properties sid :ndv-values])))
+                ;; NDV should remain approximately the same since we added duplicates
+                ;; (monotone property: NDV never decreases, but duplicates don't increase it much)
+                email-ndv-before (get-ndv loaded "http://example.org/email")
+                email-ndv-after  (get-ndv loaded2 "http://example.org/email")
+                dept-ndv-before  (get-ndv loaded "http://example.org/department")
+                dept-ndv-after   (get-ndv loaded2 "http://example.org/department")]
+
+            (is (<= email-ndv-before email-ndv-after)
+                "NDV should be monotone (non-decreasing)")
+            (is (< (- email-ndv-after email-ndv-before) 5)
+                "Adding duplicate email shouldn't increase NDV significantly")
+
+            (is (<= dept-ndv-before dept-ndv-after)
+                "NDV should be monotone (non-decreasing)")
+            (is (< (- dept-ndv-after dept-ndv-before) 2)
+                "Adding duplicate department shouldn't increase NDV significantly")))))))

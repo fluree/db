@@ -229,9 +229,9 @@
                        (swap! update-commit (policy/root-db new-db))
                        :current-db)]
     (if (indexing-enabled? branch-map)
-      (do (log/debug "Enqueueing new commit reindex for branch:" branch-map)
+      (do (log/debug "Enqueueing new commit reindex for branch:" (:name branch-map) "alias:" (:alias branch-map))
           (enqueue-index! index-queue updated-db index-files-ch))
-      (log/debug "Indexing disabled for branch:" branch-map))
+      (log/debug "Indexing disabled for branch:" (:name branch-map) "alias:" (:alias branch-map)))
     branch-map))
 
 (defn current-db

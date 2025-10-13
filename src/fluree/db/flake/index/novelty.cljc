@@ -4,10 +4,14 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.index :as index]
-            [fluree.db.flake.index.storage :as storage]
+            [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.indexer.garbage :as garbage]
+            [fluree.db.indexer.hll :as hll]
+            [fluree.db.indexer.stats-serializer :as stats-serializer]
+            [fluree.db.storage]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -291,9 +295,9 @@
                    :data      write-response
                    :address   (:address write-response)
                    :t         t}]
-        (log/debug "Broadcasting new index file event:" event)
+        (log/debug "Broadcasting new index file:" file-type "address:" (:address write-response))
         (>! changes-ch event)
-        (log/debug "New index file event broadcast success for address:" (:address event))
+        (log/debug "Broadcast success:" file-type "address:" (:address event))
         true))))
 
 (defn write-node
@@ -306,13 +310,13 @@
       (try*
         (if (index/leaf? node)
           (do (log/debug "Writing index leaf:" display-node)
-              (let [write-response (<? (storage/write-leaf index-catalog alias idx node))]
+              (let [write-response (<? (index-storage/write-leaf index-catalog alias idx node))]
                 (<! (notify-new-index-file write-response :leaf t changes-ch))
                 (update-node-id node write-response)))
 
           (do (log/debug "Writing index branch:" display-node)
               (let [node*          (update-child-ids updated-ids node)
-                    write-response (<? (storage/write-branch index-catalog alias idx node*))]
+                    write-response (<? (index-storage/write-branch index-catalog alias idx node*))]
                 (<! (notify-new-index-file write-response :branch t changes-ch))
                 (update-node-id node* write-response))))
 
@@ -323,21 +327,67 @@
 
 (defn- compute-stats-from-novelty
   "Core logic for computing property and class counts from novelty flakes.
-   Increments for assertions (op=true), decrements for retracts (op=false)."
-  [novelty-flakes prev-properties prev-classes]
+   Increments for assertions (op=true), decrements for retracts (op=false).
+
+   Maintains HLL sketches for NDV (Number of Distinct Values) tracking:
+   - NDV(values|p): distinct object values per property (monotone, assertion-only)
+   - NDV(subjects|p): distinct subjects per property (monotone, assertion-only)
+
+   Uses transients for performance during the loop, converting back to persistent maps at end.
+
+   Returns {:properties {sid -> {:count n :ndv-values n :ndv-subjects n}}
+            :classes {sid -> {:count n}}
+            :sketches {sid -> {:values sketch :subjects sketch}}}"
+  [novelty-flakes prev-properties prev-classes prev-sketches]
+  ;; Convert to transients for efficient updates during loop
   (loop [[f & r] novelty-flakes
-         properties prev-properties
-         classes prev-classes]
+         properties (transient prev-properties)
+         classes (transient prev-classes)
+         sketches (transient prev-sketches)]
     (if f
-      (let [p     (flake/p f)
+      (let [s     (flake/s f)
+            p     (flake/p f)
+            o     (flake/o f)
             delta (if (flake/op f) 1 -1)
-            properties* (update-in properties [p :count] (fnil + 0) delta)
-            classes*    (if (flake/class-flake? f)
-                          (update-in classes [(flake/o f) :count] (fnil + 0) delta)
-                          classes)]
-        (recur r properties* classes*))
-      {:properties properties
-       :classes    classes})))
+
+            ;; Get current property map (or default), update count, clamp to non-negative
+            prop-map    (get properties p {:count 0})
+            new-count   (max 0 (+ (:count prop-map 0) delta))
+            properties* (assoc! properties p (assoc prop-map :count new-count))
+
+            ;; Update HLL sketches (only on assertions - monotone NDV)
+            sketches* (if (flake/op f)
+                        (let [prop-sketch (get sketches p {:values (hll/create-sketch)
+                                                           :subjects (hll/create-sketch)})
+                              values-sketch (hll/add-value (:values prop-sketch) o)
+                              subjects-sketch (hll/add-value (:subjects prop-sketch) s)]
+                          (assoc! sketches p {:values values-sketch
+                                              :subjects subjects-sketch}))
+                        sketches)
+
+            ;; Update class counts (clamp to non-negative)
+            classes* (if (flake/class-flake? f)
+                       (let [class-sid   o
+                             class-map   (get classes class-sid {:count 0})
+                             new-count   (max 0 (+ (:count class-map 0) delta))]
+                         (assoc! classes class-sid (assoc class-map :count new-count)))
+                       classes)]
+        (recur r properties* classes* sketches*))
+
+      ;; Convert back to persistent maps and extract NDV integers
+      (let [properties-persistent (persistent! properties)
+            classes-persistent    (persistent! classes)
+            sketches-persistent   (persistent! sketches)
+            properties-with-ndv
+            (reduce-kv (fn [props sid sketch-data]
+                         (update props sid assoc
+                                 :ndv-values (hll/cardinality (:values sketch-data))
+                                 :ndv-subjects (hll/cardinality (:subjects sketch-data))))
+                       properties-persistent
+                       sketches-persistent)]
+        {:properties properties-with-ndv
+         :classes classes-persistent
+         :sketches sketches-persistent}))))
 
 (defn compute-novelty-stats
   "Computes property and class counts from novelty flakes in a separate thread/go block.
@@ -345,27 +395,61 @@
 
    Uses async/thread on JVM for true parallelism (not limited by go block thread pool).
    Falls back to go block on ClojureScript."
-  [novelty-flakes prev-properties prev-classes]
+  [novelty-flakes prev-properties prev-classes prev-sketches]
   #?(:clj
      (async/thread
-       (compute-stats-from-novelty novelty-flakes prev-properties prev-classes))
+       (compute-stats-from-novelty novelty-flakes prev-properties prev-classes prev-sketches))
      :cljs
      (go
-       (compute-stats-from-novelty novelty-flakes prev-properties prev-classes))))
+       (compute-stats-from-novelty novelty-flakes prev-properties prev-classes prev-sketches))))
+
+(defn build-prop-metrics
+  "Build derived metrics map from property statistics for O(1) optimizer lookups.
+
+   Returns map keyed by property SID with:
+   - :count - count(p)
+   - :ndvValues - NDV(values|p)
+   - :ndvSubjects - NDV(subjects|p)
+   - :avgPerSubject - max(1, ceil(count / max(1, ndvSubjects)))
+   - :uniqueRatio - ndvValues / max(1, count) bounded to [0,1]"
+  [properties]
+  (reduce-kv
+   (fn [metrics sid prop-data]
+     (let [count        (or (:count prop-data) 0)
+           ndv-values   (or (:ndv-values prop-data) 0)
+           ndv-subjects (or (:ndv-subjects prop-data) 0)
+           avg-per-subj (max 1 (long (Math/ceil (/ (double count)
+                                                   (double (max 1 ndv-subjects))))))
+           unique-ratio (if (pos? count)
+                          (min 1.0 (/ (double ndv-values) (double count)))
+                          0.0)]
+       (assoc metrics sid
+              {:count count
+               :ndvValues ndv-values
+               :ndvSubjects ndv-subjects
+               :avgPerSubject avg-per-subj
+               :uniqueRatio unique-ratio})))
+   {}
+   properties))
 
 (defn current-stats
   "Compute current property and class statistics."
   [db]
   (let [indexed-stats     (get db :stats {})
-        indexed-prop      (get indexed-stats :properties {})
-        indexed-class     (get indexed-stats :classes {})
-        spot-novelty      (get-in db [:novelty :spot])]
+        indexed-properties (get indexed-stats :properties {})
+        indexed-classes    (get indexed-stats :classes {})
+        indexed-sketches   (get indexed-stats :sketches {})
+        spot-novelty       (get-in db [:novelty :spot])]
     (if spot-novelty
       ;; Synchronous computation for both FlakeDB and AsyncDB
-      (let [novelty-updates (compute-stats-from-novelty spot-novelty indexed-prop indexed-class)]
+      (let [novelty-updates (compute-stats-from-novelty spot-novelty indexed-properties indexed-classes indexed-sketches)
+            properties      (:properties novelty-updates)
+            prop-metrics    (build-prop-metrics properties)]
         (assoc indexed-stats
-               :properties (:properties novelty-updates)
-               :classes    (:classes novelty-updates)))
+               :properties properties
+               :classes    (:classes novelty-updates)
+               :sketches   (:sketches novelty-updates)
+               :prop-metrics prop-metrics))
       ;; No novelty, return indexed stats as-is
       indexed-stats)))
 
@@ -420,9 +504,14 @@
    (let [spot-novelty      (get-in db [:novelty :spot])
          prev-properties   (get-in db [:stats :properties] {})
          prev-classes      (get-in db [:stats :classes] {})
-         stats-ch          (compute-novelty-stats spot-novelty prev-properties prev-classes)]
+         prev-sketches     (get-in db [:stats :sketches] {})
+         stats-ch          (compute-novelty-stats spot-novelty prev-properties prev-classes prev-sketches)
+         stats-timeout-ms  (or (get-in db [:stats-compute-timeout-ms]) 5000)
+         default-stats     {:properties prev-properties
+                            :classes prev-classes
+                            :sketches prev-sketches}]
      (go-try
-       (let [;; Wait for both indexing and stats to complete
+       (let [;; Wait for index to complete
              index-result (<? (->> index/types
                                    (map (partial extract-root db))
                                    (map (partial refresh-index db changes-ch error-ch))
@@ -430,10 +519,47 @@
                                    (async/reduce tally {:db      db
                                                         :indexes []
                                                         :garbage #{}})))
-             {:keys [properties classes]} (<! stats-ch)]
+
+             ;; Wait for stats with timeout fallback
+             [stats-result winner-ch] (async/alts! [stats-ch (async/timeout stats-timeout-ms)])
+
+             {:keys [properties classes sketches]}
+             (if (= winner-ch stats-ch)
+               ;; Stats completed successfully (or nil if errored)
+               (or stats-result default-stats)
+               ;; Timeout - use previous stats
+               default-stats)]
+
+         ;; Log warning if we fell back to previous stats
+         (when (not= winner-ch stats-ch)
+           (log/warn "Stats computation timeout, using previous stats"
+                     {:timeout-ms stats-timeout-ms
+                      :novelty-size (get-in db [:novelty :size])
+                      :ledger-alias (:alias db)
+                      :t (:t db)}))
+
+         (when (and (= winner-ch stats-ch) (nil? stats-result))
+           (log/warn "Stats computation failed (channel closed), using previous stats"
+                     {:novelty-size (get-in db [:novelty :size])
+                      :ledger-alias (:alias db)
+                      :t (:t db)}))
+
          (-> index-result
              (assoc :properties properties)
-             (assoc :classes classes)))))))
+             (assoc :classes classes)
+             (assoc :sketches sketches)))))))
+
+(defn write-stats-sketches
+  "Write statistics sketches to storage as a side blob.
+   Returns channel with write response containing :address and :hash."
+  [{:keys [storage] :as _index-catalog} alias t sketches]
+  (go-try
+    (when (seq sketches)
+      (log/debug "Writing stats sketches for" alias "at t" t)
+      (let [ledger-name (util.ledger/ledger-base-name alias)
+            path        (str ledger-name "/index/stats-sketches")
+            serialized  (stats-serializer/serialize-stats-sketches alias t sketches)]
+        (<? (fluree.db.storage/content-write-json storage path serialized))))))
 
 (defn refresh
   [{:keys [novelty t alias] :as db} changes-ch max-old-indexes]
@@ -454,20 +580,48 @@
            (throw e))
 
           refresh-ch
-          ([{:keys [garbage properties classes], refreshed-db :db, :as _status}]
-           (let [{:keys [index-catalog alias] :as refreshed-db*}
+          ([{:keys [garbage properties classes sketches], refreshed-db :db, :as _status}]
+           (let [;; Build prop-metrics for O(1) optimizer lookups
+                 prop-metrics (build-prop-metrics properties)
+
+                 {:keys [index-catalog alias] :as refreshed-db*}
                  (-> refreshed-db
                      (assoc-in [:stats :indexed] t)
                      (assoc-in [:stats :properties] properties)
-                     (assoc-in [:stats :classes] classes))
+                     (assoc-in [:stats :classes] classes)
+                     (assoc-in [:stats :sketches] sketches)
+                     (assoc-in [:stats :prop-metrics] prop-metrics))
+
+                 ;; Add old stats-sketches to garbage if we're writing new ones
+                 old-sketches-addr (get-in refreshed-db* [:stats-sketches :address])
+                 garbage*          (cond-> garbage
+                                     (and (seq sketches) old-sketches-addr)
+                                     (conj old-sketches-addr))
+
                 ;; TODO - ideally issue garbage/root writes to RAFT together
                 ;;        as a tx, currently requires waiting for both
                 ;;        through raft sync
-                 garbage-res   (when (seq garbage)
-                                 (let [write-res (<? (storage/write-garbage index-catalog alias t garbage))]
+                 garbage-res   (when (seq garbage*)
+                                 (let [write-res (<? (index-storage/write-garbage index-catalog alias t garbage*))]
                                    (<! (notify-new-index-file write-res :garbage t changes-ch))
                                    write-res))
-                 db-root-res   (<? (storage/write-db-root index-catalog refreshed-db* (:address garbage-res)))
+
+                 ;; Write statistics sketches side blob
+                 sketches-res  (when (seq sketches)
+                                 (let [write-res (<? (write-stats-sketches index-catalog alias t sketches))]
+                                   (<! (notify-new-index-file write-res :stats-sketches t changes-ch))
+                                   write-res))
+
+                 ;; Update db with sketches pointer
+                 refreshed-db**  (if sketches-res
+                                   (assoc refreshed-db* :stats-sketches
+                                          {:type :hll
+                                           :p 8
+                                           :address (:address sketches-res)
+                                           :version 1})
+                                   refreshed-db*)
+
+                 db-root-res   (<? (index-storage/write-db-root index-catalog refreshed-db** (:address garbage-res)))
                  _             (<! (notify-new-index-file db-root-res :root t changes-ch))
 
                  index-address (:address db-root-res)
