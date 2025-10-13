@@ -92,7 +92,7 @@
     (let [{:keys [alias schema t stats vg commit namespace-codes
                   reindex-min-bytes reindex-max-bytes max-old-indexes]}
           db
-          index-roots   (select-keys db index/types)
+          index-roots   (index/select-roots db)
           index-data    (reduce-kv (fn [m idx root]
                                      (assoc m idx (child-data root)))
                                    {}
@@ -140,12 +140,11 @@
 
 (defn reify-index-roots
   [{:keys [t ledger-alias] :as root-data}]
-  (->> index/types
-       (filter (partial contains? root-data))
-       (reduce (fn [roots idx]
-                 (let [comparator (get index/comparators idx)]
-                   (update roots idx reify-index-root ledger-alias comparator t)))
-               root-data)))
+  (reduce (fn [roots idx]
+            (let [comparator (get index/comparators idx)]
+              (update roots idx reify-index-root ledger-alias comparator t)))
+          root-data
+          (index/indexes-for root-data)))
 
 (defn deserialize-preds
   [preds]

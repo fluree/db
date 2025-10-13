@@ -102,7 +102,7 @@
   (if (newer-index? commit index-map)
     (let [index-t     (:t data-map)
           commit*     (assoc commit :index index-map)
-          index-roots (select-keys index-map index/types)]
+          index-roots (index/select-roots index-map)]
       (-> db
           (empty-novelty index-t)
           (assoc :commit commit*)
@@ -606,7 +606,7 @@
 
 (defn root-comparators
   [root-map]
-  (let [indexes (-> root-map (select-keys index/types) keys)]
+  (let [indexes (index/indexes-for root-map)]
     (select-keys index/comparators indexes)))
 
 ;; TODO - VG - need to reify vg from db-root!!

@@ -24,10 +24,15 @@
   (-> comparators keys vec))
 
 (defn indexes-for
-  [db]
+  [indexed]
   (filter (fn [idx]
-            (-> db (get idx) some?))
+            (-> indexed (get idx) some?))
           types))
+
+(defn select-roots
+  [indexed]
+  (let [index-keys (indexes-for indexed)]
+    (select-keys indexed index-keys)))
 
 (defn reference?
   [dt]

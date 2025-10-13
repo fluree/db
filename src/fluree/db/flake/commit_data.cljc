@@ -178,17 +178,17 @@
       issuer (assoc :issuer {:id (get-id issuer)}))))
 
 (defn update-index-roots
-  [commit-map index-roots]
+  [commit-map index-map]
   (if (contains? commit-map :index)
-    (let [index-roots* (select-keys index-roots index/types)]
-      (update commit-map :index merge index-roots*))
+    (let [index-map* (index/select-roots index-map)]
+      (update commit-map :index merge index-map*))
     commit-map))
 
 (defn json-ld->map
-  ([commit-jsonld index-roots]
-   (json-ld->map commit-jsonld nil index-roots))
+  ([commit-jsonld index-map]
+   (json-ld->map commit-jsonld nil index-map))
 
-  ([commit-jsonld fallback-address index-roots]
+  ([commit-jsonld fallback-address index-map]
    (let [commit-map (jsonld->clj commit-jsonld)]
      (cond-> commit-map
        (and (some? fallback-address)
@@ -197,7 +197,7 @@
                                          ; IPFS, is empty string
 
        true
-       (update-index-roots index-roots)))))
+       (update-index-roots index-map)))))
 
 (defn hash->commit-id
   [hsh]
@@ -359,7 +359,7 @@
 
 (defn revise-index-novelty
   [novelty add rem]
-  (let [index-novelty (select-keys novelty index/types)]
+  (let [index-novelty (index/select-roots novelty)]
     (reduce-kv (fn [m idx novelty]
                  (let [novelty* (if (= :opst idx)
                                   (revise-novelty-set novelty (ref-flakes add) (ref-flakes rem))

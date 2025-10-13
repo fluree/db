@@ -51,7 +51,7 @@
        seq
        boolean))
   ([db]
-   (->> index/types
+   (->> (index/indexes-for db)
         (some (partial dirty? db))
         boolean)))
 
@@ -411,7 +411,7 @@
                  commit-index  (commit-data/new-index (-> refreshed-db* :commit :data)
                                                       index-id
                                                       index-address
-                                                      (select-keys refreshed-db* index/types))
+                                                      (index/select-roots refreshed-db*))
                  indexed-db    (dbproto/-index-update refreshed-db* commit-index)
                  duration      (- (util/current-time-millis) start-time-ms)
                  end-stats     (assoc init-stats
