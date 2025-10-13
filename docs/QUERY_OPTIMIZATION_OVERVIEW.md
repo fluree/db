@@ -48,7 +48,7 @@ Explain returns a plan showing the original order, the optimized order, and the 
               :where [{"@id" "?p", "@type" "ex:Person"}
                       {"@id" "?p", "ex:email" "alice@example.org"}
                       {"@id" "?p", "ex:name"  "?name"}]}
-      plan   @(fluree/query conn (assoc-in query [:opts :explain?] true))]
+      plan   @(fluree/explain conn query)]
   plan)
 ```
 
