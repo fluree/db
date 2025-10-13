@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.query.optimize :as optimize]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [<? empty-channel go-try]]))
 
@@ -126,7 +127,21 @@
                  (if (<? (subject/-iri-visible? db tracker iri))
                    db
                    (recur r))
-                 nil))))))
+                 nil)))))
+
+  optimize/Optimizable
+  (-reorder [_ds parsed-query]
+    ;; DataSets (federated queries) are not optimized
+    ;; Return query unchanged wrapped in channel
+    (async/go parsed-query))
+
+  (-explain [_ds parsed-query]
+    ;; DataSets (federated queries) cannot be explained
+    ;; Return simple plan indicating no optimization
+    (async/go
+      {:query parsed-query
+       :plan  {:optimization :none
+               :reason       "Federated queries are not optimized"}})))
 
 (defn combine
   [named-map defaults]
