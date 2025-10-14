@@ -24,12 +24,15 @@
   (-> comparators keys vec))
 
 (defn indexes-for
+  "Return a sequence of the indexes supported by `indexed`"
   [indexed]
   (filter (fn [idx]
             (-> indexed (get idx) some?))
           types))
 
 (defn select-roots
+  "Return a map with keys of indexes from `types` supported by `indexed`, and
+  values of the index root node for that index"
   [indexed]
   (let [index-keys (indexes-for indexed)]
     (select-keys indexed index-keys)))
