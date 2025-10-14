@@ -202,6 +202,16 @@
       (async/close! out-ch))
     out-ch))
 
+(defn class-matches
+  [{:keys [alias] :as db} mch]
+  (let [cls     (where/get-sid mch db)
+        sub-obj (dissoc mch ::sids ::iri)]
+    (into [mch]
+          (comp (map (fn [cls]
+                       (where/match-sid sub-obj alias cls)))
+                (remove nil?))
+          (subclasses db cls))))
+
 (defn match-property-flakes
   [solution triple db property-flakes]
   (map (fn [flake]
@@ -277,17 +287,9 @@
                                        (with-distinct-subjects)
                                        (map (fn [flake]
                                               (where/match-flake solution triple db flake)))))
-        db-alias   (:alias db)
         triple     (where/assign-matched-values triple solution)]
     (if-let [[s p o] (where/compute-sids db triple)]
-      (let [cls        (where/get-sid o db)
-            sub-obj    (dissoc o ::sids ::iri)
-            class-objs (into [o]
-                             (comp (map (fn [cls]
-                                          (where/match-sid sub-obj db-alias cls)))
-                                   (remove nil?))
-                             (subclasses db cls))
-            class-ch   (async/to-chan! class-objs)]
+      (let [class-ch (async/to-chan! (class-matches db o))]
         (async/pipeline-async 2
                               matched-ch
                               (fn [class-obj ch]
