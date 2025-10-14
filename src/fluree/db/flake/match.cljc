@@ -227,10 +227,10 @@
             initial-solutions)))
 
 (defn match-join
-  [solution patterns db join]
+  [solution triples db join]
   (let [triple-map (group-by (fn [[_ p-mch _]]
                                (where/get-sid p-mch db))
-                             patterns)]
+                             triples)]
     (loop [[s-chunk & r] join
            new-solutions [solution]]
       (if s-chunk
@@ -241,18 +241,21 @@
 (defn match-properties
   [db tracker solution patterns error-ch]
   (if (index/supports? db :psot)
-    (let [patterns* (->> patterns
-                        (map (fn [triple]
-                               (where/assign-matched-values triple solution)))
-                        (map (partial where/compute-sids db)))]
-      (if (every? some? patterns*)
-        (let [property-ranges (->> patterns*
+    (let [triples (->> patterns
+                         (map (fn [pattern]
+                                (-> pattern
+                                    where/pattern-data ; extract triple from
+                                                       ; class patterns
+                                    (where/assign-matched-values solution))))
+                         (map (partial where/compute-sids db)))]
+      (if (every? some? triples)
+        (let [property-ranges (->> triples
                                    (map (fn [triple]
                                           (where/resolve-flake-range db tracker error-ch triple :psot)))
                                    (repartition-each-by flake/s))
               extract-sid     (comp flake/s first)
               join-xf         (mapcat (fn [join]
-                                        (match-join solution patterns* db join)))]
+                                        (match-join solution triples db join)))]
           (inner-join-by flake/cmp-sid extract-sid 2 join-xf property-ranges))
         empty-channel))
     (where/match-patterns db tracker solution patterns error-ch)))
