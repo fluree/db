@@ -403,24 +403,34 @@
                    :rem-flakes rem})
        (throw e)))))
 
+(defn add-child-tt-ids
+  [children tt-id]
+  (reduce-kv (fn [children* k child]
+               (assoc children* k (assoc child :tt-id tt-id)))
+             (empty children) children))
+
+(defn add-root-tt-id
+  [root tt-id]
+  (-> root
+      (update :children add-child-tt-ids tt-id)
+      (assoc :tt-id tt-id)))
+
+(defn add-index-tt-ids
+  [db tt-id]
+  (let [indexes (index/indexes-for db)]
+    (reduce (fn [db* idx]
+              (update db* idx add-root-tt-id tt-id))
+            db indexes)))
+
 (defn add-tt-id
   "Associates a unique tt-id for any in-memory staged db in their index roots.
   tt-id is used as part of the caching key, by having this in place it means
   that even though the 't' value hasn't changed it will cache each stage db
   data as its own entity."
   [db]
-  (let [tt-id   (random-uuid)
-        indexes [:spot :psot :post :opst :tspo]]
-    (-> (reduce
-         (fn [db* idx]
-           (let [{:keys [children] :as node} (get db* idx)
-                 children* (reduce-kv
-                            (fn [children* k v]
-                              (assoc children* k (assoc v :tt-id tt-id)))
-                            (empty children) children)]
-             (assoc db* idx (assoc node :tt-id tt-id
-                                   :children children*))))
-         db indexes)
+  (let [tt-id (random-uuid)]
+    (-> db
+        (add-index-tt-ids tt-id)
         (assoc :tt-id tt-id))))
 
 (defn commit-metadata-flakes
