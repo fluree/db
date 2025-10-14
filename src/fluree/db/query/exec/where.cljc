@@ -920,7 +920,7 @@
                   ;; add new var binding to solution
                  (update-solution-binding solution* var-name mch)
                   ;; already have a binding for the given var, no join
-                 solution*))
+                 (reduced nil)))
               solution*))
           solution
           vars))
@@ -966,7 +966,7 @@
   (let [{:keys [service silent? sparql-q]} (pattern-data pattern)
         solution-ch                        (async/chan)]
     (go
-      (let [response (async/<! (xhttp/post service (str sparql-q (solution->values solution))
+      (let [response (async/<! (xhttp/post service sparql-q
                                            {:headers {"Content-Type" "application/sparql-query"
                                                       "Accept"       "application/sparql-results+json"}}))]
         (if (util/exception? response)
@@ -978,7 +978,7 @@
                   vars      (-> response* (get "head") (get "vars"))
                   bindings  (-> response* (get "results") (get "bindings"))]
               (->> bindings
-                   (mapv (partial binding->solution solution vars))
+                   (keep (partial binding->solution solution vars))
                    (async/onto-chan! solution-ch)))
             (catch* e (async/>! error-ch (sparql-service-error! e service sparql-q)))))))
     solution-ch))
