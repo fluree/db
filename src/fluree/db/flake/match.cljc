@@ -3,6 +3,7 @@
   (:require [clojure.core.async :as async :refer [<! >!]]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.index :as index]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
@@ -227,13 +228,9 @@
           (recur r new-solutions*))
         new-solutions))))
 
-(defn psot-indexed?
-  [db]
-  (contains? db :psot))
-
 (defn match-properties
   [db tracker solution triples error-ch]
-  (if (psot-indexed? db)
+  (if (index/supports? db :psot)
     (let [triples* (->> triples
                         (map (fn [triple]
                                (where/assign-matched-values triple solution)))

@@ -23,11 +23,14 @@
   and transaction flake attributes"
   (-> comparators keys vec))
 
+(defn supports?
+  [indexed idx]
+  (-> indexed (get idx) some?))
+
 (defn indexes-for
   "Return a sequence of the indexes supported by `indexed`"
   [indexed]
-  (filter (fn [idx]
-            (-> indexed (get idx) some?))
+  (filter (partial supports? indexed)
           types))
 
 (defn select-roots
