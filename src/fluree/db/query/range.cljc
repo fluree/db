@@ -47,6 +47,7 @@
   (case idx
     :spot subject-min-match
     :post pred-min-match
+    :psot pred-min-match
     :opst subject-min-match
     :tspo txn-min-match))
 
@@ -56,6 +57,7 @@
   (case idx
     :spot subject-max-match
     :post pred-max-match
+    :psot pred-max-match
     :opst subject-max-match
     :tspo txn-max-match))
 
