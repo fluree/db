@@ -210,17 +210,17 @@
 
 (defn match-subject-property
   [initial-solutions triple-map db property-flakes]
-  (let [pid        (->> property-flakes first flake/p)
-        triple     (-> triple-map (get pid) first)]
+  (let [pid    (->> property-flakes first flake/p)
+        triple (-> triple-map (get pid) first)]
     (mapcat (fn [solution]
               (match-property-flakes solution triple db property-flakes))
             initial-solutions)))
 
 (defn match-join
-  [solution triples db join]
+  [solution patterns db join]
   (let [triple-map (group-by (fn [[_ p-mch _]]
                                (where/get-sid p-mch db))
-                             triples)]
+                             patterns)]
     (loop [[s-chunk & r] join
            new-solutions [solution]]
       (if s-chunk
@@ -229,23 +229,23 @@
         new-solutions))))
 
 (defn match-properties
-  [db tracker solution triples error-ch]
+  [db tracker solution patterns error-ch]
   (if (index/supports? db :psot)
-    (let [triples* (->> triples
+    (let [patterns* (->> patterns
                         (map (fn [triple]
                                (where/assign-matched-values triple solution)))
                         (map (partial where/compute-sids db)))]
-      (if (every? some? triples*)
-        (let [property-ranges (->> triples*
+      (if (every? some? patterns*)
+        (let [property-ranges (->> patterns*
                                    (map (fn [triple]
                                           (where/resolve-flake-range db tracker error-ch triple :psot)))
                                    (repartition-each-by flake/s))
               extract-sid     (comp flake/s first)
               join-xf         (mapcat (fn [join]
-                                        (match-join solution triples* db join)))]
+                                        (match-join solution patterns* db join)))]
           (inner-join-by flake/cmp-sid extract-sid 2 join-xf property-ranges))
         empty-channel))
-    (where/match-triples db tracker solution triples error-ch)))
+    (where/match-patterns db tracker solution patterns error-ch)))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
