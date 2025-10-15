@@ -244,16 +244,20 @@
           (recur r new-solutions*))
         new-solutions))))
 
+(defn assign-patterns
+  [db solution patterns]
+  (->> patterns
+       (map (fn [pattern]
+              (-> pattern
+                  where/pattern-data ; extract triple from
+                                     ; class patterns
+                  (where/assign-matched-values solution))))
+       (map (partial where/compute-sids db))))
+
 (defn match-properties
   [db tracker solution patterns error-ch]
   (if (index/supports? db :psot)
-    (let [triples (->> patterns
-                         (map (fn [pattern]
-                                (-> pattern
-                                    where/pattern-data ; extract triple from
-                                                       ; class patterns
-                                    (where/assign-matched-values solution))))
-                         (map (partial where/compute-sids db)))]
+    (let [triples (assign-patterns db solution patterns)]
       (if (every? some? triples)
         (let [property-ranges (->> triples
                                    (map (fn [triple]
