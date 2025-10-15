@@ -90,8 +90,8 @@
         (is (= @(fluree/query loaded q)
                @(fluree/query db q)))))))
 
-(deftest median-by-count-leaf-split-test
-  (testing "Leaf split using median-by-count maintains invariants"
+(deftest byte-based-leaf-split-test
+  (testing "Leaf split using byte-based distribution maintains invariants"
     (let [ledger-alias "test-ledger"
           cmp          flake/cmp-flakes-spot
           flakes       (reduce (fn [acc i]
@@ -108,32 +108,35 @@
                         :size         (flake/size-bytes flakes)
                         :t            42
                         :leftmost?    true}]
-      (binding [novelty/*overflow-bytes* 1000]
-        (let [[right-leaf left-leaf :as result] (novelty/rebalance-leaf leaf)]
-          (is (= 2 (count result)))
+      (binding [novelty/*overflow-bytes* 10000]
+        (let [result (novelty/rebalance-leaf leaf)]
+          (is (= 3 (count result))
+              "100 flakes at 11384 bytes with 10000 overflow should create exactly 3 leaves")
 
-          (is (:leftmost? left-leaf) "Left leaf should preserve leftmost flag")
-          (is (= (:first left-leaf) (first (:flakes left-leaf)))
-              "Left leaf :first should match first flake")
-          (is (some? (:rhs left-leaf)) "Left leaf should have :rhs (split key)")
-          (is (= (:rhs left-leaf) (:first right-leaf))
-              "Left :rhs should equal right :first")
+          (let [first-leaf (first result)
+                last-leaf  (last result)]
 
-          (is (false? (:leftmost? right-leaf)) "Right leaf should not be leftmost")
-          (is (= (:first right-leaf) (first (:flakes right-leaf)))
-              "Right leaf :first should match first flake")
-          (is (nil? (:rhs right-leaf)) "Right leaf should inherit parent's rhs (nil)")
+            (is (:leftmost? last-leaf) "Leftmost (last) leaf should preserve leftmost flag")
+            (is (= (:first last-leaf) (first (:flakes last-leaf)))
+                "Leftmost leaf :first should match first flake")
 
-          (is (some? (:next-tempid left-leaf))
-              "Left leaf should have :next-tempid pointing to right")
-          (is (= (:next-tempid left-leaf) (:tempid right-leaf))
-              "Left :next-tempid should match right :tempid")
+            (is (nil? (:rhs first-leaf)) "Rightmost (first) leaf should inherit parent's rhs (nil)")
+            (is (= (:first first-leaf) (first (:flakes first-leaf)))
+                "Rightmost leaf :first should match first flake")
 
-          (let [all-split-flakes (into (:flakes left-leaf) (:flakes right-leaf))]
-            (is (= (count flakes) (count all-split-flakes))
-                "Total flake count should be preserved")
-            (is (= flakes all-split-flakes)
-                "All flakes should be preserved in order")))))))
+            (doseq [[left-leaf right-leaf] (rest (partition 2 1 (reverse result)))]
+              (is (some? (:next-tempid left-leaf))
+                  "Each non-leftmost leaf should have :next-tempid")
+              (is (= (:next-tempid left-leaf) (:tempid right-leaf))
+                  "Each leaf's :next-tempid should match next leaf's :tempid")
+              (is (= (:rhs left-leaf) (:first right-leaf))
+                  "Each leaf's :rhs should equal next leaf's :first"))
+
+            (let [all-split-flakes (reduce into (map :flakes result))]
+              (is (= (count flakes) (count all-split-flakes))
+                  "Total flake count should be preserved")
+              (is (= flakes all-split-flakes)
+                  "All flakes should be preserved in order"))))))))
 
 (deftest median-by-count-branch-split-test
   (testing "Branch split using median-by-count maintains invariants"

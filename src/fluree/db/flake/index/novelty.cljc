@@ -105,44 +105,111 @@
         right-branch   (reconstruct-branch branch t right-children)]
     (update-sibling-leftmost [left-branch right-branch])))
 
+(defn calculate-split-params
+  "Calculates parameters needed for splitting a leaf into N leaves.
+  Returns a map with:
+  - :flake-sizes - vector of [flake size] tuples
+  - :total-bytes - total size of all flakes
+  - :target-leaves - number of leaves to create
+  - :bytes-per-leaf - target bytes per leaf"
+  [flakes]
+  (let [flake-vec             (vec flakes)
+        [flake-sizes total-bytes]
+        (reduce (fn [[tuples sum] f]
+                  (let [size (flake/size-flake f)]
+                    [(conj tuples [f size])
+                     (+ sum size)]))
+                [[] 0]
+                flake-vec)
+        target-bytes  (quot *overflow-bytes* 2)
+        target-leaves (long (max 2 #?(:clj  (Math/ceil (/ total-bytes target-bytes))
+                                      :cljs (js/Math.ceil (/ total-bytes target-bytes)))))
+        bytes-per-leaf (quot total-bytes target-leaves)]
+    {:flake-sizes   flake-sizes
+     :total-bytes   total-bytes
+     :target-leaves target-leaves
+     :bytes-per-leaf bytes-per-leaf}))
+
+(defn add-next-tempids
+  "Adds :next-tempid to leaves after they've been built.
+  Leaves are in reverse order [right ... left], so each leaf (except rightmost)
+  gets :next-tempid pointing to the leaf to its right (previous in the list)."
+  [leaves]
+  (loop [remaining leaves
+         result    []
+         prev-tempid nil]
+    (if-let [leaf (first remaining)]
+      (let [updated-leaf (cond-> leaf
+                           prev-tempid (assoc :next-tempid prev-tempid))]
+        (recur (rest remaining)
+               (conj result updated-leaf)
+               (:tempid leaf)))
+      result)))
+
 (defn rebalance-leaf
   "Splits leaf nodes if the combined size of its flakes is greater than
-  `*overflow-bytes*`. Uses median-by-count splitting to maintain consistent
-  tree height. Sets :next-id on left leaf to enable forward scanning.
+  `*overflow-bytes*`. Creates N leaves as needed, targeting half of overflow
+  threshold per leaf. Sets :next-tempid on each leaf to enable forward scanning.
 
-  Note: Returns [right left] order so right is written first, allowing
-  left's :next-id to be resolved to right's final ID."
+  Note: Returns leaves in reverse order (right-to-left) so rightmost is written
+  first, allowing each leaf's :next-id to be resolved to its right sibling's final ID."
   [{:keys [flakes leftmost? rhs] :as leaf}]
   (if (overflow-leaf? leaf)
-    (let [flake-vec (vec flakes)
-          n         (count flake-vec)
-          median-i  (quot n 2)
-          split-key (nth flake-vec median-i)
-          left-flakes  (flake/subrange flakes < split-key)
-          right-flakes (flake/subrange flakes >= split-key)
-          left-size    (flake/size-bytes left-flakes)
-          right-size   (flake/size-bytes right-flakes)
-          right-tempid (random-uuid)
-          left-leaf    (-> leaf
-                           (assoc :flakes left-flakes
-                                  :first (or (first left-flakes) flake/maximum)
-                                  :rhs split-key
-                                  :size left-size
-                                  :leftmost? leftmost?
-                                  :next-tempid right-tempid)
-                           (dissoc :id))
-          right-leaf   (-> leaf
-                           (assoc :flakes right-flakes
-                                  :first split-key
-                                  :rhs rhs
-                                  :size right-size
-                                  :leftmost? false
-                                  :tempid right-tempid)
-                           (dissoc :id))]
-      (log/debug "Rebalancing index leaf (median-by-count):"
-                 (select-keys leaf [:id :ledger-alias])
-                 "count:" n "median-i:" median-i)
-      [right-leaf left-leaf])
+    (let [{:keys [flake-sizes total-bytes target-leaves bytes-per-leaf]}
+          (calculate-split-params flakes)]
+      (log/debug "Rebalancing index leaf. Total bytes:" total-bytes
+                 "Target leaves:" target-leaves
+                 "Bytes per leaf:" bytes-per-leaf
+                 (select-keys leaf [:id :ledger-alias]))
+      (let [leaves
+            (loop [remaining-tuples flake-sizes
+                   current-flakes   []
+                   current-bytes    (long 0)
+                   leaves-acc       []
+                   is-leftmost?     leftmost?]
+              (if (empty? remaining-tuples)
+                (if (empty? current-flakes)
+                  leaves-acc
+                  (let [this-tempid  (random-uuid)
+                        final-flakes (apply flake/sorted-set-by (:comparator leaf) current-flakes)
+                        new-leaf     (-> leaf
+                                         (assoc :flakes final-flakes
+                                                :first (first final-flakes)
+                                                :rhs rhs
+                                                :size current-bytes
+                                                :leftmost? is-leftmost?
+                                                :tempid this-tempid)
+                                         (dissoc :id))]
+                    (conj leaves-acc new-leaf)))
+                (let [[flake flake-size] (first remaining-tuples)
+                      new-bytes          (long (+ current-bytes flake-size))
+                      exceeds-target?    (and (seq current-flakes)
+                                              (> new-bytes bytes-per-leaf))]
+                  (if exceeds-target?
+                    (let [this-tempid      (random-uuid)
+                          completed-flakes (conj current-flakes flake)
+                          split-flakes     (apply flake/sorted-set-by (:comparator leaf) completed-flakes)
+                          next-flake       (second remaining-tuples)
+                          next-first       (when next-flake (first next-flake))
+                          new-leaf         (-> leaf
+                                               (assoc :flakes split-flakes
+                                                      :first (first split-flakes)
+                                                      :rhs next-first
+                                                      :size new-bytes
+                                                      :leftmost? is-leftmost?
+                                                      :tempid this-tempid)
+                                               (dissoc :id))]
+                      (recur (rest remaining-tuples)
+                             []
+                             (long 0)
+                             (conj leaves-acc new-leaf)
+                             false))
+                    (recur (rest remaining-tuples)
+                           (conj current-flakes flake)
+                           new-bytes
+                           leaves-acc
+                           is-leftmost?)))))]
+        (-> leaves reverse add-next-tempids)))
     [leaf]))
 
 (defn update-leaf
