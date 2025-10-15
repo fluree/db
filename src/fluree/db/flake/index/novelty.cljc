@@ -98,47 +98,51 @@
 
 (defn rebalance-children
   [branch t child-nodes]
-  (let [target-count (/ *overflow-children* 2)]
-    (->> child-nodes
-         (partition-all target-count)
-         (map (fn [kids]
-                (reconstruct-branch branch t kids)))
-         update-sibling-leftmost)))
+  (let [median-i       (-> child-nodes count (quot 2))
+        left-children  (subvec (vec child-nodes) 0 median-i)
+        right-children (subvec (vec child-nodes) median-i)
+        left-branch    (reconstruct-branch branch t left-children)
+        right-branch   (reconstruct-branch branch t right-children)]
+    (update-sibling-leftmost [left-branch right-branch])))
 
 (defn rebalance-leaf
   "Splits leaf nodes if the combined size of its flakes is greater than
-  `*overflow-bytes*`."
+  `*overflow-bytes*`. Uses median-by-count splitting to maintain consistent
+  tree height. Sets :next-id on left leaf to enable forward scanning.
+
+  Note: Returns [right left] order so right is written first, allowing
+  left's :next-id to be resolved to right's final ID."
   [{:keys [flakes leftmost? rhs] :as leaf}]
   (if (overflow-leaf? leaf)
-    (let [target-size (/ *overflow-bytes* 2)]
-      (log/debug "Rebalancing index leaf:"
-                 (select-keys leaf [:id :ledger-alias]))
-      (loop [[f & r] flakes
-             cur-size  0
-             cur-first f
-             leaves    []]
-        (if (empty? r)
-          (let [subrange  (flake/subrange flakes >= cur-first)
-                last-leaf (-> leaf
-                              (assoc :flakes subrange
-                                     :first cur-first
-                                     :rhs rhs
-                                     :leftmost? (and (empty? leaves)
-                                                     leftmost?))
-                              (dissoc :id))]
-            (conj leaves last-leaf))
-          (let [new-size (-> f flake/size-flake (+ cur-size) long)]
-            (if (> new-size target-size)
-              (let [subrange (flake/subrange flakes >= cur-first < f)
-                    new-leaf (-> leaf
-                                 (assoc :flakes subrange
-                                        :first cur-first
-                                        :rhs f
-                                        :leftmost? (and (empty? leaves)
-                                                        leftmost?))
-                                 (dissoc :id))]
-                (recur r 0 f (conj leaves new-leaf)))
-              (recur r new-size cur-first leaves))))))
+    (let [flake-vec (vec flakes)
+          n         (count flake-vec)
+          median-i  (quot n 2)
+          split-key (nth flake-vec median-i)
+          left-flakes  (flake/subrange flakes < split-key)
+          right-flakes (flake/subrange flakes >= split-key)
+          left-size    (flake/size-bytes left-flakes)
+          right-size   (flake/size-bytes right-flakes)
+          right-tempid (random-uuid)
+          left-leaf    (-> leaf
+                           (assoc :flakes left-flakes
+                                  :first (or (first left-flakes) flake/maximum)
+                                  :rhs split-key
+                                  :size left-size
+                                  :leftmost? leftmost?
+                                  :next-tempid right-tempid)
+                           (dissoc :id))
+          right-leaf   (-> leaf
+                           (assoc :flakes right-flakes
+                                  :first split-key
+                                  :rhs rhs
+                                  :size right-size
+                                  :leftmost? false
+                                  :tempid right-tempid)
+                           (dissoc :id))]
+      (log/debug "Rebalancing index leaf (median-by-count):"
+                 (select-keys leaf [:id :ledger-alias])
+                 "count:" n "median-i:" median-i)
+      [right-leaf left-leaf])
     [leaf]))
 
 (defn update-leaf
@@ -296,6 +300,17 @@
         (log/debug "New index file event broadcast success for address:" (:address event))
         true))))
 
+(defn resolve-next-id
+  "Resolves :next-tempid to :next-id using the tempid->id mapping."
+  [updated-ids {:keys [next-tempid] :as leaf}]
+  (if next-tempid
+    (if-let [final-id (get updated-ids next-tempid)]
+      (-> leaf
+          (assoc :next-id final-id)
+          (dissoc :next-tempid))
+      leaf)
+    leaf))
+
 (defn write-node
   "Writes `node` to storage, and puts any errors onto the `error-ch`"
   [{:keys [index-catalog alias] :as _db} idx node updated-ids changes-ch error-ch]
@@ -306,9 +321,11 @@
       (try*
         (if (index/leaf? node)
           (do (log/debug "Writing index leaf:" display-node)
-              (let [write-response (<? (storage/write-leaf index-catalog alias idx node))]
+              (let [node*          (resolve-next-id updated-ids node)
+                    clean-node     (dissoc node* :next-tempid :tempid)
+                    write-response (<? (storage/write-leaf index-catalog alias idx clean-node))]
                 (<! (notify-new-index-file write-response :leaf t changes-ch))
-                (update-node-id node write-response)))
+                (update-node-id node* write-response)))
 
           (do (log/debug "Writing index branch:" display-node)
               (let [node*          (update-child-ids updated-ids node)
@@ -332,6 +349,8 @@
               stats*  (-> stats
                           (update :novel inc)
                           (assoc-in [:updated-ids (:id node)] (:id written-node))
+                          (cond-> (:tempid node)
+                            (assoc-in [:updated-ids (:tempid node)] (:id written-node)))
                           (cond-> (not= old-id :empty) (update :garbage conj old-id)))]
           (recur stats*
                  written-node))
