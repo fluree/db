@@ -214,8 +214,8 @@
                      (or force-novelty-fallback?
                          (nil? range-set)
                          (not (intersects-range? root range-set))))
-               (fallback-to-novelty-if-empty % novelty start-flake end-flake)
-               %))
+              (fallback-to-novelty-if-empty % novelty start-flake end-flake)
+              %))
           (filter-authorized db tracker error-ch)))))
 
 (defn filter-subject-page
@@ -395,5 +395,4 @@
                            error-ch ([e]
                                      (throw e))
                            page-ch ([page]
-                                    page))))))))))
-)
+                                    page)))))))))))
