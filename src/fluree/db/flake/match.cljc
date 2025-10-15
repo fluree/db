@@ -218,13 +218,19 @@
          (where/match-flake solution triple db flake))
        property-flakes))
 
+(defn match-subject-triple
+  [initial-solutions triple db property-flakes]
+  (mapcat (fn [solution]
+            (match-property-flakes solution triple db property-flakes))
+          initial-solutions))
+
 (defn match-subject-property
   [initial-solutions triple-map db property-flakes]
-  (let [pid    (->> property-flakes first flake/p)
-        triple (-> triple-map (get pid) first)]
-    (mapcat (fn [solution]
-              (match-property-flakes solution triple db property-flakes))
-            initial-solutions)))
+  (let [pid     (->> property-flakes first flake/p)
+        triples (get triple-map pid)]
+    (mapcat (fn [triple]
+              (match-subject-triple initial-solutions triple db property-flakes))
+            triples)))
 
 (defn match-join
   [solution triples db join]
