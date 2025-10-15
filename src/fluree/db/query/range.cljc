@@ -84,13 +84,14 @@
 
   - Always returns true for leaf nodes that were already reached (they passed
     branch pruning upstream).
-  - For branch nodes, returns true if the node intersects the requested range or
-    has novelty in range."
-  [node range-set novelty novelty-t to-t]
+  - For branch nodes, returns true only if the node intersects the requested range.
+
+  Note: Novelty handling is performed via a post-traversal fallback to avoid
+  visiting unrelated subtrees and to ensure authorization is applied uniformly."
+  [node range-set _novelty _novelty-t _to-t]
   (if (:leaf node)
     true
-    (or (and range-set (intersects-range? node range-set))
-        (seq (index/novelty-subrange node to-t novelty-t novelty)))))
+    (and range-set (intersects-range? node range-set))))
 
 (defn extract-query-flakes
   "Returns a transducer to extract flakes from each leaf from a stream of index
@@ -198,7 +199,7 @@
   ([db idx error-ch opts]
    (resolve-flake-slices db nil idx error-ch opts))
   ([{:keys [index-catalog] :as db} tracker idx error-ch
-    {:keys [to-t start-flake end-flake] :as opts}]
+    {:keys [to-t start-flake end-flake force-novelty-fallback?] :as opts}]
    (let [root      (get db idx)
          novelty   (get-in db [:novelty idx])
          novelty-t (get-in db [:novelty :t])
@@ -209,9 +210,12 @@
          in-range? (fn [node]
                      (node-in-range? node range-set novelty novelty-t to-t))]
      (->> (index/tree-chan resolver root start-flake end-flake in-range? 1 query-xf error-ch)
-          (#(if (seq novelty)
-              (fallback-to-novelty-if-empty % novelty start-flake end-flake)
-              %))
+          (#(if (and (seq novelty)
+                     (or force-novelty-fallback?
+                         (nil? range-set)
+                         (not (intersects-range? root range-set))))
+               (fallback-to-novelty-if-empty % novelty start-flake end-flake)
+               %))
           (filter-authorized db tracker error-ch)))))
 
 (defn filter-subject-page
@@ -382,6 +386,14 @@
            range-ch ([idx-range]
                      (if (seq idx-range)
                        idx-range
-                       (let [nov-sub (flake/subrange (get-in db [:novelty idx]) >= start-flake <= end-flake)
-                             v       (if flake-xf* (into [] flake-xf* nov-sub) (vec nov-sub))]
-                         v)))))))))
+                       (let [nov-sub   (flake/subrange (get-in db [:novelty idx]) >= start-flake <= end-flake)
+                             nov-slice (if flake-xf* (into [] flake-xf* nov-sub) (vec nov-sub))
+                             slices-ch (async/to-chan (if (seq nov-slice) [nov-slice] []))
+                             auth-ch   (filter-authorized db tracker error-ch slices-ch)
+                             page-ch   (into-page (:limit opts) (:offset opts) (:flake-limit opts) auth-ch)]
+                         (async/alt!
+                           error-ch ([e]
+                                     (throw e))
+                           page-ch ([page]
+                                    page))))))))))
+)
