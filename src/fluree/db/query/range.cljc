@@ -388,7 +388,9 @@
                        idx-range
                        (let [nov-sub   (flake/subrange (get-in db [:novelty idx]) >= start-flake <= end-flake)
                              nov-slice (if flake-xf* (into [] flake-xf* nov-sub) (vec nov-sub))
-                             slices-ch (async/to-chan (if (seq nov-slice) [nov-slice] []))
+                             slices-ch (let [ch (chan 1)]
+                                         (async/onto-chan! ch (if (seq nov-slice) [nov-slice] []) true)
+                                         ch)
                              auth-ch   (filter-authorized db tracker error-ch slices-ch)
                              page-ch   (into-page (:limit opts) (:offset opts) (:flake-limit opts) auth-ch)]
                          (async/alt!
