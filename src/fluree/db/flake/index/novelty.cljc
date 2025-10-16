@@ -12,7 +12,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(def ^:dynamic *overflow-bytes* 500000)
+(def ^:dynamic *overflow-bytes* 375000)
 (defn overflow-leaf?
   [{:keys [flakes]}]
   (> (flake/size-bytes flakes) *overflow-bytes*))
