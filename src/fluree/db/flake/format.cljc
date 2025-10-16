@@ -88,8 +88,7 @@
         flake-xf                (track/track-fuel! tracker error-ch)
         range-opts              (cond-> {:to-t        t
                                          :start-flake start-flake
-                                         :end-flake   end-flake
-                                         :force-novelty-fallback? true}
+                                         :end-flake   end-flake}
                                   flake-xf (assoc :flake-xf flake-xf))
         subj-xf                 (comp cat
                                       (format-subject-xf db cache context compact-fn
