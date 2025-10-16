@@ -325,6 +325,10 @@
     (val pattern)
     pattern))
 
+(defn class-pattern?
+  [pattern]
+  (= :class pattern))
+
 (defmulti match-pattern
   "Return a channel that will contain all pattern match solutions from flakes in
    `db` that are compatible with the initial solution `solution` and matches the

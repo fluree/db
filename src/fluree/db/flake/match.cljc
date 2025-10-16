@@ -256,12 +256,14 @@
 
 (defn match-properties
   [db tracker solution patterns error-ch]
-  (if (index/supports? db :psot)
+  (if (and (index/supports? db :psot)
+           (index/supports? db :post))
     (let [triples (assign-patterns db solution patterns)]
       (if (every? some? triples)
         (let [property-ranges (->> triples
-                                   (map (fn [triple]
-                                          (where/resolve-flake-range db tracker error-ch triple :psot)))
+                                   (map (fn [[_s _p o :as triple]]
+                                          (let [idx (if (where/matched? o) :post :psot)]
+                                            (where/resolve-flake-range db tracker error-ch triple idx))))
                                    (repartition-each-by flake/s))
               extract-sid     (comp flake/s first)
               join-xf         (mapcat (fn [join]

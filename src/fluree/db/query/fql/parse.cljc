@@ -525,10 +525,6 @@
   [attrs]
   (every? v/specified-value? (keys attrs)))
 
-(defn variable-objects?
-  [attrs]
-  (every? v/query-variable? (vals attrs)))
-
 (defn nested?
   [attrs]
   (boolean (some (fn [[_k v]]
@@ -540,7 +536,6 @@
   (and (>= (count attrs) 2)
        (v/query-variable? id)
        (specified-properties? attrs)
-       (variable-objects? attrs)
        (not (nested? attrs))))
 
 (defn parse-id-map-pattern
