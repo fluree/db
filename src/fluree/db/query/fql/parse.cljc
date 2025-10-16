@@ -529,12 +529,19 @@
   [attrs]
   (every? v/query-variable? (vals attrs)))
 
+(defn nested?
+  [attrs]
+  (boolean (some (fn [[_k v]]
+                   (map? v))
+                 attrs)))
+
 (defn simple-property-join?
   [id attrs]
   (and (>= (count attrs) 2)
        (v/query-variable? id)
        (specified-properties? attrs)
-       (variable-objects? attrs)))
+       (variable-objects? attrs)
+       (not (nested? attrs))))
 
 (defn parse-id-map-pattern
   [m var-config context]
