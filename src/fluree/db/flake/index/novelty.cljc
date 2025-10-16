@@ -1,5 +1,6 @@
 (ns fluree.db.flake.index.novelty
   (:require [clojure.core.async :as async :refer [<! >! go go-loop]]
+            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
@@ -16,7 +17,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(def ^:dynamic *overflow-bytes* 500000)
+(def ^:dynamic *overflow-bytes* const/default-overflow-bytes)
 (defn overflow-leaf?
   [{:keys [flakes]}]
   (> (flake/size-bytes flakes) *overflow-bytes*))

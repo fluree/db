@@ -2,6 +2,7 @@
   "A simple default connection-level cache."
   (:require [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [clojure.core.async :as async]
+            [fluree.db.constants :as const]
             [fluree.db.util :as util :refer [exception?]]
             [fluree.db.util.log :as log]))
 
@@ -12,15 +13,35 @@
   (cache/lru-cache-factory {} :threshold cache-size))
 
 (defn memory->cache-size
-  "Validate system memory is enough to build a usable cache, then derive cache size."
-  [cache-max-mb]
-  (let [memory      (or cache-max-mb 100) ; default 100MB memory
-        object-size 0.1 ; estimate 100kb index node size
-        cache-size  (int (quot memory object-size))] ; number of objects to keep in cache
-    (when (< cache-size 10)
-      (throw (ex-info (str "Must allocate at least 1MB of memory for Fluree. You've allocated: " memory " bytes.")
-                      {:status 400 :error :db/invalid-configuration})))
-    cache-size))
+  "Validate system memory is enough to build a usable cache, then derive cache size.
+
+   Index leaves are rebalanced when they exceed overflow-bytes (default 375KB),
+   so the average size is approximately 75% of overflow-bytes.
+
+   Note that an index segment has at least 2 entries - one for the raw data, then
+   a 'play to t' entry. The former takes the space, the latter is trivial.
+   Actual memory is ~3x raw JSON file size, but with play-to-t cache entries assume
+   each entry is ~average size of JSON file for index.
+
+   With default overflow-bytes = 375KB:
+   - Average leaf size: ~281KB on-disk, ~375KB in-memory (1:1 with cache-max-mb)
+   - 100MB cache holds ~266 segments
+   - 1GB cache holds ~2,730 segments
+   - 10GB cache holds ~27,306 segments
+
+   Optional parameters:
+   - cache-max-mb: Maximum memory in MB to use for cache (default 500MB)
+   - overflow-bytes: Override for index leaf overflow threshold (defaults to const/default-overflow-bytes)"
+  ([cache-max-mb] (memory->cache-size cache-max-mb const/default-overflow-bytes))
+  ([cache-max-mb overflow-bytes]
+   (let [memory-mb       (or cache-max-mb 500) ; default 500MB memory
+         overflow-mb     (/ overflow-bytes 1024.0 1024.0) ; convert bytes to MB
+         avg-segment-mb  (* 0.75 overflow-mb) ; average including JVM overhead
+         cache-size      (int (quot memory-mb avg-segment-mb))] ; number of segments to keep in cache
+     (when (< cache-size 100)
+       (throw (ex-info (str "Must allocate at least " (int (* 100 avg-segment-mb)) "MB of memory for Fluree. You've allocated: " memory-mb " MB.")
+                       {:status 400 :error :db/invalid-configuration})))
+     cache-size)))
 
 (defn lru-lookup
   "Given an LRU cache atom, look up value for `k`. If not found, use `value-fn` (a
