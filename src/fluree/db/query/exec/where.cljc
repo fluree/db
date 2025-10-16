@@ -665,19 +665,12 @@
                           solution-ch)
     out-ch))
 
-(defn with-constraints
-  [ds tracker patterns error-ch solution-ch]
+(defn match-patterns
+  [ds tracker solution patterns error-ch]
   (reduce (fn [solution-ch pattern]
             (with-constraint ds tracker pattern error-ch solution-ch))
-          solution-ch patterns))
-
-(defn match-patterns
-  [ds tracker patterns error-ch solution]
-  (let [[triple & r] patterns
-        ;; get initial solution channel from first triple
-        solution-ch  (match-pattern ds tracker solution triple error-ch)]
-    ;; refine solution channel with subsequent patterns
-    (with-constraints ds tracker r error-ch solution-ch)))
+          (async/to-chan! [solution])
+          patterns))
 
 (defn subquery?
   [pattern]
@@ -693,9 +686,8 @@
          other-patterns    false} (group-by subquery? clause)
 
         ;; process subqueries before other patterns
-        patterns    (into (vec subquery-patterns) other-patterns)
-        solution-ch (async/to-chan! [solution])
-        result-ch   (with-constraints ds tracker patterns error-ch solution-ch)]
+        patterns  (into (vec subquery-patterns) other-patterns)
+        result-ch (match-patterns ds tracker solution patterns error-ch)]
     (-finalize ds tracker error-ch result-ch)))
 
 (defn match-alias
