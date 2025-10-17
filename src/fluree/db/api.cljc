@@ -550,6 +550,33 @@
      (let [ledger (<? (connection/load-ledger conn ledger-id))]
        (ledger/status ledger)))))
 
+(defn ledger-info
+  "Returns comprehensive ledger information including detailed statistics.
+
+  Parameters:
+    conn - Connection object
+    ledger-id - Ledger alias (with optional :branch) or address
+
+  Returns info map with:
+    - :address - Ledger address
+    - :alias - Ledger alias
+    - :branch - Branch name
+    - :t - Current transaction number
+    - :size - Total byte size
+    - :flakes - Total flake count
+    - :commit - Commit metadata
+    - :property-counts - Map of property SID -> count (if available)
+    - :class-counts - Map of class SID -> count (if available)
+
+  Property and class counts are computed from the most recent index plus
+  any novelty, providing absolutely current statistics."
+  [conn ledger-id]
+  (validate-connection conn)
+  (promise-wrap
+   (go-try
+     (let [ledger (<? (connection/load-ledger conn ledger-id))]
+       (ledger/ledger-info ledger)))))
+
 ;; db operations
 
 (defn db
