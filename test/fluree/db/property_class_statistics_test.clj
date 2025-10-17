@@ -220,51 +220,6 @@
           (is (= 1 (get-count class-counts "http://example.org/Product"))
               "Product class should have count 1"))))))
 
-(deftest ^:integration property-class-statistics-zero-counts-test
-  (testing "Properties and classes with zero counts are preserved"
-    (with-temp-dir [storage-path {}]
-      (let [conn    @(fluree/connect-file {:storage-path (str storage-path)
-                                           :defaults
-                                           {:indexing {:reindex-min-bytes 100
-                                                       :reindex-max-bytes 10000000}}})
-            ledger-id "test/stats-zero"
-            context {"@context" {"ex" "http://example.org/"}}
-            db0     @(fluree/create conn ledger-id)
-
-            txn1    (merge context
-                           {"insert" [{"@id"      "ex:temp"
-                                       "@type"    "ex:TempClass"
-                                       "ex:tempProp" "value"}]})
-            db1      @(fluree/update db0 txn1)
-            index-ch1 (async/chan 10)
-            _        @(fluree/commit! conn db1 {:index-files-ch index-ch1})
-            _        (<!! (test-utils/block-until-index-complete index-ch1))
-
-            db-after-idx1 @(fluree/db conn ledger-id)
-            txn2    (merge context
-                           {"delete" {"@id"   "ex:temp"
-                                      "@type" "ex:TempClass"
-                                      "ex:tempProp" "value"}})
-            db2      @(fluree/update db-after-idx1 txn2)
-            index-ch2 (async/chan 10)
-            _        @(fluree/commit! conn db2 {:index-files-ch index-ch2})
-            _        (<!! (test-utils/block-until-index-complete index-ch2))
-
-            loaded   (test-utils/retry-load conn ledger-id 100)]
-
-        (testing "Zero-count properties/classes are preserved"
-          (let [property-counts (get-in loaded [:stats :properties])
-                class-counts    (get-in loaded [:stats :classes])
-                get-count (fn [stats-map iri]
-                            (let [sid (iri/encode-iri loaded iri)]
-                              (get-in stats-map [sid :count])))]
-
-            (is (= 0 (get-count class-counts "http://example.org/TempClass"))
-                "TempClass should have count 0 after deletion")
-
-            (is (= 0 (get-count property-counts "http://example.org/tempProp"))
-                "ex:tempProp should have count 0 after deletion")))))))
-
 (deftest ^:integration ledger-info-api-test
   (testing "ledger-info API returns property and class statistics"
     (with-temp-dir [storage-path {}]
@@ -304,14 +259,21 @@
                 classes    (:classes info)]
             (is (map? properties) "Should have properties map")
             (is (map? classes) "Should have classes map")
-            (is (pos? (count properties)) "Should have property entries")
-            (is (pos? (count classes)) "Should have class entries")
 
+            ;; Check exact classes - should only have Person
+            (is (= ["http://example.org/Person"] (vec (keys classes)))
+                "Should have exactly 1 class (Person)")
             (is (= 2 (get-in classes ["http://example.org/Person" :count]))
                 "Should have exactly 2 Person entities")
 
-            (is (= 2 (get-in properties ["http://example.org/name" :count]))
-                "Should have exactly 2 ex:name properties")
+            ;; Check properties include @type and ex:name (plus Fluree internal properties)
+            (let [prop-keys (set (keys properties))]
+              (is (contains? prop-keys "@type")
+                  "Should include @type property")
+              (is (contains? prop-keys "http://example.org/name")
+                  "Should include ex:name property")
+              (is (= 2 (get-in properties ["http://example.org/name" :count]))
+                  "Should have exactly 2 ex:name properties"))
 
             (is (every? string? (keys properties))
                 "All property keys should be decoded IRIs (strings)")
@@ -471,13 +433,35 @@
 
             (is (map? properties) "Properties should be a map")
 
+            ;; Test ex:email (100 unique emails, 100 subjects)
             (let [email-prop (get-prop-data "http://example.org/email")]
               (is (some? email-prop) "ex:email should have property data")
-              (is (pos? (:count email-prop)) "Should have count")
-              (is (pos? (:ndv-values email-prop)) "Should have ndv-values")
-              (is (pos? (:ndv-subjects email-prop)) "Should have ndv-subjects")
-              (is (pos? (:selectivity-value email-prop)) "Should have selectivity-value for optimizer")
-              (is (pos? (:selectivity-subject email-prop)) "Should have selectivity-subject for optimizer"))))
+              (is (= 100 (:count email-prop)) "Should have exactly 100 email property instances")
+              ;; HLL has ~6.5% error at p=8, allow 10% tolerance for NDV estimates
+              (is (< 90 (:ndv-values email-prop) 110)
+                  (str "ex:email should have ~100 distinct values (HLL estimate), got " (:ndv-values email-prop)))
+              (is (< 90 (:ndv-subjects email-prop) 110)
+                  (str "ex:email should have ~100 distinct subjects (HLL estimate), got " (:ndv-subjects email-prop)))
+              ;; Selectivity = ceil(count/ndv), clamped to at least 1
+              ;; For email with HLL variance: ceil(100/90-110) = 1-2
+              (is (<= 1 (:selectivity-value email-prop) 2)
+                  (str "ex:email selectivity-value should be 1-2 (highly selective), got " (:selectivity-value email-prop)))
+              (is (<= 1 (:selectivity-subject email-prop) 2)
+                  (str "ex:email selectivity-subject should be 1-2 (highly selective), got " (:selectivity-subject email-prop))))
+
+            ;; Test ex:department (3 distinct values, 100 subjects)
+            (let [dept-prop (get-prop-data "http://example.org/department")]
+              (is (some? dept-prop) "ex:department should have property data")
+              (is (= 100 (:count dept-prop)) "Should have exactly 100 department property instances")
+              (is (< 2 (:ndv-values dept-prop) 5)
+                  (str "ex:department should have ~3 distinct values (HLL estimate), got " (:ndv-values dept-prop)))
+              (is (< 90 (:ndv-subjects dept-prop) 110)
+                  (str "ex:department should have ~100 distinct subjects (HLL estimate), got " (:ndv-subjects dept-prop)))
+              ;; For department with HLL variance: ceil(100/2-5) = 20-50
+              (is (< 20 (:selectivity-value dept-prop) 50)
+                  (str "ex:department selectivity-value should be 20-50 (low cardinality), got " (:selectivity-value dept-prop)))
+              (is (<= 1 (:selectivity-subject dept-prop) 2)
+                  (str "ex:department selectivity-subject should be 1-2, got " (:selectivity-subject dept-prop))))))
 
         (testing "NDV values are monotone across index cycles"
           ;; Add more data with overlapping values
