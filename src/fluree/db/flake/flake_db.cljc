@@ -349,16 +349,22 @@
        :data (pr-str pdata)})))
 
 (defn- pattern-explain
-  "Generate explain information for a single pattern"
+  "Generate explain information for a single pattern with detailed inputs.
+   Per QUERY_STATS_AND_HLL.md lines 277-296, includes inputs used for selectivity calculation."
   [db stats pattern context]
   (let [ptype       (where/pattern-type pattern)
-        optimizable? (optimize/optimizable-pattern? pattern)
-        selectivity (when (and stats optimizable?)
-                      (optimize/calculate-selectivity db stats pattern))]
-    {:type        ptype
-     :pattern     (pattern->user-format db pattern context)
-     :selectivity selectivity
-     :optimizable optimizable?}))
+        optimizable? (optimize/optimizable-pattern? pattern)]
+    (if (and stats optimizable?)
+      (let [{:keys [score inputs]} (optimize/calculate-selectivity-with-details db stats pattern)]
+        {:type        ptype
+         :pattern     (pattern->user-format db pattern context)
+         :selectivity score
+         :inputs      inputs
+         :optimizable optimizable?})
+      {:type        ptype
+       :pattern     (pattern->user-format db pattern context)
+       :selectivity nil
+       :optimizable optimizable?})))
 
 (defn- segment-explain
   "Generate explain information for pattern segments"

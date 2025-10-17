@@ -147,9 +147,12 @@
     query - Query map (JSON-LD or analytical)
 
   Returns channel resolving to a query plan map."
-  [db query]
+  [db query {:keys [format] :as _override-opts :or {format :fql}}]
   (go-try
-    (let [q (-> query
+    (let [fql (if (= :sparql format)
+                (sparql/->fql query)
+                query)
+          q (-> fql
                 syntax/coerce-query
                 (sanitize-query-options nil))
           q* (update q :opts dissoc :meta :max-fuel)]

@@ -1097,7 +1097,7 @@
            ;; initial create call generates an initial commit, each commit has two files
            (is (= (* 2 (inc tx-count))
                   (count (async/<!! (fs/list-files (str primary-path "/" alias "/commit"))))))
-           (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
+           (is (= ["garbage" "opst" "post" "root" "spot" "stats-sketches" "tspo"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias "/index"))))))
            ;; one new index root per tx
            (is (= tx-count
@@ -1129,7 +1129,7 @@
                   (async/<!! (fs/list-files (str secondary-path "/ns@v2/destined-for-drop")))))
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
-           (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
+           (is (= ["garbage" "opst" "post" "root" "spot" "stats-sketches" "tspo"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias "/index"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/txn"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/commit"))))))
