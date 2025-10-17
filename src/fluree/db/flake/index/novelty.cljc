@@ -407,23 +407,29 @@
 (defn add-computed-fields
   "Add computed selectivity estimates to properties map for O(1) optimizer lookups.
 
-   Computes:
-   - :selectivity-value = count / max(1, ndv-values) - estimates results for (?s p o) patterns
-   - :selectivity-subject = count / max(1, ndv-subjects) - estimates results for (s p ?o) patterns"
+   Computes and rounds selectivity estimates to integers (clamped to at least 1):
+   - :selectivity-value = max(1, ceil(count / ndv-values)) - estimates results for (?s p o) patterns
+   - :selectivity-subject = max(1, ceil(count / ndv-subjects)) - estimates results for (s p ?o) patterns
+
+   Computing ceil and max here (once during indexing) avoids repeating the calculation
+   on every query optimization."
   [properties]
   (reduce-kv
    (fn [props sid prop-data]
      (let [count        (or (:count prop-data) 0)
            ndv-values   (or (:ndv-values prop-data) 0)
-           ndv-subjects (or (:ndv-subjects prop-data) 0)]
+           ndv-subjects (or (:ndv-subjects prop-data) 0)
+           ;; Compute selectivity, ceil, and clamp to min 1 - all in one place
+           sel-value    (if (pos? ndv-values)
+                          (max 1 (long (Math/ceil (/ (double count) (double ndv-values)))))
+                          count)
+           sel-subject  (if (pos? ndv-subjects)
+                          (max 1 (long (Math/ceil (/ (double count) (double ndv-subjects)))))
+                          count)]
        (assoc props sid
               (assoc prop-data
-                     :selectivity-value (if (pos? ndv-values)
-                                          (/ (double count) (double ndv-values))
-                                          (double count))
-                     :selectivity-subject (if (pos? ndv-subjects)
-                                            (/ (double count) (double ndv-subjects))
-                                            (double count))))))
+                     :selectivity-value sel-value
+                     :selectivity-subject sel-subject))))
    {}
    properties))
 
