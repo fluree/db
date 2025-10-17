@@ -4,6 +4,7 @@
             [clojure.core.async :as async :refer [<!!]]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
+            [fluree.db.async-db]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.test-utils :as test-utils]))
@@ -317,6 +318,76 @@
             (is (every? string? (keys classes))
                 "All class keys should be decoded IRIs (strings)")))))))
 
+(deftest ^:integration stats-serialization-roundtrip-test
+  (testing "Statistics can be serialized to file and deserialized correctly"
+    (with-temp-dir [storage-path {}]
+      (let [conn    @(fluree/connect-file {:storage-path (str storage-path)
+                                           :defaults
+                                           {:indexing {:reindex-min-bytes 100
+                                                       :reindex-max-bytes 10000000}}})
+            ledger-id "test/stats-roundtrip"
+            context {"@context" {"ex" "http://example.org/"}}
+            db0     @(fluree/create conn ledger-id)
+
+            txn     (merge context
+                           {"insert" [{"@id"      "ex:alice"
+                                       "@type"    "ex:Person"
+                                       "ex:name"  "Alice"
+                                       "ex:age"   30}
+                                      {"@id"      "ex:bob"
+                                       "@type"    "ex:Employee"
+                                       "ex:name"  "Bob"
+                                       "ex:email" "bob@example.com"}]})
+            db1      @(fluree/update db0 txn)
+
+            index-ch (async/chan 10)
+            _        @(fluree/commit! conn db1 {:index-files-ch index-ch})
+            _        (<!! (test-utils/block-until-index-complete index-ch))]
+
+        (testing "After disconnect and reconnect, stats can be read from index"
+          ;; Disconnect to force reload from disk
+          @(fluree/disconnect conn)
+
+          ;; Reconnect and load the ledger - this should read stats from the index file
+          (let [conn2    @(fluree/connect-file {:storage-path (str storage-path)
+                                                :defaults
+                                                {:indexing {:reindex-min-bytes 100
+                                                            :reindex-max-bytes 10000000}}})
+                ;; retry-load returns an AsyncDB, we need to deref its internal channel to get the FlakeDB
+                async-db (test-utils/retry-load conn2 ledger-id 100)
+                loaded   (<!! (fluree.db.async-db/deref-async async-db))
+
+                property-counts (get-in loaded [:stats :properties])
+                class-counts    (get-in loaded [:stats :classes])
+
+                get-count (fn [stats-map iri-str]
+                            (let [sid (iri/encode-iri loaded iri-str)]
+                              (get-in stats-map [sid :count])))]
+
+            (is (map? property-counts) "Property counts should be a map after reload")
+            (is (map? class-counts) "Class counts should be a map after reload")
+
+            ;; Verify we can actually look up stats by IRI
+            (is (= 2 (get-count property-counts "http://example.org/name"))
+                "Should be able to retrieve ex:name count from deserialized stats")
+            (is (= 1 (get-count property-counts "http://example.org/age"))
+                "Should be able to retrieve ex:age count from deserialized stats")
+            (is (= 1 (get-count property-counts "http://example.org/email"))
+                "Should be able to retrieve ex:email count from deserialized stats")
+
+            (is (= 1 (get-count class-counts "http://example.org/Person"))
+                "Should be able to retrieve Person class count from deserialized stats")
+            (is (= 1 (get-count class-counts "http://example.org/Employee"))
+                "Should be able to retrieve Employee class count from deserialized stats")
+
+            ;; Verify the stats keys are actual SID objects, not strings
+            (is (every? iri/sid? (keys property-counts))
+                "All property count keys should be SID objects after deserialization")
+            (is (every? iri/sid? (keys class-counts))
+                "All class count keys should be SID objects after deserialization")
+
+            @(fluree/disconnect conn2)))))))
+
 (deftest ^:integration ndv-computation-test
   (testing "NDV (Number of Distinct Values) is computed via HLL and persisted"
     (with-temp-dir [storage-path {}]
@@ -392,26 +463,21 @@
               (is (< 90 dept-ndv-subj 110)
                   (str "ex:department should have ~100 distinct subjects, got " dept-ndv-subj)))))
 
-        (testing "Prop-metrics are built from properties"
-          (let [prop-metrics (get-in loaded [:stats :prop-metrics])
-                get-metrics (fn [prop-iri]
-                              (let [sid (iri/encode-iri loaded prop-iri)]
-                                (get prop-metrics sid)))]
+        (testing "Computed selectivity fields are added to properties"
+          (let [properties (get-in loaded [:stats :properties])
+                get-prop-data (fn [prop-iri]
+                                (let [sid (iri/encode-iri loaded prop-iri)]
+                                  (get properties sid)))]
 
-            (is (map? prop-metrics) "Prop-metrics should be a map")
+            (is (map? properties) "Properties should be a map")
 
-            (let [email-metrics (get-metrics "http://example.org/email")]
-              (is (some? email-metrics) "ex:email should have metrics")
-              (is (pos? (:count email-metrics)) "Metrics should have count")
-              (is (pos? (:ndvValues email-metrics)) "Metrics should have ndvValues")
-              (is (pos? (:ndvSubjects email-metrics)) "Metrics should have ndvSubjects")
-              (is (pos? (:avgPerSubject email-metrics)) "Metrics should have avgPerSubject")
-              (is (<= 0 (:uniqueRatio email-metrics) 1.0) "Unique ratio should be between 0 and 1"))
-
-            (let [dept-metrics (get-metrics "http://example.org/department")]
-              (is (some? dept-metrics) "ex:department should have metrics")
-              (is (< (:uniqueRatio dept-metrics) 0.1)
-                  "Department should have low uniqueRatio (3 distinct / 100 total)"))))
+            (let [email-prop (get-prop-data "http://example.org/email")]
+              (is (some? email-prop) "ex:email should have property data")
+              (is (pos? (:count email-prop)) "Should have count")
+              (is (pos? (:ndv-values email-prop)) "Should have ndv-values")
+              (is (pos? (:ndv-subjects email-prop)) "Should have ndv-subjects")
+              (is (pos? (:selectivity-value email-prop)) "Should have selectivity-value for optimizer")
+              (is (pos? (:selectivity-subject email-prop)) "Should have selectivity-subject for optimizer"))))
 
         (testing "NDV values are monotone across index cycles"
           ;; Add more data with overlapping values

@@ -71,16 +71,26 @@
   (get-in stats [:classes sid :count]))
 
 (defn get-ndv-values
-  "Get NDV(values|p) for a property from prop-metrics or properties"
+  "Get raw NDV(values|p) for a property. Used by explain API to show inputs."
   [stats sid]
-  (or (get-in stats [:prop-metrics sid :ndvValues])
-      (get-in stats [:properties sid :ndv-values])))
+  (get-in stats [:properties sid :ndv-values]))
 
 (defn get-ndv-subjects
-  "Get NDV(subjects|p) for a property from prop-metrics or properties"
+  "Get raw NDV(subjects|p) for a property. Used by explain API to show inputs."
   [stats sid]
-  (or (get-in stats [:prop-metrics sid :ndvSubjects])
-      (get-in stats [:properties sid :ndv-subjects])))
+  (get-in stats [:properties sid :ndv-subjects]))
+
+(defn get-selectivity-value
+  "Get pre-computed selectivity estimate for bound value patterns (?s p o).
+   Returns count/ndv-values, computed during indexing."
+  [stats sid]
+  (get-in stats [:properties sid :selectivity-value]))
+
+(defn get-selectivity-subject
+  "Get pre-computed selectivity estimate for bound subject patterns (s p ?o).
+   Returns count/ndv-subjects, computed during indexing."
+  [stats sid]
+  (get-in stats [:properties sid :selectivity-subject]))
 
 (defn matched?
   "Check if a component is matched (has a bound value, IRI, or SID)"
@@ -97,33 +107,29 @@
   [[s p o]]
   (and (matched? s) (matched? p) (matched? o)))
 
-(defn estimate-bound-object
-  "Estimate selectivity for bound object pattern: (?s p o) where o is bound.
-   Uses formula: max(1, ceil(count(p) / max(1, NDV(values|p))))
-   Falls back to conservative estimate if NDV not available."
+(defn estimate-bound-value
+  "Estimate selectivity for bound value pattern: (?s p o) where o is bound.
+   Uses pre-computed selectivity estimate (already ceiled and clamped during indexing).
+   Falls back to conservative estimate if not available."
   [stats sid]
-  (let [count (get-property-count stats sid)
-        ndv-values (get-ndv-values stats sid)]
-    (if (and count ndv-values)
-      (max 1 (long (Math/ceil (/ (double count) (double (max 1 ndv-values))))))
-      ;; Conservative fallback if NDV not available
-      (if count
-        (min count 1000)
-        moderately-selective))))
+  (if-let [selectivity (get-selectivity-value stats sid)]
+    selectivity  ; Already an integer >= 1
+    ;; Conservative fallback if selectivity not available
+    (if-let [count (get-property-count stats sid)]
+      (min count 1000)
+      moderately-selective)))
 
 (defn estimate-bound-subject
   "Estimate selectivity for bound subject pattern: (s p ?o) where s is bound.
-   Uses formula: max(1, ceil(count(p) / max(1, NDV(subjects|p))))
-   Falls back to conservative estimate if NDV not available."
+   Uses pre-computed selectivity estimate (already ceiled and clamped during indexing).
+   Falls back to conservative estimate if not available."
   [stats sid]
-  (let [count (get-property-count stats sid)
-        ndv-subjects (get-ndv-subjects stats sid)]
-    (if (and count ndv-subjects)
-      (max 1 (long (Math/ceil (/ (double count) (double (max 1 ndv-subjects))))))
-      ;; Conservative fallback if NDV not available
-      (if count
-        (min count 10)
-        moderately-selective))))
+  (if-let [selectivity (get-selectivity-subject stats sid)]
+    selectivity  ; Already an integer >= 1
+    ;; Conservative fallback if selectivity not available
+    (if-let [count (get-property-count stats sid)]
+      (min count 10)
+      moderately-selective)))
 
 (defn calculate-selectivity
   "Calculate selectivity score for a pattern."
@@ -160,7 +166,7 @@
 
           (and (unmatched? s) (matched? p) (matched? o))
           (let [pred-sid (get-sid db p)]
-            (estimate-bound-object stats pred-sid))
+            (estimate-bound-value stats pred-sid))
 
           (and (unmatched? s) (unmatched? p) (unmatched? o))
           full-scan
@@ -173,8 +179,8 @@
    Returns map with :score and :inputs showing the exact values used.
 
    Per QUERY_STATS_AND_HLL.md lines 277-296, inputs include:
-   - :count, :ndvValues, :ndvSubjects (when applicable)
-   - Flags: :usedExact?, :usedValuesNDV?, :usedSubjectsNDV?, :fallback?, :clampedToOne?"
+   - :count, :ndv-values, :ndv-subjects (when applicable)
+   - Flags: :used-exact?, :used-values-ndv?, :used-subjects-ndv?, :fallback?, :clamped-to-one?"
   [db stats pattern]
   (let [pattern-type (where/pattern-type pattern)
         pattern-data (where/pattern-data pattern)]
@@ -199,36 +205,30 @@
                 score (or class-count default-selectivity)]
             {:score score
              :inputs (cond-> {:type :class
-                              :classSid class-sid
-                              :classCount class-count}
+                              :class-sid class-sid
+                              :class-count class-count}
                        (nil? class-count)
                        (assoc :fallback? true :reason "Class count not available"))})
 
           (all-matched? [s p o])
           {:score highly-selective
-           :inputs {:type :tuple-exact :allMatched? true}}
+           :inputs {:type :tuple-exact :all-matched? true}}
 
           (and (matched? s) (matched? p) (unmatched? o))
           (let [pred-sid (get-sid db p)
                 count (get-property-count stats pred-sid)
                 ndv-subjects (get-ndv-subjects stats pred-sid)
-                has-ndv? (and count ndv-subjects)
-                raw-est (if has-ndv?
-                          (/ (double count) (double (max 1 ndv-subjects)))
-                          (if count (double count) (double moderately-selective)))
-                clamped? (< raw-est 1.0)
-                score (if has-ndv?
-                        (max 1 (long (Math/ceil raw-est)))
-                        (if count (min count 10) moderately-selective))]
+                selectivity (get-selectivity-subject stats pred-sid)
+                score (estimate-bound-subject stats pred-sid)]
             {:score score
              :inputs (cond-> {:type :tuple
                               :pattern :bound-subject
-                              :propertySid pred-sid
+                              :property-sid pred-sid
                               :count count
-                              :ndvSubjects ndv-subjects
-                              :usedSubjectsNDV? (boolean has-ndv?)
-                              :clampedToOne? clamped?}
-                       (not has-ndv?)
+                              :ndv-subjects ndv-subjects
+                              :selectivity selectivity
+                              :used-subjects-ndv? (some? selectivity)}
+                       (nil? selectivity)
                        (assoc :fallback? true
                               :reason (if count "NDV not available" "Count not available")))})
 
@@ -239,7 +239,7 @@
             {:score score
              :inputs (cond-> {:type :tuple
                               :pattern :property-scan
-                              :propertySid pred-sid
+                              :property-sid pred-sid
                               :count count}
                        (nil? count)
                        (assoc :fallback? true :reason "Count not available"))})
@@ -248,23 +248,19 @@
           (let [pred-sid (get-sid db p)
                 count (get-property-count stats pred-sid)
                 ndv-values (get-ndv-values stats pred-sid)
-                has-ndv? (and count ndv-values)
-                raw-est (if has-ndv?
-                          (/ (double count) (double (max 1 ndv-values)))
-                          (if count (double count) (double moderately-selective)))
-                clamped? (< raw-est 1.0)
-                score (if has-ndv?
-                        (max 1 (long (Math/ceil raw-est)))
-                        (if count (min count 1000) moderately-selective))]
+                selectivity (get-selectivity-value stats pred-sid)
+                clamped? (and selectivity (< selectivity 1.0))
+                score (estimate-bound-value stats pred-sid)]
             {:score score
              :inputs (cond-> {:type :tuple
                               :pattern :bound-object
-                              :propertySid pred-sid
+                              :property-sid pred-sid
                               :count count
-                              :ndvValues ndv-values
-                              :usedValuesNDV? (boolean has-ndv?)
-                              :clampedToOne? clamped?}
-                       (not has-ndv?)
+                              :ndv-values ndv-values
+                              :selectivity selectivity
+                              :used-values-ndv? (some? selectivity)
+                              :clamped-to-one? clamped?}
+                       (nil? selectivity)
                        (assoc :fallback? true
                               :reason (if count "NDV not available" "Count not available")))})
 

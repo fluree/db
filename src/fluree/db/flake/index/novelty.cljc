@@ -404,32 +404,26 @@
      (go
        (compute-stats-from-novelty novelty-flakes prev-properties prev-classes prev-sketches))))
 
-(defn build-prop-metrics
-  "Build derived metrics map from property statistics for O(1) optimizer lookups.
+(defn add-computed-fields
+  "Add computed selectivity estimates to properties map for O(1) optimizer lookups.
 
-   Returns map keyed by property SID with:
-   - :count - count(p)
-   - :ndvValues - NDV(values|p)
-   - :ndvSubjects - NDV(subjects|p)
-   - :avgPerSubject - max(1, ceil(count / max(1, ndvSubjects)))
-   - :uniqueRatio - ndvValues / max(1, count) bounded to [0,1]"
+   Computes:
+   - :selectivity-value = count / max(1, ndv-values) - estimates results for (?s p o) patterns
+   - :selectivity-subject = count / max(1, ndv-subjects) - estimates results for (s p ?o) patterns"
   [properties]
   (reduce-kv
-   (fn [metrics sid prop-data]
+   (fn [props sid prop-data]
      (let [count        (or (:count prop-data) 0)
            ndv-values   (or (:ndv-values prop-data) 0)
-           ndv-subjects (or (:ndv-subjects prop-data) 0)
-           avg-per-subj (max 1 (long (Math/ceil (/ (double count)
-                                                   (double (max 1 ndv-subjects))))))
-           unique-ratio (if (pos? count)
-                          (min 1.0 (/ (double ndv-values) (double count)))
-                          0.0)]
-       (assoc metrics sid
-              {:count count
-               :ndvValues ndv-values
-               :ndvSubjects ndv-subjects
-               :avgPerSubject avg-per-subj
-               :uniqueRatio unique-ratio})))
+           ndv-subjects (or (:ndv-subjects prop-data) 0)]
+       (assoc props sid
+              (assoc prop-data
+                     :selectivity-value (if (pos? ndv-values)
+                                          (/ (double count) (double ndv-values))
+                                          (double count))
+                     :selectivity-subject (if (pos? ndv-subjects)
+                                            (/ (double count) (double ndv-subjects))
+                                            (double count))))))
    {}
    properties))
 
@@ -444,13 +438,11 @@
     (if spot-novelty
       ;; Synchronous computation for both FlakeDB and AsyncDB
       (let [novelty-updates (compute-stats-from-novelty spot-novelty indexed-properties indexed-classes indexed-sketches)
-            properties      (:properties novelty-updates)
-            prop-metrics    (build-prop-metrics properties)]
+            properties      (add-computed-fields (:properties novelty-updates))]
         (assoc indexed-stats
                :properties properties
                :classes    (:classes novelty-updates)
-               :sketches   (:sketches novelty-updates)
-               :prop-metrics prop-metrics))
+               :sketches   (:sketches novelty-updates)))
       ;; No novelty, return indexed stats as-is
       indexed-stats)))
 
@@ -582,16 +574,15 @@
 
           refresh-ch
           ([{:keys [garbage properties classes sketches], refreshed-db :db, :as _status}]
-           (let [;; Build prop-metrics for O(1) optimizer lookups
-                 prop-metrics (build-prop-metrics properties)
+           (let [;; Add computed fields to properties for O(1) optimizer lookups
+                 properties-with-computed (add-computed-fields properties)
 
                  {:keys [index-catalog alias] :as refreshed-db*}
                  (-> refreshed-db
                      (assoc-in [:stats :indexed] t)
-                     (assoc-in [:stats :properties] properties)
+                     (assoc-in [:stats :properties] properties-with-computed)
                      (assoc-in [:stats :classes] classes)
-                     (assoc-in [:stats :sketches] sketches)
-                     (assoc-in [:stats :prop-metrics] prop-metrics))
+                     (assoc-in [:stats :sketches] sketches))
 
                  ;; Add old stats-sketches to garbage if we're writing new ones
                  old-sketches-addr (get-in refreshed-db* [:stats-sketches :address])
