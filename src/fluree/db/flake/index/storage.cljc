@@ -35,7 +35,7 @@
   "Given a child, unresolved node, extracts just the data that will go into
   storage."
   [child]
-  (select-keys child [:id :leaf :first :rhs :size :leftmost?]))
+  (select-keys child [:id :leaf :first :rhs :size :leftmost? :next-id]))
 
 (defn write-index-file
   [storage ledger-alias index-type serialized-data]

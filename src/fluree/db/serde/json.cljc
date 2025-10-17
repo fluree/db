@@ -82,7 +82,8 @@
 
 (defn deserialize-leaf-node
   [leaf]
-  (assoc leaf :flakes (mapv deserialize-flake (:flakes leaf))))
+  (cond-> (assoc leaf :flakes (mapv deserialize-flake (:flakes leaf)))
+    (:next-id leaf) (assoc :next-id (:next-id leaf))))
 
 #?(:clj (def ^DateTimeFormatter xsdDateTimeFormatter
           (DateTimeFormatter/ofPattern "uuuu-MM-dd'T'HH:mm:ss.SSSSSSSSS[XXXXX]")))
@@ -175,7 +176,8 @@
   (-deserialize-branch [_ branch]
     (deserialize-branch-node branch))
   (-serialize-leaf [_ leaf]
-    {"flakes" (map serialize-flake (:flakes leaf))})
+    (cond-> {"flakes" (map serialize-flake (:flakes leaf))}
+      (:next-id leaf) (assoc "next-id" (:next-id leaf))))
   (-deserialize-leaf [_ leaf]
     (deserialize-leaf-node leaf))
   (-serialize-garbage [_ garbage-map]
