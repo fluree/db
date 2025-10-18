@@ -83,6 +83,15 @@
   (let [branch (idx-branch root idx-type)]
     (expand-idx branch)))
 
+(defn next-sibling
+  [branch child]
+  (let [first-flake (:first child)]
+    (loop [[sibling & r] (get branch "children")]
+      (when sibling
+        (if (= first-flake (key sibling))
+          (val sibling)
+          (recur r))))))
+
 (defn expand-addresses
   [branch]
   (let [children    (get branch "children")
