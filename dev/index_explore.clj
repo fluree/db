@@ -49,6 +49,10 @@
   [roots]
   (at-t (latest-t roots) roots))
 
+(defn read-latest-root
+  [ledger-name]
+  (-> ledger-name read-roots latest-root))
+
 (defn idx-branch
   [root idx-type]
   (let [idx*        (name idx-type)
@@ -69,6 +73,10 @@
                          (expand-idx child*))))
                    children)]
     (assoc branch "children" children*)))
+
+(defn read-latest-index
+  [ledger-name idx-type]
+  (-> ledger-name read-latest-root (idx-branch idx-type) expand-idx))
 
 (defn idx-children
   [root idx-type]
