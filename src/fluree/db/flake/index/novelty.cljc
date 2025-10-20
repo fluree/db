@@ -127,7 +127,7 @@
                                                      leftmost?))
                               (dissoc :id))]
             (conj leaves last-leaf))
-          (let [new-size (-> f flake/size-flake (+ cur-size) long)]
+          (let [new-size (-> f flake/size-flake (+ cur-size))]
             (if (> new-size target-size)
               (let [subrange (flake/subrange flakes >= cur-first < f)
                     new-leaf (-> leaf
