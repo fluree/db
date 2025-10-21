@@ -971,7 +971,7 @@
                                                       "Accept"       "application/sparql-results+json"}}))]
         (if (util/exception? response)
           (if silent?
-            (async/>! solution-ch solution)
+            (async/onto-chan! solution-ch [solution])
             (async/>! error-ch (sparql-service-error! response service sparql-q)))
           (try*
             (let [response* (json/parse response false)
