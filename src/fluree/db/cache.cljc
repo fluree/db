@@ -4,7 +4,30 @@
             [clojure.core.async :as async]
             [fluree.db.constants :as const]
             [fluree.db.util :as util :refer [exception?]]
+            [fluree.db.util.graalvm :as graalvm]
             [fluree.db.util.log :as log]))
+
+(defn default-cache-max-mb
+  "Calculates default cache size based on available memory.
+
+   Three cases:
+   1. JVM with -Xmx: Uses maxMemory() which returns the -Xmx setting
+   2. GraalVM native-image (Lambda/containers): Uses totalMemory() which reflects
+      actual container/cgroup memory limits
+   3. Node.js/JavaScript: Returns conservative 1000 MB default
+
+   Returns 50% of available memory for cache to leave room for other operations."
+  []
+  #?(:clj
+     (let [runtime      (Runtime/getRuntime)
+           max-memory   (.maxMemory runtime)
+           total-memory (.totalMemory runtime)
+           effective-mb (if (graalvm/runtime?)
+                          (/ total-memory 1024.0 1024.0)   ; Case 2: GraalVM
+                          (/ max-memory 1024.0 1024.0))]   ; Case 1: JVM
+       (int (/ effective-mb 2.0)))
+     :cljs
+     1000)) ; Case 3: Node.js/JavaScript
 
 (defn create-lru-cache
   "Create a cache that holds `cache-size` number of entries, bumping out the least
