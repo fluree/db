@@ -1,7 +1,7 @@
 (ns fluree.db.virtual-graph.bm25.storage
   (:require [clojure.set :refer [map-invert]]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.serde.protocol :as serde]
+            [fluree.db.serde :as serde]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.ledger :as util.ledger]

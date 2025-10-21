@@ -1,5 +1,5 @@
 (ns fluree.db.serde.none
-  (:require [fluree.db.serde.protocol :as serde]))
+  (:require [fluree.db.serde :as serde]))
 
 (set! *warn-on-reflection* true)
 

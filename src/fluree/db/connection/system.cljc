@@ -79,7 +79,8 @@
 
 (defmethod ig/expand-key :fluree.db/abstract-connection
   [k config]
-  (let [cache-max-mb   (config/get-first-integer config conn-vocab/cache-max-mb)
+  (let [cache-max-mb   (or (config/get-first-integer config conn-vocab/cache-max-mb)
+                           (cache/default-cache-max-mb))
         commit-storage (get config conn-vocab/commit-storage)
         index-storage  (get config conn-vocab/index-storage)
         remote-systems (get config conn-vocab/remote-systems)
