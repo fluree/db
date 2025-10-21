@@ -1,6 +1,5 @@
 (ns fluree.db.flake.index.novelty
   (:require [clojure.core.async :as async :refer [<! >! go go-loop]]
-            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
@@ -13,7 +12,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(def ^:dynamic *overflow-bytes* const/default-overflow-bytes)
+(def ^:dynamic *overflow-bytes* 500000)
 (defn overflow-leaf?
   [{:keys [flakes]}]
   (> (flake/size-bytes flakes) *overflow-bytes*))
@@ -99,48 +98,118 @@
 
 (defn rebalance-children
   [branch t child-nodes]
-  (let [target-count (/ *overflow-children* 2)]
-    (->> child-nodes
-         (partition-all target-count)
-         (map (fn [kids]
-                (reconstruct-branch branch t kids)))
-         update-sibling-leftmost)))
+  (let [median-i       (-> child-nodes count (quot 2))
+        left-children  (subvec (vec child-nodes) 0 median-i)
+        right-children (subvec (vec child-nodes) median-i)
+        left-branch    (reconstruct-branch branch t left-children)
+        right-branch   (reconstruct-branch branch t right-children)]
+    (update-sibling-leftmost [left-branch right-branch])))
+
+(defn calculate-split-params
+  "Calculates parameters needed for splitting a leaf into N leaves.
+  Returns a map with:
+  - :flake-sizes - vector of [flake size] tuples
+  - :total-bytes - total size of all flakes
+  - :target-leaves - number of leaves to create
+  - :bytes-per-leaf - target bytes per leaf"
+  [flakes]
+  (let [flake-vec             (vec flakes)
+        [flake-sizes total-bytes]
+        (reduce (fn [[tuples sum] f]
+                  (let [size (flake/size-flake f)]
+                    [(conj tuples [f size])
+                     (+ sum size)]))
+                [[] 0]
+                flake-vec)
+        target-bytes  (quot *overflow-bytes* 2)
+        target-leaves (long (max 2 #?(:clj  (Math/ceil (/ total-bytes target-bytes))
+                                      :cljs (js/Math.ceil (/ total-bytes target-bytes)))))
+        bytes-per-leaf (quot total-bytes target-leaves)]
+    {:flake-sizes   flake-sizes
+     :total-bytes   total-bytes
+     :target-leaves target-leaves
+     :bytes-per-leaf bytes-per-leaf}))
+
+(defn add-next-tempids
+  "Adds :next-tempid to leaves after they've been built.
+  Leaves are in reverse order [right ... left], so each leaf (except rightmost)
+  gets :next-tempid pointing to the leaf to its right (previous in the list)."
+  [leaves]
+  (loop [remaining leaves
+         result    []
+         prev-tempid nil]
+    (if-let [leaf (first remaining)]
+      (let [updated-leaf (cond-> leaf
+                           prev-tempid (assoc :next-tempid prev-tempid))]
+        (recur (rest remaining)
+               (conj result updated-leaf)
+               (:tempid leaf)))
+      result)))
 
 (defn rebalance-leaf
   "Splits leaf nodes if the combined size of its flakes is greater than
-  `*overflow-bytes*`."
+  `*overflow-bytes*`. Creates N leaves as needed, targeting half of overflow
+  threshold per leaf. Sets :next-tempid on each leaf to enable forward scanning.
+
+  Note: Returns leaves in reverse order (right-to-left) so rightmost is written
+  first, allowing each leaf's :next-id to be resolved to its right sibling's final ID."
   [{:keys [flakes leftmost? rhs] :as leaf}]
   (if (overflow-leaf? leaf)
-    (let [target-size (/ *overflow-bytes* 2)
-          [fflake & remaining] flakes]
-      (log/debug "Rebalancing index leaf:"
+    (let [{:keys [flake-sizes total-bytes target-leaves bytes-per-leaf]}
+          (calculate-split-params flakes)]
+      (log/debug "Rebalancing index leaf. Total bytes:" total-bytes
+                 "Target leaves:" target-leaves
+                 "Bytes per leaf:" bytes-per-leaf
                  (select-keys leaf [:id :ledger-alias]))
-      (loop [[f & r]   remaining
-             cur-size  (flake/size-flake fflake)
-             cur-first fflake
-             leaves    []]
-        (if (empty? r)
-          (let [subrange  (flake/subrange flakes >= cur-first)
-                last-leaf (-> leaf
-                              (assoc :flakes subrange
-                                     :first cur-first
-                                     :rhs rhs
-                                     :leftmost? (and (empty? leaves)
-                                                     leftmost?))
-                              (dissoc :id))]
-            (conj leaves last-leaf))
-          (let [new-size (-> f flake/size-flake (+ cur-size))]
-            (if (> new-size target-size)
-              (let [subrange (flake/subrange flakes >= cur-first < f)
-                    new-leaf (-> leaf
-                                 (assoc :flakes subrange
-                                        :first cur-first
-                                        :rhs f
-                                        :leftmost? (and (empty? leaves)
-                                                        leftmost?))
-                                 (dissoc :id))]
-                (recur r 0 f (conj leaves new-leaf)))
-              (recur r new-size cur-first leaves))))))
+      (let [leaves
+            (loop [remaining-tuples flake-sizes
+                   current-flakes   []
+                   current-bytes    (long 0)
+                   leaves-acc       []
+                   is-leftmost?     leftmost?]
+              (if (empty? remaining-tuples)
+                (if (empty? current-flakes)
+                  leaves-acc
+                  (let [this-tempid  (random-uuid)
+                        final-flakes (apply flake/sorted-set-by (:comparator leaf) current-flakes)
+                        new-leaf     (-> leaf
+                                         (assoc :flakes final-flakes
+                                                :first (first final-flakes)
+                                                :rhs rhs
+                                                :size current-bytes
+                                                :leftmost? is-leftmost?
+                                                :tempid this-tempid)
+                                         (dissoc :id))]
+                    (conj leaves-acc new-leaf)))
+                (let [[flake flake-size] (first remaining-tuples)
+                      new-bytes          (long (+ current-bytes flake-size))
+                      exceeds-target?    (and (seq current-flakes)
+                                              (> new-bytes bytes-per-leaf))]
+                  (if exceeds-target?
+                    (let [this-tempid      (random-uuid)
+                          completed-flakes (conj current-flakes flake)
+                          split-flakes     (apply flake/sorted-set-by (:comparator leaf) completed-flakes)
+                          next-flake       (second remaining-tuples)
+                          next-first       (when next-flake (first next-flake))
+                          new-leaf         (-> leaf
+                                               (assoc :flakes split-flakes
+                                                      :first (first split-flakes)
+                                                      :rhs next-first
+                                                      :size new-bytes
+                                                      :leftmost? is-leftmost?
+                                                      :tempid this-tempid)
+                                               (dissoc :id))]
+                      (recur (rest remaining-tuples)
+                             []
+                             (long 0)
+                             (conj leaves-acc new-leaf)
+                             false))
+                    (recur (rest remaining-tuples)
+                           (conj current-flakes flake)
+                           new-bytes
+                           leaves-acc
+                           is-leftmost?)))))]
+        (-> leaves reverse add-next-tempids)))
     [leaf]))
 
 (defn update-leaf
@@ -298,6 +367,17 @@
         (log/debug "New index file event broadcast success for address:" (:address event))
         true))))
 
+(defn resolve-next-id
+  "Resolves :next-tempid to :next-id using the tempid->id mapping."
+  [updated-ids {:keys [next-tempid] :as leaf}]
+  (if next-tempid
+    (if-let [final-id (get updated-ids next-tempid)]
+      (-> leaf
+          (assoc :next-id final-id)
+          (dissoc :next-tempid))
+      leaf)
+    leaf))
+
 (defn write-node
   "Writes `node` to storage, and puts any errors onto the `error-ch`"
   [{:keys [index-catalog alias] :as _db} idx node updated-ids changes-ch error-ch]
@@ -308,9 +388,11 @@
       (try*
         (if (index/leaf? node)
           (do (log/debug "Writing index leaf:" display-node)
-              (let [write-response (<? (storage/write-leaf index-catalog alias idx node))]
+              (let [node*          (resolve-next-id updated-ids node)
+                    clean-node     (dissoc node* :next-tempid :tempid)
+                    write-response (<? (storage/write-leaf index-catalog alias idx clean-node))]
                 (<! (notify-new-index-file write-response :leaf t changes-ch))
-                (update-node-id node write-response)))
+                (update-node-id node* write-response)))
 
           (do (log/debug "Writing index branch:" display-node)
               (let [node*          (update-child-ids updated-ids node)
@@ -334,6 +416,8 @@
               stats*  (-> stats
                           (update :novel inc)
                           (assoc-in [:updated-ids (:id node)] (:id written-node))
+                          (cond-> (:tempid node)
+                            (assoc-in [:updated-ids (:tempid node)] (:id written-node)))
                           (cond-> (not= old-id :empty) (update :garbage conj old-id)))]
           (recur stats*
                  written-node))
