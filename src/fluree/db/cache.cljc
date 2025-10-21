@@ -1,10 +1,10 @@
 (ns fluree.db.cache
   "A simple default connection-level cache."
-  (:require [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
+  (:require #?(:clj [fluree.db.util.graalvm :as graalvm])
+            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [clojure.core.async :as async]
             [fluree.db.constants :as const]
             [fluree.db.util :as util :refer [exception?]]
-            [fluree.db.util.graalvm :as graalvm]
             [fluree.db.util.log :as log]))
 
 (defn default-cache-max-mb

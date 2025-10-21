@@ -714,7 +714,6 @@
 ;;; This section contains all SCI-related code used for evaluating Clojure forms
 ;;; in GraalVM native images where regular eval is not available.
 
-
 ;; Forward declaration for functions referenced in SCI context setup
 (declare find-grouped-val)
 

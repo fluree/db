@@ -1,6 +1,6 @@
 (ns fluree.db.util.graalvm
   "Utilities for detecting and handling GraalVM native-image runtime."
-  (:require [fluree.db.util.log :as log]))
+  #?(:clj (:require [fluree.db.util.log :as log])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
