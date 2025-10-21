@@ -925,35 +925,6 @@
           solution
           vars))
 
-(defn format-sparql-literal
-  "Format a value as a RDF data literal."
-  [mch]
-  (if-let [iri (get-iri mch)]
-    (str "<" iri ">")
-    (let [v  (get-value mch)
-          dt (get-datatype-iri mch)]
-      (cond (get-optional mch)                   "UNDEF"
-            (datatype/JSON-LD-inferable-iris dt) (str (pr-str v))
-            :else
-            (if-let [lang (get-lang mch)]
-              (str "\"" v "\"@" lang)
-              (if (= dt const/iri-json)
-                (str "\"" v "\"^^<" const/iri-rdf-json ">")
-                (str "\"" v "\"^^<" dt ">")))))))
-
-(defn solution->values
-  "Format a solution as a SPARQL VALUES clause."
-  [solution]
-  (if (not-empty solution)
-    (let [vars (sort (keys solution))]
-      (str " VALUES " vars " { ("
-           (->> vars
-                (mapv (partial get solution))
-                (mapv format-sparql-literal)
-                (reduce #(str %1 " " %2)))
-           ") }"))
-    ""))
-
 (defn sparql-service-error!
   [ex service sparql-q]
   (log/error ex "Error processing service response " service sparql-q)
