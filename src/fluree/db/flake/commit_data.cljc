@@ -254,36 +254,6 @@
   [commit-map]
   (-> commit-map :data :t))
 
-(defn index-t
-  "Given a commit map, returns the t value of the index (if exists)."
-  [commit-map]
-  (-> commit-map :index :data :t))
-
-(defn use-latest-index
-  "Checks if old-commit has a more current index than new-commit and
-  if so, updates new-commit to contain the updated index.
-
-  This can happen when processing a new commit while an asynchronous
-  indexing process complete giving it a newer index point than the
-  new commit"
-  [{new-index :index :as new-commit} {old-index :index :as old-commit}]
-  (if (not= (index-t new-commit)
-            (index-t old-commit))
-    (cond
-      ;; there is no old index, just return new commit
-      (nil? old-index)
-      new-commit
-
-      ;; new-index is nil but there is an old index, or old index is newer
-      (or (nil? new-index)
-          (flake/t-before? (index-t new-commit) (index-t old-commit)))
-      (assoc new-commit :index old-index)
-
-      ;; index in new-commit is newer, no changes to new commit
-      :else
-      new-commit)
-    new-commit))
-
 (defn new-db-commit
   "Returns the :data portion of the commit map for a new db commit."
   [dbid t db-address prev-data flakes size]

@@ -5,6 +5,7 @@
             [fluree.db.cache :as cache]
             [fluree.db.flake :as flake]
             [fluree.db.flake.index :as index]
+            [fluree.db.index.metadata :as index.meta]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.serde :as serde]
@@ -93,8 +94,7 @@
                   reindex-min-bytes reindex-max-bytes max-old-indexes]}
           db
 
-          prev-idx-t    (-> commit :index :data :t)
-          prev-idx-addr (-> commit :index :address)
+          {prev-idx-addr :address prev-idx-t :t} (index.meta/index-metadata commit)
           vg-addresses  (<? (write-vg-map index-catalog vg))
           data          (cond-> {:ledger-alias alias
                                  :t               t

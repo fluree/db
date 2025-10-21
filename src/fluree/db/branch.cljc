@@ -3,6 +3,7 @@
             [fluree.db.async-db :as async-db]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake.commit-data :as commit-data]
+            [fluree.db.index.metadata :as index.meta]
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.nameservice :as nameservice]
@@ -27,14 +28,14 @@
 
 (defn same-index?
   [commit-x commit-y]
-  (let [x-index-t (commit-data/index-t commit-x)
-        y-index-t (commit-data/index-t commit-y)]
+  (let [x-index-t (index.meta/index-t commit-x)
+        y-index-t (index.meta/index-t commit-y)]
     (= x-index-t y-index-t)))
 
 (defn newer-index?
   [commit-x commit-y]
-  (let [x-index-t (commit-data/index-t commit-x)
-        y-index-t (commit-data/index-t commit-y)]
+  (let [x-index-t (index.meta/index-t commit-x)
+        y-index-t (index.meta/index-t commit-y)]
     (and (some? x-index-t)
          (or (nil? y-index-t)
              (> x-index-t y-index-t)))))

@@ -6,6 +6,7 @@
             [fluree.db.did :as did]
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
+            [fluree.db.index.metadata :as index.meta]
             [fluree.db.json-ld.credential :as credential]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.nameservice :as nameservice]
@@ -273,7 +274,8 @@
 (defn write-commit
   [commit-storage alias {:keys [did private]} commit]
   (go-try
-    (let [commit-jsonld (commit-data/->json-ld commit)
+    (let [commit-jsonld (-> (commit-data/->json-ld commit)
+                            (dissoc "index"))
           ;; For credential/generate, we need a DID map with public key
           did-map (when (and did private)
                     (if (map? did)
@@ -381,7 +383,7 @@
        (log/debug "commit!: publish-commit done" {:ledger ledger-alias})
 
        (if (track/track-txn? opts)
-         (let [index-t (commit-data/index-t commit-map)
+         (let [index-t (index.meta/index-t commit-map)
                novelty-size (get-in db* [:novelty :size] 0)
                ;; Always read threshold from realized FlakeDB; db* may be AsyncDB
                reindex-min-bytes (or (:reindex-min-bytes db) 1000000)]
