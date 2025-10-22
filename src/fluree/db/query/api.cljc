@@ -245,7 +245,6 @@
                               (some-> opts :ledger util/sequential)
                               (some-> sanitized-query :from util/sequential))
           named-aliases   (or (some-> opts :from-named util/sequential)
-                              (some-> opts :ledger util/sequential)
                               (some-> sanitized-query :from-named util/sequential))]
       (if (or (seq default-aliases)
               (seq named-aliases))
