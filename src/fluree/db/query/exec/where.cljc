@@ -953,6 +953,7 @@
                    (async/onto-chan! solution-ch)))
             (catch* e (async/>! error-ch (sparql-service-error! e service sparql-q)))))))
     solution-ch))
+
 (defmethod match-pattern :default
   [_db _tracker _solution pattern error-ch]
   (go
