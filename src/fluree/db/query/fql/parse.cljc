@@ -37,9 +37,8 @@
   If `:parse-object-vars` is false then we will not attempt to parse string literals in
   the object position as variables, only specifically tagged @variable objects will be
   parsed as variables."
-  [bound-vars opts orig-context]
-  {:orig-context orig-context
-   :bound-vars  (set bound-vars)
+  [bound-vars opts]
+  {:bound-vars  (set bound-vars)
    :parse-object-vars? (get opts :object-var-parsing true)})
 
 (defn parse-var-name
@@ -641,7 +640,7 @@
   (when-let [construct (:construct q)]
     (-> construct
         syntax/coerce-where
-        (parse-where-clause (var-parsing-config nil (:opts q) nil) context)
+        (parse-where-clause (var-parsing-config nil (:opts q)) context)
         unwrap-tuple-patterns
         select/construct-selector)))
 
@@ -808,7 +807,7 @@
          context       (cond->> (json-ld/parse-context orig-context)
                          parent-context (merge parent-context))
          [vars values] (parse-values (:values q) context)
-         var-config    (var-parsing-config vars q orig-context)
+         var-config    (var-parsing-config vars (:opts q))
          where         (parse-where (:where q) var-config context)
          construct     (parse-construct q context)
          grouping      (parse-grouping q)
@@ -834,8 +833,8 @@
     [(where/->pattern :query sub-query*)]))
 
 (defmethod parse-pattern :service
-  [[_ {:keys [clause] :as data}] {:keys [orig-context]} _context]
-  (let [sparql (str/join " " (into (sparql/context->prefixes orig-context)
+  [[_ {:keys [clause] :as data}] _var-config context]
+  (let [sparql (str/join " " (into (sparql/context->prefixes context)
                                    ["SELECT *"
                                     (str "WHERE " clause)]))]
     [(where/->pattern :service (assoc data :sparql-q sparql))]))
@@ -991,7 +990,7 @@
                            (:context override-opts))
          [vars values] (-> (get-named txn "values")
                            (parse-values context))
-         var-config    (var-parsing-config vars override-opts nil)
+         var-config    (var-parsing-config vars override-opts)
          where         (-> (get-named txn "where")
                            (parse-where var-config context))
          var-config*   (cond-> (update var-config :bound-vars into (where/clause-variables where))
@@ -1065,7 +1064,7 @@
                          context))
         opts       (-> (parse-txn-opts nil opts context)
                        (assoc :object-var-parsing false))
-        var-config (var-parsing-config nil opts nil)
+        var-config (var-parsing-config nil opts)
         parsed-txn (if turtle?
                      (turtle/parse txn)
                      (jld->parsed-triples txn var-config context))
@@ -1080,7 +1079,7 @@
   [txn {:keys [format context] :as opts}]
   {:insert (if (= :turtle format)
              (turtle/parse txn)
-             (jld->parsed-triples txn (var-parsing-config nil (assoc opts :object-var-parsing false) nil) context))
+             (jld->parsed-triples txn (var-parsing-config nil (assoc opts :object-var-parsing false)) context))
    :context context
    :opts opts})
 

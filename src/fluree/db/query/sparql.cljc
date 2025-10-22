@@ -71,15 +71,23 @@
   [opts]
   (= :sparql (:format opts)))
 
+(defn extract-prefix
+  "A context key is a prefix if:
+   - it is a string with no colon
+   - it is a keyword with no namespace
+  Returns the string prefix if it is a prefix, falsey if not."
+  [k]
+  (or
+   (and (string? k) (not (str/includes? k ":")) k)
+   (and (keyword? k) (not (namespace k)) (name k))))
+
 (defn context->prefixes
-  [context]
+  [parsed-context]
   (reduce-kv (fn [prefixes k v]
-               (let [prefix (if (keyword? k) (name k) k)]
-                 (if (string? v)
-                   (if (= "@base" prefix)
-                     (conj prefixes (str "BASE <" v ">"))
-                     (conj prefixes (str "PREFIX "  prefix ": <" v ">")))
-                   ;; skip non-prefix context definitions
-                   prefixes)))
+               (if-let [prefix (extract-prefix k)]
+                 (if (= "@base" prefix)
+                   (conj prefixes (str "BASE <" (:id v) ">"))
+                   (conj prefixes (str "PREFIX "  prefix ": <" (:id v) ">")))
+                 prefixes))
              []
-             context))
+             (dissoc parsed-context :type-key)))
