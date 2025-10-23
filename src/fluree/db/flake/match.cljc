@@ -8,7 +8,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.util :as util :refer [vswap!]]
-            [fluree.db.util.async :refer [<? empty-channel go-try inner-join-by
+            [fluree.db.util.async :refer [<? go-try inner-join-by
                                           repartition-each-by]]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -202,19 +202,34 @@
       (async/close! out-ch))
     out-ch))
 
+(defn class-matches
+  [{:keys [alias] :as db} mch]
+  (let [cls     (where/get-sid mch db)
+        sub-obj (dissoc mch ::sids ::iri)]
+    (into [mch]
+          (map (fn [cls]
+                 (where/match-sid sub-obj alias cls)))
+          (subclasses db cls))))
+
 (defn match-property-flakes
   [solution triple db property-flakes]
   (map (fn [flake]
          (where/match-flake solution triple db flake))
        property-flakes))
 
+(defn match-subject-triple
+  [initial-solutions triple db property-flakes]
+  (mapcat (fn [solution]
+            (match-property-flakes solution triple db property-flakes))
+          initial-solutions))
+
 (defn match-subject-property
   [initial-solutions triple-map db property-flakes]
-  (let [pid        (->> property-flakes first flake/p)
-        triple     (-> triple-map (get pid) first)]
-    (mapcat (fn [solution]
-              (match-property-flakes solution triple db property-flakes))
-            initial-solutions)))
+  (let [pid     (->> property-flakes first flake/p)
+        triples (get triple-map pid)]
+    (mapcat (fn [triple]
+              (match-subject-triple initial-solutions triple db property-flakes))
+            triples)))
 
 (defn match-join
   [solution triples db join]
@@ -228,24 +243,31 @@
           (recur r new-solutions*))
         new-solutions))))
 
+(defn assign-patterns
+  [db solution patterns]
+  (->> patterns
+       (map (fn [pattern]
+              (-> pattern
+                  where/pattern-data ; extract triple from
+                                     ; class patterns
+                  (where/assign-matched-values solution))))
+       (map (partial where/compute-sids db))))
+
 (defn match-properties
-  [db tracker solution triples error-ch]
-  (if (index/supports? db :psot)
-    (let [triples* (->> triples
-                        (map (fn [triple]
-                               (where/assign-matched-values triple solution)))
-                        (map (partial where/compute-sids db)))]
-      (if (every? some? triples*)
-        (let [property-ranges (->> triples*
-                                   (map (fn [triple]
-                                          (where/resolve-flake-range db tracker error-ch triple :psot)))
-                                   (repartition-each-by flake/s))
-              extract-sid     (comp flake/s first)
-              join-xf         (mapcat (fn [join]
-                                        (match-join solution triples* db join)))]
-          (inner-join-by flake/cmp-sid extract-sid 2 join-xf property-ranges))
-        empty-channel))
-    (where/match-triples db tracker solution triples error-ch)))
+  [db tracker solution patterns error-ch]
+  (if (and (index/supports? db :psot)
+           (index/supports? db :post))
+    (let [triples         (assign-patterns db solution patterns)
+          property-ranges (->> triples
+                               (map (fn [[_s _p o :as triple]]
+                                      (let [idx (if (where/matched? o) :post :psot)]
+                                        (where/resolve-flake-range db tracker error-ch triple idx))))
+                               (repartition-each-by flake/s))
+          extract-sid     (comp flake/s first)
+          join-xf         (mapcat (fn [join]
+                                    (match-join solution triples db join)))]
+      (inner-join-by flake/cmp-sid extract-sid 2 join-xf property-ranges))
+    (where/match-patterns db tracker solution patterns error-ch)))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
@@ -277,17 +299,9 @@
                                        (with-distinct-subjects)
                                        (map (fn [flake]
                                               (where/match-flake solution triple db flake)))))
-        db-alias   (:alias db)
         triple     (where/assign-matched-values triple solution)]
     (if-let [[s p o] (where/compute-sids db triple)]
-      (let [cls        (where/get-sid o db)
-            sub-obj    (dissoc o ::sids ::iri)
-            class-objs (into [o]
-                             (comp (map (fn [cls]
-                                          (where/match-sid sub-obj db-alias cls)))
-                                   (remove nil?))
-                             (subclasses db cls))
-            class-ch   (async/to-chan! class-objs)]
+      (let [class-ch (async/to-chan! (class-matches db o))]
         (async/pipeline-async 2
                               matched-ch
                               (fn [class-obj ch]
