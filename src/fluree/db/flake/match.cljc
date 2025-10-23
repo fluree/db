@@ -8,7 +8,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.util :as util :refer [vswap!]]
-            [fluree.db.util.async :refer [<? empty-channel go-try inner-join-by
+            [fluree.db.util.async :refer [<? go-try inner-join-by
                                           repartition-each-by]]))
 
 #?(:clj (set! *warn-on-reflection* true))
