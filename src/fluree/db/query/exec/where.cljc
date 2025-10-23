@@ -326,8 +326,8 @@
     pattern))
 
 (defn class-pattern?
-  [pattern]
-  (= :class pattern))
+  [pattern-type]
+  (= :class pattern-type))
 
 (defmulti match-pattern
   "Return a channel that will contain all pattern match solutions from flakes in
