@@ -85,8 +85,10 @@
   [parsed-context]
   (reduce-kv (fn [prefixes k v]
                (if-let [prefix (extract-prefix k)]
-                 (if (= "@base" prefix)
-                   (conj prefixes (str "BASE <" (:id v) ">"))
+                 (case prefix
+                   "base"  (conj prefixes (str "BASE <" v ">"))
+                   "vocab" prefixes    ; not supported in SPARQL
+                   ;; else
                    (conj prefixes (str "PREFIX "  prefix ": <" (:id v) ">")))
                  prefixes))
              []
