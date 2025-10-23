@@ -258,18 +258,16 @@
   [db tracker solution patterns error-ch]
   (if (and (index/supports? db :psot)
            (index/supports? db :post))
-    (let [triples (assign-patterns db solution patterns)]
-      (if (every? some? triples)
-        (let [property-ranges (->> triples
-                                   (map (fn [[_s _p o :as triple]]
-                                          (let [idx (if (where/matched? o) :post :psot)]
-                                            (where/resolve-flake-range db tracker error-ch triple idx))))
-                                   (repartition-each-by flake/s))
-              extract-sid     (comp flake/s first)
-              join-xf         (mapcat (fn [join]
-                                        (match-join solution triples db join)))]
-          (inner-join-by flake/cmp-sid extract-sid 2 join-xf property-ranges))
-        empty-channel))
+    (let [triples         (assign-patterns db solution patterns)
+          property-ranges (->> triples
+                               (map (fn [[_s _p o :as triple]]
+                                      (let [idx (if (where/matched? o) :post :psot)]
+                                        (where/resolve-flake-range db tracker error-ch triple idx))))
+                               (repartition-each-by flake/s))
+          extract-sid     (comp flake/s first)
+          join-xf         (mapcat (fn [join]
+                                    (match-join solution triples db join)))]
+      (inner-join-by flake/cmp-sid extract-sid 2 join-xf property-ranges))
     (where/match-patterns db tracker solution patterns error-ch)))
 
 (defn with-distinct-subjects
