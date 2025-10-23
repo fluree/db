@@ -207,9 +207,8 @@
   (let [cls     (where/get-sid mch db)
         sub-obj (dissoc mch ::sids ::iri)]
     (into [mch]
-          (comp (map (fn [cls]
-                       (where/match-sid sub-obj alias cls)))
-                (remove nil?))
+          (map (fn [cls]
+                 (where/match-sid sub-obj alias cls)))
           (subclasses db cls))))
 
 (defn match-property-flakes
