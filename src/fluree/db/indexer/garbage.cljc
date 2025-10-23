@@ -1,6 +1,7 @@
 (ns fluree.db.indexer.garbage
   (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.flake.index.storage :as storage]
+            [fluree.db.index.metadata :as index.meta]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try]]
             [fluree.db.util.log :as log]))
@@ -118,5 +119,5 @@
   dependent on the frequency and size of updates that is ledger-specific
   against the ledger's 'reindex-min-bytes' setting."
   [{:keys [index-catalog commit] :as _db} max-indexes]
-  (let [index-address (-> commit :index :address)]
+  (let [{index-address :address} (index.meta/index-metadata commit)]
     (clean-garbage* index-catalog index-address max-indexes)))

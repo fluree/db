@@ -18,6 +18,7 @@
             [fluree.db.flake.match :as match]
             [fluree.db.flake.reasoner :as flake.reasoner]
             [fluree.db.flake.transact :as flake.transact]
+            [fluree.db.index.metadata :as index.meta]
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
@@ -88,7 +89,7 @@
 (defn newer-index?
   [commit {data-map :data, :as _commit-index}]
   (if data-map
-    (let [commit-index-t (commit-data/index-t commit)
+    (let [commit-index-t (index.meta/index-t commit)
           index-t        (:t data-map)]
       (or (nil? commit-index-t)
           (flake/t-after? index-t commit-index-t)))
@@ -615,7 +616,7 @@
      (let [commit-t    (-> commit-jsonld
                            (get-first const/iri-data)
                            (get-first-value const/iri-fluree-t))
-           root-map    (if-let [{:keys [address]} (:index commit-map)]
+           root-map    (if-let [{:keys [address]} (index.meta/index-metadata commit-map)]
                          (<? (index-storage/read-db-root index-catalog address))
                          (genesis-root-map ledger-alias))
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)

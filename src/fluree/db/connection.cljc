@@ -5,6 +5,7 @@
             [clojure.string :as str]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
+            [fluree.db.index.metadata :as index.meta]
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
@@ -479,8 +480,7 @@
   [{:keys [index-catalog] :as _conn} latest-commit]
   (go-try
     (let [storage       (:storage index-catalog)
-          index-address (some-> (util/get-first latest-commit const/iri-index)
-                                (util/get-first-value const/iri-address))]
+          {index-address :address} (index.meta/index-metadata latest-commit)]
       (when index-address
         (log/debug "Dropping index" index-address)
         (let [{:keys [spot psot opst post tspo]} (<? (storage/read-json storage index-address true))
