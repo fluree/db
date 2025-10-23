@@ -224,12 +224,10 @@
           initial-solutions))
 
 (defn match-subject-property
-  [initial-solutions triple-map db property-flakes]
-  (let [pid     (->> property-flakes first flake/p)
-        triples (get triple-map pid)]
-    (mapcat (fn [triple]
-              (match-subject-triple initial-solutions triple db property-flakes))
-            triples)))
+  [initial-solutions triples db property-flakes]
+  (mapcat (fn [triple]
+            (match-subject-triple initial-solutions triple db property-flakes))
+          triples))
 
 (defn match-join
   [solution triples db join]
@@ -239,7 +237,9 @@
     (loop [[s-chunk & r] join
            new-solutions [solution]]
       (if s-chunk
-        (let [new-solutions* (match-subject-property new-solutions triple-map db s-chunk)]
+        (let [pid            (->> s-chunk first flake/p)
+              triples        (get triple-map pid)
+              new-solutions* (match-subject-property new-solutions triples db s-chunk)]
           (recur r new-solutions*))
         new-solutions))))
 
