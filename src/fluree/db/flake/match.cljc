@@ -14,14 +14,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn class-ids
-  "Returns list of class-ids for given subject-id"
-  [db tracker subject-id]
-  (go-try
-    (let [root (policy/root db)]
-      (<? (query-range/index-range root tracker :spot = [subject-id const/$rdf:type]
-                                   {:flake-xf (map flake/o)})))))
-
 (defn subclasses
   [{:keys [schema] :as _db} class]
   (get @(:subclasses schema) class))
@@ -429,6 +421,14 @@
         ;; Termination: do nothing but terminate the supplied reducing fn
         ([result]
          (rf result))))))
+
+(defn class-ids
+  "Returns list of class-ids for given subject-id"
+  [db tracker subject-id]
+  (go-try
+    (let [root (policy/root db)]
+      (<? (query-range/index-range root tracker :spot = [subject-id const/$rdf:type]
+                                   {:flake-xf (map flake/o)})))))
 
 (defn match-class
   [db tracker solution triple error-ch]
