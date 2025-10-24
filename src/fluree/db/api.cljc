@@ -689,6 +689,49 @@
      (throw ds)
      (promise-wrap (query-api/query ds q opts)))))
 
+(defn explain
+  "Returns a query execution plan without executing the query.
+
+  Shows how the query optimizer will reorder patterns based on statistics,
+  including selectivity scores and estimated result counts for each pattern.
+
+  Parameters:
+    ds - Database value or dataset
+    q - Query map (JSON-LD or analytical)
+
+  Returns promise resolving to a query plan map with:
+    :query - Original parsed query structure
+    :plan - Execution plan with:
+      :optimization - :reordered, :unchanged, or :none
+      :statistics - Available statistics (if any)
+      :original - Original pattern order with selectivity
+      :optimized - Optimized pattern order with selectivity
+      :segments - Pattern segments with boundaries
+      :changed? - Boolean indicating if patterns were reordered
+
+  Example:
+    @(fluree/explain db
+      {:context {\"ex\" \"http://example.org/\"}
+       :select [\"?name\"]
+       :where [{\"@id\" \"?person\"
+                \"@type\" \"ex:Person\"
+                \"ex:email\" \"alice@example.org\"
+                \"ex:name\" \"?name\"}]})
+
+    ;; Returns:
+    {:query {...}
+     :plan {:optimization :reordered
+            :statistics {...}
+            :original [{:pattern ... :selectivity 10000}
+                       {:pattern ... :selectivity 1}]
+            :optimized [{:pattern ... :selectivity 1}    ; email lookup first
+                        {:pattern ... :selectivity 10000}] ; then verify type
+            :changed? true}}"
+  [ds q]
+  (if (util/exception? ds)
+    (throw ds)
+    (promise-wrap (query-api/explain ds q))))
+
 (defn credential-query
   "Executes a query using a verifiable credential.
 
