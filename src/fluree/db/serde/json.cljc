@@ -67,7 +67,8 @@
   [db-root]
   (let [db-root* (reduce (fn [root-data idx]
                            (update root-data idx deserialize-child-node))
-                         db-root index/types)]
+                         db-root
+                         (index/indexes-for db-root))]
     (update db-root* :namespace-codes numerize-keys)))
 
 (defn deserialize-children
@@ -163,7 +164,7 @@
                 (:stats :config :garbage :prev-index)
                 (util/stringify-keys v)
 
-                (:spot :post :opst :tspo)
+                (:spot :psot :post :opst :tspo)
                 (stringify-child v)
 
                 v)))

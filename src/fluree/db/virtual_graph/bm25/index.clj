@@ -260,6 +260,9 @@
   (-match-class [_ _tracker _solution _s-mch _error-ch]
     empty-channel)
 
+  (-match-properties [this tracker solution patterns error-ch]
+    (where/match-patterns this tracker solution patterns error-ch))
+
   ;; activate-alias should not be called on an index VG, return empty chan
   (-activate-alias [_ _]
     (let [ch (async/chan)]

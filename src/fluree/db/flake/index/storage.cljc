@@ -89,31 +89,33 @@
 (defn write-db-root
   [{:keys [storage serializer] :as index-catalog} db garbage-addr]
   (go-try
-    (let [{:keys [alias schema t stats spot post opst tspo vg commit namespace-codes
+    (let [{:keys [alias schema t stats vg commit namespace-codes
                   reindex-min-bytes reindex-max-bytes max-old-indexes]}
           db
-
+          index-roots   (index/select-roots db)
+          index-data    (reduce-kv (fn [m idx root]
+                                     (assoc m idx (child-data root)))
+                                   {}
+                                   index-roots)
           prev-idx-t    (-> commit :index :data :t)
           prev-idx-addr (-> commit :index :address)
           vg-addresses  (<? (write-vg-map index-catalog vg))
-          data          (cond-> {:ledger-alias alias
-                                 :t               t
-                                 :v               1 ;; version of db root file
-                                 :schema          (vocab/serialize-schema schema)
-                                 :stats           (select-keys stats [:flakes :size])
-                                 :spot            (child-data spot)
-                                 :post            (child-data post)
-                                 :opst            (child-data opst)
-                                 :tspo            (child-data tspo)
-                                 :vg              vg-addresses
-                                 :timestamp       (util/current-time-millis)
-                                 :namespace-codes namespace-codes
-                                 :config          {:reindex-min-bytes reindex-min-bytes
-                                                   :reindex-max-bytes reindex-max-bytes
-                                                   :max-old-indexes   max-old-indexes}}
-                          prev-idx-t   (assoc :prev-index {:t       prev-idx-t
-                                                           :address prev-idx-addr})
-                          garbage-addr (assoc-in [:garbage :address] garbage-addr))
+          data          (-> {:ledger-alias    alias
+                             :t               t
+                             :v               1 ;; version of db root file
+                             :schema          (vocab/serialize-schema schema)
+                             :stats           (select-keys stats [:flakes :size])
+                             :vg              vg-addresses
+                             :timestamp       (util/current-time-millis)
+                             :namespace-codes namespace-codes
+                             :config          {:reindex-min-bytes reindex-min-bytes
+                                               :reindex-max-bytes reindex-max-bytes
+                                               :max-old-indexes   max-old-indexes}}
+                            (merge index-data)
+                            (cond->
+                             prev-idx-t   (assoc :prev-index {:t       prev-idx-t
+                                                              :address prev-idx-addr})
+                             garbage-addr (assoc-in [:garbage :address] garbage-addr)))
           serialized    (serde/-serialize-db-root serializer data)]
       (<? (write-index-file storage alias :root serialized)))))
 
@@ -138,10 +140,11 @@
 
 (defn reify-index-roots
   [{:keys [t ledger-alias] :as root-data}]
-  (reduce (fn [root idx]
+  (reduce (fn [roots idx]
             (let [comparator (get index/comparators idx)]
-              (update root idx reify-index-root ledger-alias comparator t)))
-          root-data index/types))
+              (update roots idx reify-index-root ledger-alias comparator t)))
+          root-data
+          (index/indexes-for root-data)))
 
 (defn deserialize-preds
   [preds]

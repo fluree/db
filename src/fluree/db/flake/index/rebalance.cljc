@@ -197,7 +197,7 @@
 
 (defn homogenize
   ([db leaf-size branch-size flake-xf error-ch]
-   (->> index/types
+   (->> (index/indexes-for db)
         (map (fn [idx]
                (homogenize-index db idx leaf-size branch-size flake-xf error-ch)))
         async/merge
