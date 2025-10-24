@@ -1,5 +1,5 @@
 (ns fluree.db.util.async
-  (:require [clojure.core.async :as async :refer [<! >! chan go]]
+  (:require [clojure.core.async :as async :refer [<! >! chan go go-loop]]
             [fluree.db.util :as util]
             [fluree.db.util.compare :refer [max-key-by]])
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
@@ -77,18 +77,17 @@
 
 (defn fill-voids
   [items chs]
-  (go
-    (let [item-count (count items)]
-      (loop [current-items items
-             i             0]
-        (if (< i item-count)
-          (let [next-i (inc i)]
-            (if (void? (nth current-items i))
-              (when-some [new-item (<! (nth chs i))] ; return empty channel on
-                                                     ; any closed input channel.
-                (recur (assoc current-items i new-item) next-i))
-              (recur current-items next-i)))
-          current-items)))))
+  (let [item-count (count items)]
+    (go-loop [current-items items
+              i             0]
+      (if (< i item-count)
+        (let [next-i (inc i)]
+          (if (void? (nth current-items i))
+            (when-some [new-item (<! (nth chs i))] ; return empty channel on
+                                        ; any closed input channel.
+              (recur (assoc current-items i new-item) next-i))
+            (recur current-items next-i)))
+        current-items))))
 
 (defn void-unlike-keys
   [key-cmp key-fn k items]
@@ -131,14 +130,13 @@
   ([key-cmp key-fn buf-or-n xform chs]
    (let [item-count (count chs)
          out-ch     (async/chan buf-or-n xform)]
-     (go
-       (loop [cur-items (void-vec item-count)]
-         (if-some [next-items (<! (fill-voids cur-items chs))]
-           (let [max-k        (apply max-key-by key-cmp key-fn next-items)
-                 pruned-items (void-unlike-keys key-cmp key-fn max-k next-items)]
-             (if (full? pruned-items)
-               (do (>! out-ch pruned-items)
-                   (recur (void-vec item-count)))
-               (recur pruned-items)))
-           (async/close! out-ch))))
+     (go-loop [cur-items (void-vec item-count)]
+       (if-some [next-items (<! (fill-voids cur-items chs))]
+         (let [max-k        (apply max-key-by key-cmp key-fn next-items)
+               pruned-items (void-unlike-keys key-cmp key-fn max-k next-items)]
+           (if (full? pruned-items)
+             (do (>! out-ch pruned-items)
+                 (recur (void-vec item-count)))
+             (recur pruned-items)))
+         (async/close! out-ch)))
      out-ch)))
