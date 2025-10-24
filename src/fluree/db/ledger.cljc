@@ -6,6 +6,7 @@
             [fluree.db.did :as did]
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
+            [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.json-ld.credential :as credential]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.nameservice :as nameservice]
@@ -86,6 +87,31 @@
       :size    size
       :flakes  flakes
       :commit  commit})))
+
+(defn ledger-info
+  "Returns comprehensive ledger information including statistics for specified branch (or default branch if nil).
+   Computes current property and class statistics by replaying novelty on top of indexed stats.
+   Decodes SIDs to IRIs for user-friendly output."
+  ([ledger]
+   (ledger-info ledger const/default-branch-name))
+  ([{:keys [address alias] :as ledger} requested-branch]
+   (let [branch-data (get-branch-meta ledger requested-branch)
+         branch-name (:name branch-data)
+         current-db  (branch/current-db branch-data)
+         {:keys [commit stats t namespace-codes]} current-db
+         {:keys [size flakes]} stats
+         ;; Compute current stats by replaying novelty
+         current-stats (novelty/current-stats current-db)]
+     {:address    address
+      :alias      alias
+      :branch     branch-name
+      :t          t
+      :size       size
+      :flakes     flakes
+      :commit     commit
+      ;; Decode SIDs to IRIs for properties and classes
+      :properties (update-keys (:properties current-stats) #(iri/sid->iri % namespace-codes))
+      :classes    (update-keys (:classes current-stats) #(iri/sid->iri % namespace-codes))})))
 
 (defn notify
   "Returns false if provided commit update did not result in an update to the ledger because
