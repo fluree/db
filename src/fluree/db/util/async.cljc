@@ -1,7 +1,7 @@
 (ns fluree.db.util.async
-  (:require [clojure.core.async :as async :refer [<! >! chan go go-loop]]
+  (:require [clojure.core.async :as async :refer [<! >! chan go-loop]]
             [fluree.db.util :as util]
-            [fluree.db.util.compare :refer [max-key-by]])
+            [fluree.db.util.compare :refer [max-key-by min-key-by]])
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -83,8 +83,8 @@
       (if (< i item-count)
         (let [next-i (inc i)]
           (if (void? (nth current-items i))
-            (when-some [new-item (<! (nth chs i))] ; return empty channel on
-                                        ; any closed input channel.
+            (when-some [new-item (<! (nth chs i))] ; return nil any closed input
+                                                   ; channel.
               (recur (assoc current-items i new-item) next-i))
             (recur current-items next-i)))
         current-items))))
@@ -138,5 +138,103 @@
              (do (>! out-ch pruned-items)
                  (recur (void-vec item-count)))
              (recur pruned-items)))
+         (async/close! out-ch)))
+     out-ch)))
+
+(defn populated-items
+  "Filters out void items from `items`, returning `nil` if all items are void or
+  `items` was empty ."
+  [items]
+  (->> items
+       (filterv (complement void?))
+       not-empty))
+
+(defn min-populated-key
+  "Returns the minimum key from populated items, or nil if all items are void."
+  [key-cmp key-fn items]
+  (some->> items
+           populated-items
+           (apply min-key-by key-cmp key-fn)))
+
+(defn replace-unlike-keys
+  "Replaces items that don't have the target key with empty vectors.
+
+  Similar to void-unlike-keys but replaces with [] instead of ::void."
+  [key-cmp key-fn k items]
+  (mapv (fn [item]
+          (if (and (not (void? item))
+                   (zero? (key-cmp (key-fn item) k)))
+            item
+            []))
+        items))
+
+(defn void-output-items
+  "Replaces output items with ::void, keeping next items for non-output positions."
+  [output-items next-items]
+  (mapv (fn [output-item next-item]
+          (if (= output-item [])
+            next-item
+            ::void))
+        output-items
+        next-items))
+
+(defn fill-voids-outer
+  "Like fill-voids, but for outer joins - only returns nil when ALL channels are closed.
+
+  Fills void slots from their corresponding channels, but if a channel is closed,
+  leaves that slot as void and continues processing other channels."
+  [items chs]
+  (let [item-count (count items)]
+    (go-loop [current-items items
+              i             0]
+      (if (< i item-count)
+        (let [next-i (inc i)]
+          (if (void? (nth current-items i))
+            (if-some [new-item (<! (nth chs i))]
+              (recur (assoc current-items i new-item) next-i)
+              (recur current-items next-i))
+            (recur current-items next-i)))
+        (when (->> current-items populated-items seq)
+          current-items)))))
+
+(defn outer-join-by
+  "Merges items from multiple pre-sorted input channels into an output channel
+  containing chunks where items have the same key.
+
+  Similar to inner-join-by, but performs an outer join - outputs chunks for
+  ANY key present in at least one channel. Positions without matching items
+  are filled with empty vectors [].
+
+  Takes a collection of input channels `chs`, each containing items pre-sorted
+  by `key-fn` using the `key-cmp` comparator. Returns a channel that outputs
+  chunks (vectors) where each chunk may contain either an item from that channel
+  or an empty vector [] if that channel doesn't have the key.
+
+  The function advances through all channels simultaneously, always processing
+  items with the current minimum key value and replacing items with keys greater
+  than the minimum with []. Items are output whenever ANY channel has an item
+  with the minimum key.
+
+  Input channels must be pre-sorted in ascending order by the result of applying
+  `key-fn` and comparing with `key-cmp`.
+
+  `buf-or-n` is either a number corresponding to a buffer size or a buffer, and
+  `xform` is a transducer. When those arguments are supplied, they will be
+  applied to the output channel."
+  ([key-cmp key-fn chs]
+   (outer-join-by key-cmp key-fn nil chs))
+  ([key-cmp key-fn buf-or-n chs]
+   (outer-join-by key-cmp key-fn buf-or-n nil chs))
+  ([key-cmp key-fn buf-or-n xform chs]
+   (let [item-count (count chs)
+         out-ch     (async/chan buf-or-n xform)]
+     (go-loop [cur-items (void-vec item-count)]
+       (if-some [next-items (<! (fill-voids-outer cur-items chs))]
+         (if-some [min-k (min-populated-key key-cmp key-fn next-items)]
+           (let [output-items (replace-unlike-keys key-cmp key-fn min-k next-items)
+                 next-items   (void-output-items output-items next-items)]
+             (>! out-ch output-items)
+             (recur next-items))
+           (recur next-items))
          (async/close! out-ch)))
      out-ch)))
