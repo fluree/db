@@ -96,27 +96,22 @@
    (ledger-info ledger const/default-branch-name))
   ([{:keys [address alias] :as ledger} requested-branch]
    (let [branch-data (get-branch-meta ledger requested-branch)
+         branch-name (:name branch-data)
          current-db  (branch/current-db branch-data)
          {:keys [commit stats t namespace-codes]} current-db
          {:keys [size flakes]} stats
-         branch      (or requested-branch (:branch @(:state ledger)))
          ;; Compute current stats by replaying novelty
-         current-stats (novelty/current-stats current-db)
-         decode-nested-map (fn [sid-nested-map]
-                             (reduce-kv (fn [m sid nested]
-                                          (assoc m (iri/sid->iri sid namespace-codes) nested))
-                                        {}
-                                        sid-nested-map))]
+         current-stats (novelty/current-stats current-db)]
      {:address    address
       :alias      alias
-      :branch     branch
+      :branch     branch-name
       :t          t
       :size       size
       :flakes     flakes
       :commit     commit
       ;; Decode SIDs to IRIs for properties and classes
-      :properties (decode-nested-map (:properties current-stats))
-      :classes    (decode-nested-map (:classes current-stats))})))
+      :properties (update-keys (:properties current-stats) #(iri/sid->iri % namespace-codes))
+      :classes    (update-keys (:classes current-stats) #(iri/sid->iri % namespace-codes))})))
 
 (defn notify
   "Returns false if provided commit update did not result in an update to the ledger because

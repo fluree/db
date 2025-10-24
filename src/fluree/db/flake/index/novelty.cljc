@@ -360,7 +360,7 @@
         indexed-prop      (get indexed-stats :properties {})
         indexed-class     (get indexed-stats :classes {})
         spot-novelty      (get-in db [:novelty :spot])]
-    (if spot-novelty
+    (if (not-empty spot-novelty)
       ;; Synchronous computation for both FlakeDB and AsyncDB
       (let [novelty-updates (compute-stats-from-novelty spot-novelty indexed-prop indexed-class)]
         (assoc indexed-stats
