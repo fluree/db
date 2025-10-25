@@ -296,7 +296,7 @@
 
 (defn- component->user-value
   "Convert an internal pattern component to user-readable format"
-  [db component compact-fn]
+  [component compact-fn]
   (cond
     (where/unmatched-var? component)
     (str (where/get-variable component))
@@ -308,31 +308,26 @@
     (where/matched-value? component)
     (where/get-value component)
 
-    (where/matched-sid? component)
-    (let [sid (where/get-sid component db)
-          iri (iri/decode-sid db sid)]
-      (json-ld/compact iri compact-fn))
-
     :else
     (str component)))
 
 (defn- pattern->user-format
   "Convert internal pattern to user-readable triple format"
-  [db pattern compact-fn]
+  [pattern compact-fn]
   (let [ptype (where/pattern-type pattern)
         pdata (where/pattern-data pattern)]
     (case ptype
       :class
       (let [[s _ o] pdata]
-        {:subject (component->user-value db s compact-fn)
+        {:subject (component->user-value s compact-fn)
          :property "@type"
-         :object (component->user-value db o compact-fn)})
+         :object (component->user-value o compact-fn)})
 
       (:tuple :id)
       (let [[s p o] pdata]
-        {:subject (component->user-value db s compact-fn)
-         :property (component->user-value db p compact-fn)
-         :object (component->user-value db o compact-fn)})
+        {:subject (component->user-value s compact-fn)
+         :property (component->user-value p compact-fn)
+         :object (component->user-value o compact-fn)})
 
       ;; Other pattern types (filter, bind, etc.)
       {:type ptype
@@ -346,7 +341,7 @@
         selectivity (when (and stats optimizable?)
                       (optimize/calculate-selectivity db stats pattern))]
     {:type        ptype
-     :pattern     (pattern->user-format db pattern compact-fn)
+     :pattern     (pattern->user-format pattern compact-fn)
      :selectivity selectivity
      :optimizable optimizable?}))
 
