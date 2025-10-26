@@ -92,21 +92,6 @@
   [stats sid]
   (get-in stats [:properties sid :selectivity-subject]))
 
-(defn matched?
-  "Check if a component is matched (has a bound value, IRI, or SID)"
-  [component]
-  (where/matched? component))
-
-(defn unmatched?
-  "Check if a component is unmatched (variable)"
-  [component]
-  (not (matched? component)))
-
-(defn all-matched?
-  "Check if all components are matched"
-  [[s p o]]
-  (and (matched? s) (matched? p) (matched? o)))
-
 (defn estimate-bound-value
   "Estimate selectivity for bound value pattern: (?s p o) where o is bound.
    Uses pre-computed selectivity estimate (already ceiled and clamped during indexing).
@@ -132,17 +117,21 @@
       moderately-selective)))
 
 (defn calculate-selectivity
-  "Calculate selectivity score for a pattern."
+  "Calculate selectivity score for a pattern.
+   Lower score = more selective = execute first.
+   Returns nil for non-optimizable patterns or when stats are unavailable."
   [db stats pattern]
   (let [pattern-type (where/pattern-type pattern)
         pattern-data (where/pattern-data pattern)]
 
     (cond
-      (or (nil? stats) (empty? stats))
+      (or (nil? stats)
+          (empty? stats)
+          (not (optimizable-pattern? pattern)))
       nil
 
       (= :id pattern-type)
-      (if (matched? pattern-data)
+      (if (where/matched? pattern-data)
         highly-selective
         moderately-selective)
 
@@ -153,22 +142,26 @@
           (let [class-sid (get-sid db o)]
             (or (get-class-count stats class-sid) default-selectivity))
 
-          (all-matched? [s p o])
+          ;; Specific s-p-o triple lookup
+          (where/all-matched? [s p o])
           highly-selective
 
-          (and (matched? s) (matched? p) (unmatched? o))
+          ;; s-p-? lookup uses HLL estimate
+          (and (where/matched? s) (where/matched? p) (where/unmatched? o))
           (let [pred-sid (get-sid db p)]
             (estimate-bound-subject stats pred-sid))
 
-          (and (unmatched? s) (matched? p) (unmatched? o))
+          ;; ?-p-? property scan uses property count
+          (and (where/unmatched? s) (where/matched? p) (where/unmatched? o))
           (let [pred-sid (get-sid db p)]
             (or (get-property-count stats pred-sid) default-selectivity))
 
-          (and (unmatched? s) (matched? p) (matched? o))
+          ;; ?-p-o reverse lookup uses HLL estimate
+          (and (where/unmatched? s) (where/matched? p) (where/matched? o))
           (let [pred-sid (get-sid db p)]
             (estimate-bound-value stats pred-sid))
 
-          (and (unmatched? s) (unmatched? p) (unmatched? o))
+          (and (where/unmatched? s) (where/unmatched? p) (where/unmatched? o))
           full-scan
 
           :else
@@ -190,7 +183,7 @@
       {:score nil :inputs {:fallback? true :reason "No statistics available"}}
 
       (= :id pattern-type)
-      (if (matched? pattern-data)
+      (if (where/matched? pattern-data)
         {:score highly-selective
          :inputs {:type :id :matched? true}}
         {:score moderately-selective
@@ -210,18 +203,18 @@
                        (nil? class-count)
                        (assoc :fallback? true :reason "Class count not available"))})
 
-          (all-matched? [s p o])
+          (where/all-matched? [s p o])
           {:score highly-selective
            :inputs {:type :tuple-exact :all-matched? true}}
 
-          (and (matched? s) (matched? p) (unmatched? o))
+          (and (where/matched? s) (where/matched? p) (where/unmatched? o))
           (let [pred-sid (get-sid db p)
                 count (get-property-count stats pred-sid)
                 ndv-subjects (get-ndv-subjects stats pred-sid)
                 selectivity (get-selectivity-subject stats pred-sid)
                 score (estimate-bound-subject stats pred-sid)]
             {:score score
-             :inputs (cond-> {:type :tuple
+             :inputs (cond-> {:type :triple
                               :pattern :bound-subject
                               :property-sid pred-sid
                               :count count
@@ -232,19 +225,19 @@
                        (assoc :fallback? true
                               :reason (if count "NDV not available" "Count not available")))})
 
-          (and (unmatched? s) (matched? p) (unmatched? o))
+          (and (where/unmatched? s) (where/matched? p) (where/unmatched? o))
           (let [pred-sid (get-sid db p)
                 count (get-property-count stats pred-sid)
                 score (or count default-selectivity)]
             {:score score
-             :inputs (cond-> {:type :tuple
+             :inputs (cond-> {:type :triple
                               :pattern :property-scan
                               :property-sid pred-sid
                               :count count}
                        (nil? count)
                        (assoc :fallback? true :reason "Count not available"))})
 
-          (and (unmatched? s) (matched? p) (matched? o))
+          (and (where/unmatched? s) (where/matched? p) (where/matched? o))
           (let [pred-sid (get-sid db p)
                 count (get-property-count stats pred-sid)
                 ndv-values (get-ndv-values stats pred-sid)
@@ -252,7 +245,7 @@
                 clamped? (and selectivity (< selectivity 1.0))
                 score (estimate-bound-value stats pred-sid)]
             {:score score
-             :inputs (cond-> {:type :tuple
+             :inputs (cond-> {:type :triple
                               :pattern :bound-object
                               :property-sid pred-sid
                               :count count
@@ -264,7 +257,7 @@
                        (assoc :fallback? true
                               :reason (if count "NDV not available" "Count not available")))})
 
-          (and (unmatched? s) (unmatched? p) (unmatched? o))
+          (and (where/unmatched? s) (where/unmatched? p) (where/unmatched? o))
           {:score full-scan
            :inputs {:type :full-scan :full-scan? true}}
 
@@ -294,40 +287,33 @@
   "Optimize a single segment by sorting patterns by selectivity.
    Uses compare-triples as tie-breaker for equal scores to ensure stable ordering."
   [db stats patterns]
-  (if (or (nil? stats) (empty? stats))
-    ;; No stats, return as-is
-    patterns
-    ;; Sort by selectivity (lower = more selective = execute first)
-    ;; Use compare-triples as tie-breaker for equal scores
-    (let [with-scores (mapv (fn [pattern]
-                              {:pattern pattern
-                               :score (or (calculate-selectivity db stats pattern)
-                                          default-selectivity)})
-                            patterns)
-          cmp         (fn [{sa :score pa :pattern} {sb :score pb :pattern}]
-                        (let [c (compare sa sb)]
-                          (if (zero? c)
-                            (compare-triples pa pb)
-                            c)))
-          sorted      (sort cmp with-scores)]
-      (mapv :pattern sorted))))
+  ;; Sort by selectivity (lower = more selective = execute first)
+  ;; Use compare-triples as tie-breaker for equal scores
+  (let [with-scores (mapv (fn [pattern]
+                            {:pattern pattern
+                             :score (or (calculate-selectivity db stats pattern)
+                                        default-selectivity)})
+                          patterns)
+        cmp         (fn [{sa :score pa :pattern} {sb :score pb :pattern}]
+                      (let [c (compare sa sb)]
+                        (if (zero? c)
+                          (compare-triples pa pb)
+                          c)))
+        sorted      (sort cmp with-scores)]
+    (mapv :pattern sorted)))
 
 (defn optimize-patterns
   "Reorder patterns for optimal execution based on statistics.
    Splits on optimization boundaries and optimizes each segment independently."
   [db where-clause]
-  (let [stats (:stats db)]
-    (if (or (nil? stats) (empty? stats))
-      ;; No stats available, return as-is
-      where-clause
-      ;; Split into segments and optimize each
-      (let [segments (split-by-optimization-boundaries where-clause)]
-        (into []
-              (mapcat (fn [segment]
-                        (if (= :optimizable (:type segment))
-                          (optimize-segment db stats (:data segment))
-                          [(:data segment)])))
-              segments)))))
+  (let [stats (:stats db)
+        segments (split-by-optimization-boundaries where-clause)]
+    (into []
+          (mapcat (fn [segment]
+                    (if (= :optimizable (:type segment))
+                      (optimize-segment db stats (:data segment))
+                      [(:data segment)])))
+          segments)))
 
 (defprotocol Optimizable
   "Protocol for query optimization based on database statistics."
@@ -352,12 +338,15 @@
     Returns a channel that will contain a query plan map with:
     - :query - The optimized query
     - :plan - Execution plan details including:
-      - :optimization - :reordered, :unchanged, or :none
-      - :statistics - Available statistics info
-      - :original - Original pattern order with selectivity
-      - :optimized - Optimized pattern order with selectivity
-      - :segments - Pattern segments with boundaries
-      - :changed? - Boolean indicating if patterns were reordered
+      - :optimization - Status of optimization:
+        - :none - No statistics available, optimization not attempted
+        - :unchanged - Optimization ran, patterns already in optimal order
+        - :reordered - Optimization ran, patterns were reordered
+      - :statistics - Available statistics info (when stats present)
+      - :original - Original pattern order with selectivity (when stats present)
+      - :optimized - Optimized pattern order with selectivity (when stats present)
+      - :segments - Pattern segments with boundaries (when stats present)
+      - :changed? - Boolean indicating if patterns were reordered (when stats present)
 
     Parameters:
       db - The database (FlakeDB, AsyncDB, etc.)

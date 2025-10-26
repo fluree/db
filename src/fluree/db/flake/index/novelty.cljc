@@ -115,12 +115,13 @@
   `*overflow-bytes*`."
   [{:keys [flakes leftmost? rhs] :as leaf}]
   (if (overflow-leaf? leaf)
-    (let [target-size (/ *overflow-bytes* 2)]
+    (let [target-size (/ *overflow-bytes* 2)
+          [fflake & remaining] flakes]
       (log/debug "Rebalancing index leaf:"
                  (select-keys leaf [:id :ledger-alias]))
-      (loop [[f & r] flakes
-             cur-size  0
-             cur-first f
+      (loop [[f & r]   remaining
+             cur-size  (flake/size-flake fflake)
+             cur-first fflake
              leaves    []]
         (if (empty? r)
           (let [subrange  (flake/subrange flakes >= cur-first)
@@ -132,7 +133,8 @@
                                                      leftmost?))
                               (dissoc :id))]
             (conj leaves last-leaf))
-          (let [new-size (-> f flake/size-flake (+ cur-size) long)]
+          (let [flake-size (flake/size-flake f)
+                new-size   (+ cur-size flake-size)]
             (if (> new-size target-size)
               (let [subrange (flake/subrange flakes >= cur-first < f)
                     new-leaf (-> leaf
@@ -142,7 +144,7 @@
                                         :leftmost? (and (empty? leaves)
                                                         leftmost?))
                                  (dissoc :id))]
-                (recur r 0 f (conj leaves new-leaf)))
+                (recur r flake-size f (conj leaves new-leaf)))
               (recur r new-size cur-first leaves))))))
     [leaf]))
 
@@ -441,7 +443,7 @@
         indexed-classes    (get indexed-stats :classes {})
         indexed-sketches   (get indexed-stats :sketches {})
         spot-novelty       (get-in db [:novelty :spot])]
-    (if spot-novelty
+    (if (not-empty spot-novelty)
       ;; Synchronous computation for both FlakeDB and AsyncDB
       (let [novelty-updates (compute-stats-from-novelty spot-novelty indexed-properties indexed-classes indexed-sketches)
             properties      (add-computed-fields (:properties novelty-updates))]

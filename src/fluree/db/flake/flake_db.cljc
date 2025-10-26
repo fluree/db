@@ -40,7 +40,8 @@
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]
             [fluree.db.virtual-graph.flat-rank :as flat-rank]
-            [fluree.db.virtual-graph.index-graph :as vg])
+            [fluree.db.virtual-graph.index-graph :as vg]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -295,87 +296,85 @@
 
 (defn- component->user-value
   "Convert an internal pattern component to user-readable format"
-  [db component context]
+  [component compact-fn]
   (cond
+    (nil? component)
+    nil
+
     (where/unmatched-var? component)
     (str (where/get-variable component))
 
     (where/matched-iri? component)
     (let [iri (where/get-iri component)]
-      ;; Try to find matching prefix in context
-      (if-let [[prefix ns-iri] (some (fn [[k v]]
-                                       (when (and (string? v) (str/starts-with? iri v))
-                                         [k v]))
-                                     context)]
-        (str prefix ":" (subs iri (count ns-iri)))
-        iri))
+      (json-ld/compact iri compact-fn))
 
     (where/matched-value? component)
     (where/get-value component)
 
-    (where/matched-sid? component)
-    (let [sid (where/get-sid component db)
-          iri (iri/decode-sid db sid)]
-      (if-let [[prefix ns-iri] (some (fn [[k v]]
-                                       (when (and (string? v) (str/starts-with? iri v))
-                                         [k v]))
-                                     context)]
-        (str prefix ":" (subs iri (count ns-iri)))
-        iri))
-
     :else
-    (str component)))
+    (throw (ex-info (str "Unexpected component type: " (pr-str component))
+                    {:component component}))))
 
 (defn- pattern->user-format
   "Convert internal pattern to user-readable triple format"
-  [db pattern context]
+  [pattern compact-fn]
   (let [ptype (where/pattern-type pattern)
         pdata (where/pattern-data pattern)]
     (case ptype
       :class
       (let [[s _ o] pdata]
-        {:subject (component->user-value db s context)
-         :property "@type"
-         :object (component->user-value db o context)})
+        {:subject (component->user-value s compact-fn)
+         :property const/iri-type
+         :object (component->user-value o compact-fn)})
 
-      (:tuple :id)
+      :tuple
       (let [[s p o] pdata]
-        {:subject (component->user-value db s context)
-         :property (component->user-value db p context)
-         :object (component->user-value db o context)})
+        {:subject (component->user-value s compact-fn)
+         :property (component->user-value p compact-fn)
+         :object (component->user-value o compact-fn)})
+
+      :id
+      {:subject (component->user-value pdata compact-fn)}
 
       ;; Other pattern types (filter, bind, etc.)
       {:type ptype
        :data (pr-str pdata)})))
 
+(defn- pattern-type->user-type
+  "Convert internal pattern type to user-friendly type name"
+  [ptype]
+  (case ptype
+    :tuple :triple
+    ptype))
+
 (defn- pattern-explain
   "Generate explain information for a single pattern with detailed inputs.
    Per QUERY_STATS_AND_HLL.md lines 277-296, includes inputs used for selectivity calculation."
-  [db stats pattern context]
+  [db stats pattern compact-fn]
   (let [ptype       (where/pattern-type pattern)
         optimizable? (optimize/optimizable-pattern? pattern)]
     (if (and stats optimizable?)
       (let [{:keys [score inputs]} (optimize/calculate-selectivity-with-details db stats pattern)]
-        {:type        ptype
-         :pattern     (pattern->user-format db pattern context)
+        {:type        (pattern-type->user-type ptype)
+         :pattern     (pattern->user-format pattern compact-fn)
          :selectivity score
          :inputs      inputs
-         :optimizable optimizable?})
-      {:type        ptype
-       :pattern     (pattern->user-format db pattern context)
+         :optimizable (when optimizable? (pattern-type->user-type optimizable?))})
+      {:type        (pattern-type->user-type ptype)
+       :pattern     (pattern->user-format pattern compact-fn)
        :selectivity nil
-       :optimizable optimizable?})))
+       :optimizable (when optimizable? (pattern-type->user-type optimizable?))})))
 
 (defn- segment-explain
   "Generate explain information for pattern segments"
-  [db stats where-clause context]
+  [db stats where-clause compact-fn]
   (let [segments (optimize/split-by-optimization-boundaries where-clause)]
     (mapv (fn [segment]
             (if (= :optimizable (:type segment))
               {:type     :optimizable
-               :patterns (mapv #(pattern-explain db stats % context) (:data segment))}
+               :patterns (mapv #(pattern-explain db stats % compact-fn) (:data segment))}
               {:type    :boundary
-               :pattern (pattern-explain db stats (:data segment) context)}))
+               :pattern (pattern-explain db stats (:data segment) compact-fn)}))
           segments)))
 
 (defn optimize-query
@@ -396,22 +395,22 @@
         has-stat-counts? (and stats
                               (or (seq (:properties stats))
                                   (seq (:classes stats))))
-        context          (-> parsed-query :orig-context (or {}))]
+        context          (:context parsed-query)
+        compact-fn       (json-ld/compact-fn context)]
     (if-not has-stat-counts?
       {:query parsed-query
        :plan  {:optimization :none
                :reason       "No statistics available"
                :where-clause (:where parsed-query)}}
       (let [where-clause      (:where parsed-query)
-            optimized-where   (if where-clause
-                                (optimize/optimize-patterns db where-clause)
-                                where-clause)
+            optimized-where   (when where-clause
+                                (optimize/optimize-patterns db where-clause))
             original-explain  (when where-clause
-                                (mapv #(pattern-explain db stats % context) where-clause))
+                                (mapv #(pattern-explain db stats % compact-fn) where-clause))
             optimized-explain (when optimized-where
-                                (mapv #(pattern-explain db stats % context) optimized-where))
+                                (mapv #(pattern-explain db stats % compact-fn) optimized-where))
             segments          (when where-clause
-                                (segment-explain db stats where-clause context))
+                                (segment-explain db stats where-clause compact-fn))
             changed?          (not= where-clause optimized-where)]
         {:query (assoc parsed-query :where optimized-where)
          :plan  {:optimization (if changed? :reordered :unchanged)

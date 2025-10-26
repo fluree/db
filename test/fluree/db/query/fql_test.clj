@@ -652,3 +652,33 @@
                    :where [{:id '?s :ex/foo '?foo}]}]
         (is (= "Error in value for \"select\"; Select must be a valid selector, a wildcard symbol (`*`), or a vector of selectors; Provided: [:* ?foo];  See documentation for details: https://next.developers.flur.ee/docs/reference/errorcodes#query-invalid-select"
                (ex-message @(fluree/query db query))))))))
+
+(deftest service-test
+  (let [conn @(fluree/connect-memory)
+        db0  @(fluree/create conn "service-test")
+        db1  @(fluree/update db0 {"@context" {"ex" "http://example.com/"}
+                                  "insert" (mapv #(do {"@id" (str "ex:" %)
+                                                       "@type" (if (odd? %) "ex:Odd" "ex:Even")
+                                                       "ex:name" (str "name" %)
+                                                       "ex:num" [(dec %) % (inc %)]
+                                                       "ex:ref" {"@id" (str "ex:" (inc %))}})
+                                                 (range 10))})]
+    (testing "when service endpoint is nonresponsive"
+      (testing ":service returns an error"
+        (is (= "Error processing service response http://localhost:10000/sparql due to exception: xhttp error - http://localhost:10000/sparql - "
+               (ex-message @(fluree/query db1 {"@context" {"ex" "http://example.com/"}
+                                               "where" [{"@id" "?s" "@type" "ex:Even" "ex:ref" "?ref"}
+                                                        [:service {:silent? false :service "http://localhost:10000/sparql"
+                                                                   :clause "{ ?rev ex:name ?name ; a ?type .}"}]]
+                                               "select" ["?s" "?type"]})))))
+      (testing ":service silent returns a response without bindings from the remote service"
+        (is (= [["ex:0" nil]
+                ["ex:2" nil]
+                ["ex:4" nil]
+                ["ex:6" nil]
+                ["ex:8" nil]]
+               @(fluree/query db1 {"@context" {"ex" "http://example.com/"}
+                                   "where" [{"@id" "?s" "@type" "ex:Even" "ex:ref" "?ref"}
+                                            [:service {:silent? true :service "http://localhost:10000/sparql"
+                                                       :clause "{ ?rev ex:name ?name ; a ?type .}"}]]
+                                   "select" ["?s" "?type"]})))))))

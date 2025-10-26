@@ -64,24 +64,24 @@
                                     :object "ex:Person"}
                           :selectivity 2        ;; 2 Person instances
                           :optimizable :class}
-                         {:type :tuple
+                         {:type :triple
                           :pattern {:subject "?person"
                                     :property "ex:name"
                                     :object "?name"}
                           :selectivity 2        ;; ex:name property has 2 values
-                          :optimizable :tuple}]
+                          :optimizable :triple}]
               :optimized [{:type :class
                            :pattern {:subject "?person"
                                      :property "@type"
                                      :object "ex:Person"}
                            :selectivity 2
                            :optimizable :class}
-                          {:type :tuple
+                          {:type :triple
                            :pattern {:subject "?person"
                                      :property "ex:name"
                                      :object "?name"}
                            :selectivity 2
-                           :optimizable :tuple}]}
+                           :optimizable :triple}]}
              (-> (:plan plan)
                  (select-keys [:optimization :changed? :statistics :original :optimized])
                  strip-inputs))
@@ -143,19 +143,19 @@
                                     :object "ex:Person"}
                           :selectivity 100      ;; 100 Person instances
                           :optimizable :class}
-                         {:type :tuple
+                         {:type :triple
                           :pattern {:subject "?person"
                                     :property "ex:email"
                                     :object "rare@example.org"}
                           :selectivity 2        ;; NDV-based: max(1, ceil(100/~99)) = 2
-                          :optimizable :tuple}]
+                          :optimizable :triple}]
               ;; Optimized order: email first (2), then class (100)
-              :optimized [{:type :tuple
+              :optimized [{:type :triple
                            :pattern {:subject "?person"
                                      :property "ex:email"
                                      :object "rare@example.org"}
                            :selectivity 2
-                           :optimizable :tuple}
+                           :optimizable :triple}
                           {:type :class
                            :pattern {:subject "?person"
                                      :property "@type"
@@ -222,19 +222,19 @@
                                     :object "ex:Person"}
                           :selectivity 50       ;; 50 Person instances
                           :optimizable :class}
-                         {:type :tuple
+                         {:type :triple
                           :pattern {:subject "?person"
                                     :property "ex:badge"
                                     :object "?badge"}
                           :selectivity 5        ;; Only 5 entities have ex:badge property
-                          :optimizable :tuple}]
+                          :optimizable :triple}]
               ;; Optimized order: badge property first (5), then class (50)
-              :optimized [{:type :tuple
+              :optimized [{:type :triple
                            :pattern {:subject "?person"
                                      :property "ex:badge"
                                      :object "?badge"}
                            :selectivity 5
-                           :optimizable :tuple}
+                           :optimizable :triple}
                           {:type :class
                            :pattern {:subject "?person"
                                      :property "@type"
@@ -298,12 +298,12 @@
             "Class pattern should have :class-count"))
 
       ;; Test bound-object pattern inputs structure and NDV flag
-      (let [email-pattern (first (filter #(and (= :tuple (:type %))
+      (let [email-pattern (first (filter #(and (= :triple (:type %))
                                                (some-> % :pattern :property (= "ex:email")))
                                          original))
             inputs (:inputs email-pattern)]
-        (is (= :tuple (:type inputs))
-            "Bound-object pattern should have :type :tuple")
+        (is (= :triple (:type inputs))
+            "Bound-object pattern inputs should have :type :triple")
         (is (= :bound-object (:pattern inputs))
             "Bound-object pattern should have :pattern :bound-object")
         (is (contains? inputs :property-sid)

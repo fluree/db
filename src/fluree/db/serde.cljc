@@ -1,4 +1,4 @@
-(ns fluree.db.serde.protocol)
+(ns fluree.db.serde)
 
 #?(:clj (set! *warn-on-reflection* true))
 

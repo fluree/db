@@ -100,12 +100,11 @@
 
   Options map (all optional):
     :parallelism - Number of parallel operations (default: 4)
-    :cache-max-mb - Maximum cache size in MB (default: 1000)
+    :cache-max-mb - Maximum cache size in MB (default: half of JVM -Xmx, or 1000 MB for Node.js)
     :defaults - Default settings map for operations"
   ([]
    (connect-memory {}))
-  ([{:keys [parallelism cache-max-mb defaults],
-     :or   {parallelism 4, cache-max-mb 1000}}]
+  ([{:keys [parallelism cache-max-mb defaults]}]
    (let [memory-config (cond-> {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
                                             "@vocab" "https://ns.flur.ee/system#"}
                                 "@id"      "memory"
@@ -128,7 +127,7 @@
   Options:
     - storage-path (optional): Directory path for file storage (default: \"data\")
     - parallelism (optional): Number of parallel operations (default: 4)
-    - cache-max-mb (optional): Maximum memory for caching in MB (default: 1000)
+    - cache-max-mb (optional): Maximum memory for caching in MB (default: half of JVM -Xmx, or 1000 MB for Node.js)
     - aes256-key (optional): AES-256 encryption key for file storage encryption.
       When provided, all data will be encrypted using AES-256-CBC with PKCS5 padding.
       The key should be exactly 32 bytes long for optimal security.
@@ -154,7 +153,7 @@
   ([]
    (connect-file {}))
   ([{:keys [storage-path parallelism cache-max-mb defaults aes256-key],
-     :or   {storage-path "data", parallelism 4, cache-max-mb 1000}}]
+     :or   {storage-path "data"}}]
    (let [file-config (cond-> {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
                                           "@vocab" "https://ns.flur.ee/system#"}
                               "@id"      "file"
@@ -191,12 +190,11 @@
        - s3-retry-base-delay-ms (optional): Base backoff delay in ms (default 150)
        - s3-retry-max-delay-ms (optional): Max backoff delay in ms (default 2000)
        - parallelism (optional): Number of parallel operations (default: 4)
-       - cache-max-mb (optional): Maximum memory for caching in MB (default: 1000)
+       - cache-max-mb (optional): Maximum memory for caching in MB (default: half of JVM -Xmx, or 1000 MB for Node.js)
        - defaults (optional): Default options for ledgers created with this connection"
      ([{:keys [s3-bucket s3-prefix s3-endpoint parallelism cache-max-mb defaults
                s3-read-timeout-ms s3-write-timeout-ms s3-list-timeout-ms
-               s3-max-retries s3-retry-base-delay-ms s3-retry-max-delay-ms],
-        :or   {parallelism 4, cache-max-mb 1000}}]
+               s3-max-retries s3-retry-base-delay-ms s3-retry-max-delay-ms]}]
       (when-not s3-bucket
         (throw (ex-info "S3 bucket name is required for S3 connection"
                         {:status 400 :error :db/invalid-config})))
