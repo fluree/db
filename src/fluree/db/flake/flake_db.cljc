@@ -324,7 +324,7 @@
       :class
       (let [[s _ o] pdata]
         {:subject (component->user-value s compact-fn)
-         :property "@type"
+         :property const/iri-type
          :object (component->user-value o compact-fn)})
 
       :tuple
@@ -340,17 +340,23 @@
       {:type ptype
        :data (pr-str pdata)})))
 
+(defn- pattern-type->user-type
+  "Convert internal pattern type to user-friendly type name"
+  [ptype]
+  (case ptype
+    :tuple :triple
+    ptype))
+
 (defn- pattern-explain
   "Generate explain information for a single pattern"
   [db stats pattern compact-fn]
   (let [ptype       (where/pattern-type pattern)
         optimizable? (optimize/optimizable-pattern? pattern)
-        selectivity (when (and stats optimizable?)
-                      (optimize/calculate-selectivity db stats pattern))]
-    {:type        ptype
+        selectivity (optimize/calculate-selectivity db stats pattern)]
+    {:type        (pattern-type->user-type ptype)
      :pattern     (pattern->user-format pattern compact-fn)
      :selectivity selectivity
-     :optimizable optimizable?}))
+     :optimizable (when optimizable? (pattern-type->user-type optimizable?))}))
 
 (defn- segment-explain
   "Generate explain information for pattern segments"

@@ -53,24 +53,24 @@
                                     :object "ex:Person"}
                           :selectivity 2        ;; 2 Person instances
                           :optimizable :class}
-                         {:type :tuple
+                         {:type :triple
                           :pattern {:subject "?person"
                                     :property "ex:name"
                                     :object "?name"}
                           :selectivity 2        ;; ex:name property has 2 values
-                          :optimizable :tuple}]
+                          :optimizable :triple}]
               :optimized [{:type :class
                            :pattern {:subject "?person"
                                      :property "@type"
                                      :object "ex:Person"}
                            :selectivity 2
                            :optimizable :class}
-                          {:type :tuple
+                          {:type :triple
                            :pattern {:subject "?person"
                                      :property "ex:name"
                                      :object "?name"}
                            :selectivity 2
-                           :optimizable :tuple}]}
+                           :optimizable :triple}]}
              (-> (:plan plan)
                  (select-keys [:optimization :changed? :statistics :original :optimized])))
           "Explain should not reorder when both patterns have equal selectivity (2 = 2)"))))
@@ -131,19 +131,19 @@
                                     :object "ex:Person"}
                           :selectivity 100      ;; 100 Person instances
                           :optimizable :class}
-                         {:type :tuple
+                         {:type :triple
                           :pattern {:subject "?person"
                                     :property "ex:email"
                                     :object "rare@example.org"}
                           :selectivity 0        ;; Specific value lookup (most selective)
-                          :optimizable :tuple}]
+                          :optimizable :triple}]
               ;; Optimized order: email first (0), then class (100)
-              :optimized [{:type :tuple
+              :optimized [{:type :triple
                            :pattern {:subject "?person"
                                      :property "ex:email"
                                      :object "rare@example.org"}
                            :selectivity 0
-                           :optimizable :tuple}
+                           :optimizable :triple}
                           {:type :class
                            :pattern {:subject "?person"
                                      :property "@type"
@@ -209,19 +209,19 @@
                                     :object "ex:Person"}
                           :selectivity 50       ;; 50 Person instances
                           :optimizable :class}
-                         {:type :tuple
+                         {:type :triple
                           :pattern {:subject "?person"
                                     :property "ex:badge"
                                     :object "?badge"}
                           :selectivity 5        ;; Only 5 entities have ex:badge property
-                          :optimizable :tuple}]
+                          :optimizable :triple}]
               ;; Optimized order: badge property first (5), then class (50)
-              :optimized [{:type :tuple
+              :optimized [{:type :triple
                            :pattern {:subject "?person"
                                      :property "ex:badge"
                                      :object "?badge"}
                            :selectivity 5
-                           :optimizable :tuple}
+                           :optimizable :triple}
                           {:type :class
                            :pattern {:subject "?person"
                                      :property "@type"
