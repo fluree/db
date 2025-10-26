@@ -396,9 +396,8 @@
                :reason       "No statistics available"
                :where-clause (:where parsed-query)}}
       (let [where-clause      (:where parsed-query)
-            optimized-where   (if where-clause
-                                (optimize/optimize-patterns db where-clause)
-                                where-clause)
+            optimized-where   (when where-clause
+                                (optimize/optimize-patterns db where-clause))
             original-explain  (when where-clause
                                 (mapv #(pattern-explain db stats % compact-fn) where-clause))
             optimized-explain (when optimized-where

@@ -73,34 +73,22 @@
   [stats sid]
   (get-in stats [:classes sid :count]))
 
-(defn matched?
-  "Check if a component is matched (has a bound value, IRI, or SID)"
-  [component]
-  (where/matched? component))
-
-(defn unmatched?
-  "Check if a component is unmatched (variable)"
-  [component]
-  (not (matched? component)))
-
-(defn all-matched?
-  "Check if all components are matched"
-  [[s p o]]
-  (and (matched? s) (matched? p) (matched? o)))
-
 (defn calculate-selectivity
   "Calculate selectivity score for a pattern.
-   Lower score = more selective = execute first."
+   Lower score = more selective = execute first.
+   Returns nil for non-optimizable patterns or when stats are unavailable."
   [db stats pattern]
   (let [pattern-type (where/pattern-type pattern)
         pattern-data (where/pattern-data pattern)]
 
     (cond
-      (or (nil? stats) (empty? stats))
+      (or (nil? stats)
+          (empty? stats)
+          (not (optimizable-pattern? pattern)))
       nil
 
       (= :id pattern-type)
-      (if (matched? pattern-data)
+      (if (where/matched? pattern-data)
         highly-selective
         moderately-selective)
 
@@ -114,26 +102,26 @@
             (or (get-class-count stats class-sid) default-selectivity))
 
           ;; Specific s-p-o triple lookup
-          (all-matched? [s p o])
+          (where/all-matched? [s p o])
           highly-selective
 
           ;; s-p-? lookup uses property count
-          (and (matched? s) (matched? p) (unmatched? o))
+          (and (where/matched? s) (where/matched? p) (where/unmatched? o))
           (let [pred-iri (get-iri p)
                 pred-sid (encode-iri-to-sid db pred-iri)]
             (or (get-property-count stats pred-sid) moderately-selective))
 
           ;; ?-p-? property scan uses property count
-          (and (unmatched? s) (matched? p) (unmatched? o))
+          (and (where/unmatched? s) (where/matched? p) (where/unmatched? o))
           (let [pred-iri (get-iri p)
                 pred-sid (encode-iri-to-sid db pred-iri)]
             (or (get-property-count stats pred-sid) default-selectivity))
 
           ;; ?-p-o reverse lookup (find subjects with specific value)
-          (and (unmatched? s) (matched? p) (matched? o))
+          (and (where/unmatched? s) (where/matched? p) (where/matched? o))
           highly-selective
 
-          (and (unmatched? s) (unmatched? p) (unmatched? o))
+          (and (where/unmatched? s) (where/unmatched? p) (where/unmatched? o))
           full-scan
 
           :else
@@ -160,34 +148,27 @@
 (defn optimize-segment
   "Optimize a single segment by sorting patterns by selectivity"
   [db stats patterns]
-  (if (or (nil? stats) (empty? stats))
-    ;; No stats, return as-is
-    patterns
-    ;; Sort by selectivity (lower = more selective = execute first)
-    (let [with-scores (mapv (fn [pattern]
-                              {:pattern pattern
-                               :score (or (calculate-selectivity db stats pattern)
-                                          default-selectivity)})
-                            patterns)
-          sorted      (sort-by :score with-scores)]
-      (mapv :pattern sorted))))
+  ;; Sort by selectivity (lower = more selective = execute first)
+  (let [with-scores (mapv (fn [pattern]
+                            {:pattern pattern
+                             :score (or (calculate-selectivity db stats pattern)
+                                        default-selectivity)})
+                          patterns)
+        sorted      (sort-by :score with-scores)]
+    (mapv :pattern sorted)))
 
 (defn optimize-patterns
   "Reorder patterns for optimal execution based on statistics.
    Splits on optimization boundaries and optimizes each segment independently."
   [db where-clause]
-  (let [stats (:stats db)]
-    (if (or (nil? stats) (empty? stats))
-      ;; No stats available, return as-is
-      where-clause
-      ;; Split into segments and optimize each
-      (let [segments (split-by-optimization-boundaries where-clause)]
-        (into []
-              (mapcat (fn [segment]
-                        (if (= :optimizable (:type segment))
-                          (optimize-segment db stats (:data segment))
-                          [(:data segment)])))
-              segments)))))
+  (let [stats (:stats db)
+        segments (split-by-optimization-boundaries where-clause)]
+    (into []
+          (mapcat (fn [segment]
+                    (if (= :optimizable (:type segment))
+                      (optimize-segment db stats (:data segment))
+                      [(:data segment)])))
+          segments)))
 
 (defprotocol Optimizable
   "Protocol for query optimization based on database statistics."
@@ -212,12 +193,15 @@
     Returns a channel that will contain a query plan map with:
     - :query - The optimized query
     - :plan - Execution plan details including:
-      - :optimization - :reordered, :unchanged, or :none
-      - :statistics - Available statistics info
-      - :original - Original pattern order with selectivity
-      - :optimized - Optimized pattern order with selectivity
-      - :segments - Pattern segments with boundaries
-      - :changed? - Boolean indicating if patterns were reordered
+      - :optimization - Status of optimization:
+        - :none - No statistics available, optimization not attempted
+        - :unchanged - Optimization ran, patterns already in optimal order
+        - :reordered - Optimization ran, patterns were reordered
+      - :statistics - Available statistics info (when stats present)
+      - :original - Original pattern order with selectivity (when stats present)
+      - :optimized - Optimized pattern order with selectivity (when stats present)
+      - :segments - Pattern segments with boundaries (when stats present)
+      - :changed? - Boolean indicating if patterns were reordered (when stats present)
 
     Parameters:
       db - The database (FlakeDB, AsyncDB, etc.)
