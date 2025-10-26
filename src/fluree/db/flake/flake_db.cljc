@@ -298,6 +298,9 @@
   "Convert an internal pattern component to user-readable format"
   [component compact-fn]
   (cond
+    (nil? component)
+    nil
+
     (where/unmatched-var? component)
     (str (where/get-variable component))
 
@@ -309,7 +312,8 @@
     (where/get-value component)
 
     :else
-    (str component)))
+    (throw (ex-info (str "Unexpected component type: " (pr-str component))
+                    {:component component}))))
 
 (defn- pattern->user-format
   "Convert internal pattern to user-readable triple format"
@@ -323,11 +327,14 @@
          :property "@type"
          :object (component->user-value o compact-fn)})
 
-      (:tuple :id)
+      :tuple
       (let [[s p o] pdata]
         {:subject (component->user-value s compact-fn)
          :property (component->user-value p compact-fn)
          :object (component->user-value o compact-fn)})
+
+      :id
+      {:subject (component->user-value pdata compact-fn)}
 
       ;; Other pattern types (filter, bind, etc.)
       {:type ptype
