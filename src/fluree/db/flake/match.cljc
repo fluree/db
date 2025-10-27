@@ -369,7 +369,7 @@
 
 (defn assign-patterns
   "Assigns matched values to patterns and expands properties with children.
-  Returns a sequence of maps with :root-pid and :triples keys."
+  Returns a sequence of triples vectors."
   [db solution patterns]
   (->> patterns
        (map (fn [pattern]
@@ -380,6 +380,11 @@
        (map (partial where/compute-sids db))
        (map (partial expand-property-children db))
        (merge-related-property-families db)))
+(defn first-sid
+  "Extracts the subject ID from the first flake of `flake-chunk`"
+  [flake-chunk]
+  (flake/s (first flake-chunk)))
+
 
 (defn match-properties
   [db tracker solution patterns error-ch]
