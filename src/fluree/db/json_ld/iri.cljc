@@ -2,7 +2,8 @@
   (:require [clojure.set :refer [map-invert]]
             [clojure.string :as str]
             [fluree.db.util :as util]
-            [nano-id.core :refer [nano-id]]))
+            [nano-id.core :refer [nano-id]])
+  #?(:clj (:import [com.github.benmanes.caffeine.cache Caffeine])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -70,6 +71,30 @@
    "_:"                                          24
    f-idx-ns                                      25})
 
+;; =============================================================================
+;; SID Interning Configuration
+;; =============================================================================
+
+#?(:clj
+   (do
+     (deftype InternerKey [^int ns-code ^String name]
+       Object
+       (equals [_ other]
+         (and (instance? InternerKey other)
+              (let [^InternerKey other other]
+                (and (= ns-code (.-ns_code other))
+                     (= name (.-name other))))))
+       (hashCode [_]
+         (clojure.lang.Util/hashCombine (int ns-code) (.hashCode name))))
+
+     (def ^:private interner-cache
+       "Caffeine cache with weak values for SID interning.
+        No size limit - weak values ensure GC reclaims unused SIDs."
+       (delay
+         (-> (Caffeine/newBuilder)
+             (.weakValues)
+             (.build))))))
+
 (declare compare-SIDs sid-equiv?)
 
 ;; TODO - verify sort order is same!!
@@ -111,9 +136,25 @@
        (= (.-namespace-code sid) (.-namespace-code other))
        (= (.-name sid) (.-name other))))
 
-(defn ->sid ^SID
-  [ns-code nme]
+(defn ->sid
+  "Create a SID from namespace code and name.
+   This is an internal function - for external use, prefer using
+   iri->sid or deserialize-sid which will go through interning."
+  ^SID [ns-code nme]
   (->SID #?(:clj (int ns-code) :cljs ns-code) nme))
+
+#?(:clj
+   (defn- intern-sid-impl
+     "Intern a SID using Caffeine cache with weak values.
+      Multiple concurrent requests for the same SID will only construct it once."
+     [ns-code name]
+     (let [key (->InternerKey ns-code name)
+           cache ^com.github.benmanes.caffeine.cache.Cache @interner-cache]
+       (.get cache key
+             (reify java.util.function.Function
+               (apply [_ k]
+                 (let [^InternerKey k k]
+                   (->sid (.-ns_code k) (.-name k)))))))))
 
 (defn get-ns-code
   [^SID sid]
@@ -124,8 +165,12 @@
   (.-name sid))
 
 (defn deserialize-sid
+  "Deserialize a SID from [ns-code name] vector.
+   On JVM, always uses interning for memory efficiency.
+   On ClojureScript, creates a new SID instance."
   [[ns-code nme]]
-  (->sid ns-code nme))
+  #?(:clj (intern-sid-impl ns-code nme)
+     :cljs (->sid ns-code nme)))
 
 (defn measure-sid
   "Returns the size of an SID."
@@ -224,15 +269,15 @@
   (->sid util/max-integer ""))
 
 (defn iri->sid
-  "Converts a string iri into a vector of long integer codes. The first code
-  corresponds to the iri's namespace, and the remaining codes correspond to the
-  iri's name split into 8-byte chunks"
+  "Converts a string iri into a SID.
+   On JVM, always uses interning for memory efficiency."
   ([iri]
    (iri->sid iri default-namespaces))
   ([iri namespaces]
    (let [[ns nme] (decompose iri)]
      (when-let [ns-code (get namespaces ns)]
-       (->sid ns-code nme)))))
+       #?(:clj (intern-sid-impl ns-code nme)
+          :cljs (->sid ns-code nme))))))
 
 (defn get-max-namespace-code
   [ns-codes]
