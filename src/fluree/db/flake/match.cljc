@@ -317,7 +317,7 @@
             new-triples     (set/difference related-triples visited)]
         (recur (into remaining* new-triples)
                (conj visited current)))
-      (consolidate visited))))
+      visited)))
 
 (defn merge-related-property-groups
   "Merges groups of triples that share any properties (handles equivalent properties).
@@ -340,9 +340,10 @@
         (if (empty? remaining)
           result
           (let [seed            (first remaining)
-                related-triples (group-shared-properties db pid->triples seed)]
+                related-triples (group-shared-properties db pid->triples seed)
+                merged-triples  (consolidate related-triples)]
             (recur (set/difference remaining related-triples)
-                   (conj result related-triples))))))))
+                   (conj result merged-triples))))))))
 
 (defn assign-patterns
   "Processes query patterns into property groups for matching.
