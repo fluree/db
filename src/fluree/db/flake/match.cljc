@@ -8,8 +8,8 @@
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util :as util :refer [vswap!]]
-            [fluree.db.util.async :refer [<? go-try inner-join-by
+            [fluree.db.util :as util :refer [cartesian-product vswap!]]
+            [fluree.db.util.async :refer [<? go-try inner-join-by outer-join-by
                                           repartition-each-by]]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -204,168 +204,145 @@
                  (where/match-sid sub-obj alias cls)))
           (subclasses db cls))))
 
-(defn match-property-flakes
-  [solution triple db property-flakes]
-  (map (fn [flake]
-         (where/match-flake solution triple db flake))
-       property-flakes))
+(defn match-flake-against-triples
+  "Matches a single flake against a vector of triple patterns.
 
-(defn match-subject-triple
-  [initial-solutions triple db property-flakes]
-  (mapcat (fn [solution]
-            (match-property-flakes solution triple db property-flakes))
-          initial-solutions))
+  Tries each triple in sequence until one matches. Returns the updated solution
+  if any triple matches, nil otherwise."
+  [solution triples db flake]
+  (some (fn [triple]
+          (where/match-flake solution triple db flake))
+        triples))
 
-(defn match-subject-property
-  [initial-solutions triples db property-flakes]
-  (mapcat (fn [triple]
-            (match-subject-triple initial-solutions triple db property-flakes))
-          triples))
+(defn build-solution-from-flake-tuple
+  "Builds a solution from a tuple of flakes by matching each against its triples.
 
-(defn with-family
-  "Adds mappings for a single property family to the `pid-map`.
+  Reduces over the flake tuple, matching each flake against its corresponding
+  triples vector and accumulating variable bindings in the solution.
 
-  For each triple in the family, extracts its property ID and maps it to the
-  complete set of triples for the family. This allows any property in the family
-  (parent or child) to retrieve all triples when matching.
+  Returns the final solution if all flakes match successfully, nil if any fail."
+  [initial-solution triple-groups db flake-tuple]
+  (reduce (fn [soln [triples flake]]
+            (if-let [next-soln (and soln (match-flake-against-triples soln triples db flake))]
+              next-soln
+              (reduced nil)))
+          initial-solution
+          (map vector triple-groups flake-tuple)))
 
-  Returns the updated map."
-  [db pid-map family-triples]
-  (reduce (fn [m [_s p _o]]
-            (let [pid (where/get-sid p db)]
-              (assoc m pid family-triples)))
-          pid-map family-triples))
+(defn match-inner-join
+  "Joins flake chunks across triples vectors.
 
-(defn match-join
-  "Joins flake chunks across property families. `property-families` is a sequence
-  of maps with `:root-pid` and :triples keys. `join` is a sequence of flake
-  chunks grouped by subject."
-  [solution property-families db join]
-  ;; Build a map from property ID (parent or child) to the root property's triples
-  (let [pid->triples (reduce (fn [pid-map {:keys [_root-pid triples]}]
-                               (with-family db pid-map triples))
-                             {} property-families)]
-    (loop [[s-chunk & r] join
-           new-solutions [solution]]
-      (if s-chunk
-        (let [pid            (->> s-chunk first flake/p)
-              triples        (get pid->triples pid)
-              new-solutions* (match-subject-property new-solutions triples db s-chunk)]
-          (recur r new-solutions*))
-        new-solutions))))
+  `triple-groups` is a sequence of triples vectors.
+  `join-tuple` is a vector of flake chunks, one per triples vector, all for the same subject.
 
-(defn expand-property-children
-  "Expands a triple to include child properties if they exist.
+  Computes the cartesian product of the flake chunks to get all combinations of
+  flakes (one from each chunk). For each combination, builds a solution by reducing
+  over the flakes and matching each against its corresponding triples.
 
-  Handles both rdfs:subPropertyOf and owl:equivalentProperty relationships by
-  querying the :childProps from the schema. Note that equivalent properties are
-  stored bidirectionally as subproperties, so querying prop-a will also query
-  prop-b if they are equivalent.
+  Returns a sequence of solutions."
+  [solution triple-groups db join-tuple]
+  (->> join-tuple
+       cartesian-product
+       (keep (fn [flake-tuple]
+               (build-solution-from-flake-tuple solution triple-groups db flake-tuple)))))
 
-  Expansion is non-recursive (one level only) to match the behavior of match-triple.
+(defn include-subproperties
+  "Returns a vector containing the original triple plus variants for each subproperty.
 
-  Returns a map with :root-pid (the original property ID) and :triples (expanded
-  triples including the parent property plus all child properties)."
+  Queries the schema of `db` for subproperties of the triple's property, handling
+  both rdfs:subPropertyOf and owl:equivalentProperty relationships. Equivalent
+  properties are stored bidirectionally as subproperties, so if prop-a is equivalent
+  to prop-b, both will be included when querying either one.
+
+  Only expands one level deep (non-recursive) to match the behavior of match-triple.
+
+  If no subproperties exist, returns a vector containing only the original triple."
   [db [s p o :as triple]]
-  (let [root-pid (where/get-sid p db)
-        triples  [triple]]
-    (if-some [child-props (and root-pid (where/get-child-properties db root-pid))]
-      (let [db-alias (:alias db)
-            triples* (into triples
-                           (map (fn [child-pid]
-                                  (let [p* (where/match-sid p db-alias child-pid)]
-                                    [s p* o])))
-                           child-props)]
-        {:root-pid root-pid
-         :triples  triples*})
-      {:root-pid root-pid
-       :triples  triples})))
+  (if-some [child-props (where/get-child-properties db (where/get-sid p db))]
+    (let [db-alias (:alias db)]
+      (into [triple]
+            (map (fn [child-pid]
+                   (let [p* (where/match-sid p db-alias child-pid)]
+                     [s p* o])))
+            child-props))
+    [triple]))
 
 (defn get-property-ids
-  "Extracts all property IDs from a property family's triples."
-  [db property-family]
+  "Extracts all property IDs from the `triples` collection."
+  [db triples]
   (into #{}
         (map (fn [[_s p _o]]
                (where/get-sid p db)))
-        (:triples property-family)))
+        triples))
 
 (defn group-by-pid
-  "Builds a map from each property ID to all families containing it.
-
-  This is used to find which families share properties, which is necessary for
-  merging equivalent properties correctly."
-  [db property-families]
-  (reduce (fn [acc family]
-            (let [pids (get-property-ids db family)]
+  "Builds a map from each property ID appearing in triples from `triple-groups` to
+  a collection of all the triples it appears in."
+  [db triple-groups]
+  (reduce (fn [acc triples]
+            (let [pids (get-property-ids db triples)]
               (reduce (fn [m pid]
-                        (update m pid (fnil conj #{}) family))
+                        (update m pid (fnil conj #{}) triples))
                       acc
                       pids)))
-          {} property-families))
+          {} triple-groups))
+
+(defn consolidate
+  "Consolidates a collection of sequences into a single distinct vector.
+
+  Concatenates all elements from all sequences in `seqs`, removes duplicates,
+  and returns the result as a vector."
+  [seqs]
+  (into []
+        (comp cat
+              (distinct))
+        seqs))
 
 (defn group-shared-properties
-  "Finds all property families transitively connected to the seed family via shared properties.
+  "Finds all triples vectors transitively connected to the seed via shared properties.
 
-  Uses breadth-first search to find all families that share at least one
-  property ID with the seed family or with any family connected to it.
+  Uses breadth-first search to find all triples vectors that share at least one
+  property ID with the seed or with any triples vector connected to it.
 
-  Returns a set of all connected families including the seed."
-  [db pid->families seed]
-  (loop [remaining-pids #{seed}
-         visited-pids   #{}]
-    (if-let [current-pid (first remaining-pids)]
-      (let [remaining-pids*  (disj remaining-pids current-pid)
-            related-families (->> (get-property-ids db current-pid)
-                                  (map (fn [pid]
-                                         (get pid->families pid)))
-                                  (apply set/union))
-            new-families     (set/difference related-families visited-pids)]
-        (recur (into remaining-pids* new-families)
-               (conj visited-pids current-pid)))
-      visited-pids)))
+  Returns a set of all connected triples vectors including the seed."
+  [db pid->triples seed]
+  (loop [remaining #{seed}
+         visited   #{}]
+    (if-let [current (first remaining)]
+      (let [remaining*      (disj remaining current)
+            related-triples (->> (get-property-ids db current)
+                                 (map (fn [pid]
+                                        (get pid->triples pid)))
+                                 (apply set/union))
+            new-triples     (set/difference related-triples visited)]
+        (recur (into remaining* new-triples)
+               (conj visited current)))
+      (consolidate visited))))
 
-(defn merge-shared-properties
-  "Merges a set of connected property families into a single family.
-
-  Takes all triples from all families, removes duplicates, and creates a new
-  family with the minimum root-pid from the connected families.
-
-  Returns a merged property family map with :root-pid and :triples keys."
-  [connected]
-  (let [min-root    (->> connected
-                         (map :root-pid)
-                         (apply min))
-        all-triples (->> connected
-                         (mapcat :triples)
-                         distinct)]
-    {:root-pid min-root
-     :triples  all-triples}))
-
-(defn merge-related-property-families
-  "Merges property families that share any properties (handles equivalent properties).
+(defn merge-related-property-groups
+  "Merges groups of triples that share any properties (handles equivalent properties).
 
   When properties are equivalent (owl:equivalentProperty), they appear in each
   other's childProps. This means querying either property will expand to include
   both. If the query has separate patterns for both properties, we need to merge
-  them into a single family so the join treats them as the same constraint.
+  them into a single triples vector so the join treats them as the same
+  constraint.
 
-  Uses a union-find-like algorithm to group families that share properties.
+  Uses a union-find-like algorithm to group triples vectors that share properties.
 
-  Returns a sequence of merged property families."
-  [db property-families]
-  (if (empty? property-families)
+  Returns a sequence of merged triples vectors."
+  [db triple-groups]
+  (if (empty? triple-groups)
     []
-    (let [pid->families (group-by-pid db property-families)]
-      ;; Group families that are transitively connected via shared properties
-      (loop [remaining (set property-families)
+    (let [pid->triples (group-by-pid db triple-groups)]
+      (loop [remaining (set triple-groups)
              result    []]
         (if (empty? remaining)
           result
-          (let [seed             (first remaining)
-                related-families (group-shared-properties db pid->families seed)
-                merged-family    (merge-shared-properties related-families)]
-            (recur (set/difference remaining related-families)
-                   (conj result merged-family))))))))
+          (let [seed            (first remaining)
+                related-triples (group-shared-properties db pid->triples seed)]
+            (recur (set/difference remaining related-triples)
+                   (conj result related-triples))))))))
 
 (defn assign-patterns
   "Assigns matched values to patterns and expands properties with children.
@@ -378,29 +355,54 @@
                                      ; class patterns
                   (where/assign-matched-values solution))))
        (map (partial where/compute-sids db))
-       (map (partial expand-property-children db))
-       (merge-related-property-families db)))
+       (map (partial include-subproperties db))
+       (merge-related-property-groups db)))
+
 (defn first-sid
   "Extracts the subject ID from the first flake of `flake-chunk`"
   [flake-chunk]
   (flake/s (first flake-chunk)))
 
+(defn flatten-outer-join-tuple
+  "Flattens an outer-join tuple of collections into a single vector
+
+  Removes `nil` values (from non-matching sides of the join) and concatenates
+  all remaining collections into a single vector."
+  [outer-join-tuple]
+  (into []
+        (comp (remove nil?)
+              cat)
+        outer-join-tuple))
+
+(defn combined-flake-range
+  "Converts triples into a channel of flakes grouped by subject.
+
+  For each triple, queries the appropriate index (psot or post) to get flakes.
+  Each channel is repartitioned by subject ID, then all the repartitioned
+  channels are outer-joined by subject to maintain sort order.
+
+  Returns a channel of flake chunks, where each chunk contains all flakes for
+  a single subject from any property in the triples."
+  [db tracker error-ch triples]
+  (let [flatten-xf (map flatten-outer-join-tuple)]
+    (->> triples
+         (map (fn [[_s _p o :as triple]]
+                (let [idx (if (where/matched? o) :post :psot)]
+                  (where/resolve-flake-range db tracker error-ch triple idx))))
+         (repartition-each-by flake/s)
+         (outer-join-by flake/cmp-sid first-sid 2 flatten-xf))))
 
 (defn match-properties
   [db tracker solution patterns error-ch]
   (if (and (index/supports? db :psot)
            (index/supports? db :post))
-    (let [property-families (assign-patterns db solution patterns)
-          property-ranges   (->> property-families
-                                 (mapcat :triples)
-                                 (map (fn [[_s _p o :as triple]]
-                                        (let [idx (if (where/matched? o) :post :psot)]
-                                          (where/resolve-flake-range db tracker error-ch triple idx))))
-                                 (repartition-each-by flake/s))
-          extract-sid       (comp flake/s first)
-          join-xf           (mapcat (fn [join]
-                                      (match-join solution property-families db join)))]
-      (inner-join-by flake/cmp-sid extract-sid 2 join-xf property-ranges))
+    (let [triple-groups (assign-patterns db solution patterns)
+          match-join-xf (mapcat (fn [join]
+                                  (match-inner-join solution triple-groups db join)))]
+      (->> triple-groups
+           (map (fn [triples]
+                  (combined-flake-range db tracker error-ch triples)))
+           (inner-join-by flake/cmp-sid first-sid 2 match-join-xf)))
     (where/match-patterns db tracker solution patterns error-ch)))
 
 (defn with-distinct-subjects
