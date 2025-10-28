@@ -345,8 +345,18 @@
                    (conj result related-triples))))))))
 
 (defn assign-patterns
-  "Assigns matched values to patterns and expands properties with children.
-  Returns a sequence of triples vectors."
+  "Processes query patterns into property groups for matching.
+
+  For each pattern:
+  - Extracts the triple and assigns matched values from `solution`
+  - Computes subject IDs
+  - Expands to include subproperties
+
+  Then merges any groups that share properties (e.g., equivalent properties)
+  into single consolidated groups.
+
+  Returns a sequence of triple vectors, where each vector contains triples
+  that should be matched together as a group."
   [db solution patterns]
   (->> patterns
        (map (fn [pattern]
@@ -375,14 +385,21 @@
         outer-join-tuple))
 
 (defn combined-flake-range
-  "Converts triples into a channel of flakes grouped by subject.
+  "Creates a channel of flake chunks, one chunk per subject appearing in any triple.
 
-  For each triple, queries the appropriate index (psot or post) to get flakes.
-  Each channel is repartitioned by subject ID, then all the repartitioned
-  channels are outer-joined by subject to maintain sort order.
+  For each triple in `triples`, queries the appropriate index (psot or post based
+  on whether the object is matched) to retrieve matching flakes. Each channel is
+  repartitioned by subject ID, then outer-joined by subject to ensure:
+  - All subjects appearing in ANY property are included
+  - Flakes are emitted in sorted order by subject ID
+  - Each chunk combines flakes from all properties for the same subject
 
-  Returns a channel of flake chunks, where each chunk contains all flakes for
-  a single subject from any property in the triples."
+  The outer join allows properties to match different sets of subjects - if a
+  subject has flakes for some properties but not others, it still produces a
+  chunk containing flakes from only the matching properties.
+
+  Returns a channel of flake vectors, where each vector contains all flakes for
+  a single subject across all properties in `triples`."
   [db tracker error-ch triples]
   (let [flatten-xf (map flatten-outer-join-tuple)]
     (->> triples
