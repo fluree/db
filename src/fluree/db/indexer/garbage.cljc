@@ -1,8 +1,10 @@
 (ns fluree.db.indexer.garbage
   (:require [clojure.core.async :as async :refer [<! go]]
+            [fluree.db.flake.index.hyperloglog :as hll-persist]
             [fluree.db.flake.index.storage :as storage]
-            [fluree.db.util :as util]
-            [fluree.db.util.async :refer [go-try]]
+            [fluree.db.util :as util :refer [try* catch*]]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -43,25 +45,44 @@
   {:alias 'ledger-alias',
    :branch 'main',
    :garbage ['fluree:file://.../index/segment/1.json', ...]
-   :t 1}"
+   :t 1}
+
+   Also deletes sketch files associated with this index by reading the index root
+   to determine which properties exist and deleting their sketch files."
   [index-catalog {:keys [address index t] :as _garbage-map}]
-  (go
-    (let [{:keys [alias branch garbage]} (<! (storage/read-garbage index-catalog address))]
+  (go-try
+    (let [{:keys [alias branch garbage]} (<? (storage/read-garbage index-catalog address))]
       (log/info "Removing" (count garbage) "unused index segments (garbage) from ledger"
                 alias "branch" branch "from index-t of" t)
 
-      ;; first delete all index segment files
+      ;; First delete all index segment files
       (doseq [garbage-item garbage]
         ;; note if the file was already deleted there could be an exception.
         ;; this might happen if the server shutdown in the middle of a garbage
         ;; exceptions are logged downstream, so just swallow exception here
-        ;; and keep rocessing.
+        ;; and keep processing.
         (<! (storage/delete-garbage-item index-catalog garbage-item)))
 
-      ;; delete main garbage record
+      ;; Delete sketch files for this index
+      ;; Read the index root to get property SIDs, then delete their sketch files
+      (let [index-root    (try*
+                            (<? (storage/read-db-root index-catalog index))
+                            (catch* _e
+                              (log/warn "Could not read index root for sketch deletion, index may already be deleted:" index)
+                              nil))
+            property-sids (when index-root
+                            (keys (get-in index-root [:stats :properties])))
+            ledger-name   (util.ledger/ledger-base-name alias)]
+        (when (seq property-sids)
+          (let [{:keys [deleted-count total-count]}
+                (<? (hll-persist/delete-sketches-for-index index-catalog ledger-name property-sids t))]
+            (log/info "Deleted" deleted-count "of" total-count "sketch files from index-t" t
+                      "for ledger" alias))))
+
+      ;; Delete main garbage record
       (<! (storage/delete-garbage-item index-catalog address))
 
-      ;; then delete the parent index root
+      ;; Then delete the parent index root
       (<! (storage/delete-garbage-item index-catalog index)))))
 
 (defn remove-cleaned

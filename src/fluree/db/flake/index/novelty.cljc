@@ -5,11 +5,10 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.index :as index]
+            [fluree.db.flake.index.hyperloglog :as hll-persist]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.indexer.hll :as hll]
-            [fluree.db.indexer.stats-serializer :as stats-serializer]
-            [fluree.db.storage]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.ledger :as util.ledger]
@@ -501,17 +500,31 @@
   ([db error-ch]
    (refresh-all db nil error-ch))
   ([db changes-ch error-ch]
-   ;; Kick off parallel stats computation from :spot novelty
-   (let [spot-novelty      (get-in db [:novelty :spot])
-         prev-properties   (get-in db [:stats :properties] {})
-         prev-classes      (get-in db [:stats :classes] {})
-         prev-sketches     (get-in db [:stats :sketches] {})
-         stats-ch          (compute-novelty-stats spot-novelty prev-properties prev-classes prev-sketches)
-         stats-timeout-ms  (or (get-in db [:stats-compute-timeout-ms]) 5000)
-         default-stats     {:properties prev-properties
-                            :classes prev-classes
-                            :sketches prev-sketches}]
-     (go-try
+   (go-try
+     ;; First, load previous sketches from disk before computing stats
+     (let [spot-novelty      (get-in db [:novelty :spot])
+           prev-properties   (get-in db [:stats :properties] {})
+           prev-classes      (get-in db [:stats :classes] {})
+           prev-sketches-mem (get-in db [:stats :sketches] {})
+
+           ;; Extract property SIDs from novelty to know which sketches to load
+           novelty-property-sids (into #{} (map flake/p) spot-novelty)
+
+           ;; Load sketches from previous index files on disk
+           prev-indexed-t       (get-in db [:stats :indexed])
+           index-catalog        (:index-catalog db)
+           ledger-name          (util.ledger/ledger-base-name (:alias db))
+           loaded-sketches      (<? (hll-persist/load-previous-sketches index-catalog ledger-name prev-indexed-t novelty-property-sids))
+
+           ;; Merge loaded sketches with in-memory sketches (in-memory takes precedence)
+           prev-sketches        (merge loaded-sketches prev-sketches-mem)
+
+           ;; Now kick off parallel stats computation with merged sketches
+           stats-ch             (compute-novelty-stats spot-novelty prev-properties prev-classes prev-sketches)
+           stats-timeout-ms     (or (get-in db [:stats-compute-timeout-ms]) 5000)
+           default-stats        {:properties prev-properties
+                                 :classes prev-classes
+                                 :sketches prev-sketches}]
        (let [;; Wait for index to complete
              index-result (<? (->> index/types
                                    (map (partial extract-root db))
@@ -550,18 +563,6 @@
              (assoc :classes classes)
              (assoc :sketches sketches)))))))
 
-(defn write-stats-sketches
-  "Write statistics sketches to storage as a side blob.
-   Returns channel with write response containing :address and :hash."
-  [{:keys [storage] :as _index-catalog} alias t sketches]
-  (go-try
-    (when (seq sketches)
-      (log/debug "Writing stats sketches for" alias "at t" t)
-      (let [ledger-name (util.ledger/ledger-base-name alias)
-            path        (str ledger-name "/index/stats-sketches")
-            serialized  (stats-serializer/serialize-stats-sketches alias t sketches)]
-        (<? (fluree.db.storage/content-write-json storage path serialized))))))
-
 (defn refresh
   [{:keys [novelty t alias] :as db} changes-ch max-old-indexes]
   (go-try
@@ -592,34 +593,23 @@
                      (assoc-in [:stats :classes] classes)
                      (assoc-in [:stats :sketches] sketches))
 
-                 ;; Add old stats-sketches to garbage if we're writing new ones
-                 old-sketches-addr (get-in refreshed-db* [:stats-sketches :address])
-                 garbage*          (cond-> garbage
-                                     (and (seq sketches) old-sketches-addr)
-                                     (conj old-sketches-addr))
+                 ;; No need to track old sketches addresses - using fixed filenames now
+                 ;; Garbage collection will delete old sketch files by t value
 
                 ;; TODO - ideally issue garbage/root writes to RAFT together
                 ;;        as a tx, currently requires waiting for both
                 ;;        through raft sync
-                 garbage-res   (when (seq garbage*)
-                                 (let [write-res (<? (index-storage/write-garbage index-catalog alias t garbage*))]
+                 garbage-res   (when (seq garbage)
+                                 (let [write-res (<? (index-storage/write-garbage index-catalog alias t garbage))]
                                    (<! (notify-new-index-file write-res :garbage t changes-ch))
                                    write-res))
 
-                 ;; Write statistics sketches side blob
-                 sketches-res  (when (seq sketches)
-                                 (let [write-res (<? (write-stats-sketches index-catalog alias t sketches))]
-                                   (<! (notify-new-index-file write-res :stats-sketches t changes-ch))
-                                   write-res))
+                 ;; Write statistics sketches to fixed paths (no address tracking needed)
+                 _  (when (seq sketches)
+                      (<? (hll-persist/write-sketches index-catalog alias t sketches)))
 
-                 ;; Update db with sketches pointer
-                 refreshed-db**  (if sketches-res
-                                   (assoc refreshed-db* :stats-sketches
-                                          {:type :hll
-                                           :p 8
-                                           :address (:address sketches-res)
-                                           :version 1})
-                                   refreshed-db*)
+                 ;; No need to update db with sketches pointer - using fixed filenames
+                 refreshed-db**  refreshed-db*
 
                  db-root-res   (<? (index-storage/write-db-root index-catalog refreshed-db** (:address garbage-res)))
                  _             (<! (notify-new-index-file db-root-res :root t changes-ch))

@@ -7,6 +7,7 @@
                        ["fs-ext" :refer [flockSync]]
                        ["path" :as path]])
             [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.crypto.aes :as aes]
             [fluree.db.util.log :as log])
   #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException File)
@@ -292,3 +293,18 @@
         path      (str abs-root path "/")]
     #?(:clj  (-> path io/file .getCanonicalPath)
        :cljs (path/resolve path))))
+
+(defn encode-path-segment
+  "URL-encode a string to be safe for use in file paths and S3 keys.
+   Preserves alphanumeric characters, hyphens, underscores, and periods.
+   Other characters are percent-encoded as %XX where XX is the hex code."
+  [s]
+  (str/replace s
+               #"[^a-zA-Z0-9\-_.]"
+               #(let [code (int (first %))
+                      hex  #?(:clj (format "%02X" code)
+                              :cljs (let [h (.toString code 16)]
+                                      (if (= 1 (count h))
+                                        (str "0" (.toUpperCase h))
+                                        (.toUpperCase h))))]
+                  (str "%" hex))))

@@ -1,6 +1,6 @@
 (ns fluree.db.property-class-statistics-test
   "Tests for property and class statistics tracking during indexing"
-  (:require [babashka.fs :refer [with-temp-dir]]
+  (:require [babashka.fs :as bfs :refer [with-temp-dir]]
             [clojure.core.async :as async :refer [<!!]]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
@@ -463,9 +463,35 @@
               (is (<= 1 (:selectivity-subject dept-prop) 2)
                   (str "ex:department selectivity-subject should be 1-2, got " (:selectivity-subject dept-prop))))))
 
-        (testing "NDV values are monotone across index cycles"
-          ;; Add more data with overlapping values
-          (let [db-after-idx1 @(fluree/db conn ledger-id)
+        (testing "NDV values are monotone across index cycles with new connection"
+          ;; Disconnect first connection to ensure clean state
+          @(fluree/disconnect conn)
+
+          ;; Create a new connection to ensure we're not using cached data
+          (let [conn2   @(fluree/connect-file {:storage-path (str storage-path)
+                                               :defaults
+                                               {:indexing {:reindex-min-bytes 100
+                                                           :reindex-max-bytes 10000000}}})
+                ;; retry-load returns an AsyncDB, we need to deref its internal channel to get the FlakeDB
+                async-db @(fluree/load conn2 ledger-id)
+                _ (fluree.db.util.log/warn "ASYNC DB:" async-db)
+                db-after-idx1 (<!! (fluree.db.async-db/deref-async async-db))
+                _ (fluree.db.util.log/warn "SYNC DB:" db-after-idx1)
+                get-ndv  (fn [db prop-iri]
+                           (let [sid (iri/encode-iri db prop-iri)
+                                 _ (fluree.db.util.log/warn "Looking up prop-iri:" prop-iri "encoded as SID:" sid)
+                                 props (get-in db [:stats :properties])
+                                 _ (fluree.db.util.log/warn "Available property SIDs:" (keys props))
+                                 ndv (get-in db [:stats :properties sid :ndv-values])
+                                 _ (fluree.db.util.log/warn "Found NDV value:" ndv)]
+                             ndv))
+
+                ;; Capture NDV values before adding more data
+                email-ndv-before (get-ndv db-after-idx1 "http://example.org/email")
+                dept-ndv-before  (get-ndv db-after-idx1 "http://example.org/department")
+                _ (fluree.db.util.log/warn "email-ndv-before:" email-ndv-before)
+                _ (fluree.db.util.log/warn "dept-ndv-before:" dept-ndv-before)
+                ;; Add more data with overlapping values (duplicates)
                 txn2    (merge context
                                {"insert" [{"@id"         "ex:person200"
                                            "@type"       "ex:Person"
@@ -474,20 +500,19 @@
                                            "ex:department" "Engineering"}]})      ;; Duplicate dept
                 db2      @(fluree/update db-after-idx1 txn2)
                 index-ch2 (async/chan 10)
-                _        @(fluree/commit! conn db2 {:index-files-ch index-ch2})
+                _        @(fluree/commit! conn2 db2 {:index-files-ch index-ch2})
                 _        (<!! (test-utils/block-until-index-complete index-ch2))
 
-                loaded2  (test-utils/retry-load conn ledger-id 100)
-                get-ndv  (fn [db prop-iri]
-                           (let [sid (iri/encode-iri db prop-iri)]
-                             (get-in db [:stats :properties sid :ndv-values])))
+                ;; Get the updated db after indexing completes
+                ;; async-db2 (test-utils/retry-load conn2 ledger-id 100)
+                loaded2   @(fluree/load conn2 ledger-id);;(<!! (fluree.db.async-db/deref-async async-db2))
                 ;; NDV should remain approximately the same since we added duplicates
                 ;; (monotone property: NDV never decreases, but duplicates don't increase it much)
-                email-ndv-before (get-ndv loaded "http://example.org/email")
+                _ (fluree.db.util.log/warn "LOADED2:" loaded2)
                 email-ndv-after  (get-ndv loaded2 "http://example.org/email")
-                dept-ndv-before  (get-ndv loaded "http://example.org/department")
                 dept-ndv-after   (get-ndv loaded2 "http://example.org/department")]
-
+            _ (fluree.db.util.log/warn "email-ndv-after:" email-ndv-after)
+            _ (fluree.db.util.log/warn "dept-ndv-after:" dept-ndv-after)
             (is (<= email-ndv-before email-ndv-after)
                 "NDV should be monotone (non-decreasing)")
             (is (< (- email-ndv-after email-ndv-before) 5)
@@ -496,4 +521,70 @@
             (is (<= dept-ndv-before dept-ndv-after)
                 "NDV should be monotone (non-decreasing)")
             (is (< (- dept-ndv-after dept-ndv-before) 2)
-                "Adding duplicate department shouldn't increase NDV significantly")))))))
+                "Adding duplicate department shouldn't increase NDV significantly")
+
+            @(fluree/disconnect conn2)))
+
+        (testing "NDV increases when new distinct values are added, verified with fresh connection"
+          ;; Create yet another new connection (conn3) to add new distinct values
+          (let [conn3 @(fluree/connect-file {:storage-path (str storage-path)
+                                             :defaults
+                                             {:indexing {:reindex-min-bytes 100
+                                                         :reindex-max-bytes 10000000}}})
+                async-db3 @(fluree/load conn3 ledger-id)
+                loaded-before (<!! (fluree.db.async-db/deref-async async-db3))
+                get-ndv (fn [db prop-iri]
+                          (let [sid (iri/encode-iri db prop-iri)]
+                            (get-in db [:stats :properties sid :ndv-values])))
+
+                ;; Capture current NDV values (should be ~100 emails, ~3 departments)
+                email-ndv-before (get-ndv loaded-before "http://example.org/email")
+                dept-ndv-before  (get-ndv loaded-before "http://example.org/department")
+
+                ;; Add data with NEW distinct values (not duplicates)
+                txn3 (merge context
+                            {"insert" [{"@id"         "ex:person300"
+                                        "@type"       "ex:Person"
+                                        "ex:name"     "Person300"
+                                        "ex:email"    "person300@example.org"  ;; NEW email
+                                        "ex:department" "Operations"}]})        ;; NEW department
+                db3      @(fluree/update loaded-before txn3)
+                index-ch3 (async/chan 10)
+                _        @(fluree/commit! conn3 db3 {:index-files-ch index-ch3})
+                _        (<!! (test-utils/block-until-index-complete index-ch3))]
+
+            @(fluree/disconnect conn3)
+
+            ;; Create conn4 and load to verify NDV increased
+            (let [conn4 @(fluree/connect-file {:storage-path (str storage-path)
+                                               :defaults
+                                               {:indexing {:reindex-min-bytes 100
+                                                           :reindex-max-bytes 10000000}}})
+                  async-db4 @(fluree/load conn4 ledger-id)
+                  loaded-after (<!! (fluree.db.async-db/deref-async async-db4))
+                  get-ndv (fn [db prop-iri]
+                            (let [sid (iri/encode-iri db prop-iri)]
+                              (get-in db [:stats :properties sid :ndv-values])))
+
+                  ;; Should now have ~101 emails and ~4 departments
+                  email-ndv-after (get-ndv loaded-after "http://example.org/email")
+                  dept-ndv-after  (get-ndv loaded-after "http://example.org/department")]
+
+              (is (some? email-ndv-before) "Should have email NDV before")
+              (is (some? email-ndv-after) "Should have email NDV after")
+              (is (some? dept-ndv-before) "Should have dept NDV before")
+              (is (some? dept-ndv-after) "Should have dept NDV after")
+
+              ;; NDV should increase by approximately 1 for each (allowing HLL variance)
+              (is (< 95 email-ndv-after 115)
+                  (str "ex:email should have ~101 distinct values after adding one, got " email-ndv-after))
+              (is (< 3 dept-ndv-after 6)
+                  (str "ex:department should have ~4 distinct values after adding one, got " dept-ndv-after))
+
+              ;; Verify it actually increased from before
+              (is (>= email-ndv-after email-ndv-before)
+                  "Email NDV should not decrease")
+              (is (>= dept-ndv-after dept-ndv-before)
+                  "Department NDV should not decrease")
+
+              @(fluree/disconnect conn4))))))))

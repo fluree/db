@@ -98,7 +98,7 @@
           vg-addresses  (<? (write-vg-map index-catalog vg))
           data          (cond-> {:ledger-alias alias
                                  :t               t
-                                 :v               1 ;; version of db root file
+                                 :v               2 ;; version of db root file (v2: HLL-based NDV statistics)
                                  :schema          (vocab/serialize-schema schema)
                                  :stats           (select-keys stats [:flakes :size :properties :classes])
                                  :spot            (child-data spot)
