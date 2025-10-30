@@ -21,21 +21,20 @@
             ;; Write data
             (async/<!! (storage/write-bytes encrypted-store test-path test-bytes))
 
-            ;; Read it back
+            ;; Read it back (returns bytes, even when encrypted)
             (let [read-back (async/<!! (storage/read-bytes encrypted-store test-path))]
-              (is (string? read-back) "Should return string")
-              (is (= test-data read-back)
+              (is (bytes? read-back) "Should return bytes")
+              (is (= test-data (bytes/UTF8->string read-back))
                   "Data should be readable with correct key"))))
 
         (testing "Raw encrypted file is not readable as plaintext"
           (let [encrypted-store (file-storage/open "test-encrypted" test-dir-str aes-key)]
-            ;; Write data
+
             (async/<!! (storage/write-bytes encrypted-store test-path test-bytes))
 
-            ;; Read the raw file directly
             (let [raw-file-data (async/<!! (fs/read-file (str test-dir-str "/" test-path)))]
-              (is (string? raw-file-data) "fs/read-file returns a string")
-              (is (not= test-data raw-file-data)
+              (is (bytes? raw-file-data) "fs/read-file returns bytes")
+              (is (not= test-data (bytes/UTF8->string raw-file-data))
                   "Raw file data should be encrypted, not match plaintext"))))
 
         (testing "Cannot read encrypted data with wrong key"
@@ -58,11 +57,11 @@
             (is (:path result) "Should return path")
             (is (= (count json-data) (:size result)) "Should return original size, not encrypted size")
 
-            ;; Verify the file is encrypted on disk
+            ;; Verify the file is encrypted on disk (raw bytes, no decryption)
             (let [full-path (str test-dir-str "/" (:path result))
                   raw-data (async/<!! (fs/read-file full-path))]
 
-              (is (not= json-data raw-data)
+              (is (not= json-data (bytes/UTF8->string raw-data))
                   "Content-addressed file should be encrypted"))))))))
 
 (deftest api-integration-test
@@ -84,13 +83,13 @@
                 test-path "test/encrypted-data.txt"
                 test-bytes (bytes/string->UTF8 test-data)]
 
-            ;; Write and read through the FileStore
+            ;; Write and read through the FileStore (returns bytes)
             (async/<!! (storage/write-bytes file-store test-path test-bytes))
             (let [read-back (async/<!! (storage/read-bytes file-store test-path))]
-              (is (= test-data read-back)
+              (is (= test-data (bytes/UTF8->string read-back))
                   "Data should be readable through FileStore"))
 
-            ;; Verify raw file is encrypted
+            ;; Verify raw file is encrypted (raw bytes, no decryption)
             (let [raw-content (async/<!! (fs/read-file (str test-dir-str "/" test-path)))]
-              (is (not= test-data raw-content)
+              (is (not= test-data (bytes/UTF8->string raw-content))
                   "Raw file should be encrypted"))))))))
