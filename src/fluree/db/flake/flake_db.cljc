@@ -295,7 +295,8 @@
           (assoc :commit commit-metadata)))))
 
 (defn- component->user-value
-  "Convert an internal pattern component to user-readable format"
+  "Convert an internal pattern component to user-readable format.
+   Includes lang, datatype, and transaction metadata when present."
   [component compact-fn]
   (cond
     (nil? component)
@@ -309,11 +310,70 @@
       (json-ld/compact iri compact-fn))
 
     (where/matched-value? component)
-    (where/get-value component)
+    (let [value       (where/get-value component)
+          lang        (where/get-lang component)
+          datatype    (where/get-datatype-iri component)
+          transaction (where/get-transaction component)]
+      ;; Only return a map with metadata if there's lang or transaction metadata
+      ;; (datatype is common and not particularly interesting for display)
+      (if (or lang transaction)
+        (cond-> {:value value}
+          lang        (assoc :lang lang)
+          datatype    (assoc :datatype (json-ld/compact datatype compact-fn))
+          transaction (assoc :t transaction))
+        ;; No interesting metadata, just return the value
+        value))
 
     :else
     (throw (ex-info (str "Unexpected component type: " (pr-str component))
                     {:component component}))))
+
+(defn- cleanup-filter-data
+  "Clean up filter pattern data for user display.
+   Attempts to show the original filter expression if available via metadata."
+  [f]
+  (if-let [fns (some-> f meta :fns)]
+    {:description "Filter expression"
+     :expressions fns}
+    {:description "Filter function"}))
+
+(defn- cleanup-bind-data
+  "Clean up bind pattern data for user display.
+   Shows variable names and whether they use functions or static values."
+  [bind-map compact-fn]
+  (into {}
+        (map (fn [[var-sym binding]]
+               (let [var-name (str var-sym)]
+                 [var-name
+                  (if (contains? binding :fluree.db.query.exec.where/fn)
+                    {:type "function"}
+                    {:type "value"
+                     :value (component->user-value binding compact-fn)})])))
+        bind-map))
+
+(defn- cleanup-values-data
+  "Clean up values pattern data for user display.
+   Shows inline solution bindings."
+  [solutions compact-fn]
+  {:description "Inline values"
+   :solutions (mapv (fn [solution]
+                      (into {}
+                            (map (fn [[var-sym binding]]
+                                   [(str var-sym) (component->user-value binding compact-fn)]))
+                            solution))
+                    solutions)})
+
+(defn- cleanup-union-data
+  "Clean up union pattern data for user display.
+   Shows that it contains multiple alternative clauses."
+  [clauses]
+  {:description "Union of alternative patterns"
+   :alternatives (count clauses)})
+
+(defn- cleanup-optional-data
+  "Clean up optional pattern data for user display."
+  [_clause]
+  {:description "Optional pattern group"})
 
 (defn- pattern->user-format
   "Convert internal pattern to user-readable triple format"
@@ -336,9 +396,24 @@
       :id
       {:subject (component->user-value pdata compact-fn)}
 
-      ;; Other pattern types (filter, bind, etc.)
+      :filter
+      (cleanup-filter-data pdata)
+
+      :bind
+      (cleanup-bind-data pdata compact-fn)
+
+      :values
+      (cleanup-values-data pdata compact-fn)
+
+      :union
+      (cleanup-union-data pdata)
+
+      :optional
+      (cleanup-optional-data pdata)
+
+      ;; Fallback for any other pattern types
       {:type ptype
-       :data (pr-str pdata)})))
+       :description "Advanced pattern"})))
 
 (defn- pattern-type->user-type
   "Convert internal pattern type to user-friendly type name"
