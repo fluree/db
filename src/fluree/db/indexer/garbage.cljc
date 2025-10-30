@@ -64,18 +64,18 @@
         (<! (storage/delete-garbage-item index-catalog garbage-item)))
 
       ;; Delete sketch files for this index
-      ;; Read the index root to get property SIDs, then delete their sketch files
+      ;; Read the index root to get properties with their :last-modified-t, then delete sketch files
       (let [index-root    (try*
                             (<? (storage/read-db-root index-catalog index))
                             (catch* _e
                               (log/warn "Could not read index root for sketch deletion, index may already be deleted:" index)
                               nil))
-            property-sids (when index-root
-                            (keys (get-in index-root [:stats :properties])))
+            properties-map (when index-root
+                             (get-in index-root [:stats :properties]))
             ledger-name   (util.ledger/ledger-base-name alias)]
-        (when (seq property-sids)
+        (when (seq properties-map)
           (let [{:keys [deleted-count total-count]}
-                (<? (hll-persist/delete-sketches-for-index index-catalog ledger-name property-sids t))]
+                (<? (hll-persist/delete-sketches-by-last-modified index-catalog ledger-name properties-map))]
             (log/info "Deleted" deleted-count "of" total-count "sketch files from index-t" t
                       "for ledger" alias))))
 

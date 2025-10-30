@@ -55,34 +55,50 @@
 
 (defn write-sketches
   "Write statistics sketches to storage using fixed t-based filenames.
+   Only writes sketches for properties where :last-modified-t = current t (modified in this index).
    Each property's values and subjects sketches are stored in JSON format with base64 encoding.
-   Format: <ledger-name>/sketches/values/<ns-code>_<name>_<t>.hll
-           <ledger-name>/sketches/subjects/<ns-code>_<name>_<t>.hll
-   Returns nil (no need to track addresses with fixed filenames)."
-  [{:keys [storage] :as _index-catalog} alias t sketches]
+   Format: <ledger-name>/index/stats-sketches/values/<ns-code>_<name>_<t>.hll
+           <ledger-name>/index/stats-sketches/subjects/<ns-code>_<name>_<t>.hll
+   Returns set of old sketch file paths to add to garbage collection.
+
+   old-sketch-t-map: Map of {sid -> old-t} for properties that had previous sketch files."
+  [{:keys [storage] :as _index-catalog} alias t old-sketch-t-map current-properties-map sketches]
   (go-try
     (when (seq sketches)
       (let [ledger-name (util.ledger/ledger-base-name alias)
-            sketch-seq  (seq sketches)]
-        (loop [[[sid-obj {:keys [values subjects]}] & rest-sketches] sketch-seq]
+            ;; Only write sketches for properties modified in this index
+            modified-sids (filter #(= t (:last-modified-t (get current-properties-map %)))
+                                  (keys sketches))
+            old-paths (atom #{})]
+        (loop [[sid-obj & rest-sids] modified-sids]
           (when sid-obj
-            (try*
-              ;; Write values sketch
-              (let [path (sketch-filename ledger-name sid-obj :values t)
-                    sketch-b64 #?(:clj (.encodeToString (java.util.Base64/getEncoder) values)
-                                  :cljs (.toString (.from js/Buffer values) "base64"))
-                    data {:sid sid-obj :t t :sketch sketch-b64}]
-                (<? (write-json-to-path storage path data)))
-              ;; Write subjects sketch
-              (let [path (sketch-filename ledger-name sid-obj :subjects t)
-                    sketch-b64 #?(:clj (.encodeToString (java.util.Base64/getEncoder) subjects)
-                                  :cljs (.toString (.from js/Buffer subjects) "base64"))
-                    data {:sid sid-obj :t t :sketch sketch-b64}]
-                (<? (write-json-to-path storage path data)))
-              (catch* e
-                (log/error e "Error writing sketch for" sid-obj)))
-            (recur rest-sketches)))
-        nil))))
+            (let [sketch-data (get sketches sid-obj)
+                  {:keys [values subjects]} sketch-data
+                  old-t (get old-sketch-t-map sid-obj)]
+              (try*
+                ;; Write values sketch at new t
+                (let [path (sketch-filename ledger-name sid-obj :values t)
+                      sketch-b64 #?(:clj (.encodeToString (java.util.Base64/getEncoder) values)
+                                    :cljs (.toString (.from js/Buffer values) "base64"))
+                      data {:sid sid-obj :t t :sketch sketch-b64}]
+                  (<? (write-json-to-path storage path data)))
+                ;; Write subjects sketch at new t
+                (let [path (sketch-filename ledger-name sid-obj :subjects t)
+                      sketch-b64 #?(:clj (.encodeToString (java.util.Base64/getEncoder) subjects)
+                                    :cljs (.toString (.from js/Buffer subjects) "base64"))
+                      data {:sid sid-obj :t t :sketch sketch-b64}]
+                  (<? (write-json-to-path storage path data)))
+
+                ;; Add old sketch paths to garbage (if they existed at a different t)
+                ;; Paths must use fluree:file:// prefix to match other garbage items
+                (when (and old-t (not= old-t t))
+                  (swap! old-paths conj
+                         (str "fluree:file://" (sketch-filename ledger-name sid-obj :values old-t))
+                         (str "fluree:file://" (sketch-filename ledger-name sid-obj :subjects old-t))))
+                (catch* e
+                  (log/error e "Error writing sketch for" sid-obj)))
+              (recur rest-sids))))
+        @old-paths))))
 
 (defn read-property-sketches
   "Read sketches for a specific property from the previous index.
@@ -135,6 +151,28 @@
                      result)))
           result)))))
 
+(defn load-sketches-by-last-modified
+  "Load sketches for ALL properties using their :last-modified-t from the properties map.
+   This ensures we load sketches even for properties not in current novelty.
+   For migration: if property lacks :last-modified-t, uses prev-indexed-t as fallback.
+   Returns map of {sid {:values ... :subjects ...}} for properties found in storage."
+  [index-catalog ledger-name properties-map prev-indexed-t]
+  (go-try
+    (loop [[sid & rest-sids] (keys properties-map)
+           result {}]
+      (if sid
+        (let [prop-data (get properties-map sid)
+              last-t    (or (:last-modified-t prop-data) prev-indexed-t)] ; Migration fallback
+          (if (and last-t (pos? last-t))
+            (let [sketches (<? (read-property-sketches index-catalog ledger-name sid last-t))]
+              (recur rest-sids
+                     (if (seq sketches)
+                       (assoc result sid sketches)
+                       result)))
+            ;; No t available at all (brand new property), skip loading
+            (recur rest-sids result)))
+        result))))
+
 (defn delete-sketch-file
   "Delete a single sketch file from storage.
    Returns true if deleted, false if file didn't exist or error occurred.
@@ -182,5 +220,31 @@
                                 (if subjects-deleted 1 0))
               total-count* (+ total-count 2)] ; always attempt both values and subjects
           (recur rest-sids deleted-count* total-count*))
+        {:deleted-count deleted-count
+         :total-count total-count}))))
+
+(defn delete-sketches-by-last-modified
+  "Delete sketch files for properties using their :last-modified-t from properties map.
+   This ensures we delete the correct sketch files even if properties weren't modified in this index.
+   Returns map with :deleted-count (total files deleted) and :total-count (total files attempted).
+   Gracefully handles missing files and logs summary."
+  [index-catalog ledger-name properties-map]
+  (go-try
+    (loop [[sid & rest-sids] (keys properties-map)
+           deleted-count 0
+           total-count 0]
+      (if sid
+        (let [prop-data (get properties-map sid)
+              last-t (:last-modified-t prop-data)]
+          (if (and last-t (pos? last-t))
+            (let [{:keys [values-deleted subjects-deleted]}
+                  (<? (delete-property-sketches index-catalog ledger-name sid last-t))
+                  deleted-count* (+ deleted-count
+                                    (if values-deleted 1 0)
+                                    (if subjects-deleted 1 0))
+                  total-count* (+ total-count 2)]
+              (recur rest-sids deleted-count* total-count*))
+            ;; No last-modified-t (shouldn't happen in production), skip
+            (recur rest-sids deleted-count total-count)))
         {:deleted-count deleted-count
          :total-count total-count}))))

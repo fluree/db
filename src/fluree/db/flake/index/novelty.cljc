@@ -503,18 +503,43 @@
    (go-try
      ;; First, load previous sketches from disk before computing stats
      (let [spot-novelty      (get-in db [:novelty :spot])
-           prev-properties   (get-in db [:stats :properties] {})
-           prev-classes      (get-in db [:stats :classes] {})
-           prev-sketches-mem (get-in db [:stats :sketches] {})
+           prev-properties-mem (get-in db [:stats :properties] {})
+           _ (log/info "db [:stats :properties] count:" (count prev-properties-mem))
+           _ (when-let [email-prop (get prev-properties-mem (first (filter #(= "email" (.-name %)) (keys prev-properties-mem))))]
+               (log/info "Email property from db stats at start of indexing:" email-prop))
+           prev-classes        (get-in db [:stats :classes] {})
+           prev-sketches-mem   (get-in db [:stats :sketches] {})
 
-           ;; Extract property SIDs from novelty to know which sketches to load
+           ;; Extract property SIDs from novelty to track which were modified
            novelty-property-sids (into #{} (map flake/p) spot-novelty)
 
-           ;; Load sketches from previous index files on disk
+           ;; Load previous index root to get properties with :last-modified-t
            prev-indexed-t       (get-in db [:stats :indexed])
            index-catalog        (:index-catalog db)
            ledger-name          (util.ledger/ledger-base-name (:alias db))
-           loaded-sketches      (<? (hll-persist/load-previous-sketches index-catalog ledger-name prev-indexed-t novelty-property-sids))
+
+           ;; Load the previous index root (if it exists) to get properties with :last-modified-t
+           ;; The db being indexed may already have a previous index loaded
+           prev-index-from-db   (get-in db [:index])
+           prev-index-address   (:address prev-index-from-db)
+           _ (log/info "Loading previous index root from address:" prev-index-address)
+           prev-index-root      (when prev-index-address
+                                  (try*
+                                    (<? (index-storage/read-db-root index-catalog prev-index-address))
+                                    (catch* e
+                                      (log/debug "Could not load previous index root for :last-modified-t values:" (ex-message e))
+                                      nil)))
+           prev-properties      (if prev-index-root
+                                  ;; Use properties from previous index root (has :last-modified-t)
+                                  (do
+                                    (log/info "Loaded previous index root, properties count:" (count (get-in prev-index-root [:stats :properties] {})))
+                                    (get-in prev-index-root [:stats :properties] {}))
+                                  ;; Fallback to in-memory properties (may not have :last-modified-t)
+                                  (do
+                                    (log/info "No previous index root found, using in-memory properties")
+                                    prev-properties-mem))
+
+           loaded-sketches      (<? (hll-persist/load-sketches-by-last-modified index-catalog ledger-name prev-properties prev-indexed-t))
 
            ;; Merge loaded sketches with in-memory sketches (in-memory takes precedence)
            prev-sketches        (merge loaded-sketches prev-sketches-mem)
@@ -558,10 +583,38 @@
                       :ledger-alias (:alias db)
                       :t (:t db)}))
 
-         (-> index-result
-             (assoc :properties properties)
-             (assoc :classes classes)
-             (assoc :sketches sketches)))))))
+         ;; Update :last-modified-t for properties and collect old t-values for garbage
+         (let [current-t (:t db)
+               old-sketch-t-map (atom {}) ;; Map of {sid -> old-t} for properties being updated
+               properties-with-last-t
+               (reduce-kv (fn [props sid prop-data]
+                            (let [was-in-novelty (contains? novelty-property-sids sid)
+                                  existing-last-t (:last-modified-t prop-data)
+                                  prev-prop-data (get prev-properties sid)
+                                  prev-last-t (:last-modified-t prev-prop-data)
+                                  ;; Determine the correct last-modified-t:
+                                  ;; - If in novelty: current-t
+                                  ;; - If has last-t already: keep it
+                                  ;; - If no last-t (migration): use prev-indexed-t
+                                  new-last-t (cond
+                                               was-in-novelty current-t
+                                               existing-last-t existing-last-t
+                                               prev-indexed-t prev-indexed-t
+                                               :else current-t)] ; fallback for brand new properties
+                              ;; If property is being modified and had a previous t-value, record it for garbage
+                              (when (and was-in-novelty prev-last-t (not= prev-last-t current-t))
+                                (log/debug "Recording old sketch for" sid "from t=" prev-last-t "to t=" current-t)
+                                (swap! old-sketch-t-map assoc sid prev-last-t))
+                              (assoc props sid
+                                     (assoc prop-data :last-modified-t new-last-t))))
+                          {}
+                          properties)]
+           (-> index-result
+               (assoc :properties properties-with-last-t)
+               (assoc :old-sketch-t-map @old-sketch-t-map)  ;; Pass map of old t-values for garbage
+               (assoc :classes classes)
+               (assoc :sketches sketches)
+               (assoc :novelty-property-sids novelty-property-sids))))))))  ;; Pass along for write-sketches
 
 (defn refresh
   [{:keys [novelty t alias] :as db} changes-ch max-old-indexes]
@@ -582,7 +635,7 @@
            (throw e))
 
           refresh-ch
-          ([{:keys [garbage properties classes sketches], refreshed-db :db, :as _status}]
+          ([{:keys [garbage properties old-sketch-t-map classes sketches], refreshed-db :db, :as _status}]
            (let [;; Add computed fields to properties for O(1) optimizer lookups
                  properties-with-computed (add-computed-fields properties)
 
@@ -593,20 +646,21 @@
                      (assoc-in [:stats :classes] classes)
                      (assoc-in [:stats :sketches] sketches))
 
-                 ;; No need to track old sketches addresses - using fixed filenames now
-                 ;; Garbage collection will delete old sketch files by t value
+                 ;; Write statistics sketches to fixed paths and collect old paths for garbage
+                 old-sketch-paths (when (seq sketches)
+                                    (<? (hll-persist/write-sketches index-catalog alias t
+                                                                    old-sketch-t-map properties sketches)))
+
+                 ;; Add old sketch paths to garbage collection
+                 garbage-with-sketches (into garbage old-sketch-paths)
 
                 ;; TODO - ideally issue garbage/root writes to RAFT together
                 ;;        as a tx, currently requires waiting for both
                 ;;        through raft sync
-                 garbage-res   (when (seq garbage)
-                                 (let [write-res (<? (index-storage/write-garbage index-catalog alias t garbage))]
+                 garbage-res   (when (seq garbage-with-sketches)
+                                 (let [write-res (<? (index-storage/write-garbage index-catalog alias t garbage-with-sketches))]
                                    (<! (notify-new-index-file write-res :garbage t changes-ch))
                                    write-res))
-
-                 ;; Write statistics sketches to fixed paths (no address tracking needed)
-                 _  (when (seq sketches)
-                      (<? (hll-persist/write-sketches index-catalog alias t sketches)))
 
                  ;; No need to update db with sketches pointer - using fixed filenames
                  refreshed-db**  refreshed-db*

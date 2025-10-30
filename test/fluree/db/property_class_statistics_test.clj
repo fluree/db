@@ -7,7 +7,8 @@
             [fluree.db.async-db]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.test-utils :as test-utils]))
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.util.filesystem :as fs]))
 
 (deftest ^:integration property-class-statistics-test
   (testing "Property and class statistics are accumulated during indexing"
@@ -315,7 +316,6 @@
                                                 :defaults
                                                 {:indexing {:reindex-min-bytes 100
                                                             :reindex-max-bytes 10000000}}})
-                ;; retry-load returns an AsyncDB, we need to deref its internal channel to get the FlakeDB
                 async-db (test-utils/retry-load conn2 ledger-id 100)
                 loaded   (<!! (fluree.db.async-db/deref-async async-db))
 
@@ -472,25 +472,16 @@
                                                :defaults
                                                {:indexing {:reindex-min-bytes 100
                                                            :reindex-max-bytes 10000000}}})
-                ;; retry-load returns an AsyncDB, we need to deref its internal channel to get the FlakeDB
                 async-db @(fluree/load conn2 ledger-id)
-                _ (fluree.db.util.log/warn "ASYNC DB:" async-db)
                 db-after-idx1 (<!! (fluree.db.async-db/deref-async async-db))
-                _ (fluree.db.util.log/warn "SYNC DB:" db-after-idx1)
                 get-ndv  (fn [db prop-iri]
                            (let [sid (iri/encode-iri db prop-iri)
-                                 _ (fluree.db.util.log/warn "Looking up prop-iri:" prop-iri "encoded as SID:" sid)
-                                 props (get-in db [:stats :properties])
-                                 _ (fluree.db.util.log/warn "Available property SIDs:" (keys props))
-                                 ndv (get-in db [:stats :properties sid :ndv-values])
-                                 _ (fluree.db.util.log/warn "Found NDV value:" ndv)]
+                                 ndv (get-in db [:stats :properties sid :ndv-values])]
                              ndv))
 
                 ;; Capture NDV values before adding more data
                 email-ndv-before (get-ndv db-after-idx1 "http://example.org/email")
                 dept-ndv-before  (get-ndv db-after-idx1 "http://example.org/department")
-                _ (fluree.db.util.log/warn "email-ndv-before:" email-ndv-before)
-                _ (fluree.db.util.log/warn "dept-ndv-before:" dept-ndv-before)
                 ;; Add more data with overlapping values (duplicates)
                 txn2    (merge context
                                {"insert" [{"@id"         "ex:person200"
@@ -504,15 +495,11 @@
                 _        (<!! (test-utils/block-until-index-complete index-ch2))
 
                 ;; Get the updated db after indexing completes
-                ;; async-db2 (test-utils/retry-load conn2 ledger-id 100)
-                loaded2   @(fluree/load conn2 ledger-id);;(<!! (fluree.db.async-db/deref-async async-db2))
                 ;; NDV should remain approximately the same since we added duplicates
                 ;; (monotone property: NDV never decreases, but duplicates don't increase it much)
-                _ (fluree.db.util.log/warn "LOADED2:" loaded2)
+                loaded2   @(fluree/load conn2 ledger-id)
                 email-ndv-after  (get-ndv loaded2 "http://example.org/email")
                 dept-ndv-after   (get-ndv loaded2 "http://example.org/department")]
-            _ (fluree.db.util.log/warn "email-ndv-after:" email-ndv-after)
-            _ (fluree.db.util.log/warn "dept-ndv-after:" dept-ndv-after)
             (is (<= email-ndv-before email-ndv-after)
                 "NDV should be monotone (non-decreasing)")
             (is (< (- email-ndv-after email-ndv-before) 5)
@@ -588,3 +575,170 @@
                   "Department NDV should not decrease")
 
               @(fluree/disconnect conn4))))))))
+
+(deftest ^:integration last-modified-t-sketch-persistence-test
+  (testing "Sketch files are persisted with :last-modified-t and managed correctly across indexes"
+    (with-temp-dir [storage-path {}]
+      (let [storage-path-str (str storage-path)
+            ledger-id "test/sketch-persist"]
+
+        (testing "Phase 1: Initial index creates sketch files with t=1"
+          (let [conn1   @(fluree/connect-file {:storage-path storage-path-str
+                                               :defaults
+                                               {:indexing {:reindex-min-bytes 100
+                                                           :reindex-max-bytes 10000000}}})
+                context {"@context" {"ex" "http://example.org/"}}
+                db0     @(fluree/create conn1 ledger-id)
+
+                ;; Insert data with three properties: name, email, department
+                txn1    (merge context
+                               {"insert" (into []
+                                               (for [i (range 10)]
+                                                 {"@id" (str "ex:person" i)
+                                                  "@type" "ex:Person"
+                                                  "ex:name" (str "Person" i)
+                                                  "ex:email" (str "person" i "@example.org")
+                                                  "ex:department" (if (< i 5) "Engineering" "Sales")}))})
+                db1      @(fluree/update db0 txn1)
+
+                index-ch1 (async/chan 10)
+                _         @(fluree/commit! conn1 db1 {:index-files-ch index-ch1})
+                _         (<!! (test-utils/block-until-index-complete index-ch1))
+
+                ;; Reload to get db with indexed stats
+                loaded1   (test-utils/retry-load conn1 ledger-id 100)
+
+                ;; Get SIDs for our properties
+                name-sid  (iri/encode-iri loaded1 "http://example.org/name")
+                email-sid (iri/encode-iri loaded1 "http://example.org/email")
+                dept-sid  (iri/encode-iri loaded1 "http://example.org/department")]
+
+            (testing "Properties have :last-modified-t = 1"
+              (is (= 1 (get-in loaded1 [:stats :properties name-sid :last-modified-t])))
+              (is (= 1 (get-in loaded1 [:stats :properties email-sid :last-modified-t])))
+              (is (= 1 (get-in loaded1 [:stats :properties dept-sid :last-modified-t]))))
+
+            (testing "Sketch files exist on disk with t=1"
+              (let [sketch-dir (str storage-path-str "/" ledger-id "/index/stats-sketches")
+                    values-files (<!! (fs/list-files (str sketch-dir "/values")))
+                    subjects-files (<!! (fs/list-files (str sketch-dir "/subjects")))]
+
+                ;; Each property should have values and subjects sketch files with _1.hll suffix
+                (is (some #(re-find #"name_1\.hll$" %) values-files)
+                    "name values sketch should exist at t=1")
+                (is (some #(re-find #"email_1\.hll$" %) values-files)
+                    "email values sketch should exist at t=1")
+                (is (some #(re-find #"department_1\.hll$" %) values-files)
+                    "department values sketch should exist at t=1")
+
+                (is (some #(re-find #"name_1\.hll$" %) subjects-files)
+                    "name subjects sketch should exist at t=1")
+                (is (some #(re-find #"email_1\.hll$" %) subjects-files)
+                    "email subjects sketch should exist at t=1")
+                (is (some #(re-find #"department_1\.hll$" %) subjects-files)
+                    "department subjects sketch should exist at t=1")))))
+
+        (testing "Phase 2: Second index updates only modified properties"
+          (let [conn2   @(fluree/connect-file {:storage-path storage-path-str
+                                               :defaults
+                                               {:indexing {:reindex-min-bytes 100
+                                                           :reindex-max-bytes 10000000}}})
+                context {"@context" {"ex" "http://example.org/"}}
+                ;; Load from new connection
+                async-db1 @(fluree/db conn2 ledger-id)
+                loaded1   (<!! (fluree.db.async-db/deref-async async-db1))
+
+                ;; Get SIDs for verification
+                name-sid  (iri/encode-iri loaded1 "http://example.org/name")
+                email-sid (iri/encode-iri loaded1 "http://example.org/email")
+                dept-sid  (iri/encode-iri loaded1 "http://example.org/department")
+
+                ;; Update existing person - modify ONLY email and department, leave name unchanged
+                txn2    (merge context
+                               {"delete" [{"@id" "ex:person0"
+                                           "ex:email" "person0@example.org"
+                                           "ex:department" "Engineering"}]
+                                "insert" [{"@id" "ex:person0"
+                                           "ex:email" "person0.updated@example.org"
+                                           "ex:department" "Marketing"}]})
+                db2      @(fluree/update loaded1 txn2)
+
+                index-ch2 (async/chan 10)
+                _         @(fluree/commit! conn2 db2 {:index-files-ch index-ch2})
+                _         (<!! (test-utils/block-until-index-complete index-ch2))
+
+                loaded2   (test-utils/retry-load conn2 ledger-id 100)]
+
+            (testing "Modified properties have :last-modified-t = 2, unchanged keep t = 1"
+              ;; Only email and department were modified in txn2, name was NOT modified
+              (is (= 1 (get-in loaded2 [:stats :properties name-sid :last-modified-t]))
+                  "name should still have t=1 (not modified)")
+              (is (= 2 (get-in loaded2 [:stats :properties email-sid :last-modified-t]))
+                  "email should have t=2 (was modified)")
+              (is (= 2 (get-in loaded2 [:stats :properties dept-sid :last-modified-t]))
+                  "department should have t=2 (was modified)"))
+
+            (testing "New sketch files exist with t=2 for modified properties"
+              (let [sketch-dir (str storage-path-str "/" ledger-id "/index/stats-sketches")
+                    values-files (<!! (fs/list-files (str sketch-dir "/values")))]
+
+                ;; Only email and department were modified, so only they should have t=2 sketches
+                (is (not (some #(re-find #"name_2\.hll$" %) values-files))
+                    "name should NOT have t=2 sketch (not modified)")
+                (is (some #(re-find #"email_2\.hll$" %) values-files)
+                    "email should have t=2 sketch (was modified)")
+                (is (some #(re-find #"department_2\.hll$" %) values-files)
+                    "department should have t=2 sketch (was modified)")
+
+                ;; Unchanged property (name) should still only have t=1 sketch
+                (is (some #(re-find #"name_1\.hll$" %) values-files)
+                    "name should still have t=1 sketch")
+
+                ;; Modified properties should have BOTH t=1 and t=2 (old not yet garbage collected)
+                (is (some #(re-find #"email_1\.hll$" %) values-files)
+                    "email should still have t=1 sketch (not yet garbage collected)")
+                (is (some #(re-find #"department_1\.hll$" %) values-files)
+                    "department should still have t=1 sketch (not yet garbage collected)")))
+
+            (testing "Load index root and garbage from disk, verify correct sketch files in garbage"
+              (let [index-catalog (-> conn2 :index-catalog)
+                    ;; Get the index root address directly from loaded2 db
+                    index-root-address (get-in loaded2 [:commit :index :address])
+                    _ (is (some? index-root-address)
+                          "Should have index root address from commit")
+                    ;; Load the index root from disk to get garbage reference
+                    index-root (<!! (index-storage/read-db-root index-catalog index-root-address))
+                    _ (is (some? index-root)
+                          "Index root should be loadable from disk")
+
+                    ;; Get garbage reference from index root
+                    garbage-ref (get-in index-root [:garbage :address])
+                    _ (is (some? garbage-ref)
+                          "Index root should contain garbage reference")
+
+                    ;; Load garbage data from disk using the reference
+                    garbage-data (<!! (index-storage/read-garbage index-catalog garbage-ref))
+                    _ (is (some? garbage-data)
+                          "Garbage should be loadable from disk using index root reference")]
+
+                (when garbage-data
+                  (let [garbage-items (:garbage garbage-data)]
+                    ;; (a) Old sketch files for MODIFIED properties should be in garbage
+                    (is (some #(re-find #"email_1\.hll$" %) garbage-items)
+                        "Garbage should contain old email sketch from t=1 (email was modified)")
+                    (is (some #(re-find #"department_1\.hll$" %) garbage-items)
+                        "Garbage should contain old department sketch from t=1 (department was modified)")
+
+                    ;; (b) Old sketch files for UNCHANGED properties should NOT be in garbage
+                    (is (not (some #(re-find #"name_1\.hll$" %) garbage-items))
+                        "Garbage should NOT contain name_1 sketch (name was not modified)")
+
+                    ;; (b cont.) NEW sketch files (t=2) should NOT be in garbage
+                    (is (not (some #(re-find #"_2\.hll$" %) garbage-items))
+                        "Garbage should NOT contain any t=2 sketch files (they are current)")
+                    (is (not (some #(re-find #"email_2\.hll$" %) garbage-items))
+                        "Garbage should NOT contain email_2 sketch (it is current)")
+                    (is (not (some #(re-find #"department_2\.hll$" %) garbage-items))
+                        "Garbage should NOT contain department_2 sketch (it is current)"))))
+
+              @(fluree/disconnect conn2))))))))

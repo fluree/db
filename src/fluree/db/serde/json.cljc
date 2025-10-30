@@ -63,21 +63,22 @@
              {} m))
 
 (def property-stats-packer
-  "Pack property stats into a 5-tuple: [count ndv-values ndv-subjects selectivity-value selectivity-subject]"
-  (juxt :count :ndv-values :ndv-subjects :selectivity-value :selectivity-subject))
+  "Pack property stats into a 6-tuple: [count ndv-values ndv-subjects selectivity-value selectivity-subject last-modified-t]"
+  (juxt :count :ndv-values :ndv-subjects :selectivity-value :selectivity-subject :last-modified-t))
 
 (defn unpack-property-stats
-  "Unpack 5-tuple back into property stats map"
-  [[count ndv-values ndv-subjects selectivity-value selectivity-subject]]
+  "Unpack 6-tuple back into property stats map"
+  [[count ndv-values ndv-subjects selectivity-value selectivity-subject last-modified-t]]
   {:count count
    :ndv-values ndv-values
    :ndv-subjects ndv-subjects
    :selectivity-value selectivity-value
-   :selectivity-subject selectivity-subject})
+   :selectivity-subject selectivity-subject
+   :last-modified-t last-modified-t})
 
 (defn serialize-property-stats
   "Serialize property stats map using compact tuple format.
-   Each entry: [serialized-sid [count ndv-values ndv-subjects selectivity-value selectivity-subject]]"
+   Each entry: [serialized-sid [count ndv-values ndv-subjects selectivity-value selectivity-subject last-modified-t]]"
   [properties]
   (when properties
     (reduce-kv
