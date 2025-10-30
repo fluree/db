@@ -509,8 +509,7 @@
                                     :indexed-at-t    (:indexed stats)}
                      :original     original-explain
                      :optimized    optimized-explain
-                     :segments     segments-explain
-                     :changed?     changed?}}))))))
+                     :segments     segments-explain}}))))))
 
 (defrecord FlakeDB [index-catalog commit-catalog alias commit t tt-id stats
                     spot post opst tspo vg schema comparators staged novelty policy

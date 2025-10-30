@@ -53,7 +53,6 @@
 
       ;; Test the complete explain output with user-readable patterns
       (is (= {:optimization :unchanged
-              :changed? false
               :statistics {:property-counts 12  ;; rdf:type + ex:name + ex:age for 2 entities (6 each)
                            :class-counts 1      ;; ex:Person
                            :total-flakes 16     ;; total flakes in index
@@ -83,7 +82,7 @@
                            :selectivity 2
                            :optimizable :triple}]}
              (-> (:plan plan)
-                 (select-keys [:optimization :changed? :statistics :original :optimized])
+                 (select-keys [:optimization :statistics :original :optimized])
                  strip-inputs))
           "Explain should not reorder when both patterns have equal selectivity (2 = 2)"))))
 
@@ -132,7 +131,6 @@
 
       ;; Test complete deterministic output showing patterns were reordered
       (is (= {:optimization :reordered
-              :changed? true
               :statistics {:property-counts 12  ;; rdf:type + ex:name + ex:email for 100 entities
                            :class-counts 1      ;; ex:Person
                            :total-flakes 310    ;; 100 entities × 3 properties + 10 extra flakes
@@ -163,7 +161,7 @@
                            :selectivity 100
                            :optimizable :class}]}
              (-> (:plan plan)
-                 (select-keys [:optimization :changed? :statistics :original :optimized])
+                 (select-keys [:optimization :statistics :original :optimized])
                  strip-inputs))
           "Explain should reorder patterns from [class, email] to [email, class] based on NDV selectivity (2 < 100)"))))
 
@@ -211,7 +209,6 @@
 
       ;; Test complete deterministic output showing property count drove reordering
       (is (= {:optimization :reordered
-              :changed? true
               :statistics {:property-counts 12  ;; rdf:type + ex:name + ex:badge for 50 entities
                            :class-counts 1      ;; ex:Person
                            :total-flakes 115    ;; 50 rdf:type + 50 ex:name + 5 ex:badge + metadata
@@ -242,7 +239,7 @@
                            :selectivity 50
                            :optimizable :class}]}
              (-> (:plan plan)
-                 (select-keys [:optimization :changed? :statistics :original :optimized])
+                 (select-keys [:optimization :statistics :original :optimized])
                  strip-inputs))
           "Explain should reorder patterns from [class, badge] to [badge, class] based on property count (5 < 50)"))))
 
