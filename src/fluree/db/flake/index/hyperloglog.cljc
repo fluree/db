@@ -9,8 +9,6 @@
   (:require [fluree.db.storage :as storage]
             [fluree.db.util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.bytes :as bytes]
-            [fluree.db.util.json :as json]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log :include-macros true]))
 
@@ -25,36 +23,32 @@
                   :subjects "subjects")]
     (str ledger-name "/index/stats-sketches/" subdir "/" ns-code "_" name "_" t ".hll")))
 
-(defn- write-json-to-path
-  "Write JSON data to a fixed path in storage (not content-addressed).
-   Data should be a map that will be serialized to JSON.
+(defn- write-bytes-to-path
+  "Write raw bytes to a fixed path in storage (not content-addressed).
    Uses storage/write-bytes which properly handles path-based storage."
-  [catalog path data]
+  [catalog path bytes]
   (go-try
     (let [default-key (keyword "fluree.db.storage" "default")
-          store       (storage/get-content-store catalog default-key)
-          json-str    (json/stringify data)
-          bytes       (bytes/string->UTF8 json-str)]
+          store       (storage/get-content-store catalog default-key)]
       (<? (storage/write-bytes store path bytes)))))
 
-(defn- read-json-from-path
-  "Read JSON data from a fixed path in storage (not content-addressed).
-   Returns the parsed JSON as a Clojure data structure with string keys."
+(defn- read-bytes-from-path
+  "Read raw bytes from a fixed path in storage (not content-addressed).
+   Returns bytes or nil if file does not exist."
   [catalog path]
   (go-try
     (try*
       (let [default-key (keyword "fluree.db.storage" "default")
             store       (storage/get-content-store catalog default-key)]
-        (when-let [bytes (<? (storage/read-bytes store path))]
-          (json/parse bytes false)))
+        (<? (storage/read-bytes store path)))
       (catch* e
-        (log/debug "read-json-from-path error for path:" path)
+        (log/debug "read-bytes-from-path error for path:" path)
         nil))))
 
 (defn write-sketches
   "Write statistics sketches to storage using fixed t-based filenames.
    Only writes sketches for properties where :last-modified-t = current t (modified in this index).
-   Each property's values and subjects sketches are stored in JSON format with base64 encoding.
+   Each property's values and subjects sketches are stored as raw bytes.
    Format: <ledger-name>/index/stats-sketches/values/<ns-code>_<name>_<t>.hll
            <ledger-name>/index/stats-sketches/subjects/<ns-code>_<name>_<t>.hll
    Returns set of old sketch file paths to add to garbage collection.
@@ -74,18 +68,12 @@
                   {:keys [values subjects]} sketch-data
                   old-t (get old-sketch-t-map sid-obj)]
               (try*
-                ;; Write values sketch at new t
-                (let [path (sketch-filename ledger-name sid-obj :values t)
-                      sketch-b64 #?(:clj (.encodeToString (java.util.Base64/getEncoder) values)
-                                    :cljs (.toString (.from js/Buffer values) "base64"))
-                      data {:sid sid-obj :t t :sketch sketch-b64}]
-                  (<? (write-json-to-path storage path data)))
-                ;; Write subjects sketch at new t
-                (let [path (sketch-filename ledger-name sid-obj :subjects t)
-                      sketch-b64 #?(:clj (.encodeToString (java.util.Base64/getEncoder) subjects)
-                                    :cljs (.toString (.from js/Buffer subjects) "base64"))
-                      data {:sid sid-obj :t t :sketch sketch-b64}]
-                  (<? (write-json-to-path storage path data)))
+                ;; Write values sketch at new t (raw bytes)
+                (let [path (sketch-filename ledger-name sid-obj :values t)]
+                  (<? (write-bytes-to-path storage path values)))
+                ;; Write subjects sketch at new t (raw bytes)
+                (let [path (sketch-filename ledger-name sid-obj :subjects t)]
+                  (<? (write-bytes-to-path storage path subjects)))
 
                 ;; Add old sketch paths to garbage (if they existed at a different t)
                 ;; Paths must use fluree:file:// prefix to match other garbage items
@@ -106,29 +94,19 @@
     (when (and prev-t (pos? prev-t))
       (let [values-path   (sketch-filename ledger-name sid-obj :values prev-t)
             subjects-path (sketch-filename ledger-name sid-obj :subjects prev-t)
-            values-data   (try*
-                            (<? (read-json-from-path storage values-path))
-                            (catch* e
-                              (log/debug "Failed to read values sketch for property" sid-obj "at t" prev-t
-                                         "- may be new property or legacy index")
-                              nil))
-            subjects-data (try*
-                            (<? (read-json-from-path storage subjects-path))
-                            (catch* e
-                              (log/debug "Failed to read subjects sketch for property" sid-obj "at t" prev-t
-                                         "- may be new property or legacy index")
-                              nil))
-
-            ;; Decode base64 strings back to byte arrays
-            ;; Note: JSON parsing returns string keys, not keyword keys
-            values-b64      (get values-data "sketch")
-            subjects-b64    (get subjects-data "sketch")
-            values-sketch   (when values-b64
-                              #?(:clj (.decode (java.util.Base64/getDecoder) ^String values-b64)
-                                 :cljs (.from js/Buffer values-b64 "base64")))
-            subjects-sketch (when subjects-b64
-                              #?(:clj (.decode (java.util.Base64/getDecoder) ^String subjects-b64)
-                                 :cljs (.from js/Buffer subjects-b64 "base64")))]
+            ;; Read raw bytes directly
+            values-sketch   (try*
+                              (<? (read-bytes-from-path storage values-path))
+                              (catch* e
+                                (log/debug "Failed to read values sketch for property" sid-obj "at t" prev-t
+                                           "- may be new property or legacy index")
+                                nil))
+            subjects-sketch (try*
+                              (<? (read-bytes-from-path storage subjects-path))
+                              (catch* e
+                                (log/debug "Failed to read subjects sketch for property" sid-obj "at t" prev-t
+                                           "- may be new property or legacy index")
+                                nil))]
         (cond-> {}
           (some? values-sketch)   (assoc :values values-sketch)
           (some? subjects-sketch) (assoc :subjects subjects-sketch))))))
