@@ -426,16 +426,15 @@
   "Format a pattern with its pre-calculated metadata for display.
    Takes pattern metadata map with :pattern, :score, :inputs."
   [pattern-meta compact-fn]
-  (let [pattern      (:pattern pattern-meta)
-        score        (:score pattern-meta)
-        inputs       (:inputs pattern-meta)
-        ptype        (where/pattern-type pattern)
-        optimizable? (optimize/optimizable-pattern? pattern)]
+  (let [pattern (:pattern pattern-meta)
+        score   (:score pattern-meta)
+        inputs  (:inputs pattern-meta)
+        ptype   (where/pattern-type pattern)]
     {:type        (pattern-type->user-type ptype)
      :pattern     (pattern->user-format pattern compact-fn)
      :selectivity score
      :inputs      inputs
-     :optimizable (when optimizable? (pattern-type->user-type optimizable?))}))
+     :optimizable (when score (pattern-type->user-type ptype))}))
 
 (defn- format-segment-metadata
   "Format segment metadata for display in explain output."
