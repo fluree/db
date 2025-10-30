@@ -504,9 +504,6 @@
      ;; First, load previous sketches from disk before computing stats
      (let [spot-novelty      (get-in db [:novelty :spot])
            prev-properties-mem (get-in db [:stats :properties] {})
-           _ (log/info "db [:stats :properties] count:" (count prev-properties-mem))
-           _ (when-let [email-prop (get prev-properties-mem (first (filter #(= "email" (.-name %)) (keys prev-properties-mem))))]
-               (log/info "Email property from db stats at start of indexing:" email-prop))
            prev-classes        (get-in db [:stats :classes] {})
            prev-sketches-mem   (get-in db [:stats :sketches] {})
 
@@ -549,72 +546,73 @@
            stats-timeout-ms     (or (get-in db [:stats-compute-timeout-ms]) 5000)
            default-stats        {:properties prev-properties
                                  :classes prev-classes
-                                 :sketches prev-sketches}]
-       (let [;; Wait for index to complete
-             index-result (<? (->> index/types
-                                   (map (partial extract-root db))
-                                   (map (partial refresh-index db changes-ch error-ch))
-                                   async/merge
-                                   (async/reduce tally {:db      db
-                                                        :indexes []
-                                                        :garbage #{}})))
+                                 :sketches prev-sketches}
 
-             ;; Wait for stats with timeout fallback
-             [stats-result winner-ch] (async/alts! [stats-ch (async/timeout stats-timeout-ms)])
+           ;; Wait for index to complete
+           index-result (<? (->> index/types
+                                 (map (partial extract-root db))
+                                 (map (partial refresh-index db changes-ch error-ch))
+                                 async/merge
+                                 (async/reduce tally {:db      db
+                                                      :indexes []
+                                                      :garbage #{}})))
 
-             {:keys [properties classes sketches]}
-             (if (= winner-ch stats-ch)
-               ;; Stats completed successfully (or nil if errored)
-               (or stats-result default-stats)
-               ;; Timeout - use previous stats
-               default-stats)]
+           ;; Wait for stats with timeout fallback
+           [stats-result winner-ch] (async/alts! [stats-ch (async/timeout stats-timeout-ms)])
+
+           {:keys [properties classes sketches]}
+           (if (= winner-ch stats-ch)
+             ;; Stats completed successfully (or nil if errored)
+             (or stats-result default-stats)
+             ;; Timeout - use previous stats
+             default-stats)]
 
          ;; Log warning if we fell back to previous stats
-         (when (not= winner-ch stats-ch)
-           (log/warn "Stats computation timeout, using previous stats"
-                     {:timeout-ms stats-timeout-ms
-                      :novelty-size (get-in db [:novelty :size])
-                      :ledger-alias (:alias db)
-                      :t (:t db)}))
+       (when (not= winner-ch stats-ch)
+         (log/warn "Stats computation timeout, using previous stats"
+                   {:timeout-ms stats-timeout-ms
+                    :novelty-size (get-in db [:novelty :size])
+                    :ledger-alias (:alias db)
+                    :t (:t db)}))
 
-         (when (and (= winner-ch stats-ch) (nil? stats-result))
-           (log/warn "Stats computation failed (channel closed), using previous stats"
-                     {:novelty-size (get-in db [:novelty :size])
-                      :ledger-alias (:alias db)
-                      :t (:t db)}))
+       (when (and (= winner-ch stats-ch) (nil? stats-result))
+         (log/warn "Stats computation failed (channel closed), using previous stats"
+                   {:novelty-size (get-in db [:novelty :size])
+                    :ledger-alias (:alias db)
+                    :t (:t db)}))
 
          ;; Update :last-modified-t for properties and collect old t-values for garbage
-         (let [current-t (:t db)
-               old-sketch-t-map (atom {}) ;; Map of {sid -> old-t} for properties being updated
-               properties-with-last-t
-               (reduce-kv (fn [props sid prop-data]
-                            (let [was-in-novelty (contains? novelty-property-sids sid)
-                                  existing-last-t (:last-modified-t prop-data)
-                                  prev-prop-data (get prev-properties sid)
-                                  prev-last-t (:last-modified-t prev-prop-data)
+       (let [current-t (:t db)
+             old-sketch-t-map (atom {}) ;; Map of {sid -> old-t} for properties being updated
+             properties-with-last-t
+             (reduce-kv (fn [props sid prop-data]
+                          (let [was-in-novelty (contains? novelty-property-sids sid)
+                                existing-last-t (:last-modified-t prop-data)
+                                prev-prop-data (get prev-properties sid)
+                                prev-last-t (:last-modified-t prev-prop-data)
                                   ;; Determine the correct last-modified-t:
                                   ;; - If in novelty: current-t
                                   ;; - If has last-t already: keep it
                                   ;; - If no last-t (migration): use prev-indexed-t
-                                  new-last-t (cond
-                                               was-in-novelty current-t
-                                               existing-last-t existing-last-t
-                                               prev-indexed-t prev-indexed-t
-                                               :else current-t)] ; fallback for brand new properties
+                                new-last-t (cond
+                                             was-in-novelty current-t
+                                             existing-last-t existing-last-t
+                                             prev-indexed-t prev-indexed-t
+                                             :else current-t)] ; fallback for brand new properties
                               ;; If property is being modified and had a previous t-value, record it for garbage
-                              (when (and was-in-novelty prev-last-t (not= prev-last-t current-t))
-                                (log/debug "Recording old sketch for" sid "from t=" prev-last-t "to t=" current-t)
-                                (swap! old-sketch-t-map assoc sid prev-last-t))
-                              (assoc props sid
-                                     (assoc prop-data :last-modified-t new-last-t))))
-                          {}
-                          properties)]
-           (-> index-result
-               (assoc :properties properties-with-last-t)
-               (assoc :old-sketch-t-map @old-sketch-t-map)  ;; Pass map of old t-values for garbage
-               (assoc :classes classes)
-               (assoc :sketches sketches)
-               (assoc :novelty-property-sids novelty-property-sids))))))))  ;; Pass along for write-sketches
+                            (when (and was-in-novelty prev-last-t (not= prev-last-t current-t))
+                              (log/debug "Recording old sketch for" sid "from t=" prev-last-t "to t=" current-t)
+                              (swap! old-sketch-t-map assoc sid prev-last-t))
+                            (assoc props sid
+                                   (assoc prop-data :last-modified-t new-last-t))))
+                        {}
+                        properties)]
+         (-> index-result
+             (assoc :properties properties-with-last-t)
+             (assoc :old-sketch-t-map @old-sketch-t-map)  ;; Pass map of old t-values for garbage
+             (assoc :classes classes)
+             (assoc :sketches sketches)
+             (assoc :novelty-property-sids novelty-property-sids)))))))  ;; Pass along for write-sketches
 
 (defn refresh
   [{:keys [novelty t alias] :as db} changes-ch max-old-indexes]

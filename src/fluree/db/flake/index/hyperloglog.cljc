@@ -6,12 +6,10 @@
    - <ledger>/index/stats-sketches/subjects/<ns-code>_<name>_<t>.hll
 
    This enables predictable loading without tracking addresses."
-  (:require [clojure.string :as str]
-            [fluree.db.storage :as storage]
+  (:require [fluree.db.storage :as storage]
             [fluree.db.util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
-            [fluree.db.util.filesystem :as fs]
             [fluree.db.util.json :as json]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log :include-macros true]))
@@ -19,7 +17,7 @@
 (defn sketch-filename
   "Generate filename for a sketch file.
    type is either :values or :subjects"
-  [ledger-name sid-obj type t]
+  [ledger-name ^fluree.db.json_ld.iri.SID sid-obj type t]
   (let [ns-code (.-namespace_code sid-obj)
         name    (.-name sid-obj)
         subdir  (case type
@@ -173,78 +171,3 @@
             (recur rest-sids result)))
         result))))
 
-(defn delete-sketch-file
-  "Delete a single sketch file from storage.
-   Returns true if deleted, false if file didn't exist or error occurred.
-   Errors are logged but not thrown (idempotent, graceful failure)."
-  [{:keys [storage] :as _index-catalog} path]
-  (go-try
-    (try*
-      (let [default-key (keyword "fluree.db.storage" "default")
-            store       (storage/get-content-store storage default-key)
-            root        (:root store)
-            full-path   (str/join "/" [root path])
-            result      (<? (fs/delete-file full-path))]
-        (= :deleted result))
-      (catch* e
-        ;; File may not exist (new property, already deleted, etc) - this is OK
-        (log/debug "Could not delete sketch file (may not exist):" path)
-        false))))
-
-(defn delete-property-sketches
-  "Delete both values and subjects sketch files for a property at a given t.
-   Returns map with :values-deleted and :subjects-deleted booleans.
-   Gracefully handles missing files (returns false for that type)."
-  [index-catalog ledger-name sid-obj t]
-  (go-try
-    (let [values-path   (sketch-filename ledger-name sid-obj :values t)
-          subjects-path (sketch-filename ledger-name sid-obj :subjects t)
-          values-deleted   (<? (delete-sketch-file index-catalog values-path))
-          subjects-deleted (<? (delete-sketch-file index-catalog subjects-path))]
-      {:values-deleted values-deleted
-       :subjects-deleted subjects-deleted})))
-
-(defn delete-sketches-for-index
-  "Delete all sketch files for properties in an index at time t.
-   Returns map with :deleted-count (total files deleted) and :total-count (total files attempted).
-   Gracefully handles missing files and logs summary."
-  [index-catalog ledger-name property-sids t]
-  (go-try
-    (loop [[sid & rest-sids] (seq property-sids)
-           deleted-count 0
-           total-count 0]
-      (if sid
-        (let [{:keys [values-deleted subjects-deleted]} (<? (delete-property-sketches index-catalog ledger-name sid t))
-              deleted-count* (+ deleted-count
-                                (if values-deleted 1 0)
-                                (if subjects-deleted 1 0))
-              total-count* (+ total-count 2)] ; always attempt both values and subjects
-          (recur rest-sids deleted-count* total-count*))
-        {:deleted-count deleted-count
-         :total-count total-count}))))
-
-(defn delete-sketches-by-last-modified
-  "Delete sketch files for properties using their :last-modified-t from properties map.
-   This ensures we delete the correct sketch files even if properties weren't modified in this index.
-   Returns map with :deleted-count (total files deleted) and :total-count (total files attempted).
-   Gracefully handles missing files and logs summary."
-  [index-catalog ledger-name properties-map]
-  (go-try
-    (loop [[sid & rest-sids] (keys properties-map)
-           deleted-count 0
-           total-count 0]
-      (if sid
-        (let [prop-data (get properties-map sid)
-              last-t (:last-modified-t prop-data)]
-          (if (and last-t (pos? last-t))
-            (let [{:keys [values-deleted subjects-deleted]}
-                  (<? (delete-property-sketches index-catalog ledger-name sid last-t))
-                  deleted-count* (+ deleted-count
-                                    (if values-deleted 1 0)
-                                    (if subjects-deleted 1 0))
-                  total-count* (+ total-count 2)]
-              (recur rest-sids deleted-count* total-count*))
-            ;; No last-modified-t (shouldn't happen in production), skip
-            (recur rest-sids deleted-count total-count)))
-        {:deleted-count deleted-count
-         :total-count total-count}))))
