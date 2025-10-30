@@ -1,6 +1,7 @@
 (ns fluree.db.query.fql.parse
   (:require #?(:cljs [cljs.reader :refer [read-string]])
             [clojure.set :as set]
+            [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
@@ -841,6 +842,13 @@
                        (update :opts merge {:object-var-parsing (:parse-object-vars? var-config)})
                        (parse-query* context))]
     [(where/->pattern :query sub-query*)]))
+
+(defmethod parse-pattern :service
+  [[_ {:keys [clause] :as data}] _var-config context]
+  (let [sparql (str/join " " (into (sparql/context->prefixes context)
+                                   ["SELECT *"
+                                    (str "WHERE " clause)]))]
+    [(where/->pattern :service (assoc data :sparql-q sparql))]))
 
 (defn parse-query
   [q]

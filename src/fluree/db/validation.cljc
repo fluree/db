@@ -309,10 +309,14 @@
     ::bind                 [:+ {:error/message "bind values must be mappings from variables to functions"}
                             [:catn [:var ::var]
                              [:binding [:or ::function ::literal]]]]
+    ::service              [:map
+                            [:service :string]
+                            [:silent? :boolean]
+                            [:clause  :string]]
     ::where-op             [:and
                             :keyword
-                            [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind, values, exists, not-exists, minus"}
-                             :graph :filter :optional :union :bind :query :values :exists :not-exists :minus]]
+                            [:enum {:error/message "unrecognized where operation, must be one of: graph, filter, optional, union, bind, values, exists, not-exists, minus, service"}
+                             :graph :filter :optional :union :bind :query :values :exists :not-exists :minus :service]]
     ::graph                [:orn {:error/message "value of graph. Must be a ledger name or variable"}
                             [:ledger ::ledger]
                             [:variable ::var]]
@@ -360,6 +364,7 @@
                                     [:op ::where-op]
                                     [:bindings ::bind]]]
                             [:graph [:tuple ::where-op ::graph [:ref ::where]]]
+                            [:service [:tuple ::where-op ::service]]
                             ;; TODO - because ::subquery is a separate registry it cannot be called here, validated in f.d.q.fql.syntax/coerce-subquery until resolved
                             [:query [:catn
                                      [:op ::where-op]
