@@ -116,57 +116,6 @@
       (min count 10)
       moderately-selective)))
 
-(defn calculate-selectivity
-  "Calculate selectivity score for a pattern.
-   Lower score = more selective = execute first.
-   Returns nil for non-optimizable patterns or when stats are unavailable."
-  [db stats pattern]
-  (let [pattern-type (where/pattern-type pattern)
-        pattern-data (where/pattern-data pattern)]
-
-    (cond
-      (or (nil? stats)
-          (empty? stats)
-          (not (optimizable-pattern? pattern)))
-      nil
-
-      (= :id pattern-type)
-      (if (where/matched? pattern-data)
-        highly-selective
-        moderately-selective)
-
-      :else
-      (let [[s p o] pattern-data]
-        (cond
-          (= :class pattern-type)
-          (let [class-sid (get-sid db o)]
-            (or (get-class-count stats class-sid) default-selectivity))
-
-          ;; Specific s-p-o triple lookup
-          (where/all-matched? [s p o])
-          highly-selective
-
-          ;; s-p-? lookup uses HLL estimate
-          (and (where/matched? s) (where/matched? p) (where/unmatched? o))
-          (let [pred-sid (get-sid db p)]
-            (estimate-bound-subject stats pred-sid))
-
-          ;; ?-p-? property scan uses property count
-          (and (where/unmatched? s) (where/matched? p) (where/unmatched? o))
-          (let [pred-sid (get-sid db p)]
-            (or (get-property-count stats pred-sid) default-selectivity))
-
-          ;; ?-p-o reverse lookup uses HLL estimate
-          (and (where/unmatched? s) (where/matched? p) (where/matched? o))
-          (let [pred-sid (get-sid db p)]
-            (estimate-bound-value stats pred-sid))
-
-          (and (where/unmatched? s) (where/unmatched? p) (where/unmatched? o))
-          full-scan
-
-          :else
-          default-selectivity)))))
-
 (defn calculate-selectivity-with-details
   "Calculate selectivity score with detailed inputs for explain API.
    Returns map with :score and :inputs showing the exact values used.
@@ -283,37 +232,61 @@
    []
    where-clause))
 
-(defn optimize-segment
-  "Optimize a single segment by sorting patterns by selectivity.
-   Uses compare-triples as tie-breaker for equal scores to ensure stable ordering."
+(defn optimize-segment-with-metadata
+  "Optimize a single segment and return patterns with their scores and detailed inputs.
+   Returns vector of maps with :pattern, :score, and :inputs (for explain)."
   [db stats patterns]
-  ;; Sort by selectivity (lower = more selective = execute first)
-  ;; Use compare-triples as tie-breaker for equal scores
-  (let [with-scores (mapv (fn [pattern]
-                            {:pattern pattern
-                             :score (or (calculate-selectivity db stats pattern)
-                                        default-selectivity)})
-                          patterns)
-        cmp         (fn [{sa :score pa :pattern} {sb :score pb :pattern}]
-                      (let [c (compare sa sb)]
-                        (if (zero? c)
-                          (compare-triples pa pb)
-                          c)))
-        sorted      (sort cmp with-scores)]
-    (mapv :pattern sorted)))
+  (let [with-details (mapv (fn [pattern]
+                             (let [{:keys [score inputs]} (calculate-selectivity-with-details db stats pattern)]
+                               {:pattern pattern
+                                :score (or score default-selectivity)
+                                :inputs inputs}))
+                           patterns)
+        cmp          (fn [{sa :score pa :pattern} {sb :score pb :pattern}]
+                       (let [c (compare sa sb)]
+                         (if (zero? c)
+                           (compare-triples pa pb)
+                           c)))]
+    (vec (sort cmp with-details))))
 
-(defn optimize-patterns
-  "Reorder patterns for optimal execution based on statistics.
-   Splits on optimization boundaries and optimizes each segment independently."
+(defn optimize-patterns-with-metadata
+  "Reorder patterns for optimal execution and return rich metadata for explain.
+   Returns map with:
+   - :original - original where clause
+   - :optimized - optimized pattern list (just patterns, for fast extraction)
+   - :segments - segment info with patterns, scores, and inputs
+   - :changed? - whether optimization changed the order
+
+   This function does all the optimization work once, so explain can just format
+   the results without recalculating selectivity scores."
   [db where-clause]
   (let [stats (:stats db)
-        segments (split-by-optimization-boundaries where-clause)]
-    (into []
-          (mapcat (fn [segment]
-                    (if (= :optimizable (:type segment))
-                      (optimize-segment db stats (:data segment))
-                      [(:data segment)])))
-          segments)))
+        segments (split-by-optimization-boundaries where-clause)
+        ;; Process each segment and collect metadata
+        processed-segments
+        (mapv (fn [segment]
+                (if (= :optimizable (:type segment))
+                  (let [patterns (:data segment)
+                        optimized-with-meta (optimize-segment-with-metadata db stats patterns)]
+                    {:type :optimizable
+                     :original patterns
+                     :optimized optimized-with-meta})
+                  {:type :boundary
+                   :pattern (:data segment)}))
+              segments)
+        ;; Extract just the optimized patterns for the optimized clause
+        optimized-clause
+        (into []
+              (mapcat (fn [segment]
+                        (if (= :optimizable (:type segment))
+                          (mapv :pattern (:optimized segment))
+                          [(:pattern segment)])))
+              processed-segments)
+        changed? (not= where-clause optimized-clause)]
+    {:original where-clause
+     :optimized optimized-clause
+     :segments processed-segments
+     :changed? changed?}))
 
 (defprotocol Optimizable
   "Protocol for query optimization based on database statistics."

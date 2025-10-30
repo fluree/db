@@ -422,49 +422,45 @@
     :tuple :triple
     ptype))
 
-(defn- pattern-explain
-  "Generate explain information for a single pattern with detailed inputs.
-   Per QUERY_STATS_AND_HLL.md lines 277-296, includes inputs used for selectivity calculation."
-  [db stats pattern compact-fn]
-  (let [ptype       (where/pattern-type pattern)
+(defn- format-pattern-with-metadata
+  "Format a pattern with its pre-calculated metadata for display.
+   Takes pattern metadata map with :pattern, :score, :inputs."
+  [pattern-meta compact-fn]
+  (let [pattern      (:pattern pattern-meta)
+        score        (:score pattern-meta)
+        inputs       (:inputs pattern-meta)
+        ptype        (where/pattern-type pattern)
         optimizable? (optimize/optimizable-pattern? pattern)]
-    (if (and stats optimizable?)
-      (let [{:keys [score inputs]} (optimize/calculate-selectivity-with-details db stats pattern)]
-        {:type        (pattern-type->user-type ptype)
-         :pattern     (pattern->user-format pattern compact-fn)
-         :selectivity score
-         :inputs      inputs
-         :optimizable (when optimizable? (pattern-type->user-type optimizable?))})
-      {:type        (pattern-type->user-type ptype)
-       :pattern     (pattern->user-format pattern compact-fn)
-       :selectivity nil
-       :optimizable (when optimizable? (pattern-type->user-type optimizable?))})))
+    {:type        (pattern-type->user-type ptype)
+     :pattern     (pattern->user-format pattern compact-fn)
+     :selectivity score
+     :inputs      inputs
+     :optimizable (when optimizable? (pattern-type->user-type optimizable?))}))
 
-(defn- segment-explain
-  "Generate explain information for pattern segments"
-  [db stats where-clause compact-fn]
-  (let [segments (optimize/split-by-optimization-boundaries where-clause)]
-    (mapv (fn [segment]
-            (if (= :optimizable (:type segment))
-              {:type     :optimizable
-               :patterns (mapv #(pattern-explain db stats % compact-fn) (:data segment))}
-              {:type    :boundary
-               :pattern (pattern-explain db stats (:data segment) compact-fn)}))
-          segments)))
+(defn- format-segment-metadata
+  "Format segment metadata for display in explain output."
+  [segment compact-fn]
+  (if (= :optimizable (:type segment))
+    {:type     :optimizable
+     :patterns (mapv #(format-pattern-with-metadata % compact-fn) (:optimized segment))}
+    {:type    :boundary
+     :pattern (pattern->user-format (:pattern segment) compact-fn)}))
 
 (defn optimize-query
   "Optimize a parsed query using statistics if available.
-   Returns the optimized query with patterns reordered for optimal execution."
+   Returns the optimized query with patterns reordered for optimal execution.
+   Uses fast path - extracts optimized patterns without formatting."
   [db parsed-query]
   (let [stats (:stats db)]
     (if (and stats (not-empty stats) (:where parsed-query))
-      (let [optimized-where (optimize/optimize-patterns db (:where parsed-query))]
-        (assoc parsed-query :where optimized-where))
+      (let [{:keys [optimized]} (optimize/optimize-patterns-with-metadata db (:where parsed-query))]
+        (assoc parsed-query :where optimized))
       parsed-query)))
 
 (defn explain-query
   "Generate an execution plan for the query showing optimization details.
-   Returns a query plan map with optimization information."
+   Returns a query plan map with optimization information.
+   Uses optimize-patterns-with-metadata to avoid redundant calculations."
   [db parsed-query]
   (let [stats            (:stats db)
         has-stat-counts? (and stats
@@ -477,26 +473,44 @@
        :plan  {:optimization :none
                :reason       "No statistics available"
                :where-clause (:where parsed-query)}}
-      (let [where-clause      (:where parsed-query)
-            optimized-where   (when where-clause
-                                (optimize/optimize-patterns db where-clause))
-            original-explain  (when where-clause
-                                (mapv #(pattern-explain db stats % compact-fn) where-clause))
-            optimized-explain (when optimized-where
-                                (mapv #(pattern-explain db stats % compact-fn) optimized-where))
-            segments          (when where-clause
-                                (segment-explain db stats where-clause compact-fn))
-            changed?          (not= where-clause optimized-where)]
-        {:query (assoc parsed-query :where optimized-where)
-         :plan  {:optimization (if changed? :reordered :unchanged)
-                 :statistics   {:property-counts (count (:properties stats))
-                                :class-counts    (count (:classes stats))
-                                :total-flakes    (:flakes stats)
-                                :indexed-at-t    (:indexed stats)}
-                 :original     original-explain
-                 :optimized    optimized-explain
-                 :segments     segments
-                 :changed?     changed?}}))))
+      (let [where-clause (:where parsed-query)]
+        (if-not where-clause
+          {:query parsed-query
+           :plan  {:optimization :none
+                   :reason       "No where clause"}}
+          ;; Calculate optimization metadata once
+          (let [{:keys [optimized segments changed?]}
+                (optimize/optimize-patterns-with-metadata db where-clause)
+                ;; Now just format the metadata for display (no recalculation)
+                ;; For original, we need to compute the metadata for patterns in their original order
+                original-with-meta (mapcat (fn [segment]
+                                             (if (= :optimizable (:type segment))
+                                               ;; Find scores from optimized segment (same patterns, different order)
+                                               (let [score-map (into {} (map (fn [pm] [(:pattern pm) pm])
+                                                                             (:optimized segment)))]
+                                                 (map (fn [p] (or (get score-map p)
+                                                                  {:pattern p :score nil :inputs nil}))
+                                                      (:original segment)))
+                                               [{:pattern (:pattern segment) :score nil :inputs nil}]))
+                                           segments)
+                original-explain   (mapv #(format-pattern-with-metadata % compact-fn) original-with-meta)
+                optimized-explain (mapv #(format-pattern-with-metadata % compact-fn)
+                                        (mapcat (fn [segment]
+                                                  (if (= :optimizable (:type segment))
+                                                    (:optimized segment)
+                                                    [{:pattern (:pattern segment) :score nil :inputs nil}]))
+                                                segments))
+                segments-explain  (mapv #(format-segment-metadata % compact-fn) segments)]
+            {:query (assoc parsed-query :where optimized)
+             :plan  {:optimization (if changed? :reordered :unchanged)
+                     :statistics   {:property-counts (count (:properties stats))
+                                    :class-counts    (count (:classes stats))
+                                    :total-flakes    (:flakes stats)
+                                    :indexed-at-t    (:indexed stats)}
+                     :original     original-explain
+                     :optimized    optimized-explain
+                     :segments     segments-explain
+                     :changed?     changed?}}))))))
 
 (defrecord FlakeDB [index-catalog commit-catalog alias commit t tt-id stats
                     spot post opst tspo vg schema comparators staged novelty policy
