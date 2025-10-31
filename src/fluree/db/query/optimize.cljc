@@ -36,3 +36,7 @@
                 nxt
                 (reduced nxt)))
             (map compare-component a' b'))))
+
+(defn sort-triples
+  [triple-coll]
+  (sort compare-triples triple-coll))

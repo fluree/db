@@ -549,7 +549,7 @@
       (let [statements (parse-statements s-mch attrs var-config context)]
         (if (simple-property-join? id attrs)
           [(where/->pattern :property-join statements)]
-          (sort optimize/compare-triples statements))))))
+          (optimize/sort-triples statements))))))
 
 (defn parse-node-map
   [m var-config context]
