@@ -18,14 +18,20 @@
   [x]
   (contains? triple-pattern-types (where/pattern-type x)))
 
+(defn try-coerce-triple
+  "Returns the triple data if x is a triple pattern (:class, :tuple),
+  otherwise returns nil."
+  [x]
+  (when (triple-pattern? x)
+    (where/pattern-data x)))
+
 (defn coerce-triple
   [x]
-  (if (triple-pattern? x)
-    (where/pattern-data x)
-    (throw (ex-info "Optimization failed on non triple pattern type"
-                    {:status   500
-                     :error    :db/optimization-failure
-                     ::pattern x}))))
+  (or (try-coerce-triple x)
+      (throw (ex-info "Optimization failed on non triple pattern type"
+                      {:status   500
+                       :error    :db/optimization-failure
+                       ::pattern x}))))
 
 (defn compare-triples
   [a b]
