@@ -95,12 +95,25 @@
 
           prev-idx-t    (-> commit :index :data :t)
           prev-idx-addr (-> commit :index :address)
+          prev-idx-v    (-> commit :index :data :v)
+
+          ;; Preserve version from previous index unless this is a full reindex (no prev-idx-t)
+          ;; - v1 indexes stay v1 until full reindex (to avoid incomplete stats)
+          ;; - v2 indexes stay v2
+          version       (if prev-idx-t
+                          (or prev-idx-v 1)
+                          2)
+
+          stats-data    (cond-> (select-keys stats [:flakes :size])
+                          ;; HLL-based stats (properties, classes) are only for v2 indexes
+                          (= 2 version) (merge (select-keys stats [:properties :classes])))
+
           vg-addresses  (<? (write-vg-map index-catalog vg))
           data          (cond-> {:ledger-alias alias
                                  :t               t
-                                 :v               2 ;; version of db root file (v2: HLL-based NDV statistics)
+                                 :v               version
                                  :schema          (vocab/serialize-schema schema)
-                                 :stats           (select-keys stats [:flakes :size :properties :classes])
+                                 :stats           stats-data
                                  :spot            (child-data spot)
                                  :post            (child-data post)
                                  :opst            (child-data opst)
