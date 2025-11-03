@@ -136,6 +136,9 @@
 (def indexing-enabled
   (system-iri "indexingEnabled"))
 
+(def ledger-cache-idle-minutes
+  (system-iri "ledgerCacheIdleMinutes"))
+
 (def connection
   (system-iri "connection"))
 

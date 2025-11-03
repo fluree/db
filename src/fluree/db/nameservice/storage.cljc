@@ -1,10 +1,11 @@
 (ns fluree.db.nameservice.storage
-  (:require [clojure.core.async :refer [go]]
+  (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
+            [fluree.db.util :as util]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.json :as json]
             [fluree.db.util.ledger :as util.ledger]
@@ -66,6 +67,77 @@
         ns-record))
     ns-record))
 
+(defn set-indexing-status
+  "Adds or updates the indexing metadata in a nameservice record.
+
+  Parameters:
+    ns-record - The existing nameservice record map
+    target-t - The 't' value being indexed
+    started - ISO-8601 timestamp when indexing started
+    machine-id - Machine identifier (hostname:pid) performing the indexing
+    last-heartbeat - ISO-8601 timestamp of last heartbeat (defaults to started)
+
+  Returns updated nameservice record with f:indexing field."
+  ([ns-record target-t started machine-id]
+   (set-indexing-status ns-record target-t started machine-id started))
+  ([ns-record target-t started machine-id last-heartbeat]
+   (assoc ns-record "f:indexing" {"f:target-t" target-t
+                                  "f:started" started
+                                  "f:machine-id" machine-id
+                                  "f:last-heartbeat" last-heartbeat})))
+
+(defn clear-indexing-status
+  "Removes the indexing metadata from a nameservice record.
+
+  Called when indexing completes (successfully or with error).
+
+  Returns updated nameservice record without f:indexing field."
+  [ns-record]
+  (dissoc ns-record "f:indexing"))
+
+(defn get-indexing-status
+  "Extracts indexing metadata from a nameservice record.
+
+  Returns a map with :target-t, :started, :machine-id, and :last-heartbeat if indexing is in progress,
+  or nil if not currently indexing."
+  [ns-record]
+  (when-let [indexing (get ns-record "f:indexing")]
+    {:target-t       (get indexing "f:target-t")
+     :started        (get indexing "f:started")
+     :machine-id     (get indexing "f:machine-id")
+     :last-heartbeat (get indexing "f:last-heartbeat")}))
+
+(defn indexing-stale?
+  "Checks if an in-progress indexing operation is stale (no heartbeat for >5 minutes).
+
+  Parameters:
+    indexing-status - Map with :last-heartbeat timestamp (ISO-8601 string)
+
+  Returns true if last heartbeat is older than 5 minutes, false otherwise."
+  [indexing-status]
+  (when-let [last-heartbeat (:last-heartbeat indexing-status)]
+    (let [stale-threshold-ms (* 5 60 1000) ; 5 minutes in milliseconds
+          last-hb-time       #?(:clj (java.time.Instant/parse last-heartbeat)
+                                :cljs (js/Date. last-heartbeat))
+          now                #?(:clj (java.time.Instant/now)
+                                :cljs (js/Date.))
+          elapsed-ms         #?(:clj (.toMillis (java.time.Duration/between last-hb-time now))
+                                :cljs (- (.getTime now) (.getTime last-hb-time)))]
+      (> elapsed-ms stale-threshold-ms))))
+
+(defn can-start-indexing?
+  "Determines if a new indexing operation can start.
+
+  Returns {:can-start? true} if indexing can start.
+  Returns {:can-start? false, :reason :already-indexing, :status <status>}
+          if indexing is already in progress and not stale."
+  [ns-record]
+  (if-let [indexing-status (get-indexing-status ns-record)]
+    (if (indexing-stale? indexing-status)
+      {:can-start? true, :reason :stale-indexing}
+      {:can-start? false, :reason :already-indexing, :status indexing-status})
+    {:can-start? true}))
+
 (defn update-ns-record
   [ns-record ledger-alias commit-address commit-t index-address index-t]
   (if (some? ns-record)
@@ -103,6 +175,48 @@
   (publishing-address [_ ledger-alias]
     ;; Just return the alias - lookup will handle branch extraction via local-filename
     (go ledger-alias))
+
+  (index-start [_ ledger-alias target-t machine-id]
+    (let [filename       (local-filename ledger-alias)
+          started        (util/current-time-iso)
+          result-ch      (async/chan 1)
+          record-updater (fn [ns-record]
+                           (let [check-result (can-start-indexing? ns-record)]
+                             (if (:can-start? check-result)
+                               (do
+                                 (async/put! result-ch {:status :started})
+                                 (set-indexing-status ns-record target-t started machine-id))
+                               (do
+                                 (async/put! result-ch (assoc (:status check-result)
+                                                              :status :already-indexing))
+                                 ns-record))))]
+      (log/debug "index-start for" ledger-alias "at t:" target-t "machine:" machine-id)
+      (storage/swap-json store filename record-updater)
+      result-ch))
+
+  (index-heartbeat [_ ledger-alias]
+    (let [filename       (local-filename ledger-alias)
+          now            (util/current-time-iso)
+          result-ch      (async/chan 1)
+          record-updater (fn [ns-record]
+                           (if (get ns-record "f:indexing")
+                             (do
+                               (async/put! result-ch {:status :updated})
+                               (assoc-in ns-record ["f:indexing" "f:last-heartbeat"] now))
+                             (do
+                               (async/put! result-ch {:status :not-indexing})
+                               ns-record)))]
+      (log/debug "index-heartbeat for" ledger-alias)
+      (storage/swap-json store filename record-updater)
+      result-ch))
+
+  (index-finish [_ ledger-alias]
+    (let [filename       (local-filename ledger-alias)
+          record-updater (fn [ns-record]
+                           (clear-indexing-status ns-record))]
+      (log/debug "index-finish for" ledger-alias)
+      (storage/swap-json store filename record-updater)
+      (go {:status :completed})))
 
   nameservice/iNameService
   (lookup [_ ledger-address]
