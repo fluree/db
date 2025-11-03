@@ -104,15 +104,18 @@
                             (catch Exception _
                               "unknown"))]
              (str hostname ":" pid))
-     :cljs (let [;; Node.js environment - prefer AWS Lambda log stream, then hostname
-                 hostname (or (.-AWS_LAMBDA_LOG_STREAM_NAME js/process.env)
-                              (.-HOSTNAME js/process.env)
-                              (when (exists? js/os)
-                                (try (.hostname js/os)
-                                     (catch js/Error _ "node")))
-                              "node")
-                 pid      (.-pid js/process)]
-             (str hostname ":" pid))))
+     :cljs (if (exists? js/process)
+             ;; Node.js environment - prefer AWS Lambda log stream, then hostname
+             (let [hostname (or (.-AWS_LAMBDA_LOG_STREAM_NAME js/process.env)
+                                (.-HOSTNAME js/process.env)
+                                (when (exists? js/os)
+                                  (try (.hostname js/os)
+                                       (catch js/Error _ "node")))
+                                "node")
+                   pid      (.-pid js/process)]
+               (str hostname ":" pid))
+             ;; Browser environment - use timestamp-based identifier
+             (str "browser:" (js/Date.now)))))
 
 (defn response-time-formatted
   "Returns response time, formatted as string. Must provide start time of request
