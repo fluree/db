@@ -27,7 +27,37 @@
     This may be a full address/IRI (e.g., fluree:ipns://...) or a resolvable
     identifier such as a ledger alias (e.g., ledger:branch), depending on the
     nameservice implementation. The returned value will be used with this same
-    nameservice's lookup function. If publishing should be private, return nil."))
+    nameservice's lookup function. If publishing should be private, return nil.")
+  (index-start [publisher ledger-alias target-t machine-id]
+    "Marks the start of an indexing process for the specified target-t.
+
+    Parameters:
+      publisher - The nameservice publisher
+      ledger-alias - The ledger being indexed
+      target-t - The 't' value being indexed
+      machine-id - Machine identifier (hostname:pid) performing the indexing
+
+    Returns a channel that will contain:
+    - {:status :started} on success
+    - {:status :already-indexing, :started <iso>, :machine-id <id>, :last-heartbeat <iso>}
+      if indexing already in progress and not stale (heartbeat within 5 min)")
+  (index-heartbeat [publisher ledger-alias]
+    "Updates the last-heartbeat timestamp for an in-progress indexing operation.
+
+    Should be called periodically (every ~60 seconds) during indexing to indicate
+    the process is still active. If heartbeat stops for > 5 minutes, the indexing
+    is considered stale and another process can take over.
+
+    Returns a channel that will contain:
+    - {:status :updated} on success
+    - {:status :not-indexing} if no indexing in progress")
+  (index-finish [publisher ledger-alias]
+    "Marks the completion of an indexing process.
+
+    Clears the indexing metadata from the nameservice record.
+
+    Returns a channel that will contain:
+    - {:status :completed}"))
 
 (defprotocol Publication
   (subscribe [publication ledger-alias]

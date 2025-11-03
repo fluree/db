@@ -1,5 +1,6 @@
 (ns fluree.db.nameservice.ipns
-  (:require [clojure.string :as str]
+  (:require [clojure.core.async :refer [go]]
+            [clojure.string :as str]
             [fluree.db.method.ipfs :as ipfs]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.method.ipfs.keys :as ipfs-keys]
@@ -62,6 +63,15 @@
     (ipfs/write ipfs-endpoint "null"))
   (publishing-address [_ ledger-alias]
     (ipns-address ipfs-endpoint ipns-key ledger-alias))
+  (index-start [_ _ledger-alias _target-t _machine-id]
+    (log/debug "IPNS does not support fine-grained indexing status")
+    (go {:status :not-supported}))
+  (index-heartbeat [_ _ledger-alias]
+    (log/debug "IPNS does not support fine-grained indexing status")
+    (go {:status :not-supported}))
+  (index-finish [_ _ledger-alias]
+    (log/debug "IPNS does not support fine-grained indexing status")
+    (go {:status :not-supported}))
 
   nameservice/iNameService
   (lookup [_ ledger-alias]

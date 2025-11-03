@@ -1,5 +1,6 @@
 (ns fluree.db.util
-  #?(:clj (:require [fluree.db.util.clj-exceptions :as clj-exceptions]
+  #?(:clj (:require [clojure.string :as str]
+                    [fluree.db.util.clj-exceptions :as clj-exceptions]
                     [fluree.db.util.cljs-exceptions :as cljs-exceptions]))
   #?(:cljs (:require-macros [fluree.db.util :refer [case+]]))
   #?(:clj (:import (java.time Instant OffsetDateTime ZoneId)
@@ -66,6 +67,52 @@
   []
   #?(:clj  (str (Instant/now))
      :cljs (.toISOString (js/Date.))))
+
+(defn machine-id
+  "Returns a machine identifier in format 'hostname:pid'.
+
+  This identifier is used to track which process is performing operations
+  like indexing, allowing detection of stale/failed processes across a
+  distributed system.
+
+  Attempts to use environment-specific identifiers when available:
+  - AWS Lambda: Uses AWS_LAMBDA_LOG_STREAM_NAME (unique per invocation)
+  - AWS EC2: Uses HOSTNAME env var (often instance ID)
+  - Kubernetes: Uses pod hostname (typically pod name)
+  - Docker: Uses container hostname
+  - Traditional servers: Uses system hostname via InetAddress
+
+  Examples:
+    - 'server-1.example.com:12345' (traditional server)
+    - 'fluree-pod-abc123:1' (Kubernetes pod)
+    - '2021/01/01/[$LATEST]abc123:1' (AWS Lambda)
+    - 'i-0abcdef1234567890:12345' (EC2 with instance ID as hostname)
+    - 'localhost:54321' (development)"
+  []
+  #?(:clj  (let [;; Try AWS Lambda log stream name first, then hostname, then fallback
+                 hostname (or (System/getenv "AWS_LAMBDA_LOG_STREAM_NAME")
+                              (System/getenv "HOSTNAME")
+                              (try
+                                (.getHostName (java.net.InetAddress/getLocalHost))
+                                (catch Exception _
+                                  "unknown")))
+                 pid      (try
+                            (-> (java.lang.management.ManagementFactory/getRuntimeMXBean)
+                                (.getName)
+                                (str/split #"@")
+                                first)
+                            (catch Exception _
+                              "unknown"))]
+             (str hostname ":" pid))
+     :cljs (let [;; Node.js environment - prefer AWS Lambda log stream, then hostname
+                 hostname (or (.-AWS_LAMBDA_LOG_STREAM_NAME js/process.env)
+                              (.-HOSTNAME js/process.env)
+                              (when (exists? js/os)
+                                (try (.hostname js/os)
+                                     (catch js/Error _ "node")))
+                              "node")
+                 pid      (.-pid js/process)]
+             (str hostname ":" pid))))
 
 (defn response-time-formatted
   "Returns response time, formatted as string. Must provide start time of request

@@ -8,6 +8,7 @@
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
+            [fluree.db.nameservice.storage :as nameservice.storage]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
             [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
@@ -20,8 +21,10 @@
 
 (def blank-state
   "Initial connection state"
-  {:ledger        {}
-   :subscriptions {}})
+  {:ledger         {}
+   :subscriptions  {}
+   :last-accessed  {}
+   :disconnecting? false})
 
 (defn printer-map
   "Returns map of important data for print writer"
@@ -29,7 +32,8 @@
   (select-keys conn [:id]))
 
 (defrecord Connection [id state parallelism commit-catalog index-catalog primary-publisher
-                       secondary-publishers remote-systems serializer cache defaults])
+                       secondary-publishers remote-systems serializer cache defaults
+                       idle-cleanup-ch]) ; channel for idle cleanup go-loop
 
 #?(:clj
    (defmethod print-method Connection [^Connection conn, ^Writer w]
@@ -50,14 +54,89 @@
   [x]
   (instance? Connection x))
 
+;; Forward declarations for idle cleanup loop
+(declare release-ledger touch-ledger-access)
+
+(defn start-idle-cleanup-loop
+  "Starts a background go-loop that periodically checks for idle ledgers and releases them.
+  Returns a channel that can be closed to stop the loop.
+
+  idle-timeout-ms - How long (in milliseconds) a ledger can be idle before being released.
+                    If nil or 0, idle cleanup is disabled.
+  check-interval-ms - How often to check for idle ledgers (default: 1 minute)"
+  [conn idle-timeout-ms check-interval-ms]
+  (if (and idle-timeout-ms (pos? idle-timeout-ms))
+    (let [cleanup-ch (async/chan)]
+      (log/info "Starting idle ledger cleanup loop with timeout:" idle-timeout-ms "ms")
+      (go-loop []
+        (let [timeout-ch (async/timeout check-interval-ms)]
+          (async/alt!
+            cleanup-ch
+            ([_] (log/debug "Stopping idle cleanup loop"))
+
+            timeout-ch
+            ([_]
+             (let [{:keys [state]} conn
+                   current-time (util/current-time-millis)
+                   {:keys [ledger last-accessed]} @state
+                   idle-ledgers (keep (fn [[alias _]]
+                                        (let [last-access (get last-accessed alias 0)
+                                              idle-time   (- current-time last-access)]
+                                          (log/trace "Checking ledger" alias
+                                                     "- last-access:" last-access
+                                                     "- idle-time:" idle-time "ms"
+                                                     "- threshold:" idle-timeout-ms "ms")
+                                          (when (> idle-time idle-timeout-ms)
+                                            alias)))
+                                      ledger)]
+               (when (seq idle-ledgers)
+                 (log/info "Found" (count idle-ledgers) "idle ledgers to check:" idle-ledgers)
+                 (doseq [alias idle-ledgers]
+                   (try*
+                     (let [{:keys [primary-publisher]} conn
+                           ns-record (when primary-publisher
+                                       (<? (nameservice/lookup primary-publisher alias)))
+                           indexing? (when ns-record
+                                       (nameservice.storage/get-indexing-status ns-record))]
+                       (if indexing?
+                         (do
+                           (log/debug "Ledger" alias "is currently indexing, resetting idle timer"
+                                      "- indexing:" indexing?)
+                           (touch-ledger-access conn alias))
+                         (do
+                           (log/info "Releasing idle ledger:" alias)
+                           (<? (release-ledger conn alias)))))
+                     (catch* e
+                       (log/warn e "Error checking/releasing idle ledger:" alias)))))
+               (recur))))))
+      cleanup-ch)
+    (do
+      (log/debug "Idle ledger cleanup is disabled (idle-timeout not configured)")
+      nil)))
+
 (defn connect
   [{:keys [parallelism commit-catalog index-catalog cache serializer
            primary-publisher secondary-publishers remote-systems defaults]
     :or   {serializer (json-serde)} :as _opts}]
   (let [id    (random-uuid)
-        state (atom blank-state)]
-    (->Connection id state parallelism commit-catalog index-catalog primary-publisher
-                  secondary-publishers remote-systems serializer cache defaults)))
+        state (atom blank-state)
+        ;; Get idle timeout from defaults (in minutes, convert to ms)
+        idle-timeout-minutes (get-in defaults [:ledger-cache-idle-minutes])
+        idle-timeout-ms      (when idle-timeout-minutes
+                               (* idle-timeout-minutes 60 1000))
+        ;; Check every minute by default
+        check-interval-ms    60000
+        conn                 (->Connection id state parallelism commit-catalog index-catalog
+                                           primary-publisher secondary-publishers remote-systems
+                                           serializer cache defaults nil)
+        ;; Start idle cleanup loop
+        cleanup-ch           (start-idle-cleanup-loop conn idle-timeout-ms check-interval-ms)]
+    (assoc conn :idle-cleanup-ch cleanup-ch)))
+
+(defn touch-ledger-access
+  "Updates the last-accessed timestamp for a ledger"
+  [{:keys [state] :as _conn} ledger-alias]
+  (swap! state assoc-in [:last-accessed ledger-alias] (util/current-time-millis)))
 
 (defn register-ledger
   "Creates a promise-chan and saves it in a cache of ledgers being held
@@ -72,7 +151,7 @@
   `promise-chan` is a promise channel that must have the final ledger `put!`
   into it assuming `success?` is true, otherwise it will return the existing
   found promise-chan when `success?` is false"
-  [{:keys [state] :as _conn} ledger-alias]
+  [{:keys [state] :as conn} ledger-alias]
   (let [new-p-chan (async/promise-chan)
         p-chan     (-> state
                        (swap! update-in [:ledger ledger-alias]
@@ -81,18 +160,69 @@
                        (get-in [:ledger ledger-alias]))
         cached?    (not= p-chan new-p-chan)]
     (log/debug "Registering ledger: " ledger-alias " cached? " cached?)
+    ;; Update last-accessed timestamp
+    (touch-ledger-access conn ledger-alias)
     [cached? p-chan]))
 
 (defn cached-ledger
-  "Returns a cached ledger from the connection if it is cached, else nil"
-  [{:keys [state] :as _conn} ledger-alias]
-  (get-in @state [:ledger ledger-alias]))
+  "Returns a cached ledger from the connection if it is cached, else nil.
+  Updates the last-accessed timestamp as a side effect."
+  [{:keys [state] :as conn} ledger-alias]
+  (when-let [ledger-ch (get-in @state [:ledger ledger-alias])]
+    (touch-ledger-access conn ledger-alias)
+    ledger-ch))
+
+(defn close-branch-resources
+  "Closes all resources held by a branch (index-queue channel, etc.)"
+  [branch-map]
+  (when-let [idx-q (:index-queue branch-map)]
+    (log/debug "Closing index-queue channel for branch:" (:name branch-map))
+    (async/close! idx-q)))
+
+(defn close-ledger-resources
+  "Closes all resources held by a ledger (branches, subscriptions, channels)"
+  [ledger]
+  (when ledger
+    (let [{:keys [state]} ledger
+          {:keys [branches]} @state]
+      (log/debug "Closing resources for ledger:" (:alias ledger))
+      (doseq [[_branch-name branch-map] branches]
+        (close-branch-resources branch-map)))))
 
 (defn release-ledger
-  "Opposite of register-ledger. Removes reference to a ledger from conn"
-  [{:keys [state] :as _conn} ledger-alias]
-  (swap! state update :ledger dissoc ledger-alias)
-  nil)
+  "Releases a ledger from the connection cache and cleans up all associated resources.
+  This includes:
+  - Closing index-queue channels and stopping indexing go-loops
+  - Unsubscribing from nameservice updates
+  - Removing the ledger from the cache
+  - Closing any promise channels waiting for the ledger"
+  [{:keys [state remote-systems] :as _conn} ledger-alias]
+  (go-try
+    (log/debug "Releasing ledger:" ledger-alias)
+    (when-let [ledger-ch (get-in @state [:ledger ledger-alias])]
+      (try*
+        (let [ledger (async/poll! ledger-ch)]
+          (when (and ledger (not (util/exception? ledger)))
+            (close-ledger-resources ledger)))
+        (catch* e
+          (log/warn e "Error closing ledger resources for:" ledger-alias)))
+      (async/close! ledger-ch))
+
+    (when-let [sub-ch (get-in @state [:subscriptions ledger-alias])]
+      (log/debug "Unsubscribing from nameservice for:" ledger-alias)
+      (->> remote-systems
+           (map (fn [pub]
+                  (nameservice/unsubscribe pub ledger-alias)))
+           dorun)
+      (async/close! sub-ch))
+
+    (swap! state (fn [s]
+                   (-> s
+                       (update :ledger dissoc ledger-alias)
+                       (update :subscriptions dissoc ledger-alias)
+                       (update :last-accessed dissoc ledger-alias))))
+    (log/debug "Released ledger:" ledger-alias)
+    :released))
 
 (defn all-publications
   [{:keys [remote-systems] :as _conn}]
@@ -171,15 +301,6 @@
                 (log/info "New subscrition message with action: " action "received, ignored.")))
             (recur)))
         :subscribed))))
-
-(defn unsubscribe-ledger
-  "Initiates unsubscription requests for a ledger into all namespaces on a connection."
-  [{:keys [state] :as conn} ledger-alias]
-  (->> (all-publications conn)
-       (map (fn [pub]
-              (nameservice/unsubscribe pub ledger-alias)))
-       dorun)
-  (swap! state remove-subscription ledger-alias))
 
 (defn publishers
   [{:keys [primary-publisher secondary-publishers] :as _conn}]

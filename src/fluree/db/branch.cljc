@@ -117,30 +117,70 @@
     db))
 
 (defn index-queue
-  [publishers branch-state]
+  [publishers branch-state ledger-alias]
   (let [buf   (async/sliding-buffer 1)
-        queue (async/chan buf)]
+        queue (async/chan buf)
+        ;; Find primary publisher (first one, typically storage nameservice)
+        primary-publisher (first publishers)]
     (go-loop [last-index-commit nil]
       (when-let [{:keys [db index-files-ch complete-ch]} (<! queue)]
-        (let [db* (use-latest-index db last-index-commit branch-state)
-              result (try*
-                       (let [indexed-db (<? (indexer/index db* index-files-ch)) ; indexer/index always returns a FlakeDB (never AsyncDB)
-                             [{prev-commit :commit} {indexed-commit :commit}]
-                             (swap-vals! branch-state update-index indexed-db)]
-                         (if-not (= prev-commit indexed-commit)
-                           (do (log/debug "Publishing new index commit:" indexed-commit)
-                               (let [commit-jsonld (commit-data/->json-ld indexed-commit)]
-                                 (nameservice/publish-to-all commit-jsonld publishers)))
-                           (log/debug "Not publishing unchanged index commit:" indexed-commit))
-                         {:status :success, :db indexed-db, :commit indexed-commit})
-                       (catch* e
-                         (log/error e "Error updating index")
-                         {:status :error, :error e}))]
-          (when complete-ch
-            (async/put! complete-ch result))
-          (if (= :success (:status result))
-            (recur (:commit result))
-            (recur last-index-commit)))))
+        (let [db*          (use-latest-index db last-index-commit branch-state)
+              target-t     (commit-data/t (:commit db*))
+              machine-id   (util/machine-id)
+              start-result (try*
+                             (<? (nameservice/index-start primary-publisher ledger-alias target-t machine-id))
+                             (catch* e
+                               (log/warn e "Failed to start indexing")
+                               {:status :error}))]
+          (if (= :started (:status start-result))
+            ;; Start heartbeat loop
+            (let [heartbeat-ch (async/chan)]
+              (async/go-loop []
+                (let [[_ ch] (async/alts! [(async/timeout 60000) heartbeat-ch])]
+                  (when-not (= ch heartbeat-ch) ; timeout fired, not stop signal
+                    (try*
+                      (<? (nameservice/index-heartbeat primary-publisher ledger-alias))
+                      (log/debug "Published heartbeat for" ledger-alias)
+                      (catch* e
+                        (log/warn e "Failed to publish heartbeat")))
+                    (recur))))
+
+              ;; Perform indexing
+              (let [result (try*
+                             (let [indexed-db (<? (indexer/index db* index-files-ch))
+                                   [{prev-commit :commit} {indexed-commit :commit}]
+                                   (swap-vals! branch-state update-index indexed-db)]
+                               (if-not (= prev-commit indexed-commit)
+                                 (do (log/debug "Publishing new index commit:" indexed-commit)
+                                     (let [commit-jsonld (commit-data/->json-ld indexed-commit)]
+                                       (nameservice/publish-to-all commit-jsonld publishers)))
+                                 (log/debug "Not publishing unchanged index commit:" indexed-commit))
+                               {:status :success, :db indexed-db, :commit indexed-commit})
+                             (catch* e
+                               (log/error e "Error updating index")
+                               {:status :error, :error e}))]
+
+                ;; Stop heartbeat
+                (async/close! heartbeat-ch)
+
+                ;; Finish indexing (clears status)
+                (try*
+                  (<? (nameservice/index-finish primary-publisher ledger-alias))
+                  (catch* e
+                    (log/warn e "Failed to finish indexing")))
+
+                (when complete-ch
+                  (async/put! complete-ch result))
+                (if (= :success (:status result))
+                  (recur (:commit result))
+                  (recur last-index-commit))))
+
+            ;; Indexing already in progress or failed to start
+            (do
+              (log/warn "Skipping indexing - already in progress or failed to start:" start-result)
+              (when complete-ch
+                (async/put! complete-ch {:status :skipped, :reason start-result}))
+              (recur last-index-commit))))))
     queue))
 
 (defn enqueue-index!
@@ -159,7 +199,7 @@
                                    commit-jsonld commit-map indexing-opts)
          state      (atom {:commit     commit-map
                            :current-db initial-db})
-         idx-q      (index-queue publishers state)]
+         idx-q      (index-queue publishers state alias)]
      {:name          branch-name
       :alias         alias
       :state         state

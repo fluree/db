@@ -10,7 +10,9 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.ledger :as ledger]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.nameservice.query :as ns-query]
+            [fluree.db.nameservice.storage :as nameservice.storage]
             [fluree.db.query.api :as query-api]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.range :as query-range]
@@ -46,11 +48,14 @@
               (resolve res))))))))
 
 (defn- validate-connection
-  "Throws exception if x is not a valid connection"
+  "Throws exception if x is not a valid connection or is disconnecting"
   [x]
   (when-not (connection? x)
     (throw (ex-info "Unable to create new ledger, connection is not valid. fluree/connect returns a promise, did you deref it?"
-                    {:status 400 :error :db/invalid-connection}))))
+                    {:status 400 :error :db/invalid-connection})))
+  (when (-> x :state deref :disconnecting?)
+    (throw (ex-info "Connection is disconnecting, cannot perform new operations"
+                    {:status 400 :error :db/connection-disconnecting}))))
 
 (defn connect
   "Creates a connection from a JSON-LD configuration map.
@@ -73,11 +78,87 @@
 
 (defn disconnect
   "Terminates a connection and releases associated resources.
+
+  First stops the idle cleanup loop (if running), then releases all cached ledgers
+  (cleaning up their channels, subscriptions, and background processes), and finally
+  terminates the connection's system resources.
+
   Returns a promise that resolves when disconnection is complete."
   [conn]
+  (validate-connection conn)
   (promise-wrap
    (go-try
+     (let [{:keys [state]} conn]
+       (swap! state assoc :disconnecting? true))
+
+     (when-let [cleanup-ch (:idle-cleanup-ch conn)]
+       (log/debug "Stopping idle cleanup loop")
+       (async/close! cleanup-ch))
+
+     (let [{:keys [state]} conn
+           ledger-aliases (-> @state :ledger keys)
+           num-ledgers    (count ledger-aliases)]
+       (log/debug "Disconnecting - releasing" num-ledgers "cached ledgers")
+       (when (pos? num-ledgers)
+         (let [release-chs (mapv #(connection/release-ledger conn %) ledger-aliases)
+               merged-ch   (async/merge release-chs)]
+           (dotimes [_ num-ledgers]
+             (let [result (async/<! merged-ch)]
+               (when (util/exception? result)
+                 (log/warn result "Error releasing ledger during disconnect")))))))
+
      (-> conn ::system-map system/terminate))))
+
+(defn release-ledger
+  "Releases a ledger from the connection cache and cleans up all associated resources.
+
+  This removes the ledger from memory and stops all background processes including:
+  - Index queue processing and go-loops
+  - Nameservice subscription monitoring
+  - All async channels associated with the ledger
+
+  Useful for freeing resources when a ledger is no longer needed, or can be called
+  automatically via an idle timeout mechanism.
+
+  Parameters:
+    conn - Connection object
+    ledger-alias - Ledger alias (with optional :branch) to release
+
+  Returns a promise that resolves to :released when cleanup is complete."
+  [conn ledger-alias]
+  (validate-connection conn)
+  (let [normalized-alias (util.ledger/ensure-ledger-branch ledger-alias)]
+    (promise-wrap
+     (connection/release-ledger conn normalized-alias))))
+
+(defn indexing-status
+  "Returns the current indexing status for a ledger, or nil if not indexing.
+
+  Queries the nameservice to determine if background indexing is in progress
+  for the specified ledger.
+
+  Parameters:
+    conn - Connection object
+    ledger-alias - Ledger alias (with optional :branch) to query
+
+  Returns a promise that resolves to a map with indexing metadata:
+    {:target-t <t-value>  ; The 't' value being indexed
+     :started <iso-8601>} ; ISO-8601 timestamp when indexing started
+
+  Returns nil if the ledger is not currently indexing.
+
+  Example:
+    @(indexing-status conn \"my-ledger\")
+    ;; => {:target-t 123, :started \"2025-11-02T10:30:00Z\"}
+    ;; or nil if not indexing"
+  [conn ledger-alias]
+  (validate-connection conn)
+  (let [normalized-alias (util.ledger/ensure-ledger-branch ledger-alias)]
+    (promise-wrap
+     (go-try
+       (when-let [primary-publisher (:primary-publisher conn)]
+         (when-let [ns-record (<? (nameservice/lookup primary-publisher normalized-alias))]
+           (nameservice.storage/get-indexing-status ns-record)))))))
 
 (defn convert-config-key
   [[k v]]
@@ -101,7 +182,9 @@
   Options map (all optional):
     :parallelism - Number of parallel operations (default: 4)
     :cache-max-mb - Maximum cache size in MB (default: half of JVM -Xmx, or 1000 MB for Node.js)
-    :defaults - Default settings map for operations"
+    :defaults - Default settings map for operations, which can include:
+    :ledger-cache-idle-minutes - Minutes of inactivity before releasing a ledger
+                                 from cache (default: nil, disabled)"
   ([]
    (connect-memory {}))
   ([{:keys [parallelism cache-max-mb defaults]}]
@@ -132,7 +215,9 @@
       When provided, all data will be encrypted using AES-256-CBC with PKCS5 padding.
       The key should be exactly 32 bytes long for optimal security.
       Example: \"my-secret-32-byte-encryption-key!\"
-    - defaults (optional): Default options for ledgers created with this connection
+    - defaults (optional): Default options for ledgers created with this connection, which can include:
+      :ledger-cache-idle-minutes - Minutes of inactivity before releasing a ledger
+                                   from cache (default: nil, disabled)
 
   Returns a core.async channel that resolves to a connection, or an exception if
   the connection cannot be established.

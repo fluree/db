@@ -341,11 +341,19 @@
 (defn parse-defaults
   [config]
   (when-let [defaults (get-first config conn-vocab/defaults)]
-    (let [identity      (parse-identity defaults)
-          index-options (parse-index-options defaults)]
+    (let [identity                 (parse-identity defaults)
+          index-options            (parse-index-options defaults)
+          ;; Get idle minutes as a number (may be float like 0.1)
+          idle-minutes-raw         (get-first-value defaults conn-vocab/ledger-cache-idle-minutes)
+          idle-minutes             (when idle-minutes-raw
+                                     (if (string? idle-minutes-raw)
+                                       #?(:clj (Double/parseDouble idle-minutes-raw)
+                                          :cljs (js/parseFloat idle-minutes-raw))
+                                       (double idle-minutes-raw)))]
       (cond-> nil
         identity      (assoc :identity identity)
-        index-options (assoc :indexing index-options)))))
+        index-options (assoc :indexing index-options)
+        idle-minutes  (assoc :ledger-cache-idle-minutes idle-minutes)))))
 
 (defn parse-connection-map
   [{:keys [cache commit-catalog index-catalog serializer] :as config}]
