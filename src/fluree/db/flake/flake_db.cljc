@@ -29,6 +29,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.history :refer [AuditLog]]
+            [fluree.db.query.optimize :as optimize]
             [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.time-travel :refer [TimeTravel]]
@@ -39,7 +40,8 @@
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]
             [fluree.db.virtual-graph.flat-rank :as flat-rank]
-            [fluree.db.virtual-graph.index-graph :as vg])
+            [fluree.db.virtual-graph.index-graph :as vg]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -292,6 +294,128 @@
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
 
+(defn- component->user-value
+  "Convert an internal pattern component to user-readable format"
+  [component compact-fn]
+  (cond
+    (nil? component)
+    nil
+
+    (where/unmatched-var? component)
+    (str (where/get-variable component))
+
+    (where/matched-iri? component)
+    (let [iri (where/get-iri component)]
+      (json-ld/compact iri compact-fn))
+
+    (where/matched-value? component)
+    (where/get-value component)
+
+    :else
+    (throw (ex-info (str "Unexpected component type: " (pr-str component))
+                    {:component component}))))
+
+(defn- pattern->user-format
+  "Convert internal pattern to user-readable triple format"
+  [pattern compact-fn]
+  (let [ptype (where/pattern-type pattern)
+        pdata (where/pattern-data pattern)]
+    (case ptype
+      :class
+      (let [[s _ o] pdata]
+        {:subject (component->user-value s compact-fn)
+         :property const/iri-type
+         :object (component->user-value o compact-fn)})
+
+      :tuple
+      (let [[s p o] pdata]
+        {:subject (component->user-value s compact-fn)
+         :property (component->user-value p compact-fn)
+         :object (component->user-value o compact-fn)})
+
+      :id
+      {:subject (component->user-value pdata compact-fn)}
+
+      ;; Other pattern types (filter, bind, etc.)
+      {:type ptype
+       :data (pr-str pdata)})))
+
+(defn- pattern-type->user-type
+  "Convert internal pattern type to user-friendly type name"
+  [ptype]
+  (case ptype
+    :tuple :triple
+    ptype))
+
+(defn- pattern-explain
+  "Generate explain information for a single pattern"
+  [db stats pattern compact-fn]
+  (let [ptype       (where/pattern-type pattern)
+        optimizable? (optimize/optimizable-pattern? pattern)
+        selectivity (optimize/calculate-selectivity db stats pattern)]
+    {:type        (pattern-type->user-type ptype)
+     :pattern     (pattern->user-format pattern compact-fn)
+     :selectivity selectivity
+     :optimizable (when optimizable? (pattern-type->user-type optimizable?))}))
+
+(defn- segment-explain
+  "Generate explain information for pattern segments"
+  [db stats where-clause compact-fn]
+  (let [segments (optimize/split-by-optimization-boundaries where-clause)]
+    (mapv (fn [segment]
+            (if (= :optimizable (:type segment))
+              {:type     :optimizable
+               :patterns (mapv #(pattern-explain db stats % compact-fn) (:data segment))}
+              {:type    :boundary
+               :pattern (pattern-explain db stats (:data segment) compact-fn)}))
+          segments)))
+
+(defn optimize-query
+  "Optimize a parsed query using statistics if available.
+   Returns the optimized query with patterns reordered for optimal execution."
+  [db parsed-query]
+  (let [stats (:stats db)]
+    (if (and stats (not-empty stats) (:where parsed-query))
+      (let [optimized-where (optimize/optimize-patterns db (:where parsed-query))]
+        (assoc parsed-query :where optimized-where))
+      parsed-query)))
+
+(defn explain-query
+  "Generate an execution plan for the query showing optimization details.
+   Returns a query plan map with optimization information."
+  [db parsed-query]
+  (let [stats            (:stats db)
+        has-stat-counts? (and stats
+                              (or (seq (:properties stats))
+                                  (seq (:classes stats))))
+        context          (:context parsed-query)
+        compact-fn       (json-ld/compact-fn context)]
+    (if-not has-stat-counts?
+      {:query parsed-query
+       :plan  {:optimization :none
+               :reason       "No statistics available"
+               :where-clause (:where parsed-query)}}
+      (let [where-clause      (:where parsed-query)
+            optimized-where   (when where-clause
+                                (optimize/optimize-patterns db where-clause))
+            original-explain  (when where-clause
+                                (mapv #(pattern-explain db stats % compact-fn) where-clause))
+            optimized-explain (when optimized-where
+                                (mapv #(pattern-explain db stats % compact-fn) optimized-where))
+            segments          (when where-clause
+                                (segment-explain db stats where-clause compact-fn))
+            changed?          (not= where-clause optimized-where)]
+        {:query (assoc parsed-query :where optimized-where)
+         :plan  {:optimization (if changed? :reordered :unchanged)
+                 :statistics   {:property-counts (count (:properties stats))
+                                :class-counts    (count (:classes stats))
+                                :total-flakes    (:flakes stats)
+                                :indexed-at-t    (:indexed stats)}
+                 :original     original-explain
+                 :optimized    optimized-explain
+                 :segments     segments
+                 :changed?     changed?}}))))
+
 (defrecord FlakeDB [index-catalog commit-catalog alias commit t tt-id stats
                     spot post opst tspo vg schema comparators staged novelty policy
                     namespaces namespace-codes max-namespace-code
@@ -472,7 +596,14 @@
   (-reason [db methods rule-sources tracker reasoner-max]
     (flake.reasoner/reason db methods rule-sources tracker reasoner-max))
   (-reasoned-facts [db]
-    (reasoner-util/reasoned-facts db)))
+    (reasoner-util/reasoned-facts db))
+
+  optimize/Optimizable
+  (-reorder [db parsed-query]
+    (async/go (optimize-query db parsed-query)))
+
+  (-explain [db parsed-query]
+    (async/go (explain-query db parsed-query))))
 
 (defn db?
   [x]
