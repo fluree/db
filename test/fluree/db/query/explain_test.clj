@@ -5,17 +5,6 @@
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]))
 
-(defn- strip-inputs
-  "Remove :inputs field from explain output for backward-compatible testing.
-   The :inputs field contains detailed stats (per QUERY_STATS_AND_HLL.md lines 277-296)
-   but legacy tests don't expect it."
-  [plan-data]
-  (-> plan-data
-      (update :original (fn [patterns]
-                          (mapv #(dissoc % :inputs) patterns)))
-      (update :optimized (fn [patterns]
-                           (mapv #(dissoc % :inputs) patterns)))))
-
 (deftest ^:integration explain-no-optimization-test
   (testing "Explain API with equal selectivity patterns (no reordering)"
     (let [conn      @(fluree/connect-memory {:defaults
@@ -53,6 +42,7 @@
 
       ;; Test the complete explain output with user-readable patterns
       (is (= {:optimization :unchanged
+              :changed? false
               :statistics {:property-counts 12  ;; rdf:type + ex:name + ex:age for 2 entities (6 each)
                            :class-counts 1      ;; ex:Person
                            :total-flakes 16     ;; total flakes in index
@@ -82,12 +72,11 @@
                            :selectivity 2
                            :optimizable :triple}]}
              (-> (:plan plan)
-                 (select-keys [:optimization :statistics :original :optimized])
-                 strip-inputs))
+                 (select-keys [:optimization :changed? :statistics :original :optimized])))
           "Explain should not reorder when both patterns have equal selectivity (2 = 2)"))))
 
 (deftest ^:integration explain-value-lookup-optimization-test
-  (testing "Explain API reorders based on NDV-estimated bound-object selectivity"
+  (testing "Explain API reorders based on specific value lookup (selectivity 0)"
     (let [conn      @(fluree/connect-memory {:defaults
                                              {:indexing {:reindex-min-bytes 100
                                                          :reindex-max-bytes 10000000}}})
@@ -131,6 +120,7 @@
 
       ;; Test complete deterministic output showing patterns were reordered
       (is (= {:optimization :reordered
+              :changed? true
               :statistics {:property-counts 12  ;; rdf:type + ex:name + ex:email for 100 entities
                            :class-counts 1      ;; ex:Person
                            :total-flakes 310    ;; 100 entities × 3 properties + 10 extra flakes
@@ -145,14 +135,14 @@
                           :pattern {:subject "?person"
                                     :property "ex:email"
                                     :object "rare@example.org"}
-                          :selectivity 2        ;; NDV-based: max(1, ceil(100/~99)) = 2
+                          :selectivity 0        ;; Specific value lookup (most selective)
                           :optimizable :triple}]
-              ;; Optimized order: email first (2), then class (100)
+              ;; Optimized order: email first (0), then class (100)
               :optimized [{:type :triple
                            :pattern {:subject "?person"
                                      :property "ex:email"
                                      :object "rare@example.org"}
-                           :selectivity 2
+                           :selectivity 0
                            :optimizable :triple}
                           {:type :class
                            :pattern {:subject "?person"
@@ -161,9 +151,8 @@
                            :selectivity 100
                            :optimizable :class}]}
              (-> (:plan plan)
-                 (select-keys [:optimization :statistics :original :optimized])
-                 strip-inputs))
-          "Explain should reorder patterns from [class, email] to [email, class] based on NDV selectivity (2 < 100)"))))
+                 (select-keys [:optimization :changed? :statistics :original :optimized])))
+          "Explain should reorder patterns from [class, email] to [email, class] based on selectivity (0 < 100)"))))
 
 (deftest ^:integration explain-property-count-optimization-test
   (testing "Explain API reorders based on property counts (property scan vs class scan)"
@@ -209,6 +198,7 @@
 
       ;; Test complete deterministic output showing property count drove reordering
       (is (= {:optimization :reordered
+              :changed? true
               :statistics {:property-counts 12  ;; rdf:type + ex:name + ex:badge for 50 entities
                            :class-counts 1      ;; ex:Person
                            :total-flakes 115    ;; 50 rdf:type + 50 ex:name + 5 ex:badge + metadata
@@ -239,84 +229,8 @@
                            :selectivity 50
                            :optimizable :class}]}
              (-> (:plan plan)
-                 (select-keys [:optimization :statistics :original :optimized])
-                 strip-inputs))
+                 (select-keys [:optimization :changed? :statistics :original :optimized])))
           "Explain should reorder patterns from [class, badge] to [badge, class] based on property count (5 < 50)"))))
-
-(deftest ^:integration explain-inputs-field-test
-  (testing "Explain API :inputs field structure and flags (QUERY_STATS_AND_HLL.md lines 277-296)"
-    (let [conn      @(fluree/connect-memory {:defaults
-                                             {:indexing {:reindex-min-bytes 100
-                                                         :reindex-max-bytes 10000000}}})
-          ledger-id "test/inputs"
-          db0       @(fluree/create conn ledger-id)
-
-          ;; Insert data to generate statistics
-          txn       {"@context" {"ex" "http://example.org/"}
-                     "insert" (for [i (range 20)]
-                                {"@id" (str "ex:person" i)
-                                 "@type" "ex:Person"
-                                 "ex:name" (str "Person" i)
-                                 "ex:email" (str "person" i "@example.org")})}
-          db1       @(fluree/update db0 txn)
-
-          index-ch  (async/chan 10)
-          _         @(fluree/commit! conn db1 {:index-files-ch index-ch})
-          _         (<!! (test-utils/block-until-index-complete index-ch))
-
-          db        @(fluree/db conn ledger-id)
-
-          query-map {:context {"ex" "http://example.org/"}
-                     :select  ["?person"]
-                     :where   [{"@id" "?person"
-                                "@type" "ex:Person"}
-                               {"@id" "?person"
-                                "ex:email" "person0@example.org"}]}
-
-          plan      @(fluree/explain db query-map)
-          original  (get-in plan [:plan :original])
-          optimized (get-in plan [:plan :optimized])]
-
-      ;; Test that :inputs field exists for all patterns
-      (is (every? #(contains? % :inputs) original)
-          "All original patterns should have :inputs field")
-
-      (is (every? #(contains? % :inputs) optimized)
-          "All optimized patterns should have :inputs field")
-
-      ;; Test class pattern inputs structure
-      (let [class-pattern (first (filter #(= :class (:type %)) original))
-            inputs (:inputs class-pattern)]
-        (is (= :class (:type inputs))
-            "Class pattern should have :type :class")
-        (is (contains? inputs :class-sid)
-            "Class pattern should have :class-sid")
-        (is (contains? inputs :class-count)
-            "Class pattern should have :class-count"))
-
-      ;; Test bound-object pattern inputs structure and NDV flag
-      (let [email-pattern (first (filter #(and (= :triple (:type %))
-                                               (some-> % :pattern :property (= "ex:email")))
-                                         original))
-            inputs (:inputs email-pattern)]
-        (is (= :triple (:type inputs))
-            "Bound-object pattern inputs should have :type :triple")
-        (is (= :bound-object (:pattern inputs))
-            "Bound-object pattern should have :pattern :bound-object")
-        (is (contains? inputs :property-sid)
-            "Bound-object pattern should have :property-sid")
-        (is (contains? inputs :count)
-            "Bound-object pattern should have :count")
-        (is (contains? inputs :ndv-values)
-            "Bound-object pattern should have :ndv-values")
-        (is (contains? inputs :used-values-ndv?)
-            "Bound-object pattern should have :used-values-ndv? flag")
-        (is (boolean? (:used-values-ndv? inputs))
-            "used-values-ndv? flag should be a boolean")
-        (is (:used-values-ndv? inputs)
-            "Bound-object pattern should use NDV when available")
-        (is (contains? inputs :clamped-to-one?)
-            "Bound-object pattern should have :clamped-to-one? flag")))))
 
 (deftest ^:integration explain-no-stats-test
   (testing "Explain API without statistics (no indexing)"

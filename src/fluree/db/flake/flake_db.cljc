@@ -295,8 +295,7 @@
           (assoc :commit commit-metadata)))))
 
 (defn- component->user-value
-  "Convert an internal pattern component to user-readable format.
-   Includes lang, datatype, and transaction metadata when present."
+  "Convert an internal pattern component to user-readable format"
   [component compact-fn]
   (cond
     (nil? component)
@@ -310,70 +309,11 @@
       (json-ld/compact iri compact-fn))
 
     (where/matched-value? component)
-    (let [value       (where/get-value component)
-          lang        (where/get-lang component)
-          datatype    (where/get-datatype-iri component)
-          transaction (where/get-transaction component)]
-      ;; Only return a map with metadata if there's lang or transaction metadata
-      ;; (datatype is common and not particularly interesting for display)
-      (if (or lang transaction)
-        (cond-> {:value value}
-          lang        (assoc :lang lang)
-          datatype    (assoc :datatype (json-ld/compact datatype compact-fn))
-          transaction (assoc :t transaction))
-        ;; No interesting metadata, just return the value
-        value))
+    (where/get-value component)
 
     :else
     (throw (ex-info (str "Unexpected component type: " (pr-str component))
                     {:component component}))))
-
-(defn- cleanup-filter-data
-  "Clean up filter pattern data for user display.
-   Attempts to show the original filter expression if available via metadata."
-  [f]
-  (if-let [fns (some-> f meta :fns)]
-    {:description "Filter expression"
-     :expressions fns}
-    {:description "Filter function"}))
-
-(defn- cleanup-bind-data
-  "Clean up bind pattern data for user display.
-   Shows variable names and whether they use functions or static values."
-  [bind-map compact-fn]
-  (into {}
-        (map (fn [[var-sym binding]]
-               (let [var-name (str var-sym)]
-                 [var-name
-                  (if (contains? binding :fluree.db.query.exec.where/fn)
-                    {:type "function"}
-                    {:type "value"
-                     :value (component->user-value binding compact-fn)})])))
-        bind-map))
-
-(defn- cleanup-values-data
-  "Clean up values pattern data for user display.
-   Shows inline solution bindings."
-  [solutions compact-fn]
-  {:description "Inline values"
-   :solutions (mapv (fn [solution]
-                      (into {}
-                            (map (fn [[var-sym binding]]
-                                   [(str var-sym) (component->user-value binding compact-fn)]))
-                            solution))
-                    solutions)})
-
-(defn- cleanup-union-data
-  "Clean up union pattern data for user display.
-   Shows that it contains multiple alternative clauses."
-  [clauses]
-  {:description "Union of alternative patterns"
-   :alternatives (count clauses)})
-
-(defn- cleanup-optional-data
-  "Clean up optional pattern data for user display."
-  [_clause]
-  {:description "Optional pattern group"})
 
 (defn- pattern->user-format
   "Convert internal pattern to user-readable triple format"
@@ -396,24 +336,9 @@
       :id
       {:subject (component->user-value pdata compact-fn)}
 
-      :filter
-      (cleanup-filter-data pdata)
-
-      :bind
-      (cleanup-bind-data pdata compact-fn)
-
-      :values
-      (cleanup-values-data pdata compact-fn)
-
-      :union
-      (cleanup-union-data pdata)
-
-      :optional
-      (cleanup-optional-data pdata)
-
-      ;; Fallback for any other pattern types
+      ;; Other pattern types (filter, bind, etc.)
       {:type ptype
-       :description "Advanced pattern"})))
+       :data (pr-str pdata)})))
 
 (defn- pattern-type->user-type
   "Convert internal pattern type to user-friendly type name"
@@ -422,44 +347,42 @@
     :tuple :triple
     ptype))
 
-(defn- format-pattern-with-metadata
-  "Format a pattern with its pre-calculated metadata for display.
-   Takes pattern metadata map with :pattern, :score, :inputs."
-  [pattern-meta compact-fn]
-  (let [pattern (:pattern pattern-meta)
-        score   (:score pattern-meta)
-        inputs  (:inputs pattern-meta)
-        ptype   (where/pattern-type pattern)]
+(defn- pattern-explain
+  "Generate explain information for a single pattern"
+  [db stats pattern compact-fn]
+  (let [ptype       (where/pattern-type pattern)
+        optimizable? (optimize/optimizable-pattern? pattern)
+        selectivity (optimize/calculate-selectivity db stats pattern)]
     {:type        (pattern-type->user-type ptype)
      :pattern     (pattern->user-format pattern compact-fn)
-     :selectivity score
-     :inputs      inputs
-     :optimizable (when score (pattern-type->user-type ptype))}))
+     :selectivity selectivity
+     :optimizable (when optimizable? (pattern-type->user-type optimizable?))}))
 
-(defn- format-segment-metadata
-  "Format segment metadata for display in explain output."
-  [segment compact-fn]
-  (if (= :optimizable (:type segment))
-    {:type     :optimizable
-     :patterns (mapv #(format-pattern-with-metadata % compact-fn) (:optimized segment))}
-    {:type    :boundary
-     :pattern (pattern->user-format (:pattern segment) compact-fn)}))
+(defn- segment-explain
+  "Generate explain information for pattern segments"
+  [db stats where-clause compact-fn]
+  (let [segments (optimize/split-by-optimization-boundaries where-clause)]
+    (mapv (fn [segment]
+            (if (= :optimizable (:type segment))
+              {:type     :optimizable
+               :patterns (mapv #(pattern-explain db stats % compact-fn) (:data segment))}
+              {:type    :boundary
+               :pattern (pattern-explain db stats (:data segment) compact-fn)}))
+          segments)))
 
 (defn optimize-query
   "Optimize a parsed query using statistics if available.
-   Returns the optimized query with patterns reordered for optimal execution.
-   Uses fast path - extracts optimized patterns without formatting."
+   Returns the optimized query with patterns reordered for optimal execution."
   [db parsed-query]
   (let [stats (:stats db)]
     (if (and stats (not-empty stats) (:where parsed-query))
-      (let [{:keys [optimized]} (optimize/optimize-patterns-with-metadata db (:where parsed-query))]
-        (assoc parsed-query :where optimized))
+      (let [optimized-where (optimize/optimize-patterns db (:where parsed-query))]
+        (assoc parsed-query :where optimized-where))
       parsed-query)))
 
 (defn explain-query
   "Generate an execution plan for the query showing optimization details.
-   Returns a query plan map with optimization information.
-   Uses optimize-patterns-with-metadata to avoid redundant calculations."
+   Returns a query plan map with optimization information."
   [db parsed-query]
   (let [stats            (:stats db)
         has-stat-counts? (and stats
@@ -472,43 +395,26 @@
        :plan  {:optimization :none
                :reason       "No statistics available"
                :where-clause (:where parsed-query)}}
-      (let [where-clause (:where parsed-query)]
-        (if-not where-clause
-          {:query parsed-query
-           :plan  {:optimization :none
-                   :reason       "No where clause"}}
-          ;; Calculate optimization metadata once
-          (let [{:keys [optimized segments changed?]}
-                (optimize/optimize-patterns-with-metadata db where-clause)
-                ;; Now just format the metadata for display (no recalculation)
-                ;; For original, we need to compute the metadata for patterns in their original order
-                original-with-meta (mapcat (fn [segment]
-                                             (if (= :optimizable (:type segment))
-                                               ;; Find scores from optimized segment (same patterns, different order)
-                                               (let [score-map (into {} (map (fn [pm] [(:pattern pm) pm])
-                                                                             (:optimized segment)))]
-                                                 (map (fn [p] (or (get score-map p)
-                                                                  {:pattern p :score nil :inputs nil}))
-                                                      (:original segment)))
-                                               [{:pattern (:pattern segment) :score nil :inputs nil}]))
-                                           segments)
-                original-explain   (mapv #(format-pattern-with-metadata % compact-fn) original-with-meta)
-                optimized-explain (mapv #(format-pattern-with-metadata % compact-fn)
-                                        (mapcat (fn [segment]
-                                                  (if (= :optimizable (:type segment))
-                                                    (:optimized segment)
-                                                    [{:pattern (:pattern segment) :score nil :inputs nil}]))
-                                                segments))
-                segments-explain  (mapv #(format-segment-metadata % compact-fn) segments)]
-            {:query (assoc parsed-query :where optimized)
-             :plan  {:optimization (if changed? :reordered :unchanged)
-                     :statistics   {:property-counts (count (:properties stats))
-                                    :class-counts    (count (:classes stats))
-                                    :total-flakes    (:flakes stats)
-                                    :indexed-at-t    (:indexed stats)}
-                     :original     original-explain
-                     :optimized    optimized-explain
-                     :segments     segments-explain}}))))))
+      (let [where-clause      (:where parsed-query)
+            optimized-where   (when where-clause
+                                (optimize/optimize-patterns db where-clause))
+            original-explain  (when where-clause
+                                (mapv #(pattern-explain db stats % compact-fn) where-clause))
+            optimized-explain (when optimized-where
+                                (mapv #(pattern-explain db stats % compact-fn) optimized-where))
+            segments          (when where-clause
+                                (segment-explain db stats where-clause compact-fn))
+            changed?          (not= where-clause optimized-where)]
+        {:query (assoc parsed-query :where optimized-where)
+         :plan  {:optimization (if changed? :reordered :unchanged)
+                 :statistics   {:property-counts (count (:properties stats))
+                                :class-counts    (count (:classes stats))
+                                :total-flakes    (:flakes stats)
+                                :indexed-at-t    (:indexed stats)}
+                 :original     original-explain
+                 :optimized    optimized-explain
+                 :segments     segments
+                 :changed?     changed?}}))))
 
 (defrecord FlakeDB [index-catalog commit-catalog alias commit t tt-id stats
                     spot post opst tspo vg schema comparators staged novelty policy
