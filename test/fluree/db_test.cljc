@@ -34,7 +34,7 @@
   (testing "returns true after committing data to a ledger"
     #?(:clj
        (let [conn         (test-utils/create-conn)
-             ledger-alias "testledger"
+             ledger-alias "testledger2"
              db0          @(fluree/create conn ledger-alias)
              db           @(fluree/update db0
                                           {"@context" ["https://ns.flur.ee"
