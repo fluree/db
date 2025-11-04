@@ -121,8 +121,7 @@
               ;; Non-groupable pattern (map-entry or non-groupable triple)
               ;; Add as its own "group" without wrapping
               (conj groups pattern)))
-          []
-          patterns))
+          [] patterns))
 
 (defn create-property-join-or-triples
   "Convert a group of triples into a property join if eligible,
@@ -174,10 +173,6 @@
     ;; Group of triples - check if first element is a triple
     (and (vector? group) (not-empty group) (vector? (first group)))
     (create-property-join-or-triples group)
-
-    ;; Single non-groupable triple (vector but not a group)
-    (vector? group)
-    [group]
 
     :else
     [group]))
