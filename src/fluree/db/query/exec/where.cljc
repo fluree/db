@@ -327,6 +327,16 @@
     (val pattern)
     pattern))
 
+(def triple-pattern-types
+  #{:tuple :class})
+
+(defn triple-pattern?
+  [x]
+  (contains? triple-pattern-types (pattern-type x)))
+
+(def compound-pattern?
+  (complement triple-pattern?))
+
 (defn class-pattern?
   [pattern-type]
   (= :class pattern-type))

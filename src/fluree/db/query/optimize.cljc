@@ -1,18 +1,11 @@
 (ns fluree.db.query.optimize
   (:require [fluree.db.query.exec.where :as where]))
 
-(def triple-pattern-types
-  #{:tuple :class})
-
-(defn triple-pattern?
-  [x]
-  (contains? triple-pattern-types (where/pattern-type x)))
-
 (defn try-coerce-triple
   "Returns the triple data if x is a triple pattern (:class, :tuple),
   otherwise returns nil."
   [x]
-  (when (triple-pattern? x)
+  (when (where/triple-pattern? x)
     (where/pattern-data x)))
 
 (defn coerce-triple
@@ -147,7 +140,7 @@
   [group]
   (cond
     ;; Higher-order pattern (map-entry)
-    (map-entry? group)
+    (where/compound-pattern? group)
     (let [typ (where/pattern-type group)
           data (where/pattern-data group)]
       (cond
