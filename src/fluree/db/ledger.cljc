@@ -1,6 +1,5 @@
 (ns fluree.db.ledger
   (:require [clojure.string :as str]
-            [fluree.db.async-db :as async-db]
             [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
@@ -202,11 +201,8 @@
     (let [data      (-> db :commit :data)
           index-id  (<? (idx-address->idx-id index-catalog index-address))
           index-map (commit-data/new-index data index-id index-address
-                                           (select-keys root [:spot :post :opst :tspo]))
-          res       (dbproto/-index-update db index-map)]
-      (if (async-db/db? res)
-        (do (<? (async-db/deref-async res)) res)
-        (<? res)))))
+                                           (select-keys root [:spot :post :opst :tspo]))]
+      (<? (dbproto/-index-update db index-map)))))
 
 (defn- update-branch-with-index
   "Updates branch state with new index. If use-update-commit? is true,
