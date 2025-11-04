@@ -187,22 +187,20 @@
 
 (defn idx-address->idx-id
   "Extracts the hash from a content-addressed index address and returns the index ID.
-  Address format is like: 'fluree:file://ledger/index/root/abc123def.json'
+  Uses storage/get-hash to properly extract the hash from any storage backend.
   Returns: 'fluree:index:sha256:abc123def'"
-  [index-address]
-  (let [hash (-> index-address
-                 (str/split #"/")
-                 last
-                 (str/replace #"\.json$" ""))]
-    (str "fluree:index:sha256:" hash)))
+  [index-catalog index-address]
+  (go-try
+    (let [hash (<? (storage/get-hash index-catalog index-address))]
+      (str "fluree:index:sha256:" hash))))
 
 (defn- apply-index-to-db
   "Applies an index to a database and returns the updated db.
   Returns a channel with the updated db."
-  [db root index-address]
+  [db index-catalog root index-address]
   (go-try
     (let [data      (-> db :commit :data)
-          index-id  (idx-address->idx-id index-address)
+          index-id  (<? (idx-address->idx-id index-catalog index-address))
           index-map (commit-data/new-index data index-id index-address
                                            (select-keys root [:spot :post :opst :tspo]))
           res       (dbproto/-index-update db index-map)]
@@ -223,12 +221,14 @@
       ::index-updated)))
 
 (defn- compare-index-by-hash
-  "Tie-breaker for indexes at the same t value. Returns true if new-idx should replace cur-idx.
-  Uses lexicographic comparison of content hashes for deterministic selection."
-  [new-idx-addr cur-idx-addr]
-  (let [new-hash (idx-address->idx-id new-idx-addr)
-        cur-hash (idx-address->idx-id cur-idx-addr)]
-    (pos? (compare new-hash cur-hash))))
+  "Tie-breaker for indexes at the same t value. Returns a channel that resolves to true
+  if new-idx should replace cur-idx. Uses lexicographic comparison of content hashes
+  for deterministic selection."
+  [index-catalog new-idx-addr cur-idx-addr]
+  (go-try
+    (let [new-hash (<? (idx-address->idx-id index-catalog new-idx-addr))
+          cur-hash (<? (idx-address->idx-id index-catalog cur-idx-addr))]
+      (pos? (compare new-hash cur-hash)))))
 
 (defn- handle-index-behind-commit
   "Handles case where new index t is less than current commit t.
@@ -242,14 +242,14 @@
           (flake/t-after? new-idx-t cur-idx-t)
           (do (log/debug "notify-index: applying newer index (behind commit but ahead of current)"
                          {:new-idx-t new-idx-t :cur-idx-t cur-idx-t :cur-t cur-t})
-              (let [updated-db (<? (apply-index-to-db db new-root new-idx-addr))]
+              (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
                 (update-branch-with-index ledger branch updated-db false)))
 
           (= new-idx-t cur-idx-t)
-          (if (compare-index-by-hash new-idx-addr cur-idx-addr)
+          (if (<? (compare-index-by-hash index-catalog new-idx-addr cur-idx-addr))
             (do (log/debug "notify-index: same t behind commit, applying based on hash tie-breaker"
                            {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
-                (let [updated-db (<? (apply-index-to-db db new-root new-idx-addr))]
+                (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
                   (update-branch-with-index ledger branch updated-db false)))
             (do (log/debug "notify-index: same t behind commit, keeping current based on hash"
                            {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
@@ -261,7 +261,7 @@
               ::index-current)))
       (do (log/debug "notify-index: applying index behind commit (no current index)"
                      {:new-idx-t new-idx-t :cur-t cur-t})
-          (let [updated-db (<? (apply-index-to-db db new-root new-idx-addr))]
+          (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
             (update-branch-with-index ledger branch updated-db false))))))
 
 (defn- handle-index-matches-commit
@@ -276,14 +276,14 @@
           (flake/t-after? new-idx-t cur-idx-t)
           (do (log/debug "notify-index: applying newer index at commit t"
                          {:new-idx-t new-idx-t :cur-idx-t cur-idx-t})
-              (let [updated-db (<? (apply-index-to-db db new-root new-idx-addr))]
+              (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
                 (update-branch-with-index ledger branch updated-db true)))
 
           (= new-idx-t cur-idx-t)
-          (if (compare-index-by-hash new-idx-addr cur-idx-addr)
+          (if (<? (compare-index-by-hash index-catalog new-idx-addr cur-idx-addr))
             (do (log/debug "notify-index: same t at commit, applying based on hash tie-breaker"
                            {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
-                (let [updated-db (<? (apply-index-to-db db new-root new-idx-addr))]
+                (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
                   (update-branch-with-index ledger branch updated-db true)))
             (do (log/debug "notify-index: same t at commit, keeping current based on hash"
                            {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
@@ -294,7 +294,7 @@
                         {:new-idx-t new-idx-t :cur-idx-t cur-idx-t})
               ::index-current)))
       (do (log/debug "notify-index: applying first index for this commit")
-          (let [updated-db (<? (apply-index-to-db db new-root new-idx-addr))]
+          (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
             (update-branch-with-index ledger branch updated-db true))))))
 
 (defn notify-index
