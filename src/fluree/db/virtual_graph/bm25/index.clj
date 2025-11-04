@@ -7,6 +7,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.query.optimize :as optimize]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [empty-channel <?]]
             [fluree.db.util.log :as log]
@@ -340,6 +341,20 @@
   ;; return the VG alias
   (-aliases [_]
     [alias])
+
+  optimize/Optimizable
+  (-reorder [_ parsed-query]
+    ;; BM25 indexes don't support query optimization
+    ;; Return query unchanged in a channel
+    (async/go parsed-query))
+
+  (-explain [_ parsed-query]
+    ;; BM25 indexes don't support explain
+    ;; Return empty explain in a channel
+    (async/go {:original parsed-query
+               :optimized parsed-query
+               :segments []
+               :changed? false}))
 
   dbproto/IFlureeDb
   (-query [_this _tracker _query]
