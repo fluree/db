@@ -1,16 +1,6 @@
 (ns fluree.db.query.optimize
   (:require [fluree.db.query.exec.where :as where]))
 
-(defn compare-component
-  [cmp-a cmp-b]
-  (if (where/matched-value? cmp-a)
-    (if (where/matched-value? cmp-b)
-      0
-      -1)
-    (if (where/matched-value? cmp-b)
-      1
-      0)))
-
 (def triple-pattern-types
   #{:tuple :class})
 
@@ -32,6 +22,16 @@
                       {:status   500
                        :error    :db/optimization-failure
                        ::pattern x}))))
+
+(defn compare-component
+  [cmp-a cmp-b]
+  (if (where/matched-value? cmp-a)
+    (if (where/matched-value? cmp-b)
+      0
+      -1)
+    (if (where/matched-value? cmp-b)
+      1
+      0)))
 
 (defn compare-triples
   [a b]
