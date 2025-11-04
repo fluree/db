@@ -196,72 +196,152 @@
                  (str/replace #"\.json$" ""))]
     (str "fluree:index:sha256:" hash)))
 
+(defn- apply-index-to-db
+  "Applies an index to a database and returns the updated db.
+  Returns a channel with the updated db."
+  [db root index-address]
+  (go-try
+    (let [data      (-> db :commit :data)
+          index-id  (idx-address->idx-id index-address)
+          index-map (commit-data/new-index data index-id index-address
+                                           (select-keys root [:spot :post :opst :tspo]))
+          res       (dbproto/-index-update db index-map)]
+      (if (async-db/db? res)
+        (do (<? (async-db/deref-async res)) res)
+        (<? res)))))
+
+(defn- update-branch-with-index
+  "Updates branch state with new index. If use-update-commit? is true,
+  uses update-commit! which enforces commit sequencing. Otherwise,
+  directly updates the branch state for index-only updates."
+  [ledger branch updated-db use-update-commit?]
+  (if use-update-commit?
+    (do (update-commit! ledger branch updated-db)
+        ::index-updated)
+    (let [branch-meta (get-branch-meta ledger branch)]
+      (swap! (:state branch-meta) branch/update-index updated-db)
+      ::index-updated)))
+
+(defn- compare-index-by-hash
+  "Tie-breaker for indexes at the same t value. Returns true if new-idx should replace cur-idx.
+  Uses lexicographic comparison of content hashes for deterministic selection."
+  [new-idx-addr cur-idx-addr]
+  (let [new-hash (idx-address->idx-id new-idx-addr)
+        cur-hash (idx-address->idx-id cur-idx-addr)]
+    (pos? (compare new-hash cur-hash))))
+
+(defn- handle-index-behind-commit
+  "Handles case where new index t is less than current commit t.
+  Compares against current index (if exists) to decide whether to apply."
+  [ledger branch db index-catalog new-root new-idx-t new-idx-addr cur-t cur-idx-addr]
+  (go-try
+    (if cur-idx-addr
+      (let [cur-root  (<? (index-storage/read-db-root index-catalog cur-idx-addr))
+            cur-idx-t (:t cur-root)]
+        (cond
+          (flake/t-after? new-idx-t cur-idx-t)
+          (do (log/debug "notify-index: applying newer index (behind commit but ahead of current)"
+                         {:new-idx-t new-idx-t :cur-idx-t cur-idx-t :cur-t cur-t})
+              (let [updated-db (<? (apply-index-to-db db new-root new-idx-addr))]
+                (update-branch-with-index ledger branch updated-db false)))
+
+          (= new-idx-t cur-idx-t)
+          (if (compare-index-by-hash new-idx-addr cur-idx-addr)
+            (do (log/debug "notify-index: same t behind commit, applying based on hash tie-breaker"
+                           {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
+                (let [updated-db (<? (apply-index-to-db db new-root new-idx-addr))]
+                  (update-branch-with-index ledger branch updated-db false)))
+            (do (log/debug "notify-index: same t behind commit, keeping current based on hash"
+                           {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
+                ::index-current))
+
+          :else
+          (do (log/debug "notify-index: ignoring older index"
+                         {:new-idx-t new-idx-t :cur-idx-t cur-idx-t})
+              ::index-current)))
+      (do (log/debug "notify-index: applying index behind commit (no current index)"
+                     {:new-idx-t new-idx-t :cur-t cur-t})
+          (let [updated-db (<? (apply-index-to-db db new-root new-idx-addr))]
+            (update-branch-with-index ledger branch updated-db false))))))
+
+(defn- handle-index-matches-commit
+  "Handles case where new index t equals current commit t.
+  Compares against current index (if exists) to decide whether to apply."
+  [ledger branch db index-catalog new-root new-idx-t new-idx-addr cur-idx-addr]
+  (go-try
+    (if cur-idx-addr
+      (let [cur-root  (<? (index-storage/read-db-root index-catalog cur-idx-addr))
+            cur-idx-t (:t cur-root)]
+        (cond
+          (flake/t-after? new-idx-t cur-idx-t)
+          (do (log/debug "notify-index: applying newer index at commit t"
+                         {:new-idx-t new-idx-t :cur-idx-t cur-idx-t})
+              (let [updated-db (<? (apply-index-to-db db new-root new-idx-addr))]
+                (update-branch-with-index ledger branch updated-db true)))
+
+          (= new-idx-t cur-idx-t)
+          (if (compare-index-by-hash new-idx-addr cur-idx-addr)
+            (do (log/debug "notify-index: same t at commit, applying based on hash tie-breaker"
+                           {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
+                (let [updated-db (<? (apply-index-to-db db new-root new-idx-addr))]
+                  (update-branch-with-index ledger branch updated-db true)))
+            (do (log/debug "notify-index: same t at commit, keeping current based on hash"
+                           {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
+                ::index-current))
+
+          :else
+          (do (log/warn "notify-index: current index newer than commit?"
+                        {:new-idx-t new-idx-t :cur-idx-t cur-idx-t})
+              ::index-current)))
+      (do (log/debug "notify-index: applying first index for this commit")
+          (let [updated-db (<? (apply-index-to-db db new-root new-idx-addr))]
+            (update-branch-with-index ledger branch updated-db true))))))
+
 (defn notify-index
   "Applies an index-only update when the provided index root matches the current commit t.
 
-    Returns one of:
-    - ::index-updated     when index was applied and address changed
-    - ::index-current     when index address is same or older
-    - ::stale             when index root.t is ahead of current commit t"
+  Returns one of:
+  - ::index-updated     when index was applied and address changed
+  - ::index-current     when index address is same or older
+  - ::stale             when index root.t is ahead of current commit t"
   [ledger {:keys [index-address branch]}]
   (go-try
-    (let [branch     (or branch (:branch @(:state ledger)))
-          db         (current-db ledger branch)
+    (let [branch       (or branch (:branch @(:state ledger)))
+          db           (current-db ledger branch)
           {:keys [index-catalog]} ledger
-          cur-t      (:t db)
-          cur-idx    (get-in db [:commit :index :address])]
+          cur-t        (:t db)
+          cur-idx-addr (get-in db [:commit :index :address])]
       (log/debug "notify-index called" {:alias (:alias ledger)
                                         :branch branch
                                         :cur-t cur-t
-                                        :cur-idx cur-idx
-                                        :new-index-address index-address})
-        ;; Short-circuit if index address hasn't changed
-      (if (= index-address cur-idx)
-        (do (log/debug "notify-index: index address unchanged, skipping" {:address index-address})
+                                        :cur-idx-addr cur-idx-addr
+                                        :new-idx-addr index-address})
+
+      (if (= index-address cur-idx-addr)
+        (do (log/debug "notify-index: same address, skipping")
             ::index-current)
 
-          ;; Only load the index file if the address is different
-        (let [root    (<? (index-storage/read-db-root index-catalog index-address))
-              root-t  (:t root)]
-          (log/debug "notify-index loaded root" {:root-t root-t :cur-t cur-t})
+        (let [new-root  (<? (index-storage/read-db-root index-catalog index-address))
+              new-idx-t (:t new-root)]
+          (log/debug "notify-index loaded" {:new-idx-t new-idx-t :cur-t cur-t})
+
           (cond
-            (flake/t-after? root-t cur-t)
-            (do (log/debug "notify-index: root ahead of current commit; marking stale"
-                           {:root-t root-t :cur-t cur-t})
+            (flake/t-after? new-idx-t cur-t)
+            (do (log/debug "notify-index: index ahead of commit; marking stale"
+                           {:new-idx-t new-idx-t :cur-t cur-t})
                 ::stale)
 
-            (flake/t-before? root-t cur-t)
-            (if (some? cur-idx)
-              (do (log/debug "notify-index: root behind current commit; ignoring"
-                             {:root-t root-t :cur-t cur-t})
-                  ::index-current)
-              (do (log/debug "notify-index: root behind current commit but no current index; applying"
-                             {:root-t root-t :cur-t cur-t})
-                  (let [data       (-> db :commit :data)
-                        index-id   (idx-address->idx-id index-address)
-                        index-map  (commit-data/new-index data index-id index-address
-                                                          (select-keys root [:spot :post :opst :tspo]))
-                        updated-db (<? (dbproto/-index-update db index-map))]
-                    (log/debug "notify-index: applying new index (no current index)" {:index-id index-id
-                                                                                      :address index-address})
-                    ;; Index-only update: update branch state without enforcing next-commit?
-                    (let [branch-meta (get-branch-meta ledger branch)]
-                      (swap! (:state branch-meta) branch/update-index updated-db))
-                    ::index-updated)))
+            (= new-idx-t cur-t)
+            (<? (handle-index-matches-commit ledger branch db index-catalog
+                                             new-root new-idx-t index-address cur-idx-addr))
+
+            (flake/t-before? new-idx-t cur-t)
+            (<? (handle-index-behind-commit ledger branch db index-catalog
+                                            new-root new-idx-t index-address cur-t cur-idx-addr))
 
             :else
-            (let [data       (-> db :commit :data)
-                  index-id   (idx-address->idx-id index-address)
-                  index-map  (commit-data/new-index data index-id index-address
-                                                    (select-keys root [:spot :post :opst :tspo]))
-                  res        (dbproto/-index-update db index-map)
-                  updated-db (if (async-db/db? res)
-                               (do (<? (async-db/deref-async res)) res)
-                               (<? res))]
-              (log/debug "notify-index: applying new index" {:index-id index-id
-                                                             :address index-address})
-              (update-commit! ledger branch updated-db)
-              ::index-updated)))))))
+            (do (log/error "notify-index: unexpected state" {:new-idx-t new-idx-t :cur-t cur-t})
+                ::index-current)))))))
 
 (defrecord Ledger [id address alias did state cache commit-catalog
                    index-catalog reasoner primary-publisher secondary-publishers indexing-opts])
