@@ -65,7 +65,11 @@ TriplesBlock	  ::=  WS TriplesSameSubjectPath WS ( <'.'> TriplesBlock? WS )?
 GraphPatternNotTriples	  ::=  	GroupOrUnionGraphPattern | OptionalGraphPattern | MinusGraphPattern | GraphGraphPattern | ServiceGraphPattern | Filter | Bind | InlineData
 OptionalGraphPattern	  ::=  	<'OPTIONAL'> GroupGraphPattern
 GraphGraphPattern	  ::=  	<'GRAPH'> WS VarOrIri WS GroupGraphPattern
-ServiceGraphPattern	  ::=  	<'SERVICE'> WS 'SILENT'? WS VarOrIri GroupGraphPattern
+ServiceGraphPattern ::= <'SERVICE'> WS 'SILENT'? WS VarOrIri ServiceClause
+ServiceClause ::= WS '{' ServiceContent '}' WS
+<ServiceContent> ::= (NonBrace | NestedBrace)*
+<NestedBrace> ::= '{' ServiceContent '}'
+<NonBrace> ::= #"[^{}]"
 Bind	  ::=  	<'BIND' WS '(' WS>  Expression <As> Var <WS ')' WS>
 InlineData	  ::=  	<'VALUES'> WS DataBlock
 <DataBlock>	  ::=  	InlineDataOneVar | InlineDataFull
@@ -139,7 +143,7 @@ UnaryExpression ::= '!' PrimaryExpression
 | '-' PrimaryExpression
 | PrimaryExpression
 <PrimaryExpression>	  ::=  	BrackettedExpression | BuiltInCall | iriOrFunction | RDFLiteral | NumericLiteral | BooleanLiteral | Var
-BrackettedExpression	  ::=  	<'('> WS Expression WS <')'>
+BrackettedExpression	  ::=  	<'('> WS Expression WS <')'> WS
 
 <BuiltInCall> ::= Aggregate
 | ExistsFunc

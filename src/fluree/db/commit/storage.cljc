@@ -26,6 +26,10 @@
   [commit-data]
   (contains? commit-data const/iri-cred-subj))
 
+(defn compact-credential?
+  [commit-data]
+  (contains? commit-data "credentialSubject"))
+
 (defn verify-commit
   "Given a full commit json, returns two-tuple of [commit-data commit-proof]"
   [commit-data]
@@ -35,28 +39,31 @@
       [credential-subject commit-data])
     [commit-data nil]))
 
+(defn inject-commit-metadata
+  [commit-data commit-id commit-address]
+  (if (compact-credential? commit-data)
+    (-> commit-data
+        (assoc-in ["credentialSubject" "id"] commit-id) ;; Note before expansion
+        (assoc-in ["credentialSubject" "address"] commit-address))
+    (-> commit-data
+        (assoc "id" commit-id) ;; Note before expansion
+        (assoc "address" commit-address))))
+
 (defn read-verified-commit
   [storage commit-address]
   (go-try
     (when-let [commit-data (<? (storage/content-read-json storage commit-address))]
       (log/trace "read-commit at:" commit-address "data:" commit-data)
-      (let [commit-hash    (<? (storage/get-hash storage commit-address))
-            commit-id      (commit-data/hash->commit-id commit-hash)
-            is-credential? (contains? commit-data "credentialSubject")
-            addr-key-path  (if is-credential?
-                             ["credentialSubject" "address"]
-                             ["address"])
-            id-key-path    (if is-credential?
-                             ["credentialSubject" "id"]
-                             ["id"])
-            ;; Inject the commit-id into the compact JSON before expanding
-            commit-data*   (-> commit-data
-                               (assoc-in id-key-path commit-id)
-                               (assoc-in addr-key-path commit-address))
-            [commit proof] (-> commit-data*
-                               json-ld/expand
-                               verify-commit)]
-        [commit proof]))))
+      (let [commit-hash (<? (storage/get-hash storage commit-address))
+            commit-id   (commit-data/hash->commit-id commit-hash)]
+        (log/trace "read-verified-commit: computed commit-id"
+                   {:address   commit-address
+                    :hash      commit-hash
+                    :commit-id commit-id})
+        (-> commit-data
+            (inject-commit-metadata commit-id commit-address)
+            json-ld/expand
+            verify-commit)))))
 
 ;; TODO: Verify hash
 (defn read-commit-jsonld

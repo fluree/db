@@ -100,12 +100,11 @@
 
   Options map (all optional):
     :parallelism - Number of parallel operations (default: 4)
-    :cache-max-mb - Maximum cache size in MB (default: 1000)
+    :cache-max-mb - Maximum cache size in MB (default: half of JVM -Xmx, or 1000 MB for Node.js)
     :defaults - Default settings map for operations"
   ([]
    (connect-memory {}))
-  ([{:keys [parallelism cache-max-mb defaults],
-     :or   {parallelism 4, cache-max-mb 1000}}]
+  ([{:keys [parallelism cache-max-mb defaults]}]
    (let [memory-config (cond-> {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
                                             "@vocab" "https://ns.flur.ee/system#"}
                                 "@id"      "memory"
@@ -128,7 +127,7 @@
   Options:
     - storage-path (optional): Directory path for file storage (default: \"data\")
     - parallelism (optional): Number of parallel operations (default: 4)
-    - cache-max-mb (optional): Maximum memory for caching in MB (default: 1000)
+    - cache-max-mb (optional): Maximum memory for caching in MB (default: half of JVM -Xmx, or 1000 MB for Node.js)
     - aes256-key (optional): AES-256 encryption key for file storage encryption.
       When provided, all data will be encrypted using AES-256-CBC with PKCS5 padding.
       The key should be exactly 32 bytes long for optimal security.
@@ -154,7 +153,7 @@
   ([]
    (connect-file {}))
   ([{:keys [storage-path parallelism cache-max-mb defaults aes256-key],
-     :or   {storage-path "data", parallelism 4, cache-max-mb 1000}}]
+     :or   {storage-path "data"}}]
    (let [file-config (cond-> {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
                                           "@vocab" "https://ns.flur.ee/system#"}
                               "@id"      "file"
@@ -191,12 +190,11 @@
        - s3-retry-base-delay-ms (optional): Base backoff delay in ms (default 150)
        - s3-retry-max-delay-ms (optional): Max backoff delay in ms (default 2000)
        - parallelism (optional): Number of parallel operations (default: 4)
-       - cache-max-mb (optional): Maximum memory for caching in MB (default: 1000)
+       - cache-max-mb (optional): Maximum memory for caching in MB (default: half of JVM -Xmx, or 1000 MB for Node.js)
        - defaults (optional): Default options for ledgers created with this connection"
      ([{:keys [s3-bucket s3-prefix s3-endpoint parallelism cache-max-mb defaults
                s3-read-timeout-ms s3-write-timeout-ms s3-list-timeout-ms
-               s3-max-retries s3-retry-base-delay-ms s3-retry-max-delay-ms],
-        :or   {parallelism 4, cache-max-mb 1000}}]
+               s3-max-retries s3-retry-base-delay-ms s3-retry-max-delay-ms]}]
       (when-not s3-bucket
         (throw (ex-info "S3 bucket name is required for S3 connection"
                         {:status 400 :error :db/invalid-config})))
@@ -556,6 +554,33 @@
      (let [ledger (<? (connection/load-ledger conn ledger-id))]
        (ledger/status ledger)))))
 
+(defn ledger-info
+  "Returns comprehensive ledger information including detailed statistics.
+
+  Parameters:
+    conn - Connection object
+    ledger-id - Ledger alias (with optional :branch) or address
+
+  Returns info map with:
+    - :address - Ledger address
+    - :alias - Ledger alias
+    - :branch - Branch name
+    - :t - Current transaction number
+    - :size - Total byte size
+    - :flakes - Total flake count
+    - :commit - Commit metadata
+    - :property-counts - Map of property SID -> count (if available)
+    - :class-counts - Map of class SID -> count (if available)
+
+  Property and class counts are computed from the most recent index plus
+  any novelty, providing absolutely current statistics."
+  [conn ledger-id]
+  (validate-connection conn)
+  (promise-wrap
+   (go-try
+     (let [ledger (<? (connection/load-ledger conn ledger-id))]
+       (ledger/ledger-info ledger)))))
+
 ;; db operations
 
 (defn db
@@ -667,6 +692,49 @@
    (if (util/exception? ds)
      (throw ds)
      (promise-wrap (query-api/query ds q opts)))))
+
+(defn explain
+  "Returns a query execution plan without executing the query.
+
+  Shows how the query optimizer will reorder patterns based on statistics,
+  including selectivity scores and estimated result counts for each pattern.
+
+  Parameters:
+    ds - Database value or dataset
+    q - Query map (JSON-LD or analytical)
+
+  Returns promise resolving to a query plan map with:
+    :query - Original parsed query structure
+    :plan - Execution plan with:
+      :optimization - :reordered, :unchanged, or :none
+      :statistics - Available statistics (if any)
+      :original - Original pattern order with selectivity
+      :optimized - Optimized pattern order with selectivity
+      :segments - Pattern segments with boundaries
+      :changed? - Boolean indicating if patterns were reordered
+
+  Example:
+    @(fluree/explain db
+      {:context {\"ex\" \"http://example.org/\"}
+       :select [\"?name\"]
+       :where [{\"@id\" \"?person\"
+                \"@type\" \"ex:Person\"
+                \"ex:email\" \"alice@example.org\"
+                \"ex:name\" \"?name\"}]})
+
+    ;; Returns:
+    {:query {...}
+     :plan {:optimization :reordered
+            :statistics {...}
+            :original [{:pattern ... :selectivity 10000}
+                       {:pattern ... :selectivity 1}]
+            :optimized [{:pattern ... :selectivity 1}    ; email lookup first
+                        {:pattern ... :selectivity 10000}] ; then verify type
+            :changed? true}}"
+  [ds q]
+  (if (util/exception? ds)
+    (throw ds)
+    (promise-wrap (query-api/explain ds q))))
 
 (defn credential-query
   "Executes a query using a verifiable credential.

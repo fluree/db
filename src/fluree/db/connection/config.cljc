@@ -349,7 +349,7 @@
 
 (defn parse-connection-map
   [{:keys [cache commit-catalog index-catalog serializer] :as config}]
-  (let [parallelism          (get-first-integer config conn-vocab/parallelism)
+  (let [parallelism          (or (get-first-integer config conn-vocab/parallelism) 4)
         primary-publisher    (get-first config conn-vocab/primary-publisher)
         secondary-publishers (get config conn-vocab/secondary-publishers)
         remote-systems       (get config conn-vocab/remote-systems)

@@ -11,7 +11,9 @@
             [fluree.db.track :as track]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? empty-channel]]
+            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.xhttp :as xhttp]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (clojure.lang MapEntry))))
 
@@ -895,6 +897,62 @@
         (async/onto-chan! error-ch errors)
         (when-not (::invalidated solution*)
           solution*)))))
+
+(defn binding->solution
+  [solution vars binding]
+  (reduce (fn [solution* var]
+            (if-let [{type "type" v "value" dt "datatype" lang "xml:lang"}
+                     (get binding var)]
+              (let [var-name (symbol (str "?" var))
+                    mch      (cond (= "literal" type)
+                                   (cond-> (-> (unmatched-var var-name)
+                                               (match-value v dt))
+                                     lang (match-lang v lang))
+                                   (#{"uri" "bnode"} type)
+                                   (-> (unmatched-var var-name)
+                                       (match-iri v))
+                                   :else
+                                   (throw (ex-info "Invalid SPARQL Query Results JSON Format."
+                                                   {:status 400, :error :db/invalid-query
+                                                    :spec "https://www.w3.org/TR/sparql11-results-json"
+                                                    :binding binding})))]
+                (or
+                  ;; add new var binding to solution
+                 (update-solution-binding solution* var-name mch)
+                  ;; already have a binding for the given var, no join
+                 (reduced nil)))
+              solution*))
+          solution
+          vars))
+
+(defn sparql-service-error!
+  [ex service sparql-q]
+  (log/error ex "Error processing service response " service sparql-q)
+  (ex-info (str "Error processing service response " service " due to exception: " (ex-message ex))
+           {:status 400, :error :db/invalid-query}
+           ex))
+
+(defmethod match-pattern :service
+  [_db _tracker solution pattern error-ch]
+  (let [{:keys [service silent? sparql-q]} (pattern-data pattern)
+        solution-ch                        (async/chan)]
+    (go
+      (let [response (async/<! (xhttp/post service sparql-q
+                                           {:headers {"Content-Type" "application/sparql-query"
+                                                      "Accept"       "application/sparql-results+json"}}))]
+        (if (util/exception? response)
+          (if silent?
+            (async/onto-chan! solution-ch [solution])
+            (async/>! error-ch (sparql-service-error! response service sparql-q)))
+          (try*
+            (let [response* (json/parse response false)
+                  vars      (-> response* (get "head") (get "vars"))
+                  bindings  (-> response* (get "results") (get "bindings"))]
+              (->> bindings
+                   (keep (partial binding->solution solution vars))
+                   (async/onto-chan! solution-ch)))
+            (catch* e (async/>! error-ch (sparql-service-error! e service sparql-q)))))))
+    solution-ch))
 
 (defmethod match-pattern :default
   [_db _tracker _solution pattern error-ch]

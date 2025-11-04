@@ -738,7 +738,40 @@
                 {:select ["?y" "(as (min ?name) ?minName)"],
                  :where [{"@id" "?y", ":name" "?name"}],
                  :groupBy ["?y"]}]]}
-             (sparql/->fql query))))))
+             (sparql/->fql query)))))
+  (testing "SERVICE"
+    (let [q "PREFIX : <http://example.com/>
+             SELECT ?foo ?bar
+             WHERE {
+               ?s :foo ?foo .
+               SERVICE <https://query.wikidata.org/sparql> {
+                 ?s :bar ?bar .
+               }
+             }"]
+      (is (= [{"@id" "?s", ":foo" "?foo"}
+              [:service
+               {:silent? false,
+                :service "https://query.wikidata.org/sparql",
+                :clause "{
+                 ?s :bar ?bar .
+               }"}]]
+             (:where (sparql/->fql q)))))
+    (let [q "PREFIX : <http://example.com/>
+             SELECT ?foo ?bar
+             WHERE {
+               ?s :foo ?foo .
+               SERVICE SILENT <https://query.wikidata.org/sparql> {
+                 ?s :bar ?bar .
+               }
+             }"]
+      (is (= [{"@id" "?s", ":foo" "?foo"}
+              [:service
+               {:silent? true,
+                :service "https://query.wikidata.org/sparql",
+                :clause "{
+                 ?s :bar ?bar .
+               }"}]]
+             (:where (sparql/->fql q)))))))
 
 (deftest parse-prefixes
   (testing "PREFIX"
@@ -843,6 +876,19 @@
                    ORDER BY desc(?favNums)"
             {:keys [orderBy]} (sparql/->fql query)]
         (is (= [["desc" "?favNums"]]
+               orderBy))))
+    (testing "multiple vars"
+      (let [query "SELECT ?favNums
+                   WHERE {?person person:favNums ?favNums. ?person ex:name ?name .}
+                   ORDER BY desc(?favNums) ?name"
+            {:keys [orderBy]} (sparql/->fql query)]
+        (is (= [["desc" "?favNums"] "?name"]
+               orderBy)))
+      (let [query "SELECT ?favNums
+                   WHERE {?person person:favNums ?favNums. ?person ex:name ?name .}
+                   ORDER BY ?favNums ?name"
+            {:keys [orderBy]} (sparql/->fql query)]
+        (is (= ["?favNums" "?name"]
                orderBy)))))
   (testing "PRETTY-PRINT"
     (let [query "SELECT ?person

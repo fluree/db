@@ -10,6 +10,7 @@
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.history :as history]
+            [fluree.db.query.optimize :as optimize]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.transact :as transact]
             [fluree.db.util :refer [try* catch*]]
@@ -204,7 +205,18 @@
           (catch* e
             (log/error e "Error loading db while setting root policy")
             (async/put! root-ch e))))
-      root-db)))
+      root-db))
+
+  optimize/Optimizable
+  (-reorder [_ parsed-query]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (optimize/-reorder db parsed-query)))))
+
+  (-explain [_ parsed-query]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (optimize/-explain db parsed-query))))))
 
 (defn db?
   [x]

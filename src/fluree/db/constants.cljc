@@ -8,6 +8,12 @@
 (def ^:const ns-version "ns@v2")
 (def ^:const default-branch-name "main")
 
+;; Index leaf rebalancing
+(def ^:const default-overflow-bytes
+  "Default overflow-bytes threshold for index leaf rebalancing.
+   Leaves split when exceeding this size, with average size ~75% of this value."
+  375000)
+
 ;; iri constants
 (def ^:const iri-CommitProof (fluree-iri "CommitProof"))
 (def ^:const iri-Commit (fluree-iri "Commit"))

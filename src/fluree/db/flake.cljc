@@ -496,25 +496,26 @@
   it should be 'close enough'
   reference: https://www.javamex.com/tutorials/memory/string_memory_usage.shtml"
   [^Flake f]
-  (let [o       (o f)
-        o-size  (condp = (dt f)
-                  const/$xsd:string (* 2 (count o))
-                  const/$id 30
-                  const/$xsd:boolean 1
-                  const/$xsd:long 8
-                  const/$xsd:int 4
-                  const/$xsd:short 2
-                  const/$xsd:double 8
-                  const/$xsd:float 4
-                  const/$xsd:byte 1
-                  ;; else
-                  (if (number? o)
-                    8
-                    (if (string? o)
-                      (* 2 (count o))
-                      (* 2 (count (pr-str o))))))]
+  (let [o      (o f)
+        o-size (condp = (dt f)
+                 const/$xsd:string  (* 2 (count o))
+                 const/$id          30
+                 const/$xsd:boolean 1
+                 const/$xsd:long    8
+                 const/$xsd:int     4
+                 const/$xsd:short   2
+                 const/$xsd:double  8
+                 const/$xsd:float   4
+                 const/$xsd:byte    1
+                 ;; else
+                 (if (number? o)
+                   8
+                   (if (string? o)
+                     (* 2 (count o))
+                     (* 2 (count (pr-str o))))))]
     (cond-> (+ flake-size-base o-size)
-      (m f) (* 2 (count (pr-str (m f)))))))
+      (m f) (* 2 (count (pr-str (m f))))
+      true  long)))
 
 (defn size-bytes
   "Returns approx number of bytes in a collection of flakes."
