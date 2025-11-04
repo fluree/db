@@ -90,8 +90,12 @@
   [triples]
   (and (>= (count triples) 2)
        (every? groupable-triple? triples)
-       (let [subjects   (map triple-subject triples)
-             predicates (map triple-predicate triples)]
+       (let [subjects   (map (fn [triple]
+                               (-> triple triple-subject where/get-variable))
+                             triples)
+             predicates (map (fn [triple]
+                               (-> triple triple-predicate where/get-iri))
+                             triples)]
          (and (apply = subjects)
               (= (count predicates) (count (distinct predicates)))))))
 
