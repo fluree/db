@@ -1,5 +1,6 @@
 (ns fluree.db.flake.index.novelty
   (:require [clojure.core.async :as async :refer [<! >! go go-loop]]
+            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
@@ -12,7 +13,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(def ^:dynamic *overflow-bytes* 500000)
+(def ^:dynamic *overflow-bytes* const/default-overflow-bytes)
 (defn overflow-leaf?
   [{:keys [flakes]}]
   (> (flake/size-bytes flakes) *overflow-bytes*))
@@ -110,12 +111,13 @@
   `*overflow-bytes*`."
   [{:keys [flakes leftmost? rhs] :as leaf}]
   (if (overflow-leaf? leaf)
-    (let [target-size (/ *overflow-bytes* 2)]
+    (let [target-size (/ *overflow-bytes* 2)
+          [fflake & remaining] flakes]
       (log/debug "Rebalancing index leaf:"
                  (select-keys leaf [:id :ledger-alias]))
-      (loop [[f & r] flakes
-             cur-size  0
-             cur-first f
+      (loop [[f & r]   remaining
+             cur-size  (flake/size-flake fflake)
+             cur-first fflake
              leaves    []]
         (if (empty? r)
           (let [subrange  (flake/subrange flakes >= cur-first)
@@ -127,7 +129,8 @@
                                                      leftmost?))
                               (dissoc :id))]
             (conj leaves last-leaf))
-          (let [new-size (-> f flake/size-flake (+ cur-size) long)]
+          (let [flake-size (flake/size-flake f)
+                new-size   (+ cur-size flake-size)]
             (if (> new-size target-size)
               (let [subrange (flake/subrange flakes >= cur-first < f)
                     new-leaf (-> leaf
@@ -137,7 +140,7 @@
                                         :leftmost? (and (empty? leaves)
                                                         leftmost?))
                                  (dissoc :id))]
-                (recur r 0 f (conj leaves new-leaf)))
+                (recur r flake-size f (conj leaves new-leaf)))
               (recur r new-size cur-first leaves))))))
     [leaf]))
 
@@ -321,6 +324,54 @@
                      "Error writing novel index node:" display-node)
           (async/>! error-ch e))))))
 
+(defn- compute-stats-from-novelty
+  "Core logic for computing property and class counts from novelty flakes.
+   Increments for assertions (op=true), decrements for retracts (op=false)."
+  [novelty-flakes prev-properties prev-classes]
+  (loop [[f & r] novelty-flakes
+         properties prev-properties
+         classes prev-classes]
+    (if f
+      (let [p     (flake/p f)
+            delta (if (flake/op f) 1 -1)
+            properties* (update-in properties [p :count] (fnil + 0) delta)
+            classes*    (if (flake/class-flake? f)
+                          (update-in classes [(flake/o f) :count] (fnil + 0) delta)
+                          classes)]
+        (recur r properties* classes*))
+      {:properties properties
+       :classes    classes})))
+
+(defn compute-novelty-stats
+  "Computes property and class counts from novelty flakes in a separate thread/go block.
+   Returns a channel that will contain the computed statistics.
+
+   Uses async/thread on JVM for true parallelism (not limited by go block thread pool).
+   Falls back to go block on ClojureScript."
+  [novelty-flakes prev-properties prev-classes]
+  #?(:clj
+     (async/thread
+       (compute-stats-from-novelty novelty-flakes prev-properties prev-classes))
+     :cljs
+     (go
+       (compute-stats-from-novelty novelty-flakes prev-properties prev-classes))))
+
+(defn current-stats
+  "Compute current property and class statistics."
+  [db]
+  (let [indexed-stats     (get db :stats {})
+        indexed-prop      (get indexed-stats :properties {})
+        indexed-class     (get indexed-stats :classes {})
+        spot-novelty      (get-in db [:novelty :spot])]
+    (if (not-empty spot-novelty)
+      ;; Synchronous computation for both FlakeDB and AsyncDB
+      (let [novelty-updates (compute-stats-from-novelty spot-novelty indexed-prop indexed-class)]
+        (assoc indexed-stats
+               :properties (:properties novelty-updates)
+               :classes    (:classes novelty-updates)))
+      ;; No novelty, return indexed stats as-is
+      indexed-stats)))
+
 (defn write-resolved-nodes
   [db idx changes-ch error-ch index-ch]
   (go-loop [stats     {:idx idx, :novel 0, :unchanged 0, :garbage #{}, :updated-ids {}}
@@ -368,11 +419,24 @@
   ([db error-ch]
    (refresh-all db nil error-ch))
   ([db changes-ch error-ch]
-   (->> index/types
-        (map (partial extract-root db))
-        (map (partial refresh-index db changes-ch error-ch))
-        async/merge
-        (async/reduce tally {:db db, :indexes [], :garbage #{}}))))
+   ;; Kick off parallel stats computation from :spot novelty
+   (let [spot-novelty      (get-in db [:novelty :spot])
+         prev-properties   (get-in db [:stats :properties] {})
+         prev-classes      (get-in db [:stats :classes] {})
+         stats-ch          (compute-novelty-stats spot-novelty prev-properties prev-classes)]
+     (go-try
+       (let [;; Wait for both indexing and stats to complete
+             index-result (<? (->> index/types
+                                   (map (partial extract-root db))
+                                   (map (partial refresh-index db changes-ch error-ch))
+                                   async/merge
+                                   (async/reduce tally {:db      db
+                                                        :indexes []
+                                                        :garbage #{}})))
+             {:keys [properties classes]} (<! stats-ch)]
+         (-> index-result
+             (assoc :properties properties)
+             (assoc :classes classes)))))))
 
 (defn refresh
   [{:keys [novelty t alias] :as db} changes-ch max-old-indexes]
@@ -393,9 +457,12 @@
            (throw e))
 
           refresh-ch
-          ([{:keys [garbage], refreshed-db :db, :as _status}]
+          ([{:keys [garbage properties classes], refreshed-db :db, :as _status}]
            (let [{:keys [index-catalog alias] :as refreshed-db*}
-                 (assoc-in refreshed-db [:stats :indexed] t)
+                 (-> refreshed-db
+                     (assoc-in [:stats :indexed] t)
+                     (assoc-in [:stats :properties] properties)
+                     (assoc-in [:stats :classes] classes))
                 ;; TODO - ideally issue garbage/root writes to RAFT together
                 ;;        as a tx, currently requires waiting for both
                 ;;        through raft sync

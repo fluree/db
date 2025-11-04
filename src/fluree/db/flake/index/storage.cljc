@@ -7,7 +7,7 @@
             [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.serde.protocol :as serde]
+            [fluree.db.serde :as serde]
             [fluree.db.storage :as storage]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [<? go-try]]
@@ -87,7 +87,7 @@
                                  :t               t
                                  :v               1 ;; version of db root file
                                  :schema          (vocab/serialize-schema schema)
-                                 :stats           (select-keys stats [:flakes :size])
+                                 :stats           (select-keys stats [:flakes :size :properties :classes])
                                  :spot            (child-data spot)
                                  :psot            (child-data psot)
                                  :post            (child-data post)

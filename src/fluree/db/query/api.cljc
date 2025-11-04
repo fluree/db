@@ -142,6 +142,24 @@
     :fql (query-fql db query override-opts)
     :sparql (query-sparql db query override-opts)))
 
+(defn explain
+  "Returns a query execution plan without executing the query. The plan shows
+  pattern reordering and selectivity scores based on database statistics.
+
+  Parameters:
+    db - Database value or dataset
+    query - Query map (JSON-LD or analytical)
+
+  Returns channel resolving to a query plan map."
+  [db query]
+  (go-try
+    (let [q (-> query
+                syntax/coerce-query
+                (sanitize-query-options nil))
+          q* (update q :opts dissoc :meta :max-fuel)]
+
+      (<? (fql/explain db q*)))))
+
 (defn contextualize-ledger-400-error
   [info-str e]
   (let [e-data (ex-data e)]
@@ -304,9 +322,11 @@
                                                  (sanitize-query-options override-opts))
 
           tracker         (track/init opts)
-          default-aliases (some-> sanitized-query :from util/sequential)
-          named-aliases   (some-> sanitized-query :from-named util/sequential)]
-      (log/debug "query-connection-fql - from:" default-aliases "from-named:" named-aliases)
+          default-aliases (or (some-> opts :from util/sequential)
+                              (some-> opts :ledger util/sequential)
+                              (some-> sanitized-query :from util/sequential))
+          named-aliases   (or (some-> opts :from-named util/sequential)
+                              (some-> sanitized-query :from-named util/sequential))]
       (if (or (seq default-aliases)
               (seq named-aliases))
         (let [ds            (<? (load-dataset conn tracker default-aliases named-aliases sanitized-query))

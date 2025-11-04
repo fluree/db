@@ -558,10 +558,20 @@
   [[_ & patterns]]
   (into [:minus] (mapv parse-term patterns)))
 
+(defmethod parse-term :ServiceClause
+  [[_ & chars]]
+  (apply str chars))
+
+(defn service-pattern
+  [silent? [service clause]]
+  [:service {:silent? silent? :service (parse-term service) :clause (parse-term clause)}])
+
 (defmethod parse-term :ServiceGraphPattern
-  [_]
-  (throw (ex-info "SERVICE is not a supported SPARQL pattern"
-                  {:status 400 :error :db/invalid-query})))
+  ;; ServiceGraphPattern ::= <'SERVICE'> WS 'SILENT'? WS VarOrIri GroupGraphPattern
+  [[_ & terms]]
+  (if (= "SILENT" (first terms))
+    (service-pattern true (rest terms))
+    (service-pattern false terms)))
 
 (defmethod parse-term :DataBlockValue
   ;; DataBlockValue ::= iri | RDFLiteral | NumericLiteral | BooleanLiteral | 'UNDEF' WS

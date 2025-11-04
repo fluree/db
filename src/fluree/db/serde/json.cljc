@@ -6,7 +6,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.serde.protocol :as serde]
+            [fluree.db.serde :as serde]
             [fluree.db.util :as util])
   #?(:clj (:import (java.time.format DateTimeFormatter))))
 #?(:clj (set! *warn-on-reflection* true))
@@ -163,7 +163,7 @@
                 (:stats :config :garbage :prev-index)
                 (util/stringify-keys v)
 
-                (:spot :psot :post :opst :tspo)
+                (:spot :post :opst :tspo)
                 (stringify-child v)
 
                 v)))

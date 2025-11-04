@@ -7,8 +7,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
             [fluree.db.util :as util :refer [vswap!]]
-            [fluree.db.util.async :refer [<? go-try inner-join-by
-                                          repartition-each-by]]))
+            [fluree.db.util.async :refer [<? go-try]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -174,12 +173,12 @@
 
 (defn match-triple
   [db tracker solution tuple error-ch]
-  (let [out-ch   (async/chan 2)
-        db-alias (:alias db)
-        triple   (where/assign-matched-values tuple solution)]
-    (if-some [[s p o] (where/compute-sids db triple)]
+  (let [out-ch     (async/chan 2)
+        db-alias   (:alias db)
+        triple     (where/assign-matched-values tuple solution)]
+    (if-let [[s p o] (where/compute-sids db triple)]
       (let [pid (where/get-sid p db)]
-        (if-some [props (and pid (where/get-child-properties db pid))]
+        (if-let [props (and pid (where/get-child-properties db pid))]
           (let [prop-ch (-> props (conj pid) async/to-chan!)]
             (async/pipeline-async 2
                                   out-ch
@@ -200,50 +199,6 @@
                 (async/pipe out-ch)))))
       (async/close! out-ch))
     out-ch))
-
-(defn match-property-flakes
-  [solution triple db property-flakes]
-  (map (fn [flake]
-         (where/match-flake solution triple db flake))
-       property-flakes))
-
-(defn match-subject-property
-  [initial-solutions triple-map db property-flakes]
-  (let [pid        (->> property-flakes first flake/p)
-        triple     (-> triple-map (get pid) first)]
-    (mapcat (fn [solution]
-              (match-property-flakes solution triple db property-flakes))
-            initial-solutions)))
-
-(defn match-join
-  [solution triples db join]
-  (let [triple-map (group-by (fn [[_ p-mch _]]
-                               (where/get-sid p-mch db))
-                             triples)]
-    (loop [[s-chunk & r] join
-           new-solutions [solution]]
-      (if s-chunk
-        (let [new-solutions* (match-subject-property new-solutions triple-map db s-chunk)]
-          (recur r new-solutions*))
-        new-solutions))))
-
-(defn match-properties
-  [db tracker solution triples error-ch]
-  (let [triples* (->> triples
-                      (map (fn [triple]
-                             (where/assign-matched-values triple solution)))
-                      (map (partial where/compute-sids db)))]
-    (if (every? some? triples*)
-      (let [property-ranges (->> triples*
-                                 (map (fn [triple]
-                                        (where/resolve-flake-range db tracker error-ch triple :psot)))
-                                 (repartition-each-by flake/s))
-            extract-sid     (comp flake/s first)
-            join-xf         (mapcat (fn [join]
-                                      (match-join solution triples* db join)))]
-        (inner-join-by flake/cmp-sid extract-sid 2 join-xf property-ranges))
-      (doto (async/chan)
-        (async/close!)))))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with

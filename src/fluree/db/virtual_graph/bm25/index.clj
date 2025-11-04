@@ -331,14 +331,11 @@
   (-match-class [_ _tracker _solution _s-mch _error-ch]
     empty-channel)
 
-  (-match-properties [this tracker solution triples error-ch]
-    (where/match-triples this tracker solution triples error-ch))
-
-  ;; activate-alias returns the VG itself when the alias matches
-  (-activate-alias [this alias']
-    (go
-      (when (= alias alias')
-        this)))
+  ;; activate-alias should not be called on an index VG, return empty chan
+  (-activate-alias [_ _]
+    (let [ch (async/chan)]
+      (async/close! ch)
+      ch))
 
   ;; return the VG alias
   (-aliases [_]
