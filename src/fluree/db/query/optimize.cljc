@@ -85,7 +85,7 @@
       (or (nil? stats)
           (empty? stats)
           (not (optimizable-pattern? pattern)))
-      nil
+      default-selectivity
 
       (= :id pattern-type)
       (if (where/matched? pattern-data)
@@ -151,8 +151,7 @@
   ;; Sort by selectivity (lower = more selective = execute first)
   (let [with-scores (mapv (fn [pattern]
                             {:pattern pattern
-                             :score (or (calculate-selectivity db stats pattern)
-                                        default-selectivity)})
+                             :score (calculate-selectivity db stats pattern)})
                           patterns)
         sorted      (sort-by :score with-scores)]
     (mapv :pattern sorted)))
