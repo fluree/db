@@ -618,7 +618,18 @@
   [[_ graph where] var-config context]
   (let [graph* (or (parse-variable graph)
                    (parse-graph-string graph context))
-        where* (parse-where-clause where var-config context)]
+        ;; For virtual graphs (##...), don't group the inner patterns since
+        ;; they're handled specially by the vector index system
+        where* (if (and (string? graph*) (where/virtual-graph? graph*))
+                 ;; Skip grouping for virtual graphs
+                 (->> where
+                      syntax/coerce-where
+                      (util/sequential)
+                      (mapcat (fn [pattern]
+                                (parse-pattern pattern var-config context)))
+                      where/->where-clause)
+                 ;; Normal graph - use standard parsing with grouping
+                 (parse-where-clause where var-config context))]
     [(where/->pattern :graph [graph* where*])]))
 
 (defn parse-where
