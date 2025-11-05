@@ -47,7 +47,7 @@
   [pattern]
   (some->> pattern try-coerce-triple first))
 
-(defn triple-variable-subject?
+(defn variable-triple-subject?
   "Check if a pattern is a triple with a variable subject."
   [pattern]
   (when-let [subj (triple-subject pattern)]
@@ -59,14 +59,20 @@
   [pattern]
   (some->> pattern try-coerce-triple second))
 
-(defn specified-predicate?
+(defn specified-iri?
   "Check if a predicate is specified (not a variable)."
   [pred-match]
   (and (map? pred-match)
        (not (where/get-variable pred-match))))
 
+(defn specified-predicate?
+  "Check if a pattern has a specified (non-variable) predicate."
+  [pattern]
+  (->> pattern triple-predicate specified-iri?))
+
 (defn has-filter-function?
-  "Check if a pattern component has a filter function (e.g., language matcher, datatype matcher)."
+  "Check if a pattern component has a filter function (e.g., language matcher,
+  datatype matcher)."
   [component]
   (and (map? component)
        (contains? component ::where/fn)))
@@ -79,8 +85,10 @@
   - Exactly 3 components
   - No filter functions on any component (language/datatype matchers, etc.)"
   [pattern]
-  (and (triple-variable-subject? pattern)
-       (specified-predicate? (triple-predicate pattern))
+  (and (coll? pattern)
+       (= 3 (count pattern))
+       (variable-triple-subject? pattern)
+       (specified-predicate? pattern)
        (not-any? has-filter-function? pattern)))
 
 (defn extract-subject-variable
@@ -88,46 +96,59 @@
   [triple]
   (-> triple triple-subject where/get-variable))
 
-(defn extract-predicate-iri
-  "Extract the predicate IRI from a triple pattern."
-  [triple]
-  (-> triple triple-predicate where/get-iri))
+(defn matching-subject-variables?
+  "Check if all triples have the same subject variable."
+  [triples]
+  (->> triples (map extract-subject-variable) (apply =)))
 
 (defn property-join-candidate?
-  "Check if a group of triples should become a property join.
-  Must have at least 2 triples with the same variable subject and
-  all different predicates (same predicate with different objects should not be grouped)."
+  "Check if a group of triples should become a property join. Must have at least 2
+  triples with the same variable subject and all different predicates (same
+  predicate with different objects should not be grouped)."
   [triples]
   (and (>= (count triples) 2)
        (every? groupable-triple? triples)
-       (let [subjects   (map extract-subject-variable triples)
-             predicates (map extract-predicate-iri triples)]
-         (and (apply = subjects)
-              (= (count predicates) (count (distinct predicates)))))))
+       (matching-subject-variables? triples)))
 
-(defn group-consecutive-triples
-  "Group consecutive triples by their subject variable.
+(defn group-subject-triples
+  "Build a map of subject variable -> all triples with that subject. Only includes
+  groupable triples."
+  [patterns]
+  (reduce (fn [acc pattern]
+            (if (groupable-triple? pattern)
+              (let [subj (extract-subject-variable pattern)]
+                (update acc subj (fnil conj []) pattern))
+              acc))
+          {}
+          patterns))
+
+(defn group-all-subject-triples
+  "Group all triples by their subject variable throughout the pattern sequence.
+  Returns a sequence where each group is placed at the position of the first triple
+  with that subject. Subsequent triples with the same subject are omitted from their
+  original positions. Non-groupable patterns remain in their original positions.
+
   Returns a sequence of groups, where each group is:
   - A vector of triples (for groupable triples with the same subject)
-  - A map-entry (for higher-order patterns like :union, :optional, etc.)
-  - A single triple wrapped in a marker (for non-groupable triples)"
+  - A compound pattern (for higher-order patterns like :union, :optional, etc.)
+  - A single pattern (for non-groupable triples)"
   [patterns]
-  (reduce (fn [groups pattern]
-            (if (groupable-triple? pattern)
-              (let [subj (triple-subject pattern)
-                    last-group (peek groups)]
-                ;; If the last group is a triple group with the same subject, add to it
-                (if (and (vector? last-group)
-                         (not (map-entry? last-group))
-                         (groupable-triple? (first last-group))
-                         (= subj (triple-subject (first last-group))))
-                  (conj (pop groups) (conj last-group pattern))
-                  ;; Otherwise start a new group
-                  (conj groups [pattern])))
-              ;; Non-groupable pattern (map-entry or non-groupable triple)
-              ;; Add as its own "group" without wrapping
-              (conj groups pattern)))
-          [] patterns))
+  (let [subject->triples (group-subject-triples patterns)]
+    (loop [[pattern & r] patterns
+           result        []
+           seen-subjects #{}]
+      (if pattern
+        (if (groupable-triple? pattern)
+          (let [subj (extract-subject-variable pattern)]
+            ;; Only output this subject's group at its first occurrence
+            (if (contains? seen-subjects subj)
+              (recur r result seen-subjects)
+              (recur r
+                     (conj result (get subject->triples subj))
+                     (conj seen-subjects subj))))
+          ;; Non-groupable pattern - keep as-is
+          (recur r (conj result pattern) seen-subjects))
+        result))))
 
 (defn create-property-join-or-triples
   "Convert a group of triples into a property join if eligible,
@@ -178,11 +199,13 @@
     [group]))
 
 (defn group-patterns
-  "Recursively group triples with the same subject into property joins.
-  Respects higher-order patterns (union, optional, filter, etc.) by
-  recursively processing their contents but not grouping across them."
+  "Recursively group all triples with the same subject into property joins.
+  Triples are grouped by subject throughout the entire pattern sequence, not
+  just consecutive ones. Respects higher-order patterns (union, optional,
+  filter, etc.) by recursively processing their contents but not grouping across
+  them."
   [patterns]
   (->> patterns
-       group-consecutive-triples
+       group-all-subject-triples
        (mapcat process-pattern-group)
        vec))
