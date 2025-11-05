@@ -83,6 +83,16 @@
        (specified-predicate? (triple-predicate pattern))
        (not-any? has-filter-function? pattern)))
 
+(defn extract-subject-variable
+  "Extract the subject variable from a triple pattern."
+  [triple]
+  (-> triple triple-subject where/get-variable))
+
+(defn extract-predicate-iri
+  "Extract the predicate IRI from a triple pattern."
+  [triple]
+  (-> triple triple-predicate where/get-iri))
+
 (defn property-join-candidate?
   "Check if a group of triples should become a property join.
   Must have at least 2 triples with the same variable subject and
@@ -90,12 +100,8 @@
   [triples]
   (and (>= (count triples) 2)
        (every? groupable-triple? triples)
-       (let [subjects   (map (fn [triple]
-                               (-> triple triple-subject where/get-variable))
-                             triples)
-             predicates (map (fn [triple]
-                               (-> triple triple-predicate where/get-iri))
-                             triples)]
+       (let [subjects   (map extract-subject-variable triples)
+             predicates (map extract-predicate-iri triples)]
          (and (apply = subjects)
               (= (count predicates) (count (distinct predicates)))))))
 
