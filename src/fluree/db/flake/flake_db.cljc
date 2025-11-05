@@ -25,6 +25,7 @@
             [fluree.db.json-ld.policy.rules :as policy-rules]
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
+            [fluree.db.query.explain :as explain]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql :as fql]
@@ -294,82 +295,6 @@
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
 
-(defn- component->user-value
-  "Convert an internal pattern component to user-readable format"
-  [component compact-fn]
-  (cond
-    (nil? component)
-    nil
-
-    (where/unmatched-var? component)
-    (str (where/get-variable component))
-
-    (where/matched-iri? component)
-    (let [iri (where/get-iri component)]
-      (json-ld/compact iri compact-fn))
-
-    (where/matched-value? component)
-    (where/get-value component)
-
-    :else
-    (throw (ex-info (str "Unexpected component type: " (pr-str component))
-                    {:component component}))))
-
-(defn- pattern->user-format
-  "Convert internal pattern to user-readable triple format"
-  [pattern compact-fn]
-  (let [ptype (where/pattern-type pattern)
-        pdata (where/pattern-data pattern)]
-    (case ptype
-      :class
-      (let [[s _ o] pdata]
-        {:subject (component->user-value s compact-fn)
-         :property const/iri-type
-         :object (component->user-value o compact-fn)})
-
-      :triple
-      (let [[s p o] pdata]
-        {:subject (component->user-value s compact-fn)
-         :property (component->user-value p compact-fn)
-         :object (component->user-value o compact-fn)})
-
-      :id
-      {:subject (component->user-value pdata compact-fn)}
-
-      ;; Other pattern types (filter, bind, etc.)
-      {:type ptype
-       :data (pr-str pdata)})))
-
-(defn- pattern-type->user-type
-  "Convert internal pattern type to user-friendly type name"
-  [ptype]
-  (case ptype
-    :tuple :triple
-    ptype))
-
-(defn- pattern-explain
-  "Generate explain information for a single pattern"
-  [db stats pattern compact-fn]
-  (let [ptype       (where/pattern-type pattern)
-        optimizable? (optimize/optimizable-pattern? pattern)
-        selectivity (optimize/calculate-selectivity db stats pattern)]
-    {:type        (pattern-type->user-type ptype)
-     :pattern     (pattern->user-format pattern compact-fn)
-     :selectivity selectivity
-     :optimizable (when optimizable? (pattern-type->user-type optimizable?))}))
-
-(defn- segment-explain
-  "Generate explain information for pattern segments"
-  [db stats where-clause compact-fn]
-  (let [segments (optimize/split-by-optimization-boundaries where-clause)]
-    (mapv (fn [segment]
-            (if (= :optimizable (:type segment))
-              {:type     :optimizable
-               :patterns (mapv #(pattern-explain db stats % compact-fn) (:data segment))}
-              {:type    :boundary
-               :pattern (pattern-explain db stats (:data segment) compact-fn)}))
-          segments)))
-
 (defn optimize-query
   "Optimize a parsed query using statistics if available.
    Returns the optimized query with patterns reordered for optimal execution."
@@ -399,11 +324,11 @@
             optimized-where   (when where-clause
                                 (optimize/optimize-patterns db where-clause))
             original-explain  (when where-clause
-                                (mapv #(pattern-explain db stats % compact-fn) where-clause))
+                                (mapv #(explain/pattern db stats % compact-fn) where-clause))
             optimized-explain (when optimized-where
-                                (mapv #(pattern-explain db stats % compact-fn) optimized-where))
+                                (mapv #(explain/pattern db stats % compact-fn) optimized-where))
             segments          (when where-clause
-                                (segment-explain db stats where-clause compact-fn))
+                                (explain/segment db stats where-clause compact-fn))
             changed?          (not= where-clause optimized-where)]
         {:query (assoc parsed-query :where optimized-where)
          :plan  {:optimization (if changed? :reordered :unchanged)
