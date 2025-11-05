@@ -142,21 +142,16 @@
   Returns a sequence of patterns that will be concatenated by mapcat."
   [group]
   (cond
-    ;; Higher-order pattern (map-entry)
     (where/compound-pattern? group)
-    (let [typ (where/pattern-type group)
+    (let [typ  (where/pattern-type group)
           data (where/pattern-data group)]
       (cond
-        ;; Recursively process union branches
         (= typ :union)
         [(where/->pattern :union (mapv group-patterns data))]
 
-        ;; Recursively process optional, exists, not-exists, minus
         (contains? #{:optional :exists :not-exists :minus} typ)
         [(where/->pattern typ (group-patterns data))]
 
-        ;; Recursively process graph patterns
-        ;; BUT: don't group patterns inside virtual graphs (e.g., vector indexes)
         (= typ :graph)
         (let [[graph-alias where-patterns] data]
           (if (where/virtual-graph? graph-alias)
@@ -166,12 +161,11 @@
             ;; Regular named graphs can have their patterns grouped
             [(where/->pattern :graph [graph-alias (group-patterns where-patterns)])]))
 
-        ;; Other patterns pass through unchanged
         :else
         [group]))
 
-    ;; Group of triples - check if first element is a triple
-    (and (vector? group) (not-empty group) (vector? (first group)))
+    (and (seq group)
+         (every? where/triple-pattern? group))
     (create-property-join-or-triples group)
 
     :else
