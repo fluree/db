@@ -620,7 +620,7 @@
         (parse-where-clause var-config context))))
 
 (defn unwrap-tuple-patterns
-  "Construct accepts node-map patterns, which can produce :tuple patterns, :class
+  "Construct accepts node-map patterns, which can produce :triple patterns, :class
   patterns, or :id patterns. We only need the pattern components as a template
   for construct, the :id and :class patterns are for optimized query execution,
   so this function unwraps :id and :class patterns and only returns the

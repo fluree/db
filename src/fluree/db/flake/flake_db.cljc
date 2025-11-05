@@ -327,7 +327,7 @@
          :property const/iri-type
          :object (component->user-value o compact-fn)})
 
-      :tuple
+      :triple
       (let [[s p o] pdata]
         {:subject (component->user-value s compact-fn)
          :property (component->user-value p compact-fn)

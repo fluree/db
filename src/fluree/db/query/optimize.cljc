@@ -20,7 +20,7 @@
       0)))
 
 (def triple-pattern-types
-  #{:tuple :class})
+  #{:triple :class})
 
 (defn triple-pattern?
   [x]
@@ -50,7 +50,7 @@
    Any pattern not recognized here is treated as an optimization boundary."
   [pattern]
   (let [ptype (where/pattern-type pattern)]
-    (#{:tuple :class :id} ptype)))
+    (#{:triple :class :id} ptype)))
 
 (defn get-property-count
   "Get count for a property from stats"
@@ -115,7 +115,7 @@
 
 (defn split-by-optimization-boundaries
   "Split where clause into segments separated by optimization boundaries.
-   Optimizable patterns (:tuple, :class, :id) are grouped together.
+   Optimizable patterns (:triple, :class, :id) are grouped together.
    All other patterns (boundaries) separate the segments."
   [where-clause]
   (reduce

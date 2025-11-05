@@ -7,8 +7,7 @@
 
 (deftest optimizable-pattern-test
   (testing "Pattern type recognition using where/pattern-type"
-
-    (let [tuple-pattern  (where/->pattern :tuple [:s :p :o])
+    (let [tuple-pattern  [:s :p :o]
           class-pattern  (where/->pattern :class [:s :p :o])
           id-pattern     (where/->pattern :id "ex:alice")
           filter-pattern (where/->pattern :filter "fn")
@@ -28,10 +27,10 @@
 (deftest split-boundaries-test
   (testing "Split by optimization boundaries"
     ;; Test the split-by-optimization-boundaries function directly
-    (let [tuple-pattern  (where/->pattern :tuple [:s1 :p1 :o1])
+    (let [tuple-pattern  [:s1 :p1 :o1]
           class-pattern  (where/->pattern :class [:s2 :p2 :o2])
           filter-pattern (where/->pattern :filter "fn")
-          tuple-pattern2 (where/->pattern :tuple [:s3 :p3 :o3])
+          tuple-pattern2 [:s3 :p3 :o3]
 
           where-clause [tuple-pattern class-pattern filter-pattern tuple-pattern2]
           result       (optimize/split-by-optimization-boundaries where-clause)]
