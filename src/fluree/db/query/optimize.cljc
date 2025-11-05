@@ -52,17 +52,6 @@
   (let [ptype (where/pattern-type pattern)]
     (#{:tuple :class :id} ptype)))
 
-(defn get-iri
-  "Extract IRI from a matched component"
-  [component]
-  (where/get-iri component))
-
-(defn encode-iri-to-sid
-  "Convert IRI to SID using database namespace table"
-  [db iri]
-  (when iri
-    (iri/encode-iri db iri)))
-
 (defn get-property-count
   "Get count for a property from stats"
   [stats sid]
@@ -97,8 +86,7 @@
         (cond
           ;; Class patterns use class count from stats
           (= :class pattern-type)
-          (let [class-iri (get-iri o)
-                class-sid (encode-iri-to-sid db class-iri)]
+          (let [class-sid (some->> (where/get-iri o) (iri/encode-iri db))]
             (or (get-class-count stats class-sid) default-selectivity))
 
           ;; Specific s-p-o triple lookup
@@ -107,14 +95,12 @@
 
           ;; s-p-? lookup uses property count
           (and (where/matched? s) (where/matched? p) (where/unmatched? o))
-          (let [pred-iri (get-iri p)
-                pred-sid (encode-iri-to-sid db pred-iri)]
+          (let [pred-sid (some->> (where/get-iri p) (iri/encode-iri db))]
             (or (get-property-count stats pred-sid) moderately-selective))
 
           ;; ?-p-? property scan uses property count
           (and (where/unmatched? s) (where/matched? p) (where/unmatched? o))
-          (let [pred-iri (get-iri p)
-                pred-sid (encode-iri-to-sid db pred-iri)]
+          (let [pred-sid (some->> (where/get-iri p) (iri/encode-iri db))]
             (or (get-property-count stats pred-sid) default-selectivity))
 
           ;; ?-p-o reverse lookup (find subjects with specific value)
