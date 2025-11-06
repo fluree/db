@@ -85,9 +85,7 @@
   - Exactly 3 components
   - No filter functions on any component (language/datatype matchers, etc.)"
   [pattern]
-  (and (coll? pattern)
-       (= 3 (count pattern))
-       (variable-triple-subject? pattern)
+  (and (variable-triple-subject? pattern)
        (specified-predicate? pattern)
        (not-any? has-filter-function? pattern)))
 
