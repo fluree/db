@@ -53,14 +53,3 @@
        (let [pq (parse/parse-query query-map)
              oq (<? (optimize/-reorder ds pq))]
          (<? (exec/query ds tracker oq)))))))
-
-(defn explain
-  "Returns query execution plan without executing the query.
-  Returns core async channel with query plan or exception."
-  [ds query-map]
-  (let [pq (try*
-             (parse/parse-query query-map)
-             (catch* e e))]
-    (if (util/exception? pq)
-      (async/go pq)
-      (optimize/-explain ds pq))))
