@@ -40,8 +40,6 @@
   [triple-coll]
   (sort compare-triples triple-coll))
 
-;; Post-parse triple grouping for property joins
-
 (defn triple-subject
   "Extract the subject from a triple pattern."
   [pattern]
@@ -77,7 +75,7 @@
   (and (map? component)
        (contains? component ::where/fn)))
 
-(defn groupable-triple?
+(defn property-join-candidate?
   "Check if a pattern is a regular triple that can be grouped for property joins.
   A triple is groupable if it has:
   - A variable subject
@@ -104,11 +102,11 @@
   - A compound pattern (for higher-order patterns like :union, :optional, etc.)
   - A single pattern (for non-groupable triples)"
   [patterns]
-  (let [grouping-fn   (fn [pattern]
-                        (if (groupable-triple? pattern)
-                          (extract-subject-variable pattern)
-                          ::ungrouped))
-        grouped       (group-by grouping-fn patterns)
+  (let [grouped       (group-by (fn [pattern]
+                                  (if (property-join-candidate? pattern)
+                                    (extract-subject-variable pattern)
+                                    ::ungrouped))
+                                patterns)
         ungrouped     (get grouped ::ungrouped [])
         triple-groups (-> grouped
                           (dissoc ::ungrouped)
@@ -126,11 +124,19 @@
 
 (declare group-patterns)
 
-(defn process-pattern-group
-  "Process a single pattern group, recursively grouping higher-order patterns
-  or creating property joins from triple groups.
+(defn build-property-joins
+  "Transform a pattern group into a sequence of patterns with property joins.
 
-  Returns a sequence of patterns that will be concatenated by mapcat."
+  Takes a single group which can be:
+  - A vector of triple patterns sharing the same subject variable
+    -> creates a property join pattern to enable more efficient query execution
+       by retrieving all properties for a subject in parallel
+  - A compound pattern (union, optional, graph, etc.)
+    -> recursively processes inner patterns to build property joins within them
+  - Any other pattern
+    -> returns as-is
+
+  Returns a sequence (for mapcat) containing the transformed pattern(s)."
   [group]
   (cond
     (where/compound-pattern? group)
@@ -170,5 +176,5 @@
   [patterns]
   (->> patterns
        group-subject-triples
-       (mapcat process-pattern-group)
+       (mapcat build-property-joins)
        vec))
