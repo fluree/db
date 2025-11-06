@@ -154,7 +154,6 @@
         data        (get-first jsonld const/iri-data)
         ns          (get-first jsonld const/iri-ns)
         index       (get-first jsonld const/iri-index)]
-
     (cond-> {:id     id
              :v      v
              :alias  alias

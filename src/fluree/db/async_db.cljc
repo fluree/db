@@ -36,9 +36,11 @@
     (let [commit* (assoc commit :index commit-index)
           updated-db (->async-db alias commit* t)]
       (go-try
-        (let [db (<? db-chan)]
-          (deliver! updated-db (dbproto/-index-update db commit-index))))
-      updated-db))
+        (let [db  (<? db-chan)
+              db* (<? (dbproto/-index-update db commit-index))]
+          ;; Deliver the updated FlakeDB and yield the AsyncDB when complete
+          (deliver! updated-db db*)
+          updated-db))))
   where/Matcher
   (-match-id [_ tracker solution s-match error-ch]
     (let [match-ch (async/chan)]

@@ -75,8 +75,11 @@
 (defn read-data-jsonld
   [storage address]
   (go-try
-    (let [jsonld (<? (storage/read-json storage address))]
+    (let [jsonld (<? (storage/read-json storage address))
+          hash   (<? (storage/get-hash storage address))
+          db-id  (commit-data/hash->db-id hash)]
       (-> jsonld
+          (assoc const/iri-id db-id)
           (assoc const/iri-address address)
           json-ld/expand))))
 
