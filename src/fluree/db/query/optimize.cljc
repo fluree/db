@@ -94,20 +94,6 @@
   [triple]
   (-> triple triple-subject where/get-variable))
 
-(defn matching-subject-variables?
-  "Check if all triples have the same subject variable."
-  [triples]
-  (->> triples (map extract-subject-variable) (apply =)))
-
-(defn property-join-candidate?
-  "Check if a group of triples should become a property join. Must have at least 2
-  triples with the same variable subject and all different predicates (same
-  predicate with different objects should not be grouped)."
-  [triples]
-  (and (>= (count triples) 2)
-       (every? groupable-triple? triples)
-       (matching-subject-variables? triples)))
-
 (defn group-subject-triples
   "Group all triples by their subject variable throughout the pattern sequence.
   Groupable triples are grouped by subject variable, and all grouped triples
@@ -130,16 +116,6 @@
     (-> triple-groups
         (concat ungrouped)
         vec)))
-
-(defn create-property-join-or-triples
-  "Convert a group of triples into a property join if eligible,
-  otherwise return the triples sorted.
-
-  Returns a sequence of patterns that will be concatenated by mapcat."
-  [triple-group]
-  (if (property-join-candidate? triple-group)
-    [(where/->pattern :property-join triple-group)]
-    (sort compare-triples triple-group)))
 
 (declare group-patterns)
 
@@ -174,7 +150,7 @@
 
     (and (seq group)
          (every? where/triple-pattern? group))
-    (create-property-join-or-triples group)
+    [(where/->pattern :property-join group)]
 
     :else
     [group]))
