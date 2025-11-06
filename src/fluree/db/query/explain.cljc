@@ -63,7 +63,7 @@
 (defn segment
   "Generate explain information for pattern segments"
   [db stats where-clause compact-fn]
-  (let [segments (optimize/split-by-optimization-boundaries where-clause)]
+  (let [segments (optimize/segment-clause where-clause)]
     (mapv (fn [segment]
             (if (= :optimizable (:type segment))
               {:type     :optimizable

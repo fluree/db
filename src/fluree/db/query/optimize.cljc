@@ -113,23 +113,24 @@
           :else
           default-selectivity)))))
 
-(defn split-by-optimization-boundaries
+(defn segment-clause
   "Split where clause into segments separated by optimization boundaries.
    Optimizable patterns (:triple, :class, :id) are grouped together.
    All other patterns (boundaries) separate the segments."
   [where-clause]
   (reduce
-   (fn [segments pattern]
-     (if (optimizable-pattern? pattern)
-       (if (and (seq segments)
-                (= :optimizable (:type (peek segments))))
-         (update segments (dec (count segments))
-                 update :data conj pattern)
-         (conj segments {:type :optimizable :data [pattern]}))
-       ;; Boundary - add as separate segment
-       (conj segments {:type :boundary :data pattern})))
-   []
-   where-clause))
+    (fn [segments pattern]
+      (if (optimizable-pattern? pattern)
+        (let [prev-segment (peek segments)]
+          (if (and prev-segment (= :optimizable (:type prev-segment)))
+            ;; add to prev segment
+            (conj (pop segments) (update prev-segment :data conj pattern))
+            ;; add new segment
+            (conj segments {:type :optimizable :data [pattern]})))
+        ;; Boundary - add as separate segment
+        (conj segments {:type :boundary :data pattern})))
+    []
+    where-clause))
 
 (defn optimize-segment
   "Optimize a single segment by sorting patterns by selectivity"
@@ -147,7 +148,7 @@
    Splits on optimization boundaries and optimizes each segment independently."
   [db where-clause]
   (let [stats (:stats db)
-        segments (split-by-optimization-boundaries where-clause)]
+        segments (segment-clause where-clause)]
     (into []
           (mapcat (fn [segment]
                     (if (= :optimizable (:type segment))
