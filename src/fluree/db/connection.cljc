@@ -8,7 +8,7 @@
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.serde.json :refer [json-serde]]
+            [fluree.db.serde.json-dict :refer [json-dict-serde]]
             [fluree.db.storage :as storage]
             [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
@@ -53,7 +53,7 @@
 (defn connect
   [{:keys [parallelism commit-catalog index-catalog cache serializer
            primary-publisher secondary-publishers remote-systems defaults]
-    :or   {serializer (json-serde)} :as _opts}]
+    :or   {serializer (json-dict-serde)} :as _opts}]
   (let [id    (random-uuid)
         state (atom blank-state)]
     (->Connection id state parallelism commit-catalog index-catalog primary-publisher
