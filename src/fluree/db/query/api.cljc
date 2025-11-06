@@ -147,11 +147,11 @@
     query - Query map (JSON-LD or analytical)
 
   Returns channel resolving to a query plan map."
-  [db query]
+  [db query override-opts]
   (go-try
     (let [q (-> query
                 syntax/coerce-query
-                (sanitize-query-options nil))
+                (sanitize-query-options override-opts))
           q* (update q :opts dissoc :meta :max-fuel)]
 
       (<? (fql/explain db q*)))))

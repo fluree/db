@@ -725,10 +725,12 @@
             :optimized [{:pattern ... :selectivity 1}    ; email lookup first
                         {:pattern ... :selectivity 10000}] ; then verify type
             :changed? true}}"
-  [ds q]
-  (if (util/exception? ds)
-    (throw ds)
-    (promise-wrap (query-api/explain ds q))))
+  ([ds q]
+   (explain ds q {}))
+  ([ds q opts]
+   (if (util/exception? ds)
+     (throw ds)
+     (promise-wrap (query-api/explain ds q opts)))))
 
 (defn credential-query
   "Executes a query using a verifiable credential.
