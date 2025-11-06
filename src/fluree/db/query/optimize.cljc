@@ -117,6 +117,13 @@
         (concat ungrouped)
         vec)))
 
+(defn triple-group?
+  "Determine if a group is a non-empty sequence consisting only of triple
+  patterns."
+  [group]
+  (and (seq group)
+       (every? where/triple-pattern? group)))
+
 (declare group-patterns)
 
 (defn process-pattern-group
@@ -148,8 +155,7 @@
         :else
         [group]))
 
-    (and (seq group)
-         (every? where/triple-pattern? group))
+    (triple-group? group)
     [(where/->pattern :property-join group)]
 
     :else
