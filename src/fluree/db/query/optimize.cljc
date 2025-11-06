@@ -109,44 +109,27 @@
        (matching-subject-variables? triples)))
 
 (defn group-subject-triples
-  "Build a map of subject variable -> all triples with that subject. Only includes
-  groupable triples."
-  [patterns]
-  (reduce (fn [acc pattern]
-            (if (groupable-triple? pattern)
-              (let [subj (extract-subject-variable pattern)]
-                (update acc subj (fnil conj []) pattern))
-              acc))
-          {}
-          patterns))
-
-(defn group-all-subject-triples
   "Group all triples by their subject variable throughout the pattern sequence.
-  Returns a sequence where each group is placed at the position of the first triple
-  with that subject. Subsequent triples with the same subject are omitted from their
-  original positions. Non-groupable patterns remain in their original positions.
+  Groupable triples are grouped by subject variable, and all grouped triples
+  appear before non-groupable patterns in the result.
 
   Returns a sequence of groups, where each group is:
   - A vector of triples (for groupable triples with the same subject)
   - A compound pattern (for higher-order patterns like :union, :optional, etc.)
   - A single pattern (for non-groupable triples)"
   [patterns]
-  (let [subject->triples (group-subject-triples patterns)]
-    (loop [[pattern & r] patterns
-           result        []
-           seen-subjects #{}]
-      (if pattern
-        (if (groupable-triple? pattern)
-          (let [subj (extract-subject-variable pattern)]
-            ;; Only output this subject's group at its first occurrence
-            (if (contains? seen-subjects subj)
-              (recur r result seen-subjects)
-              (recur r
-                     (conj result (get subject->triples subj))
-                     (conj seen-subjects subj))))
-          ;; Non-groupable pattern - keep as-is
-          (recur r (conj result pattern) seen-subjects))
-        result))))
+  (let [grouping-fn   (fn [pattern]
+                        (if (groupable-triple? pattern)
+                          (extract-subject-variable pattern)
+                          ::ungrouped))
+        grouped       (group-by grouping-fn patterns)
+        ungrouped     (get grouped ::ungrouped [])
+        triple-groups (-> grouped
+                          (dissoc ::ungrouped)
+                          vals)]
+    (-> triple-groups
+        (concat ungrouped)
+        vec)))
 
 (defn create-property-join-or-triples
   "Convert a group of triples into a property join if eligible,
@@ -204,6 +187,6 @@
   them."
   [patterns]
   (->> patterns
-       group-all-subject-triples
+       group-subject-triples
        (mapcat process-pattern-group)
        vec))
