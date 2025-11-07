@@ -343,18 +343,23 @@
             prop-data* (assoc prop-data :count new-count)
             ;; Update HLL sketches (only on assertions - monotone NDV)
             sketch* (if assert?
-                      (let [values-sketch (hll/add-value (:values sketch) (flake/o f))
-                            subjects-sketch (hll/add-value (:subjects sketch) (flake/s f))]
+                      (let [;; Initialize sketches if nil
+                            curr-sketch (or sketch {:values (hll/create-sketch)
+                                                    :subjects (hll/create-sketch)})
+                            values-sketch (hll/add-value (:values curr-sketch) (flake/o f))
+                            subjects-sketch (hll/add-value (:subjects curr-sketch) (flake/s f))]
                         {:values values-sketch
                          :subjects subjects-sketch})
                       sketch)]
         (recur r prop-data* sketch*))
 
       ;; Return updated data with NDV extracted from sketches
-      {:property-data (assoc prop-data
-                             :ndv-values (hll/cardinality (:values sketch))
-                             :ndv-subjects (hll/cardinality (:subjects sketch)))
-       :sketch sketch})))
+      (let [final-sketch (or sketch {:values (hll/create-sketch)
+                                     :subjects (hll/create-sketch)})]
+        {:property-data (assoc prop-data
+                               :ndv-values (hll/cardinality (:values final-sketch))
+                               :ndv-subjects (hll/cardinality (:subjects final-sketch)))
+         :sketch final-sketch}))))
 
 (defn- update-class-counts
   "Update class counts for rdf:type flakes.
