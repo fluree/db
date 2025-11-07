@@ -293,19 +293,25 @@
        (<? (connection/ledger-exists? conn address))))))
 
 (defn notify
-  "Notifies the connection of a new commit for maintaining current db state.
+  "Notifies the connection of an update for maintaining current db state.
 
-  Parameters:
-    conn - Connection object
-    commit-address - Address where commit is stored
-    commit-hash - Hash of the commit
+  Parameters (2-arity overload):
+    - conn: Connection
+    - update: either
+      - a nameservice record map (possibly compacted), or
+      - a commit address string (content-addressed)
 
-  Updates in-memory ledger if commit is next in sequence.
-  Returns promise resolving when notification is processed."
-  [conn commit-address]
+  Behavior:
+    - If `update` is a map, it is treated as a nameservice record and the
+      minimal action is applied (index/commit/none).
+    - If `update` is a string, it is treated as a commit address and the commit
+      is read and applied if newer.
+
+  Returns a promise resolving to true on no-op or successful application."
+  [conn update]
   (validate-connection conn)
   (promise-wrap
-   (connection/notify conn commit-address)))
+   (connection/notify conn update)))
 
 (defn insert
   "Stages insertion of new entities into a database.
@@ -725,12 +731,10 @@
             :optimized [{:pattern ... :selectivity 1}    ; email lookup first
                         {:pattern ... :selectivity 10000}] ; then verify type
             :changed? true}}"
-  ([ds q]
-   (explain ds q {}))
-  ([ds q opts]
-   (if (util/exception? ds)
-     (throw ds)
-     (promise-wrap (query-api/explain ds q opts)))))
+  [ds q]
+  (if (util/exception? ds)
+    (throw ds)
+    (promise-wrap (query-api/explain ds q))))
 
 (defn credential-query
   "Executes a query using a verifiable credential.

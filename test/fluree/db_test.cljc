@@ -464,7 +464,8 @@
      (testing "can load a ledger with `list` values"
        (let [conn         @(fluree/connect-memory)
              ledger-alias "load-lists-test"
-             db0 @(fluree/create conn ledger-alias)
+             db0 @(fluree/create conn ledger-alias
+                                 {:reindex-min-bytes 0}) ; force reindex on every commit
              db           @(fluree/update
                             db0
                             {"@context" ["https://ns.flur.ee"
@@ -1089,6 +1090,11 @@
                   (sort (async/<!! (fs/list-files primary-path)))))
            (is (= ["destined-for-drop"]
                   (async/<!! (fs/list-files (str secondary-path "/ns@v2")))))
+          ;; nameservice files should exist at ns@v2/<ledger>/main.json (new layout)
+           (is (= ["main.json"]
+                  (async/<!! (fs/list-files (str primary-path "/ns@v2/" alias)))))
+           (is (= ["main.json"]
+                  (async/<!! (fs/list-files (str secondary-path "/ns@v2/" alias)))))
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
            ;; only store txns when signed
@@ -1097,7 +1103,7 @@
            ;; initial create call generates an initial commit, each commit has two files
            (is (= (* 2 (inc tx-count))
                   (count (async/<!! (fs/list-files (str primary-path "/" alias "/commit"))))))
-           (is (= ["garbage" "opst" "post" "root" "spot" "stats-sketches" "tspo"]
+           (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias "/index"))))))
            ;; one new index root per tx
            (is (= tx-count
@@ -1126,14 +1132,15 @@
            (is (= ["destined-for-drop"]
                   (async/<!! (fs/list-files (str secondary-path "/ns@v2")))))
            (is (= []
-                  (async/<!! (fs/list-files (str secondary-path "/ns@v2/destined-for-drop")))))
+                  (async/<!! (fs/list-files (str secondary-path "/ns@v2/" alias)))))
+           (is (= []
+                  (async/<!! (fs/list-files (str primary-path "/ns@v2/" alias)))))
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
-           (is (= ["garbage" "opst" "post" "root" "spot" "stats-sketches" "tspo"]
+           (is (= ["garbage" "opst" "post" "root" "spot" "tspo"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias "/index"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/txn"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/commit"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/root"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/root"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/garbage"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/spot"))))))
