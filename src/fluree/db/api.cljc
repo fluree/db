@@ -698,14 +698,21 @@
     q - Query map (JSON-LD or analytical)
 
   Returns promise resolving to a query plan map with:
-    :query - Original parsed query structure
+    :query - Original query structure
     :plan - Execution plan with:
-      :optimization - :reordered, :unchanged, or :none
-      :statistics - Available statistics (if any)
+      :optimizations - array of optimization methods applied: :statistics, :heuristics, or :none
+      :statistics - If the :statistics optimization was applied, the statistics used as a basis
+         :properties - count of properties
+         :classes - count of classes
+         :flakes - total number of flakes in db
+         :index-t - t value of latest index
+         :segments - groups of patterns that are either optimizable or not
+      :heuristics - If the :heuristics optimization was applied, the list of optimized pattern types
       :original - Original pattern order with selectivity
       :optimized - Optimized pattern order with selectivity
-      :segments - Pattern segments with boundaries
-      :changed? - Boolean indicating if patterns were reordered
+
+  Patterns with higher selectivity scores are processed first.
+
 
   Example:
     @(fluree/explain db
@@ -718,13 +725,12 @@
 
     ;; Returns:
     {:query {...}
-     :plan {:optimization :reordered
-            :statistics {...}
+     :plan {:optimizations [:statistics]
             :original [{:pattern ... :selectivity 10000}
                        {:pattern ... :selectivity 1}]
             :optimized [{:pattern ... :selectivity 1}    ; email lookup first
                         {:pattern ... :selectivity 10000}] ; then verify type
-            :changed? true}}"
+            :statistics {...}}}"
   ([ds q]
    (explain ds q {}))
   ([ds q opts]

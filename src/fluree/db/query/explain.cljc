@@ -60,6 +60,7 @@
         plan))
 
 (defn query
+  "Provide a user-readable summary of the query plan and any optimizations applied to a query."
   [stats {:keys [plan orig-query context] :as _planned-query}]
   (let [compact-fn     (json-ld/compact-fn context)
         formatted-plan (format-plan compact-fn plan)

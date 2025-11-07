@@ -154,19 +154,26 @@
     segment))
 
 (defn plan-query
+  "Generate a plan: a collection of segments of rearrangable patterns.
+
+  [{:type <:optimizable|:boundary>
+    :patterns [{:pattern <pattern>
+                :type <pattern-type>
+                :selectivity <score>}
+                ,,,]}]"
   [db {:keys [where] :as parsed-query}]
-  ;; TODO: plan recursively
   (assoc parsed-query :plan (->> (segment-clause where)
                                  (mapv (partial plan-segment db)))))
 
 (defn reorder-patterns
-  ;; TODO: optimize recursively
+  "Reorder patterns in a plan according to selectivity score, with higher scores first."
   [segments]
   (mapv (fn [segment]
           (update segment :patterns (partial sort-by :selectivity)))
         segments))
 
 (defn plan->where
+  "Convert a plan into a where clause."
   [segments]
   (vec (mapcat
         (fn [{:keys [patterns type]}]
@@ -176,6 +183,7 @@
         segments)))
 
 (defn optimize-query
+  "Produce a query with the where-clause reordered according to the :plan."
   [{:keys [plan] :as planned-query}]
   (if plan
     (assoc planned-query :where (-> plan
