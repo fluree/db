@@ -113,53 +113,80 @@
           :else
           default-selectivity)))))
 
+(defn create-segment
+  [type pattern]
+  {:type type
+   :patterns [pattern]})
+
+(defn add-pattern
+  [segment pattern]
+  (update segment :patterns conj pattern))
+
 (defn segment-clause
   "Split where clause into segments separated by optimization boundaries.
    Optimizable patterns (:triple, :class, :id) are grouped together.
    All other patterns (boundaries) separate the segments."
   [where-clause]
   (reduce
-    (fn [segments pattern]
-      (if (optimizable-pattern? pattern)
-        (let [prev-segment (peek segments)]
-          (if (and prev-segment (= :optimizable (:type prev-segment)))
+   (fn [segments pattern]
+     (if (optimizable-pattern? pattern)
+       (let [prev-segment (peek segments)]
+         (if (and prev-segment (= :optimizable (:type prev-segment)))
             ;; add to prev segment
-            (conj (pop segments) (update prev-segment :data conj pattern))
+           (conj (pop segments) (add-pattern prev-segment pattern))
             ;; add new segment
-            (conj segments {:type :optimizable :data [pattern]})))
-        ;; Boundary - add as separate segment
-        (conj segments {:type :boundary :data pattern})))
-    []
-    where-clause))
+           (conj segments (create-segment :optimizable pattern))))
+        ;; Boundary - add separate segment
+       (conj segments (create-segment :boundary pattern))))
+   []
+   where-clause))
 
-(defn optimize-segment
-  "Optimize a single segment by sorting patterns by selectivity"
-  [db stats patterns]
-  ;; Sort by selectivity (lower = more selective = execute first)
-  (let [with-scores (mapv (fn [pattern]
-                            {:pattern pattern
-                             :score (calculate-selectivity db stats pattern)})
-                          patterns)
-        sorted      (sort-by :score with-scores)]
-    (mapv :pattern sorted)))
+(defn plan-pattern
+  [{:keys [stats] :as db} pattern]
+  {:pattern     pattern
+   :type        (where/pattern-type pattern)
+   :selectivity (calculate-selectivity db stats pattern)})
 
-(defn optimize-patterns
-  "Reorder patterns for optimal execution based on statistics.
-   Splits on optimization boundaries and optimizes each segment independently."
-  [db where-clause]
-  (let [stats (:stats db)
-        segments (segment-clause where-clause)]
-    (into []
-          (mapcat (fn [segment]
-                    (if (= :optimizable (:type segment))
-                      (optimize-segment db stats (:data segment))
-                      [(:data segment)])))
-          segments)))
+(defn plan-segment
+  [db {:keys [type patterns] :as segment}]
+  (if (= type :optimizable)
+    (assoc segment :patterns (mapv (partial plan-pattern db) patterns))
+    segment))
+
+(defn plan-query
+  [db {:keys [where] :as parsed-query}]
+  ;; TODO: plan recursively
+  (assoc parsed-query :plan (->> (segment-clause where)
+                                 (mapv (partial plan-segment db)))))
+
+(defn reorder-patterns
+  ;; TODO: optimize recursively
+  [segments]
+  (mapv (fn [segment]
+          (update segment :patterns (partial sort-by :selectivity)))
+        segments))
+
+(defn plan->where
+  [segments]
+  (vec (mapcat
+        (fn [{:keys [patterns type]}]
+          (if (= :optimizable type)
+            (mapv :pattern patterns)
+            patterns))
+        segments)))
+
+(defn optimize-query
+  [{:keys [plan] :as planned-query}]
+  (if plan
+    (assoc planned-query :where (-> plan
+                                    (reorder-patterns)
+                                    (plan->where)))
+    planned-query))
 
 (defprotocol Optimizable
   "Protocol for query optimization based on database statistics."
-
-  (-reorder [db parsed-query]
+  (-plan [db parsed-query])
+  (-reorder [db planned-query]
     "Reorder query patterns based on database statistics.
 
     Returns a channel that will contain the optimized query with patterns
@@ -173,7 +200,7 @@
     Returns:
       Channel containing optimized query")
 
-  (-explain [db parsed-query]
+  (-explain [db planned-query]
     "Generate an execution plan for the query showing optimization details.
 
     Returns a channel that will contain a query plan map with:

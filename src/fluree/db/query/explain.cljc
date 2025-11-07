@@ -1,7 +1,6 @@
 (ns fluree.db.query.explain
-  (:require [fluree.db.query.optimize :as optimize]
+  (:require [fluree.db.constants :as const]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.constants :as const]
             [fluree.json-ld :as json-ld]))
 
 (defn component->user-value
@@ -25,9 +24,9 @@
     (throw (ex-info (str "Unexpected component type: " (pr-str component))
                     {:component component}))))
 
-(defn pattern->user-format
+(defn format-pattern
   "Convert internal pattern to user-readable triple format"
-  [pattern compact-fn]
+  [compact-fn pattern]
   (let [ptype (where/pattern-type pattern)
         pdata (where/pattern-data pattern)]
     (case ptype
@@ -50,24 +49,40 @@
       {:type ptype
        :data (pr-str pdata)})))
 
-(defn pattern
-  "Generate explain information for a single pattern"
-  [db stats pattern compact-fn]
-  (let [ptype       (where/pattern-type pattern)
-        selectivity (optimize/calculate-selectivity db stats pattern)]
-    {:type        ptype
-     :pattern     (pattern->user-format pattern compact-fn)
-     :selectivity selectivity
-     :optimizable (when (optimize/optimizable-pattern? pattern) ptype)}))
+(defn format-plan-pattern
+  [compact-fn pattern]
+  (update pattern :pattern (partial format-pattern compact-fn)))
 
-(defn segment
-  "Generate explain information for pattern segments"
-  [db stats where-clause compact-fn]
-  (let [segments (optimize/segment-clause where-clause)]
-    (mapv (fn [segment]
-            (if (= :optimizable (:type segment))
-              {:type     :optimizable
-               :patterns (mapv #(pattern db stats % compact-fn) (:data segment))}
-              {:type    :boundary
-               :pattern (pattern db stats (:data segment) compact-fn)}))
-          segments)))
+(defn format-plan
+  [compact-fn plan]
+  (mapv (fn [segment]
+          (update segment :patterns (partial mapv (partial format-plan-pattern compact-fn))))
+        plan))
+
+(defn query
+  [stats {:keys [plan orig-query context] :as _planned-query}]
+  (let [compact-fn     (json-ld/compact-fn context)
+        formatted-plan (format-plan compact-fn plan)
+        original       (mapcat :patterns formatted-plan)
+        optimized      (sort-by :selectivity original)
+
+        statistics? (not= original optimized)
+        heuristics  (->> optimized
+                         (map where/pattern-type)
+                         (filter #{:property-join})
+                         (not-empty))]
+    {:query orig-query
+     :plan  (cond-> {:optimizations (or (->> [(when statistics? :statistics)
+                                              (when heuristics :heuristics)]
+                                             (remove nil?)
+                                             (vec)
+                                             (not-empty))
+                                        [:none])
+                     :original  (vec original)
+                     :optimized (vec optimized)}
+              statistics? (assoc :statistics {:properties (count (:properties stats))
+                                              :classes    (count (:classes stats))
+                                              :flakes     (:flakes stats)
+                                              :index-t    (:indexed stats)
+                                              :segments   formatted-plan})
+              heuristics  (assoc :heuristics (vec heuristics)))}))

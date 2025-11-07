@@ -151,15 +151,16 @@
   Returns channel resolving to a query plan map."
   [db query override-opts]
   (go-try
-    (let [{:keys [opts] :as parsed-query}
+    (let [{:keys [_opts] :as parsed-query}
           (-> query
               syntax/coerce-query
               (sanitize-query-options override-opts)
               (update :opts dissoc :max-fuel)
               (assoc :orig-query query)
-              parse/parse-query*)]
+              parse/parse-query*)
 
-      (<? (optimize/-explain db parsed-query)))))
+          planned-query (<? (optimize/-plan db parsed-query))]
+      (<? (optimize/-explain db planned-query)))))
 
 (defn contextualize-ledger-400-error
   [info-str e]

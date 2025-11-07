@@ -206,15 +206,20 @@
       root-db))
 
   optimize/Optimizable
-  (-reorder [_ parsed-query]
+  (-plan [_ parsed-query]
     (go-try
       (let [db (<? db-chan)]
-        (<? (optimize/-reorder db parsed-query)))))
+        (<? (optimize/-plan db parsed-query)))))
 
-  (-explain [_ parsed-query]
+  (-reorder [_ planned-query]
     (go-try
       (let [db (<? db-chan)]
-        (<? (optimize/-explain db parsed-query))))))
+        (<? (optimize/-reorder db planned-query)))))
+
+  (-explain [_ planned-query]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (optimize/-explain db planned-query))))))
 
 (defn db?
   [x]

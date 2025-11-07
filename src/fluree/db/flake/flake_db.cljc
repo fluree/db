@@ -25,9 +25,9 @@
             [fluree.db.json-ld.policy.rules :as policy-rules]
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.query.explain :as explain]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.query.explain :as explain]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.history :refer [AuditLog]]
             [fluree.db.query.optimize :as optimize]
@@ -41,8 +41,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]
             [fluree.db.virtual-graph.flat-rank :as flat-rank]
-            [fluree.db.virtual-graph.index-graph :as vg]
-            [fluree.json-ld :as json-ld])
+            [fluree.db.virtual-graph.index-graph :as vg])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -295,52 +294,6 @@
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
 
-(defn optimize-query
-  "Optimize a parsed query using statistics if available.
-   Returns the optimized query with patterns reordered for optimal execution."
-  [db parsed-query]
-  (let [stats (:stats db)]
-    (if (and stats (not-empty stats) (:where parsed-query))
-      (let [optimized-where (optimize/optimize-patterns db (:where parsed-query))]
-        (assoc parsed-query :where optimized-where))
-      parsed-query)))
-
-(defn explain-query
-  "Generate an execution plan for the query showing optimization details.
-   Returns a query plan map with optimization information."
-  [db parsed-query]
-  (let [stats            (:stats db)
-        has-stat-counts? (and stats
-                              (or (seq (:properties stats))
-                                  (seq (:classes stats))))
-        context          (:context parsed-query)
-        compact-fn       (json-ld/compact-fn context)]
-    (if-not has-stat-counts?
-      {:query parsed-query
-       :plan  {:optimization :none
-               :reason       "No statistics available"
-               :where-clause (:where parsed-query)}}
-      (let [where-clause      (:where parsed-query)
-            optimized-where   (when where-clause
-                                (optimize/optimize-patterns db where-clause))
-            original-explain  (when where-clause
-                                (mapv #(explain/pattern db stats % compact-fn) where-clause))
-            optimized-explain (when optimized-where
-                                (mapv #(explain/pattern db stats % compact-fn) optimized-where))
-            segments          (when where-clause
-                                (explain/segment db stats where-clause compact-fn))
-            changed?          (not= where-clause optimized-where)]
-        {:query (assoc parsed-query :where optimized-where)
-         :plan  {:optimization (if changed? :reordered :unchanged)
-                 :statistics   {:property-counts (count (:properties stats))
-                                :class-counts    (count (:classes stats))
-                                :total-flakes    (:flakes stats)
-                                :indexed-at-t    (:indexed stats)}
-                 :original     original-explain
-                 :optimized    optimized-explain
-                 :segments     segments
-                 :changed?     changed?}}))))
-
 (defrecord FlakeDB [index-catalog commit-catalog alias commit t tt-id stats
                     spot post opst tspo vg schema comparators staged novelty policy
                     namespaces namespace-codes max-namespace-code
@@ -524,11 +477,12 @@
     (reasoner-util/reasoned-facts db))
 
   optimize/Optimizable
-  (-reorder [db parsed-query]
-    (async/go (optimize-query db parsed-query)))
-
-  (-explain [db parsed-query]
-    (async/go (explain-query db parsed-query))))
+  (-plan [db parsed-query]
+    (async/go (optimize/plan-query db parsed-query)))
+  (-reorder [_db planned-query]
+    (async/go (optimize/optimize-query planned-query)))
+  (-explain [db planned-query]
+    (async/go (explain/query (:stats db) planned-query))))
 
 (defn db?
   [x]

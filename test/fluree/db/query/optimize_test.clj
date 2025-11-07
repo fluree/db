@@ -39,7 +39,7 @@
 
       (is (= :optimizable (:type (first result)))
           "First segment should be optimizable")
-      (is (= 2 (count (:data (first result))))
+      (is (= 2 (count (:patterns (first result))))
           "First segment should contain 2 patterns")
 
       (is (= :boundary (:type (second result)))
@@ -47,5 +47,5 @@
 
       (is (= :optimizable (:type (nth result 2)))
           "Third segment should be optimizable")
-      (is (= 1 (count (:data (nth result 2))))
+      (is (= 1 (count (:patterns (nth result 2))))
           "Third segment should contain 1 pattern"))))
