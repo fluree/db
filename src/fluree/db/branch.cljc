@@ -59,9 +59,7 @@
   [{:keys [alias commit t] :as current-db} index-map]
   (if (async-db/db? current-db)
     (dbproto/-index-update current-db index-map)
-    (let [updated-commit (-> commit
-                             (assoc :index index-map)
-                             (assoc :alias alias))  ; Ensure alias is on the commit
+    (let [updated-commit (assoc commit :index index-map)
           updated-db     (async-db/->async-db alias updated-commit t)]
       (go ;; update index in the background, return updated db immediately
         (let [db* (<? (dbproto/-index-update current-db index-map))]
