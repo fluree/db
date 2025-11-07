@@ -7,6 +7,7 @@
                        ["fs-ext" :refer [flockSync]]
                        ["path" :as path]])
             [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.crypto.aes :as aes]
             [fluree.db.util.log :as log])
   #?(:clj (:import (java.io ByteArrayOutputStream FileNotFoundException File)
@@ -183,8 +184,9 @@
                               "path"    (.-path e)}))))))))
 
 (defn read-file
-  "Read a string from disk at `path`. Returns nil if file does not exist.
-   If encryption-key is provided, expects file to be encrypted and will decrypt it."
+  "Read bytes from disk at `path`. Returns nil if file does not exist.
+   If encryption-key is provided, expects file to be encrypted and will decrypt it,
+   returning the decrypted bytes."
   ([path] (read-file path nil))
   ([path encryption-key]
    #?(:clj
@@ -197,15 +199,14 @@
               (if encryption-key
                 (try
                   (aes/decrypt raw-bytes encryption-key
-                               {:input-format :none
-                                :output-format :string})
+                               {:output-format :none})
                   (catch Exception e
                     (ex-info (str "Failed to decrypt file: " path)
                              {:status 500
                               :error :db/storage-error
                               :path path}
                              e)))
-                (String. raw-bytes))))
+                raw-bytes)))
           (catch FileNotFoundException _
             nil)
           (catch Exception e
@@ -214,20 +215,19 @@
       (async/go
         (try
           (if encryption-key
-            ;; For encrypted files, read as buffer and decrypt
+            ;; For encrypted files, read as buffer and decrypt to bytes
             (let [buffer (fs/readFileSync path)]
               (try
                 (aes/decrypt buffer encryption-key
-                             {:input-format :none
-                              :output-format :string})
+                             {:output-format :none})
                 (catch :default e
                   (ex-info (str "Failed to decrypt file: " path)
                            {:status 500
                             :error :db/storage-error
                             :path path}
                            e))))
-            ;; For non-encrypted files, read as string
-            (fs/readFileSync path "utf8"))
+            ;; For non-encrypted files, read as buffer (bytes)
+            (fs/readFileSync path))
           (catch :default e
             (if (= "ENOENT" (.-code e))
               nil
@@ -292,3 +292,18 @@
         path      (str abs-root path "/")]
     #?(:clj  (-> path io/file .getCanonicalPath)
        :cljs (path/resolve path))))
+
+(defn encode-path-segment
+  "URL-encode a string to be safe for use in file paths and S3 keys.
+   Preserves alphanumeric characters, hyphens, underscores, and periods.
+   Other characters are percent-encoded as %XX where XX is the hex code."
+  [s]
+  (str/replace s
+               #"[^a-zA-Z0-9\-_.]"
+               #(let [code (int (first %))
+                      hex  #?(:clj (format "%02X" code)
+                              :cljs (let [h (.toString code 16)]
+                                      (if (= 1 (count h))
+                                        (str "0" (.toUpperCase h))
+                                        (.toUpperCase h))))]
+                  (str "%" hex))))
