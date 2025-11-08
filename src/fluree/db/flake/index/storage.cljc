@@ -95,11 +95,11 @@
 
           prev-idx-t    (-> commit :index :data :t)
           prev-idx-addr (-> commit :index :address)
-          prev-idx-v    (-> commit :index :data :v)
+          prev-idx-v    (-> commit :index :v)
 
-          ;; Preserve version from previous index unless this is a full reindex (no prev-idx-t)
-          ;; - v1 indexes stay v1 until full reindex (to avoid incomplete stats)
-          ;; - v2 indexes stay v2
+          ;; Version logic:
+          ;; - New ledgers (no previous index) use v2
+          ;; - Existing ledgers preserve their version (or default to v1 for legacy)
           version       (if prev-idx-t
                           (or prev-idx-v 1)
                           2)

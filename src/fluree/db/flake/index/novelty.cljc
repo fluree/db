@@ -343,23 +343,21 @@
             prop-data* (assoc prop-data :count new-count)
             ;; Update HLL sketches (only on assertions - monotone NDV)
             sketch* (if assert?
-                      (let [;; Initialize sketches if nil
-                            curr-sketch (or sketch {:values (hll/create-sketch)
-                                                    :subjects (hll/create-sketch)})
-                            values-sketch (hll/add-value (:values curr-sketch) (flake/o f))
-                            subjects-sketch (hll/add-value (:subjects curr-sketch) (flake/s f))]
+                      (let [values-sketch (hll/add-value (or (:values sketch) (hll/create-sketch)) (flake/o f))
+                            subjects-sketch (hll/add-value (or (:subjects sketch) (hll/create-sketch)) (flake/s f))]
                         {:values values-sketch
                          :subjects subjects-sketch})
                       sketch)]
         (recur r prop-data* sketch*))
 
       ;; Return updated data with NDV extracted from sketches
-      (let [final-sketch (or sketch {:values (hll/create-sketch)
-                                     :subjects (hll/create-sketch)})]
+      (let [values-sketch (or (:values sketch) (hll/create-sketch))
+            subjects-sketch (or (:subjects sketch) (hll/create-sketch))]
         {:property-data (assoc prop-data
-                               :ndv-values (hll/cardinality (:values final-sketch))
-                               :ndv-subjects (hll/cardinality (:subjects final-sketch)))
-         :sketch final-sketch}))))
+                               :ndv-values (hll/cardinality values-sketch)
+                               :ndv-subjects (hll/cardinality subjects-sketch))
+         :sketch {:values values-sketch
+                  :subjects subjects-sketch}}))))
 
 (defn- update-class-counts
   "Update class counts for rdf:type flakes.
@@ -697,9 +695,16 @@
 
                  index-address (:address db-root-res)
                  index-id      (str "fluree:index:sha256:" (:hash db-root-res))
+
+                 prev-idx-v    (get-in refreshed-db* [:commit :index :v])
+                 index-version (if (get-in refreshed-db* [:commit :index :data :t])
+                                 (or prev-idx-v 1)
+                                 2)
+
                  commit-index  (commit-data/new-index (-> refreshed-db* :commit :data)
                                                       index-id
                                                       index-address
+                                                      index-version
                                                       (select-keys refreshed-db* index/types))
                  indexed-db    (dbproto/-index-update refreshed-db* commit-index)
                  duration      (- (util/current-time-millis) start-time-ms)
