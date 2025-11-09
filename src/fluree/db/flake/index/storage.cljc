@@ -95,12 +95,25 @@
 
           prev-idx-t    (-> commit :index :data :t)
           prev-idx-addr (-> commit :index :address)
+          prev-idx-v    (-> commit :index :v)
+
+          ;; Version logic:
+          ;; - New ledgers (no previous index) use v2
+          ;; - Existing ledgers preserve their version (or default to v1 for legacy)
+          version       (if prev-idx-t
+                          (or prev-idx-v 1)
+                          2)
+
+          stats-data    (cond-> (select-keys stats [:flakes :size])
+                          ;; HLL-based stats (properties, classes) are only for v2 indexes
+                          (= 2 version) (merge (select-keys stats [:properties :classes])))
+
           vg-addresses  (<? (write-vg-map index-catalog vg))
           data          (cond-> {:ledger-alias alias
                                  :t               t
-                                 :v               1 ;; version of db root file
+                                 :v               version
                                  :schema          (vocab/serialize-schema schema)
-                                 :stats           (select-keys stats [:flakes :size :properties :classes])
+                                 :stats           stats-data
                                  :spot            (child-data spot)
                                  :post            (child-data post)
                                  :opst            (child-data opst)

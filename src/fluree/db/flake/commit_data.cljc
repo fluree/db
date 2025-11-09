@@ -129,6 +129,7 @@
   [data]
   {:id      (get-id data)
    :t       (get-first-value data const/iri-fluree-t)
+   :v       (get-first-value data const/iri-v)
    :address (get-first-value data const/iri-address)
    :flakes  (get-first-value data const/iri-flakes)
    :size    (get-first-value data const/iri-size)})
@@ -240,12 +241,13 @@
 (defn new-index
   "Creates a new commit index record, given the commit-map used to trigger
   the indexing process (which contains the db info used for the index), the
-  index id, index address and optionally index-type-addresses which contain
-  the address for each index type top level branch node."
-  [data-map id address index-root-maps]
+  index id, index address, index version, and optionally index-type-addresses
+  which contain the address for each index type top level branch node."
+  [data-map id address index-version index-root-maps]
   (merge {:id      id
           :address address
-          :data    data-map}
+          :data    data-map
+          :v       index-version}
          index-root-maps))
 
 (defn t

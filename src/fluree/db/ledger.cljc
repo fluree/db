@@ -198,10 +198,11 @@
   Returns a channel with the updated db."
   [db index-catalog root index-address]
   (go-try
-    (let [data      (-> db :commit :data)
-          index-id  (<? (idx-address->idx-id index-catalog index-address))
-          index-map (commit-data/new-index data index-id index-address
-                                           (select-keys root [:spot :post :opst :tspo]))]
+    (let [data          (-> db :commit :data)
+          index-id      (<? (idx-address->idx-id index-catalog index-address))
+          index-version (:v root)
+          index-map     (commit-data/new-index data index-id index-address index-version
+                                               (select-keys root [:spot :post :opst :tspo]))]
       (dbproto/-index-update db index-map))))
 
 (defn- update-branch-with-index
