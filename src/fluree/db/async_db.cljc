@@ -33,14 +33,18 @@
       (let [db (<? db-chan)]
         (<? (dbproto/-class-ids db tracker subject)))))
   (-index-update [_ commit-index]
-    (let [commit* (assoc commit :index commit-index)
+    (let [commit* (-> commit
+                      (assoc :index commit-index)
+                      (assoc :alias alias))  ; Ensure alias is on commit for nameservice publishing
           updated-db (->async-db alias commit* t)]
-      (go-try
-        (let [db  (<? db-chan)
-              db* (<? (dbproto/-index-update db commit-index))]
-          ;; Deliver the updated FlakeDB and yield the AsyncDB when complete
-          (deliver! updated-db db*)
-          updated-db))))
+      (go
+        (try*
+          (let [db  (<? db-chan)
+                db* (dbproto/-index-update db commit-index)]
+            (deliver! updated-db db*))
+          (catch* e
+            (deliver! updated-db e))))
+      updated-db))
   where/Matcher
   (-match-id [_ tracker solution s-match error-ch]
     (let [match-ch (async/chan)]
@@ -261,6 +265,16 @@
   This is to be used in conjunction with `deliver!` that will deliver the
   loaded db to the async-db."
   [ledger-alias commit-map t]
+  (when-not (:alias commit-map)
+    (log/error "Creating AsyncDB with commit missing :alias field!"
+               {:ledger-alias ledger-alias
+                :commit-id (:id commit-map)
+                :commit-keys (keys commit-map)
+                :stack-trace (try
+                               (throw (ex-info "Stack trace capture" {}))
+                               (catch #?(:clj Exception :cljs js/Error) e
+                                 #?(:clj (.getStackTrace e)
+                                    :cljs (.-stack e))))}))
   (->AsyncDB ledger-alias commit-map t (async/promise-chan)))
 
 (defn load

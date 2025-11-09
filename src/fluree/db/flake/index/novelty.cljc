@@ -479,7 +479,7 @@
                                                       index-id
                                                       index-address
                                                       (select-keys refreshed-db* index/types))
-                 indexed-db    (<? (dbproto/-index-update refreshed-db* commit-index))
+                 indexed-db    (dbproto/-index-update refreshed-db* commit-index)
                  duration      (- (util/current-time-millis) start-time-ms)
                  end-stats     (assoc init-stats
                                       :end-time (util/current-time-iso)

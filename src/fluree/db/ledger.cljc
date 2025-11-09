@@ -202,7 +202,7 @@
           index-id  (<? (idx-address->idx-id index-catalog index-address))
           index-map (commit-data/new-index data index-id index-address
                                            (select-keys root [:spot :post :opst :tspo]))]
-      (<? (dbproto/-index-update db index-map)))))
+      (dbproto/-index-update db index-map))))
 
 (defn- update-branch-with-index
   "Updates branch state with new index. If use-update-commit? is true,
@@ -273,14 +273,14 @@
           (do (log/debug "notify-index: applying newer index at commit t"
                          {:new-idx-t new-idx-t :cur-idx-t cur-idx-t})
               (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
-                (update-branch-with-index ledger branch updated-db true)))
+                (update-branch-with-index ledger branch updated-db false)))
 
           (= new-idx-t cur-idx-t)
           (if (<? (compare-index-by-hash index-catalog new-idx-addr cur-idx-addr))
             (do (log/debug "notify-index: same t at commit, applying based on hash tie-breaker"
                            {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
                 (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
-                  (update-branch-with-index ledger branch updated-db true)))
+                  (update-branch-with-index ledger branch updated-db false)))
             (do (log/debug "notify-index: same t at commit, keeping current based on hash"
                            {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
                 ::index-current))
@@ -291,7 +291,7 @@
               ::index-current)))
       (do (log/debug "notify-index: applying first index for this commit")
           (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
-            (update-branch-with-index ledger branch updated-db true))))))
+            (update-branch-with-index ledger branch updated-db false))))))
 
 (defn notify-index
   "Applies an index-only update when the provided index root matches the current commit t.
