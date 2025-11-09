@@ -1,5 +1,5 @@
 (ns fluree.db.branch
-  (:require [clojure.core.async :as async :refer [go <! go-loop]]
+  (:require [clojure.core.async :as async :refer [<! go-loop]]
             [fluree.db.async-db :as async-db]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake.commit-data :as commit-data]
@@ -57,14 +57,9 @@
   updating the db to reflect the latest index can take some time
   which would lead to atom contention."
   [{:keys [alias commit t] :as current-db} index-map]
-  (if (async-db/db? current-db)
-    (dbproto/-index-update current-db index-map)
-    (let [updated-commit (assoc commit :index index-map)
-          updated-db     (async-db/->async-db alias updated-commit t)]
-      (go ;; update index in the background, return updated db immediately
-        (let [db* (<? (dbproto/-index-update current-db index-map))]
-          (async-db/deliver! updated-db db*)))
-      updated-db)))
+  (let [to-update (async-db/->async-db alias commit t)]
+    (async-db/deliver! to-update current-db)
+    (dbproto/-index-update to-update index-map)))
 
 (defn update-index
   [{current-commit :commit, current-db :current-db, :as current-state}
