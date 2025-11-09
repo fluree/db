@@ -37,9 +37,13 @@
                       (assoc :index commit-index)
                       (assoc :alias alias))  ; Ensure alias is on commit for nameservice publishing
           updated-db (->async-db alias commit* t)]
-      (go-try
-        (let [db (<? db-chan)]
-          (deliver! updated-db (dbproto/-index-update db commit-index))))
+      (go
+        (try*
+          (let [db  (<? db-chan)
+                db* (dbproto/-index-update db commit-index)]
+            (deliver! updated-db db*))
+          (catch* e
+            (deliver! updated-db e))))
       updated-db))
   where/Matcher
   (-match-id [_ tracker solution s-match error-ch]
