@@ -621,7 +621,7 @@
    (go-try
      ;; Check if this is a v1 index - if so, skip stats computation entirely
      ;; v1 indexes should not generate stats until fully reindexed
-     (let [prev-index-version (get-in db [:commit :index :data :v])
+     (let [prev-index-version (get-in db [:commit :index :v])
            is-v1-index?       (and prev-index-version (< prev-index-version 2))
 
            ;; Kick off stats computation in parallel (v2 only)

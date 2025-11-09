@@ -56,9 +56,12 @@
   return immediately - and for a large amount of novelty,
   updating the db to reflect the latest index can take some time
   which would lead to atom contention."
-  [{:keys [alias commit t] :as current-db} index-map]
-  (let [to-update (async-db/->async-db alias commit t)]
-    (async-db/deliver! to-update current-db)
+  [{:keys [alias commit t] :as current-db} index-map stats]
+  (let [to-update (async-db/->async-db alias commit t)
+        db-with-stats (if stats
+                        (assoc current-db :stats stats)
+                        current-db)]
+    (async-db/deliver! to-update db-with-stats)
     (dbproto/-index-update to-update index-map)))
 
 (defn update-index
@@ -74,7 +77,7 @@
       current-state)
     (if (newer-commit? current-commit indexed-commit)
       (if (newer-index? indexed-commit current-commit)
-        (let [latest-db (update-index-async current-db (:index indexed-commit))]
+        (let [latest-db (update-index-async current-db (:index indexed-commit) (:stats indexed-db))]
           (assoc current-state
                  :commit     (:commit latest-db)
                  :current-db latest-db))
@@ -189,12 +192,12 @@
        (= (dissoc commit1 :index) (dissoc commit2 :index))))
 
 (defn update-commit
-  [{current-commit :commit, :as current-state}
+  [{current-commit :commit, current-db :current-db, :as current-state}
    {new-commit :commit, :as new-db}]
   (if (and (next-t? current-commit new-commit)
            (previous-id? current-commit new-commit))
     (if (newer-index? current-commit new-commit)
-      (let [latest-db (update-index-async new-db (:index current-commit))]
+      (let [latest-db (update-index-async new-db (:index current-commit) (:stats current-db))]
         (assoc current-state
                :commit     (:commit latest-db)
                :current-db latest-db))
@@ -211,7 +214,7 @@
                                      (assoc-in [:previous :index] (:index current-commit)))
               updated-new-db (assoc new-db :commit updated-new-commit)]
           (if (newer-index? current-commit updated-new-commit)
-            (let [latest-db (update-index-async updated-new-db (:index current-commit))]
+            (let [latest-db (update-index-async updated-new-db (:index current-commit) (:stats current-db))]
               (assoc current-state
                      :commit     (:commit latest-db)
                      :current-db latest-db))
