@@ -424,8 +424,7 @@
   (-query [this tracker query-map] (fql/query this tracker query-map))
   (-class-ids [this tracker subject] (match/class-ids this tracker subject))
   (-index-update [db commit-index]
-    (go-try
-      (index-update db commit-index)))
+    (index-update db commit-index))
 
   iri/IRICodec
   (encode-iri [_ iri]

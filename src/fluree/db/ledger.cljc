@@ -202,7 +202,7 @@
           index-id  (<? (idx-address->idx-id index-catalog index-address))
           index-map (commit-data/new-index data index-id index-address
                                            (select-keys root [:spot :post :opst :tspo]))]
-      (<? (dbproto/-index-update db index-map)))))
+      (dbproto/-index-update db index-map))))
 
 (defn- update-branch-with-index
   "Updates branch state with new index. If use-update-commit? is true,

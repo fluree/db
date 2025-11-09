@@ -107,7 +107,7 @@
   [{db-commit :commit, :as db} idx-commit branch-state]
   (if (newer-index? idx-commit db-commit)
     (let [updated-db (or (use-latest-db db idx-commit branch-state)
-                         (try* (<? (dbproto/-index-update db (:index idx-commit)))
+                         (try* (dbproto/-index-update db (:index idx-commit))
                                (catch* e (log/error e "Exception updating db with new index, attempting full reload. Exception:" (ex-message e))
                                        (reload-with-index db (:index idx-commit)))))]
       updated-db)
