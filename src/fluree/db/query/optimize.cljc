@@ -20,7 +20,7 @@
       0)))
 
 (def triple-pattern-types
-  #{:tuple :class})
+  #{:triple :class})
 
 (defn triple-pattern?
   [x]
@@ -50,18 +50,7 @@
    Any pattern not recognized here is treated as an optimization boundary."
   [pattern]
   (let [ptype (where/pattern-type pattern)]
-    (#{:tuple :class :id} ptype)))
-
-(defn get-iri
-  "Extract IRI from a matched component"
-  [component]
-  (where/get-iri component))
-
-(defn encode-iri-to-sid
-  "Convert IRI to SID using database namespace table"
-  [db iri]
-  (when iri
-    (iri/encode-iri db iri)))
+    (#{:triple :class :id} ptype)))
 
 (defn get-property-count
   "Get count for a property from stats"
@@ -85,7 +74,7 @@
       (or (nil? stats)
           (empty? stats)
           (not (optimizable-pattern? pattern)))
-      nil
+      default-selectivity
 
       (= :id pattern-type)
       (if (where/matched? pattern-data)
@@ -97,8 +86,7 @@
         (cond
           ;; Class patterns use class count from stats
           (= :class pattern-type)
-          (let [class-iri (get-iri o)
-                class-sid (encode-iri-to-sid db class-iri)]
+          (let [class-sid (some->> (where/get-iri o) (iri/encode-iri db))]
             (or (get-class-count stats class-sid) default-selectivity))
 
           ;; Specific s-p-o triple lookup
@@ -107,14 +95,12 @@
 
           ;; s-p-? lookup uses property count
           (and (where/matched? s) (where/matched? p) (where/unmatched? o))
-          (let [pred-iri (get-iri p)
-                pred-sid (encode-iri-to-sid db pred-iri)]
+          (let [pred-sid (some->> (where/get-iri p) (iri/encode-iri db))]
             (or (get-property-count stats pred-sid) moderately-selective))
 
           ;; ?-p-? property scan uses property count
           (and (where/unmatched? s) (where/matched? p) (where/unmatched? o))
-          (let [pred-iri (get-iri p)
-                pred-sid (encode-iri-to-sid db pred-iri)]
+          (let [pred-sid (some->> (where/get-iri p) (iri/encode-iri db))]
             (or (get-property-count stats pred-sid) default-selectivity))
 
           ;; ?-p-o reverse lookup (find subjects with specific value)
@@ -127,53 +113,88 @@
           :else
           default-selectivity)))))
 
-(defn split-by-optimization-boundaries
+(defn create-segment
+  [type pattern]
+  {:type type
+   :patterns [pattern]})
+
+(defn add-pattern
+  [segment pattern]
+  (update segment :patterns conj pattern))
+
+(defn segment-clause
   "Split where clause into segments separated by optimization boundaries.
-   Optimizable patterns (:tuple, :class, :id) are grouped together.
+   Optimizable patterns (:triple, :class, :id) are grouped together.
    All other patterns (boundaries) separate the segments."
   [where-clause]
   (reduce
    (fn [segments pattern]
      (if (optimizable-pattern? pattern)
-       (if (and (seq segments)
-                (= :optimizable (:type (peek segments))))
-         (update segments (dec (count segments))
-                 update :data conj pattern)
-         (conj segments {:type :optimizable :data [pattern]}))
-       ;; Boundary - add as separate segment
-       (conj segments {:type :boundary :data pattern})))
+       (let [prev-segment (peek segments)]
+         (if (and prev-segment (= :optimizable (:type prev-segment)))
+            ;; add to prev segment
+           (conj (pop segments) (add-pattern prev-segment pattern))
+            ;; add new segment
+           (conj segments (create-segment :optimizable pattern))))
+        ;; Boundary - add separate segment
+       (conj segments (create-segment :boundary pattern))))
    []
    where-clause))
 
-(defn optimize-segment
-  "Optimize a single segment by sorting patterns by selectivity"
-  [db stats patterns]
-  ;; Sort by selectivity (lower = more selective = execute first)
-  (let [with-scores (mapv (fn [pattern]
-                            {:pattern pattern
-                             :score (or (calculate-selectivity db stats pattern)
-                                        default-selectivity)})
-                          patterns)
-        sorted      (sort-by :score with-scores)]
-    (mapv :pattern sorted)))
+(defn plan-pattern
+  [{:keys [stats] :as db} pattern]
+  {:pattern     pattern
+   :type        (where/pattern-type pattern)
+   :selectivity (calculate-selectivity db stats pattern)})
 
-(defn optimize-patterns
-  "Reorder patterns for optimal execution based on statistics.
-   Splits on optimization boundaries and optimizes each segment independently."
-  [db where-clause]
-  (let [stats (:stats db)
-        segments (split-by-optimization-boundaries where-clause)]
-    (into []
-          (mapcat (fn [segment]
-                    (if (= :optimizable (:type segment))
-                      (optimize-segment db stats (:data segment))
-                      [(:data segment)])))
-          segments)))
+(defn plan-segment
+  [db {:keys [type patterns] :as segment}]
+  (if (= type :optimizable)
+    (assoc segment :patterns (mapv (partial plan-pattern db) patterns))
+    segment))
+
+(defn plan-query
+  "Generate a plan: a collection of segments of rearrangable patterns.
+
+  [{:type <:optimizable|:boundary>
+    :patterns [{:pattern <pattern>
+                :type <pattern-type>
+                :selectivity <score>}
+                ,,,]}]"
+  [db {:keys [where] :as parsed-query}]
+  (assoc parsed-query :plan (->> (segment-clause where)
+                                 (mapv (partial plan-segment db)))))
+
+(defn reorder-patterns
+  "Reorder patterns in a plan according to selectivity score, with higher scores first."
+  [segments]
+  (mapv (fn [segment]
+          (update segment :patterns (partial sort-by :selectivity)))
+        segments))
+
+(defn plan->where
+  "Convert a plan into a where clause."
+  [segments]
+  (vec (mapcat
+        (fn [{:keys [patterns type]}]
+          (if (= :optimizable type)
+            (mapv :pattern patterns)
+            patterns))
+        segments)))
+
+(defn optimize-query
+  "Produce a query with the where-clause reordered according to the :plan."
+  [{:keys [plan] :as planned-query}]
+  (if plan
+    (assoc planned-query :where (-> plan
+                                    (reorder-patterns)
+                                    (plan->where)))
+    planned-query))
 
 (defprotocol Optimizable
   "Protocol for query optimization based on database statistics."
-
-  (-reorder [db parsed-query]
+  (-plan [db parsed-query])
+  (-reorder [db planned-query]
     "Reorder query patterns based on database statistics.
 
     Returns a channel that will contain the optimized query with patterns
@@ -187,7 +208,7 @@
     Returns:
       Channel containing optimized query")
 
-  (-explain [db parsed-query]
+  (-explain [db planned-query]
     "Generate an execution plan for the query showing optimization details.
 
     Returns a channel that will contain a query plan map with:

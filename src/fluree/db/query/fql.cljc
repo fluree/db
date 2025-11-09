@@ -3,7 +3,6 @@
             [fluree.db.query.exec :as exec]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.optimize :as optimize]
-            [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [go-try <?]])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
@@ -50,17 +49,7 @@
    (if (cache? query-map)
      (cache-query ds query-map)
      (go-try
-       (let [pq (parse/parse-query query-map)
-             oq (<? (optimize/-reorder ds pq))]
-         (<? (exec/query ds tracker oq)))))))
-
-(defn explain
-  "Returns query execution plan without executing the query.
-  Returns core async channel with query plan or exception."
-  [ds query-map]
-  (let [pq (try*
-             (parse/parse-query query-map)
-             (catch* e e))]
-    (if (util/exception? pq)
-      (async/go pq)
-      (optimize/-explain ds pq))))
+       (let [parsed-query    (parse/parse-query query-map)
+             planned-query   (<? (optimize/-plan ds parsed-query))
+             optimized-query (<? (optimize/-reorder ds planned-query))]
+         (<? (exec/query ds tracker optimized-query)))))))

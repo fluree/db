@@ -318,7 +318,7 @@
   [pattern]
   (if (map-entry? pattern)
     (key pattern)
-    :tuple))
+    :triple))
 
 (defn pattern-data
   [pattern]
@@ -585,7 +585,7 @@
   (let [s-mch (pattern-data pattern)]
     (-match-id ds tracker solution s-mch error-ch)))
 
-(defmethod match-pattern :tuple
+(defmethod match-pattern :triple
   [ds tracker solution pattern error-ch]
   (let [tuple (pattern-data pattern)]
     (-match-triple ds tracker solution tuple error-ch)))

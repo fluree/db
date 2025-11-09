@@ -6,8 +6,10 @@
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.ledger :as ledger]
             [fluree.db.query.fql :as fql]
+            [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.history :as history]
+            [fluree.db.query.optimize :as optimize]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.time-travel :as time-travel]
@@ -147,14 +149,18 @@
     query - Query map (JSON-LD or analytical)
 
   Returns channel resolving to a query plan map."
-  [db query]
+  [db query override-opts]
   (go-try
-    (let [q (-> query
-                syntax/coerce-query
-                (sanitize-query-options nil))
-          q* (update q :opts dissoc :meta :max-fuel)]
+    (let [{:keys [_opts] :as parsed-query}
+          (-> query
+              syntax/coerce-query
+              (sanitize-query-options override-opts)
+              (update :opts dissoc :max-fuel)
+              (assoc :orig-query query)
+              parse/parse-query*)
 
-      (<? (fql/explain db q*)))))
+          planned-query (<? (optimize/-plan db parsed-query))]
+      (<? (optimize/-explain db planned-query)))))
 
 (defn contextualize-ledger-400-error
   [info-str e]

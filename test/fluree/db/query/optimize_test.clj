@@ -2,19 +2,16 @@
   "Unit tests for query optimization functions.
   Integration tests for optimization behavior are in explain_test.clj"
   (:require [clojure.test :refer [deftest is testing]]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.query.optimize :as optimize]))
 
 (deftest optimizable-pattern-test
   (testing "Pattern type recognition using where/pattern-type"
-    ;; Patterns are map-entries (created by iterating over a map)
-    ;; where/pattern-type returns the key if it's a map-entry, :tuple otherwise
-
-    (let [;; Create map-entries by taking first from a map
-          tuple-pattern (first {:tuple [:s :p :o]})
-          class-pattern (first {:class [:s :p :o]})
-          id-pattern    (first {:id "ex:alice"})
-          filter-pattern (first {:filter "fn"})
-          bind-pattern   (first {:bind "var"})]
+    (let [tuple-pattern  [:s :p :o]
+          class-pattern  (where/->pattern :class [:s :p :o])
+          id-pattern     (where/->pattern :id "ex:alice")
+          filter-pattern (where/->pattern :filter "fn")
+          bind-pattern   (where/->pattern :bind ["?var" ["value"]])]
 
       (is (optimize/optimizable-pattern? tuple-pattern)
           "tuple patterns are optimizable")
@@ -29,22 +26,20 @@
 
 (deftest split-boundaries-test
   (testing "Split by optimization boundaries"
-    ;; Test the split-by-optimization-boundaries function directly
-    ;; Patterns are map-entries - create them from maps
-    (let [tuple-pattern (first {:tuple [:s1 :p1 :o1]})
-          class-pattern (first {:class [:s2 :p2 :o2]})
-          filter-pattern (first {:filter "fn"})
-          tuple-pattern2 (first {:tuple [:s3 :p3 :o3]})
+    (let [tuple-pattern  [:s1 :p1 :o1]
+          class-pattern  (where/->pattern :class [:s2 :p2 :o2])
+          filter-pattern (where/->pattern :filter "fn")
+          tuple-pattern2 [:s3 :p3 :o3]
 
           where-clause [tuple-pattern class-pattern filter-pattern tuple-pattern2]
-          result (optimize/split-by-optimization-boundaries where-clause)]
+          result       (optimize/segment-clause where-clause)]
 
       (is (= 3 (count result))
           "Should split into 3 segments: [tuple class] [filter] [tuple]")
 
       (is (= :optimizable (:type (first result)))
           "First segment should be optimizable")
-      (is (= 2 (count (:data (first result))))
+      (is (= 2 (count (:patterns (first result))))
           "First segment should contain 2 patterns")
 
       (is (= :boundary (:type (second result)))
@@ -52,5 +47,5 @@
 
       (is (= :optimizable (:type (nth result 2)))
           "Third segment should be optimizable")
-      (is (= 1 (count (:data (nth result 2))))
+      (is (= 1 (count (:patterns (nth result 2))))
           "Third segment should contain 1 pattern"))))

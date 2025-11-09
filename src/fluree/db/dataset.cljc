@@ -130,16 +130,18 @@
                  nil)))))
 
   optimize/Optimizable
-  (-reorder [_ds parsed-query]
+  (-plan [_ds parsed-query]
+    (async/go parsed-query))
+  (-reorder [_ds planned-query]
     ;; DataSets (federated queries) are not optimized
     ;; Return query unchanged wrapped in channel
-    (async/go parsed-query))
+    (async/go planned-query))
 
-  (-explain [_ds parsed-query]
+  (-explain [_ds planned-query]
     ;; DataSets (federated queries) cannot be explained
     ;; Return simple plan indicating no optimization
     (async/go
-      {:query parsed-query
+      {:query planned-query
        :plan  {:optimization :none
                :reason       "Federated queries are not optimized"}})))
 
