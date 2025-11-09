@@ -1134,7 +1134,6 @@
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/txn"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/commit"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/root"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/root"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/garbage"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/spot"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/post"))))))
