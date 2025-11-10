@@ -1,6 +1,7 @@
 (ns fluree.db.track
   (:require [fluree.db.track.fuel :as fuel]
             [fluree.db.track.policy :as policy]
+            [fluree.db.track.solutions :as solutions]
             [fluree.db.track.time :as time]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -30,18 +31,24 @@
   (or (track-all? opts)
       (-> meta :policy true?)))
 
+(defn track-solutions?
+  [opts]
+  (:analyze opts))
+
 (defn track-query?
   [opts]
   (or (track-time? opts)
       (track-fuel? opts)
-      (track-policy? opts)))
+      (track-policy? opts)
+      (track-solutions? opts)))
 
 (defn track-txn?
   [opts]
   (or (track-time? opts)
       (track-fuel? opts)
       (track-file? opts)
-      (track-policy? opts)))
+      (track-policy? opts)
+      (track-solutions? opts)))
 
 (defn init-time
   [tracker]
@@ -55,13 +62,18 @@
   [tracker]
   (assoc tracker :policy (policy/init)))
 
+(defn init-solutions
+  [tracker]
+  (assoc tracker :analyze (solutions/init)))
+
 (defn init
   "Creates a new fuel tracker w/ optional fuel limit (0 means unlimited)."
   [{:keys [max-fuel] :as opts}]
   (cond-> {}
     (track-time? opts) init-time
     (track-fuel? opts) (init-fuel max-fuel)
-    (track-policy? opts) init-policy))
+    (track-policy? opts) init-policy
+    (track-solutions? opts) init-solutions))
 
 (defn track-fuel!
   [tracker error-ch]
@@ -83,9 +95,20 @@
   (when-let [policy-tracker (:policy tracker)]
     (policy/track-allow! policy-tracker policy-id)))
 
+(defn pattern-in!
+  [tracker pattern solution]
+  (when-let [solution-tracker (:analyze tracker)]
+    (solutions/pattern-in! solution-tracker pattern solution)))
+
+(defn pattern-out!
+  [tracker pattern solution]
+  (when-let [solution-tracker (:analyze tracker)]
+    (solutions/pattern-out! solution-tracker pattern solution)))
+
 (defn tally
   [tracker]
   (cond-> tracker
     (contains? tracker :time) (update :time time/tally)
     (contains? tracker :fuel) (update :fuel fuel/tally)
-    (contains? tracker :policy) (update :policy policy/tally)))
+    (contains? tracker :policy) (update :policy policy/tally)
+    (contains? tracker :analyze) (update :analyze solutions/tally)))
