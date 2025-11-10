@@ -239,3 +239,98 @@
 
       (is (contains? plan :query)
           "Should contain parsed query"))))
+
+(defn gen-subj
+  [i]
+  {"@id" (str "ex:" i)
+   "ex:foo" "foo"
+   "ex:i" i})
+
+(deftest explain-analyze-test
+  (let [conn @(fluree/connect-memory)
+        db0  @(fluree/create conn "test-explain")
+        db1  @(fluree/update db0 {"@context" {"ex" "http://example.com/"}
+                                  "insert"
+                                  (mapv (fn [i]
+                                          (cond-> (gen-subj i)
+                                            (odd? i) (assoc "ex:ref1"
+                                                            (cond-> (gen-subj (+ 1000 i))
+                                                              (#{0} (mod i 3))
+                                                              (assoc "ex:ref2" (gen-subj (+ 2000 i))
+                                                                     "ex:ref3" {"@id" (str "ex:" i)})))
+                                            (even? i) (assoc
+                                                        "ex:bar" "bar"
+                                                        "ex:num" [i (inc i) (dec i)])))
+                                        (range 1 100 3))})]
+    (testing "meta"
+      (let [result @(fluree/explain db1
+                                    {"@context" {"ex" "http://example.com/"}
+                                     "where" [{"@id" "?s" "ex:num" "?num"}
+                                              ["optional"
+                                               {"@id" "?s" "ex:ref1" "?ref1"}]
+                                              ["union"
+                                               {"@id" "?s" "ex:foo" "?str"}
+                                               {"@id" "?s" "ex:bar" "?str"}]
+                                              ["filter" "(> 50 ?num)"]]
+                                     "select" ["?s" "?ref1" "?str"]}
+                                    {:analyze true})]
+        (is (= [:analyze :fuel :plan :policy :query :result :status :time]
+               (sort (keys result))))
+        (is (= '[{:in 1,
+                  :out 48,
+                  :binds-in [],
+                  :binds-out [?s ?num],
+                  :pattern
+                  {:subject "?s", :property "http://example.com/num", :object "?num"}}
+                 {:in 48,
+                  :out 48,
+                  :binds-in [?s ?num],
+                  :binds-out [?s ?num ?ref1],
+                  :pattern
+                  {:type :optional,
+                   :data
+                   "[[#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/ref1\"} #:fluree.db.query.exec.where{:var ?ref1}]]"}}
+                 {:in 48,
+                  :out 0,
+                  :binds-in [?s ?num],
+                  :binds-out [],
+                  :pattern
+                  {:subject "?s",
+                   :property "http://example.com/ref1",
+                   :object "?ref1"}}
+                 {:in 48,
+                  :out 96,
+                  :binds-in [?s ?num ?ref1],
+                  :binds-out [?s ?num ?ref1 ?str],
+                  :pattern
+                  {:type :union,
+                   :data
+                   "[[[#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/foo\"} #:fluree.db.query.exec.where{:var ?str}]] [[#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/bar\"} #:fluree.db.query.exec.where{:var ?str}]]]"}}
+                 {:in 48,
+                  :out 48,
+                  :binds-in [?s ?num ?ref1],
+                  :binds-out [?s ?num ?ref1 ?str],
+                  :pattern
+                  {:subject "?s", :property "http://example.com/foo", :object "?str"}}
+                 {:in 48,
+                  :out 48,
+                  :binds-in [?s ?num ?ref1],
+                  :binds-out [?s ?num ?ref1 ?str],
+                  :pattern
+                  {:subject "?s", :property "http://example.com/bar", :object "?str"}}
+                 {:in 96,
+                  :out 48,
+                  :binds-in [?s ?num ?ref1 ?str],
+                  :binds-out [?s ?num ?ref1 ?str],
+                  :pattern
+                  {:type :filter, :data "#function[clojure.lang.AFunction/1]"}}]
+               (->> result :analyze
+                    (reduce (fn [det-result curr]
+                              ;; execution order of the union clauses is nondeterministic, make them deterministic
+                              (let [prev (peek det-result)]
+                                ;; bar always before foo
+                                (if (and (= (:pattern prev) "[#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/foo\"} #:fluree.db.query.exec.where{:var ?str}]")
+                                         (= (:pattern curr) "[#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/bar\"} #:fluree.db.query.exec.where{:var ?str}]"))
+                                  (into (pop det-result) [curr prev])
+                                  (conj det-result curr))))
+                            []))))))))
