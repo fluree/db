@@ -55,8 +55,10 @@
 
 (defn format-plan
   [compact-fn plan]
-  (mapv (fn [segment]
-          (update segment :patterns (partial mapv (partial format-plan-pattern compact-fn))))
+  (mapv (fn [{:keys [type] :as segment}]
+          (if (= type :optimizable)
+            (update segment :patterns (partial mapv (partial format-plan-pattern compact-fn)))
+            (update segment :patterns (partial mapv (partial format-pattern compact-fn)))))
         plan))
 
 (defn query
