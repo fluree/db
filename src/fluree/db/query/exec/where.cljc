@@ -333,6 +333,16 @@
   (fn [_ds _tracker _solution pattern _error-ch]
     (pattern-type pattern)))
 
+(defn match-and-track-pattern
+  [ds tracker solution pattern error-ch]
+  (if (:analyze tracker)
+    (do (track/pattern-in! tracker pattern solution)
+        (-> (match-pattern ds tracker solution pattern error-ch)
+            (async/pipe (async/chan 2 (map (fn [solution]
+                                             (track/pattern-out! tracker pattern solution)
+                                             solution))))))
+    (match-pattern ds tracker solution pattern error-ch)))
+
 (defn assign-solution-filter
   [component solution]
   (if (::fn component)
@@ -652,7 +662,7 @@
     (async/pipeline-async 2
                           out-ch
                           (fn [solution ch]
-                            (-> (match-pattern ds tracker solution pattern error-ch)
+                            (-> (match-and-track-pattern ds tracker solution pattern error-ch)
                                 (async/pipe ch)))
                           solution-ch)
     out-ch))
