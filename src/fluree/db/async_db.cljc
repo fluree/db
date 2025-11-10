@@ -45,6 +45,11 @@
           (catch* e
             (deliver! updated-db e))))
       updated-db))
+  (-ledger-info [_]
+    (go-try
+      (let [db (<? db-chan)
+            info (<? (dbproto/-ledger-info db))]
+        info)))
   where/Matcher
   (-match-id [_ tracker solution s-match error-ch]
     (let [match-ch (async/chan)]

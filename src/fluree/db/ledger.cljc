@@ -93,27 +93,26 @@
 (defn ledger-info
   "Returns comprehensive ledger information including statistics for specified branch (or default branch if nil).
    Computes current property and class statistics by replaying novelty on top of indexed stats.
-   Decodes SIDs to IRIs for user-friendly output."
+   Returns stats in native SID format - use fluree.db.api/ledger-info for IRI-decoded version."
   ([ledger]
    (ledger-info ledger const/default-branch-name))
   ([{:keys [address alias] :as ledger} requested-branch]
-   (let [branch-data (get-branch-meta ledger requested-branch)
-         branch-name (:name branch-data)
-         current-db  (branch/current-db branch-data)
-         {:keys [commit stats t namespace-codes]} current-db
-         {:keys [size flakes]} stats
-         ;; Compute current stats by replaying novelty
-         current-stats (novelty/current-stats current-db)]
-     {:address    address
-      :alias      alias
-      :branch     branch-name
-      :t          t
-      :size       size
-      :flakes     flakes
-      :commit     commit
-      ;; Decode SIDs to IRIs for properties and classes
-      :properties (update-keys (:properties current-stats) #(iri/sid->iri % namespace-codes))
-      :classes    (update-keys (:classes current-stats) #(iri/sid->iri % namespace-codes))})))
+   (go-try
+     (let [branch-data (get-branch-meta ledger requested-branch)
+           branch-name (:name branch-data)
+           current-db  (branch/current-db branch-data)
+           ;; Get stats, namespace-codes, commit, index, and novelty via protocol method
+           {:keys [stats namespace-codes t novelty-post commit index]} (<? (dbproto/-ledger-info current-db))
+           ;; Compute current stats by replaying novelty - need to pass a map with :stats and :novelty :post
+           current-stats (novelty/current-stats {:stats stats :novelty {:post novelty-post}})]
+       {:address         address
+        :alias           alias
+        :branch          branch-name
+        :t               t
+        :commit          commit
+        :index           index
+        :namespace-codes namespace-codes
+        :stats           (merge stats current-stats)}))))
 
 (defn notify
   "Returns false if provided commit update did not result in an update to the ledger because

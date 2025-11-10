@@ -118,7 +118,8 @@
 (defn with-index-address
   [commit index-address]
   (if index-address
-    (let [index-reference {const/iri-address index-address}]
+    (let [existing-index  (get-first commit const/iri-index)
+          index-reference (assoc existing-index const/iri-address index-address)]
       (assoc commit const/iri-index [index-reference]))
     commit))
 

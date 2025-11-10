@@ -518,6 +518,19 @@
   (-query [this tracker query-map] (fql/query this tracker query-map))
   (-class-ids [this tracker subject] (match/class-ids this tracker subject))
   (-index-update [db commit-index] (index-update db commit-index))
+  (-ledger-info [_]
+    (async/go
+      (let [index-address (get-in commit [:index :address])
+            index-id      (get-in commit [:index :id])
+            index-t       (get-in commit [:index :data :t])]
+        {:stats           stats
+         :namespace-codes namespace-codes
+         :t               t
+         :novelty-post    (get novelty :post)
+         :commit          commit
+         :index           {:id      index-id
+                           :t       index-t
+                           :address index-address}})))
 
   iri/IRICodec
   (encode-iri [_ iri]
