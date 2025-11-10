@@ -5,6 +5,7 @@
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.ledger :as ledger]
+            [fluree.db.query.exec :as exec]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.fql.syntax :as syntax]
@@ -146,21 +147,32 @@
 
   Parameters:
     db - Database value or dataset
-    query - Query map (JSON-LD or analytical)
+    q - Query map (JSON-LD or analytical)
 
   Returns channel resolving to a query plan map."
-  [db query override-opts]
+  [db q override-opts]
   (go-try
-    (let [{:keys [_opts] :as parsed-query}
-          (-> query
+    (let [{:keys [opts] :as parsed-query}
+          (-> q
               syntax/coerce-query
               (sanitize-query-options override-opts)
-              (update :opts dissoc :max-fuel)
-              (assoc :orig-query query)
+              (assoc :orig-query q)
+              (assoc-in [:opts :meta] true)
               parse/parse-query*)
 
           planned-query (<? (optimize/-plan db parsed-query))]
-      (<? (optimize/-explain db planned-query)))))
+      (if (track/track-solutions? opts)
+        (let [optimized-query (<? (optimize/-reorder db planned-query))
+              tracker         (track/init opts)
+
+              db* (if (dataset? db)
+                    db
+                    (<? (restrict-db db tracker optimized-query)))
+
+              result      (<? (track-execution db* tracker #(exec/query db* tracker optimized-query)))
+              explanation (<? (optimize/-explain db* planned-query))]
+          (merge result explanation))
+        (<? (optimize/-explain db planned-query))))))
 
 (defn contextualize-ledger-400-error
   [info-str e]
