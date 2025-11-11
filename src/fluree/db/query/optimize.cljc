@@ -57,18 +57,7 @@
   (-explain [db parsed-query]
     "Generate an execution plan for the query showing optimization details.
 
-    Returns a channel that will contain a query plan map with:
-    - :query - The optimized query
-    - :plan - Execution plan details including:
-      - :optimization - Status of optimization:
-        - :none - No statistics available, optimization not attempted
-        - :unchanged - Optimization ran, patterns already in optimal order
-        - :reordered - Optimization ran, patterns were reordered
-      - :statistics - Available statistics info (when stats present)
-      - :original - Original pattern order with selectivity (when stats present)
-      - :optimized - Optimized pattern order with selectivity (when stats present)
-      - :segments - Pattern segments with boundaries (when stats present)
-      - :changed? - Boolean indicating if patterns were reordered (when stats present)
+    Returns a channel that will contain a query plan map
 
     Parameters:
       db - The database (FlakeDB, AsyncDB, etc.)
