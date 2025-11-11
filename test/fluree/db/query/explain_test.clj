@@ -281,56 +281,49 @@
                   :binds-in [],
                   :binds-out [?s ?num],
                   :pattern
-                  {:subject "?s", :property "http://example.com/num", :object "?num"}}
+                  "[:triple [#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/num\"} #:fluree.db.query.exec.where{:var ?num}]]"}
                  {:in 48,
                   :out 48,
                   :binds-in [?s ?num],
                   :binds-out [?s ?num ?ref1],
                   :pattern
-                  {:type :optional,
-                   :data
-                   "[[#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/ref1\"} #:fluree.db.query.exec.where{:var ?ref1}]]"}}
+                  "[:optional [[:triple [#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/ref1\"} #:fluree.db.query.exec.where{:var ?ref1}]]]]"}
                  {:in 48,
                   :out 0,
                   :binds-in [?s ?num],
                   :binds-out [],
                   :pattern
-                  {:subject "?s",
-                   :property "http://example.com/ref1",
-                   :object "?ref1"}}
+                  "[:triple [#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/ref1\"} #:fluree.db.query.exec.where{:var ?ref1}]]"}
                  {:in 48,
                   :out 96,
                   :binds-in [?s ?num ?ref1],
                   :binds-out [?s ?num ?ref1 ?str],
                   :pattern
-                  {:type :union,
-                   :data
-                   "[[[#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/foo\"} #:fluree.db.query.exec.where{:var ?str}]] [[#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/bar\"} #:fluree.db.query.exec.where{:var ?str}]]]"}}
+                  "[:union [[[:triple [#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/foo\"} #:fluree.db.query.exec.where{:var ?str}]]] [[:triple [#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/bar\"} #:fluree.db.query.exec.where{:var ?str}]]]]]"}
                  {:in 48,
                   :out 48,
                   :binds-in [?s ?num ?ref1],
                   :binds-out [?s ?num ?ref1 ?str],
                   :pattern
-                  {:subject "?s", :property "http://example.com/foo", :object "?str"}}
+                  "[:triple [#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/foo\"} #:fluree.db.query.exec.where{:var ?str}]]"}
                  {:in 48,
                   :out 48,
                   :binds-in [?s ?num ?ref1],
                   :binds-out [?s ?num ?ref1 ?str],
                   :pattern
-                  {:subject "?s", :property "http://example.com/bar", :object "?str"}}
+                  "[:triple [#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/bar\"} #:fluree.db.query.exec.where{:var ?str}]]"}
                  {:in 96,
                   :out 48,
                   :binds-in [?s ?num ?ref1 ?str],
                   :binds-out [?s ?num ?ref1 ?str],
-                  :pattern
-                  {:type :filter, :data "#function[clojure.lang.AFunction/1]"}}]
+                  :pattern "[:filter #function[clojure.lang.AFunction/1]]"}]
                (->> result :analyze
                     (reduce (fn [det-result curr]
                               ;; execution order of the union clauses is nondeterministic, make them deterministic
                               (let [prev (peek det-result)]
                                 ;; bar always before foo
-                                (if (and (= (:pattern prev) "[#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/foo\"} #:fluree.db.query.exec.where{:var ?str}]")
-                                         (= (:pattern curr) "[#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/bar\"} #:fluree.db.query.exec.where{:var ?str}]"))
+                                (if (and (= (:pattern prev) "[:triple [#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/bar\"} #:fluree.db.query.exec.where{:var ?str}]]")
+                                         (= (:pattern curr) "[:triple [#:fluree.db.query.exec.where{:var ?s} #:fluree.db.query.exec.where{:iri \"http://example.com/foo\"} #:fluree.db.query.exec.where{:var ?str}]]"))
                                   (into (pop det-result) [curr prev])
                                   (conj det-result curr))))
                             []))))))))

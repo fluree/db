@@ -463,7 +463,7 @@
       (let [attrs (-> o (dissoc const/iri-variable) (expand-keys context))
             var   (parse-var-name explicit-var)
             o-mch (parse-variable-attributes var attrs var-config context)]
-        [(flip-reverse-pattern [s-mch p-mch o-mch])])
+        [(where/->pattern :triple (flip-reverse-pattern [s-mch p-mch o-mch]))])
 
       (contains? o* const/iri-value)
       (let [v     (get o* const/iri-value)
@@ -471,7 +471,7 @@
             o-mch (if (and parse-object-vars? (parse-var-name v))
                     (parse-variable-attributes (parse-var-name v) attrs var-config context)
                     (parse-value-attributes v attrs context))]
-        [(flip-reverse-pattern [s-mch p-mch o-mch])])
+        [(where/->pattern :triple (flip-reverse-pattern [s-mch p-mch o-mch]))])
 
       :else ;;ref
       (let [id-map  (with-id o context) ; not o*, we can't use expanded or we'll lose @reverse
@@ -481,7 +481,7 @@
             o-attrs (dissoc id-map const/iri-id)]
         ;; return a thunk wrapping the recursive call to preserve stack
         ;; space by delaying execution
-        #(into [(flip-reverse-pattern [s-mch p-mch o-mch])]
+        #(into [(where/->pattern :triple (flip-reverse-pattern [s-mch p-mch o-mch]))]
                (parse-statements o-mch o-attrs var-config context))))))
 
 (defn parse-statement*
@@ -489,7 +489,7 @@
   (cond
     (v/query-variable? o var-config)
     (let [o-mch (parse-variable o)]
-      [(flip-reverse-pattern [s-mch p-mch o-mch])])
+      [(where/->pattern :triple (flip-reverse-pattern [s-mch p-mch o-mch]))])
 
     (map? o)
     (parse-object-map s-mch p-mch o var-config context)
@@ -505,7 +505,7 @@
 
     :else
     (let [o-mch (where/anonymous-value o)]
-      [(flip-reverse-pattern [s-mch p-mch o-mch])])))
+      [(where/->pattern :triple (flip-reverse-pattern [s-mch p-mch o-mch]))])))
 
 (defn parse-statement
   [s-mch p-mch o var-config context]
@@ -629,6 +629,7 @@
   (->> patterns
        (mapcat (fn [[pattern-type component :as pattern]]
                  (case pattern-type
+                   :triple        [component]
                    :class         [component]
                    :property-join component
                    :id            [[component]]
@@ -1048,7 +1049,7 @@
             (let [o-var      (str "?f" (count vars))
                   delete-smt (assoc next-triple 2 (parse-variable o-var))
                   ;; optional so we don't have to match every var in order to delete
-                  where-smt  (where/->pattern :optional [delete-smt])]
+                  where-smt  (where/->pattern :optional [(where/->pattern :triple delete-smt)])]
               (recur r
                      (assoc vars [s-iri p-iri] o-var)
                      (conj where where-smt)

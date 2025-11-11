@@ -597,8 +597,8 @@
 
 (defmethod match-pattern :triple
   [ds tracker solution pattern error-ch]
-  (let [tuple (pattern-data pattern)]
-    (-match-triple ds tracker solution tuple error-ch)))
+  (let [triple (pattern-data pattern)]
+    (-match-triple ds tracker solution triple error-ch)))
 
 (defmethod match-pattern :class
   [ds tracker solution pattern error-ch]
