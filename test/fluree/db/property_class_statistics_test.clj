@@ -251,13 +251,13 @@
           (is (some? (:alias info)) "Should have alias")
           (is (some? (:branch info)) "Should have branch")
           (is (some? (:t info)) "Should have t")
-          (is (some? (:size info)) "Should have size")
-          (is (some? (:flakes info)) "Should have flakes")
+          (is (some? (get-in info [:stats :size])) "Should have size")
+          (is (some? (get-in info [:stats :flakes])) "Should have flakes")
           (is (some? (:commit info)) "Should have commit"))
 
         (testing "ledger-info includes statistics with decoded IRIs and nested structure"
-          (let [properties (:properties info)
-                classes    (:classes info)]
+          (let [properties (get-in info [:stats :properties])
+                classes    (get-in info [:stats :classes])]
             (is (map? properties) "Should have properties map")
             (is (map? classes) "Should have classes map")
 
