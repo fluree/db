@@ -294,8 +294,6 @@
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
 
-
-
 (defrecord FlakeDB [index-catalog commit-catalog alias commit t tt-id stats
                     spot post opst tspo vg schema comparators staged novelty policy
                     namespaces namespace-codes max-namespace-code

@@ -1,9 +1,9 @@
 (ns fluree.db.flake.optimize
-  (:require [fluree.json-ld :as json-ld]
-            [fluree.db.constants :as const]
+  (:require [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.query.optimize :refer [compare-triples]]))
+            [fluree.db.query.optimize :refer [compare-triples]]
+            [fluree.json-ld :as json-ld]))
 
 ;; Selectivity score constants
 ;; Lower score = more selective = execute first
