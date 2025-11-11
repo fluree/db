@@ -50,7 +50,6 @@
 (defn tally
   [tracker]
   (let [{:keys [patterns] :as explain} @tracker]
-    (def explain explain)
     (reduce (fn [explanation pattern]
               (conj explanation (-> (get explain pattern)
                                     (assoc :pattern (pr-str pattern))
@@ -58,9 +57,3 @@
                                     (update :binds-out #(vec (sort-by (comp :ord meta) %))))))
             []
             patterns)))
-
-(comment
-  explain
-
-
-  )
