@@ -130,22 +130,26 @@
         (update :classes serialize-class-stats))))
 
 (defn deserialize-stats
-  "Deserializes the stats structure from compact tuple format."
-  [stats]
+  "Deserializes the stats structure from compact tuple format.
+   Only deserializes properties/classes for v2 indexes."
+  [stats version]
   (when stats
-    (-> stats
-        (update :properties deserialize-property-stats)
-        (update :classes deserialize-class-stats))))
+    (if (= 2 version)
+      (-> stats
+          (update :properties deserialize-property-stats)
+          (update :classes deserialize-class-stats))
+      (dissoc stats :properties :classes))))
 
 (defn deserialize-db-root
   "Assumes all data comes in as keywordized JSON."
   [db-root]
-  (let [db-root* (reduce (fn [root-data idx]
+  (let [version  (or (:v db-root) 1)  ; default to v1 for legacy indexes
+        db-root* (reduce (fn [root-data idx]
                            (update root-data idx deserialize-child-node))
                          db-root index/types)]
     (-> db-root*
         (update :namespace-codes numerize-keys)
-        (update :stats deserialize-stats))))
+        (update :stats deserialize-stats version))))
 
 (defn deserialize-children
   [children]
