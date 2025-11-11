@@ -1,8 +1,8 @@
-(ns fluree.db.query.optimize-test
+(ns fluree.db.flake.optimize-test
   "Unit tests for query optimization functions.
   Integration tests for optimization behavior are in explain_test.clj"
   (:require [clojure.test :refer [deftest is testing]]
-            [fluree.db.query.optimize :as optimize]))
+            [fluree.db.flake.optimize :as optimize]))
 
 (deftest optimizable-pattern-test
   (testing "Pattern type recognition using where/pattern-type"
