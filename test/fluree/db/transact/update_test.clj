@@ -305,6 +305,24 @@
                                                         "ex:rand" "?rand"}
                                            "selectOne" "?rand"})))))
 
+    (testing "math functions"
+      (let [updated (-> @(fluree/update db1 {"@context" [test-utils/default-str-context
+                                                         {"ex" "http://example.com/"}]
+                                             "insert"   [{"id" "ex:math" "ex:num" 0}]})
+                        (fluree/update {"@context" [test-utils/default-str-context
+                                                    {"ex" "http://example.com/"}]
+                                        "where"    [{"id" "?s" "ex:num" "?num"}
+                                                    ["bind"
+                                                     "?result" "(* (power (- (/ (+ ?num 10) 2) 3) 3) 5 2)"]]
+                                        "insert"   {"id" "?s" "ex:result" "?result"}
+                                        "values"   ["?s" [{"@value" "ex:math" "@type" "@id"}]]}))]
+        (is (= {"ex:result" 80.0}
+               @(fluree/query @updated
+                              {"@context" [test-utils/default-str-context
+                                           {"ex" "http://example.com/"}]
+                               "selectOne"
+                               {"ex:math" ["ex:result"]}})))))
+
     (testing "string functions"
       (let [updated (-> @(fluree/update db1 {"@context" [test-utils/default-str-context
                                                          {"ex" "http://example.com/"}]
