@@ -178,3 +178,32 @@
        group-subject-triples
        (mapcat build-property-joins)
        vec))
+
+(defprotocol Optimizable
+  "Protocol for query optimization based on database statistics."
+
+  (-reorder [db parsed-query]
+    "Reorder query patterns based on database statistics.
+
+    Returns a channel that will contain the optimized query with patterns
+    reordered for optimal execution. If the database has no statistics
+    available, returns the query unchanged.
+
+    Parameters:
+      db - The database (FlakeDB, AsyncDB, etc.)
+      parsed-query - The parsed query from fql/parse-query
+
+    Returns:
+      Channel containing optimized query")
+
+  (-explain [db parsed-query]
+    "Generate an execution plan for the query showing optimization details.
+
+    Returns a channel that will contain a query plan map
+
+    Parameters:
+      db - The database (FlakeDB, AsyncDB, etc.)
+      parsed-query - The parsed query from fql/parse-query
+
+    Returns:
+      Channel containing query plan map"))
