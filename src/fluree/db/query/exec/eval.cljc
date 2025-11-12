@@ -579,6 +579,10 @@
   [{num :value} {div :value}]
   (where/->typed-val (quot num div)))
 
+(defn power
+  [{base :value} {power :value}]
+  (where/->typed-val (math/pow base power)))
+
 (defn untyped-equal
   ([_]  (where/->typed-val true))
   ([{x :value} {y :value}] (where/->typed-val (= x y)))
@@ -668,6 +672,7 @@
     not-equal      fluree.db.query.exec.eval/typed-not-equal
     now            fluree.db.query.exec.eval/now
     or             fluree.db.query.exec.eval/-or
+    power          fluree.db.query.exec.eval/power
     quot           fluree.db.query.exec.eval/quotient
     rand           fluree.db.query.exec.eval/rand
     regex          fluree.db.query.exec.eval/regex
@@ -890,7 +895,7 @@
 
 (def allowed-scalar-fns
   '#{&& || ! > < >= <= = equal not-equal + - * / quot and bound coalesce if
-     nil? as not not= or re-find re-pattern in
+     nil? as not not= or re-find re-pattern in power
 
      ;; string fns
      strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter
