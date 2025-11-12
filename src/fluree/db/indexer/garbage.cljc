@@ -2,7 +2,7 @@
   (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.flake.index.storage :as storage]
             [fluree.db.util :as util]
-            [fluree.db.util.async :refer [go-try]]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -38,30 +38,33 @@
 
 (defn clean-garbage-record
   "Cleans up a complete garbage file, which will contain
-  many index segment garbage items within it. Garbage file
+  many garbage items within it (index segments and sketch files). Garbage file
   looks like:
   {:alias 'ledger-alias',
    :branch 'main',
-   :garbage ['fluree:file://.../index/segment/1.json', ...]
-   :t 1}"
+   :garbage ['fluree:file://.../index/segment/1.json',
+             'fluree:file://.../stats-sketches/values/ex_email_1.hll', ...]
+   :t 1}
+
+   All garbage items (segments and sketches) are deleted by iterating through the list."
   [index-catalog {:keys [address index t] :as _garbage-map}]
-  (go
-    (let [{:keys [alias branch garbage]} (<! (storage/read-garbage index-catalog address))]
-      (log/info "Removing" (count garbage) "unused index segments (garbage) from ledger"
+  (go-try
+    (let [{:keys [alias branch garbage]} (<? (storage/read-garbage index-catalog address))]
+      (log/info "Removing" (count garbage) "unused index items (garbage) from ledger"
                 alias "branch" branch "from index-t of" t)
 
-      ;; first delete all index segment files
+      ;; Delete all garbage items (index segments and sketch files)
       (doseq [garbage-item garbage]
         ;; note if the file was already deleted there could be an exception.
         ;; this might happen if the server shutdown in the middle of a garbage
         ;; exceptions are logged downstream, so just swallow exception here
-        ;; and keep rocessing.
+        ;; and keep processing.
         (<! (storage/delete-garbage-item index-catalog garbage-item)))
 
-      ;; delete main garbage record
+      ;; Delete main garbage record
       (<! (storage/delete-garbage-item index-catalog address))
 
-      ;; then delete the parent index root
+      ;; Then delete the parent index root
       (<! (storage/delete-garbage-item index-catalog index)))))
 
 (defn remove-cleaned

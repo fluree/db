@@ -62,14 +62,95 @@
                  (assoc numerized int-k v)))
              {} m))
 
+(def property-stats-packer
+  "Pack property stats into a 6-tuple: [count ndv-values ndv-subjects selectivity-value selectivity-subject last-modified-t]"
+  (juxt :count :ndv-values :ndv-subjects :selectivity-value :selectivity-subject :last-modified-t))
+
+(defn unpack-property-stats
+  "Unpack 6-tuple back into property stats map"
+  [[count ndv-values ndv-subjects selectivity-value selectivity-subject last-modified-t]]
+  {:count count
+   :ndv-values ndv-values
+   :ndv-subjects ndv-subjects
+   :selectivity-value selectivity-value
+   :selectivity-subject selectivity-subject
+   :last-modified-t last-modified-t})
+
+(defn serialize-property-stats
+  "Serialize property stats map using compact tuple format.
+   Each entry: [serialized-sid [count ndv-values ndv-subjects selectivity-value selectivity-subject last-modified-t]]"
+  [properties]
+  (when properties
+    (reduce-kv
+     (fn [acc k v]
+       (conj acc [(iri/serialize-sid k) (property-stats-packer v)]))
+     []
+     properties)))
+
+(defn deserialize-property-stats
+  "Deserialize property stats from compact tuple format."
+  [properties]
+  (when properties
+    (reduce
+     (fn [acc [sid-vec tuple]]
+       (let [[ns-code nme] sid-vec
+             sid (iri/->sid ns-code nme)]
+         (assoc acc sid (unpack-property-stats tuple))))
+     {}
+     properties)))
+
+(defn serialize-class-stats
+  "Serialize class stats map. Classes only have :count field."
+  [classes]
+  (when classes
+    (reduce-kv
+     (fn [acc k v]
+       (conj acc [(iri/serialize-sid k) (:count v)]))
+     []
+     classes)))
+
+(defn deserialize-class-stats
+  "Deserialize class stats. Classes only have :count field."
+  [classes]
+  (when classes
+    (reduce
+     (fn [acc [sid-vec count]]
+       (let [[ns-code nme] sid-vec
+             sid (iri/->sid ns-code nme)]
+         (assoc acc sid {:count count})))
+     {}
+     classes)))
+
+(defn serialize-stats
+  "Serializes the stats structure using compact tuple format for properties."
+  [stats]
+  (when stats
+    (-> stats
+        (update :properties serialize-property-stats)
+        (update :classes serialize-class-stats))))
+
+(defn deserialize-stats
+  "Deserializes the stats structure from compact tuple format.
+   Only deserializes properties/classes for v2 indexes."
+  [stats version]
+  (when stats
+    (if (= 2 version)
+      (-> stats
+          (update :properties deserialize-property-stats)
+          (update :classes deserialize-class-stats))
+      (dissoc stats :properties :classes))))
+
 (defn deserialize-db-root
   "Assumes all data comes in as keywordized JSON."
   [db-root]
-  (let [db-root* (reduce (fn [root-data idx]
+  (let [version  (or (:v db-root) 1)  ; default to v1 for legacy indexes
+        db-root* (reduce (fn [root-data idx]
                            (update root-data idx deserialize-child-node))
                          db-root
                          (index/indexes-for db-root))]
-    (update db-root* :namespace-codes numerize-keys)))
+    (-> db-root*
+        (update :namespace-codes numerize-keys)
+        (update :stats deserialize-stats version))))
 
 (defn deserialize-children
   [children]
@@ -161,7 +242,10 @@
      (fn [acc k v]
        (assoc acc (name k)
               (case k
-                (:stats :config :garbage :prev-index)
+                :stats
+                (serialize-stats v)
+
+                (:config :garbage :prev-index)
                 (util/stringify-keys v)
 
                 (:spot :psot :post :opst :tspo)

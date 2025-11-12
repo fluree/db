@@ -40,12 +40,13 @@
 (defn publish-to-all
   [commit-jsonld publishers]
   (->> publishers
+       (keep identity)
        (map (fn [ns]
               (go
                 (try*
                   (<? (publish ns commit-jsonld))
                   (catch* e
-                    (log/warn e "Publisher failed to publish commit")
+                    (log/warn e "Publisher failed to publish commit" {:alias (or (get commit-jsonld "alias") (get commit-jsonld :alias))})
                     ::publishing-error)))))
        async/merge))
 

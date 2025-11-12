@@ -97,12 +97,25 @@
                                    {} (index/select-roots db))
           prev-idx-t    (-> commit :index :data :t)
           prev-idx-addr (-> commit :index :address)
+          prev-idx-v    (-> commit :index :v)
+
+          ;; Version logic:
+          ;; - New ledgers (no previous index) use v2
+          ;; - Existing ledgers preserve their version (or default to v1 for legacy)
+          version       (if prev-idx-t
+                          (or prev-idx-v 1)
+                          2)
+
+          stats-data    (cond-> (select-keys stats [:flakes :size])
+                          ;; HLL-based stats (properties, classes) are only for v2 indexes
+                          (= 2 version) (merge (select-keys stats [:properties :classes])))
+
           vg-addresses  (<? (write-vg-map index-catalog vg))
           data          (-> {:ledger-alias    alias
                              :t               t
-                             :v               1 ;; version of db root file
+                             :v               version
                              :schema          (vocab/serialize-schema schema)
-                             :stats           (select-keys stats [:flakes :size :properties :classes])
+                             :stats           stats-data
                              :vg              vg-addresses
                              :timestamp       (util/current-time-millis)
                              :namespace-codes namespace-codes
@@ -110,9 +123,10 @@
                                                :reindex-max-bytes reindex-max-bytes
                                                :max-old-indexes   max-old-indexes}}
                             (merge index-data)
-                            (cond-> prev-idx-t   (assoc :prev-index {:t       prev-idx-t
-                                                                     :address prev-idx-addr})
-                                    garbage-addr (assoc-in [:garbage :address] garbage-addr)))
+                            (cond->
+                                prev-idx-t   (assoc :prev-index {:t       prev-idx-t
+                                                                 :address prev-idx-addr})
+                                garbage-addr (assoc-in [:garbage :address] garbage-addr)))
           serialized    (serde/-serialize-db-root serializer data)]
       (<? (write-index-file storage alias :root serialized)))))
 

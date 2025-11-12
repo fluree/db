@@ -16,6 +16,7 @@
             [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.flake.match :as match]
+            [fluree.db.flake.optimize :refer  [explain-query optimize-query]]
             [fluree.db.flake.reasoner :as flake.reasoner]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.indexer :as indexer]
@@ -29,6 +30,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.history :refer [AuditLog]]
+            [fluree.db.query.optimize :as optimize]
             [fluree.db.query.range :as query-range]
             [fluree.db.reasoner :as reasoner]
             [fluree.db.time-travel :refer [TimeTravel]]
@@ -298,6 +300,19 @@
   (-query [this tracker query-map] (fql/query this tracker query-map))
   (-class-ids [this tracker subject] (match/class-ids this tracker subject))
   (-index-update [db commit-index] (index-update db commit-index))
+  (-ledger-info [_]
+    (async/go
+      (let [index-address (get-in commit [:index :address])
+            index-id      (get-in commit [:index :id])
+            index-t       (get-in commit [:index :data :t])]
+        {:stats           stats
+         :namespace-codes namespace-codes
+         :t               t
+         :novelty-post    (get novelty :post)
+         :commit          commit
+         :index           {:id      index-id
+                           :t       index-t
+                           :address index-address}})))
 
   iri/IRICodec
   (encode-iri [_ iri]
@@ -473,7 +488,14 @@
   (-reason [db methods rule-sources tracker reasoner-max]
     (flake.reasoner/reason db methods rule-sources tracker reasoner-max))
   (-reasoned-facts [db]
-    (reasoner-util/reasoned-facts db)))
+    (reasoner-util/reasoned-facts db))
+
+  optimize/Optimizable
+  (-reorder [db parsed-query]
+    (async/go (optimize-query db parsed-query)))
+
+  (-explain [db parsed-query]
+    (async/go (explain-query db parsed-query))))
 
 (defn db?
   [x]
