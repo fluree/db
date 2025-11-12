@@ -139,6 +139,9 @@
   Returns a sequence (for mapcat) containing the transformed pattern(s)."
   [group]
   (cond
+    (triple-group? group)
+    [(where/->pattern :property-join group)]
+
     (where/compound-pattern? group)
     (let [typ  (where/pattern-type group)
           data (where/pattern-data group)]
@@ -160,9 +163,6 @@
 
         :else
         [group]))
-
-    (triple-group? group)
-    [(where/->pattern :property-join group)]
 
     :else
     [group]))
