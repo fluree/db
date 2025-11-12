@@ -14,10 +14,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn subclasses
-  [{:keys [schema] :as _db} class]
-  (get @(:subclasses schema) class))
-
 (defn match-id
   [db tracker solution s-mch error-ch]
   (let [matched-ch (async/chan 2 (comp cat
@@ -195,6 +191,10 @@
       (async/close! out-ch))
     out-ch))
 
+(defn subclasses
+  [{:keys [schema] :as _db} class]
+  (get @(:subclasses schema) class))
+
 (defn class-matches
   [{:keys [alias] :as db} mch]
   (let [cls     (where/get-sid mch db)
@@ -266,6 +266,29 @@
                      [s p* o])))
             child-props))
     [triple]))
+
+(defn expand-subclasses
+  "Expands a single class pattern triple to include all subclasses.
+
+  For class patterns (rdf:type), returns a vector containing the original triple
+  plus a variant for each subclass. For non-class patterns, returns a vector
+  containing only the original triple."
+  [db [s p o :as triple]]
+  (if (= (where/get-sid p db) const/$rdf:type)
+    (mapv (fn [class-obj]
+            [s p class-obj])
+          (class-matches db o))
+    [triple]))
+
+(defn include-subclasses
+  "Expands class patterns in a triple collection to include subclasses.
+
+  Applies `expand-subclasses` to each triple and concatenates results into a
+  single vector."
+  [db triple-group]
+  (into []
+        (mapcat (partial expand-subclasses db))
+        triple-group))
 
 (defn get-property-ids
   "Extracts all property IDs from the `triples` collection."
@@ -352,6 +375,7 @@
   - Extracts the triple and assigns matched values from `solution`
   - Computes subject IDs
   - Expands to include subproperties
+  - Expands class patterns to include subclasses
 
   Then merges any groups that share properties (e.g., equivalent properties)
   into single consolidated groups.
@@ -367,6 +391,7 @@
                   (where/assign-matched-values solution))))
        (map (partial where/compute-sids db))
        (map (partial include-subproperties db))
+       (map (partial include-subclasses db))
        (merge-related-property-groups db)))
 
 (defn first-sid
