@@ -1,25 +1,18 @@
 (ns fluree.db.flake.match
   (:refer-clojure :exclude [load vswap!])
   (:require [clojure.core.async :as async :refer [<! >!]]
+            [clojure.set :as set]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.flake.index :as index]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util :as util :refer [vswap!]]
-            [fluree.db.util.async :refer [<? go-try inner-join-by
+            [fluree.db.util :as util :refer [cartesian-product vswap!]]
+            [fluree.db.util.async :refer [<? go-try inner-join-by outer-join-by
                                           repartition-each-by]]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn class-ids
-  "Returns list of class-ids for given subject-id"
-  [db tracker subject-id]
-  (go-try
-    (let [root (policy/root db)]
-      (<? (query-range/index-range root tracker :spot = [subject-id const/$rdf:type]
-                                   {:flake-xf (map flake/o)})))))
 
 (defn subclasses
   [{:keys [schema] :as _db} class]
@@ -211,39 +204,160 @@
                  (where/match-sid sub-obj alias cls)))
           (subclasses db cls))))
 
-(defn match-property-flakes
-  [solution triple db property-flakes]
-  (map (fn [flake]
-         (where/match-flake solution triple db flake))
-       property-flakes))
+(defn match-flake-against-triples
+  "Matches a single flake against a vector of triple patterns.
 
-(defn match-subject-triple
-  [initial-solutions triple db property-flakes]
-  (mapcat (fn [solution]
-            (match-property-flakes solution triple db property-flakes))
-          initial-solutions))
+  Tries each triple in sequence until one matches. Returns the updated solution
+  if any triple matches, nil otherwise."
+  [solution triples db flake]
+  (some (fn [triple]
+          (where/match-flake solution triple db flake))
+        triples))
 
-(defn match-subject-property
-  [initial-solutions triples db property-flakes]
-  (mapcat (fn [triple]
-            (match-subject-triple initial-solutions triple db property-flakes))
-          triples))
+(defn build-solution-from-flake-tuple
+  "Builds a solution from a tuple of flakes by matching each against its triples.
 
-(defn match-join
-  [solution triples db join]
-  (let [triple-map (group-by (fn [[_ p-mch _]]
-                               (where/get-sid p-mch db))
-                             triples)]
-    (loop [[s-chunk & r] join
-           new-solutions [solution]]
-      (if s-chunk
-        (let [pid            (->> s-chunk first flake/p)
-              triples        (get triple-map pid)
-              new-solutions* (match-subject-property new-solutions triples db s-chunk)]
-          (recur r new-solutions*))
-        new-solutions))))
+  Reduces over the flake tuple, matching each flake against its corresponding
+  triples vector and accumulating variable bindings in the solution.
+
+  Returns the final solution if all flakes match successfully, nil if any fail."
+  [initial-solution triple-groups db flake-tuple]
+  (reduce (fn [soln [triples flake]]
+            (if-let [next-soln (and soln (match-flake-against-triples soln triples db flake))]
+              next-soln
+              (reduced nil)))
+          initial-solution
+          (map vector triple-groups flake-tuple)))
+
+(defn match-inner-join
+  "Joins flake chunks across triples vectors.
+
+  `triple-groups` is a sequence of triples vectors.
+  `join-tuple` is a vector of flake chunks, one per triples vector, all for the same subject.
+
+  Computes the cartesian product of the flake chunks to get all combinations of
+  flakes (one from each chunk). For each combination, builds a solution by reducing
+  over the flakes and matching each against its corresponding triples.
+
+  Returns a sequence of solutions."
+  [solution triple-groups db join-tuple]
+  (->> join-tuple
+       cartesian-product
+       (keep (fn [flake-tuple]
+               (build-solution-from-flake-tuple solution triple-groups db flake-tuple)))))
+
+(defn include-subproperties
+  "Returns a vector containing the original triple plus variants for each subproperty.
+
+  Queries the schema of `db` for subproperties of the triple's property, handling
+  both rdfs:subPropertyOf and owl:equivalentProperty relationships. Equivalent
+  properties are stored bidirectionally as subproperties, so if prop-a is equivalent
+  to prop-b, both will be included when querying either one.
+
+  Only expands one level deep (non-recursive) to match the behavior of match-triple.
+
+  If no subproperties exist, returns a vector containing only the original triple."
+  [db [s p o :as triple]]
+  (if-some [child-props (where/get-child-properties db (where/get-sid p db))]
+    (let [db-alias (:alias db)]
+      (into [triple]
+            (map (fn [child-pid]
+                   (let [p* (where/match-sid p db-alias child-pid)]
+                     [s p* o])))
+            child-props))
+    [triple]))
+
+(defn get-property-ids
+  "Extracts all property IDs from the `triples` collection."
+  [db triples]
+  (into #{}
+        (map (fn [[_s p _o]]
+               (where/get-sid p db)))
+        triples))
+
+(defn group-by-pid
+  "Builds a map from each property ID appearing in triples from `triple-groups` to
+  a collection of all the triples it appears in."
+  [db triple-groups]
+  (reduce (fn [acc triples]
+            (let [pids (get-property-ids db triples)]
+              (reduce (fn [m pid]
+                        (update m pid (fnil conj #{}) triples))
+                      acc
+                      pids)))
+          {} triple-groups))
+
+(defn consolidate
+  "Consolidates a collection of sequences into a single distinct vector.
+
+  Concatenates all elements from all sequences in `seqs`, removes duplicates,
+  and returns the result as a vector."
+  [seqs]
+  (into []
+        (comp cat
+              (distinct))
+        seqs))
+
+(defn group-shared-properties
+  "Finds all triples vectors transitively connected to the seed via shared properties.
+
+  Uses breadth-first search to find all triples vectors that share at least one
+  property ID with the seed or with any triples vector connected to it.
+
+  Returns a set of all connected triples vectors including the seed."
+  [db pid->triples seed]
+  (loop [remaining #{seed}
+         visited   #{}]
+    (if-let [current (first remaining)]
+      (let [remaining*      (disj remaining current)
+            related-triples (->> (get-property-ids db current)
+                                 (map (fn [pid]
+                                        (get pid->triples pid)))
+                                 (apply set/union))
+            new-triples     (set/difference related-triples visited)]
+        (recur (into remaining* new-triples)
+               (conj visited current)))
+      visited)))
+
+(defn merge-related-property-groups
+  "Merges groups of triples that share any properties (handles equivalent properties).
+
+  When properties are equivalent (owl:equivalentProperty), they appear in each
+  other's childProps. This means querying either property will expand to include
+  both. If the query has separate patterns for both properties, we need to merge
+  them into a single triples vector so the join treats them as the same
+  constraint.
+
+  Uses a union-find-like algorithm to group triples vectors that share properties.
+
+  Returns a sequence of merged triples vectors."
+  [db triple-groups]
+  (if (empty? triple-groups)
+    []
+    (let [pid->triples (group-by-pid db triple-groups)]
+      (loop [remaining (set triple-groups)
+             result    []]
+        (if (empty? remaining)
+          result
+          (let [seed            (first remaining)
+                related-triples (group-shared-properties db pid->triples seed)
+                merged-triples  (consolidate related-triples)]
+            (recur (set/difference remaining related-triples)
+                   (conj result merged-triples))))))))
 
 (defn assign-patterns
+  "Processes query patterns into property groups for matching.
+
+  For each pattern:
+  - Extracts the triple and assigns matched values from `solution`
+  - Computes subject IDs
+  - Expands to include subproperties
+
+  Then merges any groups that share properties (e.g., equivalent properties)
+  into single consolidated groups.
+
+  Returns a sequence of triple vectors, where each vector contains triples
+  that should be matched together as a group."
   [db solution patterns]
   (->> patterns
        (map (fn [pattern]
@@ -251,22 +365,62 @@
                   where/pattern-data ; extract triple from
                                      ; class patterns
                   (where/assign-matched-values solution))))
-       (map (partial where/compute-sids db))))
+       (map (partial where/compute-sids db))
+       (map (partial include-subproperties db))
+       (merge-related-property-groups db)))
+
+(defn first-sid
+  "Extracts the subject ID from the first flake of `flake-chunk`"
+  [flake-chunk]
+  (flake/s (first flake-chunk)))
+
+(defn flatten-outer-join-tuple
+  "Flattens an outer-join tuple of collections into a single vector
+
+  Removes `nil` values (from non-matching sides of the join) and concatenates
+  all remaining collections into a single vector."
+  [outer-join-tuple]
+  (into []
+        (comp (remove nil?)
+              cat)
+        outer-join-tuple))
+
+(defn combined-flake-range
+  "Creates a channel of flake chunks, one chunk per subject appearing in any triple.
+
+  For each triple in `triples`, queries the appropriate index (psot or post based
+  on whether the object is matched) to retrieve matching flakes. Each channel is
+  repartitioned by subject ID, then outer-joined by subject to ensure:
+  - All subjects appearing in ANY property are included
+  - Flakes are emitted in sorted order by subject ID
+  - Each chunk combines flakes from all properties for the same subject
+
+  The outer join allows properties to match different sets of subjects - if a
+  subject has flakes for some properties but not others, it still produces a
+  chunk containing flakes from only the matching properties.
+
+  Returns a channel of flake vectors, where each vector contains all flakes for
+  a single subject across all properties in `triples`."
+  [db tracker error-ch triples]
+  (let [flatten-xf (map flatten-outer-join-tuple)]
+    (->> triples
+         (map (fn [[_s _p o :as triple]]
+                (let [idx (if (where/matched? o) :post :psot)]
+                  (where/resolve-flake-range db tracker error-ch triple idx))))
+         (repartition-each-by flake/s)
+         (outer-join-by flake/cmp-sid first-sid 2 flatten-xf))))
 
 (defn match-properties
   [db tracker solution patterns error-ch]
   (if (and (index/supports? db :psot)
            (index/supports? db :post))
-    (let [triples         (assign-patterns db solution patterns)
-          property-ranges (->> triples
-                               (map (fn [[_s _p o :as triple]]
-                                      (let [idx (if (where/matched? o) :post :psot)]
-                                        (where/resolve-flake-range db tracker error-ch triple idx))))
-                               (repartition-each-by flake/s))
-          extract-sid     (comp flake/s first)
-          join-xf         (mapcat (fn [join]
-                                    (match-join solution triples db join)))]
-      (inner-join-by flake/cmp-sid extract-sid 2 join-xf property-ranges))
+    (let [triple-groups (assign-patterns db solution patterns)
+          match-join-xf (mapcat (fn [join]
+                                  (match-inner-join solution triple-groups db join)))]
+      (->> triple-groups
+           (map (fn [triples]
+                  (combined-flake-range db tracker error-ch triples)))
+           (inner-join-by flake/cmp-sid first-sid 2 match-join-xf)))
     (where/match-patterns db tracker solution patterns error-ch)))
 
 (defn with-distinct-subjects
@@ -292,6 +446,14 @@
         ;; Termination: do nothing but terminate the supplied reducing fn
         ([result]
          (rf result))))))
+
+(defn class-ids
+  "Returns list of class-ids for given subject-id"
+  [db tracker subject-id]
+  (go-try
+    (let [root (policy/root db)]
+      (<? (query-range/index-range root tracker :spot = [subject-id const/$rdf:type]
+                                   {:flake-xf (map flake/o)})))))
 
 (defn match-class
   [db tracker solution triple error-ch]

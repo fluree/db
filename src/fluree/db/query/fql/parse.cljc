@@ -547,9 +547,7 @@
     (if (empty? attrs)
       [(where/->pattern :id s-mch)]
       (let [statements (parse-statements s-mch attrs var-config context)]
-        (if (simple-property-join? id attrs)
-          [(where/->pattern :property-join statements)]
-          (sort optimize/compare-triples statements))))))
+        (optimize/sort-triples statements)))))
 
 (defn parse-node-map
   [m var-config context]
@@ -620,7 +618,18 @@
   [[_ graph where] var-config context]
   (let [graph* (or (parse-variable graph)
                    (parse-graph-string graph context))
-        where* (parse-where-clause where var-config context)]
+        ;; For virtual graphs (##...), don't group the inner patterns since
+        ;; they're handled specially by the vector index system
+        where* (if (and (string? graph*) (where/virtual-graph? graph*))
+                 ;; Skip grouping for virtual graphs
+                 (->> where
+                      syntax/coerce-where
+                      (util/sequential)
+                      (mapcat (fn [pattern]
+                                (parse-pattern pattern var-config context)))
+                      where/->where-clause)
+                 ;; Normal graph - use standard parsing with grouping
+                 (parse-where-clause where var-config context))]
     [(where/->pattern :graph [graph* where*])]))
 
 (defn parse-where

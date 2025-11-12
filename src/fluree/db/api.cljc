@@ -563,8 +563,8 @@
     - :size - Total byte size
     - :flakes - Total flake count
     - :commit - Commit metadata
-    - :property-counts - Map of property SID -> count (if available)
-    - :class-counts - Map of class SID -> count (if available)
+    - :properties - Map of property IRI -> stats (count, NDV, selectivity, etc.)
+    - :classes - Map of class IRI -> stats
 
   Property and class counts are computed from the most recent index plus
   any novelty, providing absolutely current statistics."
@@ -572,8 +572,30 @@
   (validate-connection conn)
   (promise-wrap
    (go-try
-     (let [ledger (<? (connection/load-ledger conn ledger-id))]
-       (ledger/ledger-info ledger)))))
+     (let [ledger (<? (connection/load-ledger conn ledger-id))
+           info   (<? (ledger/ledger-info ledger))
+           namespace-codes (:namespace-codes info)
+           ;; Helper to decode SID keys to IRIs
+           decode-keys (fn [m]
+                         (reduce-kv (fn [acc sid stats]
+                                      (assoc acc (iri/sid->iri sid namespace-codes) stats))
+                                    {}
+                                    m))
+           ;; Decode properties and classes within stats
+           decoded-properties (decode-keys (get-in info [:stats :properties]))
+           decoded-classes (decode-keys (get-in info [:stats :classes]))
+           ;; Invert namespace-codes to be {namespace -> code} for API consumers
+           inverted-ns-codes (reduce-kv (fn [acc code ns]
+                                          (assoc acc ns code))
+                                        {}
+                                        namespace-codes)]
+       ;; Return result with IRIs instead of SIDs, with inverted namespace-codes
+       ;; Remove internal fields like novelty-post
+       (-> info
+           (assoc-in [:stats :properties] decoded-properties)
+           (assoc-in [:stats :classes] decoded-classes)
+           (assoc :namespace-codes inverted-ns-codes)
+           (dissoc :novelty-post))))))
 
 ;; db operations
 
@@ -686,6 +708,51 @@
    (if (util/exception? ds)
      (throw ds)
      (promise-wrap (query-api/query ds q opts)))))
+
+(defn explain
+  "Returns a query execution plan without executing the query.
+
+  Shows how the query optimizer will reorder patterns based on statistics,
+  including selectivity scores and estimated result counts for each pattern.
+
+  Parameters:
+    ds - Database value or dataset
+    q - Query map (JSON-LD or analytical)
+
+  Returns promise resolving to a query plan map with:
+    :query - Original parsed query structure
+    :plan - Execution plan with:
+      :optimization - :reordered, :unchanged, or :none
+      :statistics - Available statistics (if any)
+      :original - Original pattern order with selectivity
+      :optimized - Optimized pattern order with selectivity
+      :segments - Pattern segments with boundaries
+      :changed? - Boolean indicating if patterns were reordered
+
+  Example:
+    @(fluree/explain db
+      {:context {\"ex\" \"http://example.org/\"}
+       :select [\"?name\"]
+       :where [{\"@id\" \"?person\"
+                \"@type\" \"ex:Person\"
+                \"ex:email\" \"alice@example.org\"
+                \"ex:name\" \"?name\"}]})
+
+    ;; Returns:
+    {:query {...}
+     :plan {:optimization :reordered
+            :statistics {...}
+            :original [{:pattern ... :selectivity 10000}
+                       {:pattern ... :selectivity 1}]
+            :optimized [{:pattern ... :selectivity 1}    ; email lookup first
+                        {:pattern ... :selectivity 10000}] ; then verify type
+            :changed? true}}"
+  ([ds q]
+   (explain ds q {}))
+  ([ds q opts]
+   (if (util/exception? ds)
+     (throw ds)
+     (promise-wrap (query-api/explain ds q opts)))))
 
 (defn credential-query
   "Executes a query using a verifiable credential.

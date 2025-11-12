@@ -317,8 +317,13 @@
 
 (defn pattern-type
   [pattern]
-  (if (map-entry? pattern)
+  (cond
+    (map-entry? pattern)
     (key pattern)
+
+    (and (vector? pattern)
+         (= 3 (count pattern))
+         (every? map? pattern))
     :tuple))
 
 (defn pattern-data
@@ -326,6 +331,16 @@
   (if (map-entry? pattern)
     (val pattern)
     pattern))
+
+(def triple-pattern-types
+  #{:tuple :class})
+
+(defn triple-pattern?
+  [x]
+  (contains? triple-pattern-types (pattern-type x)))
+
+(def compound-pattern?
+  (complement triple-pattern?))
 
 (defn class-pattern?
   [pattern-type]

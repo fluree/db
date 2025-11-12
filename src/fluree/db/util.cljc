@@ -181,6 +181,20 @@
     x
     [x]))
 
+(defn cartesian-product
+  "Computes the cartesian product of multiple collections.
+
+  Given a sequence of collections, returns a sequence of vectors where each
+  vector contains one element from each collection, covering all combinations.
+
+  Example: (cartesian-product [[1 2] [a b]]) => ([1 a] [1 b] [2 a] [2 b])"
+  [colls]
+  (if (empty? colls)
+    [[]]
+    (for [x    (first colls)
+          more (cartesian-product (rest colls))]
+      (cons x more))))
+
 #?(:clj
    (defn- eval-dispatch
      [d]
