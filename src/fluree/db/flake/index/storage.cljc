@@ -124,9 +124,9 @@
                                                :max-old-indexes   max-old-indexes}}
                             (merge index-data)
                             (cond->
-                                prev-idx-t   (assoc :prev-index {:t       prev-idx-t
-                                                                 :address prev-idx-addr})
-                                garbage-addr (assoc-in [:garbage :address] garbage-addr)))
+                             prev-idx-t   (assoc :prev-index {:t       prev-idx-t
+                                                              :address prev-idx-addr})
+                             garbage-addr (assoc-in [:garbage :address] garbage-addr)))
           serialized    (serde/-serialize-db-root serializer data)]
       (<? (write-index-file storage alias :root serialized)))))
 
