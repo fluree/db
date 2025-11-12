@@ -975,7 +975,7 @@
   [_db _tracker _solution pattern error-ch]
   (go
     (>! error-ch
-        (ex-info (str "Unknown pattern type: " (pattern-type pattern))
+        (ex-info (str "Unknown type for pattern: " pattern)
                  {:status 400
                   :error  :db/invalid-query}))))
 
