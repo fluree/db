@@ -2,6 +2,7 @@
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.core.async :as async :refer [go <!]]
             [clojure.walk :refer [postwalk]]
+            [fluree.db.api.decode :as decode]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.connection :as connection :refer [connection?]]
             [fluree.db.connection.config :as config]
@@ -564,7 +565,7 @@
     - :flakes - Total flake count
     - :commit - Commit metadata
     - :properties - Map of property IRI -> stats (count, NDV, selectivity, etc.)
-    - :classes - Map of class IRI -> stats
+    - :classes - Map of class IRI -> stats (with nested property details decoded)
 
   Property and class counts are computed from the most recent index plus
   any novelty, providing absolutely current statistics."
@@ -573,29 +574,8 @@
   (promise-wrap
    (go-try
      (let [ledger (<? (connection/load-ledger conn ledger-id))
-           info   (<? (ledger/ledger-info ledger))
-           namespace-codes (:namespace-codes info)
-           ;; Helper to decode SID keys to IRIs
-           decode-keys (fn [m]
-                         (reduce-kv (fn [acc sid stats]
-                                      (assoc acc (iri/sid->iri sid namespace-codes) stats))
-                                    {}
-                                    m))
-           ;; Decode properties and classes within stats
-           decoded-properties (decode-keys (get-in info [:stats :properties]))
-           decoded-classes (decode-keys (get-in info [:stats :classes]))
-           ;; Invert namespace-codes to be {namespace -> code} for API consumers
-           inverted-ns-codes (reduce-kv (fn [acc code ns]
-                                          (assoc acc ns code))
-                                        {}
-                                        namespace-codes)]
-       ;; Return result with IRIs instead of SIDs, with inverted namespace-codes
-       ;; Remove internal fields like novelty-post
-       (-> info
-           (assoc-in [:stats :properties] decoded-properties)
-           (assoc-in [:stats :classes] decoded-classes)
-           (assoc :namespace-codes inverted-ns-codes)
-           (dissoc :novelty-post))))))
+           info   (<? (ledger/ledger-info ledger))]
+       (decode/ledger-info info)))))
 
 ;; db operations
 

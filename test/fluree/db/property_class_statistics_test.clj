@@ -742,3 +742,119 @@
                         "Garbage should NOT contain department_2 sketch (it is current)"))))
 
               @(fluree/disconnect conn2))))))))
+
+(deftest ^:integration class-property-tracking-structure-test
+  (testing "Class property tracking captures types, ref-classes, and langs in expected structure"
+    (with-temp-dir [storage-path {}]
+      (let [conn    @(fluree/connect-file {:storage-path (str storage-path)
+                                           :defaults
+                                           {:indexing {:reindex-min-bytes 100
+                                                       :reindex-max-bytes 10000000}}})
+            ledger-id "test/class-props"
+            context {"@context" {"ex" "http://example.org/"
+                                 "schema" "http://schema.org/"}}
+            db0     @(fluree/create conn ledger-id)
+
+            ;; Create rich test data with various datatypes, references, and language tags
+            txn     (merge context
+                           {"insert" [{"@id"      "ex:company1"
+                                       "@type"    "ex:Company"
+                                       "schema:name" "Acme Corp"}
+                                      {"@id"      "ex:alice"
+                                       "@type"    "ex:Person"
+                                       "ex:name"  "Alice"
+                                       "ex:age"   30
+                                       "ex:email" "alice@example.com"
+                                       "ex:employer" {"@id" "ex:company1"}
+                                       "ex:bio"   {"@value" "Software engineer"
+                                                   "@language" "en"}}
+                                      {"@id"      "ex:bob"
+                                       "@type"    "ex:Person"
+                                       "ex:name"  "Bob"
+                                       "ex:title" {"@value" "Ingénieur"
+                                                   "@language" "fr"}
+                                       "ex:active" true
+                                       "ex:employer" {"@id" "ex:company1"}}
+                                      {"@id"      "ex:product1"
+                                       "@type"    "ex:Product"
+                                       "ex:name"  "Widget"
+                                       "ex:price" 19.99
+                                       "ex:inStock" true}]})
+            db1      @(fluree/update db0 txn)
+
+            index-ch (async/chan 10)
+            _        @(fluree/commit! conn db1 {:index-files-ch index-ch})
+            _        (<!! (test-utils/block-until-index-complete index-ch))]
+
+        (testing "Full class property structure matches expected format"
+          (let [;; Use ledger-info API which decodes SIDs to IRIs for comparison
+                info @(fluree/ledger-info conn ledger-id)
+                classes (get-in info [:stats :classes])
+
+                expected-classes
+                {"http://example.org/Person"
+                 {:count 2
+                  :properties
+                  {"http://example.org/name"
+                   {:types #{"http://www.w3.org/2001/XMLSchema#string"}
+                    :ref-classes #{}
+                    :langs #{}}
+
+                   "http://example.org/age"
+                   {:types #{"http://www.w3.org/2001/XMLSchema#integer"}
+                    :ref-classes #{}
+                    :langs #{}}
+
+                   "http://example.org/email"
+                   {:types #{"http://www.w3.org/2001/XMLSchema#string"}
+                    :ref-classes #{}
+                    :langs #{}}
+
+                   "http://example.org/employer"
+                   {:types #{"@id"}
+                    :ref-classes #{"http://example.org/Company"}
+                    :langs #{}}
+
+                   "http://example.org/bio"
+                   {:types #{"http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"}
+                    :ref-classes #{}
+                    :langs #{"en"}}
+
+                   "http://example.org/title"
+                   {:types #{"http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"}
+                    :ref-classes #{}
+                    :langs #{"fr"}}
+
+                   "http://example.org/active"
+                   {:types #{"http://www.w3.org/2001/XMLSchema#boolean"}
+                    :ref-classes #{}
+                    :langs #{}}}}
+
+                 "http://example.org/Product"
+                 {:count 1
+                  :properties
+                  {"http://example.org/name"
+                   {:types #{"http://www.w3.org/2001/XMLSchema#string"}
+                    :ref-classes #{}
+                    :langs #{}}
+
+                   "http://example.org/price"
+                   {:types #{"http://www.w3.org/2001/XMLSchema#double"}
+                    :ref-classes #{}
+                    :langs #{}}
+
+                   "http://example.org/inStock"
+                   {:types #{"http://www.w3.org/2001/XMLSchema#boolean"}
+                    :ref-classes #{}
+                    :langs #{}}}}
+
+                 "http://example.org/Company"
+                 {:count 1
+                  :properties
+                  {"http://schema.org/name"
+                   {:types #{"http://www.w3.org/2001/XMLSchema#string"}
+                    :ref-classes #{}
+                    :langs #{}}}}}]
+
+            (is (= expected-classes classes)
+                "All class structures should match expected format")))))))

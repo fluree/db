@@ -136,6 +136,9 @@
 (def indexing-enabled
   (system-iri "indexingEnabled"))
 
+(def track-class-stats
+  (system-iri "trackClassStats"))
+
 (def connection
   (system-iri "connection"))
 
