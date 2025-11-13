@@ -34,8 +34,10 @@
    - Language tags with counts (if datatype is langString)
 
    Processes both assertions (increment) and retractions (decrement).
-   Excludes @type/rdf:type as it's an internal JSON-LD construct."
-  [db class-props classes flake]
+   Excludes @type/rdf:type as it's an internal JSON-LD construct.
+
+   class-cache: atom containing {sid -> #{classes}} to avoid redundant lookups"
+  [db class-props classes flake class-cache]
   (go-try
     (let [prop-sid (flake/p flake)]
       (if (= prop-sid const/$rdf:type) ;; Skip tracking for @type/rdf:type property
@@ -55,10 +57,14 @@
                     prop-data*   (update-in prop-data [:types dt-sid]
                                             (fn [cnt] (max 0 (+ (or cnt 0) delta))))
 
-                    ;; Update ref-class counts if @id type
+                    ;; Update ref-class counts if @id type (with caching)
                     prop-data**  (if (= dt-sid const/$id)
                                    (let [ref-sid (flake/o flake)
-                                         ref-classes (<? (get-subject-classes db ref-sid))]
+                                         ;; Check cache first
+                                         ref-classes (or (@class-cache ref-sid)
+                                                         (let [classes (<? (get-subject-classes db ref-sid))]
+                                                           (swap! class-cache assoc ref-sid classes)
+                                                           classes))]
                                      (reduce (fn [pd ref-cls]
                                                (update-in pd [:ref-classes ref-cls]
                                                           (fn [cnt] (max 0 (+ (or cnt 0) delta)))))
@@ -85,8 +91,9 @@
 
    subject-flakes: All flakes for a single subject (already grouped)
    db: Database to query for class information
-   class-props: Accumulated class property tracking map"
-  [db subject-flakes class-props]
+   class-props: Accumulated class property tracking map
+   class-cache: atom for caching SID -> classes lookups"
+  [db subject-flakes class-props class-cache]
   (go-try
     (let [subject-sid (flake/s (first subject-flakes))
           classes (<? (get-subject-classes db subject-sid))]
@@ -96,7 +103,7 @@
                [f & rest-flakes] subject-flakes]
           (if-not f
             class-props*
-            (let [updated-props (<? (track-property-usage db class-props* classes f))]
+            (let [updated-props (<? (track-property-usage db class-props* classes f class-cache))]
               (recur updated-props rest-flakes))))))))
 
 (defn update-class-counts
@@ -245,7 +252,9 @@
                                                 (assoc acc class-sid {:properties props})
                                                 acc))
                                             {}
-                                            prev-classes)]
+                                            prev-classes)
+                ;; Create cache for SID -> classes lookups (process-specific, not persistent)
+                class-cache (atom {})]
             (log/debug "compute-class-property-stats-async processing"
                        {:subject-groups-count (count subject-groups)})
             (loop [[sg & rest-sgs] subject-groups
@@ -256,7 +265,7 @@
                   (when (zero? (mod idx 10))
                     (log/debug "compute-class-property-stats-async progress"
                                {:processed idx :remaining (count rest-sgs)}))
-                  (let [updated (<? (process-subject-group db sg class-props*))]
+                  (let [updated (<? (process-subject-group db sg class-props* class-cache))]
                     (recur rest-sgs updated (inc idx))))
                 (do
                   (log/debug "compute-class-property-stats-async DONE"
