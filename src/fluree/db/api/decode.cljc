@@ -3,14 +3,21 @@
   (:require [fluree.db.json-ld.iri :as iri]))
 
 (defn property-data
-  "Decodes property data SIDs to IRIs. Returns map with :types, :ref-classes, :langs."
+  "Decodes property data SIDs to IRIs. Returns map with :types, :ref-classes, :langs.
+   Each contains a map of SID/IRI -> count."
   [prop-data ns-codes]
-  (cond-> {:types #{} :ref-classes #{} :langs #{}}
+  (cond-> {:types {} :ref-classes {} :langs {}}
     (:types prop-data)
-    (assoc :types (into #{} (map #(iri/sid->iri % ns-codes)) (:types prop-data)))
+    (assoc :types (reduce-kv (fn [acc sid count]
+                               (assoc acc (iri/sid->iri sid ns-codes) count))
+                             {}
+                             (:types prop-data)))
 
     (:ref-classes prop-data)
-    (assoc :ref-classes (into #{} (map #(iri/sid->iri % ns-codes)) (:ref-classes prop-data)))
+    (assoc :ref-classes (reduce-kv (fn [acc sid count]
+                                     (assoc acc (iri/sid->iri sid ns-codes) count))
+                                   {}
+                                   (:ref-classes prop-data)))
 
     (:langs prop-data)
     (assoc :langs (:langs prop-data))))

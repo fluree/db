@@ -796,65 +796,65 @@
                  {:count 2
                   :properties
                   {"http://example.org/name"
-                   {:types #{"http://www.w3.org/2001/XMLSchema#string"}
-                    :ref-classes #{}
-                    :langs #{}}
+                   {:types {"http://www.w3.org/2001/XMLSchema#string" 2}
+                    :ref-classes {}
+                    :langs {}}
 
                    "http://example.org/age"
-                   {:types #{"http://www.w3.org/2001/XMLSchema#integer"}
-                    :ref-classes #{}
-                    :langs #{}}
+                   {:types {"http://www.w3.org/2001/XMLSchema#integer" 1}  ;; Only Alice has age
+                    :ref-classes {}
+                    :langs {}}
 
                    "http://example.org/email"
-                   {:types #{"http://www.w3.org/2001/XMLSchema#string"}
-                    :ref-classes #{}
-                    :langs #{}}
+                   {:types {"http://www.w3.org/2001/XMLSchema#string" 1}  ;; Only Alice has email
+                    :ref-classes {}
+                    :langs {}}
 
                    "http://example.org/employer"
-                   {:types #{"@id"}
-                    :ref-classes #{"http://example.org/Company"}
-                    :langs #{}}
+                   {:types {"@id" 2}
+                    :ref-classes {"http://example.org/Company" 2}
+                    :langs {}}
 
                    "http://example.org/bio"
-                   {:types #{"http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"}
-                    :ref-classes #{}
-                    :langs #{"en"}}
+                   {:types {"http://www.w3.org/1999/02/22-rdf-syntax-ns#langString" 1}
+                    :ref-classes {}
+                    :langs {"en" 1}}
 
                    "http://example.org/title"
-                   {:types #{"http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"}
-                    :ref-classes #{}
-                    :langs #{"fr"}}
+                   {:types {"http://www.w3.org/1999/02/22-rdf-syntax-ns#langString" 1}
+                    :ref-classes {}
+                    :langs {"fr" 1}}
 
                    "http://example.org/active"
-                   {:types #{"http://www.w3.org/2001/XMLSchema#boolean"}
-                    :ref-classes #{}
-                    :langs #{}}}}
+                   {:types {"http://www.w3.org/2001/XMLSchema#boolean" 1}  ;; Only Bob has active
+                    :ref-classes {}
+                    :langs {}}}}
 
                  "http://example.org/Product"
                  {:count 1
                   :properties
                   {"http://example.org/name"
-                   {:types #{"http://www.w3.org/2001/XMLSchema#string"}
-                    :ref-classes #{}
-                    :langs #{}}
+                   {:types {"http://www.w3.org/2001/XMLSchema#string" 1}
+                    :ref-classes {}
+                    :langs {}}
 
                    "http://example.org/price"
-                   {:types #{"http://www.w3.org/2001/XMLSchema#double"}
-                    :ref-classes #{}
-                    :langs #{}}
+                   {:types {"http://www.w3.org/2001/XMLSchema#double" 1}
+                    :ref-classes {}
+                    :langs {}}
 
                    "http://example.org/inStock"
-                   {:types #{"http://www.w3.org/2001/XMLSchema#boolean"}
-                    :ref-classes #{}
-                    :langs #{}}}}
+                   {:types {"http://www.w3.org/2001/XMLSchema#boolean" 1}
+                    :ref-classes {}
+                    :langs {}}}}
 
                  "http://example.org/Company"
                  {:count 1
                   :properties
                   {"http://schema.org/name"
-                   {:types #{"http://www.w3.org/2001/XMLSchema#string"}
-                    :ref-classes #{}
-                    :langs #{}}}}}]
+                   {:types {"http://www.w3.org/2001/XMLSchema#string" 1}
+                    :ref-classes {}
+                    :langs {}}}}}]
 
             (is (= expected-classes classes)
                 "All class structures should match expected format")))))))

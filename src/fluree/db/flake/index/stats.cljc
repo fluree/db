@@ -29,43 +29,55 @@
 (defn- track-property-usage
   "Track property usage for a flake on given classes.
    Updates the class-props map with:
-   - Property SID used
-   - Datatype of the value
-   - Referenced class SIDs (if datatype is @id)
-   - Language tags (if datatype is langString)
+   - Property SID used with counts per datatype
+   - Referenced class SIDs with counts (if datatype is @id)
+   - Language tags with counts (if datatype is langString)
 
-   Only processes assertion (add) flakes.
+   Processes both assertions (increment) and retractions (decrement).
    Excludes @type/rdf:type as it's an internal JSON-LD construct."
   [db class-props classes flake]
   (go-try
-    (if-not (flake/op flake)
-      class-props
-      (let [prop-sid (flake/p flake)] 
-        (if (= prop-sid const/$rdf:type) ;; Skip tracking for @type/rdf:type property
-          class-props
-          (let [dt-sid (flake/dt flake)]
-            (loop [class-props* class-props
-                   [cls & rest-classes] (seq classes)]
-              (if-not cls
-                class-props*
-                (let [cls-data (get class-props* cls {})
-                      props    (get cls-data :properties {})
-                      prop-data    (get props prop-sid {:types #{} :ref-classes #{} :langs #{}})
-                      prop-data*   (update prop-data :types conj dt-sid)
-                      prop-data**  (if (= dt-sid const/$id)
-                                     (let [ref-sid (flake/o flake)
-                                           ref-classes (<? (get-subject-classes db ref-sid))]
-                                       (update prop-data* :ref-classes into ref-classes))
-                                     prop-data*)
-                      prop-data*** (if (= dt-sid const/$rdf:langString)
-                                     (if-let [lang (get-lang-tag flake)]
-                                       (update prop-data** :langs conj lang)
-                                       prop-data**)
+    (let [prop-sid (flake/p flake)]
+      (if (= prop-sid const/$rdf:type) ;; Skip tracking for @type/rdf:type property
+        class-props
+        (let [dt-sid (flake/dt flake)
+              assert? (flake/op flake)
+              delta (if assert? 1 -1)]
+          (loop [class-props* class-props
+                 [cls & rest-classes] (seq classes)]
+            (if-not cls
+              class-props*
+              (let [cls-data (get class-props* cls {})
+                    props    (get cls-data :properties {})
+                    prop-data    (get props prop-sid {:types {} :ref-classes {} :langs {}})
+
+                    ;; Update type count
+                    prop-data*   (update-in prop-data [:types dt-sid]
+                                            (fn [cnt] (max 0 (+ (or cnt 0) delta))))
+
+                    ;; Update ref-class counts if @id type
+                    prop-data**  (if (= dt-sid const/$id)
+                                   (let [ref-sid (flake/o flake)
+                                         ref-classes (<? (get-subject-classes db ref-sid))]
+                                     (reduce (fn [pd ref-cls]
+                                               (update-in pd [:ref-classes ref-cls]
+                                                          (fn [cnt] (max 0 (+ (or cnt 0) delta)))))
+                                             prop-data*
+                                             ref-classes))
+                                   prop-data*)
+
+                    ;; Update lang counts if langString type
+                    prop-data*** (if (= dt-sid const/$rdf:langString)
+                                   (if-let [lang (get-lang-tag flake)]
+                                     (update-in prop-data** [:langs lang]
+                                                (fn [cnt] (max 0 (+ (or cnt 0) delta))))
                                      prop-data**)
-                      props* (assoc props prop-sid prop-data***)
-                      cls-data* (assoc cls-data :properties props*)
-                      class-props** (assoc class-props* cls cls-data*)]
-                  (recur class-props** rest-classes))))))))))
+                                   prop-data**)
+
+                    props* (assoc props prop-sid prop-data***)
+                    cls-data* (assoc cls-data :properties props*)
+                    class-props** (assoc class-props* cls cls-data*)]
+                (recur class-props** rest-classes)))))))))
 
 (defn process-subject-group
   "Process all flakes for a single subject, tracking property usage on its classes.
@@ -212,13 +224,19 @@
 
 (defn compute-class-property-stats-async
   "Compute enhanced class property statistics by processing all subjects.
-   Returns a map of {class-sid {:properties {prop-sid {:types #{} :ref-classes #{} :langs #{}}}}}}"
+   Returns a map of {class-sid {:properties {prop-sid {:types {dt-sid count} :ref-classes {ref-sid count} :langs {lang count}}}}}"
   [db]
   (go-try
     (let [post-novelty (get-in db [:novelty :post])
           prev-classes (get-in db [:stats :classes] {})]
+      (log/debug "compute-class-property-stats-async START"
+                 {:novelty-size (count post-novelty)
+                  :ledger-alias (:alias db)
+                  :t (:t db)})
       (if (empty? post-novelty)
-        {}
+        (do
+          (log/debug "compute-class-property-stats-async EMPTY - returning {}")
+          {})
         (try*
           (let [subject-groups (partition-by flake/s post-novelty)
                 ;; Extract only :properties from previous classes
@@ -228,12 +246,22 @@
                                                 acc))
                                             {}
                                             prev-classes)]
+            (log/debug "compute-class-property-stats-async processing"
+                       {:subject-groups-count (count subject-groups)})
             (loop [[sg & rest-sgs] subject-groups
-                   class-props* prev-class-props]
+                   class-props* prev-class-props
+                   idx 0]
               (if sg
-                (let [updated (<? (process-subject-group db sg class-props*))]
-                  (recur rest-sgs updated))
-                class-props*)))
+                (do
+                  (when (zero? (mod idx 10))
+                    (log/debug "compute-class-property-stats-async progress"
+                               {:processed idx :remaining (count rest-sgs)}))
+                  (let [updated (<? (process-subject-group db sg class-props*))]
+                    (recur rest-sgs updated (inc idx))))
+                (do
+                  (log/debug "compute-class-property-stats-async DONE"
+                             {:processed idx})
+                  class-props*))))
           (catch* e
             (log/error e "Class property stats computation failed"
                        {:novelty-size (get-in db [:novelty :size])

@@ -100,18 +100,21 @@
      properties)))
 
 (defn serialize-class-property-data
-  "Serialize property data map for a class: {:types #{} :ref-classes #{} :langs #{}}
-   Uses JSON arrays instead of EDN serialization."
+  "Serialize property data map for a class: {:types {sid count} :ref-classes {sid count} :langs {lang count}}
+   Uses JSON arrays of [sid-vec count] tuples instead of EDN serialization."
   [prop-data]
   (cond-> {}
     (seq (:types prop-data))
-    (assoc "types" (vec (map iri/serialize-sid (:types prop-data))))
+    (assoc "types" (vec (map (fn [[sid cnt]] [(iri/serialize-sid sid) cnt])
+                             (:types prop-data))))
 
     (seq (:ref-classes prop-data))
-    (assoc "refClasses" (vec (map iri/serialize-sid (:ref-classes prop-data))))
+    (assoc "refClasses" (vec (map (fn [[sid cnt]] [(iri/serialize-sid sid) cnt])
+                                  (:ref-classes prop-data))))
 
     (seq (:langs prop-data))
-    (assoc "langs" (vec (:langs prop-data)))))
+    (assoc "langs" (vec (map (fn [[lang cnt]] [lang cnt])
+                             (:langs prop-data))))))
 
 (defn serialize-class-properties
   "Serialize properties map for a class.
@@ -140,26 +143,31 @@
      classes)))
 
 (defn deserialize-class-property-data
-  "Deserialize property data map: {:types #{} :ref-classes #{} :langs #{}}
-   Expects JSON arrays of sid-vecs for types/ref-classes and strings for langs."
+  "Deserialize property data map: {:types {sid count} :ref-classes {sid count} :langs {lang count}}
+   Expects JSON arrays of [[sid-vec count]] tuples for types/ref-classes and [[lang count]] for langs."
   [prop-data]
   (let [;; Handle both keywordized and string keys
         types-val (or (get prop-data :types) (get prop-data "types"))
         ref-classes-val (or (get prop-data :refClasses) (get prop-data "refClasses"))
         langs-val (or (get prop-data :langs) (get prop-data "langs"))]
-    (cond-> {:types #{} :ref-classes #{} :langs #{}}
+    (cond-> {:types {} :ref-classes {} :langs {}}
       types-val
-      (assoc :types (into #{}
-                          (map (fn [[ns-code nme]] (iri/->sid ns-code nme)))
-                          types-val))
+      (assoc :types (reduce (fn [acc [[ns-code nme] cnt]]
+                              (assoc acc (iri/->sid ns-code nme) cnt))
+                            {}
+                            types-val))
 
       ref-classes-val
-      (assoc :ref-classes (into #{}
-                                (map (fn [[ns-code nme]] (iri/->sid ns-code nme)))
-                                ref-classes-val))
+      (assoc :ref-classes (reduce (fn [acc [[ns-code nme] cnt]]
+                                    (assoc acc (iri/->sid ns-code nme) cnt))
+                                  {}
+                                  ref-classes-val))
 
       langs-val
-      (assoc :langs (set langs-val)))))
+      (assoc :langs (reduce (fn [acc [lang cnt]]
+                              (assoc acc lang cnt))
+                            {}
+                            langs-val)))))
 
 (defn deserialize-class-properties
   "Deserialize properties map for a class.
