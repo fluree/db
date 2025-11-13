@@ -707,11 +707,16 @@
       (catch* e (log/debug e "Failed to complete ledger deletion")))))
 
 (defn resolve-txn
-  "Reads a transaction from the commit catalog by address.
+  "Reads a transaction from the commit catalog by address. Throws an error if the
+  address doesn't exist.
 
    Used by fluree/server in consensus/events."
   [{:keys [commit-catalog] :as _conn} address]
-  (storage/read-json commit-catalog address))
+  (go-try
+    (or (<? (storage/read-json commit-catalog address))
+        (throw (ex-info (str "No transaction exists for address " address
+                             " in commit storage.")
+                        {:status 404, :error :db/missing-transaction})))))
 
 (defn replicate-index-node
   [conn address data]
