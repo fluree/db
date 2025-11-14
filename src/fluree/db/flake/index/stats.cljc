@@ -140,11 +140,8 @@
 
 (defn- track-property-usage-sync
   "Synchronous version of track-property-usage for novelty replay.
-   Only tracks properties for subjects whose classes are in the subject-classes-map.
-
-   subject-classes-map: Pre-built map of {subject-sid -> #{class-sids}} from novelty
    ref-classes-map: Pre-built map of {ref-sid -> #{class-sids}} from novelty (for @id refs)"
-  [class-props classes flake subject-classes-map ref-classes-map]
+  [class-props classes flake ref-classes-map]
   (let [prop-sid (flake/p flake)]
     (if (= prop-sid const/$rdf:type) ;; Skip tracking for @type/rdf:type property
       class-props
@@ -211,7 +208,7 @@
                  class-props
                  (reduce
                   (fn [cp f]
-                    (track-property-usage-sync cp classes f subject-classes-map subject-classes-map))
+                    (track-property-usage-sync cp classes f subject-classes-map))
                   class-props
                   subject-flakes))))
            prev-class-props
