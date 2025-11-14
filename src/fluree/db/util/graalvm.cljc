@@ -15,22 +15,37 @@
 
 (defn runtime?
   "Detects if running in GraalVM native-image at runtime.
-   Uses ImageInfo API when available, returns false otherwise (regular JVM).
-   This uses reflection to avoid ClassNotFoundException on regular JVM."
+   Uses system property check first, with reflection fallback.
+   Returns false for regular JVM."
   []
   #?(:clj
-     (try
-       ;; Try to use GraalVM's ImageInfo API to detect native-image runtime
-       (let [image-info-class (Class/forName "org.graalvm.nativeimage.ImageInfo")
-             method           (.getMethod image-info-class "inImageRuntimeCode" (into-array Class []))]
-         (boolean (.invoke method nil (object-array 0))))
-       (catch ClassNotFoundException _
-         ;; ImageInfo class not available - running on regular JVM
-         false)
-       (catch Exception e
-         ;; Any other error, assume regular JVM
-         (log/warn e "Error detecting GraalVM runtime, assuming regular JVM")
-         false))
+     (if-some [prop (System/getProperty "org.graalvm.nativeimage.imagecode")]
+       (let [runtime? (= "runtime" (.toLowerCase prop))]
+         (when runtime?
+           (log/info "Detected GraalVM native-image runtime via system property"))
+         runtime?)
+       (try
+           ;; Fallback: try to use GraalVM's ImageInfo constants
+         (let [cls          (Class/forName "org.graalvm.nativeimage.ImageInfo")
+               key-field    (.getField cls "PROPERTY_IMAGE_CODE_KEY")
+               val-field    (.getField cls "PROPERTY_IMAGE_CODE_VALUE_RUNTIME")
+               key          (.get key-field nil)
+               val-runtime  (.get val-field nil)
+               prop2        (System/getProperty (str key))
+               runtime?   (= (str val-runtime) prop2)]
+           (when runtime?
+             (log/info "Detected GraalVM native-image runtime via ImageInfo constants"))
+           runtime?)
+         (catch ClassNotFoundException _
+             ;; ImageInfo class not available - running on regular JVM
+           false)
+         (catch NoSuchFieldException _
+             ;; Fields not available in this GraalVM version - assume regular JVM
+           false)
+         (catch Throwable e
+             ;; Any unexpected error, log and assume regular JVM
+           (log/warn e "Unexpected error detecting GraalVM runtime, assuming regular JVM")
+           false)))
      :cljs false))
 
 #?(:clj
