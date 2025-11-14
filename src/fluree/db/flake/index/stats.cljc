@@ -119,6 +119,111 @@
           prev-classes
           property-flakes))
 
+(defn- build-subject-classes-map
+  "Build a map of {subject-sid -> #{class-sids}} from novelty flakes.
+   Only looks at rdf:type flakes in novelty to determine classes for subjects.
+   This is synchronous - no async queries needed."
+  [novelty-flakes]
+  (let [;; Find all rdf:type flakes in novelty
+        type-flakes (filter flake/class-flake? novelty-flakes)]
+    ;; Build map from novelty type flakes
+    (reduce
+     (fn [acc f]
+       (let [subject-sid (flake/s f)
+             class-sid (flake/o f)
+             assert? (flake/op f)]
+         (if assert?
+           (update acc subject-sid (fnil conj #{}) class-sid)
+           (update acc subject-sid (fnil disj #{}) class-sid))))
+     {}
+     type-flakes)))
+
+(defn- track-property-usage-sync
+  "Synchronous version of track-property-usage for novelty replay.
+   Only tracks properties for subjects whose classes are in the subject-classes-map.
+
+   subject-classes-map: Pre-built map of {subject-sid -> #{class-sids}} from novelty
+   ref-classes-map: Pre-built map of {ref-sid -> #{class-sids}} from novelty (for @id refs)"
+  [class-props classes flake subject-classes-map ref-classes-map]
+  (let [prop-sid (flake/p flake)]
+    (if (= prop-sid const/$rdf:type) ;; Skip tracking for @type/rdf:type property
+      class-props
+      (let [dt-sid (flake/dt flake)
+            assert? (flake/op flake)
+            delta (if assert? 1 -1)]
+        (reduce
+         (fn [class-props* cls]
+           (let [cls-data (get class-props* cls {})
+                 props    (get cls-data :properties {})
+                 prop-data    (get props prop-sid {:types {} :ref-classes {} :langs {}})
+
+                 ;; Update type count
+                 prop-data*   (update-in prop-data [:types dt-sid]
+                                         (fn [cnt] (max 0 (+ (or cnt 0) delta))))
+
+                 ;; Update ref-class counts if @id type
+                 prop-data**  (if (= dt-sid const/$id)
+                                (let [ref-sid (flake/o flake)
+                                      ;; Get ref classes from pre-built map
+                                      ref-classes (get ref-classes-map ref-sid #{})]
+                                  (reduce (fn [pd ref-cls]
+                                            (update-in pd [:ref-classes ref-cls]
+                                                       (fn [cnt] (max 0 (+ (or cnt 0) delta)))))
+                                          prop-data*
+                                          ref-classes))
+                                prop-data*)
+
+                 ;; Update lang counts if langString type
+                 prop-data*** (if (= dt-sid const/$rdf:langString)
+                                (if-let [lang (get-lang-tag flake)]
+                                  (update-in prop-data** [:langs lang]
+                                             (fn [cnt] (max 0 (+ (or cnt 0) delta))))
+                                  prop-data**)
+                                prop-data**)
+
+                 props* (assoc props prop-sid prop-data***)
+                 cls-data* (assoc cls-data :properties props*)]
+             (assoc class-props* cls cls-data*)))
+         class-props
+         classes)))))
+
+(defn compute-class-property-stats-from-novelty
+  "Compute class property statistics from novelty for ledger-info.
+   Only tracks subjects that have rdf:type assertions in novelty.
+   Returns updated classes map with :properties details merged from novelty."
+  [novelty-flakes prev-classes]
+  (if (empty? novelty-flakes)
+    prev-classes
+    (let [subject-classes-map (build-subject-classes-map novelty-flakes)
+          prev-class-props (reduce-kv (fn [acc class-sid class-data]
+                                        (if-let [props (:properties class-data)]
+                                          (assoc acc class-sid {:properties props})
+                                          acc))
+                                      {}
+                                      prev-classes)
+          subject-groups (partition-by flake/s novelty-flakes)
+          updated-class-props
+          (reduce
+           (fn [class-props subject-flakes]
+             (let [subject-sid (flake/s (first subject-flakes))
+                   classes (get subject-classes-map subject-sid)]
+               (if (empty? classes)
+                 class-props
+                 (reduce
+                  (fn [cp f]
+                    (track-property-usage-sync cp classes f subject-classes-map subject-classes-map))
+                  class-props
+                  subject-flakes))))
+           prev-class-props
+           subject-groups)]
+      (reduce-kv
+       (fn [acc class-sid class-data]
+         (if-let [updated-props (get-in updated-class-props [class-sid :properties])]
+           (assoc acc class-sid (assoc class-data :properties updated-props))
+           (assoc acc class-sid class-data)))
+       {}
+       prev-classes))))
+
 (defn- process-property-group
   "Process all flakes for a single property, updating counts and sketches.
    Returns updated property data and sketch for this property only."

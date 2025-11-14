@@ -564,11 +564,15 @@
     - :size - Total byte size
     - :flakes - Total flake count
     - :commit - Commit metadata
-    - :properties - Map of property IRI -> stats (count, NDV, selectivity, etc.)
-    - :classes - Map of class IRI -> stats (with nested property details decoded)
+    - :stats - Statistics map containing:
+      - :properties - Map of property IRI -> stats (count, NDV, selectivity, :sub-property-of)
+      - :classes - Map of class IRI -> stats (count, :subclass-of, nested property details)
 
   Property and class counts are computed from the most recent index plus
-  any novelty, providing absolutely current statistics."
+  any novelty, providing absolutely current statistics.
+
+  Hierarchy information (:sub-property-of, :subclass-of) shows direct parent relationships
+  for properties and classes that have them."
   [conn ledger-id]
   (validate-connection conn)
   (promise-wrap

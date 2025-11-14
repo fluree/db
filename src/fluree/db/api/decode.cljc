@@ -60,15 +60,69 @@
   [ns-codes]
   (reduce-kv #(assoc %1 %3 %2) {} ns-codes))
 
+(defn- decode-sid-set
+  "Converts a set of SIDs to a vector of IRIs."
+  [sid-set ns-codes]
+  (when (seq sid-set)
+    (vec (map #(iri/sid->iri % ns-codes) sid-set))))
+
+(defn- merge-property-hierarchy
+  "Merges property hierarchy (subPropertyOf) into property stats.
+   Returns property stats with :sub-property-of added where applicable."
+  [property-stats schema ns-codes]
+  (let [pred-map (get schema :pred {})]
+    (reduce-kv
+     (fn [acc prop-iri prop-stats]
+       (let [;; Find the SID for this property IRI
+             prop-sid (some (fn [[sid prop-data]]
+                              (when (= (:iri prop-data) prop-iri)
+                                sid))
+                            pred-map)
+             ;; Get parent properties (subPropertyOf)
+             parent-props (when prop-sid
+                            (get-in pred-map [prop-sid :parentProps]))
+             ;; Decode parent SIDs to IRIs
+             parent-iris (decode-sid-set parent-props ns-codes)]
+         (if parent-iris
+           (assoc acc prop-iri (assoc prop-stats :sub-property-of parent-iris))
+           (assoc acc prop-iri prop-stats))))
+     {}
+     property-stats)))
+
+(defn- merge-class-hierarchy
+  "Merges class hierarchy (subClassOf) into class stats.
+   Returns class stats with :subclass-of added where applicable."
+  [class-stats schema ns-codes]
+  (let [pred-map (get schema :pred {})]
+    (reduce-kv
+     (fn [acc class-iri class-data]
+       (let [class-sid (some (fn [[sid class-info]]
+                               (when (= (:iri class-info) class-iri)
+                                 sid))
+                             pred-map)
+             parent-classes (when class-sid
+                              (get-in pred-map [class-sid :subclassOf]))
+             parent-iris (decode-sid-set parent-classes ns-codes)]
+         (if parent-iris
+           (assoc acc class-iri (assoc class-data :subclass-of parent-iris))
+           (assoc acc class-iri class-data))))
+     {}
+     class-stats)))
+
 (defn ledger-info
-  "Decodes ledger info by converting SIDs to IRIs and preparing for external consumption."
+  "Decodes ledger info by converting SIDs to IRIs and preparing for external consumption.
+   Merges schema hierarchy (subClassOf, subPropertyOf) into stats for classes and properties."
   [info]
   (let [ns-codes (:namespace-codes info)
+        schema (:schema info)
         props (sid-keys (get-in info [:stats :properties]) ns-codes)
         class-stats (classes (get-in info [:stats :classes] {}) ns-codes)
+        ;; Merge hierarchy info into stats
+        props-with-hierarchy (merge-property-hierarchy props schema ns-codes)
+        classes-with-hierarchy (merge-class-hierarchy class-stats schema ns-codes)
         inverted-ns (invert-namespace-codes ns-codes)]
     (-> info
-        (assoc-in [:stats :properties] props)
-        (assoc-in [:stats :classes] class-stats)
+        (assoc-in [:stats :properties] props-with-hierarchy)
+        (assoc-in [:stats :classes] classes-with-hierarchy)
         (assoc :namespace-codes inverted-ns)
-        (dissoc :novelty-post))))
+        (dissoc :novelty-post :schema))))

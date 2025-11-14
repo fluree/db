@@ -101,24 +101,26 @@
 
 (defn serialize-class-property-data
   "Serialize property data map for a class: {:types {sid count} :ref-classes {sid count} :langs {lang count}}
-   Uses JSON arrays of [sid-vec count] tuples instead of EDN serialization."
+   Uses compact tuple format: [types-vec, ref-classes-vec, langs-vec]
+   Each vec contains [sid/lang, count] tuples."
   [prop-data]
-  (cond-> {}
-    (seq (:types prop-data))
-    (assoc "types" (vec (map (fn [[sid cnt]] [(iri/serialize-sid sid) cnt])
-                             (:types prop-data))))
-
-    (seq (:ref-classes prop-data))
-    (assoc "refClasses" (vec (map (fn [[sid cnt]] [(iri/serialize-sid sid) cnt])
-                                  (:ref-classes prop-data))))
-
-    (seq (:langs prop-data))
-    (assoc "langs" (vec (map (fn [[lang cnt]] [lang cnt])
-                             (:langs prop-data))))))
+  (let [types (if (seq (:types prop-data))
+                (vec (map (fn [[sid cnt]] [(iri/serialize-sid sid) cnt])
+                          (:types prop-data)))
+                [])
+        ref-classes (if (seq (:ref-classes prop-data))
+                      (vec (map (fn [[sid cnt]] [(iri/serialize-sid sid) cnt])
+                                (:ref-classes prop-data)))
+                      [])
+        langs (if (seq (:langs prop-data))
+                (vec (map (fn [[lang cnt]] [lang cnt])
+                          (:langs prop-data)))
+                [])]
+    [types ref-classes langs]))
 
 (defn serialize-class-properties
   "Serialize properties map for a class.
-   Returns vector of [prop-sid-vec prop-data-map] tuples for JSON compatibility."
+   Returns vector of [prop-sid-vec [types ref-classes langs]] tuples using compact format."
   [properties]
   (when (seq properties)
     (reduce-kv
@@ -129,49 +131,71 @@
      properties)))
 
 (defn serialize-class-stats
-  "Serialize class stats map. Classes have :count and optionally :properties.
-   Returns vector of [class-sid-vec class-data-map] tuples for JSON compatibility."
+  "Serialize class stats map using compact tuple format.
+   Format: [class-sid-vec [count properties-vec]]
+   Where properties-vec is [[prop-sid [types ref-classes langs]] ...]
+   This eliminates string keys like 'count', 'properties', 'types', etc."
   [classes]
   (when classes
     (reduce-kv
      (fn [acc class-sid class-data]
-       (let [serialized (cond-> {"count" (:count class-data)}
-                          (:properties class-data)
-                          (assoc "properties" (serialize-class-properties (:properties class-data))))]
-         (conj acc [(iri/serialize-sid class-sid) serialized])))
+       (let [count (:count class-data)
+             props (serialize-class-properties (:properties class-data))]
+         (conj acc [(iri/serialize-sid class-sid) [count props]])))
      []
      classes)))
 
 (defn deserialize-class-property-data
-  "Deserialize property data map: {:types {sid count} :ref-classes {sid count} :langs {lang count}}
-   Expects JSON arrays of [[sid-vec count]] tuples for types/ref-classes and [[lang count]] for langs."
+  "Deserialize property data from compact tuple format: [types ref-classes langs]
+   Also handles legacy map format for backward compatibility."
   [prop-data]
-  (let [;; Handle both keywordized and string keys
-        types-val (or (get prop-data :types) (get prop-data "types"))
-        ref-classes-val (or (get prop-data :refClasses) (get prop-data "refClasses"))
-        langs-val (or (get prop-data :langs) (get prop-data "langs"))]
-    (cond-> {:types {} :ref-classes {} :langs {}}
-      types-val
-      (assoc :types (reduce (fn [acc [[ns-code nme] cnt]]
-                              (assoc acc (iri/->sid ns-code nme) cnt))
-                            {}
-                            types-val))
+  (if (vector? prop-data)
+    ;; New compact tuple format: [types ref-classes langs]
+    (let [[types-val ref-classes-val langs-val] prop-data]
+      (cond-> {:types {} :ref-classes {} :langs {}}
+        (seq types-val)
+        (assoc :types (reduce (fn [acc [[ns-code nme] cnt]]
+                                (assoc acc (iri/->sid ns-code nme) cnt))
+                              {}
+                              types-val))
 
-      ref-classes-val
-      (assoc :ref-classes (reduce (fn [acc [[ns-code nme] cnt]]
-                                    (assoc acc (iri/->sid ns-code nme) cnt))
-                                  {}
-                                  ref-classes-val))
+        (seq ref-classes-val)
+        (assoc :ref-classes (reduce (fn [acc [[ns-code nme] cnt]]
+                                      (assoc acc (iri/->sid ns-code nme) cnt))
+                                    {}
+                                    ref-classes-val))
 
-      langs-val
-      (assoc :langs (reduce (fn [acc [lang cnt]]
-                              (assoc acc lang cnt))
-                            {}
-                            langs-val)))))
+        (seq langs-val)
+        (assoc :langs (reduce (fn [acc [lang cnt]]
+                                (assoc acc lang cnt))
+                              {}
+                              langs-val))))
+    ;; Legacy map format: {"types" [...] "refClasses" [...] "langs" [...]}
+    (let [types-val (or (get prop-data :types) (get prop-data "types"))
+          ref-classes-val (or (get prop-data :refClasses) (get prop-data "refClasses"))
+          langs-val (or (get prop-data :langs) (get prop-data "langs"))]
+      (cond-> {:types {} :ref-classes {} :langs {}}
+        types-val
+        (assoc :types (reduce (fn [acc [[ns-code nme] cnt]]
+                                (assoc acc (iri/->sid ns-code nme) cnt))
+                              {}
+                              types-val))
+
+        ref-classes-val
+        (assoc :ref-classes (reduce (fn [acc [[ns-code nme] cnt]]
+                                      (assoc acc (iri/->sid ns-code nme) cnt))
+                                    {}
+                                    ref-classes-val))
+
+        langs-val
+        (assoc :langs (reduce (fn [acc [lang cnt]]
+                                (assoc acc lang cnt))
+                              {}
+                              langs-val))))))
 
 (defn deserialize-class-properties
   "Deserialize properties map for a class.
-   Expects vector of [prop-sid-vec prop-data-map] tuples."
+   Expects vector of [prop-sid-vec prop-data] tuples where prop-data is compact tuple format."
   [properties]
   (when properties
     (reduce
@@ -183,24 +207,36 @@
      properties)))
 
 (defn deserialize-class-stats
-  "Deserialize class stats. Classes have :count and optionally :properties.
-   Expects vector of [class-sid-vec class-data-map] tuples.
-   Also handles legacy format: vector of [sid count] tuples (for backward compatibility)."
+  "Deserialize class stats from compact tuple format or legacy formats.
+   New format: [sid-vec [count properties-vec]]
+   Legacy map format: [sid-vec {:count ... :properties ...}]
+   Oldest format: [sid-vec count]"
   [classes]
   (when classes
     (reduce
      (fn [acc [sid-vec class-data]]
        (let [[ns-code nme] sid-vec
              class-sid (iri/->sid ns-code nme)]
-         (if (map? class-data)
-           ;; Current format: [sid-vec {:count ... :properties ...}]
+         (cond
+           ;; New compact tuple format: [count props]
+           (and (vector? class-data) (number? (first class-data)))
+           (let [[count-val props] class-data
+                 deserialized (cond-> {:count count-val}
+                                (seq props)
+                                (assoc :properties (deserialize-class-properties props)))]
+             (assoc acc class-sid deserialized))
+
+           ;; Legacy map format: {:count ... :properties ...}
+           (map? class-data)
            (let [count-val (or (get class-data :count) (get class-data "count"))
                  props (or (get class-data :properties) (get class-data "properties"))
                  deserialized (cond-> {:count count-val}
                                 props
                                 (assoc :properties (deserialize-class-properties props)))]
              (assoc acc class-sid deserialized))
-           ;; Legacy format: [sid-vec count]
+
+           ;; Oldest format: just count number
+           :else
            (assoc acc class-sid {:count class-data}))))
      {}
      classes)))

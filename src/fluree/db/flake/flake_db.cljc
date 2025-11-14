@@ -524,6 +524,7 @@
             index-id      (get-in commit [:index :id])
             index-t       (get-in commit [:index :data :t])]
         {:stats           stats
+         :schema          schema
          :namespace-codes namespace-codes
          :t               t
          :novelty-post    (get novelty :post)

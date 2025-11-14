@@ -371,31 +371,40 @@
 
 (defn- compute-counts-from-novelty
   "Update property and class counts from novelty, keeping NDV/selectivity from indexed stats.
-   This is a fast, synchronous computation for ledger-info that only updates counts.
+   Also updates class property details (types, ref-classes, langs) from novelty.
+   This is a fast, synchronous computation for ledger-info.
    NDV values require loading sketches from disk (expensive), so we keep indexed NDV as-is.
 
    Returns {:properties {sid -> {:count n :ndv-values n :ndv-subjects n :selectivity-* n}}
-            :classes {sid -> {:count n}}}"
+            :classes {sid -> {:count n :properties {prop -> {:types {...} :ref-classes {...} :langs {...}}}}}}"
   [novelty-flakes prev-properties prev-classes]
-  (let [property-groups (partition-by flake/p novelty-flakes)]
-    (reduce
-     (fn [acc property-flakes]
-       (let [p (flake/p (first property-flakes))
-             prev-prop-data (get prev-properties p {:count 0})
+  (let [property-groups (partition-by flake/p novelty-flakes)
+        ;; First pass: update property counts and class counts
+        updated-counts
+        (reduce
+         (fn [acc property-flakes]
+           (let [p (flake/p (first property-flakes))
+                 prev-prop-data (get prev-properties p {:count 0})
 
-             ;; Update count only (keep indexed NDV/selectivity)
-             property-data (update-property-count property-flakes prev-prop-data)
+                 property-data (update-property-count property-flakes prev-prop-data)
 
-             ;; Update class counts if rdf:type property
-             classes* (if (flake/class-flake? (first property-flakes))
-                        (stats/update-class-counts property-flakes (:classes acc))
-                        (:classes acc))]
+                 classes* (if (flake/class-flake? (first property-flakes))
+                            (stats/update-class-counts property-flakes (:classes acc))
+                            (:classes acc))]
 
-         {:properties (assoc (:properties acc) p property-data)
-          :classes classes*}))
-     {:properties prev-properties
-      :classes prev-classes}
-     property-groups)))
+             {:properties (assoc (:properties acc) p property-data)
+              :classes classes*}))
+         {:properties prev-properties
+          :classes prev-classes}
+         property-groups)
+
+        ;; Second pass: update class property details (types, ref-classes, langs)
+        updated-class-props (stats/compute-class-property-stats-from-novelty
+                             novelty-flakes
+                             (:classes updated-counts))]
+
+    {:properties (:properties updated-counts)
+     :classes updated-class-props}))
 
 (defn current-stats
   "Compute current property and class statistics for ledger-info.
