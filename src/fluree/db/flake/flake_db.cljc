@@ -48,9 +48,10 @@
 
 (defn empty-all-novelty
   [db]
-  (let [cleared (reduce (fn [db* idx]
-                          (update-in db* [:novelty idx] empty))
-                        db index/types)]
+  (let [cleared (->> (index/indexes-for db)
+                     (reduce (fn [db* idx]
+                               (update-in db* [:novelty idx] empty))
+                             db))]
     (assoc-in cleared [:novelty :size] 0)))
 
 (defn novelty-after-t
@@ -67,19 +68,19 @@
     (empty-all-novelty db)
 
     (flake/t-before? t (:t db))
-    (let [novelty (reduce (fn [acc idx]
+    (let [indexes (index/indexes-for db)
+          novelty (reduce (fn [acc idx]
                             (assoc acc idx
                                    #?(:clj  (future (novelty-after-t db t idx))
                                       :cljs (novelty-after-t db t idx))))
-                          {} index/types)
+                          {} indexes)
           size    (flake/size-bytes #?(:clj  @(:spot novelty)
                                        :cljs (:spot novelty)))
-          db*     (reduce
-                   (fn [db* idx]
-                     (assoc-in db* [:novelty idx] #?(:clj  @(get novelty idx)
-                                                     :cljs (get novelty idx))))
-                   (assoc-in db [:novelty :size] size)
-                   index/types)]
+          db*     (reduce (fn [db* idx]
+                            (assoc-in db* [:novelty idx] #?(:clj  @(get novelty idx)
+                                                            :cljs (get novelty idx))))
+                          (assoc-in db [:novelty :size] size)
+                          indexes)]
       db*)
 
     :else
@@ -99,18 +100,15 @@
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
   If it is not newer, returns original db."
-  [{:keys [commit] :as db} {data-map :data, :keys [spot psot post opst tspo] :as index-map}]
+  [{:keys [commit] :as db} {data-map :data, :as index-map}]
   (if (newer-index? commit index-map)
-    (let [index-t (:t data-map)
-          commit* (assoc commit :index index-map)]
+    (let [index-t     (:t data-map)
+          commit*     (assoc commit :index index-map)
+          index-roots (index/select-roots index-map)]
       (-> db
           (empty-novelty index-t)
-          (assoc :commit commit*
-                 :spot spot
-                 :psot psot
-                 :post post
-                 :opst opst
-                 :tspo tspo)
+          (assoc :commit commit*)
+          (merge index-roots)
           (assoc-in [:stats :indexed] index-t)))
     db))
 
@@ -329,6 +327,9 @@
   (-match-triple [db tracker solution triple-mch error-ch]
     (match/match-triple db tracker solution triple-mch error-ch))
 
+  (-match-properties [db tracker solution triple-mchs error-ch]
+    (match/match-properties db tracker solution triple-mchs error-ch))
+
   (-match-class [db tracker solution class-mch error-ch]
     (match/match-class db tracker solution class-mch error-ch))
 
@@ -524,13 +525,10 @@
 
 (defn new-novelty-map
   [comparators]
-  (reduce
-   (fn [m idx]
-     (assoc m idx (-> comparators
-                      (get idx)
-                      flake/sorted-set-by)))
-   {:size 0
-    :t    0} index/types))
+  (reduce-kv (fn [m idx cmp]
+               (assoc m idx (flake/sorted-set-by cmp)))
+             {:size 0, :t 0}
+             comparators))
 
 (defn genesis-root-map
   [ledger-alias]
@@ -628,6 +626,11 @@
            :reindex-max-bytes reindex-max-bytes
            :max-old-indexes max-old-indexes)))
 
+(defn root-comparators
+  [root-map]
+  (let [indexes (index/indexes-for root-map)]
+    (select-keys index/comparators indexes)))
+
 ;; TODO - VG - need to reify vg from db-root!!
 (defn load
   ([ledger-alias commit-catalog index-catalog commit-pair]
@@ -640,6 +643,7 @@
            root-map    (if-let [{:keys [address]} (:index commit-map)]
                          (<? (index-storage/read-db-root index-catalog address))
                          (genesis-root-map ledger-alias))
+           comparators (root-comparators root-map)
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
            indexed-db  (-> root-map
                            (add-reindex-thresholds indexing-opts)
@@ -648,9 +652,9 @@
                                   :alias ledger-alias
                                   :commit commit-map
                                   :tt-id nil
-                                  :comparators index/comparators
+                                  :comparators comparators
                                   :staged nil
-                                  :novelty (new-novelty-map index/comparators)
+                                  :novelty (new-novelty-map comparators)
                                   :max-namespace-code max-ns-code)
                            map->FlakeDB
                            policy/root)
