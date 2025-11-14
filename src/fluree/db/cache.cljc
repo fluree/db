@@ -22,13 +22,13 @@
      (let [runtime      (Runtime/getRuntime)
            max-memory   (.maxMemory runtime)
            total-memory (.totalMemory runtime)
-           is-graalvm?  (graalvm/runtime?)
-           effective-mb (if is-graalvm?
+           graalvm?     (graalvm/runtime?)
+           effective-mb (if graalvm?
                           (/ total-memory 1024.0 1024.0)   ; Case 2: GraalVM
                           (/ max-memory 1024.0 1024.0))    ; Case 1: JVM
            cache-mb     (int (/ effective-mb 2.0))]
        (log/info (str "Detected " (int effective-mb) "MB available memory"
-                      (when is-graalvm? " (GraalVM native-image)")
+                      (when graalvm? " (GraalVM native-image)")
                       ", setting default cache to " cache-mb "MB"))
        cache-mb)
      :cljs
