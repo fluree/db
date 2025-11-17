@@ -291,84 +291,6 @@
         (mapcat (partial expand-subclasses db))
         triple-group))
 
-(defn get-property-ids
-  "Extracts all property IDs from the `triples` collection."
-  [db triples]
-  (into #{}
-        (map (fn [[_s p _o]]
-               (where/get-sid p db)))
-        triples))
-
-(defn group-by-pid
-  "Builds a map from each property ID appearing in triples from `triple-groups` to
-  a collection of all the triples it appears in."
-  [db triple-groups]
-  (reduce (fn [acc triples]
-            (let [pids (get-property-ids db triples)]
-              (reduce (fn [m pid]
-                        (update m pid (fnil conj #{}) triples))
-                      acc
-                      pids)))
-          {} triple-groups))
-
-(defn consolidate
-  "Consolidates a collection of sequences into a single distinct vector.
-
-  Concatenates all elements from all sequences in `seqs`, removes duplicates,
-  and returns the result as a vector."
-  [seqs]
-  (into []
-        (comp cat
-              (distinct))
-        seqs))
-
-(defn group-shared-properties
-  "Finds all triples vectors transitively connected to the seed via shared properties.
-
-  Uses breadth-first search to find all triples vectors that share at least one
-  property ID with the seed or with any triples vector connected to it.
-
-  Returns a set of all connected triples vectors including the seed."
-  [db pid->triples seed]
-  (loop [remaining #{seed}
-         visited   #{}]
-    (if-let [current (first remaining)]
-      (let [remaining*      (disj remaining current)
-            related-triples (->> (get-property-ids db current)
-                                 (map (fn [pid]
-                                        (get pid->triples pid)))
-                                 (apply set/union))
-            new-triples     (set/difference related-triples visited)]
-        (recur (into remaining* new-triples)
-               (conj visited current)))
-      visited)))
-
-(defn merge-related-property-groups
-  "Merges groups of triples that share any properties (handles equivalent properties).
-
-  When properties are equivalent (owl:equivalentProperty), they appear in each
-  other's childProps. This means querying either property will expand to include
-  both. If the query has separate patterns for both properties, we need to merge
-  them into a single triples vector so the join treats them as the same
-  constraint.
-
-  Uses a union-find-like algorithm to group triples vectors that share properties.
-
-  Returns a sequence of merged triples vectors."
-  [db triple-groups]
-  (if (empty? triple-groups)
-    []
-    (let [pid->triples (group-by-pid db triple-groups)]
-      (loop [remaining (set triple-groups)
-             result    []]
-        (if (empty? remaining)
-          result
-          (let [seed            (first remaining)
-                related-triples (group-shared-properties db pid->triples seed)
-                merged-triples  (consolidate related-triples)]
-            (recur (set/difference remaining related-triples)
-                   (conj result merged-triples))))))))
-
 (defn assign-patterns
   "Processes query patterns into property groups for matching.
 
@@ -392,8 +314,7 @@
                   (where/assign-matched-values solution))))
        (map (partial where/compute-sids db))
        (map (partial include-subproperties db))
-       (map (partial include-subclasses db))
-       (merge-related-property-groups db)))
+       (map (partial include-subclasses db))))
 
 (defn first-sid
   "Extracts the subject ID from the first flake of `flake-chunk`"
