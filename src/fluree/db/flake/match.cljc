@@ -258,14 +258,15 @@
 
   If no subproperties exist, returns a vector containing only the original triple."
   [db [s p o :as triple]]
-  (if-some [child-props (where/get-child-properties db (where/get-sid p db))]
-    (let [db-alias (:alias db)]
-      (into [triple]
-            (map (fn [child-pid]
-                   (let [p* (where/match-sid p db-alias child-pid)]
-                     [s p* o])))
-            child-props))
-    [triple]))
+  (let [pid (where/get-sid p db)]
+    (if-some [child-props (where/get-child-properties db pid)]
+      (let [db-alias (:alias db)]
+        (into [triple]
+              (map (fn [child-pid]
+                     (let [p* (where/match-sid p db-alias child-pid)]
+                       [s p* o])))
+              (disj child-props pid)))
+      [triple])))
 
 (defn expand-subclasses
   "Expands a single class pattern triple to include all subclasses.
