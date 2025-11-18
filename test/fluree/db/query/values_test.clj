@@ -142,7 +142,7 @@
                                              ["?greet" [{"@value" "Здраво" "@language" "sb"}]]]]}))
             "language tag"))
       (testing "with empty solution"
-        (is (= [["ex:liam" "Liam"] ["ex:cam" "Cam"]]
+        (is (= [["ex:cam" "Cam"] ["ex:liam" "Liam"]]
                @(fluree/query db1 {"@context" context
                                    "where" [["values" ["?name" ["Liam" "Cam"]]]
                                             {"@id" "?s" "schema:name" "?name"}]

@@ -1,5 +1,6 @@
 (ns fluree.db.query.optimize
-  (:require [fluree.db.query.exec.where :as where]))
+  (:require [fluree.db.query.exec.where :as where]
+            [fluree.db.util.async :refer [<? go-try]]))
 
 (defn try-coerce-triple
   "Returns the triple data if x is a triple pattern (:class, :tuple),
@@ -207,3 +208,9 @@
 
     Returns:
       Channel containing query plan map"))
+
+(defn optimize
+  [db parsed-query]
+  (go-try
+    (let [parsed-query* (<? (-reorder db parsed-query))]
+      (update parsed-query* :where group-patterns))))

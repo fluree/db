@@ -654,7 +654,7 @@
                                   "delete"   {:id :ex/mosquitos, "?p" "?o"}})
              _                 @(fluree/commit! conn db2)
              loaded-db2        (test-utils/retry-load conn ledger-alias 100)]
-         (is (= [{:id :ex/fluree} {:id :ex/w3c} {:id :ex/kittens}]
+         (is (= [{:id :ex/fluree} {:id :ex/kittens} {:id :ex/w3c}]
                 @(fluree/query loaded-db2 description-query))
              "The id :ex/mosquitos should be removed")
          (let [db3        @(fluree/update

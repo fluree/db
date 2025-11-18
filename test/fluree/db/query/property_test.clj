@@ -249,13 +249,13 @@
           loaded @(fluree/load conn ledger-id)
           dbl    loaded]
       (testing "before load"
-        (is (= [{"id" "ex:dan", "ex:givenName" "Dan"}
-                {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}]
+        (is (= [{"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}
+                {"id" "ex:dan", "ex:givenName" "Dan"}]
                @(fluree/query db2 {"@context" context
                                    "select"   {"?s" ["*"]}
                                    "where"    {"@id" "?s", "ex:givenName" "?o"}})))
-        (is (= [{"id" "ex:dan", "ex:givenName" "Dan"}
-                {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}]
+        (is (= [{"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}
+                {"id" "ex:dan", "ex:givenName" "Dan"}]
                @(fluree/query db2 {"@context" context
                                    "select"   {"?s" ["*"]}
                                    "where"    {"@id" "?s", "ex:firstName" "?o"}})))
@@ -267,13 +267,13 @@
                                                "ex:fool" "?fool"}}))
             "handle list values"))
       (testing "after load"
-        (is (= [{"id" "ex:dan", "ex:givenName" "Dan"}
-                {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}]
+        (is (= [{"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}
+                {"id" "ex:dan", "ex:givenName" "Dan"}]
                @(fluree/query dbl {"@context" context
                                    "select"   {"?s" ["*"]}
                                    "where"    {"@id" "?s", "ex:givenName" "?o"}})))
-        (is (= [{"id" "ex:dan", "ex:givenName" "Dan"}
-                {"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}]
+        (is (= [{"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}
+                {"id" "ex:dan", "ex:givenName" "Dan"}]
                @(fluree/query dbl {"@context" context
                                    "select"   {"?s" ["*"]}
                                    "where"    {"@id" "?s", "ex:firstName" "?o"}})))

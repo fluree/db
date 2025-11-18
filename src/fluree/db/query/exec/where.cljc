@@ -705,6 +705,7 @@
         ;; process subqueries before other patterns
         patterns  (into (vec subquery-patterns) other-patterns)
         result-ch (match-patterns ds tracker solution patterns error-ch)]
+    (log/info "finalizing clause:" clause)
     (-finalize ds tracker error-ch result-ch)))
 
 (defn match-alias
