@@ -444,8 +444,8 @@
                                  "where"  {"@id" "?s" "@type" "ex:Person"}
                                  "select" {"?s" ["*"]}}))
           "comes out as data from subject crawl")
-      (is (= [{"json" "data", "is" ["cool" "right?" 1 false 1]}
-              {":edn" "data", ":is" ["cool" "right?" 1 false 1]}]
+      (is (= [{":edn" "data", ":is" ["cool" "right?" 1 false 1]}
+              {"json" "data", "is" ["cool" "right?" 1 false 1]}]
              @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"}
                                  "select"   "?json"
                                  "where"  {"@id" "?s" "ex:json" "?json"}}))

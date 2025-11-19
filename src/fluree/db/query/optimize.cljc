@@ -141,7 +141,9 @@
   [group]
   (cond
     (triple-group? group)
-    [(where/->pattern :property-join group)]
+    (if (<= 2 (count group))
+      [(where/->pattern :property-join group)]
+      group)
 
     (where/compound-pattern? group)
     (let [typ  (where/pattern-type group)

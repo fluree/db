@@ -291,7 +291,16 @@
                                 :select  {"?s" ["*"]}
                                 :where   {:id          "?s"
                                           :schema/name "Alice"}})))
-      (is (= [{:id           :ex/alice
+      (is (= [{:type         :ex/User
+               :schema/email "cam@example.org"
+               :ex/favNums   [5 10]
+               :schema/age   34
+               :ex/last      "Jones"
+               :schema/name  "Cam"
+               :id           :ex/cam
+               :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
+               :ex/favColor  "Blue"}
+              {:id           :ex/alice
                :type         :ex/User
                :schema/name  "Alice"
                :ex/last      "Smith"
@@ -306,8 +315,13 @@
                :schema/age   50,
                :ex/last      "Smith",
                :schema/email "brian@example.org",
-               :schema/name  "Brian"}
-              {:type         :ex/User
+               :schema/name  "Brian"}]
+             @(fluree/query db {:context context
+                                :select  {"?s" ["*"]}
+                                :where   {:id          "?s"
+                                          :ex/favColor "?color"}})))
+
+      (is (= [{:type         :ex/User
                :schema/email "cam@example.org"
                :ex/favNums   [5 10]
                :schema/age   34
@@ -315,28 +329,15 @@
                :schema/name  "Cam"
                :id           :ex/cam
                :ex/friend    [{:id :ex/alice} {:id :ex/brian}]
-               :ex/favColor  "Blue"}]
-             @(fluree/query db {:context context
-                                :select  {"?s" ["*"]}
-                                :where   {:id          "?s"
-                                          :ex/favColor "?color"}})))
-
-      (is (= [{:id           :ex/alice,
+               :ex/favColor  "Blue"}
+              {:id           :ex/alice,
                :type         :ex/User,
                :ex/favColor  "Green",
                :ex/favNums   [9 42 76],
                :ex/last      "Smith",
                :schema/age   42,
                :schema/email "alice@example.org",
-               :schema/name  "Alice"}
-              {:id           :ex/brian,
-               :type         :ex/User,
-               :ex/favColor  "Green",
-               :ex/favNums   7,
-               :ex/last      "Smith",
-               :schema/age   50,
-               :schema/email "brian@example.org",
-               :schema/name  "Brian"}]
+               :schema/name  "Alice"}]
              @(fluree/query db {:context context
                                 :select  {"?s" ["*"]}
                                 :where   {:id          "?s"
@@ -383,7 +384,7 @@
           _      @(fluree/commit! conn db0)
           db1    @(fluree/load conn alias)]
 
-      (is (= [["foo" "Foo"] ["foaf:bar" "Bar"]]
+      (is (= [["foaf:bar" "Bar"] ["foo" "Foo"]]
              @(fluree/query db1 {"@context" test-utils/default-str-context
                                  "select"   ["?f" "?n"]
                                  "where"    {"id"      "?f"

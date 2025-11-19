@@ -1780,24 +1780,24 @@
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"]
              (testing "output :fql"
-               (is (= [[23] [5.428571428571429] [37.75]]
+               (is (= [[5.428571428571429] [37.75] [23]]
                       @(fluree/query db query {:format :sparql}))))
              (testing "output :sparql"
                (is (= {"head" {"vars" ["avgFav"]},
                        "results"
                        {"bindings"
                         [{"avgFav"
-                          {"value" "23",
-                           "type" "literal",
-                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
-                         {"avgFav"
                           {"value" "5.428571428571429",
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#double"}}
                          {"avgFav"
                           {"value" "37.75",
                            "type" "literal",
-                           "datatype" "http://www.w3.org/2001/XMLSchema#double"}}]}}
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"}}
+                         {"avgFav"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "GROUP_CONCAT aggregate fn query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
@@ -1805,15 +1805,15 @@
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"]
              (testing "output :fql"
-               (is (= [["23"] ["0, 3, 5, 6, 7, 8, 9"] ["3, 7, 42, 99"]]
+               (is (= [["0, 3, 5, 6, 7, 8, 9"] ["3, 7, 42, 99"] ["23"]]
                       @(fluree/query db query {:format :sparql}))))
              (testing "output :sparql"
                (is (= {"head" {"vars" ["nums"]},
                        "results"
                        {"bindings"
-                        [{"nums" {"value" "23", "type" "literal"}}
-                         {"nums" {"value" "0, 3, 5, 6, 7, 8, 9", "type" "literal"}}
-                         {"nums" {"value" "3, 7, 42, 99", "type" "literal"}}]}}
+                        [{"nums" {"value" "0, 3, 5, 6, 7, 8, 9", "type" "literal"}}
+                         {"nums" {"value" "3, 7, 42, 99", "type" "literal"}}
+                         {"nums" {"value" "23", "type" "literal"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "aggregate fn w/ GROUP BY ... HAVING query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
@@ -1821,20 +1821,20 @@
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person HAVING(AVG(?favNums) > 10)"]
              (testing "output :fql"
-               (is (= [[23] [37.75]]
+               (is (= [[37.75] [23]]
                       @(fluree/query db query {:format :sparql}))))
              (testing "output :sparql"
                (is (= {"head" {"vars" ["avgFav"]},
                        "results"
                        {"bindings"
                         [{"avgFav"
-                          {"value" "23",
-                           "type" "literal",
-                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
-                         {"avgFav"
                           {"value" "37.75",
                            "type" "literal",
-                           "datatype" "http://www.w3.org/2001/XMLSchema#double"}}]}}
+                           "datatype" "http://www.w3.org/2001/XMLSchema#double"}}
+                         {"avgFav"
+                          {"value" "23",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
          (testing "multi-arg fn query works"
            (let [query   "PREFIX person: <http://example.org/Person#>
@@ -2066,22 +2066,22 @@
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"]
              (testing "output :fql"
-               (is (= [[1] [7] [4]]
+               (is (= [[7] [4] [1]]
                       @(fluree/query db query {:format :sparql}))))
              (testing "output :sparql"
                (is (= {"head" {"vars" ["numFavs"]},
                        "results"
                        {"bindings"
                         [{"numFavs"
-                          {"value" "1",
-                           "type" "literal",
-                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
-                         {"numFavs"
                           {"value" "7",
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"numFavs"
                           {"value" "4",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"numFavs"
+                          {"value" "1",
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
@@ -2091,22 +2091,22 @@
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"]
              (testing "output :fql"
-               (is (= [[1] [7] [4]]
+               (is (= [[7] [4] [1]]
                       @(fluree/query db query {:format :sparql}))))
              (testing "output :sparql"
                (is (= {"head" {"vars" ["count"]},
                        "results"
                        {"bindings"
                         [{"count"
-                          {"value" "1",
-                           "type" "literal",
-                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
-                         {"count"
                           {"value" "7",
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"count"
                           {"value" "4",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"count"
+                          {"value" "1",
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))
@@ -2130,22 +2130,22 @@
                           WHERE {?person person:favNums ?favNums.}
                           GROUP BY ?person"]
              (testing "output :fql"
-               (is (= [[23] [38] [151]]
+               (is (= [[38] [151] [23]]
                       @(fluree/query db query {:format :sparql}))))
              (testing "output :sparql"
                (is (= {"head" {"vars" ["favNum"]},
                        "results"
                        {"bindings"
                         [{"favNum"
-                          {"value" "23",
-                           "type" "literal",
-                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
-                         {"favNum"
                           {"value" "38",
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
                          {"favNum"
                           {"value" "151",
+                           "type" "literal",
+                           "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}
+                         {"favNum"
+                          {"value" "23",
                            "type" "literal",
                            "datatype" "http://www.w3.org/2001/XMLSchema#integer"}}]}}
                       @(fluree/query db query {:format :sparql :output :sparql}))))))

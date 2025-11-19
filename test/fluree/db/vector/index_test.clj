@@ -182,9 +182,9 @@
               results @(fluree/query db query)]
           (is (= [["ex:bart" "ex:homer" 0.7211047102874315]
                   ["ex:bart" "ex:lucy" 0.41905817746174695]
-                  ["ex:homer" "ex:lucy" 0.9312427797057533]
-                  ["ex:homer" "ex:bart" 0.7211047102874315]
                   ["ex:lucy" "ex:homer" 0.9312427797057533]
-                  ["ex:lucy" "ex:bart" 0.41905817746174695]]
+                  ["ex:lucy" "ex:bart" 0.41905817746174695]
+                  ["ex:homer" "ex:lucy" 0.9312427797057533]
+                  ["ex:homer" "ex:bart" 0.7211047102874315]]
                  results)
               "comparing every person to every other person with a ranked score"))))))
