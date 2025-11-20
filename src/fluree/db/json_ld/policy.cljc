@@ -134,6 +134,7 @@
   ([db parsed-context opts]
    (policy-enforce-db db nil parsed-context opts))
   ([db tracker parsed-context opts]
+   (log/debug! ::enforce-policy {:db db :opts opts})
    (go-try
      (let [{:keys [identity policy-class policy policy-values]} opts
            policy-values* (util.parse/normalize-values policy-values)]

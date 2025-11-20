@@ -4,7 +4,8 @@
             [fluree.db.query.exec.select.fql :as select.fql]
             [fluree.db.query.exec.select.sparql :as select.sparql]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util :as util]))
+            [fluree.db.util :as util]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -78,9 +79,10 @@
   [{:keys [group-by select]} solution-ch]
   (if-let [grouping (or group-by
                         (implicit-grouping select))]
-    (-> (async/transduce (map (partial split-solution-by grouping))
-                         (completing group-solution
-                                     (partial unwind-groups grouping))
+    (-> (async/transduce (comp
+                           (log/xf-debug! ::query-group {:grouping grouping})
+                           (map (partial split-solution-by grouping)))
+                         (completing group-solution (partial unwind-groups grouping))
                          {}
                          solution-ch)
         (async/pipe (async/chan 2 cat)))

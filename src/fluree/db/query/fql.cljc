@@ -4,7 +4,8 @@
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.optimize :as optimize]
             [fluree.db.util :as util :refer [try* catch*]]
-            [fluree.db.util.async :refer [go-try <?]])
+            [fluree.db.util.async :refer [go-try <?]]
+            [fluree.db.util.log :as log])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -23,6 +24,7 @@
     ;; object cache takes (a) key and (b) fn to retrieve value if null
     (oc cache-key
         (fn [_]
+          (log/debug! ::query-cache-miss {:cache-key cache-key})
           (let [pc (async/promise-chan)]
             (go
               (let [res (<! (query db (assoc-in query-map [:opts :cache]
@@ -51,7 +53,9 @@
      (cache-query ds query-map)
      (go-try
        (let [pq (parse/parse-query query-map)
+             _  (log/debug! ::parsed-query {:query query-map :parsed-query pq})
              oq (<? (optimize/optimize ds pq))]
+         (log/debug! ::optimized-query {:query query-map :optimized-query pq})
          (<? (exec/query ds tracker oq)))))))
 
 (defn explain

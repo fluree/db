@@ -660,7 +660,10 @@
 (defn with-constraints
   [ds tracker patterns error-ch solution-ch]
   (reduce (fn [solution-ch pattern]
-            (with-constraint ds tracker pattern error-ch solution-ch))
+            (log/debug! ::pattern-start {:pattern pattern})
+            (let [solution-ch* (with-constraint ds tracker pattern error-ch solution-ch)]
+              (log/debug! ::pattern-complete {:pattern pattern})
+              solution-ch*))
           solution-ch patterns))
 
 (defn match-triples
@@ -976,6 +979,7 @@
   ([ds q tracker error-ch]
    (search ds q tracker error-ch nil))
   ([ds q tracker error-ch initial-solution-ch]
+   (log/debug! ::query-where {:where (:where q)})
    (let [out-ch               (async/chan 2)
          initial-solution-ch* (or initial-solution-ch
                                   (values-initial-solution q))]

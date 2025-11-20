@@ -1,6 +1,7 @@
 (ns fluree.db.reasoner
   (:require [fluree.db.track :as track]
-            [fluree.db.util :as util]))
+            [fluree.db.util :as util]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -10,7 +11,8 @@
 
 (defn reason
   [db methods rule-sources {:keys [max-fuel reasoner-max]
-                            :or   {reasoner-max 10} :as _opts}]
+                            :or   {reasoner-max 10} :as opts}]
+  (log/debug! ::reason {:db db :methods methods :rule-sources rule-sources :opts opts})
   (let [methods* (set (util/sequential methods))
         tracker  (track/init {:max-fuel max-fuel})]
     (-reason db methods* rule-sources tracker reasoner-max)))
