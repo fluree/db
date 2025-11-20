@@ -65,3 +65,17 @@
 
     Returns:
       Channel containing query plan map"))
+;; Public API
+
+(defn optimize
+  "Optimize a parsed query based on the optimizable database it will be executed
+  on. Returns a channel that will contain the fully optimized query.
+
+  Parameters:
+    db - The database (FlakeDB, AsyncDB, etc.)
+    parsed-query - The parsed query from fql/parse-query
+
+  Returns:
+    Channel containing optimized query"
+  [db parsed-query]
+  (-reorder db parsed-query))
