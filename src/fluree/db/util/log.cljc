@@ -147,3 +147,7 @@
            (vreset! logged? true))
          (rf result x))
         ([result] (rf result))))))
+
+(defn trace!
+  [id data]
+  (tel/log! {:level :trace :id id :data data}))

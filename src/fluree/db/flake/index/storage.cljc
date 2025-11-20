@@ -12,6 +12,7 @@
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.ledger :as util.ledger]
+            [fluree.db.util.log :as log]
             [fluree.db.virtual-graph :as vg]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -292,4 +293,5 @@
          cache
          cache-key
          (fn [_]
+           (log/trace! ::resolve-miss {:cache-key [::resolve id tempid]})
            (resolve-index-node this node)))))))

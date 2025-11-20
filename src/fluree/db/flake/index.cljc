@@ -289,6 +289,7 @@
        cache
        [::t-range id tempid tt-id to-t]
        (fn [_]
+         (log/trace! ::t-range-miss {:cache-key [::t-range id tempid tt-id to-t]})
          (resolve-t-range node-resolver node novelty-t novelty to-t))))))
 
 (defn index-catalog->t-range-resolver
@@ -312,6 +313,7 @@
        lru-cache-atom
        [::history-t-range id tempid tt-id from-t to-t]
        (fn [_]
+         (log/trace! ::history-t-range-miss {:cache-key [::history-t-range id tempid tt-id from-t to-t]})
          (go-try
            (let [resolved (<? (resolve node-resolver node))
                  flakes   (history-t-range resolved novelty-t novelty from-t to-t)]
