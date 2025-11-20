@@ -120,6 +120,8 @@
   expected timeframe. The frequency of new indexes being created is
   dependent on the frequency and size of updates that is ledger-specific
   against the ledger's 'reindex-min-bytes' setting."
-  [{:keys [index-catalog commit] :as _db} max-indexes]
+  [{:keys [index-catalog commit] :as db} max-indexes]
   (let [index-address (-> commit :index :address)]
-    (clean-garbage* index-catalog index-address max-indexes)))
+    (log/info! ::collect-garbage-start {:ledger-alias (:alias db) :max-indexes max-indexes})
+    (clean-garbage* index-catalog index-address max-indexes)
+    (log/info! ::collect-garbage-complete {:ledger-alias (:alias db) :max-indexes max-indexes})))

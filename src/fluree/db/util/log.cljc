@@ -1,7 +1,8 @@
 (ns fluree.db.util.log
   (:require #?@(:clj  [[clojure.core.async :as async]
                        [clojure.tools.logging.readable :as log] ; readable variants use pr-str automatically
-                       [fluree.db.util :refer [if-cljs]]]
+                       [fluree.db.util :refer [if-cljs]]
+                       [taoensso.telemere :as tel]]
                 :cljs [[goog.log :as glog]]))
   #?(:cljs (:require-macros [fluree.db.util.log :refer
                              [debug->val debug->>val debug-async->vals
@@ -124,3 +125,7 @@
      them."
      [msg c]
      `(debug-async->vals ~c ~msg)))
+
+(defn info!
+  [id data]
+  (tel/log! {:level :info :id id :data data}))

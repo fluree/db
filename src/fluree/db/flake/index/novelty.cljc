@@ -549,6 +549,7 @@
                            :start-time   (util/current-time-iso)}
             error-ch   (async/chan)
             refresh-ch (refresh-all db changes-ch error-ch)]
+        (log/info! ::index-start {:ledger-alias alias :novelty-size novelty-size :t t})
         (log/info "Refreshing Index:" init-stats)
         (async/alt!
           error-ch
@@ -602,6 +603,7 @@
                                       :duration duration
                                       :address (:address db-root-res)
                                       :garbage (:address garbage-res))]
+             (log/info! ::index-complete {:ledger-alias alias :root index-address :garbage (:address garbage-res)})
              (log/info "Index refresh complete:" end-stats)
             ;; kick off automatic garbage collection in the background
              (garbage/clean-garbage indexed-db max-old-indexes)

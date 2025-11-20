@@ -62,6 +62,7 @@
   See documentation for configuration schema."
   [config]
   ;; TODO - do some validation
+  (log/info! ::connect {:config config})
   (promise-wrap
    (go-try
      (let [system-map (-> config config/parse system/initialize)
@@ -247,6 +248,7 @@
       :indexing - Indexing configuration"
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
+   (log/info! ::create {:ledger-alias ledger-alias :opts opts})
    (validate-connection conn)
    (util.ledger/validate-ledger-name ledger-alias)
    (promise-wrap
@@ -267,6 +269,7 @@
   "Loads an existing ledger by alias or address.
   Returns a promise that resolves to the latest database."
   [conn alias-or-address]
+  (log/info! ::load {:ledger-alias alias-or-address})
   (validate-connection conn)
   (promise-wrap
    (go-try
@@ -277,6 +280,7 @@
   "Deletes a ledger and its associated data.
   Returns a promise that resolves when deletion is complete."
   [conn ledger-alias]
+  (log/info! ::drop {:ledger-alias ledger-alias})
   (promise-wrap
    (connection/drop-ledger conn ledger-alias)))
 
@@ -324,6 +328,7 @@
   Returns promise resolving to updated database."
   ([db rdf] (insert db rdf nil))
   ([db rdf opts]
+   (log/info! ::insert {:opts opts})
    (promise-wrap
     (transact-api/insert db rdf opts))))
 
@@ -342,6 +347,7 @@
   Returns promise resolving to updated database."
   ([db rdf] (upsert db rdf nil))
   ([db rdf opts]
+   (log/info! ::upsert {:opts opts})
    (promise-wrap
     (transact-api/upsert db rdf opts))))
 
@@ -358,6 +364,7 @@
   Returns promise resolving to updated database."
   ([db json-ld] (update db json-ld nil))
   ([db json-ld opts]
+   (log/info! ::update {:opts opts})
    (promise-wrap
     (transact-api/update db json-ld opts))))
 
@@ -395,6 +402,7 @@
   ([conn db]
    (commit! conn db {}))
   ([conn db opts]
+   (log/info! ::commit {:opts opts})
    (validate-connection conn)
    (promise-wrap
     (go-try
@@ -410,6 +418,7 @@
   Updates a ledger and commits the changes in one operation."
   ([conn txn] (transact! conn txn nil))
   ([conn txn opts]
+   (log/info! ::transact {:opts opts})
    (validate-connection conn)
    (promise-wrap
     (transact-api/update! conn txn opts))))
@@ -428,6 +437,7 @@
   Returns promise resolving to committed database."
   ;; New preferred arity matching insert!/upsert!
   ([conn ledger-id txn opts]
+   (log/info! ::update {:opts opts})
    (validate-connection conn)
    (promise-wrap
     (transact-api/update! conn ledger-id txn opts)))
@@ -462,6 +472,7 @@
   Returns promise resolving to committed database."
   ([conn ledger-id txn] (upsert! conn ledger-id txn nil))
   ([conn ledger-id txn opts]
+   (log/info! ::upsert {:ledger-alias ledger-id :opts opts})
    (validate-connection conn)
    (promise-wrap
     (transact-api/upsert! conn ledger-id txn opts))))
@@ -483,6 +494,7 @@
   Returns promise resolving to committed database."
   ([conn ledger-id txn] (insert! conn ledger-id txn nil))
   ([conn ledger-id txn opts]
+   (log/info! ::insert {:ledger-alias ledger-id :opts opts})
    (validate-connection conn)
    (promise-wrap
     (transact-api/insert! conn ledger-id txn opts))))
@@ -503,6 +515,7 @@
   Returns promise resolving to committed database."
   ([conn credential] (credential-update! conn credential nil))
   ([conn credential opts]
+   (log/info! ::credential {:opts opts})
    (validate-connection conn)
    (promise-wrap
     (transact-api/credential-transact! conn credential opts))))
@@ -527,9 +540,9 @@
   Returns promise resolving to initial database."
   ([conn txn]
    (validate-connection conn)
-   (promise-wrap
-    (transact-api/create-with-txn conn txn)))
+   (create-with-txn conn txn nil))
   ([conn txn opts]
+   (log/info! ::create {:opts opts})
    (validate-connection conn)
    (promise-wrap
     (transact-api/create-with-txn conn txn opts))))
@@ -707,6 +720,7 @@
   ([ds q]
    (query ds q {}))
   ([ds q opts]
+   (log/info! ::query {:query q :opts opts})
    (if (util/exception? ds)
      (throw ds)
      (promise-wrap (query-api/query ds q opts)))))
@@ -770,6 +784,7 @@
   Returns promise resolving to query results."
   ([ds cred-query] (credential-query ds cred-query {}))
   ([ds cred-query {:keys [values-map format] :as opts}]
+   (log/info! ::credential {:credential-query cred-query :opts opts})
    (promise-wrap
     (go-try
       (let [{query :subject, identity :did} (if (= :sparql format)
@@ -806,6 +821,7 @@
   Returns promise resolving to query results."
   ([conn cred-query] (credential-query-connection conn cred-query {}))
   ([conn cred-query {:keys [format] :as opts}]
+   (log/info! ::credential {:credential-query cred-query :opts opts})
    (validate-connection conn)
    (promise-wrap
     (go-try
@@ -830,6 +846,7 @@
   Returns promise resolving to query results."
   ([conn query] (query-nameservice conn query {}))
   ([conn query opts]
+   (log/info! ::query {:query query :opts opts})
    (validate-connection conn)
    (promise-wrap
     (go-try
@@ -855,6 +872,7 @@
   ([conn ledger-id query]
    (history conn ledger-id query nil))
   ([conn ledger-id query override-opts]
+   (log/info! ::history {:ledger-alias ledger-id :query query :opts override-opts})
    (validate-connection conn)
    (promise-wrap
     (go-try
@@ -875,6 +893,7 @@
   ([conn ledger-id cred-query]
    (credential-history conn ledger-id cred-query {}))
   ([conn ledger-id cred-query override-opts]
+   (log/info! ::credential-history {:ledger-alias ledger-id :credential-query cred-query :opts override-opts})
    (validate-connection conn)
    (promise-wrap
     (go-try
@@ -970,6 +989,7 @@
   ([db methods] (reason db methods nil nil))
   ([db methods rule-sources] (reason db methods rule-sources nil))
   ([db methods rule-sources opts]
+   (log/info! ::reason {:methods methods :rule-sources rule-sources :opts opts})
    (promise-wrap
     (reasoner/reason db methods rule-sources opts))))
 
@@ -1023,6 +1043,7 @@
   ([conn ledger-alias]
    (trigger-index conn ledger-alias nil))
   ([conn ledger-alias opts]
+   (log/info! ::trigger {:ledger-alias ledger-alias :opts opts})
    (validate-connection conn)
    (promise-wrap
     (connection/trigger-ledger-index conn ledger-alias opts))))
