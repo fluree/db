@@ -51,7 +51,7 @@
      (cache-query ds query-map)
      (go-try
        (let [pq (parse/parse-query query-map)
-             oq (<? (optimize/-reorder ds pq))]
+             oq (<? (optimize/optimize ds pq))]
          (<? (exec/query ds tracker oq)))))))
 
 (defn explain
