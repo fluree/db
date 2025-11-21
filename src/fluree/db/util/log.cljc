@@ -126,6 +126,10 @@
      [msg c]
      `(debug-async->vals ~c ~msg)))
 
+(defn warn!
+  [id data]
+  (tel/log! {:level :warn :id id :data data}))
+
 (defn info!
   [id data]
   (tel/log! {:level :info :id id :data data}))

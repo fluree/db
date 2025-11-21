@@ -596,7 +596,8 @@
                                :error       (ex-message res)}
                               (ex-data res)
                               log-context)]
-              (log/info "S3 request retrying" data)
+              (log/warn! ::s3-request-attempting-retry data)
+              (log/warn "S3 request retrying" data)
               (<! (async/timeout wait-ms))
               (recur (inc attempt)))
             (let [data (merge {:event "s3.error"
@@ -605,11 +606,16 @@
                                :error (ex-message res)}
                               (ex-data res)
                               log-context)]
+              (log/error! ::s3-request-failed data)
               (log/error "S3 request failed permanently" data)
               (>! out res)
               (async/close! out)))
           (do
             (when (pos? attempt)
+              (log/debug! ::s3-retry-succeeded (merge {:event "s3.success-after-retry"
+                                                       :attempts (inc attempt)
+                                                       :duration-ms duration-ms}
+                                                      log-context))
               (log/info "S3 request succeeded after retries"
                         (merge {:event "s3.success-after-retry"
                                 :attempts (inc attempt)
