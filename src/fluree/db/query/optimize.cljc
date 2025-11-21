@@ -1,6 +1,6 @@
 (ns fluree.db.query.optimize
-  (:require [fluree.db.query.exec.where :as where]
-            [fluree.db.query.exec.eval :as eval]
+  (:require [fluree.db.query.exec.eval :as eval]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.util.async :refer [go-try <?]]))
 
 (defn compare-component
@@ -162,7 +162,7 @@
       :union
       ;; Union patterns contain a vector of where clauses
       (let [clauses (->> (where/pattern-data pattern)
-                         (mapv (partial compile-filter-codes context))) ]
+                         (mapv (partial compile-filter-codes context)))]
         (where/->pattern pattern-type clauses))
 
       (:optional :exists :not-exists :minus)
