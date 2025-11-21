@@ -42,6 +42,8 @@
                      node)]
          (not-empty node*))
        (catch* e
+         (log/error! ::id-formatting-error e {:msg "Error appending subject iri"
+                                              :iri iri})
          (log/error e "Error appending subject iri")
          (>! error-ch e))))))
 

@@ -157,6 +157,7 @@
               (when-let [verified-commit (<? (read-verified-commit storage prev-commit-addr))]
                 (recur verified-commit commit-t commit-tuples*)))))
         (catch* e
+          (log/error! ::commit-tracing-error e {:msg "Error tracing commits"})
           (log/error e "Error tracing commits")
           (>! error-ch e)
           (async/close! resp-ch))))

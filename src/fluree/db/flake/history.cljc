@@ -90,6 +90,7 @@
                   assert-key  asserts
                   retract-key retracts})
                (catch* e
+                 (log/error! ::history-conversion-error e {:msg "Error converting history flakes."})
                  (log/error e "Error converting history flakes.")
                  (>! error-ch e))))
 
@@ -233,6 +234,7 @@
               (assoc-in [commit-key data-key retract-key] retracts)
               (cond-> annotation (assoc-in [commit-key annotation-key] annotation)))))
       (catch* e
+        (log/error! ::commit-conversion-error e {:msg "Error converting commit flakes."})
         (log/error e "Error converting commit flakes.")
         (>! error-ch e)))))
 

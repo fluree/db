@@ -105,6 +105,7 @@
                                           :depth  6}))]
       (if (util/exception? all-rules)
         (do
+          (log/error! ::owl2rl-extraction-error all-rules {:msg "Error extracting owl2rl from db"})
           (log/error "Error extracting owl2rl from db:" (ex-message all-rules))
           all-rules)
         ;; blank nodes can be part of OWL logic (nested), but we won't assign class or

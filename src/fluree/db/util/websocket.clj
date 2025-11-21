@@ -62,6 +62,7 @@
           (.request ^WebSocket websocket 1)
           nil
           (catch* e
+            (log/error! ::ws-on-text-error e {:msg "Error processing WebSocket text message"})
             (log/error e "Error processing WebSocket text message")
             nil)))
 
@@ -90,6 +91,7 @@
         nil)
 
       (onError [_ websocket error]
+        (log/error! ::ws-error error {:msg "WebSocket error"})
         (log/error error "WebSocket error")
         (when on-error
           (on-error websocket error))
@@ -152,7 +154,7 @@
 
 (defn connect
   "Connect to a WebSocket endpoint.
-   
+
    Options:
    - :on-open      - fn called when connection opens [ws]
    - :on-message   - fn called for each message [ws message last?]
@@ -164,7 +166,7 @@
    - :connect-timeout - connection timeout in ms (default 30000)
    - :headers      - map of headers to send
    - :subprotocols - collection of subprotocols to request
-   
+
    Returns a CompletableFuture<WebSocket> or throws on connection failure."
   [url opts]
   (let [client   (HttpClient/newHttpClient)
@@ -209,6 +211,7 @@
           (try*
             (send-ping! ws (java.nio.ByteBuffer/allocate 0))
             (catch* e
+              (log/error! ::ws-send-ping-error e {:msg "Error sending ping"})
               (log/error e "Error sending ping")))
           (recur))
 
@@ -221,6 +224,8 @@
               (async/put! resp-chan true)
               (async/close! resp-chan))
             (catch* e
+              (log/error! ::ws-send-msg-error e {:msg "Error sending websocket message:"
+                                                 :payload msg})
               (log/error e "Error sending websocket message:" msg)
               (when resp-chan
                 (async/put! resp-chan false)
@@ -234,15 +239,15 @@
 
 (defn websocket
   "High-level WebSocket connection that matches the API of existing xhttp implementation.
-   
+
    Creates a WebSocket connection with automatic reconnection on abnormal closure.
-   
+
    Options:
    - :msg-in       - async channel for incoming messages
-   - :msg-out      - async channel for outgoing messages  
+   - :msg-out      - async channel for outgoing messages
    - :connect-timeout - connection timeout in ms
    - :close-fn     - function to call on final close
-   
+
    Returns a channel that will contain the WebSocket or an error."
   [url {:keys [msg-in msg-out connect-timeout close-fn]
         :or {connect-timeout 30000}}]

@@ -85,6 +85,7 @@
         (let [v (async/<! (value-fn k))]
           (async/put! c v)
           (when (exception? v)
+            (log/error! ::lru-lookup-error v {:msg "Error resolving cache value" :cache-key k})
             (log/error v "Error resolving cache value for key: " k "with exception:" (ex-message v))
             (swap! cache-atom cache/evict k))))
       c)))

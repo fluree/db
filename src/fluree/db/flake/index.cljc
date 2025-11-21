@@ -390,6 +390,8 @@
     (try* (let [resolved (<? (resolve r node))]
             (trim-node resolved start-flake end-flake))
           (catch* e
+            (log/error! ::resolve-node e {:msg "Error resolving index node"
+                                          :node (select-keys node [:id :ledger-alias])})
             (log/error e
                        "Error resolving index node:"
                        (select-keys node [:id :ledger-alias]))

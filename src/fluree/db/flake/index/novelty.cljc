@@ -322,6 +322,7 @@
                 (update-node-id node* write-response))))
 
         (catch* e
+          (log/error! ::write-novel-node e {:msg "Error writing novel index node" :node display-node})
           (log/error e
                      "Error writing novel index node:" display-node)
           (async/>! error-ch e))))))
@@ -483,7 +484,6 @@
         {:properties (get-in db [:stats :properties] {})
          :classes (get-in db [:stats :classes] {})
          :old-sketch-paths #{}}
-
         (let [{:keys [index-catalog alias t]} db
               ledger-name (util.ledger/ledger-base-name alias)
               prev-properties (get-in db [:stats :properties] {})
