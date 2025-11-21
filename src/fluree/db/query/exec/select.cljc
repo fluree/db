@@ -150,13 +150,13 @@
                                 (:select-distinct q))
         modifying-selectors (filter #(satisfies? SolutionModifier %) (util/sequential selectors))
         mods-xf             (comp
-                              (log/xf-debug! ::query-projection-modification {:solution-modifiers modifying-selectors})
-                              (map (fn [solution]
-                                     (reduce
-                                       (fn [sol sel]
-                                         (log/trace "Updating solution:" sol)
-                                         (update-solution sel sol))
-                                       solution modifying-selectors))))
+                             (log/xf-debug! ::query-projection-modification {:solution-modifiers modifying-selectors})
+                             (map (fn [solution]
+                                    (reduce
+                                     (fn [sol sel]
+                                       (log/trace "Updating solution:" sol)
+                                       (update-solution sel sol))
+                                     solution modifying-selectors))))
         modify-ch               (chan 1 mods-xf)]
     (async/pipe solution-ch modify-ch)))
 

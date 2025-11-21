@@ -80,8 +80,8 @@
   (if-let [grouping (or group-by
                         (implicit-grouping select))]
     (-> (async/transduce (comp
-                           (log/xf-debug! ::query-group {:grouping grouping})
-                           (map (partial split-solution-by grouping)))
+                          (log/xf-debug! ::query-group {:grouping grouping})
+                          (map (partial split-solution-by grouping)))
                          (completing group-solution (partial unwind-groups grouping))
                          {}
                          solution-ch)
