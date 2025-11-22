@@ -189,7 +189,7 @@
   Returns: 'fluree:index:sha256:abc123def'"
   [index-catalog index-address]
   (go-try
-    (let [hash (<? (storage/get-hash index-catalog index-address))]
+    (let [hash (<? (storage/get-hash (:storage index-catalog) index-address))]
       (str "fluree:index:sha256:" hash))))
 
 (defn- apply-index-to-db
