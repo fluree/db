@@ -5,11 +5,9 @@
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.index :as index]
-            [fluree.db.flake.index.hyperloglog :as hll-persist]
+            [fluree.db.flake.index.stats :as stats]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.indexer.garbage :as garbage]
-            [fluree.db.indexer.hll :as hll]
-            [fluree.db.storage :as storage]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.ledger :as util.ledger]
@@ -328,129 +326,6 @@
                      "Error writing novel index node:" display-node)
           (async/>! error-ch e))))))
 
-(defn- process-property-group
-  "Process all flakes for a single property, updating counts and sketches.
-   Returns updated property data and sketch for this property only."
-  [property-flakes prev-prop-data prev-sketch]
-  (loop [[f & r] property-flakes
-         prop-data prev-prop-data
-         sketch prev-sketch]
-    (if f
-      (let [assert? (flake/op f)
-            new-count (if assert?
-                        (inc (:count prop-data 0))
-                        (dec (:count prop-data)))
-            prop-data* (assoc prop-data :count new-count)
-            ;; Update HLL sketches (only on assertions - monotone NDV)
-            sketch* (if assert?
-                      (let [values-sketch (hll/add-value (or (:values sketch) (hll/create-sketch)) (flake/o f))
-                            subjects-sketch (hll/add-value (or (:subjects sketch) (hll/create-sketch)) (flake/s f))]
-                        {:values values-sketch
-                         :subjects subjects-sketch})
-                      sketch)]
-        (recur r prop-data* sketch*))
-
-      ;; Return updated data with NDV extracted from sketches
-      (let [values-sketch (or (:values sketch) (hll/create-sketch))
-            subjects-sketch (or (:subjects sketch) (hll/create-sketch))]
-        {:property-data (assoc prop-data
-                               :ndv-values (hll/cardinality values-sketch)
-                               :ndv-subjects (hll/cardinality subjects-sketch))
-         :sketch {:values values-sketch
-                  :subjects subjects-sketch}}))))
-
-(defn- update-class-counts
-  "Update class counts for rdf:type flakes.
-   Each flake's object is a class SID - increment for assertions, decrement for retractions."
-  [property-flakes prev-classes]
-  (reduce (fn [cls f]
-            (let [class-sid (flake/o f)
-                  delta (if (flake/op f) 1 -1)
-                  class-map (get cls class-sid {:count 0})
-                  new-count (max 0 (+ (:count class-map 0) delta))]
-              (assoc cls class-sid (assoc class-map :count new-count))))
-          prev-classes
-          property-flakes))
-
-(defn- write-property-sketch
-  "Write a single property's sketch to disk immediately.
-   Writes values and subjects sketches in parallel.
-   Returns :success on successful write (throws on error)."
-  [{:keys [storage] :as _index-catalog} ledger-name current-t property-sid sketch]
-  (go-try
-    (let [{:keys [values subjects]} sketch
-          default-key (keyword "fluree.db.storage" "default")
-          store       (storage/get-content-store storage default-key)
-
-          values-path   (hll-persist/sketch-filename ledger-name property-sid :values current-t)
-          subjects-path (hll-persist/sketch-filename ledger-name property-sid :subjects current-t)
-
-          ;; Kick off both writes in parallel
-          values-ch   (storage/write-bytes store values-path values)
-          subjects-ch (storage/write-bytes store subjects-path subjects)]
-
-      (<? values-ch)
-      (<? subjects-ch)
-
-      :success)))
-
-(defn- process-and-write-property
-  "Load sketch, process property flakes, write sketch immediately.
-   Returns property stats, class updates (if rdf:type), and old sketch paths for garbage."
-  [index-catalog ledger-name current-t property-flakes prev-properties prev-classes]
-  (go-try
-    (let [p (flake/p (first property-flakes))
-          prev-prop-data (get prev-properties p {:count 0})
-          prev-last-t (:last-modified-t prev-prop-data)
-
-          ;; Load sketch for this property only (from disk using :last-modified-t)
-          loaded-sketch (<? (hll-persist/read-property-sketches index-catalog ledger-name p prev-last-t))
-          prev-sketch (or loaded-sketch
-                          {:values (hll/create-sketch)
-                           :subjects (hll/create-sketch)})
-
-          ;; Process flakes for this property
-          {:keys [property-data sketch]} (process-property-group property-flakes prev-prop-data prev-sketch)
-
-          ;; :last-modified-t is important as the sketch file name uses it, without it the sketch cannot be loaded
-          property-data* (assoc property-data :last-modified-t current-t)
-
-          _ (<? (write-property-sketch index-catalog ledger-name current-t p sketch))
-
-          ;; Calculate old sketch paths for garbage collection
-          old-sketch-paths (when (and prev-last-t (not= prev-last-t current-t))
-                             #{(str "fluree:file://" (hll-persist/sketch-filename ledger-name p :values prev-last-t))
-                               (str "fluree:file://" (hll-persist/sketch-filename ledger-name p :subjects prev-last-t))})
-
-          class-updates (when (flake/class-flake? (first property-flakes))
-                          (update-class-counts property-flakes prev-classes))]
-
-      [p property-data* class-updates old-sketch-paths])))
-
-(defn- compute-stats-with-writes
-  "Process properties one-by-property: load → update → write.
-   Each property's sketch is loaded, updated, and written immediately.
-   Returns {:properties {...} :classes {...} :old-sketch-paths #{...}}
-   NO sketches in return value - they're written to disk and discarded."
-  [index-catalog ledger-name current-t novelty-flakes prev-properties prev-classes]
-  (go-try
-    (let [property-groups (partition-by flake/p novelty-flakes)]
-      (loop [[pg & rest] property-groups
-             properties prev-properties
-             classes prev-classes
-             old-paths #{}]
-        (if pg
-          (let [[property-sid property-data class-updates old-sketch-paths]
-                (<? (process-and-write-property index-catalog ledger-name current-t pg
-                                                prev-properties prev-classes))]
-            (recur rest
-                   (assoc properties property-sid property-data)
-                   (or class-updates classes)
-                   (into old-paths (or old-sketch-paths #{}))))
-          {:properties properties
-           :classes classes
-           :old-sketch-paths old-paths})))))
-
 (defn add-computed-fields
   "Add computed selectivity estimates to properties map for O(1) optimizer lookups.
 
@@ -496,31 +371,40 @@
 
 (defn- compute-counts-from-novelty
   "Update property and class counts from novelty, keeping NDV/selectivity from indexed stats.
-   This is a fast, synchronous computation for ledger-info that only updates counts.
+   Also updates class property details (types, ref-classes, langs) from novelty.
+   This is a fast, synchronous computation for ledger-info.
    NDV values require loading sketches from disk (expensive), so we keep indexed NDV as-is.
 
    Returns {:properties {sid -> {:count n :ndv-values n :ndv-subjects n :selectivity-* n}}
-            :classes {sid -> {:count n}}}"
+            :classes {sid -> {:count n :properties {prop -> {:types {...} :ref-classes {...} :langs {...}}}}}}"
   [novelty-flakes prev-properties prev-classes]
-  (let [property-groups (partition-by flake/p novelty-flakes)]
-    (reduce
-     (fn [acc property-flakes]
-       (let [p (flake/p (first property-flakes))
-             prev-prop-data (get prev-properties p {:count 0})
+  (let [property-groups (partition-by flake/p novelty-flakes)
+        ;; First pass: update property counts and class counts
+        updated-counts
+        (reduce
+         (fn [acc property-flakes]
+           (let [p (flake/p (first property-flakes))
+                 prev-prop-data (get prev-properties p {:count 0})
 
-             ;; Update count only (keep indexed NDV/selectivity)
-             property-data (update-property-count property-flakes prev-prop-data)
+                 property-data (update-property-count property-flakes prev-prop-data)
 
-             ;; Update class counts if rdf:type property
-             classes* (if (flake/class-flake? (first property-flakes))
-                        (update-class-counts property-flakes (:classes acc))
-                        (:classes acc))]
+                 classes* (if (flake/class-flake? (first property-flakes))
+                            (stats/update-class-counts property-flakes (:classes acc))
+                            (:classes acc))]
 
-         {:properties (assoc (:properties acc) p property-data)
-          :classes classes*}))
-     {:properties prev-properties
-      :classes prev-classes}
-     property-groups)))
+             {:properties (assoc (:properties acc) p property-data)
+              :classes classes*}))
+         {:properties prev-properties
+          :classes prev-classes}
+         property-groups)
+
+        ;; Second pass: update class property details (types, ref-classes, langs)
+        updated-class-props (stats/compute-class-property-stats-from-novelty
+                             novelty-flakes
+                             (:classes updated-counts))]
+
+    {:properties (:properties updated-counts)
+     :classes updated-class-props}))
 
 (defn current-stats
   "Compute current property and class statistics for ledger-info.
@@ -594,25 +478,18 @@
    If stats computation fails, returns previous stats with empty old-sketch-paths."
   [db]
   (go-try
-    (let [post-novelty    (get-in db [:novelty :post])
-          prev-properties (get-in db [:stats :properties] {})
-          prev-classes    (get-in db [:stats :classes] {})
-          ledger-name     (util.ledger/ledger-base-name (:alias db))
-          current-t       (:t db)]
+    (let [post-novelty (get-in db [:novelty :post])]
+      (if (empty? post-novelty)
+        {:properties (get-in db [:stats :properties] {})
+         :classes (get-in db [:stats :classes] {})
+         :old-sketch-paths #{}}
 
-      ;; Compute stats with error handling - keep previous stats if computation fails
-      (try*
-        (<? (compute-stats-with-writes (:index-catalog db) ledger-name current-t
-                                       post-novelty prev-properties prev-classes))
-        (catch* e
-          (log/error e "Stats computation failed, keeping previous stats"
-                     {:novelty-size (get-in db [:novelty :size])
-                      :ledger-alias (:alias db)
-                      :t current-t})
-          ;; Return previous stats on error
-          {:properties prev-properties
-           :classes prev-classes
-           :old-sketch-paths #{}})))))
+        (let [{:keys [index-catalog alias t]} db
+              ledger-name (util.ledger/ledger-base-name alias)
+              prev-properties (get-in db [:stats :properties] {})
+              prev-classes (get-in db [:stats :classes] {})]
+          (<? (stats/compute-stats-with-writes index-catalog ledger-name t post-novelty
+                                               prev-properties prev-classes)))))))
 
 (defn refresh-all
   ([db error-ch]
@@ -621,12 +498,18 @@
    (go-try
      ;; Check if this is a v1 index - if so, skip stats computation entirely
      ;; v1 indexes should not generate stats until fully reindexed
-     (let [prev-index-version (get-in db [:commit :index :v])
-           is-v1-index?       (and prev-index-version (< prev-index-version 2))
+     (let [prev-index-version  (get-in db [:commit :index :v])
+           is-v1-index?        (and prev-index-version (< prev-index-version 2))
+           track-class-stats?  (get db :track-class-stats true)
 
            ;; Kick off stats computation in parallel (v2 only)
            stats-ch (when-not is-v1-index?
                       (compute-stats-async db))
+
+           ;; Kick off class property tracking in parallel (v2 only, if enabled)
+           class-props-ch (when (and (not is-v1-index?)
+                                     track-class-stats?)
+                            (stats/compute-class-property-stats-async db))
 
            ;; Run index refresh (always required)
            index-result (<? (->> index/types
@@ -644,9 +527,15 @@
                             {:properties {}
                              :classes {}
                              :old-sketch-paths #{}})
-                          (<? stats-ch))]
+                          (<? stats-ch))
 
-       (merge index-result stats-result)))))
+           class-props-result (if class-props-ch
+                                (<? class-props-ch)
+                                {})
+
+           merged-classes (merge-with merge (:classes stats-result) class-props-result)]
+
+       (merge index-result (assoc stats-result :classes merged-classes))))))
 
 (defn refresh
   [{:keys [novelty t alias] :as db} changes-ch max-old-indexes]

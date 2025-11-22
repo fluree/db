@@ -297,7 +297,7 @@
 (defrecord FlakeDB [index-catalog commit-catalog alias commit t tt-id stats
                     spot post opst tspo vg schema comparators staged novelty policy
                     namespaces namespace-codes max-namespace-code
-                    reindex-min-bytes reindex-max-bytes max-old-indexes]
+                    reindex-min-bytes reindex-max-bytes max-old-indexes track-class-stats]
   dbproto/IFlureeDb
   (-query [this tracker query-map] (fql/query this tracker query-map))
   (-class-ids [this tracker subject] (match/class-ids this tracker subject))
@@ -308,6 +308,7 @@
             index-id      (get-in commit [:index :id])
             index-t       (get-in commit [:index :data :t])]
         {:stats           stats
+         :schema          schema
          :namespace-codes namespace-codes
          :t               t
          :novelty-post    (get novelty :post)
@@ -617,16 +618,22 @@
         reindex-max-bytes (or (:reindex-max-bytes indexing-opts)
                               (:reindex-max-bytes config)
                               1000000) ; 1mb
-        max-old-indexes (or (:max-old-indexes indexing-opts)
-                            (:max-old-indexes config)
-                            3)] ;; default of 3 maximum old indexes not garbage collected
+        max-old-indexes   (or (:max-old-indexes indexing-opts)
+                              (:max-old-indexes config)
+                              3) ;; default of 3 maximum old indexes not garbage collected
+        track-class-stats (if (contains? indexing-opts :track-class-stats)
+                            (:track-class-stats indexing-opts)
+                            (if (contains? config :track-class-stats)
+                              (:track-class-stats config)
+                              true))]
     (when-not (and (int? max-old-indexes)
                    (>= max-old-indexes 0))
       (throw (ex-info "Invalid max-old-indexes value. Must be a non-negative integer."
                       {:status 400, :error :db/invalid-config})))
     (assoc root-map :reindex-min-bytes reindex-min-bytes
            :reindex-max-bytes reindex-max-bytes
-           :max-old-indexes max-old-indexes)))
+           :max-old-indexes max-old-indexes
+           :track-class-stats track-class-stats)))
 
 ;; TODO - VG - need to reify vg from db-root!!
 (defn load

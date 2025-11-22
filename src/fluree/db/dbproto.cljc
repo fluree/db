@@ -13,6 +13,7 @@
 
     Returns a channel containing a map with:
       :stats - Stats map with :size, :flakes, :properties, :classes
+      :schema - Schema map with :pred (property/class definitions), :subclasses, :shapes
       :namespace-codes - Namespace codes for SID->IRI decoding
       :t - Current transaction number
       :novelty-post - Post novelty for computing current stats
