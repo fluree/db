@@ -66,14 +66,11 @@ jobs:
           cache-to: type=gha,mode=max
           tags: fluree/db
           load: true
-      - name: Extract seccomp profile
-        run: |
-          # Use a temporary container that doesn't need /proc/thread-self
-          CONTAINER_ID=$(docker run -d fluree/db sleep 5)
-          docker cp $CONTAINER_ID:/usr/src/flureedb/docker-chrome-seccomp.json .
-          docker rm -f $CONTAINER_ID
       - name: Run tests
-        run: docker run --security-opt seccomp=docker-chrome-seccomp.json fluree/db make cljstest
+        run: |
+          # Run with --privileged to avoid runc /proc/thread-self issue
+          # This is needed for Chrome to run in the container for CLJS tests
+          docker run --privileged fluree/db make cljstest
 
   test-other:
     name: run other tests
