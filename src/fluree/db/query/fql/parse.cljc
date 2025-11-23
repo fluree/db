@@ -103,7 +103,9 @@
             (where/match-value v const/iri-lang-string)
             (where/link-lang-var lang))
         (where/match-lang where/unmatched v lang))
-      (where/anonymous-value v))))
+      (if (number? v)
+        (where/untyped-value v)
+        (where/anonymous-value v)))))
 
 (defn every-binary-pred
   [& fs]
@@ -504,7 +506,9 @@
       [(where/->pattern :class (flip-reverse-pattern [s-mch p-mch class-ref]))])
 
     :else
-    (let [o-mch (where/anonymous-value o)]
+    (let [o-mch (if (number? o)
+                  (where/untyped-value o)
+                  (where/anonymous-value o))]
       [(flip-reverse-pattern [s-mch p-mch o-mch])])))
 
 (defn parse-statement
