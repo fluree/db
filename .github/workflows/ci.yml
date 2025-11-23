@@ -66,12 +66,14 @@ jobs:
           cache-to: type=gha,mode=max
           tags: fluree/db
           load: true
-      - name: Run tests
+      - name: Extract seccomp profile
         run: |
-          docker create --name fluree-db fluree/db true
-          docker cp fluree-db:/usr/src/flureedb/docker-chrome-seccomp.json .
-          docker rm fluree-db
-          docker run --security-opt seccomp=docker-chrome-seccomp.json fluree/db make cljstest
+          # Use a temporary container that doesn't need /proc/thread-self
+          CONTAINER_ID=$(docker run -d fluree/db sleep 5)
+          docker cp $CONTAINER_ID:/usr/src/flureedb/docker-chrome-seccomp.json .
+          docker rm -f $CONTAINER_ID
+      - name: Run tests
+        run: docker run --security-opt seccomp=docker-chrome-seccomp.json fluree/db make cljstest
 
   test-other:
     name: run other tests
