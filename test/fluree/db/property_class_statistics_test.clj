@@ -2,6 +2,7 @@
   "Tests for property and class statistics tracking during indexing"
   (:require [babashka.fs :as bfs :refer [with-temp-dir]]
             [clojure.core.async :as async :refer [<!!]]
+            [clojure.pprint :refer [pprint]]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.async-db]
@@ -246,14 +247,42 @@
 
             info     @(fluree/ledger-info conn ledger-id)]
 
-        (testing "ledger-info includes standard fields"
-          (is (some? (:address info)) "Should have address")
-          (is (some? (:alias info)) "Should have alias")
-          (is (some? (:branch info)) "Should have branch")
-          (is (some? (:t info)) "Should have t")
+        ;; Print full ledger-info for inspection
+        (println "\n=== FULL LEDGER-INFO STRUCTURE ===")
+        (pprint info)
+        (println "=================================\n")
+
+        (testing "ledger-info structure contains commit, nameservice, namespace-codes, and stats"
+          (is (some? (:commit info)) "Should have commit (JSON-LD)")
+          (is (some? (:nameservice info)) "Should have nameservice (JSON-LD)")
+          (is (map? (:namespace-codes info)) "Should have namespace-codes map")
+          (is (map? (:stats info)) "Should have stats map"))
+
+        (testing "Commit JSON-LD contains expected structure"
+          (let [commit (:commit info)]
+            (is (some? (get commit "id")) "Commit should have id")
+            (is (some? (get commit "type")) "Commit should have type")
+            (is (some? (get commit "alias")) "Commit should have alias")
+            (is (some? (get commit "data")) "Commit should have data")
+            (is (some? (get-in commit ["data" "t"])) "Commit data should have t")
+            (is (some? (get commit "index")) "Commit should have index metadata")
+            (is (some? (get-in commit ["index" "id"])) "Commit index should have id")
+            (is (some? (get-in commit ["index" "address"])) "Commit index should have address")
+            (is (test-utils/address? (get-in commit ["index" "address"]))
+                "Index address should be a valid address")))
+
+        (testing "Nameservice record contains ledger metadata"
+          (let [ns (:nameservice info)]
+            (when ns  ;; Nameservice may be nil if no publisher configured
+              (is (some? (get ns "@id")) "Nameservice should have @id (ledger alias)")
+              (is (some? (get ns "f:branch")) "Nameservice should have f:branch")
+              (is (some? (get ns "f:t")) "Nameservice should have f:t"))))
+
+        (testing "Stats contain size, flakes, properties, and classes"
           (is (some? (get-in info [:stats :size])) "Should have size")
           (is (some? (get-in info [:stats :flakes])) "Should have flakes")
-          (is (some? (:commit info)) "Should have commit"))
+          (is (map? (get-in info [:stats :properties])) "Should have properties map")
+          (is (map? (get-in info [:stats :classes])) "Should have classes map"))
 
         (testing "ledger-info includes statistics with decoded IRIs and nested structure"
           (let [properties (get-in info [:stats :properties])

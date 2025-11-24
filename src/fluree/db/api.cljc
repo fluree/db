@@ -557,14 +557,25 @@
     ledger-id - Ledger alias (with optional :branch) or address
 
   Returns info map with:
-    - :address - Ledger address
-    - :alias - Ledger alias
-    - :branch - Branch name
-    - :t - Current transaction number
-    - :size - Total byte size
-    - :flakes - Total flake count
-    - :commit - Commit metadata
+    - :commit - Commit metadata (JSON-LD format) including:
+        - @id - Commit ID
+        - @type - Type (VerifiableCredential)
+        - alias - Ledger alias
+        - data - DB data including t (transaction number)
+        - index - Index metadata with id, t, and address
+        - ns - Namespace addresses
+        - previous - Previous commit reference
+        - time - Commit timestamp
+    - :nameservice - Nameservice record (JSON-LD format) if available, including:
+        - @id - Ledger alias with branch
+        - f:branch - Branch name
+        - f:t - Current transaction number
+        - f:commit - Commit address/reference
+        - f:index - Index address/reference
+    - :namespace-codes - Map of namespace IRIs to namespace codes
     - :stats - Statistics map containing:
+      - :size - Total byte size
+      - :flakes - Total flake count
       - :properties - Map of property IRI -> stats (count, NDV, selectivity, :sub-property-of)
       - :classes - Map of class IRI -> stats (count, :subclass-of, nested property details)
 
