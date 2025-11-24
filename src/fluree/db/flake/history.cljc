@@ -115,6 +115,7 @@
           idx     (index/for-components s p o nil)
           pattern (case idx
                     :spot [s p o]
+                    :psot [p s o]
                     :post [p o s]
                     :opst [o p s])]
       [pattern idx])))
