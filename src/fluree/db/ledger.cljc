@@ -96,21 +96,21 @@
    Returns stats in native SID format - use fluree.db.api/ledger-info for IRI-decoded version."
   ([ledger]
    (ledger-info ledger const/default-branch-name))
-  ([{:keys [address alias] :as ledger} requested-branch]
+  ([{:keys [address alias primary-publisher] :as ledger} requested-branch]
    (go-try
      (let [branch-data (get-branch-meta ledger requested-branch)
-           branch-name (:name branch-data)
            current-db  (branch/current-db branch-data)
-           ;; Get stats, namespace-codes, commit, index, and novelty via protocol method
-           {:keys [stats namespace-codes t novelty-post commit index]} (<? (dbproto/-ledger-info current-db))
-           ;; Compute current stats by replaying novelty - need to pass a map with :stats and :novelty :post
-           current-stats (novelty/current-stats {:stats stats :novelty {:post novelty-post}})]
-       {:address         address
-        :alias           alias
-        :branch          branch-name
-        :t               t
-        :commit          commit
-        :index           index
+           {:keys [stats namespace-codes novelty-post commit]} (<? (dbproto/-ledger-info current-db))
+           current-stats (novelty/current-stats {:stats stats :novelty {:post novelty-post}})
+           commit-jsonld (commit-data/->json-ld commit)
+           nameservice (when primary-publisher
+                         (try*
+                           (<? (nameservice/lookup primary-publisher address))
+                           (catch* e
+                             (log/debug "Unable to fetch nameservice record" {:alias alias :error (ex-message e)})
+                             nil)))]
+       {:commit          commit-jsonld
+        :nameservice     nameservice
         :namespace-codes namespace-codes
         :stats           (merge stats current-stats)}))))
 
