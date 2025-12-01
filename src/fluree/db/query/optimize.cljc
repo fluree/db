@@ -101,7 +101,7 @@
   "Attach filter code to a match object for later compilation.
   Stores the code and variable in metadata for later compilation."
   [mch variable codes]
-  (assoc mch ::filter-code {:variable variable :codes codes}))
+  (assoc mch ::filter-code {:variable variable, :forms codes}))
 
 (defn with-var-filter
   "Add filter code to the match object for the variable in tuple."
@@ -115,7 +115,7 @@
 (defn get-filter-codes
   "Extract filter codes from a filter function's metadata."
   [filter-fn]
-  (-> filter-fn meta :codes vec))
+  (-> filter-fn meta :forms vec))
 
 (defn compile-filter
   "Compile filter code into an executable filter function.
@@ -134,10 +134,10 @@
 (defn compile-inline-filters
   "Compile any filter codes in a match object."
   [mch context]
-  (if-let [{:keys [variable codes]} (::filter-code mch)]
+  (if-let [{:keys [variable forms]} (::filter-code mch)]
     (-> mch
         (dissoc ::filter-code)
-        (where/with-filter (compile-filter variable codes context)))
+        (where/with-filter (compile-filter variable forms context)))
     mch))
 
 (declare compile-filter-codes)

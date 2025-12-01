@@ -568,7 +568,7 @@
   (let [parsed-codes (map parse-code codes)
         vars         (apply set/union (map variables parsed-codes))
         f            (compile-filter-fn context parsed-codes)]
-    [(where/->pattern :filter (with-meta f {:codes parsed-codes :vars vars}))]))
+    [(where/->pattern :filter (with-meta f {:forms parsed-codes, :vars vars}))]))
 
 (defmethod parse-pattern :union
   [[_ & unions] var-config context]
