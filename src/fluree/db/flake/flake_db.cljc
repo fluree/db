@@ -647,13 +647,18 @@
            root-map    (if-let [{:keys [address]} (:index commit-map)]
                          (<? (index-storage/read-db-root index-catalog address))
                          (genesis-root-map ledger-alias))
+           ;; Propagate index version from root-map into commit-map so it's available
+           ;; for subsequent re-indexing operations (novelty.cljc, storage.cljc)
+           commit-map* (if-let [v (:v root-map)]
+                         (assoc-in commit-map [:index :v] v)
+                         commit-map)
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
            indexed-db  (-> root-map
                            (add-reindex-thresholds indexing-opts)
                            (assoc :index-catalog index-catalog
                                   :commit-catalog commit-catalog
                                   :alias ledger-alias
-                                  :commit commit-map
+                                  :commit commit-map*
                                   :tt-id nil
                                   :comparators index/comparators
                                   :staged nil
