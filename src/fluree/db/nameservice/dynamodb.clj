@@ -179,19 +179,23 @@
           ;; Java's HttpClient doesn't allow setting restricted headers like "host"
           ;; It sets them automatically based on the URL
           headers* (dissoc headers "host")
-          ;; Use xhttp/post with the pre-serialized JSON body
-          response (<? (xhttp/post url body
-                                   {:headers headers*
-                                    :request-timeout timeout-ms}))]
-      (if (:error response)
-        (throw (ex-info "DynamoDB request failed"
-                        {:status (:status response)
-                         :error (:error response)
-                         :operation operation}))
-        ;; Parse the JSON response body with string keys (not keywords)
-        ;; DynamoDB uses keys like "Item", "Items", "LastEvaluatedKey"
-        (when-let [resp-body (:body response)]
-          (json/parse resp-body false))))))
+          ;; xhttp/post returns the body directly on success (not a map with :status/:body/:headers)
+          ;; Errors are thrown as exceptions
+          response-body (<? (xhttp/post url body
+                                        {:headers headers*
+                                         :request-timeout timeout-ms}))]
+      (log/debug "DynamoDB response" {:operation operation
+                                      :body-type (type response-body)
+                                      :body-length (when (string? response-body) (count response-body))
+                                      :body-preview (when (string? response-body)
+                                                      (subs response-body 0 (min 500 (count response-body))))})
+      ;; Parse the JSON response body with string keys (not keywords)
+      ;; DynamoDB uses keys like "Item", "Items", "LastEvaluatedKey"
+      (when (and response-body (string? response-body))
+        (let [parsed (json/parse response-body false)]
+          (log/debug "DynamoDB parsed response" {:operation operation
+                                                 :parsed-keys (keys parsed)})
+          parsed)))))
 
 ;; --- DynamoDB Operations ---
 
