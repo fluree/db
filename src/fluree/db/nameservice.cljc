@@ -19,7 +19,18 @@
 
 (defprotocol Publisher
   (publish [publisher commit-jsonld]
-    "Publishes new commit.")
+    "Publishes new commit data. This is the legacy method that writes both commit
+    and index data to a single record. For independent transactor/indexer operations,
+    prefer publish-commit and publish-index.")
+  (publish-commit [publisher ledger-alias commit-address commit-t]
+    "Publishes only commit data (address and t). This allows transactors to update
+    commit information without contending with indexers. Only updates if commit-t
+    is greater than the existing value.")
+  (publish-index [publisher ledger-alias index-address index-t]
+    "Publishes only index data (address and t). This allows indexers to update
+    index information without contending with transactors. Only updates if index-t
+    is greater than the existing value. Writes to a separate file/record to avoid
+    contention with commit updates.")
   (retract [publisher ledger-alias]
     "Remove the nameservice record for the ledger.")
   (publishing-address [publisher ledger-alias]

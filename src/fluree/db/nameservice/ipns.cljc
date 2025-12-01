@@ -58,6 +58,16 @@
   nameservice/Publisher
   (publish [_ commit-jsonld]
     (ipfs/push! ipfs-endpoint commit-jsonld))
+  (publish-commit [_ _ledger-alias _commit-address _commit-t]
+    ;; IPNS doesn't support separate commit/index publishing
+    ;; Use the full publish method instead
+    (log/warn "publish-commit not supported for IPNS nameservice; use publish instead")
+    (go-try nil))
+  (publish-index [_ _ledger-alias _index-address _index-t]
+    ;; IPNS doesn't support separate commit/index publishing
+    ;; Use the full publish method instead
+    (log/warn "publish-index not supported for IPNS nameservice; use publish instead")
+    (go-try nil))
   (retract [_ _ledger-alias]
     (ipfs/write ipfs-endpoint "null"))
   (publishing-address [_ ledger-alias]
