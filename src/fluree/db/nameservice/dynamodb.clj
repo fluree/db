@@ -202,8 +202,12 @@
     (let [payload {:TableName table-name
                    :Key {"ledger_alias" {"S" ledger-alias}}
                    :ConsistentRead true}
-          response (<? (dynamodb-request config "GetItem" payload timeout-ms))]
-      (get response "Item"))))
+          response (<? (dynamodb-request config "GetItem" payload timeout-ms))
+          item     (get response "Item")]
+      (log/debug "DynamoDB get-item" {:ledger-alias ledger-alias
+                                      :response-keys (keys response)
+                                      :has-item? (some? item)})
+      item)))
 
 (defn- dynamo-value->clj
   "Convert a DynamoDB attribute value to Clojure"
@@ -365,8 +369,13 @@
   (lookup [_ ledger-address]
     (go-try
       (log/debug "DynamoDBNameService lookup:" {:ledger-address ledger-address})
-      (when-let [item (<? (get-item config ledger-address))]
-        (item->ns-record item ledger-address))))
+      (let [item (<? (get-item config ledger-address))
+            record (when item (item->ns-record item ledger-address))]
+        (log/debug "DynamoDBNameService lookup result:" {:ledger-address ledger-address
+                                                          :has-item? (some? item)
+                                                          :has-record? (some? record)
+                                                          :commit-address (get record "f:commit")})
+        record)))
 
   (alias [_ ledger-address]
     ;; For DynamoDB, the address is the alias
