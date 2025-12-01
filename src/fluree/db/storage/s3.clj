@@ -537,6 +537,7 @@
         err (:error data)]
     (or (= err :xhttp/timeout)
         (nil? status)
+        (= status 412) ; Precondition Failed - retry for conditional writes (ETag mismatch)
         (= status 429)
         (= status 500)
         (= status 502)
