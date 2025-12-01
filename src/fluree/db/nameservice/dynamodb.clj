@@ -57,10 +57,13 @@
                        (System/getProperty "aws.secretKey"))
         session-token (or (System/getenv "AWS_SESSION_TOKEN")
                           (System/getProperty "aws.sessionToken"))]
-    (when (and access-key secret-key)
+    (when (and (not (str/blank? access-key))
+               (not (str/blank? secret-key)))
       (cond-> {:access-key access-key
                :secret-key secret-key}
-        session-token (assoc :session-token session-token)))))
+        ;; Only include session token if it's not blank
+        (and session-token (not (str/blank? session-token)))
+        (assoc :session-token session-token)))))
 
 (defn hmac-sha256
   "Generate HMAC-SHA256 signature"
@@ -71,9 +74,10 @@
     (.doFinal mac (.getBytes data "UTF-8"))))
 
 (defn sha256-hex
-  "Generate SHA256 hash and return as hex string"
+  "Generate SHA256 hash and return as lowercase hex string"
   [^String data]
-  (crypto/sha2-256 data :hex))
+  ;; Ensure lowercase - AWS SigV4 requires lowercase hex
+  (str/lower-case (crypto/sha2-256 data :hex)))
 
 (defn get-signature-key
   "Derive the signing key for AWS Signature V4"
@@ -129,7 +133,7 @@
         payload-str (json/stringify payload)
         payload-hash (sha256-hex payload-str)
 
-        ;; Build headers
+        ;; Build headers - values must be trimmed per AWS spec
         base-headers {"content-type" "application/x-amz-json-1.0"
                       "host" host
                       "x-amz-date" amz-date
@@ -138,10 +142,13 @@
                   (assoc base-headers "x-amz-security-token" session-token)
                   base-headers)
 
-        ;; Canonical headers must be sorted
+        ;; Canonical headers must be sorted by lowercase header name
+        ;; Header values must be trimmed and multiple spaces collapsed
         sorted-header-names (sort (keys headers))
-        canonical-headers (str/join "" (map #(str (str/lower-case %) ":" (get headers %) "\n") sorted-header-names))
-        signed-headers (str/join ";" (map str/lower-case sorted-header-names))
+        canonical-headers (str/join ""
+                                    (map #(str % ":" (str/trim (get headers %)) "\n")
+                                         sorted-header-names))
+        signed-headers (str/join ";" sorted-header-names)
 
         ;; Create canonical request
         canonical-request (create-canonical-request "POST" "/" "" canonical-headers signed-headers payload-hash)
@@ -160,6 +167,17 @@
                            "SignedHeaders=" signed-headers ", "
                            "Signature=" signature)]
 
+    (log/debug "DynamoDB SigV4 signing"
+               {:operation operation
+                :host host
+                :amz-date amz-date
+                :date-stamp date-stamp
+                :region region
+                :payload-hash payload-hash
+                :payload-length (count payload-str)
+                :signed-headers signed-headers
+                :canonical-request canonical-request
+                :string-to-sign string-to-sign})
     {:url endpoint
      :headers (assoc headers "authorization" authorization)
      :body payload-str}))
@@ -172,18 +190,21 @@
           ;; Java's HttpClient doesn't allow setting restricted headers like "host"
           ;; It sets them automatically based on the URL
           headers* (dissoc headers "host")
-          ;; Use xhttp/post (not post-json) since body is already stringified
-          ;; and we need custom headers for AWS signing
+          ;; Use xhttp/post with the pre-serialized JSON body
+          ;; Don't use :json? true as that might modify the body
           response (<? (xhttp/post url body
                                    {:headers headers*
-                                    :request-timeout timeout-ms
-                                    :json? true}))]
+                                    :request-timeout timeout-ms}))]
+      (log/debug "DynamoDB response" {:status (:status response)
+                                      :error (:error response)})
       (if (:error response)
         (throw (ex-info "DynamoDB request failed"
                         {:status (:status response)
                          :error (:error response)
                          :operation operation}))
-        response))))
+        ;; Parse the JSON response
+        (when-let [resp-body (:body response)]
+          (json/parse resp-body false))))))
 
 ;; --- DynamoDB Operations ---
 
