@@ -167,17 +167,6 @@
                            "SignedHeaders=" signed-headers ", "
                            "Signature=" signature)]
 
-    (log/debug "DynamoDB SigV4 signing"
-               {:operation operation
-                :host host
-                :amz-date amz-date
-                :date-stamp date-stamp
-                :region region
-                :payload-hash payload-hash
-                :payload-length (count payload-str)
-                :signed-headers signed-headers
-                :canonical-request canonical-request
-                :string-to-sign string-to-sign})
     {:url endpoint
      :headers (assoc headers "authorization" authorization)
      :body payload-str}))
@@ -191,18 +180,16 @@
           ;; It sets them automatically based on the URL
           headers* (dissoc headers "host")
           ;; Use xhttp/post with the pre-serialized JSON body
-          ;; Don't use :json? true as that might modify the body
           response (<? (xhttp/post url body
                                    {:headers headers*
                                     :request-timeout timeout-ms}))]
-      (log/debug "DynamoDB response" {:status (:status response)
-                                      :error (:error response)})
       (if (:error response)
         (throw (ex-info "DynamoDB request failed"
                         {:status (:status response)
                          :error (:error response)
                          :operation operation}))
-        ;; Parse the JSON response
+        ;; Parse the JSON response body with string keys (not keywords)
+        ;; DynamoDB uses keys like "Item", "Items", "LastEvaluatedKey"
         (when-let [resp-body (:body response)]
           (json/parse resp-body false))))))
 
