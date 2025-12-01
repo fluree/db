@@ -169,10 +169,13 @@
   [config operation payload timeout-ms]
   (go-try
     (let [{:keys [url headers body]} (sign-request config operation payload)
+          ;; Java's HttpClient doesn't allow setting restricted headers like "host"
+          ;; It sets them automatically based on the URL
+          headers* (dissoc headers "host")
           ;; Use xhttp/post (not post-json) since body is already stringified
           ;; and we need custom headers for AWS signing
           response (<? (xhttp/post url body
-                                   {:headers headers
+                                   {:headers headers*
                                     :request-timeout timeout-ms
                                     :json? true}))]
       (if (:error response)
