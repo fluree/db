@@ -482,7 +482,9 @@
                                      (<? (write-s3-data this path new-bytes {"If-None-Match" "*"}))))
                                  ;; Other error, re-throw
                                  (throw e))))))]
-        (<? (with-retries swap-thunk {:max-retries         max-retries
+        ;; Swap operations use 3x retries because 412 conflicts under high contention
+        ;; may require many attempts before winning the race
+        (<? (with-retries swap-thunk {:max-retries         (* 3 max-retries)
                                       :retry-base-delay-ms retry-base-delay-ms
                                       :retry-max-delay-ms  retry-max-delay-ms
                                       :log-context         {:method "SWAP"
@@ -561,6 +563,11 @@
       (nil? status)          "unknown error (no status)"
       :else                  (str "HTTP " status))))
 
+(defn- etag-conflict?
+  "Returns true if the error is a 412 Precondition Failed (ETag mismatch)."
+  [e]
+  (= 412 (:status (ex-data e))))
+
 (defn- with-retries
   "Runs thunk returning a channel; retries on retryable errors with backoff/jitter.
   policy may include :log-context with keys like {:method :bucket :path}"
@@ -572,7 +579,12 @@
             duration-ms (long (/ (- (System/nanoTime) start) 1000000))]
         (if (instance? Throwable res)
           (if (and (< attempt max-retries) (retryable-error? res))
-            (let [delay (min (* retry-base-delay-ms (long (Math/pow 2 attempt))) retry-max-delay-ms)
+            (let [;; For 412 ETag conflicts: use fixed 200ms delay with jitter (not exponential backoff)
+                  ;; since we just need to spread out concurrent writers, not wait for server recovery.
+                  ;; 200ms accounts for S3's ~100ms latency plus buffer for the read-modify-write cycle.
+                  delay (if (etag-conflict? res)
+                          200
+                          (min (* retry-base-delay-ms (long (Math/pow 2 attempt))) retry-max-delay-ms))
                   wait-ms (jitter delay)
                   reason (retry-reason res)
                   data (merge {:event       "s3.retry"

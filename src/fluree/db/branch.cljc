@@ -118,8 +118,11 @@
 
 (defn index-queue
   [publishers branch-state]
-  (let [buf   (async/sliding-buffer 1)
-        queue (async/chan buf)]
+  (let [buf                   (async/sliding-buffer 1)
+        queue                 (async/chan buf)
+        ;; Publishers list is (cons primary secondary...), so first is primary
+        primary-publisher     (first publishers)
+        secondary-publishers  (rest publishers)]
     (go-loop [last-index-commit nil]
       (when-let [{:keys [db index-files-ch complete-ch]} (<! queue)]
         (let [db* (use-latest-index db last-index-commit branch-state)
@@ -127,11 +130,15 @@
                        (let [indexed-db (<? (indexer/index db* index-files-ch)) ; indexer/index always returns a FlakeDB (never AsyncDB)
                              [{prev-commit :commit} {indexed-commit :commit}]
                              (swap-vals! branch-state update-index indexed-db)]
-                         (if-not (= prev-commit indexed-commit)
+                         (when-not (= prev-commit indexed-commit)
                            (let [_ (log/debug "Publishing new index commit:" indexed-commit)
                                  commit-jsonld (commit-data/->json-ld indexed-commit)]
-                             (nameservice/publish-to-all commit-jsonld publishers))
-                           (log/debug "Not publishing unchanged index commit:" indexed-commit))
+                             ;; Await primary publisher (critical for consistency)
+                             (when primary-publisher
+                               (<? (nameservice/publish primary-publisher commit-jsonld)))
+                             ;; Fire-and-forget secondary publishers (non-blocking)
+                             (when (seq secondary-publishers)
+                               (nameservice/publish-to-all commit-jsonld secondary-publishers))))
                          {:status :success, :db indexed-db, :commit indexed-commit})
                        (catch* e
                          (log/error e "Error updating index")

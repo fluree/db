@@ -38,17 +38,23 @@
   (known-addresses [publication ledger-alias]))
 
 (defn publish-to-all
+  "Publishes commit to all publishers and returns a channel with a vector of results.
+   Each result is either the publish response or ::publishing-error on failure.
+   Waits for all publishers to complete before returning."
   [commit-jsonld publishers]
-  (->> publishers
-       (keep identity)
-       (map (fn [ns]
-              (go
-                (try*
-                  (<? (publish ns commit-jsonld))
-                  (catch* e
-                    (log/warn e "Publisher failed to publish commit" {:alias (or (get commit-jsonld "alias") (get commit-jsonld :alias))})
-                    ::publishing-error)))))
-       async/merge))
+  (let [pub-chs (->> publishers
+                     (keep identity)
+                     (mapv (fn [ns]
+                             (go
+                               (try*
+                                 (<? (publish ns commit-jsonld))
+                                 (catch* e
+                                   (log/warn e "Publisher failed to publish commit"
+                                             {:alias (or (get commit-jsonld "alias") (get commit-jsonld :alias))})
+                                   ::publishing-error))))))]
+    (if (seq pub-chs)
+      (async/into [] (async/merge pub-chs))
+      (go []))))
 
 (defn published-ledger?
   [nsv ledger-alias]
