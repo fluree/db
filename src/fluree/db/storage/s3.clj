@@ -544,6 +544,23 @@
         (= status 503)
         (= status 504))))
 
+(defn- retry-reason
+  "Returns a human-readable reason for why a request is being retried."
+  [e]
+  (let [data (ex-data e)
+        status (:status data)
+        err (:error data)]
+    (cond
+      (= err :xhttp/timeout) "request timeout"
+      (= status 412)         "conditional write conflict (ETag mismatch)"
+      (= status 429)         "rate limited"
+      (= status 500)         "internal server error"
+      (= status 502)         "bad gateway"
+      (= status 503)         "service unavailable"
+      (= status 504)         "gateway timeout"
+      (nil? status)          "unknown error (no status)"
+      :else                  (str "HTTP " status))))
+
 (defn- with-retries
   "Runs thunk returning a channel; retries on retryable errors with backoff/jitter.
   policy may include :log-context with keys like {:method :bucket :path}"
@@ -557,14 +574,17 @@
           (if (and (< attempt max-retries) (retryable-error? res))
             (let [delay (min (* retry-base-delay-ms (long (Math/pow 2 attempt))) retry-max-delay-ms)
                   wait-ms (jitter delay)
-                  data (merge {:event "s3.retry"
-                               :attempt attempt
-                               :wait-ms wait-ms
+                  reason (retry-reason res)
+                  data (merge {:event       "s3.retry"
+                               :reason      reason
+                               :attempt     (inc attempt)
+                               :max-retries max-retries
+                               :wait-ms     wait-ms
                                :duration-ms duration-ms
-                               :error (ex-message res)}
+                               :error       (ex-message res)}
                               (ex-data res)
                               log-context)]
-              (log/warn "S3 request failed, retrying" data)
+              (log/info "S3 request retrying" data)
               (<! (async/timeout wait-ms))
               (recur (inc attempt)))
             (let [data (merge {:event "s3.error"
