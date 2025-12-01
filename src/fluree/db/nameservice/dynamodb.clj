@@ -169,9 +169,12 @@
   [config operation payload timeout-ms]
   (go-try
     (let [{:keys [url headers body]} (sign-request config operation payload)
-          response (<? (xhttp/post-json url body
-                                        {:headers headers
-                                         :timeout timeout-ms}))]
+          ;; Use xhttp/post (not post-json) since body is already stringified
+          ;; and we need custom headers for AWS signing
+          response (<? (xhttp/post url body
+                                   {:headers headers
+                                    :request-timeout timeout-ms
+                                    :json? true}))]
       (if (:error response)
         (throw (ex-info "DynamoDB request failed"
                         {:status (:status response)
