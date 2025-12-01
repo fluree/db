@@ -598,7 +598,7 @@
 (defn filter-exception
   "Reformats raw filter exception to try to provide more useful feedback."
   [e f]
-  (let [fn-str (->> f meta :fns (str/join " "))
+  (let [fn-str (->> f meta :forms (str/join " "))
         ex-msg (or (ex-message e)
                    ;; note: NullPointerException is common but has no ex-message, create one
                    (let [ex-type (str (type e))] ;; attempt to make JS compatible
