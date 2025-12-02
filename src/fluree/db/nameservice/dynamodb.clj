@@ -210,7 +210,10 @@
           item     (get response "Item")]
       (log/debug "DynamoDB get-item" {:ledger-alias ledger-alias
                                       :response-keys (keys response)
-                                      :has-item? (some? item)})
+                                      :has-item? (some? item)
+                                      :item-keys (keys item)
+                                      :has-index-address? (contains? item "index_address")
+                                      :has-commit-address? (contains? item "commit_address")})
       item)))
 
 (defn- dynamo-value->clj
@@ -233,7 +236,12 @@
           commit-address (dynamo-value->clj (get item "commit_address"))
           commit-t (dynamo-value->clj (get item "commit_t"))
           index-address (dynamo-value->clj (get item "index_address"))
-          index-t (dynamo-value->clj (get item "index_t"))]
+          index-t (dynamo-value->clj (get item "index_t"))
+          _ (log/debug "item->ns-record extraction" {:ledger-alias ledger-alias
+                                                     :raw-index-address (get item "index_address")
+                                                     :parsed-index-address index-address
+                                                     :raw-commit-address (get item "commit_address")
+                                                     :parsed-commit-address commit-address})]
       (cond-> {"@context" {"f" "https://ns.flur.ee/ledger#"}
                "@id" ledger-alias
                "@type" ["f:Database" "f:PhysicalDatabase"]
@@ -376,9 +384,10 @@
       (let [item (<? (get-item config ledger-address))
             record (when item (item->ns-record item ledger-address))]
         (log/debug "DynamoDBNameService lookup result:" {:ledger-address ledger-address
-                                                          :has-item? (some? item)
-                                                          :has-record? (some? record)
-                                                          :commit-address (get record "f:commit")})
+                                                         :has-item? (some? item)
+                                                         :has-record? (some? record)
+                                                         :commit-address (get record "f:commit")
+                                                         :index-address (get record "f:index")})
         record)))
 
   (alias [_ ledger-address]
