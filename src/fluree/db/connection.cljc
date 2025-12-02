@@ -188,12 +188,7 @@
 
                   :else
                   :noop)]
-    (log/debug "plan-ns-update" {:cur-t cur-t
-                                 :cur-idx cur-idx
-                                 :ns-t ns-t
-                                 :index-address index-address
-                                 :commit-address commit-address
-                                 :action action})
+    (log/trace "plan-ns-update" {:cur-t cur-t :ns-t ns-t :action action})
     action))
 
 (defn- commit->ns-info
@@ -216,47 +211,39 @@
   [{:keys [commit-catalog] :as conn} ns-info expanded-commit]
   (go-try
     (let [{:keys [ledger-alias branch commit-address index-address ns-t]} ns-info]
-      (log/debug "notify* received ns-info" {:ledger-alias ledger-alias
-                                             :branch branch
-                                             :ns-t ns-t
-                                             :commit-address commit-address
-                                             :index-address index-address
-                                             :expanded-commit? (boolean expanded-commit)})
       (if-let [ledger-ch (and ledger-alias (cached-ledger conn ledger-alias))]
         (let [ledger  (<? ledger-ch)
               db      (ledger/current-db ledger branch)
+              cur-t   (:t db)
               action  (plan-ns-update db ns-info)]
-          (log/debug "notify* planned action" {:ledger-alias ledger-alias :action action})
           (case action
             :noop
-            (do (log/debug "Ledger" ledger-alias "is already up to date")
+            (do (log/trace "Ledger" ledger-alias "is already up to date at t:" cur-t)
                 true)
 
             :index
-            (do (log/debug "Applying index-only update" {:ledger-alias ledger-alias
-                                                         :branch branch
-                                                         :index-address index-address})
+            (do (log/debug "Updating index for" (str ledger-alias "@" cur-t))
                 (let [res (try* (<? (ledger/notify-index ledger {:index-address index-address
                                                                  :branch        branch}))
                                 (catch* e
                                   (log/warn e "notify-index failed; marking stale to reload"
-                                            {:ledger-alias ledger-alias :branch branch
-                                             :index-address index-address})
+                                            {:ledger-alias ledger-alias :branch branch})
                                   ::ledger/stale))]
-                  (log/debug "notify-index result" {:ledger-alias ledger-alias :result res})
                   (when (= res ::ledger/stale)
                     (release-ledger conn ledger-alias))
                   res))
 
             :commit
-            (let [expanded-commit (or expanded-commit
+            (let [start-ms    (util/current-time-millis)
+                  _           (log/debug "Updating db" (str "\"" ledger-alias "@" cur-t "\"")
+                                         "to t:" ns-t "with commit:" commit-address)
+                  expanded-commit (or expanded-commit
                                       (<? (commit-storage/load-commit-with-metadata
                                            commit-catalog commit-address index-address)))
                   expanded-data   (let [db-address (-> expanded-commit
                                                        (get-first const/iri-data)
                                                        (get-first-value const/iri-address))]
                                     (<? (commit-storage/read-data-jsonld commit-catalog db-address)))]
-              (log/debug "Applying commit update" {:ledger-alias ledger-alias :t ns-t})
               (let [res (try* (<? (ledger/notify ledger expanded-commit expanded-data))
                               (catch* e
                                 (log/warn e "notify commit failed; marking stale to reload"
@@ -264,7 +251,8 @@
                                 ::ledger/stale))]
                 (case res
                   (::ledger/current ::ledger/newer ::ledger/updated)
-                  (do (log/debug "Ledger" ledger-alias "is up to date after commit path")
+                  (do (log/debug "Updated" ledger-alias "to t:" ns-t
+                                 "in" (- (util/current-time-millis) start-ms) "ms")
                       true)
                   ::ledger/stale
                   (do (log/debug "Dropping state for stale ledger:" ledger-alias)
@@ -273,7 +261,7 @@
             :stale
             (do (log/debug "Dropping state for stale ledger:" ledger-alias)
                 (release-ledger conn ledger-alias))))
-        (log/debug "Ledger not currently loaded:" ledger-alias "; skipping notify of changes.")))))
+        (log/trace "Ledger not currently loaded:" ledger-alias)))))
 
 ;; TODO; Were subscribing to every remote system for every ledger we load.
 ;; Perhaps we should ensure that a remote system manages a particular ledger
