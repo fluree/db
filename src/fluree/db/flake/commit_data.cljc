@@ -74,7 +74,8 @@
   [["id" :id]
    ["type" ["Index"]]
    ["address" :address]
-   ["data" :data]])
+   ["data" :data]
+   ["v" :v]])
 
 (defn merge-template
   "Merges provided map with template and places any
@@ -171,9 +172,12 @@
                          util/sequential
                          (mapv (fn [namespace]
                                  {:id (get-id namespace)}))))
-      index (assoc :index {:id      (get-id index)
-                           :address (get-first-value index const/iri-address)
-                           :data    (parse-db-data (get-first index const/iri-data))})
+      index (assoc :index (cond-> {:id      (get-id index)
+                                   :address (get-first-value index const/iri-address)
+                                   :data    (parse-db-data (get-first index const/iri-data))}
+                            ;; Include index version if present for proper propagation
+                            (get-first-value index const/iri-v)
+                            (assoc :v (get-first-value index const/iri-v))))
       issuer (assoc :issuer {:id (get-id issuer)}))))
 
 (defn update-index-roots

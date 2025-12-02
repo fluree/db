@@ -173,7 +173,15 @@
   [ns-record]
   (let [expanded (json-ld/expand ns-record)
         ;; The @id field contains the full ledger:branch alias
-        ledger-alias (get-first-value expanded const/iri-id)]
+        ledger-alias (get-first-value expanded const/iri-id)
+        commit-node (get-first expanded const/iri-commit)
+        index-node (get-first expanded const/iri-index)
+        _ (log/debug "expand-and-extract-ns" {:ns-record-keys (keys ns-record)
+                                              :has-f:index? (contains? ns-record "f:index")
+                                              :raw-f:index (get ns-record "f:index")
+                                              :expanded-keys (keys expanded)
+                                              :commit-node commit-node
+                                              :index-node index-node})]
     {:ledger-alias   ledger-alias
      :branch         (or (get-first-value expanded const/iri-branch)
                          (second (util.ledger/ledger-parts ledger-alias)))
