@@ -61,6 +61,25 @@
                     ::publishing-error)))))
        async/merge))
 
+(defn publish-index-to-all
+  "Publishes index data to all publishers using atomic conditional updates.
+   Each result is either the publish-index response or ::publishing-error on failure.
+   This is the safe way to publish index updates without overwriting commit data."
+  [ledger-alias index-address index-t publishers]
+  (let [pub-chs (->> publishers
+                     (keep identity)
+                     (mapv (fn [ns]
+                             (go
+                               (try*
+                                 (<? (publish-index ns ledger-alias index-address index-t))
+                                 (catch* e
+                                   (log/warn e "Publisher failed to publish index"
+                                             {:alias ledger-alias :index-t index-t})
+                                   ::publishing-error))))))]
+    (if (seq pub-chs)
+      (async/into [] (async/merge pub-chs))
+      (go []))))
+
 (defn published-ledger?
   [nsv ledger-alias]
   (go-try

@@ -127,11 +127,22 @@
                        (let [indexed-db (<? (indexer/index db* index-files-ch)) ; indexer/index always returns a FlakeDB (never AsyncDB)
                              [{prev-commit :commit} {indexed-commit :commit}]
                              (swap-vals! branch-state update-index indexed-db)]
-                         (if-not (= prev-commit indexed-commit)
-                           (let [_ (log/debug "Publishing new index commit:" indexed-commit)
-                                 commit-jsonld (commit-data/->json-ld indexed-commit)]
-                             (nameservice/publish-to-all commit-jsonld publishers))
-                           (log/debug "Not publishing unchanged index commit:" indexed-commit))
+                         (when-not (= prev-commit indexed-commit)
+                           ;; Use publish-index to atomically update only index data.
+                           ;; This prevents race conditions where indexing could overwrite
+                           ;; newer commit data that was published while indexing was running.
+                           (let [ledger-alias  (:alias indexed-db)
+                                 index-address (-> indexed-commit :index :address)
+                                 index-t       (commit-data/index-t indexed-commit)]
+                             (log/debug "Publishing new index" {:alias ledger-alias
+                                                                :index-address index-address
+                                                                :index-t index-t})
+                             ;; Await primary publisher (critical for consistency)
+                             (when primary-publisher
+                               (<? (nameservice/publish-index primary-publisher ledger-alias index-address index-t)))
+                             ;; Fire-and-forget secondary publishers (non-blocking)
+                             (when (seq secondary-publishers)
+                               (nameservice/publish-index-to-all ledger-alias index-address index-t secondary-publishers))))
                          {:status :success, :db indexed-db, :commit indexed-commit})
                        (catch* e
                          (log/error e "Error updating index")
