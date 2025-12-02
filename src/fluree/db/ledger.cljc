@@ -201,7 +201,7 @@
           index-id      (<? (idx-address->idx-id index-catalog index-address))
           index-version (:v root)
           index-map     (commit-data/new-index data index-id index-address index-version
-                                               (select-keys root [:spot :post :opst :tspo]))]
+                                               (select-keys root [:spot :post :opst :tspo :stats]))]
       (dbproto/-index-update db index-map))))
 
 (defn- update-branch-with-index

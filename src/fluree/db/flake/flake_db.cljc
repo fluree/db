@@ -98,11 +98,21 @@
 
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
-  If it is not newer, returns original db."
-  [{:keys [commit] :as db} {data-map :data, :keys [spot psot post opst tspo] :as index-map}]
+  If it is not newer, returns original db.
+
+  The index-map may include :stats from the index root (with :properties and :classes)
+  which should be merged into the db's stats when applying the newer index."
+  [{:keys [commit] :as db} {data-map :data, :keys [spot psot post opst tspo stats] :as index-map}]
   (if (newer-index? commit index-map)
     (let [index-t (:t data-map)
-          commit* (assoc commit :index index-map)]
+          commit* (assoc commit :index index-map)
+          ;; Merge stats from index root, preserving flakes/size from current db
+          ;; and applying :properties/:classes from the index
+          current-stats (get db :stats {})
+          updated-stats (cond-> current-stats
+                          true                (assoc :indexed index-t)
+                          (:properties stats) (assoc :properties (:properties stats))
+                          (:classes stats)    (assoc :classes (:classes stats)))]
       (-> db
           (empty-novelty index-t)
           (assoc :commit commit*
@@ -110,8 +120,8 @@
                  :psot psot
                  :post post
                  :opst opst
-                 :tspo tspo)
-          (assoc-in [:stats :indexed] index-t)))
+                 :tspo tspo
+                 :stats updated-stats)))
     db))
 
 (defn with-namespaces
