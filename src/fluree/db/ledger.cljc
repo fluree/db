@@ -500,11 +500,21 @@
        :write-result  commit-res})))
 
 (defn publish-commit
-  "Publishes commit to all nameservices registered with the ledger."
+  "Publishes commit to all nameservices registered with the ledger.
+   Uses atomic publish-commit to update only commit fields, avoiding
+   overwriting index data that may have been updated by a separate indexer."
   [{:keys [primary-publisher secondary-publishers] :as _ledger} commit-jsonld]
   (go-try
-    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
-      (nameservice/publish-to-all commit-jsonld secondary-publishers)
+    (let [ledger-alias   (get commit-jsonld "alias")
+          commit-address (get commit-jsonld "address")
+          commit-t       (get-in commit-jsonld ["data" "t"])
+          _              (log/debug "publish-commit using atomic update"
+                                    {:alias ledger-alias :commit-t commit-t})
+          result         (<? (nameservice/publish-commit primary-publisher
+                                                         ledger-alias
+                                                         commit-address
+                                                         commit-t))]
+      (nameservice/publish-commit-to-all ledger-alias commit-address commit-t secondary-publishers)
       result)))
 
 (defn formalize-commit
