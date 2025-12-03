@@ -70,15 +70,35 @@
 
 ;; Inline filter optimization
 
+(defn filter-info
+  "Describe a `:filter` pattern by returning a map of useful details, or nil if the
+  pattern is not a filter.
+
+  {:pattern <original pattern entry>
+   :fn      <compiled filter fn>
+   :vars    #{sym ...} ; symbols referenced by the filter
+   :forms   [form ...] ; parsed forms used to compile the filter}
+
+  The values mirror what the parser stored in the filter function's metadata, but
+  packaged in a plain map so downstream optimizations can reason about them without
+  digging through metadata directly."
+  [pattern]
+  (when (= :filter (where/pattern-type pattern))
+    (let [f     (where/pattern-data pattern)
+          forms (some-> f meta :forms vec)
+          vars  (-> f meta :vars)]
+      {:pattern pattern
+       :fn      f
+       :vars    vars
+       :forms   forms})))
+
 (defn get-filtered-variable
   "Get the variable from a filter pattern that references exactly one variable.
   Returns the variable symbol if it is a single-variable filter, nil otherwise."
   [pattern]
-  (when (= :filter (where/pattern-type pattern))
-    (let [f    (where/pattern-data pattern)
-          vars (-> f meta :vars)]
-      (when (= 1 (count vars))
-        (first vars)))))
+  (let [vars (some-> pattern filter-info :vars)]
+    (when (= 1 (count vars))
+      (first vars))))
 
 (defn matches-var?
   "Check if a match object references the given variable."
