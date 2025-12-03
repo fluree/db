@@ -1,6 +1,8 @@
 (ns fluree.db.query.optimize
-  (:require [fluree.db.query.exec.eval :as eval]
+  (:require [clojure.set :as set]
+            [fluree.db.query.exec.eval :as eval]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try <?]]))
 
 (defn compare-component
@@ -137,6 +139,174 @@
   [filter-fn]
   (-> filter-fn meta :forms vec))
 
+(def binding-pattern-types
+  #{:tuple :class :id})
+
+(defn binding-pattern?
+  [pattern-type]
+  (contains? binding-pattern-types pattern-type))
+
+(defn tuple-bound-vars
+  [tuple]
+  (->> tuple
+       (keep (fn [m]
+               (let [var (where/get-variable m)]
+                 (when (and var (where/unmatched? m))
+                   var))))
+       set))
+
+(defn pattern-bound-vars
+  [pattern pattern-type]
+  (when (binding-pattern? pattern-type)
+    (let [tuple (if (= :tuple pattern-type)
+                  (util/ensure-vector pattern)
+                  (util/ensure-vector (where/pattern-data pattern)))]
+      (tuple-bound-vars tuple))))
+
+(defn choose-target-var
+  [likely-vars all-vars]
+  (let [ordered (vec (sort all-vars))]
+    (or (some #(when (contains? likely-vars %) %) (reverse ordered))
+        (last ordered))))
+
+(defn update-pending-for-pattern
+  [pending pattern-vars]
+  (reduce-kv
+   (fn [[pending* inline] id {:keys [info remaining inlined?] :as entry}]
+     (if inlined?
+       [(assoc pending* id entry) inline]
+       (let [remaining (or remaining #{})
+             newly-bound (set/intersection remaining pattern-vars)
+             remaining*  (set/difference remaining pattern-vars)]
+         (if (and (seq newly-bound) (empty? remaining*))
+           (let [target (choose-target-var newly-bound (:vars info))]
+             [(assoc pending* id (assoc entry
+                                        :remaining remaining*
+                                        :inlined? true
+                                        :target target))
+              (conj inline {:id id
+                            :target target
+                            :forms  (:forms info)})])
+           [(assoc pending* id (assoc entry :remaining remaining*))
+            inline]))))
+   [pending []]
+   pending))
+
+(defn attach-inline-filters
+  [pattern pattern-type pending pattern-vars]
+  (let [tuple (if (= :tuple pattern-type)
+                (util/ensure-vector pattern)
+                (util/ensure-vector (where/pattern-data pattern)))
+        [pending* inline] (update-pending-for-pattern pending pattern-vars)
+        tuple* (reduce (fn [tuple {:keys [target forms]}]
+                         (with-var-filter tuple target forms))
+                       tuple inline)
+        pattern* (if (seq inline)
+                   (if (= :tuple pattern-type)
+                     tuple*
+                     (where/->pattern pattern-type tuple*))
+                   pattern)]
+    {:pattern pattern*
+     :pending pending*
+     :inlined? (seq inline)}))
+
+(def ^:private pending-filter-key ::pending-filter)
+
+(declare inline-where-clause)
+
+(defn process-higher-order-pattern
+  [pattern pattern-type bound]
+  (case pattern-type
+    (:optional :exists :not-exists :minus)
+    (let [clause  (where/pattern-data pattern)
+          clause* (inline-where-clause clause bound)]
+      (where/->pattern pattern-type clause*))
+
+    :union
+    (let [clauses  (where/pattern-data pattern)
+          clauses* (mapv #(inline-where-clause % bound) clauses)]
+      (where/->pattern pattern-type clauses*))
+
+    :graph
+    (let [[graph-clause where-clause] (where/pattern-data pattern)
+          where-clause* (inline-where-clause where-clause bound)]
+      (where/->pattern pattern-type [graph-clause where-clause*]))
+
+    pattern))
+
+(defn finalize-inline-result
+  [result pending]
+  (into []
+        (mapcat (fn [entry]
+                  (if (and (map? entry)
+                           (contains? entry pending-filter-key))
+                    (let [id (get entry pending-filter-key)
+                          {:keys [info inlined?]} (get pending id)]
+                      (when-not inlined?
+                        [(:pattern info)]))
+                    [entry])))
+        result))
+
+(defn inline-where-clause*
+  [patterns bound]
+  (loop [remaining patterns
+         result []
+         bound bound
+         pending {}]
+    (if-let [pattern (first remaining)]
+      (let [pattern-type (where/pattern-type pattern)]
+        (case pattern-type
+          :filter
+          (if-let [{:keys [vars] :as info} (filter-info pattern)]
+            (if (seq vars)
+              (let [id (gensym "filter")
+                    pending-entry {:info info
+                                   :remaining (set vars)
+                                   :inlined? false}]
+                (recur (rest remaining)
+                       (conj result {pending-filter-key id})
+                       bound
+                       (assoc pending id pending-entry)))
+              (recur (rest remaining)
+                     (conj result pattern)
+                     bound
+                     pending))
+            (recur (rest remaining)
+                   (conj result pattern)
+                   bound
+                   pending))
+
+          (:tuple :class :id)
+          (let [pattern-vars (or (pattern-bound-vars pattern pattern-type) #{})
+                {:keys [pattern pending]} (attach-inline-filters pattern pattern-type pending pattern-vars)
+                bound* (into bound pattern-vars)]
+            (recur (rest remaining)
+                   (conj result pattern)
+                   bound*
+                   pending))
+
+          (:optional :exists :not-exists :minus :union :graph)
+          (let [pattern* (process-higher-order-pattern pattern pattern-type bound)]
+            (recur (rest remaining)
+                   (conj result pattern*)
+                   bound
+                   pending))
+
+          (recur (rest remaining)
+                 (conj result pattern)
+                 bound
+                 pending)))
+      {:result result
+       :pending pending
+       :bound bound})))
+
+(defn inline-where-clause
+  [patterns bound]
+  (if (seq patterns)
+    (let [{:keys [result pending]} (inline-where-clause* patterns bound)]
+      (finalize-inline-result result pending))
+    patterns))
+
 (defn compile-filter
   "Compile filter code into an executable filter function.
   The returned function takes [solution var-value] and applies the filter.
@@ -208,78 +378,11 @@
     (mapv #(compile-pattern-filters % context) where-clause)
     where-clause))
 
-(defn extract-var-filters
-  "Extract a map of variable -> filter function for single-variable filters."
-  [where-clause]
-  (reduce (fn [acc pattern]
-            (if-let [variable (get-filtered-variable pattern)]
-              (assoc acc variable (where/pattern-data pattern))
-              acc))
-          {} where-clause))
-
-(defn find-filtered-vars
-  "Find variables that the tuple binds and have filters."
-  [tuple var-filters]
-  (filter (partial tuple-binds-var? tuple)
-          (keys var-filters)))
-
-(defn attach-filters
-  "Attach filter codes to a tuple for the given filtered variables."
-  [tuple filtered-vars var-filters]
-  (reduce (fn [tuple* variable]
-            (let [codes (-> var-filters (get variable) get-filter-codes)]
-              (with-var-filter tuple* variable codes)))
-          tuple filtered-vars))
-
-(defn process-binding-pattern
-  "Process a binding pattern (tuple/class/id) and attach inline filters.
-  Returns [processed-pattern filtered-vars]."
-  [pattern pattern-type var-filters]
-  (let [tuple (if (= :tuple pattern-type)
-                pattern
-                (where/pattern-data pattern))
-        filtered-vars (find-filtered-vars tuple var-filters)
-        tuple* (attach-filters tuple filtered-vars var-filters)
-        pattern* (if (and (seq filtered-vars) (not= :tuple pattern-type))
-                   (where/->pattern pattern-type tuple*)
-                   (if (seq filtered-vars) tuple* pattern))]
-    [pattern* filtered-vars]))
-
-(defn keep-filter?
-  "Determine if a filter pattern should be kept.
-  Multi-variable filters are always kept. Single-variable filters are kept
-  only if they weren't inlined."
-  [pattern inlined]
-  (if-some [variable (get-filtered-variable pattern)]
-    (not (contains? inlined variable))
-    true))
-
 (defn optimize-inline-filters
   "Rewrite single-variable filters as inline filters attached to the pattern
   that binds the variable. Returns the optimized where clause."
   [where-clause]
-  (if (seq where-clause)
-    (let [var-filters (extract-var-filters where-clause)]
-      (loop [patterns where-clause
-             result []
-             inlined #{}]
-        (if (empty? patterns)
-          result
-          (let [pattern (first patterns)
-                pattern-type (where/pattern-type pattern)]
-            (case pattern-type
-              (:tuple :class :id)
-              (let [[pattern* filtered-vars] (process-binding-pattern pattern pattern-type var-filters)
-                    inlined* (into inlined filtered-vars)]
-                (recur (rest patterns) (conj result pattern*) inlined*))
-
-              :filter
-              (if (keep-filter? pattern inlined)
-                (recur (rest patterns) (conj result pattern) inlined)
-                (recur (rest patterns) result inlined))
-
-              (recur (rest patterns) (conj result pattern) inlined))))))
-    where-clause))
+  (inline-where-clause where-clause #{}))
 
 (defn optimize
   "Optimize a parsed query by first reordering patterns based on statistics,
