@@ -343,15 +343,15 @@
                        [var binding]))))
         binds))
 
-(defn higher-order-pattern?
-  "A non-node where pattern."
+(defn vector-pattern?
+  "True when the where clause pattern is expressed as a vector form rather than a node map."
   [pattern]
   (and (sequential? pattern) (keyword? (first pattern))))
 
 (defn parse-where-clause
   [clause var-config context]
-  ;; a single higher-order where pattern is already sequential, so we need to check if it needs wrapping
-  (let [clause* (if (higher-order-pattern? clause)
+  ;; a single vector-form where pattern is already sequential, so we need to check if it needs wrapping
+  (let [clause* (if (vector-pattern? clause)
                   [clause]
                   (util/sequential clause))]
     (->> clause*
