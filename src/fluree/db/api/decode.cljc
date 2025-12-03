@@ -89,16 +89,6 @@
      {}
      class-stats)))
 
-(defn- compact-property-data
-  "Compacts IRIs in property data map."
-  [prop-data compact-fn]
-  (cond-> prop-data
-    (:types prop-data)
-    (update :types #(update-keys % compact-fn))
-
-    (:ref-classes prop-data)
-    (update :ref-classes #(update-keys % compact-fn))))
-
 (defn- compact-stats
   "Compacts all IRIs in stats maps using compact-fn."
   [stats compact-fn]
