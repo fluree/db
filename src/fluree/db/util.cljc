@@ -181,6 +181,18 @@
     x
     [x]))
 
+(defn ensure-vector
+  "Coerce `x` to a vector while preserving list-like values as single entries.
+
+  - Existing vectors are returned unchanged.
+  - `nil` becomes an empty vector.
+  - All other values (including non-vector sequences) become single-element vectors."
+  [x]
+  (cond
+    (vector? x) x
+    (nil? x)    []
+    :else       [x]))
+
 #?(:clj
    (defn- eval-dispatch
      [d]

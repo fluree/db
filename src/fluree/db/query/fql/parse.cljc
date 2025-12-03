@@ -766,22 +766,16 @@
       (assoc q select-key select))
     q))
 
-(defn ensure-vector
-  [x]
-  (if (vector? x)
-    x
-    [x]))
-
 (defn parse-grouping
   [q]
   (some->> (:group-by q)
-           ensure-vector
+           util/ensure-vector
            (mapv parse-var-name)))
 
 (defn parse-ordering
   [q]
   (some->> (:order-by q)
-           ensure-vector
+           util/ensure-vector
            (mapv (fn [ord]
                    (if-let [v (parse-var-name ord)]
                      [v :asc]
