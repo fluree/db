@@ -5,7 +5,7 @@
 
 (defn property-data
   "Decodes property data SIDs to IRIs. Returns map with :types, :ref-classes, :langs.
-   Each contains a map of SID/IRI -> count."
+   Each contains a map of IRI -> count."
   [prop-data ns-codes]
   (cond-> {:types {} :ref-classes {} :langs {}}
     (:types prop-data)
@@ -89,20 +89,78 @@
      {}
      class-stats)))
 
+(defn- compact-property-data
+  "Compacts IRIs in property data map."
+  [prop-data compact-fn]
+  (cond-> prop-data
+    (:types prop-data)
+    (update :types #(update-keys % compact-fn))
+
+    (:ref-classes prop-data)
+    (update :ref-classes #(update-keys % compact-fn))))
+
+(defn- compact-stats
+  "Compacts all IRIs in stats maps using compact-fn."
+  [stats compact-fn]
+  (let [compact-props (fn [props]
+                        (reduce-kv
+                         (fn [acc prop-iri prop-stats]
+                           (let [compacted-iri (compact-fn prop-iri)
+                                 compacted-stats (cond-> prop-stats
+                                                   (:sub-property-of prop-stats)
+                                                   (update :sub-property-of #(mapv compact-fn %))
+
+                                                   (:types prop-stats)
+                                                   (update :types #(update-keys % compact-fn))
+
+                                                   (:ref-classes prop-stats)
+                                                   (update :ref-classes #(update-keys % compact-fn)))]
+                             (assoc acc compacted-iri compacted-stats)))
+                         {}
+                         props))
+        compact-classes (fn [cls]
+                          (reduce-kv
+                           (fn [acc class-iri class-data]
+                             (let [compacted-iri (compact-fn class-iri)
+                                   compacted-data (cond-> class-data
+                                                    (:subclass-of class-data)
+                                                    (update :subclass-of #(mapv compact-fn %))
+
+                                                    (:properties class-data)
+                                                    (update :properties compact-props))]
+                               (assoc acc compacted-iri compacted-data)))
+                           {}
+                           cls))]
+    (cond-> stats
+      (:properties stats)
+      (update :properties compact-props)
+
+      (:classes stats)
+      (update :classes compact-classes))))
+
 (defn ledger-info
   "Decodes ledger info by converting SIDs to IRIs and preparing for external consumption.
-   Merges schema hierarchy (subClassOf, subPropertyOf) into stats for classes and properties."
-  [info]
-  (let [ns-codes (:namespace-codes info)
-        schema (:schema info)
-        props (sid-keys (get-in info [:stats :properties]) ns-codes)
-        class-stats (classes (get-in info [:stats :classes] {}) ns-codes)
-        ;; Merge hierarchy info into stats
-        props-with-hierarchy (merge-property-hierarchy props schema ns-codes)
-        classes-with-hierarchy (merge-class-hierarchy class-stats schema ns-codes)
-        inverted-ns (invert-namespace-codes ns-codes)]
-    (-> info
-        (assoc-in [:stats :properties] props-with-hierarchy)
-        (assoc-in [:stats :classes] classes-with-hierarchy)
-        (assoc :namespace-codes inverted-ns)
-        (dissoc :novelty-post :schema))))
+   Merges schema hierarchy (subClassOf, subPropertyOf) into stats for classes and properties.
+   If compact-fn is provided, compacts all IRIs using the given function."
+  ([info] (ledger-info info nil))
+  ([info compact-fn]
+   (let [ns-codes (:namespace-codes info)
+         schema (:schema info)
+         props (sid-keys (get-in info [:stats :properties]) ns-codes)
+         class-stats (classes (get-in info [:stats :classes] {}) ns-codes)
+         ;; Merge hierarchy info into stats
+         props-with-hierarchy (merge-property-hierarchy props schema ns-codes)
+         classes-with-hierarchy (merge-class-hierarchy class-stats schema ns-codes)
+         inverted-ns (invert-namespace-codes ns-codes)
+         ;; Build stats with full IRIs
+         stats (-> (:stats info)
+                   (assoc :properties props-with-hierarchy)
+                   (assoc :classes classes-with-hierarchy))
+         ;; Compact if compact-fn provided
+         final-stats (if compact-fn
+                       (compact-stats stats compact-fn)
+                       stats)]
+     (-> info
+         (assoc :stats final-stats)
+         (assoc :namespace-codes inverted-ns)
+         (dissoc :novelty-post :schema)))))
