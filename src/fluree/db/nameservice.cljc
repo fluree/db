@@ -48,6 +48,16 @@
     "Unsubscribes to publication for ledger events")
   (known-addresses [publication ledger-alias]))
 
+(defn primary-publisher
+  "Returns the primary publisher from a publishers list."
+  [publishers]
+  (first publishers))
+
+(defn secondary-publishers
+  "Returns the secondary publishers from a publishers list."
+  [publishers]
+  (rest publishers))
+
 (defn publish-to-all
   [commit-jsonld publishers]
   (->> publishers

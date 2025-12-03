@@ -138,11 +138,11 @@
                                                                 :index-address index-address
                                                                 :index-t index-t})
                              ;; Await primary publisher (critical for consistency)
-                             (when primary-publisher
-                               (<? (nameservice/publish-index primary-publisher ledger-alias index-address index-t)))
+                             (when-let [primary (nameservice/primary-publisher publishers)]
+                               (<? (nameservice/publish-index primary ledger-alias index-address index-t)))
                              ;; Fire-and-forget secondary publishers (non-blocking)
-                             (when (seq secondary-publishers)
-                               (nameservice/publish-index-to-all ledger-alias index-address index-t secondary-publishers))))
+                             (when-let [secondaries (seq (nameservice/secondary-publishers publishers))]
+                               (nameservice/publish-index-to-all ledger-alias index-address index-t secondaries))))
                          {:status :success, :db indexed-db, :commit indexed-commit})
                        (catch* e
                          (log/error e "Error updating index")
