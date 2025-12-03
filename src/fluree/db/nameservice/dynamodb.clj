@@ -350,18 +350,6 @@
 
 (defrecord DynamoDBNameService [config]
   nameservice/Publisher
-  (publish [_ data]
-    (let [ledger-alias (get data "alias")]
-      (if (not ledger-alias)
-        (do (log/warn "nameservice.dynamodb/publish missing alias in commit data; skipping" {:data-keys (keys data)})
-            (go nil))
-        (let [commit-address (get data "address")
-              commit-t (get-in data ["data" "t"])
-              index-address (get-in data ["index" "address"])
-              index-t (get-in data ["index" "data" "t"])]
-          (log/debug "nameservice.dynamodb/publish" {:ledger ledger-alias})
-          (put-item config ledger-alias commit-address commit-t index-address index-t)))))
-
   (publish-commit [_ ledger-alias commit-address commit-t]
     (log/debug "nameservice.dynamodb/publish-commit" {:ledger ledger-alias :commit-t commit-t})
     (update-commit config ledger-alias commit-address commit-t))

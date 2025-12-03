@@ -128,19 +128,14 @@
                              [{prev-commit :commit} {indexed-commit :commit}]
                              (swap-vals! branch-state update-index indexed-db)]
                          (when-not (= prev-commit indexed-commit)
-                           ;; Use publish-index to atomically update only index data.
-                           ;; This prevents race conditions where indexing could overwrite
-                           ;; newer commit data that was published while indexing was running.
                            (let [ledger-alias  (:alias indexed-db)
                                  index-address (-> indexed-commit :index :address)
                                  index-t       (commit-data/index-t indexed-commit)]
                              (log/debug "Publishing new index" {:alias ledger-alias
                                                                 :index-address index-address
                                                                 :index-t index-t})
-                             ;; Await primary publisher (critical for consistency)
                              (when-let [primary (nameservice/primary-publisher publishers)]
                                (<? (nameservice/publish-index primary ledger-alias index-address index-t)))
-                             ;; Fire-and-forget secondary publishers (non-blocking)
                              (when-let [secondaries (seq (nameservice/secondary-publishers publishers))]
                                (nameservice/publish-index-to-all ledger-alias index-address index-t secondaries))))
                          {:status :success, :db indexed-db, :commit indexed-commit})

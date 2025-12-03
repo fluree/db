@@ -18,10 +18,6 @@
     "Returns a channel containing all nameservice records for building in-memory query ledger"))
 
 (defprotocol Publisher
-  (publish [publisher commit-jsonld]
-    "Publishes new commit data. This is the legacy method that writes both commit
-    and index data to a single record. For independent transactor/indexer operations,
-    prefer publish-commit and publish-index.")
   (publish-commit [publisher ledger-alias commit-address commit-t]
     "Publishes only commit data (address and t). This allows transactors to update
     commit information without contending with indexers. Only updates if commit-t
@@ -57,19 +53,6 @@
   "Returns the secondary publishers from a publishers list."
   [publishers]
   (rest publishers))
-
-(defn publish-to-all
-  [commit-jsonld publishers]
-  (->> publishers
-       (keep identity)
-       (map (fn [ns]
-              (go
-                (try*
-                  (<? (publish ns commit-jsonld))
-                  (catch* e
-                    (log/warn e "Publisher failed to publish commit" {:alias (or (get commit-jsonld "alias") (get commit-jsonld :alias))})
-                    ::publishing-error)))))
-       async/merge))
 
 (defn publish-commit-to-all
   "Publishes commit data to all publishers using atomic conditional updates.

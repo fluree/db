@@ -54,19 +54,25 @@
                              "IPNS key: " ipns-key " does not exist on the server.")
                         {:status 400, :error :db/missing-ipns-key}))))))
 
+(defn build-commit-record
+  "Builds a minimal commit record for IPNS publishing."
+  [ledger-alias commit-address commit-t publishing-address]
+  {"alias"   ledger-alias
+   "address" commit-address
+   "ns"      [{"id" publishing-address}]
+   "data"    {"t" commit-t}})
+
 (defrecord IpnsNameService [ipfs-endpoint ipns-key]
   nameservice/Publisher
-  (publish [_ commit-jsonld]
-    (ipfs/push! ipfs-endpoint commit-jsonld))
-  (publish-commit [_ _ledger-alias _commit-address _commit-t]
-    ;; IPNS doesn't support separate commit/index publishing
-    ;; Use the full publish method instead
-    (log/warn "publish-commit not supported for IPNS nameservice; use publish instead")
-    (go-try nil))
+  (publish-commit [_ ledger-alias commit-address commit-t]
+    (go-try
+      (let [pub-addr (<? (ipns-address ipfs-endpoint ipns-key ledger-alias))
+            record   (build-commit-record ledger-alias commit-address commit-t pub-addr)]
+        (<? (ipfs/push! ipfs-endpoint record)))))
   (publish-index [_ _ledger-alias _index-address _index-t]
-    ;; IPNS doesn't support separate commit/index publishing
-    ;; Use the full publish method instead
-    (log/warn "publish-index not supported for IPNS nameservice; use publish instead")
+    ;; IPNS doesn't support atomic index updates - the full commit is published each time
+    ;; Index updates would require reading current record, merging, and republishing
+    (log/warn "publish-index not fully supported for IPNS nameservice")
     (go-try nil))
   (retract [_ _ledger-alias]
     (ipfs/write ipfs-endpoint "null"))

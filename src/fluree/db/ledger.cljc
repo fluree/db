@@ -381,12 +381,9 @@
     (let [init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit
                               commit-catalog alias publish-addresses init-time))
-          ;; Publish genesis commit to nameservice - convert expanded to compact format first
+          commit-address (util/get-first-value genesis-commit const/iri-address)
           _              (when primary-publisher
-                           (let [;; Convert expanded genesis commit to compact JSON-ld format
-                                 commit-map (commit-data/json-ld->map genesis-commit nil)
-                                 compact-commit (commit-data/->json-ld commit-map)]
-                             (<? (nameservice/publish primary-publisher compact-commit))))]
+                           (<? (nameservice/publish-commit primary-publisher alias commit-address 0)))]
       (instantiate alias primary-address commit-catalog index-catalog
                    primary-publisher secondary-publishers indexing did genesis-commit))))
 
@@ -514,7 +511,8 @@
                                                          ledger-alias
                                                          commit-address
                                                          commit-t))]
-      (nameservice/publish-commit-to-all ledger-alias commit-address commit-t secondary-publishers)
+      (when-let [secondaries (seq secondary-publishers)]
+        (nameservice/publish-commit-to-all ledger-alias commit-address commit-t secondaries))
       result)))
 
 (defn formalize-commit

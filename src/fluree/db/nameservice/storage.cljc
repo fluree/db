@@ -120,23 +120,6 @@
 
 (defrecord StorageNameService [store]
   nameservice/Publisher
-  (publish [_ data]
-    (let [ledger-alias (get data "alias")]
-      (if (not ledger-alias)
-        (do (log/warn "nameservice.storage/publish missing alias in commit data; skipping" {:data-keys (keys data)})
-            (go nil))
-        (let [filename     (local-filename ledger-alias)
-              _            (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :filename filename})
-              commit-address (get data "address")
-              commit-t       (get-in data ["data" "t"])
-              index-address  (get-in data ["index" "address"])
-              index-t        (get-in data ["index" "data" "t"])
-              record-updater (fn [ns-record]
-                               (update-ns-record ns-record ledger-alias commit-address commit-t index-address index-t))
-              res            (storage/swap-json store filename record-updater)]
-          (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :filename filename})
-          res))))
-
   (publish-commit [_ ledger-alias commit-address commit-t]
     (let [filename (local-filename ledger-alias)]
       (log/debug "nameservice.storage/publish-commit start" {:ledger ledger-alias :filename filename})

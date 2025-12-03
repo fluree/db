@@ -243,20 +243,20 @@
                   expanded-data   (let [db-address (-> expanded-commit
                                                        (get-first const/iri-data)
                                                        (get-first-value const/iri-address))]
-                                    (<? (commit-storage/read-data-jsonld commit-catalog db-address)))]
-              (let [res (try* (<? (ledger/notify ledger expanded-commit expanded-data))
-                              (catch* e
-                                (log/warn e "notify commit failed; marking stale to reload"
-                                          {:ledger-alias ledger-alias :t ns-t})
-                                ::ledger/stale))]
-                (case res
-                  (::ledger/current ::ledger/newer ::ledger/updated)
-                  (do (log/debug "Updated" ledger-alias "to t:" ns-t
-                                 "in" (- (util/current-time-millis) start-ms) "ms")
-                      true)
-                  ::ledger/stale
-                  (do (log/debug "Dropping state for stale ledger:" ledger-alias)
-                      (release-ledger conn ledger-alias)))))
+                                    (<? (commit-storage/read-data-jsonld commit-catalog db-address)))
+                  res             (try* (<? (ledger/notify ledger expanded-commit expanded-data))
+                                        (catch* e
+                                          (log/warn e "notify commit failed; marking stale to reload"
+                                                    {:ledger-alias ledger-alias :t ns-t})
+                                          ::ledger/stale))]
+              (case res
+                (::ledger/current ::ledger/newer ::ledger/updated)
+                (do (log/debug "Updated" ledger-alias "to t:" ns-t
+                               "in" (- (util/current-time-millis) start-ms) "ms")
+                    true)
+                ::ledger/stale
+                (do (log/debug "Dropping state for stale ledger:" ledger-alias)
+                    (release-ledger conn ledger-alias))))
 
             :stale
             (do (log/debug "Dropping state for stale ledger:" ledger-alias)
