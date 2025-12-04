@@ -224,7 +224,7 @@
                                       :query-params query-params})
 
           ;; Use xhttp for the actual request
-          _        (log/debug "s3-request start" {:method  method
+          _        (log/trace "s3-request start" {:method  method
                                                   :bucket  bucket
                                                   :path    encoded-path
                                                   :timeout request-timeout})
@@ -236,7 +236,7 @@
                          "DELETE" (xhttp/delete-response url {:headers         signed-headers
                                                               :request-timeout request-timeout})
                          (throw (ex-info "Unsupported HTTP method" {:method method}))))]
-      (log/debug "s3-request done" {:method      method
+      (log/trace "s3-request done" {:method      method
                                     :bucket      bucket
                                     :path        encoded-path
                                     :duration-ms (long (/ (- (System/nanoTime) start)

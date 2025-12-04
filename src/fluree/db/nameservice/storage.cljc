@@ -19,6 +19,17 @@
         branch (or branch const/default-branch-name)]
     (str const/ns-version "/" ledger-name "/" branch ".json")))
 
+(defn index-filename
+  "Returns the filename for a ledger's separate index record.
+   Expects ledger-alias to be in format 'ledger:branch'.
+   Returns path like 'ns@v2/ledger-name/branch.index.json'.
+   This separate file allows indexers to update index info without
+   contending with transactors updating commit info."
+  [ledger-alias]
+  (let [[ledger-name branch] (util.ledger/ledger-parts ledger-alias)
+        branch (or branch const/default-branch-name)]
+    (str const/ns-version "/" ledger-name "/" branch ".index.json")))
+
 (defn new-ns-record
   "Generates nameservice metadata map for JSON storage using new minimal format.
    Expects ledger-alias to be in format 'ledger:branch'."
@@ -35,6 +46,38 @@
              "f:status"     "ready"}
       index-address (assoc "f:index" {"@id" index-address
                                       "f:t" index-t}))))
+
+(defn new-index-record
+  "Generates a minimal index-only record for the separate index file.
+   This file is used by indexers to update index info independently."
+  [ledger-alias index-address index-t]
+  {"@context" {"f" iri/f-ns}
+   "@id"      ledger-alias
+   "f:index"  {"@id" index-address
+               "f:t"  index-t}})
+
+(defn update-index-record
+  "Updates an index-only record with new index info.
+   Only updates if new index-t is greater than existing."
+  [index-record ledger-alias index-address index-t]
+  (if (some? index-record)
+    (let [prev-t (get-in index-record ["f:index" "f:t"] 0)]
+      (if (< prev-t index-t)
+        (assoc index-record "f:index" {"@id" index-address "f:t" index-t})
+        index-record))
+    (new-index-record ledger-alias index-address index-t)))
+
+(defn merge-index-into-record
+  "Merges index info from the separate index file into a main NS record.
+   Index file takes precedence if it has a higher index-t."
+  [main-record index-record]
+  (if index-record
+    (let [main-index-t  (get-in main-record ["f:index" "f:t"] 0)
+          file-index-t  (get-in index-record ["f:index" "f:t"] 0)]
+      (if (> file-index-t main-index-t)
+        (assoc main-record "f:index" (get index-record "f:index"))
+        main-record))
+    main-record))
 
 (defn get-t
   [ns-record]
@@ -77,29 +120,31 @@
 
 (defrecord StorageNameService [store]
   nameservice/Publisher
-  (publish [_ data]
-    (let [ledger-alias (get data "alias")]
-      (if (not ledger-alias)
-        (do (log/warn "nameservice.storage/publish missing alias in commit data; skipping" {:data-keys (keys data)})
-            (go nil))
-        (let [filename     (local-filename ledger-alias)
-              _            (log/debug "nameservice.storage/publish start" {:ledger ledger-alias :filename filename})
-              commit-address (get data "address")
-              commit-t       (get-in data ["data" "t"])
-              index-address  (get-in data ["index" "address"])
-              index-t        (get-in data ["index" "data" "t"])
-              record-updater (fn [ns-record]
-                               (update-ns-record ns-record ledger-alias commit-address commit-t index-address index-t))
-              res            (storage/swap-json store filename record-updater)]
-          (log/debug "nameservice.storage/publish enqueued" {:ledger ledger-alias :filename filename})
-          res))))
+  (publish-commit [_ ledger-alias commit-address commit-t]
+    (let [filename (local-filename ledger-alias)]
+      (log/debug "nameservice.storage/publish-commit start" {:ledger ledger-alias :filename filename})
+      (storage/swap-json store filename
+                         (fn [ns-record]
+                           (if (some? ns-record)
+                             (update-commit-address ns-record commit-address commit-t)
+                             (new-ns-record ledger-alias commit-address commit-t nil nil))))))
+
+  (publish-index [_ ledger-alias index-address index-t]
+    (let [filename (index-filename ledger-alias)]
+      (log/debug "nameservice.storage/publish-index start" {:ledger ledger-alias :filename filename})
+      (storage/swap-json store filename
+                         (fn [index-record]
+                           (update-index-record index-record ledger-alias index-address index-t)))))
 
   (retract [_ ledger-alias]
-    (let [filename (local-filename ledger-alias)
-          address  (-> store
-                       storage/location
-                       (storage/build-address filename))]
-      (storage/delete store address)))
+    (go-try
+      (let [main-filename  (local-filename ledger-alias)
+            index-filename* (index-filename ledger-alias)
+            main-address   (-> store storage/location (storage/build-address main-filename))
+            index-address  (-> store storage/location (storage/build-address index-filename*))]
+        ;; Delete both files - index file may not exist, which is fine
+        (<? (storage/delete store main-address))
+        (<? (storage/delete store index-address)))))
 
   (publishing-address [_ ledger-alias]
     ;; Just return the alias - lookup will handle branch extraction via local-filename
@@ -109,11 +154,23 @@
   (lookup [_ ledger-address]
     (go-try
       ;; ledger-address is just the alias (potentially with :branch)
-      (let [filename (local-filename ledger-address)]
-        (log/debug "StorageNameService lookup:" {:ledger-address ledger-address
-                                                 :filename       filename})
-        (when-let [record-bytes (<? (storage/read-bytes store filename))]
-          (json/parse record-bytes false)))))
+      ;; Read both main file and index file in parallel, then merge
+      (let [main-filename  (local-filename ledger-address)
+            index-filename* (index-filename ledger-address)
+            _              (log/debug "StorageNameService lookup:" {:ledger-address ledger-address
+                                                                    :main-filename  main-filename
+                                                                    :index-filename index-filename*})
+            ;; Start both reads in parallel
+            main-ch        (storage/read-bytes store main-filename)
+            index-ch       (storage/read-bytes store index-filename*)
+            ;; Await both results
+            main-bytes     (<? main-ch)
+            index-bytes    (<? index-ch)]
+        (when main-bytes
+          (let [main-record  (json/parse main-bytes false)
+                index-record (when index-bytes (json/parse index-bytes false))]
+            ;; Merge index file data into main record (index file takes precedence if newer)
+            (merge-index-into-record main-record index-record))))))
 
   (alias [_ ledger-address]
     ;; TODO: need to validate that the branch doesn't have a slash?
@@ -127,20 +184,34 @@
       ;; Use recursive listing to support ledger names with '/' characters
       (if (satisfies? storage/RecursiveListableStore store)
         (if-let [list-paths-result (storage/list-paths-recursive store const/ns-version)]
-          (loop [remaining-paths (<? list-paths-result)
-                 records         []]
-            (if-let [path (first remaining-paths)]
-              (let [file-content (<? (storage/read-bytes store path))]
-                (if file-content
-                  (let [content-str (if (string? file-content)
-                                      file-content
-                                      #?(:clj (let [^bytes bytes-content file-content]
-                                                (String. bytes-content "UTF-8"))
-                                         :cljs (js/String.fromCharCode.apply nil file-content)))
-                        record      (json/parse content-str false)]
-                    (recur (rest remaining-paths) (conj records record)))
-                  (recur (rest remaining-paths) records)))
-              records))
+          (let [all-paths (<? list-paths-result)
+                ;; Filter out .index.json files - they're supplementary and will be merged
+                main-paths (filterv #(not (str/ends-with? % ".index.json")) all-paths)]
+            (loop [remaining-paths main-paths
+                   records         []]
+              (if-let [path (first remaining-paths)]
+                (let [file-content (<? (storage/read-bytes store path))]
+                  (if file-content
+                    (let [content-str  (if (string? file-content)
+                                         file-content
+                                         #?(:clj (let [^bytes bytes-content file-content]
+                                                   (String. bytes-content "UTF-8"))
+                                            :cljs (js/String.fromCharCode.apply nil file-content)))
+                          main-record  (json/parse content-str false)
+                          ;; Try to read corresponding index file (branch.json -> branch.index.json)
+                          index-path   (str/replace path #"\.json$" ".index.json")
+                          index-record (when-let [idx-content (<? (storage/read-bytes store index-path))]
+                                         (let [idx-str (if (string? idx-content)
+                                                         idx-content
+                                                         #?(:clj (let [^bytes bytes-content idx-content]
+                                                                   (String. bytes-content "UTF-8"))
+                                                            :cljs (js/String.fromCharCode.apply nil idx-content)))]
+                                           (json/parse idx-str false)))
+                          ;; Merge index data into main record
+                          merged       (merge-index-into-record main-record index-record)]
+                      (recur (rest remaining-paths) (conj records merged)))
+                    (recur (rest remaining-paths) records)))
+                records)))
           [])
         ;; Fallback for stores that don't support ListableStore
         (do

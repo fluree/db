@@ -18,8 +18,15 @@
     "Returns a channel containing all nameservice records for building in-memory query ledger"))
 
 (defprotocol Publisher
-  (publish [publisher commit-jsonld]
-    "Publishes new commit.")
+  (publish-commit [publisher ledger-alias commit-address commit-t]
+    "Publishes only commit data (address and t). This allows transactors to update
+    commit information without contending with indexers. Only updates if commit-t
+    is greater than the existing value.")
+  (publish-index [publisher ledger-alias index-address index-t]
+    "Publishes only index data (address and t). This allows indexers to update
+    index information without contending with transactors. Only updates if index-t
+    is greater than the existing value. Writes to a separate file/record to avoid
+    contention with commit updates.")
   (retract [publisher ledger-alias]
     "Remove the nameservice record for the ledger.")
   (publishing-address [publisher ledger-alias]
@@ -37,20 +44,49 @@
     "Unsubscribes to publication for ledger events")
   (known-addresses [publication ledger-alias]))
 
-(defn publish-to-all
-  "Publishes commit to all publishers and returns a channel with a vector of results.
-   Each result is either the publish response or ::publishing-error on failure.
-   Waits for all publishers to complete before returning."
-  [commit-jsonld publishers]
+(defn primary-publisher
+  "Returns the primary publisher from a publishers list."
+  [publishers]
+  (first publishers))
+
+(defn secondary-publishers
+  "Returns the secondary publishers from a publishers list."
+  [publishers]
+  (rest publishers))
+
+(defn publish-commit-to-all
+  "Publishes commit data to all publishers using atomic conditional updates.
+   Each result is either the publish-commit response or ::publishing-error on failure.
+   This is the safe way to publish commit updates without overwriting index data."
+  [ledger-alias commit-address commit-t publishers]
   (let [pub-chs (->> publishers
                      (keep identity)
                      (mapv (fn [ns]
                              (go
                                (try*
-                                 (<? (publish ns commit-jsonld))
+                                 (<? (publish-commit ns ledger-alias commit-address commit-t))
                                  (catch* e
                                    (log/warn e "Publisher failed to publish commit"
-                                             {:alias (or (get commit-jsonld "alias") (get commit-jsonld :alias))})
+                                             {:alias ledger-alias :commit-t commit-t})
+                                   ::publishing-error))))))]
+    (if (seq pub-chs)
+      (async/into [] (async/merge pub-chs))
+      (go []))))
+
+(defn publish-index-to-all
+  "Publishes index data to all publishers using atomic conditional updates.
+   Each result is either the publish-index response or ::publishing-error on failure.
+   This is the safe way to publish index updates without overwriting commit data."
+  [ledger-alias index-address index-t publishers]
+  (let [pub-chs (->> publishers
+                     (keep identity)
+                     (mapv (fn [ns]
+                             (go
+                               (try*
+                                 (<? (publish-index ns ledger-alias index-address index-t))
+                                 (catch* e
+                                   (log/warn e "Publisher failed to publish index"
+                                             {:alias ledger-alias :index-t index-t})
                                    ::publishing-error))))))]
     (if (seq pub-chs)
       (async/into [] (async/merge pub-chs))
