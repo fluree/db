@@ -555,6 +555,7 @@
   Parameters:
     conn - Connection object
     ledger-id - Ledger alias (with optional :branch) or address
+    context - (optional) JSON-LD context for compacting IRIs in response
 
   Returns info map with:
     - :commit - Commit metadata (JSON-LD format) including:
@@ -583,14 +584,20 @@
   any novelty, providing absolutely current statistics.
 
   Hierarchy information (:sub-property-of, :subclass-of) shows direct parent relationships
-  for properties and classes that have them."
-  [conn ledger-id]
-  (validate-connection conn)
-  (promise-wrap
-   (go-try
-     (let [ledger (<? (connection/load-ledger conn ledger-id))
-           info   (<? (ledger/ledger-info ledger))]
-       (decode/ledger-info info)))))
+  for properties and classes that have them.
+
+  When context is provided, all IRIs in the stats maps will be compacted using
+  the context prefixes (e.g., \"http://example.org/name\" -> \"ex:name\")."
+  ([conn ledger-id] (ledger-info conn ledger-id nil))
+  ([conn ledger-id context]
+   (validate-connection conn)
+   (promise-wrap
+    (go-try
+      (let [ledger     (<? (connection/load-ledger conn ledger-id))
+            info       (<? (ledger/ledger-info ledger))
+            compact-fn (when context
+                         (json-ld/compact-fn (json-ld/parse-context context)))]
+        (decode/ledger-info info compact-fn))))))
 
 ;; db operations
 

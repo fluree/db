@@ -2,13 +2,13 @@
   "Tests for property and class statistics tracking during indexing"
   (:require [babashka.fs :as bfs :refer [with-temp-dir]]
             [clojure.core.async :as async :refer [<!!]]
-            [clojure.pprint :refer [pprint]]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.async-db]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.test-utils :as test-utils]
+            [fluree.db.util :as util]
             [fluree.db.util.filesystem :as fs]))
 
 (deftest ^:integration property-class-statistics-test
@@ -222,93 +222,314 @@
           (is (= 1 (get-count class-counts "http://example.org/Product"))
               "Product class should have count 1"))))))
 
+;; Expected deterministic output from ledger-info with fixed time 2023-11-14T22:13:20Z
+(def ^:private ledger-info-expected
+  {:commit
+   {"@context" "https://ns.flur.ee/ledger/v1"
+    "id" "fluree:commit:sha256:bb6k4qo7swsabwjrpsgl2sodonzlckjkaundqosq4k3wbckd7ofdq"
+    "v" 2
+    "address" "fluree:file://test/ledger-info/commit/b6k4qo7swsabwjrpsgl2sodonzlckjkaundqosq4k3wbckd7ofdq.json"
+    "type" ["Commit"]
+    "alias" "test/ledger-info:main"
+    "time" "2023-11-14T22:13:20Z"
+    "previous"
+    {"id" "fluree:commit:sha256:bbtycakz5rdsk5mv2gi3jehfdkkxe4brz4l44ivpkosx5nnmhzkhl"
+     "type" ["Commit"]
+     "address" "fluree:file://test/ledger-info/commit/abjstl7dj55jdm3wfrogcwt43vicfzfedchawegtyz42emf7alk.json"}
+    "data"
+    {"id" "fluree:db:sha256:bbtvjesfhzyojnalpe5wfayrooafw7pr6cmrkyx6cfgqflbkkkcgy"
+     "type" ["DB"]
+     "t" 1
+     "address" "fluree:file://test/ledger-info/commit/btvjesfhzyojnalpe5wfayrooafw7pr6cmrkyx6cfgqflbkkkcgy.json"
+     "previous"
+     {"id" "fluree:db:sha256:bbktr7nvywjwtiamogekl3gfy57di3c5b7vob4gth3dm7hwmtw5k4"
+      "type" ["DB"]
+      "address" "fluree:file://test/ledger-info/commit/b5me6vr2xxiz3mle4nvvknjjcnypmpk3f2jeme2rhgfnwaqpmdoq.json"}
+     "flakes" 4
+     "size" 468}
+    "ns" [{"id" "test/ledger-info:main"}]
+    "index"
+    {"id" "fluree:index:sha256:57hhdzbqja4hyv3n6wg6jscvmxlwxt6v7httdbrr2saknls3h5k"
+     "type" ["Index"]
+     "address" "fluree:file://test/ledger-info/index/root/57hhdzbqja4hyv3n6wg6jscvmxlwxt6v7httdbrr2saknls3h5k.json"
+     "data"
+     {"id" "fluree:db:sha256:bbtvjesfhzyojnalpe5wfayrooafw7pr6cmrkyx6cfgqflbkkkcgy"
+      "type" ["DB"]
+      "t" 1
+      "address" "fluree:file://test/ledger-info/commit/btvjesfhzyojnalpe5wfayrooafw7pr6cmrkyx6cfgqflbkkkcgy.json"
+      "previous"
+      {"id" "fluree:db:sha256:bbktr7nvywjwtiamogekl3gfy57di3c5b7vob4gth3dm7hwmtw5k4"
+       "type" ["DB"]
+       "address" "fluree:file://test/ledger-info/commit/b5me6vr2xxiz3mle4nvvknjjcnypmpk3f2jeme2rhgfnwaqpmdoq.json"}
+      "flakes" 4
+      "size" 468}
+     "v" 2}}
+   :nameservice
+   {"f:commit" {"@id" "fluree:file://test/ledger-info/commit/b6k4qo7swsabwjrpsgl2sodonzlckjkaundqosq4k3wbckd7ofdq.json"}
+    "@context" {"f" "https://ns.flur.ee/ledger#"}
+    "@id" "test/ledger-info:main"
+    "f:ledger" {"@id" "test/ledger-info"}
+    "f:branch" "main"
+    "f:t" 1
+    "f:index" {"@id" "fluree:file://test/ledger-info/index/root/57hhdzbqja4hyv3n6wg6jscvmxlwxt6v7httdbrr2saknls3h5k.json"
+               "f:t" 1}
+    "@type" ["f:Database" "f:PhysicalDatabase"]
+    "f:status" "ready"}
+   :namespace-codes
+   {"" 0
+    "_:" 24
+    "https://www.wikidata.org/wiki/" 18
+    "https://www.w3.org/2018/credentials#" 7
+    "http://www.w3.org/2002/07/owl#" 6
+    "http://www.w3.org/2001/XMLSchema#" 2
+    "fluree:s3://" 16
+    "urn:uuid" 21
+    "https://ns.flur.ee/index#" 25
+    "did:key:" 11
+    "fluree:memory://" 13
+    "fluree:ipfs://" 15
+    "http://xmlns.com/foaf/0.1/" 19
+    "http://schema.org/" 17
+    "urn:issn:" 23
+    "https://ns.flur.ee/ledger#" 8
+    "urn:isbn:" 22
+    "fluree:commit:sha256:" 12
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#" 3
+    "fluree:file://" 14
+    "http://www.w3.org/2008/05/skos#" 20
+    "http://www.w3.org/ns/shacl#" 5
+    "http://example.org/" 101
+    "fluree:db:sha256:" 10
+    "http://www.w3.org/2000/01/rdf-schema#" 4
+    "@" 1}
+   :stats
+   {:flakes 14
+    :size 1954
+    :indexed 1
+    :properties
+    {"https://ns.flur.ee/ledger#size"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "http://example.org/name"
+     {:count 2 :ndv-values 2 :ndv-subjects 2 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "https://ns.flur.ee/ledger#t"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "https://ns.flur.ee/ledger#flakes"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "https://ns.flur.ee/ledger#previous"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "https://ns.flur.ee/ledger#address"
+     {:count 2 :ndv-values 2 :ndv-subjects 2 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "https://ns.flur.ee/ledger#alias"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "https://ns.flur.ee/ledger#v"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "https://ns.flur.ee/ledger#time"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "https://ns.flur.ee/ledger#data"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "@type"
+     {:count 2 :ndv-values 1 :ndv-subjects 2 :last-modified-t 1
+      :selectivity-value 2 :selectivity-subject 1}}
+    :classes
+    {"http://example.org/Person"
+     {:count 2
+      :properties
+      {"http://example.org/name"
+       {:types {"http://www.w3.org/2001/XMLSchema#string" 2}
+        :ref-classes {}
+        :langs {}}}}}}})
+
+;; Expected output with context compaction - same data but with compacted IRIs in :stats
+(def ^:private ledger-info-with-context-expected
+  {:commit
+   {"@context" "https://ns.flur.ee/ledger/v1"
+    "id" "fluree:commit:sha256:bb6k4qo7swsabwjrpsgl2sodonzlckjkaundqosq4k3wbckd7ofdq"
+    "v" 2
+    "address" "fluree:file://test/ledger-info/commit/b6k4qo7swsabwjrpsgl2sodonzlckjkaundqosq4k3wbckd7ofdq.json"
+    "type" ["Commit"]
+    "alias" "test/ledger-info:main"
+    "time" "2023-11-14T22:13:20Z"
+    "previous"
+    {"id" "fluree:commit:sha256:bbtycakz5rdsk5mv2gi3jehfdkkxe4brz4l44ivpkosx5nnmhzkhl"
+     "type" ["Commit"]
+     "address" "fluree:file://test/ledger-info/commit/abjstl7dj55jdm3wfrogcwt43vicfzfedchawegtyz42emf7alk.json"}
+    "data"
+    {"id" "fluree:db:sha256:bbtvjesfhzyojnalpe5wfayrooafw7pr6cmrkyx6cfgqflbkkkcgy"
+     "type" ["DB"]
+     "t" 1
+     "address" "fluree:file://test/ledger-info/commit/btvjesfhzyojnalpe5wfayrooafw7pr6cmrkyx6cfgqflbkkkcgy.json"
+     "previous"
+     {"id" "fluree:db:sha256:bbktr7nvywjwtiamogekl3gfy57di3c5b7vob4gth3dm7hwmtw5k4"
+      "type" ["DB"]
+      "address" "fluree:file://test/ledger-info/commit/b5me6vr2xxiz3mle4nvvknjjcnypmpk3f2jeme2rhgfnwaqpmdoq.json"}
+     "flakes" 4
+     "size" 468}
+    "ns" [{"id" "test/ledger-info:main"}]
+    "index"
+    {"id" "fluree:index:sha256:57hhdzbqja4hyv3n6wg6jscvmxlwxt6v7httdbrr2saknls3h5k"
+     "type" ["Index"]
+     "address" "fluree:file://test/ledger-info/index/root/57hhdzbqja4hyv3n6wg6jscvmxlwxt6v7httdbrr2saknls3h5k.json"
+     "data"
+     {"id" "fluree:db:sha256:bbtvjesfhzyojnalpe5wfayrooafw7pr6cmrkyx6cfgqflbkkkcgy"
+      "type" ["DB"]
+      "t" 1
+      "address" "fluree:file://test/ledger-info/commit/btvjesfhzyojnalpe5wfayrooafw7pr6cmrkyx6cfgqflbkkkcgy.json"
+      "previous"
+      {"id" "fluree:db:sha256:bbktr7nvywjwtiamogekl3gfy57di3c5b7vob4gth3dm7hwmtw5k4"
+       "type" ["DB"]
+       "address" "fluree:file://test/ledger-info/commit/b5me6vr2xxiz3mle4nvvknjjcnypmpk3f2jeme2rhgfnwaqpmdoq.json"}
+      "flakes" 4
+      "size" 468}
+     "v" 2}}
+   :nameservice
+   {"f:commit" {"@id" "fluree:file://test/ledger-info/commit/b6k4qo7swsabwjrpsgl2sodonzlckjkaundqosq4k3wbckd7ofdq.json"}
+    "@context" {"f" "https://ns.flur.ee/ledger#"}
+    "@id" "test/ledger-info:main"
+    "f:ledger" {"@id" "test/ledger-info"}
+    "f:branch" "main"
+    "f:t" 1
+    "f:index" {"@id" "fluree:file://test/ledger-info/index/root/57hhdzbqja4hyv3n6wg6jscvmxlwxt6v7httdbrr2saknls3h5k.json"
+               "f:t" 1}
+    "@type" ["f:Database" "f:PhysicalDatabase"]
+    "f:status" "ready"}
+   :namespace-codes
+   {"" 0
+    "_:" 24
+    "https://www.wikidata.org/wiki/" 18
+    "https://www.w3.org/2018/credentials#" 7
+    "http://www.w3.org/2002/07/owl#" 6
+    "http://www.w3.org/2001/XMLSchema#" 2
+    "fluree:s3://" 16
+    "urn:uuid" 21
+    "https://ns.flur.ee/index#" 25
+    "did:key:" 11
+    "fluree:memory://" 13
+    "fluree:ipfs://" 15
+    "http://xmlns.com/foaf/0.1/" 19
+    "http://schema.org/" 17
+    "urn:issn:" 23
+    "https://ns.flur.ee/ledger#" 8
+    "urn:isbn:" 22
+    "fluree:commit:sha256:" 12
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#" 3
+    "fluree:file://" 14
+    "http://www.w3.org/2008/05/skos#" 20
+    "http://www.w3.org/ns/shacl#" 5
+    "http://example.org/" 101
+    "fluree:db:sha256:" 10
+    "http://www.w3.org/2000/01/rdf-schema#" 4
+    "@" 1}
+   :stats
+   {:flakes 14
+    :size 1954
+    :indexed 1
+    :properties
+    {"f:size"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "ex:name"
+     {:count 2 :ndv-values 2 :ndv-subjects 2 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "f:t"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "f:flakes"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "f:previous"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "f:address"
+     {:count 2 :ndv-values 2 :ndv-subjects 2 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "f:alias"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "f:v"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "f:time"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "f:data"
+     {:count 1 :ndv-values 1 :ndv-subjects 1 :last-modified-t 1
+      :selectivity-value 1 :selectivity-subject 1}
+     "@type"
+     {:count 2 :ndv-values 1 :ndv-subjects 2 :last-modified-t 1
+      :selectivity-value 2 :selectivity-subject 1}}
+    :classes
+    {"ex:Person"
+     {:count 2
+      :properties
+      {"ex:name"
+       {:types {"xsd:string" 2}
+        :ref-classes {}
+        :langs {}}}}}}})
+
 (deftest ^:integration ledger-info-api-test
-  (testing "ledger-info API returns property and class statistics"
+  (testing "ledger-info API returns fully deterministic response with fixed time"
     (with-temp-dir [storage-path {}]
-      (let [conn    @(fluree/connect-file {:storage-path (str storage-path)
-                                           :defaults
-                                           {:indexing {:reindex-min-bytes 100
-                                                       :reindex-max-bytes 10000000}}})
-            ledger-id "test/ledger-info"
-            context {"@context" {"ex" "http://example.org/"}}
-            db0     @(fluree/create conn ledger-id)
+      (let [fixed-time-ms 1700000000000
+            fixed-time-iso "2023-11-14T22:13:20Z"]
+        (with-redefs [util/current-time-millis (constantly fixed-time-ms)
+                      util/current-time-iso (constantly fixed-time-iso)]
+          (let [conn     @(fluree/connect-file {:storage-path (str storage-path)
+                                                :defaults
+                                                {:indexing {:reindex-min-bytes 100
+                                                            :reindex-max-bytes 10000000}}})
+                _        @(fluree/create conn "test/ledger-info")
+                db0      @(fluree/db conn "test/ledger-info")
+                db1      @(fluree/update db0 {"@context" {"ex" "http://example.org/"}
+                                              "insert" [{"@id" "ex:alice"
+                                                         "@type" "ex:Person"
+                                                         "ex:name" "Alice"}
+                                                        {"@id" "ex:bob"
+                                                         "@type" "ex:Person"
+                                                         "ex:name" "Bob"}]})
+                index-ch (async/chan 10)
+                _        @(fluree/commit! conn db1 {:index-files-ch index-ch})
+                _        (<!! (test-utils/block-until-index-complete index-ch))
+                info     @(fluree/ledger-info conn "test/ledger-info")]
+            (is (= ledger-info-expected info))))))))
 
-            txn     (merge context
-                           {"insert" [{"@id"      "ex:alice"
-                                       "@type"    "ex:Person"
-                                       "ex:name"  "Alice"}
-                                      {"@id"      "ex:bob"
-                                       "@type"    "ex:Person"
-                                       "ex:name"  "Bob"}]})
-            db1      @(fluree/update db0 txn)
-            index-ch (async/chan 10)
-            _        @(fluree/commit! conn db1 {:index-files-ch index-ch})
-            _        (<!! (test-utils/block-until-index-complete index-ch))
-
-            info     @(fluree/ledger-info conn ledger-id)]
-
-        ;; Print full ledger-info for inspection
-        (println "\n=== FULL LEDGER-INFO STRUCTURE ===")
-        (pprint info)
-        (println "=================================\n")
-
-        (testing "ledger-info structure contains commit, nameservice, namespace-codes, and stats"
-          (is (some? (:commit info)) "Should have commit (JSON-LD)")
-          (is (some? (:nameservice info)) "Should have nameservice (JSON-LD)")
-          (is (map? (:namespace-codes info)) "Should have namespace-codes map")
-          (is (map? (:stats info)) "Should have stats map"))
-
-        (testing "Commit JSON-LD contains expected structure"
-          (let [commit (:commit info)]
-            (is (some? (get commit "id")) "Commit should have id")
-            (is (some? (get commit "type")) "Commit should have type")
-            (is (some? (get commit "alias")) "Commit should have alias")
-            (is (some? (get commit "data")) "Commit should have data")
-            (is (some? (get-in commit ["data" "t"])) "Commit data should have t")
-            (is (some? (get commit "index")) "Commit should have index metadata")
-            (is (some? (get-in commit ["index" "id"])) "Commit index should have id")
-            (is (some? (get-in commit ["index" "address"])) "Commit index should have address")
-            (is (test-utils/address? (get-in commit ["index" "address"]))
-                "Index address should be a valid address")))
-
-        (testing "Nameservice record contains ledger metadata"
-          (let [ns (:nameservice info)]
-            (when ns  ;; Nameservice may be nil if no publisher configured
-              (is (some? (get ns "@id")) "Nameservice should have @id (ledger alias)")
-              (is (some? (get ns "f:branch")) "Nameservice should have f:branch")
-              (is (some? (get ns "f:t")) "Nameservice should have f:t"))))
-
-        (testing "Stats contain size, flakes, properties, and classes"
-          (is (some? (get-in info [:stats :size])) "Should have size")
-          (is (some? (get-in info [:stats :flakes])) "Should have flakes")
-          (is (map? (get-in info [:stats :properties])) "Should have properties map")
-          (is (map? (get-in info [:stats :classes])) "Should have classes map"))
-
-        (testing "ledger-info includes statistics with decoded IRIs and nested structure"
-          (let [properties (get-in info [:stats :properties])
-                classes    (get-in info [:stats :classes])]
-            (is (map? properties) "Should have properties map")
-            (is (map? classes) "Should have classes map")
-
-            ;; Check exact classes - should only have Person
-            (is (= ["http://example.org/Person"] (vec (keys classes)))
-                "Should have exactly 1 class (Person)")
-            (is (= 2 (get-in classes ["http://example.org/Person" :count]))
-                "Should have exactly 2 Person entities")
-
-            ;; Check properties include @type and ex:name (plus Fluree internal properties)
-            (let [prop-keys (set (keys properties))]
-              (is (contains? prop-keys "@type")
-                  "Should include @type property")
-              (is (contains? prop-keys "http://example.org/name")
-                  "Should include ex:name property")
-              (is (= 2 (get-in properties ["http://example.org/name" :count]))
-                  "Should have exactly 2 ex:name properties"))
-
-            (is (every? string? (keys properties))
-                "All property keys should be decoded IRIs (strings)")
-            (is (every? string? (keys classes))
-                "All class keys should be decoded IRIs (strings)")))))))
+(deftest ^:integration ledger-info-api-with-context-test
+  (testing "ledger-info API with context returns compacted IRIs in stats"
+    (with-temp-dir [storage-path {}]
+      (let [fixed-time-ms 1700000000000
+            fixed-time-iso "2023-11-14T22:13:20Z"]
+        (with-redefs [util/current-time-millis (constantly fixed-time-ms)
+                      util/current-time-iso (constantly fixed-time-iso)]
+          (let [conn     @(fluree/connect-file {:storage-path (str storage-path)
+                                                :defaults
+                                                {:indexing {:reindex-min-bytes 100
+                                                            :reindex-max-bytes 10000000}}})
+                _        @(fluree/create conn "test/ledger-info")
+                db0      @(fluree/db conn "test/ledger-info")
+                db1      @(fluree/update db0 {"@context" {"ex" "http://example.org/"}
+                                              "insert" [{"@id" "ex:alice"
+                                                         "@type" "ex:Person"
+                                                         "ex:name" "Alice"}
+                                                        {"@id" "ex:bob"
+                                                         "@type" "ex:Person"
+                                                         "ex:name" "Bob"}]})
+                index-ch (async/chan 10)
+                _        @(fluree/commit! conn db1 {:index-files-ch index-ch})
+                _        (<!! (test-utils/block-until-index-complete index-ch))
+                context  {"ex"  "http://example.org/"
+                          "f"   "https://ns.flur.ee/ledger#"
+                          "xsd" "http://www.w3.org/2001/XMLSchema#"}
+                info     @(fluree/ledger-info conn "test/ledger-info" context)]
+            (is (= ledger-info-with-context-expected info))))))))
 
 (deftest ^:integration stats-serialization-roundtrip-test
   (testing "Statistics can be serialized to file and deserialized correctly"
