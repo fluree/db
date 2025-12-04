@@ -190,27 +190,26 @@
             (loop [remaining-paths main-paths
                    records         []]
               (if-let [path (first remaining-paths)]
-                (let [file-content (<? (storage/read-bytes store path))]
-                  (if file-content
-                    (let [content-str  (if (string? file-content)
-                                         file-content
-                                         #?(:clj (let [^bytes bytes-content file-content]
-                                                   (String. bytes-content "UTF-8"))
-                                            :cljs (js/String.fromCharCode.apply nil file-content)))
-                          main-record  (json/parse content-str false)
+                (if-some [file-content (<? (storage/read-bytes store path))]
+                  (let [content-str  (if (string? file-content)
+                                       file-content
+                                       #?(:clj (let [^bytes bytes-content file-content]
+                                                 (String. bytes-content "UTF-8"))
+                                          :cljs (js/String.fromCharCode.apply nil file-content)))
+                        main-record  (json/parse content-str false)
                           ;; Try to read corresponding index file (branch.json -> branch.index.json)
-                          index-path   (str/replace path #"\.json$" ".index.json")
-                          index-record (when-let [idx-content (<? (storage/read-bytes store index-path))]
-                                         (let [idx-str (if (string? idx-content)
-                                                         idx-content
-                                                         #?(:clj (let [^bytes bytes-content idx-content]
-                                                                   (String. bytes-content "UTF-8"))
-                                                            :cljs (js/String.fromCharCode.apply nil idx-content)))]
-                                           (json/parse idx-str false)))
+                        index-path   (str/replace path #"\.json$" ".index.json")
+                        index-record (when-let [idx-content (<? (storage/read-bytes store index-path))]
+                                       (let [idx-str (if (string? idx-content)
+                                                       idx-content
+                                                       #?(:clj (let [^bytes bytes-content idx-content]
+                                                                 (String. bytes-content "UTF-8"))
+                                                          :cljs (js/String.fromCharCode.apply nil idx-content)))]
+                                         (json/parse idx-str false)))
                           ;; Merge index data into main record
-                          merged       (merge-index-into-record main-record index-record)]
-                      (recur (rest remaining-paths) (conj records merged)))
-                    (recur (rest remaining-paths) records)))
+                        merged       (merge-index-into-record main-record index-record)]
+                    (recur (rest remaining-paths) (conj records merged)))
+                  (recur (rest remaining-paths) records))
                 records)))
           [])
         ;; Fallback for stores that don't support ListableStore
