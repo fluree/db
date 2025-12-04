@@ -79,7 +79,8 @@
   {:pattern <original pattern entry>
    :fn      <compiled filter fn>
    :vars    #{sym ...} ; symbols referenced by the filter
-   :forms   [form ...] ; parsed forms used to compile the filter}
+   :forms   [form ...] ; parsed forms used to compile the filter
+   :order   [sym ...]} ; vars in a deterministic dependency order
 
   The values mirror what the parser stored in the filter function's metadata, but
   packaged in a plain map so downstream optimizations can reason about them without
@@ -88,11 +89,14 @@
   (when (= :filter (where/pattern-type pattern))
     (let [f     (where/pattern-data pattern)
           forms (some-> f meta :forms vec)
-          vars  (-> f meta :vars)]
+          vars  (-> f meta :vars)
+          order (or (some-> f meta :dependency-order vec)
+                    (some-> vars sort vec))]
       {:pattern pattern
        :fn      f
        :vars    vars
-       :forms   forms})))
+       :forms   forms
+       :order   order})))
 
 (defn get-filtered-variable
   "Get the variable from a filter pattern that references exactly one variable.
@@ -164,10 +168,11 @@
       (tuple-bound-vars tuple))))
 
 (defn choose-target-var
-  [likely-vars all-vars]
-  (let [ordered (vec (sort all-vars))]
-    (or (some #(when (contains? likely-vars %) %) (reverse ordered))
-        (last ordered))))
+  "Return the last variable from `ordered-vars` that is present in the set
+  `likely-vars`. `likely-vars` must be a set of symbols and `ordered-vars` a
+  vector of symbols."
+  [likely-vars ordered-vars]
+  (some likely-vars (rseq ordered-vars)))
 
 (defn update-pending-for-pattern
   [pending pattern-vars]
@@ -179,7 +184,7 @@
              newly-bound (set/intersection remaining pattern-vars)
              remaining*  (set/difference remaining pattern-vars)]
          (if (and (seq newly-bound) (empty? remaining*))
-           (let [target (choose-target-var newly-bound (:vars info))]
+           (let [target (choose-target-var newly-bound (:order info))]
              [(assoc pending* id (assoc entry
                                         :remaining remaining*
                                         :inlined? true

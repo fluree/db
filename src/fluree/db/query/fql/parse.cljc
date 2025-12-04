@@ -566,9 +566,17 @@
 (defmethod parse-pattern :filter
   [[_ & codes] _var-config context]
   (let [parsed-codes (map parse-code codes)
-        vars         (apply set/union (map variables parsed-codes))
-        f            (compile-filter-fn context parsed-codes)]
-    [(where/->pattern :filter (with-meta f {:forms parsed-codes, :vars vars}))]))
+        order        (not-empty (into []
+                                      (comp (map variables)
+                                            cat
+                                            (distinct))
+                                      parsed-codes))
+        vars         (not-empty (into #{} order))
+        f            (compile-filter-fn context parsed-codes)
+        metadata     {:forms parsed-codes
+                      :vars  vars
+                      :dependency-order (not-empty order)}]
+    [(where/->pattern :filter (with-meta f metadata))]))
 
 (defmethod parse-pattern :union
   [[_ & unions] var-config context]
