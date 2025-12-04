@@ -141,3 +141,16 @@
 
 (def connection-config
   (system-iri "connectionConfig"))
+
+;; DynamoDB nameservice config
+(def dynamodb-table
+  (system-iri "dynamodbTable"))
+
+(def dynamodb-region
+  (system-iri "dynamodbRegion"))
+
+(def dynamodb-endpoint
+  (system-iri "dynamodbEndpoint"))
+
+(def dynamodb-timeout-ms
+  (system-iri "dynamodbTimeoutMs"))
