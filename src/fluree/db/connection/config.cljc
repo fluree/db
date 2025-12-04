@@ -52,6 +52,11 @@
        (or (contains? node conn-vocab/ipfs-endpoint)
            (contains? node conn-vocab/ipns-key))))
 
+(defn dynamodb-nameservice?
+  [node]
+  (and (publisher? node)
+       (contains? node conn-vocab/dynamodb-table)))
+
 (defn storage?
   [node]
   (of-type? node conn-vocab/storage-type))
@@ -150,7 +155,8 @@
       (s3-storage? node)          (derive id :fluree.db.storage/s3)
       (ipfs-storage? node)        (derive id :fluree.db.storage/ipfs)
       (ipns-nameservice? node)    (derive id :fluree.db.nameservice/ipns)
-      (storage-nameservice? node) (derive id :fluree.db.nameservice/storage))
+      (storage-nameservice? node) (derive id :fluree.db.nameservice/storage)
+      (dynamodb-nameservice? node) (derive id :fluree.db.nameservice/dynamodb))
     node))
 
 (def component-exclusions

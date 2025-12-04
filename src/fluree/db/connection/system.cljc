@@ -2,6 +2,7 @@
   (:require #?(:clj  [fluree.db.storage.s3 :as s3-storage]
                :cljs [fluree.db.storage.localstorage :as localstorage-store])
             #?(:clj [fluree.db.migrations.nameservice :as ns-migration])
+            #?(:clj [fluree.db.nameservice.dynamodb :as dynamodb-nameservice])
             #?(:clj [fluree.db.storage.file :as file-storage])
             [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]
@@ -46,6 +47,9 @@
 
 (derive :fluree.db.nameservice/ipns :fluree.db/publisher)
 (derive :fluree.db.nameservice/ipns :fluree.db/nameservice)
+
+#?(:clj (derive :fluree.db.nameservice/dynamodb :fluree.db/publisher))
+#?(:clj (derive :fluree.db.nameservice/dynamodb :fluree.db/nameservice))
 
 (derive :fluree.db.serializer/json :fluree.db/serializer)
 
@@ -231,6 +235,18 @@
   (let [endpoint (config/get-first-string config conn-vocab/ipfs-endpoint)
         ipns-key (config/get-first-string config conn-vocab/ipns-key)]
     (ipns-nameservice/initialize endpoint ipns-key)))
+
+#?(:clj
+   (defmethod ig/init-key :fluree.db.nameservice/dynamodb
+     [_ config]
+     (let [table-name (config/get-first-string config conn-vocab/dynamodb-table)
+           region     (config/get-first-string config conn-vocab/dynamodb-region)
+           endpoint   (config/get-first-string config conn-vocab/dynamodb-endpoint)
+           timeout-ms (config/get-first-long config conn-vocab/dynamodb-timeout-ms)]
+       (dynamodb-nameservice/start (cond-> {:table-name table-name}
+                                     region     (assoc :region region)
+                                     endpoint   (assoc :endpoint endpoint)
+                                     timeout-ms (assoc :timeout-ms timeout-ms))))))
 
 (defmethod ig/init-key :fluree.db.serializer/json
   [_ _]

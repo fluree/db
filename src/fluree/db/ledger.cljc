@@ -381,12 +381,9 @@
     (let [init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit
                               commit-catalog alias publish-addresses init-time))
-          ;; Publish genesis commit to nameservice - convert expanded to compact format first
+          commit-address (util/get-first-value genesis-commit const/iri-address)
           _              (when primary-publisher
-                           (let [;; Convert expanded genesis commit to compact JSON-ld format
-                                 commit-map (commit-data/json-ld->map genesis-commit nil)
-                                 compact-commit (commit-data/->json-ld commit-map)]
-                             (<? (nameservice/publish primary-publisher compact-commit))))]
+                           (<? (nameservice/publish-commit primary-publisher alias commit-address 0)))]
       (instantiate alias primary-address commit-catalog index-catalog
                    primary-publisher secondary-publishers indexing did genesis-commit))))
 
@@ -500,11 +497,22 @@
        :write-result  commit-res})))
 
 (defn publish-commit
-  "Publishes commit to all nameservices registered with the ledger."
+  "Publishes commit to all nameservices registered with the ledger.
+   Uses atomic publish-commit to update only commit fields, avoiding
+   overwriting index data that may have been updated by a separate indexer."
   [{:keys [primary-publisher secondary-publishers] :as _ledger} commit-jsonld]
   (go-try
-    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
-      (nameservice/publish-to-all commit-jsonld secondary-publishers)
+    (let [ledger-alias   (get commit-jsonld "alias")
+          commit-address (get commit-jsonld "address")
+          commit-t       (get-in commit-jsonld ["data" "t"])
+          _              (log/debug "publish-commit using atomic update"
+                                    {:alias ledger-alias :commit-t commit-t})
+          result         (<? (nameservice/publish-commit primary-publisher
+                                                         ledger-alias
+                                                         commit-address
+                                                         commit-t))]
+      (when-let [secondaries (seq secondary-publishers)]
+        (nameservice/publish-commit-to-all ledger-alias commit-address commit-t secondaries))
       result)))
 
 (defn formalize-commit
