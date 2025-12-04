@@ -482,7 +482,9 @@
                                      (<? (write-s3-data this path new-bytes {"If-None-Match" "*"}))))
                                  ;; Other error, re-throw
                                  (throw e))))))]
-        (<? (with-retries swap-thunk {:max-retries         max-retries
+        ;; Swap operations use 3x retries because 412 conflicts under high contention
+        ;; may require many attempts before winning the race
+        (<? (with-retries swap-thunk {:max-retries         (* 3 max-retries)
                                       :retry-base-delay-ms retry-base-delay-ms
                                       :retry-max-delay-ms  retry-max-delay-ms
                                       :log-context         {:method "SWAP"
@@ -537,11 +539,34 @@
         err (:error data)]
     (or (= err :xhttp/timeout)
         (nil? status)
+        (= status 412) ; Precondition Failed - retry for conditional writes (ETag mismatch)
         (= status 429)
         (= status 500)
         (= status 502)
         (= status 503)
         (= status 504))))
+
+(defn- retry-reason
+  "Returns a human-readable reason for why a request is being retried."
+  [e]
+  (let [data (ex-data e)
+        status (:status data)
+        err (:error data)]
+    (cond
+      (= err :xhttp/timeout) "request timeout"
+      (= status 412)         "conditional write conflict (ETag mismatch)"
+      (= status 429)         "rate limited"
+      (= status 500)         "internal server error"
+      (= status 502)         "bad gateway"
+      (= status 503)         "service unavailable"
+      (= status 504)         "gateway timeout"
+      (nil? status)          "unknown error (no status)"
+      :else                  (str "HTTP " status))))
+
+(defn- etag-conflict?
+  "Returns true if the error is a 412 Precondition Failed (ETag mismatch)."
+  [e]
+  (= 412 (:status (ex-data e))))
 
 (defn- with-retries
   "Runs thunk returning a channel; retries on retryable errors with backoff/jitter.
@@ -554,16 +579,24 @@
             duration-ms (long (/ (- (System/nanoTime) start) 1000000))]
         (if (instance? Throwable res)
           (if (and (< attempt max-retries) (retryable-error? res))
-            (let [delay (min (* retry-base-delay-ms (long (Math/pow 2 attempt))) retry-max-delay-ms)
+            (let [;; For 412 ETag conflicts: use fixed 200ms delay with jitter (not exponential backoff)
+                  ;; since we just need to spread out concurrent writers, not wait for server recovery.
+                  ;; 200ms accounts for S3's ~100ms latency plus buffer for the read-modify-write cycle.
+                  delay (if (etag-conflict? res)
+                          200
+                          (min (* retry-base-delay-ms (long (Math/pow 2 attempt))) retry-max-delay-ms))
                   wait-ms (jitter delay)
-                  data (merge {:event "s3.retry"
-                               :attempt attempt
-                               :wait-ms wait-ms
+                  reason (retry-reason res)
+                  data (merge {:event       "s3.retry"
+                               :reason      reason
+                               :attempt     (inc attempt)
+                               :max-retries max-retries
+                               :wait-ms     wait-ms
                                :duration-ms duration-ms
-                               :error (ex-message res)}
+                               :error       (ex-message res)}
                               (ex-data res)
                               log-context)]
-              (log/warn "S3 request failed, retrying" data)
+              (log/info "S3 request retrying" data)
               (<! (async/timeout wait-ms))
               (recur (inc attempt)))
             (let [data (merge {:event "s3.error"
