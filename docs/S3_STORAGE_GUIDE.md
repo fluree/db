@@ -74,6 +74,216 @@ API will throw a validation error if not provided.
 }
 ```
 
+## S3 Express One Zone Configuration
+
+### Overview
+
+S3 Express One Zone is a high-performance S3 storage class that provides single-digit millisecond data access. Fluree automatically detects and handles Express One Zone buckets without requiring configuration changes.
+
+**Key Benefits:**
+- 10x faster data access compared to standard S3
+- Single-digit millisecond latency
+- Ideal for frequently accessed index data
+- Automatic session-based authentication
+
+### Bucket Naming Convention
+
+Express One Zone buckets follow a specific naming pattern:
+```
+{bucket-name}--{region}-az{number}--x-s3
+```
+
+**Examples:**
+- `my-data--use1-az1--x-s3` (US East 1, AZ 1)
+- `prod-index--usw2-az2--x-s3` (US West 2, AZ 2)
+- `fluree-cache--euw1-az3--x-s3` (EU West 1, AZ 3)
+
+### Basic Express One Zone Configuration
+
+```json
+{
+  "@context": {
+    "@vocab": "https://ns.flur.ee/system#"
+  },
+  "@graph": [
+    {
+      "@id": "s3ExpressStorage",
+      "@type": "Storage",
+      "s3Bucket": "my-data--use1-az1--x-s3",
+      "s3Prefix": "fluree/",
+      "addressIdentifier": "express-storage"
+    },
+    {
+      "@id": "connection",
+      "@type": "Connection",
+      "commitStorage": {"@id": "s3ExpressStorage"},
+      "indexStorage": {"@id": "s3ExpressStorage"}
+    }
+  ]
+}
+```
+
+### Split Storage Configuration (Recommended)
+
+For optimal performance and cost, use Express One Zone for frequently-accessed indexes and standard S3 for archival commits:
+
+```json
+{
+  "@context": {
+    "@vocab": "https://ns.flur.ee/system#"
+  },
+  "@graph": [
+    {
+      "@id": "standardS3",
+      "@type": "Storage",
+      "s3Bucket": "fluree-commits-standard",
+      "s3Prefix": "commits/",
+      "addressIdentifier": "commit-storage"
+    },
+    {
+      "@id": "expressOneS3",
+      "@type": "Storage",
+      "s3Bucket": "fluree-index--use1-az1--x-s3",
+      "s3Prefix": "indexes/",
+      "addressIdentifier": "index-storage"
+    },
+    {
+      "@id": "connection",
+      "@type": "Connection",
+      "parallelism": 4,
+      "cacheMaxMb": 1000,
+      "commitStorage": {"@id": "standardS3"},
+      "indexStorage": {"@id": "expressOneS3"},
+      "primaryPublisher": {
+        "@type": "Publisher",
+        "storage": {"@id": "standardS3"}
+      }
+    }
+  ]
+}
+```
+
+### Clojure API with Express One Zone
+
+```clojure
+(require '[fluree.db.api :as fluree])
+
+;; Express One Zone connection
+(def conn
+  @(fluree/connect
+    {:method :s3
+     :storage-config
+     {:commitStorage {:s3-bucket "commits-bucket"
+                      :s3-prefix "commits/"}
+      :indexStorage  {:s3-bucket "index--use1-az1--x-s3"
+                      :s3-prefix "indexes/"}}}))
+```
+
+### Authentication
+
+Express One Zone uses the same AWS credential chain as standard S3:
+- Environment variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+- AWS credentials file: `~/.aws/credentials`
+- IAM roles (when running on EC2)
+
+**Session Management:**
+- Fluree automatically calls the `CreateSession` API for Express One Zone buckets
+- Session credentials are cached for 5 minutes
+- Automatic refresh before expiration
+- No manual session management required
+
+### Required Permissions
+
+In addition to standard S3 permissions, Express One Zone requires the `CreateSession` action:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::your-standard-bucket",
+        "arn:aws:s3:::your-standard-bucket/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3express:CreateSession",
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3express:us-east-1:123456789012:bucket/your-express-bucket--use1-az1--x-s3",
+        "arn:aws:s3express:us-east-1:123456789012:bucket/your-express-bucket--use1-az1--x-s3/*"
+      ]
+    }
+  ]
+}
+```
+
+### Performance Considerations
+
+**When to Use Express One Zone:**
+- Frequently accessed index data (high read throughput)
+- Hot data that requires low-latency access
+- Query-heavy workloads with many index lookups
+- Real-time applications requiring fast data access
+
+**When to Use Standard S3:**
+- Archival commit data (write-once, read-rarely)
+- Long-term storage with infrequent access
+- Cost-sensitive workloads
+- Cross-region replication needs
+
+**Performance Characteristics:**
+- Express One Zone: ~1-5ms latency
+- Standard S3: ~100-200ms latency
+- Session creation overhead: ~100-200ms (cached for 5 minutes)
+
+### Migration to Express One Zone
+
+To migrate existing deployments:
+
+1. **Create Express One Zone Bucket**
+   ```bash
+   aws s3api create-bucket \
+     --bucket my-index--use1-az1--x-s3 \
+     --location-type AvailabilityZone \
+     --location-name use1-az1
+   ```
+
+2. **Update Configuration**
+   - Change `s3Bucket` to use Express One Zone bucket name
+   - For split storage, update only `indexStorage` configuration
+
+3. **Copy Existing Data** (Optional)
+   ```bash
+   aws s3 sync s3://old-bucket/indexes/ s3://my-index--use1-az1--x-s3/indexes/
+   ```
+
+4. **Deploy Updated Configuration**
+   - No code changes required
+   - Fluree automatically detects Express One Zone buckets
+
+### Limitations and Considerations
+
+- **Regional Availability**: Express One Zone is available in specific AWS regions and AZs only
+- **Single AZ**: Data is stored in a single availability zone (lower durability than multi-AZ S3)
+- **Cost**: Higher per-GB storage cost, but lower per-request cost than standard S3
+- **SDK Dependency**: Requires AWS SDK v2 (adds ~15-20MB to deployment size)
+
+For more details, see [S3_EXPRESS_ONE_ZONE.md](../S3_EXPRESS_ONE_ZONE.md).
+
 ## AWS Credentials
 
 ### Authentication Methods

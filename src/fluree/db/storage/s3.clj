@@ -6,6 +6,7 @@
             [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.db.storage :as storage]
+            [fluree.db.storage.s3-express :as s3-express]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]
@@ -33,9 +34,10 @@
   (.withZone (DateTimeFormatter/ofPattern "yyyyMMdd")
              ZoneOffset/UTC))
 
-(defn get-credentials
-  "Get AWS credentials from environment variables or system properties.
-   Returns a map with :access-key and :secret-key"
+(defn get-base-credentials
+  "Get base AWS credentials from environment variables or system properties.
+   Returns a map with :access-key and :secret-key.
+   Note: For Express One Zone buckets, these will be exchanged for session credentials."
   []
   (let [access-key (or (System/getenv "AWS_ACCESS_KEY_ID")
                        (System/getProperty "aws.accessKeyId"))
@@ -47,6 +49,13 @@
       (cond-> {:access-key access-key
                :secret-key secret-key}
         session-token (assoc :session-token session-token)))))
+
+(defn get-credentials
+  "Get appropriate credentials for the given bucket and region.
+   For Express One Zone buckets, returns session credentials.
+   For standard S3 buckets, returns base credentials."
+  [bucket region base-credentials]
+  (s3-express/get-credentials-for-bucket bucket region base-credentials))
 
 (defn hmac-sha256
   "Generate HMAC-SHA256 signature"
@@ -280,24 +289,26 @@
   ([client path]
    (read-s3-data client path {}))
   ([client path headers]
-   (let [{:keys [credentials bucket region prefix read-timeout-ms max-retries
+   (let [{:keys [base-credentials bucket region prefix read-timeout-ms max-retries
                  retry-base-delay-ms retry-max-delay-ms]}
          client
 
-         ch        (async/promise-chan)
-         full-path (str prefix path)
-         policy    {:max-retries         max-retries
-                    :retry-base-delay-ms retry-base-delay-ms
-                    :retry-max-delay-ms  retry-max-delay-ms}
-         thunk     (fn []
-                     (let [req (cond-> {:method          "GET"
-                                        :bucket          bucket
-                                        :region          region
-                                        :path            path
-                                        :credentials     credentials
-                                        :request-timeout read-timeout-ms}
-                                 (seq headers) (assoc :headers headers))]
-                       (s3-request req)))]
+         ch           (async/promise-chan)
+         full-path    (str prefix path)
+         ;; Get appropriate credentials for this bucket (session-based for Express One)
+         credentials  (get-credentials bucket region base-credentials)
+         policy       {:max-retries         max-retries
+                       :retry-base-delay-ms retry-base-delay-ms
+                       :retry-max-delay-ms  retry-max-delay-ms}
+         thunk        (fn []
+                        (let [req (cond-> {:method          "GET"
+                                           :bucket          bucket
+                                           :region          region
+                                           :path            path
+                                           :credentials     credentials
+                                           :request-timeout read-timeout-ms}
+                                    (seq headers) (assoc :headers headers))]
+                          (s3-request req)))]
      (go
        (try
          (let [response (<? (with-retries thunk (assoc policy :log-context {:method "GET" :bucket bucket :path full-path})))]
@@ -313,25 +324,27 @@
   ([client path data]
    (write-s3-data client path data {}))
   ([client path data headers]
-   (let [{:keys [credentials bucket region prefix write-timeout-ms max-retries
+   (let [{:keys [base-credentials bucket region prefix write-timeout-ms max-retries
                  retry-base-delay-ms retry-max-delay-ms]}
          client
 
-         ch        (async/promise-chan)
-         full-path (str prefix path)
-         policy    {:max-retries         max-retries
-                    :retry-base-delay-ms retry-base-delay-ms
-                    :retry-max-delay-ms  retry-max-delay-ms}
-         thunk     (fn []
-                     (let [req (cond-> {:method          "PUT"
-                                        :bucket          bucket
-                                        :region          region
-                                        :path            path
-                                        :body            data
-                                        :credentials     credentials
-                                        :request-timeout write-timeout-ms}
-                                 (seq headers) (assoc :headers headers))]
-                       (s3-request req)))]
+         ch           (async/promise-chan)
+         full-path    (str prefix path)
+         ;; Get appropriate credentials for this bucket (session-based for Express One)
+         credentials  (get-credentials bucket region base-credentials)
+         policy       {:max-retries         max-retries
+                       :retry-base-delay-ms retry-base-delay-ms
+                       :retry-max-delay-ms  retry-max-delay-ms}
+         thunk        (fn []
+                        (let [req (cond-> {:method          "PUT"
+                                           :bucket          bucket
+                                           :region          region
+                                           :path            path
+                                           :body            data
+                                           :credentials     credentials
+                                           :request-timeout write-timeout-ms}
+                                    (seq headers) (assoc :headers headers))]
+                          (s3-request req)))]
      (go
        (let [res (<? (with-retries thunk (assoc policy :log-context {:method "PUT"
                                                                      :bucket bucket
@@ -344,9 +357,11 @@
   ([client path]
    (s3-list* client path nil))
   ([client path continuation-token]
-   (let [{:keys [credentials bucket region prefix list-timeout-ms max-retries retry-base-delay-ms retry-max-delay-ms]} client
+   (let [{:keys [base-credentials bucket region prefix list-timeout-ms max-retries retry-base-delay-ms retry-max-delay-ms]} client
          ch (async/promise-chan)
-         full-path (str prefix path)]
+         full-path (str prefix path)
+         ;; Get appropriate credentials for this bucket (session-based for Express One)
+         credentials (get-credentials bucket region base-credentials)]
      (go
        (try
          (let [query-params (cond-> {"list-type" "2"}
@@ -388,7 +403,7 @@
   [identifier path]
   (storage/build-fluree-address identifier method-name path))
 
-(defrecord S3Store [identifier credentials bucket region prefix
+(defrecord S3Store [identifier base-credentials bucket region prefix
                    ;; timeouts (ms)
                     read-timeout-ms
                     write-timeout-ms
@@ -494,18 +509,20 @@
   storage/EraseableStore
   (delete [_ address]
     (go-try
-      (let [path      (storage/get-local-path address)
-            full-path (str prefix path)
-            policy    {:max-retries         max-retries
-                       :retry-base-delay-ms retry-base-delay-ms
-                       :retry-max-delay-ms  retry-max-delay-ms}
-            response  (<? (with-retries (fn [] (s3-request {:method          "DELETE"
-                                                            :bucket          bucket
-                                                            :region          region
-                                                            :path            full-path
-                                                            :credentials     credentials
-                                                            :request-timeout write-timeout-ms}))
-                            policy))]
+      (let [path        (storage/get-local-path address)
+            full-path   (str prefix path)
+            ;; Get appropriate credentials for this bucket (session-based for Express One)
+            credentials (get-credentials bucket region base-credentials)
+            policy      {:max-retries         max-retries
+                         :retry-base-delay-ms retry-base-delay-ms
+                         :retry-max-delay-ms  retry-max-delay-ms}
+            response    (<? (with-retries (fn [] (s3-request {:method          "DELETE"
+                                                              :bucket          bucket
+                                                              :region          region
+                                                              :path            full-path
+                                                              :credentials     credentials
+                                                              :request-timeout write-timeout-ms}))
+                              policy))]
         (:body response))))
 
   storage/RecursiveListableStore
@@ -620,7 +637,10 @@
     out))
 
 (defn open
-  "Open an S3 store using direct HTTP implementation"
+  "Open an S3 store using direct HTTP implementation.
+   Supports both standard S3 and S3 Express One Zone buckets.
+   For Express One Zone buckets (ending in --x-s3), session credentials
+   will be automatically managed."
   ([bucket prefix]
    (open nil bucket prefix))
   ([identifier bucket prefix]
@@ -632,7 +652,7 @@
    (let [region (or (System/getenv "AWS_REGION")
                     (System/getenv "AWS_DEFAULT_REGION")
                     "us-east-1")
-         credentials (get-credentials)
+         base-credentials (get-base-credentials)
          ;; Normalize prefix to always end with / (unless empty)
          normalized-prefix (when (and prefix (not (str/blank? prefix)))
                              (if (str/ends-with? prefix "/")
@@ -644,13 +664,17 @@
          max-retries* (or max-retries 4)
          retry-base-delay-ms* (or retry-base-delay-ms 150)
          retry-max-delay-ms* (or retry-max-delay-ms 2000)]
-     (when-not credentials
+     (when-not base-credentials
        (throw (ex-info "AWS credentials not found"
                        {:error :s3/missing-credentials
                         :hint "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"})))
      ;; Note: endpoint-override can be handled via with-redefs of build-s3-url in tests
      (when endpoint-override
        (log/warn "endpoint-override provided - can be handled via with-redefs of build-s3-url in tests"))
-     (->S3Store identifier credentials bucket region normalized-prefix
+     ;; Log if this is an Express One Zone bucket
+     (when (s3-express/express-one-bucket? bucket)
+       (log/info "Opening S3 Express One Zone bucket - session credentials will be managed automatically"
+                 {:bucket bucket :region region}))
+     (->S3Store identifier base-credentials bucket region normalized-prefix
                 read-timeout-ms* write-timeout-ms* list-timeout-ms*
                 max-retries* retry-base-delay-ms* retry-max-delay-ms*))))
