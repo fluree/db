@@ -327,12 +327,13 @@
                 compiled-filters)))))
 
 (defn compile-inline-filters
-  "Compile any filter codes in a match object."
-  [mch context]
-  (if-let [{:keys [variable forms]} (::filter-code mch)]
-    (-> mch
-        (dissoc ::filter-code)
-        (where/with-filter (compile-filter variable forms context)))
+  "Compile any filter codes in a match object.
+
+  Filters compiled during parsing already carry runtime fns and do not need
+  recompilation."
+  [mch _context]
+  (if (::filter-code mch)
+    (dissoc mch ::filter-code)
     mch))
 
 (declare compile-filter-codes)

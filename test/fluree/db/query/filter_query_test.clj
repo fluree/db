@@ -157,6 +157,39 @@
                                                    "ex:father" ?f2}
                                                   ["filter" "(not= ?f1 ?f2)"]]})))))
 
+    (testing "multi-variable filter across sequential patterns"
+      (is (= [["Cam" "Alice"]
+              ["Cam" "Brian"]]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '[?name ?friend]
+                                :order   '[?name ?friend]
+                                :where   '[{:schema/name  ?name
+                                            :schema/age   ?age
+                                            :ex/friend    {:schema/name ?friend
+                                                           :schema/age  ?friendAge}}
+                                           [:filter "(< ?age ?friendAge)"]]}))))
+
+    (testing "multi-variable filters inside union branches"
+      (is (= [["Cam" "Alice"]
+              ["Cam" "Brian"]
+              ["David" "Cam"]]
+             @(fluree/query db {:context [test-utils/default-context
+                                          {:ex "http://example.org/ns/"}]
+                                :select  '[?name ?friend]
+                                :order   '[?name ?friend]
+                                :where   '[:union
+                                           [{:schema/name  ?name
+                                             :schema/age   ?age
+                                             :ex/friend    {:schema/name ?friend
+                                                            :schema/age  ?friendAge}}
+                                            [:filter "(< ?age ?friendAge)"]]
+                                           [{:schema/name  ?name
+                                             :schema/age   ?age
+                                             :ex/friend    {:schema/name ?friend
+                                                            :schema/age  ?friendAge}}
+                                            [:filter "(>= ?age ?friendAge)"]]]}))))
+
     (testing "value map filters"
       (is (= [["Brian" "Smith"]]
              @(fluree/query db {:context [test-utils/default-context
