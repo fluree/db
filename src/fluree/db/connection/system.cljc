@@ -4,6 +4,7 @@
             #?(:clj [fluree.db.migrations.nameservice :as ns-migration])
             #?(:clj [fluree.db.nameservice.dynamodb :as dynamodb-nameservice])
             #?(:clj [fluree.db.storage.file :as file-storage])
+            #?(:clj [fluree.db.util.log :as log])
             [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]
             [fluree.db.connection.config :as config]
@@ -191,6 +192,11 @@
            max-retries (config/get-first-integer config conn-vocab/s3-max-retries)
            retry-base-delay-ms (config/get-first-long config conn-vocab/s3-retry-base-delay-ms)
            retry-max-delay-ms (config/get-first-long config conn-vocab/s3-retry-max-delay-ms)]
+       (log/info "Initializing S3 storage from configuration"
+                 {:identifier identifier
+                  :bucket s3-bucket
+                  :prefix s3-prefix
+                  :endpoint s3-endpoint})
        (s3-storage/open identifier s3-bucket s3-prefix s3-endpoint
                         {:read-timeout-ms read-timeout-ms
                          :write-timeout-ms write-timeout-ms

@@ -216,16 +216,23 @@
   ([bucket region path]
    (build-s3-url bucket region path nil))
   ([bucket region path endpoint]
-   (if endpoint
-     ;; Check if bucket is already in the endpoint hostname (virtual-hosted-style)
-     ;; If the endpoint contains the bucket name, it's virtual-hosted
-     (if (str/includes? endpoint (str bucket "."))
-       ;; Virtual-hosted-style: bucket is in hostname, just append path
-       (str endpoint "/" path)
-       ;; Path-style: bucket not in hostname, include it in path
-       (str endpoint "/" bucket "/" path))
-     ;; No endpoint - use standard AWS S3 format
-     (str "https://" bucket ".s3." region ".amazonaws.com/" path))))
+   (let [url (if endpoint
+               ;; Check if bucket is already in the endpoint hostname (virtual-hosted-style)
+               ;; If the endpoint contains the bucket name, it's virtual-hosted
+               (if (str/includes? endpoint (str bucket "."))
+                 ;; Virtual-hosted-style: bucket is in hostname, just append path
+                 (str endpoint "/" path)
+                 ;; Path-style: bucket not in hostname, include it in path
+                 (str endpoint "/" bucket "/" path))
+               ;; No endpoint - use standard AWS S3 format
+               (str "https://" bucket ".s3." region ".amazonaws.com/" path))]
+     (log/trace "Built S3 URL"
+                {:bucket bucket
+                 :region region
+                 :path path
+                 :endpoint endpoint
+                 :url url})
+     url)))
 
 (declare with-retries parse-list-objects-response)
 
@@ -235,12 +242,22 @@
     :or   {method  "GET"
            headers {}}}]
   (go-try
+    (log/debug "s3-request called"
+               {:method method
+                :bucket bucket
+                :region region
+                :path path
+                :endpoint endpoint})
     (let [start                     (System/nanoTime)
           ;; Encode path segments for both URL and signature to match S3's encoding
           encoded-path              (encode-s3-path path)
           query-string              (canonical-query-string query-params)
           url                       (str (build-s3-url bucket region encoded-path endpoint)
                                          (when query-string (str "?" query-string)))
+          _                         (log/debug "s3-request built URL"
+                                               {:method method
+                                                :bucket bucket
+                                                :url url})
           headers-with-content-type (if (and (= method "PUT") body)
                                       (assoc headers "Content-Type" "application/octet-stream")
                                       headers)
@@ -698,6 +715,13 @@
      (when (s3-express/express-one-bucket? bucket)
        (log/info "Opening S3 Express One Zone bucket - session credentials will be managed automatically"
                  {:bucket bucket :region region}))
+     ;; Log endpoint configuration for debugging
+     (log/info "Opening S3 store"
+               {:bucket bucket
+                :region region
+                :prefix normalized-prefix
+                :endpoint endpoint-override
+                :identifier identifier})
      (->S3Store identifier base-credentials bucket region normalized-prefix endpoint-override
                 read-timeout-ms* write-timeout-ms* list-timeout-ms*
                 max-retries* retry-base-delay-ms* retry-max-delay-ms*))))
