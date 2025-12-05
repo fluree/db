@@ -163,7 +163,6 @@
              @(fluree/query db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '[?name ?friend]
-                                :order   '[?name ?friend]
                                 :where   '[{:schema/name  ?name
                                             :schema/age   ?age
                                             :ex/friend    {:schema/name ?friend
@@ -177,7 +176,6 @@
              @(fluree/query db {:context [test-utils/default-context
                                           {:ex "http://example.org/ns/"}]
                                 :select  '[?name ?friend]
-                                :order   '[?name ?friend]
                                 :where   '[:union
                                            [{:schema/name  ?name
                                              :schema/age   ?age
