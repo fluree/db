@@ -19,6 +19,10 @@
       (contains? node conn-vocab/default-val)
       (of-type? node conn-vocab/config-val-type)))
 
+(defn telemetry?
+  [node]
+  (of-type? node conn-vocab/telemetry-type))
+
 (defn connection?
   [node]
   (of-type? node conn-vocab/connection-type))
@@ -148,6 +152,7 @@
     (cond
       (config-value? node)        (derive id :fluree.db/config-value)
       (connection? node)          (derive id :fluree.db/connection)
+      (telemetry? node)           (derive id :fluree.db/telemetry)
       (connection-config? node)   (derive id :fluree.db/connection-config)
       (system? node)              (derive id :fluree.db/remote-system)
       (memory-storage? node)      (derive id :fluree.db.storage/memory)
@@ -353,6 +358,10 @@
       (cond-> nil
         identity      (assoc :identity identity)
         index-options (assoc :indexing index-options)))))
+
+(defn parse-telemetry
+  [config]
+  {:endpoint (get-first-string config conn-vocab/telemetry-endpoint)})
 
 (defn parse-connection-map
   [{:keys [cache commit-catalog index-catalog serializer] :as config}]

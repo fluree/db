@@ -55,7 +55,7 @@
   (instance? Connection x))
 
 (defn connect
-  [{:keys [parallelism commit-catalog index-catalog cache serializer
+  [{:keys [parallelism commit-catalog index-catalog cache serializer telemetry
            primary-publisher secondary-publishers remote-systems defaults]
     :or   {serializer (json-dict-serde)} :as _opts}]
   (let [id    (random-uuid)
