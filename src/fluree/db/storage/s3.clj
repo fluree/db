@@ -201,15 +201,23 @@
     (assoc headers* "authorization" authorization)))
 
 (defn build-s3-url
-  "Build the S3 REST API URL"
-  [bucket region path]
-  (str "https://" bucket ".s3." region ".amazonaws.com/" path))
+  "Build the S3 REST API URL. If endpoint is provided, uses that instead of
+   the default AWS endpoint. This is useful for testing with LocalStack or
+   using custom S3-compatible endpoints."
+  ([bucket region path]
+   (build-s3-url bucket region path nil))
+  ([bucket region path endpoint]
+   (if endpoint
+     ;; Custom endpoint (e.g., LocalStack)
+     (str endpoint "/" bucket "/" path)
+     ;; Standard AWS S3 endpoint
+     (str "https://" bucket ".s3." region ".amazonaws.com/" path))))
 
 (declare with-retries parse-list-objects-response)
 
 (defn s3-request
   "Make an S3 REST API request"
-  [{:keys [method bucket region path headers body credentials query-params request-timeout]
+  [{:keys [method bucket region path headers body credentials query-params request-timeout endpoint]
     :or   {method  "GET"
            headers {}}}]
   (go-try
@@ -217,7 +225,7 @@
           ;; Encode path segments for both URL and signature to match S3's encoding
           encoded-path              (encode-s3-path path)
           query-string              (canonical-query-string query-params)
-          url                       (str (build-s3-url bucket region encoded-path)
+          url                       (str (build-s3-url bucket region encoded-path endpoint)
                                          (when query-string (str "?" query-string)))
           headers-with-content-type (if (and (= method "PUT") body)
                                       (assoc headers "Content-Type" "application/octet-stream")
@@ -289,7 +297,7 @@
   ([client path]
    (read-s3-data client path {}))
   ([client path headers]
-   (let [{:keys [base-credentials bucket region prefix read-timeout-ms max-retries
+   (let [{:keys [base-credentials bucket region prefix endpoint read-timeout-ms max-retries
                  retry-base-delay-ms retry-max-delay-ms]}
          client
 
@@ -306,6 +314,7 @@
                                            :region          region
                                            :path            path
                                            :credentials     credentials
+                                           :endpoint        endpoint
                                            :request-timeout read-timeout-ms}
                                     (seq headers) (assoc :headers headers))]
                           (s3-request req)))]
@@ -324,7 +333,7 @@
   ([client path data]
    (write-s3-data client path data {}))
   ([client path data headers]
-   (let [{:keys [base-credentials bucket region prefix write-timeout-ms max-retries
+   (let [{:keys [base-credentials bucket region prefix endpoint write-timeout-ms max-retries
                  retry-base-delay-ms retry-max-delay-ms]}
          client
 
@@ -342,6 +351,7 @@
                                            :path            path
                                            :body            data
                                            :credentials     credentials
+                                           :endpoint        endpoint
                                            :request-timeout write-timeout-ms}
                                     (seq headers) (assoc :headers headers))]
                           (s3-request req)))]
@@ -357,7 +367,7 @@
   ([client path]
    (s3-list* client path nil))
   ([client path continuation-token]
-   (let [{:keys [base-credentials bucket region prefix list-timeout-ms max-retries retry-base-delay-ms retry-max-delay-ms]} client
+   (let [{:keys [base-credentials bucket region prefix endpoint list-timeout-ms max-retries retry-base-delay-ms retry-max-delay-ms]} client
          ch (async/promise-chan)
          full-path (str prefix path)
          ;; Get appropriate credentials for this bucket (session-based for Express One)
@@ -372,6 +382,7 @@
                                                               :region region
                                                               :path ""
                                                               :credentials credentials
+                                                              :endpoint endpoint
                                                               :query-params query-params
                                                               :request-timeout list-timeout-ms}))
                               {:max-retries max-retries
@@ -403,7 +414,7 @@
   [identifier path]
   (storage/build-fluree-address identifier method-name path))
 
-(defrecord S3Store [identifier base-credentials bucket region prefix
+(defrecord S3Store [identifier base-credentials bucket region prefix endpoint
                    ;; timeouts (ms)
                     read-timeout-ms
                     write-timeout-ms
@@ -521,6 +532,7 @@
                                                               :region          region
                                                               :path            full-path
                                                               :credentials     credentials
+                                                              :endpoint        endpoint
                                                               :request-timeout write-timeout-ms}))
                               policy))]
         (:body response))))
@@ -668,13 +680,10 @@
        (throw (ex-info "AWS credentials not found"
                        {:error :s3/missing-credentials
                         :hint "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"})))
-     ;; Note: endpoint-override can be handled via with-redefs of build-s3-url in tests
-     (when endpoint-override
-       (log/warn "endpoint-override provided - can be handled via with-redefs of build-s3-url in tests"))
      ;; Log if this is an Express One Zone bucket
      (when (s3-express/express-one-bucket? bucket)
        (log/info "Opening S3 Express One Zone bucket - session credentials will be managed automatically"
                  {:bucket bucket :region region}))
-     (->S3Store identifier base-credentials bucket region normalized-prefix
+     (->S3Store identifier base-credentials bucket region normalized-prefix endpoint-override
                 read-timeout-ms* write-timeout-ms* list-timeout-ms*
                 max-retries* retry-base-delay-ms* retry-max-delay-ms*))))
