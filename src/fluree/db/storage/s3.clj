@@ -202,15 +202,29 @@
 
 (defn build-s3-url
   "Build the S3 REST API URL. If endpoint is provided, uses that instead of
-   the default AWS endpoint. This is useful for testing with LocalStack or
-   using custom S3-compatible endpoints."
+   the default AWS endpoint.
+
+   Supports two endpoint styles:
+   1. Virtual-hosted-style (full URL with bucket in hostname):
+      'https://bucket.s3.region.amazonaws.com' or
+      'https://bucket.s3express-azid.region.amazonaws.com'
+      -> appends path only: {endpoint}/{path}
+
+   2. Path-style (base URL, for LocalStack/S3-compatible services):
+      'http://localhost:4566'
+      -> includes bucket in path: {endpoint}/{bucket}/{path}"
   ([bucket region path]
    (build-s3-url bucket region path nil))
   ([bucket region path endpoint]
    (if endpoint
-     ;; Custom endpoint (e.g., LocalStack)
-     (str endpoint "/" bucket "/" path)
-     ;; Standard AWS S3 endpoint
+     ;; Check if bucket is already in the endpoint hostname (virtual-hosted-style)
+     ;; If the endpoint contains the bucket name, it's virtual-hosted
+     (if (str/includes? endpoint (str bucket "."))
+       ;; Virtual-hosted-style: bucket is in hostname, just append path
+       (str endpoint "/" path)
+       ;; Path-style: bucket not in hostname, include it in path
+       (str endpoint "/" bucket "/" path))
+     ;; No endpoint - use standard AWS S3 format
      (str "https://" bucket ".s3." region ".amazonaws.com/" path))))
 
 (declare with-retries parse-list-objects-response)
