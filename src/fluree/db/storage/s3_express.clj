@@ -23,17 +23,27 @@
 ;; This allows the db library to be used as a git dependency without
 ;; requiring consumers to include AWS SDK unless they actually use Express One Zone.
 
+(defn- load-class-dynamic
+  "Load a class by name, constructing the class name dynamically to avoid
+   GraalVM native image compile-time resolution. GraalVM detects Class/forName
+   calls with constant strings and tries to resolve them at build time."
+  [base-package class-suffix]
+  (Class/forName (str base-package class-suffix)))
+
 (defonce ^:private aws-sdk-classes
   (delay
     (try
       (log/debug "s3-express: Loading AWS SDK v2 classes dynamically")
-      {:AwsBasicCredentials      (Class/forName "software.amazon.awssdk.auth.credentials.AwsBasicCredentials")
-       :StaticCredentialsProvider (Class/forName "software.amazon.awssdk.auth.credentials.StaticCredentialsProvider")
-       :Region                    (Class/forName "software.amazon.awssdk.regions.Region")
-       :S3Client                  (Class/forName "software.amazon.awssdk.services.s3.S3Client")
-       :CreateSessionRequest      (Class/forName "software.amazon.awssdk.services.s3.model.CreateSessionRequest")
-       :CreateSessionResponse     (Class/forName "software.amazon.awssdk.services.s3.model.CreateSessionResponse")
-       :SessionCredentials        (Class/forName "software.amazon.awssdk.services.s3.model.SessionCredentials")}
+      (let [auth-pkg "software.amazon.awssdk.auth."
+            s3-pkg "software.amazon.awssdk.services."
+            region-pkg "software.amazon.awssdk."]
+        {:AwsBasicCredentials      (load-class-dynamic auth-pkg "credentials.AwsBasicCredentials")
+         :StaticCredentialsProvider (load-class-dynamic auth-pkg "credentials.StaticCredentialsProvider")
+         :Region                    (load-class-dynamic region-pkg "regions.Region")
+         :S3Client                  (load-class-dynamic s3-pkg "s3.S3Client")
+         :CreateSessionRequest      (load-class-dynamic s3-pkg "s3.model.CreateSessionRequest")
+         :CreateSessionResponse     (load-class-dynamic s3-pkg "s3.model.CreateSessionResponse")
+         :SessionCredentials        (load-class-dynamic s3-pkg "s3.model.SessionCredentials")})
       (catch ClassNotFoundException e
         (throw (ex-info (str "AWS SDK v2 is required for S3 Express One Zone but not found on classpath. "
                              "Add software.amazon.awssdk/s3 dependency to use Express One Zone buckets. "
