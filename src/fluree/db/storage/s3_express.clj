@@ -54,19 +54,26 @@
    Returns a map with :access-key, :secret-key, :session-token, and :expiration."
   [^S3Client client bucket]
   (try
-    (log/debug "s3-express: Creating session for bucket" {:bucket bucket})
+    (log/warn "CRED-DIAGNOSTIC: About to call AWS CreateSession API [v2025-12-06T04:00]"
+              {:bucket bucket
+               :code-version "2025-12-06T04:00:00Z"})
     (let [^CreateSessionRequest request (-> (CreateSessionRequest/builder)
-                                             (.bucket bucket)
-                                             (.build))
+                                            (.bucket bucket)
+                                            (.build))
           ^CreateSessionResponse response (.createSession client request)
           ^SessionCredentials credentials (.credentials response)
           access-key (.accessKeyId credentials)
           secret-key (.secretAccessKey credentials)
           session-token (.sessionToken credentials)
           expiration (.expiration credentials)]
-      (log/info "s3-express: Session created successfully"
+      (log/warn "CRED-DIAGNOSTIC: AWS CreateSession API returned credentials [v2025-12-06T04:00]"
                 {:bucket bucket
-                 :expiration (str expiration)})
+                 :access-key-full access-key
+                 :secret-key-prefix (subs secret-key 0 (min 4 (count secret-key)))
+                 :session-token-prefix (subs session-token 0 (min 20 (count session-token)))
+                 :session-token-length (count session-token)
+                 :expiration (str expiration)
+                 :code-version "2025-12-06T04:00:00Z"})
       {:access-key access-key
        :secret-key secret-key
        :session-token session-token
@@ -163,9 +170,17 @@
    A map with :access-key, :secret-key, and optionally :session-token"
   [bucket region base-credentials]
   (if (express-one-bucket? bucket)
-    (do
-      (log/trace "s3-express: Detected Express One Zone bucket, getting session" {:bucket bucket})
-      (get-session-credentials bucket region base-credentials))
+    (let [session-creds (get-session-credentials bucket region base-credentials)]
+      (log/warn "CRED-DIAGNOSTIC: get-credentials-for-bucket returning session creds [v2025-12-06T03:00]"
+                {:bucket bucket
+                 :region region
+                 :base-access-key-prefix (when (:access-key base-credentials)
+                                           (subs (:access-key base-credentials) 0 (min 4 (count (:access-key base-credentials)))))
+                 :session-access-key-prefix (when (:access-key session-creds)
+                                              (subs (:access-key session-creds) 0 (min 4 (count (:access-key session-creds)))))
+                 :has-session-token? (boolean (:session-token session-creds))
+                 :code-version "2025-12-06T03:00:00Z"})
+      session-creds)
     (do
       (log/trace "s3-express: Standard S3 bucket, using base credentials" {:bucket bucket})
       base-credentials)))

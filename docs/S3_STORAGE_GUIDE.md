@@ -100,6 +100,8 @@ Express One Zone buckets follow a specific naming pattern:
 
 ### Basic Express One Zone Configuration
 
+> **⚠️ IMPORTANT**: Do NOT set `s3Endpoint` for Express One Zone buckets. Fluree automatically constructs the correct virtual-hosted endpoint based on the bucket name suffix.
+
 ```json
 {
   "@context": {
@@ -122,6 +124,14 @@ Express One Zone buckets follow a specific naming pattern:
   ]
 }
 ```
+
+**Key Configuration Rules:**
+- ✅ **Express One Zone buckets**: Omit `s3Endpoint` field entirely (Fluree auto-detects from bucket name)
+- ✅ **Standard S3 in AWS**: `s3Endpoint` is **optional** - omit it to use AWS defaults
+- ✅ **LocalStack/Custom endpoints**: Include `s3Endpoint` (e.g., `"http://localhost:4566"`)
+- ❌ **DON'T** manually construct Express endpoints - Fluree handles this automatically
+
+**For AWS CloudFormation deployments**: You don't need to pass `s3Endpoint` via environment variables - just the bucket name is sufficient.
 
 ### Split Storage Configuration (Recommended)
 
@@ -162,6 +172,8 @@ For optimal performance and cost, use Express One Zone for frequently-accessed i
   ]
 }
 ```
+
+**Notice**: Both storage configurations omit `s3Endpoint` - Fluree automatically uses AWS defaults. Only add `s3Endpoint` if using LocalStack or custom S3-compatible storage.
 
 ### Clojure API with Express One Zone
 
@@ -481,6 +493,28 @@ definitions.
 - Example: `{:s3-bucket "my-bucket" :s3-endpoint "http://localhost:4566"}`
 - For AWS: use `"https://s3.us-east-1.amazonaws.com"` format
 - For LocalStack: use `"http://localhost:4566"` format
+
+#### 7. S3 Express One Zone SignatureDoesNotMatch Errors
+**Symptoms**: `SignatureDoesNotMatch` errors when using Express One Zone buckets
+**Root Cause**: Setting an explicit `s3Endpoint` for Express buckets interferes with automatic virtual-hosted URL construction
+**Solutions**:
+- **DO NOT** set `s3Endpoint` for Express One Zone buckets (or standard S3 in AWS)
+- Fluree automatically constructs the correct endpoint from the bucket name
+- Only set `s3Endpoint` for LocalStack or custom S3-compatible storage
+- Example **WRONG** configuration for Express:
+  ```json
+  {
+    "s3Bucket": "my-index--use1-az1--x-s3",
+    "s3Endpoint": "https://my-index--use1-az1--x-s3.s3express-use1-az1.us-east-1.amazonaws.com"
+  }
+  ```
+- Example **CORRECT** configuration for Express:
+  ```json
+  {
+    "s3Bucket": "my-index--use1-az1--x-s3"
+  }
+  ```
+- The bucket name suffix `--x-s3` triggers automatic Express One Zone handling
 
 ---
 

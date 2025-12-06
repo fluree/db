@@ -55,7 +55,17 @@
    For Express One Zone buckets, returns session credentials.
    For standard S3 buckets, returns base credentials."
   [bucket region base-credentials]
-  (s3-express/get-credentials-for-bucket bucket region base-credentials))
+  (let [credentials (s3-express/get-credentials-for-bucket bucket region base-credentials)
+        is-session? (boolean (:session-token credentials))]
+    (log/warn "CRED-DIAGNOSTIC: get-credentials returning [v2025-12-06T03:00]"
+              {:bucket bucket
+               :region region
+               :is-session? is-session?
+               :access-key-prefix (when (:access-key credentials)
+                                    (subs (:access-key credentials) 0 (min 4 (count (:access-key credentials)))))
+               :has-session-token? (boolean (:session-token credentials))
+               :code-version "2025-12-06T03:00:00Z"})
+    credentials))
 
 (defn hmac-sha256
   "Generate HMAC-SHA256 signature"
@@ -150,6 +160,12 @@
 (defn sign-request
   "Sign an S3 request using AWS Signature V4"
   [{:keys [method path headers payload region bucket credentials query-params endpoint]}]
+  (log/warn "CRED-DIAGNOSTIC: sign-request received credentials [v2025-12-06T03:00]"
+            {:bucket bucket
+             :access-key-prefix (when (:access-key credentials)
+                                  (subs (:access-key credentials) 0 (min 4 (count (:access-key credentials)))))
+             :has-session-token? (boolean (:session-token credentials))
+             :code-version "2025-12-06T03:00:00Z"})
   (let [{:keys [access-key secret-key session-token]} credentials
         now (Instant/now)
         amz-date (.format amz-date-formatter now)
@@ -161,12 +177,21 @@
                        (sha256-hex ""))
 
         ;; Determine URL style and adjust host/path for signature
-        ;; If endpoint contains bucket name, it's virtual-hosted style
-        ;; Otherwise, it's path-style and bucket must be in the canonical URI
-        virtual-hosted? (and endpoint (str/includes? endpoint (str bucket ".")))
+        ;; S3 Express One Zone ALWAYS uses virtual-hosted style
+        ;; Standard S3 with no endpoint uses virtual-hosted style
+        ;; Path-style is only for custom endpoints (LocalStack, etc.)
+        virtual-hosted? (or (s3-express/express-one-bucket? bucket)  ; S3 Express always virtual-hosted
+                            (nil? endpoint)                          ; No endpoint = AWS default (virtual-hosted)
+                            (str/includes? endpoint (str bucket ".")))
         host-header (if (or (nil? endpoint) virtual-hosted?)
                       ;; Virtual-hosted-style or no endpoint (use AWS default)
-                      (str bucket ".s3." region ".amazonaws.com")
+                      ;; S3 Express One Zone buckets use different host format
+                      (if (s3-express/express-one-bucket? bucket)
+                        ;; Extract AZ ID for S3 Express: bucket--use1-az4--x-s3 -> use1-az4
+                        (let [az-id (second (re-matches #".*--([a-z0-9]+-az\d+)--x-s3$" bucket))]
+                          (str bucket ".s3express-" az-id "." region ".amazonaws.com"))
+                        ;; Standard S3
+                        (str bucket ".s3." region ".amazonaws.com"))
                       ;; Path-style: extract host from endpoint
                       (-> endpoint
                           (str/replace #"^https?://" "")
@@ -176,11 +201,15 @@
                          (str bucket "/" path))  ; Path-style: include bucket
         ;; Remove restricted headers that Java 11 HTTP client sets automatically
         headers-cleaned (dissoc headers "host" "Host" "content-length" "Content-Length")
+        ;; S3 Express One Zone uses x-amz-s3session-token instead of x-amz-security-token
+        session-token-header (if (s3-express/express-one-bucket? bucket)
+                               "x-amz-s3session-token"
+                               "x-amz-security-token")
         headers* (merge headers-cleaned
                         {"x-amz-date" amz-date
                          "x-amz-content-sha256" payload-hash}
                         (when session-token
-                          {"x-amz-security-token" session-token}))
+                          {session-token-header session-token}))
         ;; Include host header for signing but don't send it (Java 11 HTTP client sets it automatically)
         headers-for-signing (assoc headers* "host" host-header)
 
@@ -191,16 +220,33 @@
                        (canonical-query-string query-params)
                        headers-for-signing
                        payload-hash)
+        _        (log/warn "CRED-DIAGNOSTIC: Canonical request created [v2025-12-06T08:00]"
+                           {:bucket bucket
+                            :canonical-req-hash (sha256-hex canonical-req)
+                            :canonical-req-first-200 (subs canonical-req 0 (min 200 (count canonical-req)))
+                            :headers-for-signing-keys (sort (keys headers-for-signing))
+                            :code-version "2025-12-06T08:00:00Z"})
 
+        ;; Determine service name for signature - S3 Express uses "s3express"
+        service-name (if (s3-express/express-one-bucket? bucket)
+                       "s3express"
+                       aws-service)
         ;; Create string to sign
-        credential-scope (str date-stamp "/" region "/" aws-service "/" aws4-request)
+        credential-scope (str date-stamp "/" region "/" service-name "/" aws4-request)
         string-to-sign (create-string-to-sign
                         amz-date
                         credential-scope
                         (sha256-hex canonical-req))
 
         ;; Calculate signature
-        signing-key (get-signature-key secret-key date-stamp region aws-service)
+        _        (log/warn "CRED-DIAGNOSTIC: About to calculate signature [v2025-12-06T07:00]"
+                           {:bucket bucket
+                            :service-name service-name
+                            :secret-key-prefix (subs secret-key 0 (min 4 (count secret-key)))
+                            :access-key access-key
+                            :has-session-token? (boolean session-token)
+                            :code-version "2025-12-06T07:00:00Z"})
+        signing-key (get-signature-key secret-key date-stamp region service-name)
         signature (-> (hmac-sha256 signing-key string-to-sign)
                       (alphabase/base-to-base :bytes :hex))
 
@@ -236,8 +282,15 @@
                  (str endpoint "/" path)
                  ;; Path-style: bucket not in hostname, include it in path
                  (str endpoint "/" bucket "/" path))
-               ;; No endpoint - use standard AWS S3 format
-               (str "https://" bucket ".s3." region ".amazonaws.com/" path))]
+               ;; No endpoint - build URL based on bucket type
+               ;; S3 Express One Zone buckets use format: bucket--azid--x-s3
+               ;; and require endpoint: bucket.s3express-azid.region.amazonaws.com
+               (if (s3-express/express-one-bucket? bucket)
+                 ;; Extract AZ ID from bucket name: bucket--use1-az4--x-s3 -> use1-az4
+                 (let [az-id (second (re-matches #".*--([a-z0-9]+-az\d+)--x-s3$" bucket))]
+                   (str "https://" bucket ".s3express-" az-id "." region ".amazonaws.com/" path))
+                 ;; Standard S3 bucket
+                 (str "https://" bucket ".s3." region ".amazonaws.com/" path)))]
      ;; DIAGNOSTIC: Log every URL build with WARN level
      (log/warn "S3-DIAGNOSTIC: Built URL [v2025-12-06T02:00]"
                {:bucket bucket
@@ -284,10 +337,19 @@
                                       :endpoint     endpoint})
 
           ;; Use xhttp for the actual request
-          _        (log/trace "s3-request start" {:method  method
-                                                  :bucket  bucket
-                                                  :path    encoded-path
-                                                  :timeout request-timeout})
+          _        (log/warn "CRED-DIAGNOSTIC: About to send S3 request [v2025-12-06T06:00]"
+                             {:method method
+                              :bucket bucket
+                              :path (subs encoded-path 0 (min 50 (count encoded-path)))
+                              :has-x-amz-security-token? (boolean (get signed-headers "x-amz-security-token"))
+                              :has-x-amz-s3session-token? (boolean (get signed-headers "x-amz-s3session-token"))
+                              :session-token-length (or (when-let [st (get signed-headers "x-amz-s3session-token")]
+                                                          (count st))
+                                                        (when-let [st (get signed-headers "x-amz-security-token")]
+                                                          (count st)))
+                              :authorization-prefix (when (get signed-headers "authorization")
+                                                      (subs (get signed-headers "authorization") 0 (min 50 (count (get signed-headers "authorization")))))
+                              :code-version "2025-12-06T06:00:00Z"})
           response (<? (case method
                          "GET"    (xhttp/get-response url {:headers         signed-headers
                                                            :request-timeout request-timeout})
