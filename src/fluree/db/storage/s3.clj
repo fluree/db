@@ -227,11 +227,12 @@
                ;; No endpoint - use standard AWS S3 format
                (str "https://" bucket ".s3." region ".amazonaws.com/" path))]
      ;; DIAGNOSTIC: Log every URL build with WARN level
-     (log/warn "S3-DIAGNOSTIC: Built URL"
+     (log/warn "S3-DIAGNOSTIC: Built URL [v2025-12-06T02:00]"
                {:bucket bucket
                 :region region
                 :endpoint endpoint
-                :url url})
+                :url url
+                :code-version "2025-12-06T02:00:00Z"})
      url)))
 
 (declare with-retries parse-list-objects-response)
@@ -243,12 +244,13 @@
            headers {}}}]
   (go-try
     ;; DIAGNOSTIC: Log first S3 request to verify endpoint parameter
-    (log/warn "S3-DIAGNOSTIC: s3-request called"
+    (log/warn "S3-DIAGNOSTIC: s3-request called [v2025-12-06T02:00]"
               {:method method
                :bucket bucket
                :region region
                :path path
-               :endpoint endpoint})
+               :endpoint endpoint
+               :code-version "2025-12-06T02:00:00Z"})
     (let [start                     (System/nanoTime)
           ;; Encode path segments for both URL and signature to match S3's encoding
           encoded-path              (encode-s3-path path)
@@ -659,7 +661,8 @@
             (let [data (merge {:event "s3.error"
                                :attempt attempt
                                :duration-ms duration-ms
-                               :error (ex-message res)}
+                               :error (ex-message res)
+                               :code-version "2025-12-06T02:00:00Z-endpoint-fix"}
                               (ex-data res)
                               log-context)]
               (log/error "S3 request failed permanently" data)
@@ -709,12 +712,13 @@
                        {:error :s3/missing-credentials
                         :hint "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"})))
      ;; DIAGNOSTIC: This MUST log when S3 store is created
-     (log/warn "S3-DIAGNOSTIC: Opening S3 store"
+     (log/warn "S3-DIAGNOSTIC: Opening S3 store [v2025-12-06T02:00]"
                {:bucket bucket
                 :region region
                 :prefix normalized-prefix
                 :endpoint endpoint-override
-                :identifier identifier})
+                :identifier identifier
+                :code-version "2025-12-06T02:00:00Z"})
      ;; Log if this is an Express One Zone bucket
      (when (s3-express/express-one-bucket? bucket)
        (log/info "Opening S3 Express One Zone bucket - session credentials will be managed automatically"
