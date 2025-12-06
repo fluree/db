@@ -8,19 +8,59 @@
    - Providing session credentials to the HTTP-based S3 implementation
 
    The hybrid approach uses the AWS SDK only for session management while
-   continuing to use direct HTTP requests for actual data operations."
+   continuing to use direct HTTP requests for actual data operations.
+
+   NOTE: This namespace uses dynamic class loading for AWS SDK v2 classes.
+   The classes are loaded on-demand when Express One Zone buckets are accessed.
+   If AWS SDK v2 is not on the classpath, standard S3 buckets will work normally,
+   but Express One Zone buckets will fail with a clear error message."
   (:require [clojure.core.cache.wrapped :as cache]
             [fluree.db.util.log :as log])
-  (:import (java.time Duration Instant)
-           (software.amazon.awssdk.auth.credentials AwsBasicCredentials
-                                                    StaticCredentialsProvider)
-           (software.amazon.awssdk.regions Region)
-           (software.amazon.awssdk.services.s3 S3Client)
-           (software.amazon.awssdk.services.s3.model CreateSessionRequest
-                                                     CreateSessionResponse
-                                                     SessionCredentials)))
+  (:import (java.time Duration Instant)))
 
-(set! *warn-on-reflection* true)
+;; AWS SDK v2 classes are loaded dynamically to avoid ClassNotFoundException
+;; when this namespace is loaded but AWS SDK isn't on the classpath.
+;; This allows the db library to be used as a git dependency without
+;; requiring consumers to include AWS SDK unless they actually use Express One Zone.
+
+(defonce ^:private aws-sdk-classes
+  (delay
+    (try
+      (log/debug "s3-express: Loading AWS SDK v2 classes dynamically")
+      {:AwsBasicCredentials      (Class/forName "software.amazon.awssdk.auth.credentials.AwsBasicCredentials")
+       :StaticCredentialsProvider (Class/forName "software.amazon.awssdk.auth.credentials.StaticCredentialsProvider")
+       :Region                    (Class/forName "software.amazon.awssdk.regions.Region")
+       :S3Client                  (Class/forName "software.amazon.awssdk.services.s3.S3Client")
+       :CreateSessionRequest      (Class/forName "software.amazon.awssdk.services.s3.model.CreateSessionRequest")
+       :CreateSessionResponse     (Class/forName "software.amazon.awssdk.services.s3.model.CreateSessionResponse")
+       :SessionCredentials        (Class/forName "software.amazon.awssdk.services.s3.model.SessionCredentials")}
+      (catch ClassNotFoundException e
+        (throw (ex-info (str "AWS SDK v2 is required for S3 Express One Zone but not found on classpath. "
+                             "Add software.amazon.awssdk/s3 dependency to use Express One Zone buckets. "
+                             "Missing class: " (.getMessage e))
+                        {:error :s3-express/aws-sdk-not-found
+                         :missing-class (.getMessage e)
+                         :required-dependency "software.amazon.awssdk/s3"
+                         :min-version "2.20.0"}
+                        e))))))
+
+(defn- get-aws-classes
+  "Returns the AWS SDK classes, loading them if needed.
+   Throws if AWS SDK v2 is not on the classpath."
+  []
+  @aws-sdk-classes)
+
+(defn- invoke-static
+  "Helper to invoke static methods on dynamically loaded classes."
+  [^Class class method-name & args]
+  (let [method (.getMethod class method-name (into-array Class (map class args)))]
+    (.invoke method nil (into-array Object args))))
+
+(defn- invoke-instance
+  "Helper to invoke instance methods on objects."
+  [obj method-name & args]
+  (let [method (.getMethod (class obj) method-name (into-array Class (map class args)))]
+    (.invoke method obj (into-array Object args))))
 
 (defn express-one-bucket?
   "Returns true if the bucket name follows S3 Express One Zone naming convention.
@@ -32,31 +72,47 @@
         (re-matches #".*--[a-z0-9]+-az\d+--x-s3$" bucket))))
 
 (defn- build-s3-client
-  "Builds an AWS SDK S3 client with the provided credentials and region."
+  "Builds an AWS SDK S3 client with the provided credentials and region.
+   Uses reflection to avoid compile-time dependency on AWS SDK classes."
   [access-key secret-key region]
-  (let [credentials (AwsBasicCredentials/create access-key secret-key)
-        credentials-provider (StaticCredentialsProvider/create credentials)
-        region-obj (Region/of region)]
-    (-> (S3Client/builder)
-        (.region region-obj)
-        (.credentialsProvider credentials-provider)
-        (.build))))
+  (let [classes (get-aws-classes)
+        ;; AwsBasicCredentials.create(accessKey, secretKey)
+        credentials (invoke-static (:AwsBasicCredentials classes) "create" access-key secret-key)
+        ;; StaticCredentialsProvider.create(credentials)
+        credentials-provider (invoke-static (:StaticCredentialsProvider classes) "create" credentials)
+        ;; Region.of(region)
+        region-obj (invoke-static (:Region classes) "of" region)
+        ;; S3Client.builder()
+        builder (invoke-static (:S3Client classes) "builder")]
+    ;; builder.region(regionObj).credentialsProvider(credentialsProvider).build()
+    (-> builder
+        (invoke-instance "region" region-obj)
+        (invoke-instance "credentialsProvider" credentials-provider)
+        (invoke-instance "build"))))
 
 (defn- create-session-credentials
   "Calls the S3 CreateSession API to obtain session credentials for an Express One bucket.
-   Returns a map with :access-key, :secret-key, :session-token, and :expiration."
-  [^S3Client client bucket]
+   Returns a map with :access-key, :secret-key, :session-token, and :expiration.
+   Uses reflection to avoid compile-time dependency on AWS SDK classes."
+  [client bucket]
   (try
     (log/debug "s3-express: Creating session for bucket" {:bucket bucket})
-    (let [^CreateSessionRequest request (-> (CreateSessionRequest/builder)
-                                            (.bucket ^String bucket)
-                                            (.build))
-          ^CreateSessionResponse response (.createSession client request)
-          ^SessionCredentials credentials (.credentials response)
-          access-key (.accessKeyId credentials)
-          secret-key (.secretAccessKey credentials)
-          session-token (.sessionToken credentials)
-          expiration (.expiration credentials)]
+    (let [classes (get-aws-classes)
+          ;; CreateSessionRequest.builder()
+          request-builder (invoke-static (:CreateSessionRequest classes) "builder")
+          ;; builder.bucket(bucket).build()
+          request (-> request-builder
+                      (invoke-instance "bucket" bucket)
+                      (invoke-instance "build"))
+          ;; client.createSession(request)
+          response (invoke-instance client "createSession" request)
+          ;; response.credentials()
+          credentials (invoke-instance response "credentials")
+          ;; Extract credential values
+          access-key (invoke-instance credentials "accessKeyId")
+          secret-key (invoke-instance credentials "secretAccessKey")
+          session-token (invoke-instance credentials "sessionToken")
+          expiration (invoke-instance credentials "expiration")]
       (log/info "s3-express: Session created successfully"
                 {:bucket bucket
                  :expiration (str expiration)})
@@ -78,8 +134,8 @@
   [expiration-instant buffer-seconds]
   (let [now (Instant/now)
         buffer (Duration/ofSeconds buffer-seconds)
-        expiration-with-buffer (.minus ^Instant expiration-instant buffer)]
-    (.isAfter now expiration-with-buffer)))
+        expiration-with-buffer (.minus ^Instant expiration-instant ^Duration buffer)]
+    (.isAfter ^Instant now ^Instant expiration-with-buffer)))
 
 (defn- cache-key
   "Generates a cache key for session credentials based on bucket and base credentials."
@@ -126,11 +182,11 @@
           (select-keys cached [:access-key :secret-key :session-token])))
 
       ;; No valid cache, create new session
-      (let [^S3Client client (build-s3-client access-key secret-key region)
+      (let [client (build-s3-client access-key secret-key region)
             session (try
                       (create-session-credentials client bucket)
                       (finally
-                        (.close client)))]
+                        (.close ^java.lang.AutoCloseable client)))]
         ;; Cache the session credentials
         (cache/miss session-cache key session)
         (select-keys session [:access-key :secret-key :session-token])))))
