@@ -22,7 +22,7 @@
      (if-some [prop (System/getProperty "org.graalvm.nativeimage.imagecode")]
        (let [runtime? (= "runtime" (.toLowerCase prop))]
          (when runtime?
-           (log/info "Detected GraalVM native-image runtime via system property"))
+           (log/info "AAAAA Detected GraalVM native-image runtime via system property"))
          runtime?)
        (try
            ;; Fallback: try to use GraalVM's ImageInfo constants
@@ -34,7 +34,7 @@
                prop2        (System/getProperty (str key))
                runtime?   (= (str val-runtime) prop2)]
            (when runtime?
-             (log/info "Detected GraalVM native-image runtime via ImageInfo constants"))
+             (log/info "BBBBB Detected GraalVM native-image runtime via ImageInfo constants"))
            runtime?)
          (catch ClassNotFoundException _
              ;; ImageInfo class not available - running on regular JVM
