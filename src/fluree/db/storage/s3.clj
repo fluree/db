@@ -149,7 +149,7 @@
 
 (defn sign-request
   "Sign an S3 request using AWS Signature V4"
-  [{:keys [method path headers payload region bucket credentials query-params]}]
+  [{:keys [method path headers payload region bucket credentials query-params endpoint]}]
   (let [{:keys [access-key secret-key session-token]} credentials
         now (Instant/now)
         amz-date (.format amz-date-formatter now)
@@ -160,8 +160,20 @@
                          (sha256-hex payload))
                        (sha256-hex ""))
 
-        ;; Add required headers
-        host-header (str bucket ".s3." region ".amazonaws.com")
+        ;; Determine URL style and adjust host/path for signature
+        ;; If endpoint contains bucket name, it's virtual-hosted style
+        ;; Otherwise, it's path-style and bucket must be in the canonical URI
+        virtual-hosted? (and endpoint (str/includes? endpoint (str bucket ".")))
+        host-header (if (or (nil? endpoint) virtual-hosted?)
+                      ;; Virtual-hosted-style or no endpoint (use AWS default)
+                      (str bucket ".s3." region ".amazonaws.com")
+                      ;; Path-style: extract host from endpoint
+                      (-> endpoint
+                          (str/replace #"^https?://" "")
+                          (str/replace #"/.*$" "")))
+        canonical-path (if virtual-hosted?
+                         path  ; Virtual-hosted: path as-is
+                         (str bucket "/" path))  ; Path-style: include bucket
         ;; Remove restricted headers that Java 11 HTTP client sets automatically
         headers-cleaned (dissoc headers "host" "Host" "content-length" "Content-Length")
         headers* (merge headers-cleaned
@@ -175,7 +187,7 @@
         ;; Create canonical request
         canonical-req (create-canonical-request
                        method
-                       (canonical-uri path)
+                       (canonical-uri canonical-path)
                        (canonical-query-string query-params)
                        headers-for-signing
                        payload-hash)
@@ -268,7 +280,8 @@
                                       :region       region
                                       :bucket       bucket
                                       :credentials  credentials
-                                      :query-params query-params})
+                                      :query-params query-params
+                                      :endpoint     endpoint})
 
           ;; Use xhttp for the actual request
           _        (log/trace "s3-request start" {:method  method

@@ -22,7 +22,7 @@
      (if-some [prop (System/getProperty "org.graalvm.nativeimage.imagecode")]
        (let [runtime? (= "runtime" (.toLowerCase prop))]
          (when runtime?
-           (log/info "DDDDD Detected GraalVM native-image runtime via system property"))
+           (log/info "EEEEEE Detected GraalVM native-image runtime via system property"))
          runtime?)
        (try
            ;; Fallback: try to use GraalVM's ImageInfo constants
