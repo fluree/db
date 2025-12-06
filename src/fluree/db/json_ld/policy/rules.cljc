@@ -237,13 +237,18 @@
 
 (defn wrap-policy
   ([db policy-rules policy-values]
-   (wrap-policy db nil policy-rules policy-values))
+   (wrap-policy db nil policy-rules policy-values nil))
   ([db tracker policy-rules policy-values]
+   (wrap-policy db tracker policy-rules policy-values nil))
+  ([db tracker policy-rules policy-values default-allow?]
    (async/go
-     (let [error-ch       (async/chan)
-           policy-values* (ensure-ground-identity policy-values)
-           [wrapper _]    (async/alts! [error-ch (parse-policies db tracker error-ch policy-values*
-                                                                 (util/sequential policy-rules))])]
+     (let [error-ch        (async/chan)
+           policy-values*  (ensure-ground-identity policy-values)
+           [wrapper _]     (async/alts! [error-ch (parse-policies db tracker error-ch policy-values*
+                                                                  (util/sequential policy-rules))])]
        (if (util/exception? wrapper)
          wrapper
-         (assoc db :policy (assoc wrapper :cache (atom {}), :policy-values policy-values*)))))))
+         (assoc db :policy (assoc wrapper
+                                  :cache (atom {})
+                                  :policy-values policy-values*
+                                  :default-allow? default-allow?)))))))

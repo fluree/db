@@ -487,10 +487,8 @@
     (history/query-commits db tracker context from-t to-t include error-ch))
 
   policy/Restrictable
-  (wrap-policy [db policy policy-values]
-    (policy-rules/wrap-policy db policy policy-values))
-  (wrap-policy [db tracker policy policy-values]
-    (policy-rules/wrap-policy db tracker policy policy-values))
+  (wrap-policy [db tracker policy policy-values default-allow?]
+    (policy-rules/wrap-policy db tracker policy policy-values default-allow?))
   (root [db]
     (policy/root-db db))
 

@@ -11,9 +11,7 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defprotocol Restrictable
-  (wrap-policy
-    [db policy-rules policy-values]
-    [db tracker policy-rules policy-values])
+  (wrap-policy [db tracker policy-rules policy-values default-allow?])
   (root [db]))
 
 (def root-policy-map
@@ -59,27 +57,29 @@
 (defn wrap-class-policy
   "Given one or more policy classes, queries for policies
   containing those classes and calls `wrap-policy`"
-  [db tracker classes policy-values]
-  (go
-    (let [c-values  (->> classes ;; for passing in classes as query `values`
-                         util/sequential
-                         (mapv (fn [c] {const/iri-value c
-                                        const/iri-type  const/iri-id})))
-          policies  (<! (dbproto/-query db tracker {"select" {"?policy" ["*"]}
-                                                    "where"  [{const/iri-id   "?policy"
-                                                               const/iri-type "?classes"}]
-                                                    "values" ["?classes" c-values]}))
-          policies* (if (util/exception? policies)
-                      policies
-                      (policy-from-query policies))]
-      (log/trace "wrap-class-policy - extracted policy from classes: " classes
-                 " policy: " policies*)
-      (if (util/exception? policies*)
-        (ex-info (str "Unable to extract policies for classes: " classes
-                      " with error: " (ex-message policies*))
-                 {:status 400 :error :db/policy-exception}
-                 policies*)
-        (<! (wrap-policy db tracker (json-ld/expand policies*) policy-values))))))
+  ([db tracker classes policy-values]
+   (wrap-class-policy db tracker classes policy-values nil))
+  ([db tracker classes policy-values default-allow?]
+   (go
+     (let [c-values  (->> classes ;; for passing in classes as query `values`
+                          util/sequential
+                          (mapv (fn [c] {const/iri-value c
+                                         const/iri-type  const/iri-id})))
+           policies  (<! (dbproto/-query db tracker {"select" {"?policy" ["*"]}
+                                                     "where"  [{const/iri-id   "?policy"
+                                                                const/iri-type "?classes"}]
+                                                     "values" ["?classes" c-values]}))
+           policies* (if (util/exception? policies)
+                       policies
+                       (policy-from-query policies))]
+       (log/trace "wrap-class-policy - extracted policy from classes: " classes
+                  " policy: " policies*)
+       (if (util/exception? policies*)
+         (ex-info (str "Unable to extract policies for classes: " classes
+                       " with error: " (ex-message policies*))
+                  {:status 400 :error :db/policy-exception}
+                  policies*)
+         (<! (wrap-policy db tracker (json-ld/expand policies*) policy-values default-allow?)))))))
 
 (defn inject-value-binding
   "Inject the given var and value into a normalized values clause."
@@ -100,26 +100,28 @@
   "Given an identity (@id) that exists in the db which contains a
   property `f:policyClass` listing policy classes associated with
   that identity, queries for those classes and calls `wrap-policy`"
-  [db tracker identity policy-values]
-  (go
-    (let [policies  (<! (dbproto/-query db tracker {"select" {"?policy" ["*"]}
-                                                    "where"  [{const/iri-id          identity
-                                                               const/iri-policyClass "?classes"}
-                                                              {const/iri-id   "?policy"
-                                                               const/iri-type "?classes"}]}))
-          policies* (if (util/exception? policies)
-                      policies
-                      (policy-from-query policies))
+  ([db tracker identity policy-values]
+   (wrap-identity-policy db tracker identity policy-values nil))
+  ([db tracker identity policy-values default-allow?]
+   (go
+     (let [policies  (<! (dbproto/-query db tracker {"select" {"?policy" ["*"]}
+                                                     "where"  [{const/iri-id          identity
+                                                                const/iri-policyClass "?classes"}
+                                                               {const/iri-id   "?policy"
+                                                                const/iri-type "?classes"}]}))
+           policies* (if (util/exception? policies)
+                       policies
+                       (policy-from-query policies))
 
-          policy-values* (inject-value-binding policy-values "?$identity" {const/iri-value identity
-                                                                           const/iri-type  const/iri-id})]
-      (log/trace "wrap-identity-policy - extracted policy from identity: " identity " policy: " policies*)
-      (if (util/exception? policies*)
-        (ex-info (str "Unable to extract policies for identity: " identity
-                      " with error: " (ex-message policies*))
-                 {:status 400 :error :db/policy-exception}
-                 policies*)
-        (<! (wrap-policy db tracker (json-ld/expand policies*) policy-values*))))))
+           policy-values* (inject-value-binding policy-values "?$identity" {const/iri-value identity
+                                                                            const/iri-type  const/iri-id})]
+       (log/trace "wrap-identity-policy - extracted policy from identity: " identity " policy: " policies*)
+       (if (util/exception? policies*)
+         (ex-info (str "Unable to extract policies for identity: " identity
+                       " with error: " (ex-message policies*))
+                  {:status 400 :error :db/policy-exception}
+                  policies*)
+         (<! (wrap-policy db tracker (json-ld/expand policies*) policy-values* default-allow?)))))))
 
 (defn policy-enforced-opts?
   "Tests 'options' for a query or transaction to see if the options request
@@ -130,22 +132,23 @@
       (:policy opts)))
 
 (defn policy-enforce-db
-  "Policy enforces a db based on the query/transaction options"
+  "Policy enforces a db based on the query/transaction options.
+  Supports :default-allow option - if true, allows access when no policies apply."
   ([db parsed-context opts]
    (policy-enforce-db db nil parsed-context opts))
   ([db tracker parsed-context opts]
    (go-try
-     (let [{:keys [identity policy-class policy policy-values]} opts
+     (let [{:keys [identity policy-class policy policy-values default-allow]} opts
            policy-values* (util.parse/normalize-values policy-values)]
        (cond
 
          identity
-         (<? (wrap-identity-policy db tracker identity policy-values*))
+         (<? (wrap-identity-policy db tracker identity policy-values* default-allow))
 
          policy-class
          (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policy-class))]
-           (<? (wrap-class-policy db tracker classes policy-values*)))
+           (<? (wrap-class-policy db tracker classes policy-values* default-allow)))
 
          policy
          (let [expanded-policy (json-ld/expand policy parsed-context)]
-           (<? (wrap-policy db tracker expanded-policy policy-values*))))))))
+           (<? (wrap-policy db tracker expanded-policy policy-values* default-allow))))))))

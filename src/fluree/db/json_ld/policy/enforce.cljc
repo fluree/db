@@ -91,23 +91,27 @@
 
 (defn- policies-allow?
   "Once narrowed to a specific set of policies, execute and return
-  appropriate policy response."
+  appropriate policy response. If no policies apply, returns the value
+  of :default-allow? from the db's policy (defaults to false)."
   [db tracker sid policies]
   (go-try
-    (loop [[{:keys [id query] :as policy} & r] policies]
-      ;; return first truthy response, else false
-      (if policy
-        (let [query*  (when query (policy-query db sid query))
-              result  (if query*
-                        (seq (<? (dbproto/-query (root db) tracker query*)))
-                        deny-query-result)]
-          (track/policy-exec! tracker id)
-          (if result
-            (do (track/policy-allow! tracker id)
-                true)
-            (recur r)))
-        ;; no more policies left to evaluate - all returned false
-        false))))
+    (if (empty? policies)
+      ;; no policies apply - use default-allow? setting
+      (get-in db [:policy :default-allow?] false)
+      (loop [[{:keys [id query] :as policy} & r] policies]
+        ;; return first truthy response, else false
+        (if policy
+          (let [query*  (when query (policy-query db sid query))
+                result  (if query*
+                          (seq (<? (dbproto/-query (root db) tracker query*)))
+                          deny-query-result)]
+            (track/policy-exec! tracker id)
+            (if result
+              (do (track/policy-allow! tracker id)
+                  true)
+              (recur r)))
+          ;; policies exist but all returned false - deny
+          false)))))
 
 (defn policies-allow-viewing?
   [db tracker sid policies]

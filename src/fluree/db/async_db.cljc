@@ -196,14 +196,10 @@
       commit-ch))
 
   policy/Restrictable
-  (wrap-policy [_ policy policy-values]
+  (wrap-policy [_ tracker policy policy-values default-allow?]
     (go-try
       (let [db (<? db-chan)]
-        (<? (policy/wrap-policy db policy policy-values)))))
-  (wrap-policy [_ tracker policy policy-values]
-    (go-try
-      (let [db (<? db-chan)]
-        (<? (policy/wrap-policy db tracker policy policy-values)))))
+        (<? (policy/wrap-policy db tracker policy policy-values default-allow?)))))
   (root [_]
     (let [root-ch (async/promise-chan)
           root-db (->AsyncDB alias commit t root-ch)]
