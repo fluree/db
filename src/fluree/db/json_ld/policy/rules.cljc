@@ -121,8 +121,14 @@
             on-class    (when-let [classes (util/get-all-ids policy-doc const/iri-onClass)]
                           (set classes))
 
+            allow?    (util/get-first-value policy-doc const/iri-allow)
+
             src-query (util/get-first-value policy-doc const/iri-query)
             query     (cond
+                        ;; f:allow takes precedence - no query needed
+                        (some? allow?)
+                        nil
+
                         (map? src-query)
                         (assoc src-query "select" "?$this" "limit" 1)
 
@@ -142,7 +148,8 @@
             subject-targets  (when subject-targets-ch (<? subject-targets-ch))
             property-targets (when property-targets-ch (<? property-targets-ch))]
 
-        (when (and (nil? query)
+        (when (and (nil? allow?)
+                   (nil? query)
                    (nil? target-subject)
                    (nil? target-property)
                    (nil? on-property)
@@ -165,6 +172,7 @@
                    :ex-message  (util/get-first-value policy-doc const/iri-exMessage)
                    :view?       view?
                    :modify?     modify?
+                   :allow?      allow?
                    :query       query}
             target-subject               (assoc :target-subject target-subject)
             target-property              (assoc :target-property target-property)

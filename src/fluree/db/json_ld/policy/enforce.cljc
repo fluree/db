@@ -98,13 +98,25 @@
     (if (empty? policies)
       ;; no policies apply - use default-allow? setting
       (get-in db [:policy :default-allow?] false)
-      (loop [[{:keys [id query] :as policy} & r] policies]
+      (loop [[{:keys [id query allow?] :as policy} & r] policies]
         ;; return first truthy response, else false
         (if policy
-          (let [query*  (when query (policy-query db sid query))
-                result  (if query*
-                          (seq (<? (dbproto/-query (root db) tracker query*)))
-                          deny-query-result)]
+          (let [result (cond
+                         ;; f:allow true - unconditional allow, no query needed
+                         (true? allow?)
+                         true
+
+                         ;; f:allow false - unconditional deny, no query needed
+                         (false? allow?)
+                         false
+
+                         ;; query exists - execute it
+                         query
+                         (seq (<? (dbproto/-query (root db) tracker (policy-query db sid query))))
+
+                         ;; no allow? and no query - deny
+                         :else
+                         deny-query-result)]
             (track/policy-exec! tracker id)
             (if result
               (do (track/policy-allow! tracker id)

@@ -492,6 +492,93 @@ graph database flexibility with cryptographic verifiability.
                                   {:f "https://ns.flur.ee/ledger#"})})
 ```
 
+### Simple Allow/Deny with f:allow
+
+For policies that don't require conditional logic, use `f:allow` instead of `f:query`
+for better performance. This avoids query execution entirely.
+
+```clojure
+;; Unconditional allow - no query execution needed
+(def allow-all-policy
+  {"@context" {"ex" "http://example.org/"
+               "f"  "https://ns.flur.ee/ledger#"}
+   "@id"      "ex:allowAllView"
+   "@type"    "f:AccessPolicy"
+   "f:action" {"@id" "f:view"}
+   "f:allow"  true})
+
+;; Unconditional deny for a specific property (must use f:required to prevent
+;; other policies from allowing access)
+(def deny-ssn-policy
+  {"@context" {"ex"     "http://example.org/"
+               "schema" "http://schema.org/"
+               "f"      "https://ns.flur.ee/ledger#"}
+   "@id"          "ex:denySsn"
+   "@type"        "f:AccessPolicy"
+   "f:onProperty" {"@id" "schema:ssn"}
+   "f:action"     {"@id" "f:view"}
+   "f:required"   true   ;; ensures only this policy is evaluated for ssn
+   "f:allow"      false})
+```
+
+**Key points:**
+- `f:allow true` - unconditional allow without query execution
+- `f:allow false` - unconditional deny (combine with `f:required true` for property restrictions)
+- If both `f:allow` and `f:query` are present, `f:allow` takes precedence
+
+### Default Allow Mode
+
+By default, Fluree's policy system is **default-deny**: any data without a matching
+policy that returns true is hidden. You can switch to **default-allow** mode where
+data is visible unless explicitly denied by a policy.
+
+This is useful for composable policies where:
+- Organization-wide deny policies restrict sensitive data (e.g., PII, SSN)
+- Local datasets use default-allow so everything else is visible
+- Deny policies layer on top and cannot be bypassed
+
+```clojure
+;; Policy that denies access to Secret data unless classification is "public"
+(def secret-restriction
+  {"@context" {"ex" "http://example.org/"
+               "f"  "https://ns.flur.ee/ledger#"}
+   "@id"      "ex:secretRestriction"
+   "@type"    "f:AccessPolicy"
+   "f:targetSubject" {"@type"  "@json"
+                      "@value" {"where" [{"@id" "?$target" "@type" {"@id" "ex:Secret"}}]}}
+   "f:action" {"@id" "f:view"}
+   ;; Only allows if classification is "public" (returns false for "top-secret")
+   "f:query"  {"@type"  "@json"
+               "@value" {"where" [{"@id" "?$this" "ex:classification" "public"}]}}})
+
+;; Without default-allow: data with no policy is denied (default-deny)
+(def policy-db @(fluree/wrap-policy db secret-restriction))
+@(fluree/query policy-db {:select ["?s"] :where [{"@id" "?s" "@type" "ex:Public"}]})
+;; => [] (denied - no policy targets ex:Public)
+
+;; With default-allow: data with no policy is allowed
+(def default-allow-db @(fluree/wrap-policy db secret-restriction nil true))
+@(fluree/query default-allow-db {:select ["?s"] :where [{"@id" "?s" "@type" "ex:Public"}]})
+;; => ["ex:public-data"] (allowed - default-allow kicks in)
+
+;; Secret data with failing policy is still denied
+@(fluree/query default-allow-db {:select ["?s"] :where [{"@id" "?s" "@type" "ex:Secret"}]})
+;; => [] (denied - policy exists and returns false)
+```
+
+The `default-allow?` parameter is the 4th argument to all wrap functions:
+- `(fluree/wrap-policy db policy policy-values default-allow?)`
+- `(fluree/wrap-class-policy db classes policy-values default-allow?)`
+- `(fluree/wrap-identity-policy db identity policy-values default-allow?)`
+
+When using query/transact options, use `:default-allow true`:
+```clojure
+@(fluree/query db {:select ["*"]
+                   :where [{"@id" "?s"}]
+                   :opts {:policy some-policy
+                          :default-allow true}})
+```
+
 ## Advanced Features
 
 ### Multi-Format Support

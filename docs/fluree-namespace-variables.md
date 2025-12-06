@@ -91,6 +91,7 @@ The primary Fluree namespaces are defined in `/src/fluree/db/json_ld/iri.cljc`:
 ### Policy Logic
 | Variable | Description | Defined in constants.cljc |
 |----------|-------------|---------------------------|
+| `f:allow` | Unconditional allow/deny (boolean) | ✅ `iri-allow` |
 | `f:query` | Policy query/condition | ✅ `iri-query` |
 | `f:where` | Where clause in policy | ✅ `iri-where` |
 | `f:values` | Values specification | ✅ `iri-values` |
