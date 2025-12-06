@@ -192,7 +192,8 @@
            max-retries (config/get-first-integer config conn-vocab/s3-max-retries)
            retry-base-delay-ms (config/get-first-long config conn-vocab/s3-retry-base-delay-ms)
            retry-max-delay-ms (config/get-first-long config conn-vocab/s3-retry-max-delay-ms)]
-       (log/info "Initializing S3 storage from configuration"
+       ;; DIAGNOSTIC: This fires when loading from solo3 config
+       (log/warn "S3-DIAGNOSTIC: Initializing S3 storage from configuration"
                  {:identifier identifier
                   :bucket s3-bucket
                   :prefix s3-prefix
