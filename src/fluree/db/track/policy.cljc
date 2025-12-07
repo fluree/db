@@ -5,14 +5,16 @@
   (reset! tracker (reduce (fn [state policy-id]
                             (assoc state policy-id {:executed 0 :allowed 0}))
                           {}
-                          ;; Note: :class and :property values are maps from cid/pid to vectors of policies
+                          ;; Note: :class, :property, and :subject values are maps from cid/pid/sid to vectors of policies
                           ;; so we need (mapcat identity (vals ...)) to flatten one level
                           (concat (->> policy-db :policy :view :class vals (mapcat identity) (mapv :id))
                                   (->> policy-db :policy :view :property vals (mapcat identity) (mapv :id))
+                                  (->> policy-db :policy :view :subject vals (mapcat identity) (mapv :id))
                                   (->> policy-db :policy :view :default (mapv :id))
 
                                   (->> policy-db :policy :modify :class vals (mapcat identity) (mapv :id))
                                   (->> policy-db :policy :modify :property vals (mapcat identity) (mapv :id))
+                                  (->> policy-db :policy :modify :subject vals (mapcat identity) (mapv :id))
                                   (->> policy-db :policy :modify :default (mapv :id))))))
 
 (defn init

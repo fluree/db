@@ -80,13 +80,11 @@ The primary Fluree namespaces are defined in `/src/fluree/db/json_ld/iri.cljc`:
 | `f:targetRole` | Target role for policy | ✅ `iri-target-role` |
 | `f:targetClass` | Target class for policy | ✅ `iri-target-class` |
 | `f:targetNode` | Target node for policy | ✅ `iri-target-node` |
-| `f:targetSubject` | Target subject for policy | ✅ `iri-target-subject` |
-| `f:targetProperty` | Target property for policy | ✅ `iri-target-property` |
+| `f:targetSubject` | Target subject for policy | ✅ `iri-target-subject` | ⚠️ **DEPRECATED**: Use `f:onSubject` instead |
+| `f:targetProperty` | Target property for policy | ✅ `iri-target-property` | ⚠️ **DEPRECATED**: Use `f:onProperty` instead |
 | `f:targetObjectsOf` | Target objects of property | ✅ `iri-target-objects-of` |
-| `f:onProperty` | Property constraint (indexed) | ✅ `iri-onProperty` | Supports
-static IRIs (O(1) lookup) or queries for dynamic resolution |
-| `f:onSubject` | Subject constraint | ✅ `iri-onSubject` | ⚠️ **LEGACY**: Use
-`f:targetSubject` instead |
+| `f:onSubject` | Subject constraint (indexed) | ✅ `iri-onSubject` | O(1) lookup; supports static IRIs, queries, or mixed |
+| `f:onProperty` | Property constraint (indexed) | ✅ `iri-onProperty` | O(1) lookup; supports static IRIs, queries, or mixed |
 
 ### Policy Logic
 | Variable | Description | Defined in constants.cljc |

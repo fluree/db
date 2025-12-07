@@ -69,13 +69,13 @@ The `f:allow` property provides unconditional allow or deny without query execut
 
 Policies can be targeted to specific subjects, classes, or properties.
 
-### f:targetSubject - Subject Targeting
+### f:onSubject - Subject Targeting
 
 Target specific subjects via static IRIs or dynamic queries:
 
 ```json
 {
-  "f:targetSubject": [{"@id": "ex:publicData"}]
+  "f:onSubject": [{"@id": "ex:publicData"}]
 }
 ```
 
@@ -83,14 +83,16 @@ Or dynamically with a query:
 
 ```json
 {
-  "f:targetSubject": {
+  "f:onSubject": {
     "@type": "@json",
     "@value": {
-      "where": {"@id": "?$target", "@type": {"@id": "ex:PublicClass"}}
+      "where": {"@id": "?$this", "@type": {"@id": "ex:PublicClass"}}
     }
   }
 }
 ```
+
+The query must use `?$this` as the variable for the subject IRI.
 
 ### f:onClass - Class Targeting
 
@@ -124,7 +126,7 @@ Or dynamically determine properties using a query:
     "@type": "@json",
     "@value": {
       "@context": {"ex": "http://example.org/"},
-      "where": {"@id": "?$target", "ex:isSensitive": true}
+      "where": {"@id": "?$this", "ex:isSensitive": true}
     }
   },
   "f:action": {"@id": "f:view"},
@@ -132,7 +134,7 @@ Or dynamically determine properties using a query:
 }
 ```
 
-The query must use `?$target` as the variable for the property IRI.
+The query must use `?$this` as the variable for the property IRI.
 
 You can also mix static IRIs and queries in the same policy:
 
@@ -143,7 +145,7 @@ You can also mix static IRIs and queries in the same policy:
     {"@type": "@json",
      "@value": {
        "@context": {"ex": "http://example.org/"},
-       "where": {"@id": "?$target", "ex:isSensitive": true}
+       "where": {"@id": "?$this", "ex:isSensitive": true}
      }}
   ],
   "f:action": {"@id": "f:view"},
@@ -176,8 +178,7 @@ Then apply policies by class:
 
 | Variable | Description |
 |----------|-------------|
-| `?$this` | The subject being evaluated for access |
-| `?$target` | Used in targeting queries to bind to target IRIs |
+| `?$this` | The subject/property/object being evaluated |
 | `?$identity` | The authenticated identity (provided via policy values) |
 
 ## Required Policies
@@ -240,7 +241,7 @@ By default, if no policy matches a piece of data, access is denied. Use the `def
       "@type": "@json",
       "@value": {
         "@context": {"ex": "http://example.org/"},
-        "where": {"@id": "?$target", "ex:isSensitive": true}
+        "where": {"@id": "?$this", "ex:isSensitive": true}
       }
     },
     "f:allow": false
@@ -260,10 +261,10 @@ By default, if no policy matches a piece of data, access is denied. Use the `def
 {
   "@id": "ex:ownDataPolicy",
   "@type": "f:AccessPolicy",
-  "f:targetSubject": {
+  "f:onSubject": {
     "@type": "@json",
     "@value": {
-      "where": {"@id": "?$target", "@type": {"@id": "ex:User"}}
+      "where": {"@id": "?$this", "@type": {"@id": "ex:User"}}
     }
   },
   "f:action": {"@id": "f:view"},

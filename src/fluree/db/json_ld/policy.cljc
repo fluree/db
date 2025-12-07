@@ -29,36 +29,33 @@
 ;  explicit @type declaration for the query itself. Once there is a way
 ;  to have the query result come back as raw json-ld, then this step can
 ;  be removed.
+(defn- wrap-json-targets
+  "Wraps target values as @json types if they're not already IRIs."
+  [targets]
+  (mapv (fn [target]
+          (if (util/get-id target)
+            target
+            {const/iri-value target
+             const/iri-type  const/iri-json}))
+        (util/sequential targets)))
+
 (defn policy-from-query
   "Recasts @type: @json from a raw query result which
   would looses the @type information."
   [query-results]
   (mapv
    (fn [{q                 const/iri-query
+         on-subjects       const/iri-onSubject
          target-subjects   const/iri-targetSubject
          target-properties const/iri-targetProperty
          on-properties     const/iri-onProperty
          :as               policy}]
      (cond-> policy
        q                 (assoc const/iri-query {const/iri-value q, const/iri-type const/iri-json})
-       target-subjects   (assoc const/iri-targetSubject  (mapv (fn [subject]
-                                                                 (if (util/get-id subject)
-                                                                   subject
-                                                                   {const/iri-value subject
-                                                                    const/iri-type  const/iri-json}))
-                                                               (util/sequential target-subjects)))
-       target-properties (assoc const/iri-targetProperty (mapv (fn [property]
-                                                                 (if (util/get-id property)
-                                                                   property
-                                                                   {const/iri-value property
-                                                                    const/iri-type  const/iri-json}))
-                                                               (util/sequential target-properties)))
-       on-properties     (assoc const/iri-onProperty     (mapv (fn [property]
-                                                                 (if (util/get-id property)
-                                                                   property
-                                                                   {const/iri-value property
-                                                                    const/iri-type  const/iri-json}))
-                                                               (util/sequential on-properties)))))
+       on-subjects       (assoc const/iri-onSubject       (wrap-json-targets on-subjects))
+       target-subjects   (assoc const/iri-targetSubject   (wrap-json-targets target-subjects))
+       target-properties (assoc const/iri-targetProperty  (wrap-json-targets target-properties))
+       on-properties     (assoc const/iri-onProperty      (wrap-json-targets on-properties))))
    query-results))
 
 (defn wrap-class-policy

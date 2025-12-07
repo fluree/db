@@ -53,6 +53,26 @@
   (let [prop-policies (view-property-policy-map policy-map)]
     (get prop-policies property)))
 
+(defn view-subject-policy-map
+  [policy]
+  (get-in policy [:view :subject]))
+
+(defn modify-subject-policy-map
+  [policy]
+  (get-in policy [:modify :subject]))
+
+(defn view-policies-for-subject
+  "O(1) lookup for subject-targeted view policies."
+  [policy-map subject]
+  (let [subj-policies (view-subject-policy-map policy-map)]
+    (get subj-policies subject)))
+
+(defn modify-policies-for-subject
+  "O(1) lookup for subject-targeted modify policies."
+  [policy-map subject]
+  (let [subj-policies (modify-subject-policy-map policy-map)]
+    (get subj-policies subject)))
+
 (defn default-view-policies
   [policy-map]
   (get-in policy-map [:view :default]))

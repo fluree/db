@@ -145,7 +145,7 @@
                                ;; Use query to find which properties are sensitive
                                "f:onProperty" {"@type"  "@json"
                                                "@value" {"@context" {"ex" "http://example.org/ns/"}
-                                                         "where"    {"@id"            "?$target"
+                                                         "where"    {"@id"            "?$this"
                                                                      "ex:isSensitive" true}}}
                                "f:allow"      false}
                               ;; Default allow for non-sensitive properties
@@ -202,7 +202,7 @@
                                                ;; Query - dynamically find sensitive properties
                                                {"@type"  "@json"
                                                 "@value" {"@context" {"ex" "http://example.org/ns/"}
-                                                          "where"    {"@id"            "?$target"
+                                                          "where"    {"@id"            "?$this"
                                                                       "ex:isSensitive" true}}}]
                                "f:allow"      false}
                               ;; Default allow for non-restricted properties

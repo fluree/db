@@ -71,10 +71,50 @@
      policy-map
      (:on-property restriction-map))))
 
+(defn add-subject-restriction
+  "Adds subject-targeted policies with O(1) indexed lookup by subject ID."
+  [restriction-map db policy-map]
+  (let [cids (policy-cids db restriction-map)]
+    (reduce
+     (fn [policy subject]
+       (let [sid              (if (iri/sid? subject) subject (iri/encode-iri db subject))
+             restriction-map* (assoc restriction-map :sid sid
+                                     :cids cids)]
+         (cond-> policy
+
+           (view-restriction? restriction-map*)
+           (update-in [:view :subject sid] util/conjv restriction-map*)
+
+           (modify-restriction? restriction-map*)
+           (update-in [:modify :subject sid] util/conjv restriction-map*))))
+     policy-map
+     (:on-subject restriction-map))))
+
 (defn query-target?
   "A target-expr can either be a static IRI or a query map."
   [target-expr]
   (map? target-expr))
+
+(defn- query-contains-var?
+  "Checks if a query map contains a specific variable (recursively searches all values)."
+  [query-map var-name]
+  (let [check-val (fn check-val [v]
+                    (cond
+                      (= v var-name) true
+                      (map? v) (some check-val (vals v))
+                      (sequential? v) (some check-val v)
+                      :else false))]
+    (check-val query-map)))
+
+(defn- detect-target-var
+  "Detects which target variable the user used in their query.
+  Prefers ?$this (modern) over ?$target (legacy) for new queries."
+  [query-map]
+  (cond
+    (query-contains-var? query-map "?$this")   "?$this"
+    (query-contains-var? query-map "?$target") "?$target"
+    ;; Default to ?$this for queries that don't use either (shouldn't happen normally)
+    :else "?$this"))
 
 (defn parse-targets
   [db tracker error-ch policy-values target-exprs]
@@ -86,10 +126,12 @@
                             (async/go
                               (try*
                                 (if (query-target? target-expr)
-                                  (let [target-q (cond-> (assoc target-expr
-                                                                "select" "?$target"
-                                                                :selection-context {}) ;; don't compact selection results
-                                                   policy-values (policy/inject-where-pattern ["values" policy-values]))]
+                                  ;; Support both ?$this (preferred) and ?$target (legacy)
+                                  (let [target-var (detect-target-var target-expr)
+                                        target-q   (cond-> (assoc target-expr
+                                                                  "select" target-var
+                                                                  :selection-context {}) ;; don't compact selection results
+                                                     policy-values (policy/inject-where-pattern ["values" policy-values]))]
                                     (->> (<? (dbproto/-query db tracker target-q))
                                          (async/onto-chan! ch)))
                                  ;; non-maps are literals
@@ -109,10 +151,14 @@
     (try*
       (let [id (util/get-id policy-doc) ;; @id name of policy-doc
 
-            ;; Subject targeting via targetSubject (dynamic resolution via parse-targets)
+            ;; Subject targeting via onSubject (preferred) or targetSubject (legacy)
+            ;; Both support static IRIs and queries via parse-targets
+            on-subject-specs    (unwrap (get policy-doc const/iri-onSubject))
             target-subject      (unwrap (get policy-doc const/iri-targetSubject))
-            subject-targets-ch  (when target-subject
-                                  (parse-targets db tracker error-ch policy-values target-subject))
+            subject-specs       (not-empty (into (vec (or on-subject-specs []))
+                                                 (or target-subject [])))
+            subject-targets-ch  (when subject-specs
+                                  (parse-targets db tracker error-ch policy-values subject-specs))
 
             ;; Property targeting via targetProperty (dynamic resolution via parse-targets)
             target-property     (unwrap (get policy-doc const/iri-targetProperty))
@@ -184,12 +230,14 @@
                    :allow?      allow?
                    :query       query}
             ;; Raw specs for modify refresh logic (when they contain queries)
-            target-subject                  (assoc :target-subject target-subject)
+            ;; Store combined subject specs from both onSubject and targetSubject
+            subject-specs                   (assoc :subject-specs subject-specs)
             target-property                 (assoc :target-property target-property)
             ;; Store raw on-property specs for modify refresh (when they contain queries)
             (some query-target? on-property-specs) (assoc :on-property-specs on-property-specs)
-            (not-empty subject-targets)     (assoc :s-targets subject-targets)
             (not-empty property-targets)    (assoc :p-targets property-targets)
+            ;; onSubject targets stored for O(1) indexed lookup via add-subject-restriction
+            (not-empty subject-targets)     (assoc :on-subject subject-targets)
             ;; onProperty targets stored for O(1) indexed lookup via add-property-restriction
             (not-empty on-property-targets) (assoc :on-property on-property-targets))
         ;; policy-doc has incorrectly formatted view? and/or modify?
@@ -216,8 +264,10 @@
       (seq (:on-property policy))
       (add-property-restriction policy db wrapper)
 
-      (or (:s-targets policy)
-          (:p-targets policy)
+      (seq (:on-subject policy))
+      (add-subject-restriction policy db wrapper)
+
+      (or (:p-targets policy)
           (:o-targets policy))
       (add-default-restriction policy wrapper)
 

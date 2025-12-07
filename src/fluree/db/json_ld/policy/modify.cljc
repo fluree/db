@@ -10,10 +10,12 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn refresh-policy
-  [db-after tracker error-ch policy-values {:keys [target-subject target-property on-property-specs] :as policy}]
+  [db-after tracker error-ch policy-values {:keys [subject-specs target-property on-property-specs] :as policy}]
   (go-try
     (cond-> policy
-      target-subject    (update :s-targets into (<? (policy.rules/parse-targets db-after tracker error-ch policy-values target-subject)))
+      ;; subject-specs combines both onSubject (preferred) and targetSubject (legacy)
+      ;; Refreshes :on-subject for O(1) indexed lookup
+      subject-specs     (update :on-subject into (<? (policy.rules/parse-targets db-after tracker error-ch policy-values subject-specs)))
       target-property   (update :p-targets into (<? (policy.rules/parse-targets db-after tracker error-ch policy-values target-property)))
       on-property-specs (update :on-property into (<? (policy.rules/parse-targets db-after tracker error-ch policy-values on-property-specs))))))
 
@@ -26,8 +28,8 @@
       (loop [[policy & r] (-> db-after :policy :modify :default)
              refreshed []]
         (if policy
-          (let [{:keys [target-subject target-property on-property-specs]} policy]
-            (if (or target-subject target-property on-property-specs)
+          (let [{:keys [subject-specs target-property on-property-specs]} policy]
+            (if (or subject-specs target-property on-property-specs)
               (let [[policy* _] (async/alts! [error-ch
                                               (refresh-policy db-after tracker error-ch policy-values policy)])]
                 (if (util/exception? policy*)
@@ -68,6 +70,7 @@
             (let [sid      (flake/s flake)
                   pid      (flake/p flake)
                   policies (concat (enforce/modify-policies-for-property policy pid)
+                                   (enforce/modify-policies-for-subject policy sid)
                                    (when class-policies?
                                      (or (get @class-policy-cache sid)
                                          (<? (subject-class-policies db-after tracker policy class-policy-cache sid))))
