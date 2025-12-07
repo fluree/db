@@ -17,6 +17,7 @@
             [fluree.db.util.log :as log])
   (:import (java.time Duration Instant)
            (software.amazon.awssdk.auth.credentials AwsBasicCredentials
+                                                    AwsSessionCredentials
                                                     StaticCredentialsProvider)
            (software.amazon.awssdk.regions Region)
            (software.amazon.awssdk.services.s3 S3Client)
@@ -39,9 +40,18 @@
         (re-matches #".*--[a-z0-9]+-az\d+--x-s3$" bucket))))
 
 (defn- build-s3-client
-  "Builds an AWS SDK S3 client with the provided credentials and region."
-  [access-key secret-key region]
-  (let [credentials (AwsBasicCredentials/create access-key secret-key)
+  "Builds an AWS SDK S3 client with the provided credentials and region.
+   Supports both basic credentials and temporary session credentials (for Lambda IAM roles)."
+  [access-key secret-key session-token region]
+  (log/warn "CRED-DIAGNOSTIC: Building S3 client for CreateSession [v2025-12-06T09:00]"
+            {:access-key-prefix (subs access-key 0 (min 4 (count access-key)))
+             :has-session-token? (boolean session-token)
+             :session-token-length (when session-token (count session-token))
+             :credential-type (if session-token "AwsSessionCredentials" "AwsBasicCredentials")
+             :code-version "2025-12-06T09:00:00Z"})
+  (let [credentials (if session-token
+                      (AwsSessionCredentials/create access-key secret-key session-token)
+                      (AwsBasicCredentials/create access-key secret-key))
         credentials-provider (StaticCredentialsProvider/create credentials)
         region-obj (Region/of region)]
     (-> (S3Client/builder)
@@ -121,7 +131,7 @@
   [bucket region base-credentials & [{:keys [refresh-buffer-seconds force-refresh]
                                       :or {refresh-buffer-seconds 30
                                            force-refresh false}}]]
-  (let [{:keys [access-key secret-key]} base-credentials
+  (let [{:keys [access-key secret-key session-token]} base-credentials
         key (cache-key bucket access-key)]
 
     ;; Check if we have valid cached credentials
@@ -140,7 +150,7 @@
           (select-keys cached [:access-key :secret-key :session-token])))
 
       ;; No valid cache, create new session
-      (let [client (build-s3-client access-key secret-key region)
+      (let [client (build-s3-client access-key secret-key session-token region)
             session (try
                       (create-session-credentials client bucket)
                       (finally
