@@ -37,6 +37,7 @@
    (fn [{q                 const/iri-query
          target-subjects   const/iri-targetSubject
          target-properties const/iri-targetProperty
+         on-properties     const/iri-onProperty
          :as               policy}]
      (cond-> policy
        q                 (assoc const/iri-query {const/iri-value q, const/iri-type const/iri-json})
@@ -51,7 +52,13 @@
                                                                    property
                                                                    {const/iri-value property
                                                                     const/iri-type  const/iri-json}))
-                                                               (util/sequential target-properties)))))
+                                                               (util/sequential target-properties)))
+       on-properties     (assoc const/iri-onProperty     (mapv (fn [property]
+                                                                 (if (util/get-id property)
+                                                                   property
+                                                                   {const/iri-value property
+                                                                    const/iri-type  const/iri-json}))
+                                                               (util/sequential on-properties)))))
    query-results))
 
 (defn wrap-class-policy

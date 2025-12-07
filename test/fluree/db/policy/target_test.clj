@@ -22,7 +22,7 @@
                       "f:action"     {"@id" "f:modify"}
                       "f:required"   true
                       "f:exMessage"  "User can only create a wishlist linked to their own identity."
-                      "f:targetProperty" [{"@id" "a:wishlist"}]
+                      "f:onProperty" [{"@id" "a:wishlist"}]
                       "f:query"
                       {"@type"  "@json"
                        "@value" {"@context" {"a" "http://a.co/"}
@@ -34,7 +34,7 @@
                       "f:action"     {"@id" "f:modify"}
                       "f:required"   true
                       "f:exMessage"  "User can only modify own wishlist properties."
-                      "f:targetProperty" [{"@id" "a:name"} {"@id" "a:summary"} {"@id" "a:item"}]
+                      "f:onProperty" [{"@id" "a:name"} {"@id" "a:summary"} {"@id" "a:item"}]
                       "f:query"
                       {"@type"  "@json"
                        "@value" {"@context" {"a" "http://a.co/"}
@@ -45,7 +45,7 @@
                     "@id"          "a:wishlistViewPolicy"
                     "f:action"     {"@id" "f:view"}
                     "f:required"   true
-                    "f:targetProperty" [{"@id" "a:wishlist"}]
+                    "f:onProperty" [{"@id" "a:wishlist"}]
                     "f:query"
                     {"@type"  "@json"
                      "@value" {"@context" {"a" "http://a.co/"}
@@ -57,7 +57,7 @@
                   "f:action"     {"@id" "f:modify"}
                   "f:required"   true
                   "f:exMessage"  "User can only create an item on their own wishlist."
-                  "f:targetProperty" [{"@id" "a:item"}]
+                  "f:onProperty" [{"@id" "a:item"}]
                   "f:query"
                   {"@type"  "@json"
                    "@value" {"@context" {"a" "http://a.co/"}
@@ -69,9 +69,9 @@
                   "f:action"     {"@id" "f:modify"}
                   "f:required"   true
                   "f:exMessage"  "User can modify all but available on item."
-                  "f:targetProperty" [{"@id" "a:title"}
-                                      {"@id" "a:description"}
-                                      {"@id" "a:rank"}]
+                  "f:onProperty" [{"@id" "a:title"}
+                                  {"@id" "a:description"}
+                                  {"@id" "a:rank"}]
                   "f:query"
                   {"@type"  "@json"
                    "@value" {"@context" {"a" "http://a.co/"}
@@ -82,9 +82,9 @@
                             "f" "https://ns.flur.ee/ledger#"}
                 "@id"      "a:wishlistItemViewPolicy"
 
-                "f:targetProperty" [{"@id" "a:title"}
-                                    {"@id" "a:description"}
-                                    {"@id" "a:rank"}]
+                "f:onProperty" [{"@id" "a:title"}
+                                {"@id" "a:description"}
+                                {"@id" "a:rank"}]
                 "f:query"
                 {"@type"  "@json"
                  "@value" {"@context" {"a" "http://a.co/"}
@@ -95,7 +95,7 @@
                 "@id" "a:availableModifyPolicy"
                 "f:required" true
                 "f:exMessage" "User cannot modify available status on their own items."
-                "f:targetProperty" [{"@id" "a:available"}]
+                "f:onProperty" [{"@id" "a:available"}]
                 "f:query"
                 {"@type" "@json"
                  "@value" {"@context" {"a" "http://a.co/"}
@@ -366,7 +366,7 @@
         {"@id"              "ex:doublePropertyRestriction"
          "@type"            ["f:AccessPolicy" "http://example.org/ns/DoublePropertyPolicy"]
          "f:required"       true
-         "f:targetProperty" [{"@id" "http://example.org/ns/secretProperty"} {"@id" "http://example.org/ns/secretPropertyTwo"}]
+         "f:onProperty" [{"@id" "http://example.org/ns/secretProperty"} {"@id" "http://example.org/ns/secretPropertyTwo"}]
          "f:action"         [{"@id" "f:view"}, {"@id" "f:modify"}]
          "f:query"          {"@type"  "@json"
                              "@value" {"where" [["filter" "(not= 1 1)"]]}}}

@@ -109,15 +109,23 @@
     (try*
       (let [id (util/get-id policy-doc) ;; @id name of policy-doc
 
+            ;; Subject targeting via targetSubject (dynamic resolution via parse-targets)
             target-subject      (unwrap (get policy-doc const/iri-targetSubject))
             subject-targets-ch  (when target-subject
                                   (parse-targets db tracker error-ch policy-values target-subject))
+
+            ;; Property targeting via targetProperty (dynamic resolution via parse-targets)
             target-property     (unwrap (get policy-doc const/iri-targetProperty))
             property-targets-ch (when target-property
                                   (parse-targets db tracker error-ch policy-values target-property))
 
-            on-property (when-let [p-iris (util/get-all-ids policy-doc const/iri-onProperty)]
-                          (set p-iris))
+            ;; Property targeting via onProperty
+            ;; Supports both static IRIs and queries - both go through parse-targets
+            ;; This unifies behavior with targetProperty for backward compatibility
+            on-property-specs   (unwrap (get policy-doc const/iri-onProperty))
+            on-property-ch      (when on-property-specs
+                                  (parse-targets db tracker error-ch policy-values on-property-specs))
+
             on-class    (when-let [classes (util/get-all-ids policy-doc const/iri-onClass)]
                           (set classes))
 
@@ -145,39 +153,45 @@
             modify?   (or (empty? actions)
                           (contains? actions const/iri-modify))
 
-            subject-targets  (when subject-targets-ch (<? subject-targets-ch))
-            property-targets (when property-targets-ch (<? property-targets-ch))]
+            subject-targets     (when subject-targets-ch (<? subject-targets-ch))
+            property-targets    (when property-targets-ch (<? property-targets-ch))
+            ;; Resolved onProperty targets (static IRIs or queries)
+            on-property-targets (when on-property-ch (<? on-property-ch))]
 
         (when (and (nil? allow?)
                    (nil? query)
                    (nil? target-subject)
                    (nil? target-property)
-                   (nil? on-property)
+                   (nil? on-property-targets)
                    (nil? on-class))
-          (throw (ex-info (str "Invalid policy, unable to extract a target subject, property, or on-property."
+          (throw (ex-info (str "Invalid policy, unable to extract a target subject, property, or on-property. "
                                "Did you forget @context?. Parsed restriction: " policy-doc)
                           {:status 400
                            :error  :db/invalid-policy})))
 
         (if (or view? modify?)
           (cond-> {:id          id
-                   :on-property on-property
                    :on-class    on-class
                    :required?   (util/get-first-value policy-doc const/iri-required)
-                 ;; with no class or property restrictions, becomes a default policy-doc
-                   :default?    (and (nil? on-property)
-                                     (nil? on-class)
+                   ;; with no class or property restrictions, becomes a default policy-doc
+                   :default?    (and (nil? on-class)
                                      (nil? subject-targets)
-                                     (nil? property-targets))
+                                     (nil? property-targets)
+                                     (nil? on-property-targets))
                    :ex-message  (util/get-first-value policy-doc const/iri-exMessage)
                    :view?       view?
                    :modify?     modify?
                    :allow?      allow?
                    :query       query}
-            target-subject               (assoc :target-subject target-subject)
-            target-property              (assoc :target-property target-property)
-            (not-empty subject-targets)  (assoc :s-targets subject-targets)
-            (not-empty property-targets) (assoc :p-targets property-targets))
+            ;; Raw specs for modify refresh logic (when they contain queries)
+            target-subject                  (assoc :target-subject target-subject)
+            target-property                 (assoc :target-property target-property)
+            ;; Store raw on-property specs for modify refresh (when they contain queries)
+            (some query-target? on-property-specs) (assoc :on-property-specs on-property-specs)
+            (not-empty subject-targets)     (assoc :s-targets subject-targets)
+            (not-empty property-targets)    (assoc :p-targets property-targets)
+            ;; onProperty targets stored for O(1) indexed lookup via add-property-restriction
+            (not-empty on-property-targets) (assoc :on-property on-property-targets))
         ;; policy-doc has incorrectly formatted view? and/or modify?
         ;; this might allow data through that was intended to be restricted, so throw.
           (throw (ex-info (str "Invalid policy definition. Policies must have f:action of {@id: f:view} or {@id: f:modify}. "

@@ -83,8 +83,8 @@ The primary Fluree namespaces are defined in `/src/fluree/db/json_ld/iri.cljc`:
 | `f:targetSubject` | Target subject for policy | ✅ `iri-target-subject` |
 | `f:targetProperty` | Target property for policy | ✅ `iri-target-property` |
 | `f:targetObjectsOf` | Target objects of property | ✅ `iri-target-objects-of` |
-| `f:onProperty` | Property constraint (legacy) | ✅ `iri-onProperty` | ⚠️
-**LEGACY**: Use `f:targetProperty` instead |
+| `f:onProperty` | Property constraint (indexed) | ✅ `iri-onProperty` | Supports
+static IRIs (O(1) lookup) or queries for dynamic resolution |
 | `f:onSubject` | Subject constraint | ✅ `iri-onSubject` | ⚠️ **LEGACY**: Use
 `f:targetSubject` instead |
 

@@ -10,11 +10,12 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn refresh-policy
-  [db-after tracker error-ch policy-values {:keys [target-subject target-property] :as policy}]
+  [db-after tracker error-ch policy-values {:keys [target-subject target-property on-property-specs] :as policy}]
   (go-try
     (cond-> policy
-      target-subject  (update :s-targets into (<? (policy.rules/parse-targets db-after tracker error-ch policy-values target-subject)))
-      target-property (update :p-targets into (<? (policy.rules/parse-targets db-after tracker error-ch policy-values target-subject))))))
+      target-subject    (update :s-targets into (<? (policy.rules/parse-targets db-after tracker error-ch policy-values target-subject)))
+      target-property   (update :p-targets into (<? (policy.rules/parse-targets db-after tracker error-ch policy-values target-property)))
+      on-property-specs (update :on-property into (<? (policy.rules/parse-targets db-after tracker error-ch policy-values on-property-specs))))))
 
 (defn refresh-modify-policies
   "Update targets to include newly created targets."
@@ -25,8 +26,8 @@
       (loop [[policy & r] (-> db-after :policy :modify :default)
              refreshed []]
         (if policy
-          (let [{:keys [target-subject target-property]} policy]
-            (if (or target-subject target-property)
+          (let [{:keys [target-subject target-property on-property-specs]} policy]
+            (if (or target-subject target-property on-property-specs)
               (let [[policy* _] (async/alts! [error-ch
                                               (refresh-policy db-after tracker error-ch policy-values policy)])]
                 (if (util/exception? policy*)

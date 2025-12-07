@@ -44,7 +44,7 @@
                      "@graph"   [{"@id"          "ex:ssnRestriction"
                                   "@type"        ["f:AccessPolicy"]
                                   "f:required"   true
-                                  "f:targetProperty" [{"@id" "schema:ssn"}]
+                                  "f:onProperty" [{"@id" "schema:ssn"}]
                                   "f:action"     {"@id" "f:view"}
                                   "f:query"      {"@type"  "@json"
                                                   "@value" {"@context" {"ex" "http://example.org/ns/"}
@@ -421,7 +421,7 @@
                                        {"@id"       "ex:restrictAllSSNs"
                                         "@type"     ["f:AccessPolicy"]
                                         "f:required" true
-                                        "f:targetProperty" [{"@id" "schema:ssn"}]
+                                        "f:onProperty" [{"@id" "schema:ssn"}]
                                         "f:action"  {"@id" "f:view"}}]}
           policy-db  @(fluree/wrap-policy db policy)]
 
