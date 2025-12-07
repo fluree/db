@@ -55,17 +55,7 @@
    For Express One Zone buckets, returns session credentials.
    For standard S3 buckets, returns base credentials."
   [bucket region base-credentials]
-  (let [credentials (s3-express/get-credentials-for-bucket bucket region base-credentials)
-        is-session? (boolean (:session-token credentials))]
-    (log/warn "CRED-DIAGNOSTIC: get-credentials returning [v2025-12-06T03:00]"
-              {:bucket bucket
-               :region region
-               :is-session? is-session?
-               :access-key-prefix (when (:access-key credentials)
-                                    (subs (:access-key credentials) 0 (min 4 (count (:access-key credentials)))))
-               :has-session-token? (boolean (:session-token credentials))
-               :code-version "2025-12-06T03:00:00Z"})
-    credentials))
+  (s3-express/get-credentials-for-bucket bucket region base-credentials))
 
 (defn hmac-sha256
   "Generate HMAC-SHA256 signature"
@@ -160,12 +150,6 @@
 (defn sign-request
   "Sign an S3 request using AWS Signature V4"
   [{:keys [method path headers payload region bucket credentials query-params endpoint]}]
-  (log/warn "CRED-DIAGNOSTIC: sign-request received credentials [v2025-12-06T03:00]"
-            {:bucket bucket
-             :access-key-prefix (when (:access-key credentials)
-                                  (subs (:access-key credentials) 0 (min 4 (count (:access-key credentials)))))
-             :has-session-token? (boolean (:session-token credentials))
-             :code-version "2025-12-06T03:00:00Z"})
   (let [{:keys [access-key secret-key session-token]} credentials
         now (Instant/now)
         amz-date (.format amz-date-formatter now)
@@ -220,12 +204,6 @@
                        (canonical-query-string query-params)
                        headers-for-signing
                        payload-hash)
-        _        (log/warn "CRED-DIAGNOSTIC: Canonical request created [v2025-12-06T08:00]"
-                           {:bucket bucket
-                            :canonical-req-hash (sha256-hex canonical-req)
-                            :canonical-req-first-200 (subs canonical-req 0 (min 200 (count canonical-req)))
-                            :headers-for-signing-keys (sort (keys headers-for-signing))
-                            :code-version "2025-12-06T08:00:00Z"})
 
         ;; Determine service name for signature - S3 Express uses "s3express"
         service-name (if (s3-express/express-one-bucket? bucket)
@@ -239,13 +217,6 @@
                         (sha256-hex canonical-req))
 
         ;; Calculate signature
-        _        (log/warn "CRED-DIAGNOSTIC: About to calculate signature [v2025-12-06T07:00]"
-                           {:bucket bucket
-                            :service-name service-name
-                            :secret-key-prefix (subs secret-key 0 (min 4 (count secret-key)))
-                            :access-key access-key
-                            :has-session-token? (boolean session-token)
-                            :code-version "2025-12-06T07:00:00Z"})
         signing-key (get-signature-key secret-key date-stamp region service-name)
         signature (-> (hmac-sha256 signing-key string-to-sign)
                       (alphabase/base-to-base :bytes :hex))
@@ -291,13 +262,6 @@
                    (str "https://" bucket ".s3express-" az-id "." region ".amazonaws.com/" path))
                  ;; Standard S3 bucket
                  (str "https://" bucket ".s3." region ".amazonaws.com/" path)))]
-     ;; DIAGNOSTIC: Log every URL build with WARN level
-     (log/warn "S3-DIAGNOSTIC: Built URL [v2025-12-06T02:00]"
-               {:bucket bucket
-                :region region
-                :endpoint endpoint
-                :url url
-                :code-version "2025-12-06T02:00:00Z"})
      url)))
 
 (declare with-retries parse-list-objects-response)
@@ -308,14 +272,6 @@
     :or   {method  "GET"
            headers {}}}]
   (go-try
-    ;; DIAGNOSTIC: Log first S3 request to verify endpoint parameter
-    (log/warn "S3-DIAGNOSTIC: s3-request called [v2025-12-06T02:00]"
-              {:method method
-               :bucket bucket
-               :region region
-               :path path
-               :endpoint endpoint
-               :code-version "2025-12-06T02:00:00Z"})
     (let [start                     (System/nanoTime)
           ;; Encode path segments for both URL and signature to match S3's encoding
           encoded-path              (encode-s3-path path)
@@ -336,20 +292,6 @@
                                       :query-params query-params
                                       :endpoint     endpoint})
 
-          ;; Use xhttp for the actual request
-          _        (log/warn "CRED-DIAGNOSTIC: About to send S3 request [v2025-12-06T06:00]"
-                             {:method method
-                              :bucket bucket
-                              :path (subs encoded-path 0 (min 50 (count encoded-path)))
-                              :has-x-amz-security-token? (boolean (get signed-headers "x-amz-security-token"))
-                              :has-x-amz-s3session-token? (boolean (get signed-headers "x-amz-s3session-token"))
-                              :session-token-length (or (when-let [st (get signed-headers "x-amz-s3session-token")]
-                                                          (count st))
-                                                        (when-let [st (get signed-headers "x-amz-security-token")]
-                                                          (count st)))
-                              :authorization-prefix (when (get signed-headers "authorization")
-                                                      (subs (get signed-headers "authorization") 0 (min 50 (count (get signed-headers "authorization")))))
-                              :code-version "2025-12-06T06:00:00Z"})
           response (<? (case method
                          "GET"    (xhttp/get-response url {:headers         signed-headers
                                                            :request-timeout request-timeout})
@@ -736,8 +678,7 @@
             (let [data (merge {:event "s3.error"
                                :attempt attempt
                                :duration-ms duration-ms
-                               :error (ex-message res)
-                               :code-version "2025-12-06T02:00:00Z-endpoint-fix"}
+                               :error (ex-message res)}
                               (ex-data res)
                               log-context)]
               (log/error "S3 request failed permanently" data)
@@ -786,14 +727,6 @@
        (throw (ex-info "AWS credentials not found"
                        {:error :s3/missing-credentials
                         :hint "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"})))
-     ;; DIAGNOSTIC: This MUST log when S3 store is created
-     (log/warn "S3-DIAGNOSTIC: Opening S3 store [v2025-12-06T02:00]"
-               {:bucket bucket
-                :region region
-                :prefix normalized-prefix
-                :endpoint endpoint-override
-                :identifier identifier
-                :code-version "2025-12-06T02:00:00Z"})
      ;; Log if this is an Express One Zone bucket
      (when (s3-express/express-one-bucket? bucket)
        (log/info "Opening S3 Express One Zone bucket - session credentials will be managed automatically"
