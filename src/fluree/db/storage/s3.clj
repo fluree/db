@@ -167,7 +167,7 @@
         virtual-hosted? (or (s3-express/express-one-bucket? bucket)  ; S3 Express always virtual-hosted
                             (nil? endpoint)                          ; No endpoint = AWS default (virtual-hosted)
                             (str/includes? endpoint (str bucket ".")))
-        host-header (if (or (nil? endpoint) virtual-hosted?)
+        host-header (if virtual-hosted?
                       ;; Virtual-hosted-style or no endpoint (use AWS default)
                       ;; S3 Express One Zone buckets use different host format
                       (if (s3-express/express-one-bucket? bucket)
