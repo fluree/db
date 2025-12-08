@@ -126,23 +126,27 @@
      [msg c]
      `(debug-async->vals ~c ~msg)))
 
-(defn error!
-  [id err data]
-  (tel/error! {:level :info :id id :data data} err))
+#?(:clj
+   (defmacro error!
+     [id err data]
+     `(tel/error! {:level :info :id ~id :data ~data} ~err)))
 
-(defn warn!
-  [id data]
-  (tel/log! {:level :warn :id id :data data}))
+#?(:clj
+   (defmacro warn!
+     [id data]
+     `(tel/log! {:level :warn :id ~id :data ~data})))
 
-(defn info!
-  [id data]
-  (tel/log! {:level :info :id id :data data}))
+#?(:clj
+   (defmacro info!
+     [id data]
+     `(tel/log! {:level :info :id ~id :data ~data})))
 
-(defn debug!
-  [id data]
-  (tel/log! {:level :debug :id id :data data}))
+#?(:clj
+   (defmacro debug!
+     [id data]
+     `(tel/log! {:level :debug :id ~id :data ~data})))
 
-(defn xf-debug!
+(defn xf-debug-impl
   "Logs the first time a transducer receives a value."
   [id data]
   (fn [rf]
@@ -156,6 +160,22 @@
          (rf result x))
         ([result] (rf result))))))
 
-(defn trace!
-  [id data]
-  (tel/log! {:level :trace :id id :data data}))
+#?(:clj
+   (defmacro xf-debug!
+     "Logs the first time a transducer receives a value."
+     [id data]
+     `(fn [rf#]
+       (let [logged?# (volatile! false)]
+         (fn
+           ([] (rf#))
+           ([result# x#]
+            (when-not @logged?#
+              (debug! ~id ~data)
+              (vreset! logged?# true))
+            (rf# result# x#))
+           ([result#] (rf# result#)))))))
+
+#?(:clj
+   (defmacro trace!
+     [id data]
+     `(tel/log! {:level :trace :id ~id :data ~data})))
