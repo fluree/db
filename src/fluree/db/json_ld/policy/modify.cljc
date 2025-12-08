@@ -1,6 +1,5 @@
 (ns fluree.db.json-ld.policy.modify
   (:require [clojure.core.async :as async]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.policy.enforce :as enforce]
             [fluree.db.json-ld.policy.rules :as policy.rules]
@@ -38,23 +37,6 @@
               (recur r (conj refreshed policy))))
           (assoc-in db-after [:policy :modify :default] refreshed))))))
 
-(defn- filter-applicable-modify-class-policies
-  "Filters class-derived policies to only those applicable to the subject's classes.
-   For property-indexed class policies, we need to verify the subject is of the target class.
-   Uses the class-policy-cache to avoid redundant class lookups."
-  [db-after tracker class-policy-cache sid class-derived-policies]
-  (go-try
-    (when (seq class-derived-policies)
-      (let [;; Get subject's classes (using cache if available)
-            subject-classes (or (get @class-policy-cache sid)
-                                (let [classes (<? (dbproto/-class-ids db-after tracker sid))]
-                                  (swap! class-policy-cache assoc sid classes)
-                                  classes))]
-        ;; Filter to only policies where subject is of a target class
-        (filter (fn [{:keys [for-classes]}]
-                  (some (set subject-classes) for-classes))
-                class-derived-policies)))))
-
 (defn allowed?
   "Checks if all 'adds' are allowed by the policy. If so
   returns final db.
@@ -63,11 +45,12 @@
   message (if available).
 
   Class policies are stored directly in [:modify :property pid] with a :class-policy? flag.
-  This enables a single O(1) lookup - class-derived policies are filtered inline based
-  on subject's classes (cached)."
+  This enables a single O(1) lookup. Class applicability filtering is handled lazily
+  inside policies-allow-modification? using cached class membership lookups."
   [tracker {:keys [db-after add]}]
   (go-try
-    (let [{:keys [policy]} (<? (refresh-modify-policies db-after tracker))
+    (let [{:keys [policy] :as db-after*} (<? (refresh-modify-policies db-after tracker))
+          ;; Create a separate class cache for this modification batch
           class-policy-cache (atom {})]
       (if (enforce/unrestricted-modify? policy)
         db-after
@@ -76,23 +59,16 @@
             (let [sid      (flake/s flake)
                   pid      (flake/p flake)
                   ;; Single O(1) lookup - gets both regular and class-derived policies
-                  all-property-policies (enforce/modify-policies-for-property policy pid)
-                  ;; Separate regular vs class-derived policies
-                  {class-derived-policies true
-                   regular-property-policies false} (group-by #(boolean (:class-policy? %))
-                                                              (or all-property-policies []))
-                  ;; Filter class-derived policies to only those where subject is of target class
-                  applicable-class-policies (when (seq class-derived-policies)
-                                              (<? (filter-applicable-modify-class-policies
-                                                   db-after tracker class-policy-cache sid class-derived-policies)))
-                  policies (concat regular-property-policies
+                  property-policies (enforce/modify-policies-for-property policy pid)
+                  ;; Collect all applicable policies
+                  policies (concat property-policies
                                    (enforce/modify-policies-for-subject policy sid)
-                                   applicable-class-policies
-                                   (enforce/modify-policies-for-flake db-after flake))]
+                                   (enforce/modify-policies-for-flake db-after* flake))]
               ;; policies-allow-modification? will throw if access forbidden
+              ;; Class applicability is checked lazily inside policies-allow-modification?
               (if-some [required-policies (not-empty (filter :required? policies))]
-                (<? (enforce/policies-allow-modification? db-after tracker sid required-policies))
-                (<? (enforce/policies-allow-modification? db-after tracker sid policies)))
+                (<? (enforce/policies-allow-modification? db-after* tracker class-policy-cache sid required-policies))
+                (<? (enforce/policies-allow-modification? db-after* tracker class-policy-cache sid policies)))
               (recur r))
             ;; no more flakes, all passed so return final db
             db-after))))))

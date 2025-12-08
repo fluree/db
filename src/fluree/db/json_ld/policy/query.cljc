@@ -1,7 +1,6 @@
 (ns fluree.db.json-ld.policy.query
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy.enforce :as enforce]
@@ -15,24 +14,6 @@
   [db]
   (enforce/unrestricted-view? (:policy db)))
 
-(defn- filter-applicable-class-policies
-  "Filters class-derived policies to only those applicable to the subject's classes.
-   For property-indexed class policies, we need to verify the subject is of the target class.
-   Uses the policy cache to avoid redundant class lookups."
-  [{:keys [policy] :as db} tracker sid class-derived-policies]
-  (go-try
-    (when (seq class-derived-policies)
-      (let [;; Get subject's classes (using cache if available)
-            subject-classes (or (get @(:cache policy) sid)
-                                (let [classes (<? (dbproto/-class-ids db tracker sid))]
-                                  (swap! (:cache policy) assoc sid classes)
-                                  classes))]
-        ;; Filter to only policies where subject is of a target class
-        ;; Convert subject-classes to set to use as predicate in some
-        (filter (fn [{:keys [for-classes]}]
-                  (some (set subject-classes) for-classes))
-                class-derived-policies)))))
-
 (defn allow-flake?
   "Returns one of:
   (a) exception if there was an error
@@ -44,24 +25,17 @@
   hits this fn.
 
   Class policies are stored directly in [:view :property pid] with a :class-policy? flag.
-  This enables a single O(1) lookup - class-derived policies are filtered inline based
-  on subject's classes (cached)."
+  This enables a single O(1) lookup. Class applicability filtering is handled lazily
+  inside policies-allow-viewing? using cached class membership lookups."
   [{:keys [policy] :as db} tracker flake]
   (go-try
     (let [pid      (flake/p flake)
           sid      (flake/s flake)
           ;; Single O(1) lookup - gets both regular and class-derived policies
-          all-property-policies (enforce/view-policies-for-property policy pid)
-          ;; Separate regular vs class-derived policies
-          {class-derived-policies true
-           regular-property-policies false} (group-by #(boolean (:class-policy? %))
-                                                      (or all-property-policies []))
-          ;; Filter class-derived policies to only those where subject is of target class
-          applicable-class-policies (when (seq class-derived-policies)
-                                      (<? (filter-applicable-class-policies db tracker sid class-derived-policies)))
-          policies (concat regular-property-policies
+          property-policies (enforce/view-policies-for-property policy pid)
+          ;; Collect all applicable policies
+          policies (concat property-policies
                            (enforce/view-policies-for-subject policy sid)
-                           applicable-class-policies
                            (enforce/view-policies-for-flake db flake))]
       (if-some [required-policies (not-empty (filter :required? policies))]
         (<? (enforce/policies-allow-viewing? db tracker sid required-policies))
