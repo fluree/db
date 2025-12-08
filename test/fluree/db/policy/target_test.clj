@@ -3,6 +3,13 @@
             [fluree.db.api :as fluree]
             [fluree.db.util :as util]))
 
+(defn valid-policy-tracker?
+  "Validates that a policy tracker result has no nil keys and all IDs are strings."
+  [policy-map]
+  (and (map? policy-map)
+       (not (contains? policy-map nil))
+       (every? string? (keys policy-map))))
+
 (def burt
   {:id    "did:key:z6MkjMMe1dHZ5Q8DxoFQpXCjhZvqswMva3WvLGUKAAabsBxr"
    :private "4048a60cbc9eb74814808f2b67897eea4b1f01d46c166b7c4d2be7902602a66a",
@@ -128,13 +135,10 @@
                                                       "opts"     {"meta" true}})]
           (is (= "User can only create a wishlist linked to their own identity."
                  (ex-message unauthorized)))
-          (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 1, :allowed 0},
-                  "http://a.co/wishlistModifyPolicy"     {:executed 0, :allowed 0},
-                  "http://a.co/wishlistViewPolicy"       {:executed 0, :allowed 0},
-                  "http://a.co/wishlistItemCreatePolicy" {:executed 0, :allowed 0},
-                  "http://a.co/wishlistItemModifyPolicy" {:executed 0, :allowed 0},
-                  "http://a.co/wishlistItemViewPolicy"   {:executed 0, :allowed 0},
-                  "http://a.co/availableModifyPolicy"    {:executed 0, :allowed 0}}
+          ;; Only tracks policies that were actually executed (no pre-registration)
+          (is (valid-policy-tracker? (:policy (ex-data unauthorized)))
+              "Policy tracker should have no nil keys")
+          (is (= {"http://a.co/wishlistCreatePolicy" {:executed 1}}
                  (:policy (ex-data unauthorized))))
           (is (= 3
                  (:fuel (ex-data unauthorized))))))
@@ -156,25 +160,20 @@
                                                     "select"   "?wishlist"
                                                     "opts"     {"meta" true}})]
           (is (nil? (ex-data authorized)))
-          (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 1, :allowed 1},
-                  "http://a.co/wishlistModifyPolicy"     {:executed 2, :allowed 2},
-                  "http://a.co/wishlistViewPolicy"       {:executed 0, :allowed 0},
-                  "http://a.co/wishlistItemCreatePolicy" {:executed 0, :allowed 0},
-                  "http://a.co/wishlistItemModifyPolicy" {:executed 0, :allowed 0},
-                  "http://a.co/wishlistItemViewPolicy"   {:executed 0, :allowed 0},
-                  "http://a.co/availableModifyPolicy"    {:executed 0, :allowed 0}}
+          ;; Only tracks policies that were actually executed (no pre-registration)
+          (is (valid-policy-tracker? (:policy txn-result))
+              "Policy tracker should have no nil keys")
+          (is (= {"http://a.co/wishlistCreatePolicy" {:executed 1, :allowed 1},
+                  "http://a.co/wishlistModifyPolicy" {:executed 2, :allowed 2}}
                  (:policy txn-result)))
           (is (= 5
                  (:fuel txn-result)))
           (is (= ["a:burt-wish1"]
                  (:result result)))
-          (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 0, :allowed 0},
-                  "http://a.co/wishlistModifyPolicy"     {:executed 0, :allowed 0},
-                  "http://a.co/wishlistViewPolicy"       {:executed 1, :allowed 1},
-                  "http://a.co/wishlistItemCreatePolicy" {:executed 0, :allowed 0},
-                  "http://a.co/wishlistItemModifyPolicy" {:executed 0, :allowed 0},
-                  "http://a.co/wishlistItemViewPolicy"   {:executed 0, :allowed 0},
-                  "http://a.co/availableModifyPolicy"    {:executed 0, :allowed 0}}
+          ;; Only tracks policies that were actually executed (no pre-registration)
+          (is (valid-policy-tracker? (:policy result))
+              "Query policy tracker should have no nil keys")
+          (is (= {"http://a.co/wishlistViewPolicy" {:executed 1, :allowed 1}}
                  (:policy result)))
           (is (= 1
                  (:fuel result))))))
@@ -201,12 +200,8 @@
                                                         "opts" {"meta" true}})]
             (is (= "User can only create an item on their own wishlist."
                    (ex-message unauthorized)))
-            (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 0, :allowed 0},
-                    "http://a.co/wishlistViewPolicy"       {:executed 0, :allowed 0},
-                    "http://a.co/wishlistItemCreatePolicy" {:executed 1, :allowed 0},
-                    "http://a.co/wishlistItemModifyPolicy" {:executed 0, :allowed 0},
-                    "http://a.co/wishlistItemViewPolicy"   {:executed 0, :allowed 0},
-                    "http://a.co/availableModifyPolicy"    {:executed 0, :allowed 0}}
+            ;; Only tracks policies that were actually executed (no pre-registration)
+            (is (= {"http://a.co/wishlistItemCreatePolicy" {:executed 1}}
                    (:policy (ex-data unauthorized))))
             (is (= 5
                    (:fuel (ex-data unauthorized))))))
@@ -227,13 +222,9 @@
                                                       "select"   {"a:burt-wish1-1" ["*"]}
                                                       "opts"     {"meta" true}})]
             (is (nil? (ex-data authorized)))
-            (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 0, :allowed 0},
-                    "http://a.co/wishlistModifyPolicy"     {:executed 1, :allowed 1},
-                    "http://a.co/wishlistViewPolicy"       {:executed 0, :allowed 0},
-                    "http://a.co/wishlistItemCreatePolicy" {:executed 0, :allowed 0},
-                    "http://a.co/wishlistItemModifyPolicy" {:executed 3, :allowed 3},
-                    "http://a.co/wishlistItemViewPolicy"   {:executed 0, :allowed 0},
-                    "http://a.co/availableModifyPolicy"    {:executed 0, :allowed 0}}
+            ;; Only tracks policies that were actually executed (no pre-registration)
+            (is (= {"http://a.co/wishlistModifyPolicy"     {:executed 1, :allowed 1},
+                    "http://a.co/wishlistItemModifyPolicy" {:executed 3, :allowed 3}}
                    (:policy txn-result)))
             (is (= 11
                    (:fuel txn-result)))
@@ -241,13 +232,8 @@
                      "a:description" "flying car, basically"
                      "a:rank"        1}]
                    (:result result)))
-            (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 0, :allowed 0},
-                    "http://a.co/wishlistModifyPolicy"     {:executed 0, :allowed 0},
-                    "http://a.co/wishlistViewPolicy"       {:executed 0, :allowed 0},
-                    "http://a.co/wishlistItemCreatePolicy" {:executed 0, :allowed 0},
-                    "http://a.co/wishlistItemModifyPolicy" {:executed 0, :allowed 0},
-                    "http://a.co/wishlistItemViewPolicy"   {:executed 3, :allowed 3},
-                    "http://a.co/availableModifyPolicy"    {:executed 0, :allowed 0}}
+            ;; Only tracks policies that were actually executed (no pre-registration)
+            (is (= {"http://a.co/wishlistItemViewPolicy" {:executed 3, :allowed 3}}
                    (:policy result)))
             (is (= 3
                    (:fuel result)))))))
@@ -281,13 +267,8 @@
             (testing "cannot be modified by owner"
               (is (= "User cannot modify available status on their own items."
                      (ex-message unauthorized)))
-              (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 0, :allowed 0},
-                      "http://a.co/wishlistModifyPolicy"     {:executed 0, :allowed 0},
-                      "http://a.co/wishlistViewPolicy"       {:executed 0, :allowed 0},
-                      "http://a.co/wishlistItemCreatePolicy" {:executed 0, :allowed 0},
-                      "http://a.co/wishlistItemModifyPolicy" {:executed 0, :allowed 0},
-                      "http://a.co/wishlistItemViewPolicy"   {:executed 0, :allowed 0},
-                      "http://a.co/availableModifyPolicy"    {:executed 1, :allowed 0}}
+              ;; Only tracks policies that were actually executed (no pre-registration)
+              (is (= {"http://a.co/availableModifyPolicy" {:executed 1}}
                      (:policy (ex-data unauthorized))))
               (is (= 3
                      (:fuel (ex-data unauthorized)))))
@@ -299,13 +280,10 @@
                          "a:description" "for enhanced mobility on the ground"
                          "a:rank"        2}]
                        (:result result)))
-                (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 0, :allowed 0},
-                        "http://a.co/wishlistModifyPolicy"     {:executed 0, :allowed 0},
-                        "http://a.co/wishlistViewPolicy"       {:executed 0, :allowed 0},
-                        "http://a.co/wishlistItemCreatePolicy" {:executed 0, :allowed 0},
-                        "http://a.co/wishlistItemModifyPolicy" {:executed 0, :allowed 0},
-                        "http://a.co/wishlistItemViewPolicy"   {:executed 3, :allowed 3},
-                        "http://a.co/availableModifyPolicy"    {:executed 1, :allowed 0}}
+                ;; Only tracks policies that were actually executed (no pre-registration)
+                ;; availableModifyPolicy is checked for the available property but doesn't grant view
+                (is (= {"http://a.co/wishlistItemViewPolicy" {:executed 3, :allowed 3}
+                        "http://a.co/availableModifyPolicy"  {:executed 1}}
                        (:policy result)))
                 (is (= 6
                        (:fuel result)))))))
@@ -327,13 +305,9 @@
                          "a:rank"        1,
                          "a:available"   true}]
                        (:result result)))
-                (is (= {"http://a.co/wishlistCreatePolicy"     {:executed 0, :allowed 0},
-                        "http://a.co/wishlistModifyPolicy"     {:executed 0, :allowed 0},
-                        "http://a.co/wishlistViewPolicy"       {:executed 0, :allowed 0},
-                        "http://a.co/wishlistItemCreatePolicy" {:executed 0, :allowed 0},
-                        "http://a.co/wishlistItemModifyPolicy" {:executed 0, :allowed 0},
-                        "http://a.co/wishlistItemViewPolicy"   {:executed 3, :allowed 3},
-                        "http://a.co/availableModifyPolicy"    {:executed 1, :allowed 1}}
+                ;; Only tracks policies that were actually executed (no pre-registration)
+                (is (= {"http://a.co/wishlistItemViewPolicy" {:executed 3, :allowed 3},
+                        "http://a.co/availableModifyPolicy"  {:executed 1, :allowed 1}}
                        (:policy result)))
                 (is (= 6
                        (:fuel result)))))))))))

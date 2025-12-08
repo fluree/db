@@ -93,6 +93,7 @@
 (defn ledger-info
   "Returns comprehensive ledger information including statistics for specified branch (or default branch if nil).
    Computes current property and class statistics by replaying novelty on top of indexed stats.
+   Uses connection's LRU cache to share stats computation with f:onClass policy optimization.
    Returns stats in native SID format - use fluree.db.api/ledger-info for IRI-decoded version."
   ([ledger]
    (ledger-info ledger const/default-branch-name))
@@ -100,8 +101,9 @@
    (go-try
      (let [branch-data (get-branch-meta ledger requested-branch)
            current-db  (branch/current-db branch-data)
-           {:keys [stats namespace-codes novelty-post commit]} (<? (dbproto/-ledger-info current-db))
-           current-stats (novelty/current-stats {:stats stats :novelty {:post novelty-post}})
+           {:keys [stats namespace-codes commit]} (<? (dbproto/-ledger-info current-db))
+           ;; Use cached stats - shared with f:onClass policy optimization
+           current-stats (<? (novelty/cached-current-stats current-db))
            commit-jsonld (commit-data/->json-ld commit)
            nameservice (when primary-publisher
                          (try*

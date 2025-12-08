@@ -15,19 +15,23 @@
   [db]
   (enforce/unrestricted-view? (:policy db)))
 
-;; TODO - could cache resolved policies and not  just classes
-;; TODO - need to look for any other use of (:cache policy) to see
-(defn cached-class-policies
-  [policy sid]
-  (when-let [classes (get @(:cache policy) sid)]
-    (enforce/view-policies-for-classes policy classes)))
-
-(defn class-policies
-  [{:keys [policy] :as db} tracker sid]
+(defn- filter-applicable-class-policies
+  "Filters class-derived policies to only those applicable to the subject's classes.
+   For property-indexed class policies, we need to verify the subject is of the target class.
+   Uses the policy cache to avoid redundant class lookups."
+  [{:keys [policy] :as db} tracker sid class-derived-policies]
   (go-try
-    (let [class-sids (<? (dbproto/-class-ids db tracker sid))]
-      (swap! (:cache policy) assoc sid class-sids)
-      (enforce/view-policies-for-classes policy class-sids))))
+    (when (seq class-derived-policies)
+      (let [;; Get subject's classes (using cache if available)
+            subject-classes (or (get @(:cache policy) sid)
+                                (let [classes (<? (dbproto/-class-ids db tracker sid))]
+                                  (swap! (:cache policy) assoc sid classes)
+                                  classes))]
+        ;; Filter to only policies where subject is of a target class
+        ;; Convert subject-classes to set to use as predicate in some
+        (filter (fn [{:keys [for-classes]}]
+                  (some (set subject-classes) for-classes))
+                class-derived-policies)))))
 
 (defn allow-flake?
   "Returns one of:
@@ -37,17 +41,27 @@
 
   Note: does not check here for unrestricted-view? as that should
   happen upstream. Assumes this is a policy-wrapped db if it ever
-  hits this fn."
+  hits this fn.
+
+  Class policies are stored directly in [:view :property pid] with a :class-policy? flag.
+  This enables a single O(1) lookup - class-derived policies are filtered inline based
+  on subject's classes (cached)."
   [{:keys [policy] :as db} tracker flake]
   (go-try
     (let [pid      (flake/p flake)
           sid      (flake/s flake)
-          policies (concat (enforce/view-policies-for-property policy pid)
+          ;; Single O(1) lookup - gets both regular and class-derived policies
+          all-property-policies (enforce/view-policies-for-property policy pid)
+          ;; Separate regular vs class-derived policies
+          {class-derived-policies true
+           regular-property-policies false} (group-by #(boolean (:class-policy? %))
+                                                      (or all-property-policies []))
+          ;; Filter class-derived policies to only those where subject is of target class
+          applicable-class-policies (when (seq class-derived-policies)
+                                      (<? (filter-applicable-class-policies db tracker sid class-derived-policies)))
+          policies (concat regular-property-policies
                            (enforce/view-policies-for-subject policy sid)
-                           (or (cached-class-policies policy sid)
-                               (when (-> policy :view :class not-empty)
-                                 ;; only do range scan if we have /any/ class policies
-                                 (<? (class-policies db tracker sid))))
+                           applicable-class-policies
                            (enforce/view-policies-for-flake db flake))]
       (if-some [required-policies (not-empty (filter :required? policies))]
         (<? (enforce/policies-allow-viewing? db tracker sid required-policies))

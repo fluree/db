@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.util :as util :refer [try* catch*]]
@@ -37,21 +38,78 @@
     (modify-restriction? restriction)
     (update-in [:modify :default] util/conjv restriction)))
 
+(defn- get-class-properties
+  "Returns the set of property SIDs used by instances of the given class.
+   Uses stats from db :stats field (either from indexing or from cached ledger-info computation)."
+  [db cid]
+  (when-let [class-stats (get-in db [:stats :classes cid])]
+    (set (keys (:properties class-stats)))))
+
+(defn- build-property-to-classes-map
+  "Builds a reverse mapping from property SID to the set of classes that use it.
+   Returns {pid #{cid1 cid2 ...}}"
+  [db cids]
+  (reduce
+   (fn [acc cid]
+     (let [properties (get-class-properties db cid)]
+       (reduce (fn [m pid]
+                 (update m pid (fnil conj #{}) cid))
+               acc
+               properties)))
+   {}
+   cids))
+
+(defn- add-implicit-class-properties
+  "Adds implicit properties (@id, @type) to the property-classes map.
+   Every subject of a class has @id and @type flakes, so class-derived
+   policies must also apply to these properties."
+  [property-classes-map cids]
+  (-> property-classes-map
+      (update const/$id (fnil into #{}) cids)
+      (update const/$rdf:type (fnil into #{}) cids)))
+
 (defn add-class-restriction
+  "Adds class-targeted policies with O(1) indexed lookup.
+
+   Stores class-derived policies directly in [:view :property pid] and [:modify :property pid]
+   (the same map as regular property policies) with a :class-policy? flag. This enables
+   a single O(1) lookup at query time - the class check is done inline during policy evaluation.
+
+   When stats are available, policies are indexed by all properties used by the target classes.
+   Additionally, implicit properties (@id, @type) are always indexed since every subject has them.
+   This ensures policies apply even when restricting classes with no existing instances."
   [restriction-map db policy-map]
-  (let [cids (policy-cids db restriction-map)]
-    (reduce
-     (fn [policy cid]
-       (let [restriction-map* (assoc restriction-map :cid cid)]
+  (let [cids (policy-cids db restriction-map)
+        ;; Build reverse mapping: property -> classes that use it
+        property-classes-map (build-property-to-classes-map db cids)
+        ;; Always add implicit properties (@id, @type) - every class instance has these
+        ;; This ensures policies work even for classes with no existing instances
+        property-classes-map* (add-implicit-class-properties property-classes-map cids)]
+    ;; Store class-derived policies directly in [:view :property pid]
+    ;; This is the same map as regular property policies, enabling single O(1) lookup
+    ;; The :class-policy? flag indicates class verification is needed during evaluation
+    (reduce-kv
+     (fn [policy pid classes-using-property]
+       (let [;; Create a class-derived restriction for this property
+             ;; It includes metadata about which classes use this property
+             class-policy {:id               (:id restriction-map)
+                           :class-policy?    true          ; marks this as needing class check
+                           :for-classes      classes-using-property ; classes this policy targets
+                           :on-class         (:on-class restriction-map)
+                           :required?        (:required? restriction-map)
+                           :ex-message       (:ex-message restriction-map)
+                           :view?            (:view? restriction-map)
+                           :modify?          (:modify? restriction-map)
+                           :allow?           (:allow? restriction-map)
+                           :query            (:query restriction-map)}]
          (cond-> policy
+           (view-restriction? restriction-map)
+           (update-in [:view :property pid] util/conjv class-policy)
 
-           (view-restriction? restriction-map*)
-           (update-in [:view :class cid] util/conjv restriction-map*)
-
-           (modify-restriction? restriction-map*)
-           (update-in [:modify :class cid] util/conjv restriction-map*))))
+           (modify-restriction? restriction-map)
+           (update-in [:modify :property pid] util/conjv class-policy))))
      policy-map
-     cids)))
+     property-classes-map*)))
 
 (defn add-property-restriction
   [restriction-map db policy-map]
@@ -307,6 +365,26 @@
     (policy/inject-value-binding policy-values "?$identity" {const/iri-value (str ":" (random-uuid))
                                                              const/iri-type const/iri-id})))
 
+(defn- has-class-policies?
+  "Checks if any policy document has f:onClass targeting.
+   Used to determine if we need to compute class->property stats."
+  [policy-docs]
+  (some #(get % const/iri-onClass) policy-docs))
+
+(defn- get-stats-for-class-policies
+  "Gets class->property stats for f:onClass optimization.
+   Uses shared LRU cache (same as ledger-info API).
+   Returns db with :stats populated.
+   Throws if stats computation fails (required for f:onClass policies)."
+  [db]
+  (async/go
+    (let [stats (async/<! (novelty/cached-current-stats db))]
+      (if (util/exception? stats)
+        (throw (ex-info "Failed to compute stats for f:onClass policy optimization. Class restrictions require stats."
+                        {:error :db/policy-error
+                         :cause (ex-message stats)}))
+        (assoc db :stats stats)))))
+
 (defn wrap-policy
   ([db policy-rules policy-values]
    (wrap-policy db nil policy-rules policy-values nil))
@@ -314,10 +392,15 @@
    (wrap-policy db tracker policy-rules policy-values nil))
   ([db tracker policy-rules policy-values default-allow?]
    (async/go
-     (let [error-ch        (async/chan)
+     (let [policy-docs     (util/sequential policy-rules)
+           ;; Only compute stats if there are f:onClass policies
+           db*             (if (has-class-policies? policy-docs)
+                             (async/<! (get-stats-for-class-policies db))
+                             db)
+           error-ch        (async/chan)
            policy-values*  (ensure-ground-identity policy-values)
-           [wrapper _]     (async/alts! [error-ch (parse-policies db tracker error-ch policy-values*
-                                                                  (util/sequential policy-rules))])]
+           [wrapper _]     (async/alts! [error-ch (parse-policies db* tracker error-ch policy-values*
+                                                                  policy-docs)])]
        (if (util/exception? wrapper)
          wrapper
          (assoc db :policy (assoc wrapper

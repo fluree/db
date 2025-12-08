@@ -17,14 +17,6 @@
   [policy]
   (true? (get-in policy [:view :root?])))
 
-(defn view-class-policy-map
-  [policy]
-  (get-in policy [:view :class]))
-
-(defn modify-class-policy-map
-  [policy]
-  (get-in policy [:modify :class]))
-
 (defn modify-property-policy-map
   [policy]
   (get-in policy [:modify :property]))
@@ -32,16 +24,6 @@
 (defn view-property-policy-map
   [policy]
   (get-in policy [:view :property]))
-
-(defn view-policies-for-classes
-  [policy classes]
-  (let [class-policies (view-class-policy-map policy)]
-    (seq (apply concat (keep #(get class-policies %) classes)))))
-
-(defn modify-policies-for-classes
-  [policy classes]
-  (let [class-policies (modify-class-policy-map policy)]
-    (seq (apply concat (keep #(get class-policies %) classes)))))
 
 (defn modify-policies-for-property
   [policy-map property]

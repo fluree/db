@@ -96,7 +96,7 @@ The query must use `?$this` as the variable for the subject IRI.
 
 ### f:onClass - Class Targeting
 
-Target all instances of a class for efficient indexed lookups:
+Target all instances of a class. Class policies are automatically optimized to use O(1) property-based lookups:
 
 ```json
 {
@@ -105,6 +105,13 @@ Target all instances of a class for efficient indexed lookups:
   "f:query": {...}
 }
 ```
+
+**How it works**: When you define a class policy, Fluree automatically indexes the policy by all properties used by that class. At query time, the policy is found via fast property lookup, then verified against the subject's actual class membership.
+
+**Performance characteristics**:
+- O(1) lookup per property (same as `f:onProperty`)
+- Class membership verification is cached per subject during the request
+- Implicit properties (`@id`, `@type`) are always indexed for class policies
 
 ### f:onProperty - Property Targeting (Indexed)
 
@@ -277,6 +284,67 @@ By default, if no policy matches a piece of data, access is denied. Use the `def
   }
 }
 ```
+
+## Tracking Policy Execution
+
+Enable policy execution tracking to understand which policies are evaluated and how often they grant access. This is useful for debugging, auditing, and performance analysis.
+
+### Enabling Tracking
+
+Include `"meta": true` in the query/transaction options:
+
+```clojure
+;; Query with policy tracking
+@(fluree/query policy-db
+  {"@context" {"ex" "http://example.org/"}
+   "select" {"?s" ["*"]}
+   "where" {"@id" "?s" "@type" "ex:User"}
+   "opts" {"meta" true}})
+
+;; Transaction with policy tracking
+@(fluree/update policy-db
+  {"@context" {"ex" "http://example.org/"}
+   "insert" {"@id" "ex:newUser" "@type" "ex:User"}
+   "opts" {"meta" true}})
+```
+
+### Tracking Results
+
+When `meta` is enabled, the result includes a `:policy` map showing execution statistics:
+
+```clojure
+{:result [...],
+ :fuel 5,
+ :time "2.3ms",
+ :policy {"http://example.org/viewPolicy" {:executed 3, :allowed 3},
+          "http://example.org/adminPolicy" {:executed 1, :allowed 0}}}
+```
+
+| Key | Description |
+|-----|-------------|
+| `:executed` | Number of times the policy was evaluated against a flake/subject |
+| `:allowed` | Number of times the policy granted access |
+
+### Interpreting Results
+
+- **High executed, low allowed**: Policy is frequently checked but restrictive
+- **executed = allowed**: Policy always grants access when evaluated
+- **Only executed, no allowed**: Policy evaluated but denied (may be normal for deny policies)
+- **Policy not in map**: Policy was never evaluated (didn't match any data)
+
+### Error Tracking
+
+When a policy-enforced operation fails, the exception data includes tracking:
+
+```clojure
+(try
+  @(fluree/update policy-db {..., "opts" {"meta" true}})
+  (catch Exception e
+    (println (:policy (ex-data e)))))
+;; => {"http://example.org/denyPolicy" {:executed 1}}
+```
+
+This shows which policy caused the denial.
 
 ## API Functions
 

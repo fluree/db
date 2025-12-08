@@ -38,30 +38,36 @@
               (recur r (conj refreshed policy))))
           (assoc-in db-after [:policy :modify :default] refreshed))))))
 
-(defn has-class-policies?
-  [policy]
-  (boolean (-> policy enforce/modify-class-policy-map not-empty)))
-
-;; TODO - get parent classes
-(defn subject-class-policies
-  [db-after tracker policy class-policy-cache sid]
+(defn- filter-applicable-modify-class-policies
+  "Filters class-derived policies to only those applicable to the subject's classes.
+   For property-indexed class policies, we need to verify the subject is of the target class.
+   Uses the class-policy-cache to avoid redundant class lookups."
+  [db-after tracker class-policy-cache sid class-derived-policies]
   (go-try
-    (let [classes  (<? (dbproto/-class-ids db-after tracker sid))
-          policies (or (enforce/modify-policies-for-classes classes policy)
-                       [])]
-      (swap! class-policy-cache assoc sid policies)
-      policies)))
+    (when (seq class-derived-policies)
+      (let [;; Get subject's classes (using cache if available)
+            subject-classes (or (get @class-policy-cache sid)
+                                (let [classes (<? (dbproto/-class-ids db-after tracker sid))]
+                                  (swap! class-policy-cache assoc sid classes)
+                                  classes))]
+        ;; Filter to only policies where subject is of a target class
+        (filter (fn [{:keys [for-classes]}]
+                  (some (set subject-classes) for-classes))
+                class-derived-policies)))))
 
 (defn allowed?
   "Checks if all 'adds' are allowed by the policy. If so
   returns final db.
 
   If encounters a policy error, will throw with policy error
-  message (if available)."
+  message (if available).
+
+  Class policies are stored directly in [:modify :property pid] with a :class-policy? flag.
+  This enables a single O(1) lookup - class-derived policies are filtered inline based
+  on subject's classes (cached)."
   [tracker {:keys [db-after add]}]
   (go-try
     (let [{:keys [policy]} (<? (refresh-modify-policies db-after tracker))
-          class-policies? (has-class-policies? policy)
           class-policy-cache (atom {})]
       (if (enforce/unrestricted-modify? policy)
         db-after
@@ -69,11 +75,19 @@
           (if flake
             (let [sid      (flake/s flake)
                   pid      (flake/p flake)
-                  policies (concat (enforce/modify-policies-for-property policy pid)
+                  ;; Single O(1) lookup - gets both regular and class-derived policies
+                  all-property-policies (enforce/modify-policies-for-property policy pid)
+                  ;; Separate regular vs class-derived policies
+                  {class-derived-policies true
+                   regular-property-policies false} (group-by #(boolean (:class-policy? %))
+                                                              (or all-property-policies []))
+                  ;; Filter class-derived policies to only those where subject is of target class
+                  applicable-class-policies (when (seq class-derived-policies)
+                                              (<? (filter-applicable-modify-class-policies
+                                                   db-after tracker class-policy-cache sid class-derived-policies)))
+                  policies (concat regular-property-policies
                                    (enforce/modify-policies-for-subject policy sid)
-                                   (when class-policies?
-                                     (or (get @class-policy-cache sid)
-                                         (<? (subject-class-policies db-after tracker policy class-policy-cache sid))))
+                                   applicable-class-policies
                                    (enforce/modify-policies-for-flake db-after flake))]
               ;; policies-allow-modification? will throw if access forbidden
               (if-some [required-policies (not-empty (filter :required? policies))]
