@@ -66,11 +66,11 @@
                                (try*
                                  (<? (publish-commit ns ledger-alias commit-address commit-t))
                                  (catch* e
-                                         (log/warn! ::publish-commit-failed
-                                                    {:ledger-alias ledger-alias :commit-t commit-t :publisher ns})
-                                         (log/warn e "Publisher failed to publish commit"
-                                                   {:alias ledger-alias :commit-t commit-t})
-                                         ::publishing-error))))))]
+                                   (log/warn! ::publish-commit-failed
+                                              {:ledger-alias ledger-alias :commit-t commit-t :publisher ns})
+                                   (log/warn e "Publisher failed to publish commit"
+                                             {:alias ledger-alias :commit-t commit-t})
+                                   ::publishing-error))))))]
     (if (seq pub-chs)
       (async/into [] (async/merge pub-chs))
       (go []))))
@@ -87,11 +87,11 @@
                                (try*
                                  (<? (publish-index ns ledger-alias index-address index-t))
                                  (catch* e
-                                         (log/warn! ::publish-index-failed
-                                                    {:ledger-alias ledger-alias :index-t index-t :publisher ns})
-                                         (log/warn e "Publisher failed to publish index"
-                                                   {:alias ledger-alias :index-t index-t})
-                                         ::publishing-error))))))]
+                                   (log/warn! ::publish-index-failed
+                                              {:ledger-alias ledger-alias :index-t index-t :publisher ns})
+                                   (log/warn e "Publisher failed to publish index"
+                                             {:alias ledger-alias :index-t index-t})
+                                   ::publishing-error))))))]
     (if (seq pub-chs)
       (async/into [] (async/merge pub-chs))
       (go []))))

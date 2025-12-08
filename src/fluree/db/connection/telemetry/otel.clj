@@ -9,7 +9,6 @@
    [io.opentelemetry.exporter.otlp.http.metrics OtlpHttpMetricExporter]
    [io.opentelemetry.exporter.otlp.http.trace OtlpHttpSpanExporter]
    [io.opentelemetry.sdk OpenTelemetrySdk]
-   [io.opentelemetry.sdk.common InstrumentationLibraryInfo]
    [io.opentelemetry.sdk.logs SdkLoggerProvider]
    [io.opentelemetry.sdk.logs.export BatchLogRecordProcessor]
    [io.opentelemetry.sdk.metrics SdkMeterProvider]
@@ -50,10 +49,10 @@
                             (.build))
 
         propagators     (ContextPropagators/create
-                          (TextMapPropagator/composite
-                            (doto (java.util.ArrayList.)
-                              (.add (W3CTraceContextPropagator/getInstance))
-                              (.add (W3CBaggagePropagator/getInstance)))))
+                         (TextMapPropagator/composite
+                          (doto (java.util.ArrayList.)
+                            (.add (W3CTraceContextPropagator/getInstance))
+                            (.add (W3CBaggagePropagator/getInstance)))))
 
         sdk  (-> (OpenTelemetrySdk/builder)
                  (.setTracerProvider trace-provider)
@@ -68,6 +67,4 @@
 (comment
 
   (GlobalOpenTelemetry/resetForTest)
-  (def sdk (configure-otel {:protocol "http/protobuf" :endpoint "http://localhost:4318" :service-name "fluree-db"}))
-
-  )
+  (def sdk (configure-otel {:protocol "http/protobuf" :endpoint "http://localhost:4318" :service-name "fluree-db"})))

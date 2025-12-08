@@ -414,7 +414,7 @@
 (defn handler:memory
   "A taoensso.telemere logging handler that stores all the logs it receives in memory."
   ([] (handler:memory {:store (atom [])}))
-  ([{:keys [store] :as constructor-opts}]
+  ([{:keys [store]}]
    (fn a-handler:memory-handler
      ([signal] (swap! store conj signal))
      ([] :closed))))

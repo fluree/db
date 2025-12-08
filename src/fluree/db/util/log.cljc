@@ -165,15 +165,15 @@
      "Logs the first time a transducer receives a value."
      [id data]
      `(fn [rf#]
-       (let [logged?# (volatile! false)]
-         (fn
-           ([] (rf#))
-           ([result# x#]
-            (when-not @logged?#
-              (debug! ~id ~data)
-              (vreset! logged?# true))
-            (rf# result# x#))
-           ([result#] (rf# result#)))))))
+        (let [logged?# (volatile! false)]
+          (fn
+            ([] (rf#))
+            ([result# x#]
+             (when-not @logged?#
+               (debug! ~id ~data)
+               (vreset! logged?# true))
+             (rf# result# x#))
+            ([result#] (rf# result#)))))))
 
 #?(:clj
    (defmacro trace!
