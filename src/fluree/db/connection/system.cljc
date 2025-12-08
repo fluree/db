@@ -4,6 +4,7 @@
             #?(:clj [fluree.db.migrations.nameservice :as ns-migration])
             #?(:clj [fluree.db.nameservice.dynamodb :as dynamodb-nameservice])
             #?(:clj [fluree.db.storage.file :as file-storage])
+            #?(:clj [fluree.db.util.log :as log])
             [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]
             [fluree.db.connection.config :as config]
@@ -181,6 +182,12 @@
 #?(:clj
    (defmethod ig/init-key :fluree.db.storage/s3
      [_ config]
+     ;; LOG RAW CONFIG - This will show if s3Endpoint is present at all
+     (log/error "S3-INIT-CONFIG-RAW [v2025-12-06T02:00]"
+                {:config-keys (keys config)
+                 :has-endpoint? (contains? config conn-vocab/s3-endpoint)
+                 :endpoint-raw (get config conn-vocab/s3-endpoint)
+                 :full-config config})
      (let [identifier  (config/get-first-string config conn-vocab/address-identifier)
            s3-bucket   (config/get-first-string config conn-vocab/s3-bucket)
            s3-prefix   (config/get-first-string config conn-vocab/s3-prefix)
@@ -191,6 +198,13 @@
            max-retries (config/get-first-integer config conn-vocab/s3-max-retries)
            retry-base-delay-ms (config/get-first-long config conn-vocab/s3-retry-base-delay-ms)
            retry-max-delay-ms (config/get-first-long config conn-vocab/s3-retry-max-delay-ms)]
+       ;; DIAGNOSTIC: This fires when loading from solo3 config
+       (log/warn "S3-DIAGNOSTIC: Initializing S3 storage from configuration [v2025-12-06T02:00]"
+                 {:identifier identifier
+                  :bucket s3-bucket
+                  :prefix s3-prefix
+                  :endpoint s3-endpoint
+                  :code-version "2025-12-06T02:00:00Z"})
        (s3-storage/open identifier s3-bucket s3-prefix s3-endpoint
                         {:read-timeout-ms read-timeout-ms
                          :write-timeout-ms write-timeout-ms
