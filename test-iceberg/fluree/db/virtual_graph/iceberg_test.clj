@@ -5,6 +5,10 @@
    Run with: clojure -M:dev:iceberg:cljtest -e \"(require '[fluree.db.virtual-graph.iceberg-test]) (clojure.test/run-tests 'fluree.db.virtual-graph.iceberg-test)\""
   (:require [clojure.core.async :as async]
             [clojure.test :refer [deftest is testing use-fixtures]]
+            [fluree.db.api :as fluree]
+            [fluree.db.connection.config :as config]
+            [fluree.db.connection.system :as system]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.query.exec.where :as where]
             [fluree.db.virtual-graph.iceberg :as iceberg-vg])
   (:import [java.io File]))
@@ -238,6 +242,150 @@
            #"requires :mapping or :mappingInline"
            (iceberg-vg/create {:alias "test"
                                :config {:warehouse-path warehouse-path}}))))))
+
+;;; ---------------------------------------------------------------------------
+;;; End-to-End Integration Tests (Full Fluree API)
+;;; ---------------------------------------------------------------------------
+
+(def ^:private e2e-system (atom nil))
+(def ^:private e2e-conn (atom nil))
+(def ^:private e2e-publisher (atom nil))
+
+(defn- setup-fluree-system
+  "Set up Fluree system for end-to-end testing."
+  []
+  (let [memory-config {"@context" {"@base"  "https://ns.flur.ee/config/connection/"
+                                   "@vocab" "https://ns.flur.ee/system#"}
+                       "@id"      "memory"
+                       "@graph"   [{"@id"   "memoryStorage"
+                                    "@type" "Storage"}
+                                   {"@id"              "connection"
+                                    "@type"            "Connection"
+                                    "parallelism"      4
+                                    "cacheMaxMb"       100
+                                    "commitStorage"    {"@id" "memoryStorage"}
+                                    "indexStorage"     {"@id" "memoryStorage"}
+                                    "primaryPublisher" {"@type"   "Publisher"
+                                                        "storage" {"@id" "memoryStorage"}}}]}
+        sys (system/initialize (config/parse memory-config))]
+    (reset! e2e-system sys)
+    (reset! e2e-conn (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) sys))
+    (reset! e2e-publisher (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) sys))))
+
+(defn- teardown-fluree-system []
+  (when @e2e-system
+    (reset! e2e-system nil)
+    (reset! e2e-conn nil)
+    (reset! e2e-publisher nil)))
+
+(deftest e2e-register-and-query-iceberg-vg-test
+  (when (and (warehouse-exists?) (mapping-exists?))
+    (testing "End-to-end: Register Iceberg VG and query via Fluree API"
+      (setup-fluree-system)
+      (try
+        ;; Register the Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/airlines:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping mapping-path}}))
+
+        ;; Query using FQL with FROM clause
+        (let [query {"from" ["iceberg/airlines"]
+                     "select" ["?name" "?country"]
+                     "where" {"@id" "?airline"
+                              "http://example.org/airlines/name" "?name"
+                              "http://example.org/airlines/country" "?country"}
+                     "limit" 10}
+              res @(fluree/query-connection @e2e-conn query)]
+          (is (vector? res) "Should return results as vector")
+          (is (= 10 (count res)) "Should return 10 results (limit)")
+          (is (every? #(= 2 (count %)) res) "Each result should have 2 values"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-iceberg-literal-filter-test
+  (when (and (warehouse-exists?) (mapping-exists?))
+    (testing "End-to-end: Query with literal filter pushdown"
+      (setup-fluree-system)
+      (try
+        ;; Register the Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/airlines-filter:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping mapping-path}}))
+
+        ;; Query with literal filter - should push predicate to Iceberg
+        (let [query {"from" ["iceberg/airlines-filter"]
+                     "select" ["?name"]
+                     "where" {"@id" "?airline"
+                              "http://example.org/airlines/name" "?name"
+                              "http://example.org/airlines/country" "United States"}}
+              res @(fluree/query-connection @e2e-conn query)]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should have some US airlines")
+          (is (< (count res) 6162) "Should filter (not return all airlines)"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-iceberg-sparql-query-test
+  (when (and (warehouse-exists?) (mapping-exists?))
+    (testing "End-to-end: SPARQL query against Iceberg VG"
+      (setup-fluree-system)
+      (try
+        ;; Register the Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/airlines-sparql:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping mapping-path}}))
+
+        ;; Query using SPARQL with FROM clause
+        (let [sparql "PREFIX ex: <http://example.org/airlines/>
+                      SELECT ?name ?country
+                      FROM <iceberg/airlines-sparql>
+                      WHERE {
+                        ?airline ex:name ?name .
+                        ?airline ex:country ?country .
+                      }
+                      LIMIT 5"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return results as vector")
+          (is (= 5 (count res)) "Should return 5 results (limit)")
+          (is (every? #(= 2 (count %)) res) "Each result should have name and country"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-iceberg-count-query-test
+  (when (and (warehouse-exists?) (mapping-exists?))
+    (testing "End-to-end: Aggregate COUNT query"
+      (setup-fluree-system)
+      (try
+        ;; Register the Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/airlines-count:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping mapping-path}}))
+
+        ;; Count all airlines
+        (let [query {"from" ["iceberg/airlines-count"]
+                     "select" ["(count ?airline)"]
+                     "where" {"@id" "?airline"
+                              "http://example.org/airlines/name" "?name"}}
+              res @(fluree/query-connection @e2e-conn query)]
+          (is (= [[6162]] res) "Should count all 6162 airlines"))
+
+        (finally
+          (teardown-fluree-system))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Run from REPL

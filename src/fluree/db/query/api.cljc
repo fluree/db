@@ -17,6 +17,7 @@
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
+            [fluree.db.util.json :as json]
             [fluree.db.util.ledger :as ledger-util]
             [fluree.db.util.log :as log]))
 
@@ -240,7 +241,11 @@
 
              (iceberg-virtual-graph? ns-record)
              ;; Iceberg VGs - create directly and apply time-travel if specified
-             (let [config (get ns-record "fidx:config")
+             (let [raw-config (get-in ns-record ["fidx:config" "@value"])
+                   ;; Config is stored as JSON string, need to parse it
+                   config (if (string? raw-config)
+                            (json/parse raw-config false)
+                            raw-config)
                    ;; Dynamic loading to avoid requiring Iceberg deps at compile time
                    create-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/create)
                    with-time-travel-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/with-time-travel)
