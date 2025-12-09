@@ -164,8 +164,77 @@
     (parse-r2rml-from-triples by-subject)))
 
 ;;; ---------------------------------------------------------------------------
-;;; Pattern Analysis
+;;; Pattern Analysis & Multi-Table Routing
 ;;; ---------------------------------------------------------------------------
+
+(defn- build-routing-indexes
+  "Build indexes for routing patterns to the correct table.
+
+   Returns:
+     {:class->mapping {rdf-class -> mapping}
+      :predicate->mapping {predicate-iri -> mapping}}"
+  [mappings]
+  (let [class->mapping (->> mappings
+                            vals
+                            (filter :class)
+                            (map (fn [m] [(:class m) m]))
+                            (into {}))
+        predicate->mapping (->> mappings
+                                vals
+                                (mapcat (fn [m]
+                                          (for [pred (keys (:predicates m))]
+                                            [pred m])))
+                                (into {}))]
+    {:class->mapping class->mapping
+     :predicate->mapping predicate->mapping}))
+
+(defn- extract-pattern-info
+  "Extract type and predicates from a pattern item."
+  [item]
+  (let [triple (if (= :class (first item)) (second item) item)
+        [s p o] triple
+        subject-var (when (and (map? s) (get s ::where/var))
+                      (get s ::where/var))
+        pred-iri (when (map? p) (get p ::where/iri))
+        is-type? (= const/iri-rdf-type pred-iri)
+        rdf-type (when (and is-type? (or (string? o) (map? o)))
+                   (if (string? o) o (get o ::where/iri)))]
+    {:subject-var subject-var
+     :predicate pred-iri
+     :is-type? is-type?
+     :rdf-type rdf-type
+     :item item}))
+
+(defn- group-patterns-by-table
+  "Group patterns by which table they should be routed to.
+
+   Uses the routing indexes to determine which table handles each pattern.
+   Patterns are grouped by subject variable to keep related patterns together.
+
+   Returns: [{:mapping mapping :patterns [...]} ...]"
+  [patterns mappings routing-indexes]
+  (let [{:keys [class->mapping predicate->mapping]} routing-indexes
+        pattern-infos (map extract-pattern-info patterns)
+
+        ;; Find mapping for each pattern
+        find-mapping (fn [{:keys [rdf-type predicate]}]
+                       (or (when rdf-type (get class->mapping rdf-type))
+                           (when predicate (get predicate->mapping predicate))
+                           (first (vals mappings))))
+
+        ;; Group by subject variable first, then by mapping
+        by-subject (group-by :subject-var pattern-infos)
+
+        ;; For each subject group, determine the primary mapping
+        groups (for [[_subj-var infos] by-subject
+                     :let [;; Find mappings for patterns with type info first
+                           type-patterns (filter :rdf-type infos)
+                           mapping (if (seq type-patterns)
+                                     (find-mapping (first type-patterns))
+                                     (find-mapping (first infos)))]]
+                 {:mapping mapping
+                  :patterns (mapv :item infos)})]
+    (vec groups)))
 
 (defn- analyze-clause-for-mapping
   "Find the mapping that matches the query patterns."
@@ -358,10 +427,14 @@
     (map #(row->solution % mapping pred->var subject-var base-solution) rows)))
 
 ;;; ---------------------------------------------------------------------------
-;;; IcebergDatabase Record
+;;; IcebergDatabase Record (Multi-Table Support)
 ;;; ---------------------------------------------------------------------------
 
-(defrecord IcebergDatabase [alias config source mappings time-travel]
+(defrecord IcebergDatabase [alias config sources mappings routing-indexes time-travel]
+  ;; sources: {table-name -> IcebergSource}
+  ;; mappings: {table-key -> {:table, :class, :predicates, ...}}
+  ;; routing-indexes: {:class->mapping {...} :predicate->mapping {...}}
+
   vg/UpdatableVirtualGraph
   (upsert [this _source-db _new-flakes _remove-flakes]
     (go this))
@@ -400,11 +473,49 @@
            (try
              (let [patterns (get solution ::iceberg-patterns)]
                (if (seq patterns)
-                 (let [mapping (analyze-clause-for-mapping patterns mappings)
-                       solutions (execute-iceberg-query source mapping patterns solution time-travel)]
-                   (doseq [sol solutions]
-                     (async/>! ch sol))
-                   (async/close! ch))
+                 ;; Group patterns by table and execute each group
+                 (let [pattern-groups (group-patterns-by-table patterns mappings routing-indexes)]
+                   (if (= 1 (count pattern-groups))
+                     ;; Single table - simple case
+                     (let [{:keys [mapping patterns]} (first pattern-groups)
+                           table-name (:table mapping)
+                           source (get sources table-name)]
+                       (when-not source
+                         (throw (ex-info (str "No source found for table: " table-name)
+                                         {:error :db/missing-source
+                                          :table table-name
+                                          :available-sources (keys sources)})))
+                       (let [solutions (execute-iceberg-query source mapping patterns solution time-travel)]
+                         (doseq [sol solutions]
+                           (async/>! ch sol))
+                         (async/close! ch)))
+                     ;; Multiple tables - nested loop join
+                     (let [execute-group (fn [base-solution {:keys [mapping patterns]}]
+                                           (let [table-name (:table mapping)
+                                                 source (get sources table-name)]
+                                             (when-not source
+                                               (throw (ex-info (str "No source found for table: " table-name)
+                                                               {:error :db/missing-source
+                                                                :table table-name
+                                                                :available-sources (keys sources)})))
+                                             (execute-iceberg-query source mapping patterns base-solution time-travel)))
+                           ;; Execute first group to get initial solutions
+                           first-group (first pattern-groups)
+                           initial-solutions (execute-group solution first-group)]
+                       ;; Short-circuit if first group returns empty
+                       (if (empty? initial-solutions)
+                         (async/close! ch)
+                         ;; For each subsequent group, join with existing solutions
+                         (let [final-solutions (reduce
+                                                (fn [solutions group]
+                                                  (if (empty? solutions)
+                                                    (reduced []) ;; Short-circuit on empty
+                                                    (mapcat #(execute-group % group) solutions)))
+                                                initial-solutions
+                                                (rest pattern-groups))]
+                           (doseq [sol final-solutions]
+                             (async/>! ch sol))
+                           (async/close! ch))))))
                  (do (async/>! ch solution)
                      (async/close! ch))))
              (catch Exception e
@@ -501,16 +612,17 @@
    If time-travel is nil, returns the database unchanged (latest snapshot)."
   [iceberg-db time-travel]
   (if time-travel
-    (let [{:keys [source mappings]} iceberg-db
-          ;; Get the table name from the first mapping to validate snapshot
-          table-name (some-> mappings vals first :table)]
-      (when table-name
+    (let [{:keys [sources mappings]} iceberg-db
+          ;; Validate against the first table (all tables should have same snapshot time for consistency)
+          table-name (some-> mappings vals first :table)
+          source (when table-name (get sources table-name))]
+      (when (and table-name source)
         (validate-snapshot-exists source table-name time-travel))
       (assoc iceberg-db :time-travel time-travel))
     iceberg-db))
 
 (defn create
-  "Create an IcebergDatabase virtual graph.
+  "Create an IcebergDatabase virtual graph with multi-table support.
 
    Registration-time alias format:
      <name>           - defaults to :main branch
@@ -520,9 +632,16 @@
    At query time, use FROM <alias@t:snapshot-id> or FROM <alias@iso:timestamp>
    to specify which snapshot to query.
 
+   Multi-Table Support:
+     The R2RML mapping can define multiple TriplesMap entries, each mapping
+     a different table to a different RDF class. This VG will automatically:
+     - Create an IcebergSource for each unique table in the mappings
+     - Route query patterns to the appropriate table based on class/predicate
+     - Execute cross-table joins using nested loop join strategy
+
    Examples:
-     Registration: 'sales-vg' or 'sales-vg:main'
-     Query: FROM <sales-vg@t:12345> or FROM <sales-vg@iso:2024-01-15T00:00:00Z>
+     Registration: 'openflights-vg' (with R2RML mapping airlines, airports, routes)
+     Query: SELECT ?airline ?airport WHERE { ?airline a :Airline . ?airport a :Airport }
 
    Config:
      :alias          - Virtual graph alias with optional branch (required)
@@ -532,7 +651,6 @@
        :metadata-location - Direct path to metadata JSON (optional)
        :mapping         - Path to R2RML mapping file
        :mappingInline   - Inline R2RML mapping (Turtle or JSON-LD)
-       :table           - Default table name (optional)
 
    Either :warehouse-path or :store must be provided."
   [{:keys [alias config]}]
@@ -567,24 +685,44 @@
             (throw (ex-info "Iceberg virtual graph requires :mapping or :mappingInline"
                             {:error :db/invalid-config :config config})))
 
-        ;; Create appropriate source
-        source (if store
-                 (iceberg/create-fluree-iceberg-source
-                  {:store store
-                   :warehouse-path (or warehouse-path "")})
-                 (iceberg/create-iceberg-source
-                  {:warehouse-path warehouse-path}))
+        ;; Parse R2RML mappings first to discover all tables
+        mappings (parse-r2rml mapping-source)
 
-        mappings (parse-r2rml mapping-source)]
+        ;; Extract unique table names from all mappings
+        table-names (->> mappings
+                         vals
+                         (map :table)
+                         (remove nil?)
+                         distinct)
+
+        ;; Create source factory function
+        create-source-fn (if store
+                           #(iceberg/create-fluree-iceberg-source
+                             {:store store
+                              :warehouse-path (or warehouse-path "")})
+                           #(iceberg/create-iceberg-source
+                             {:warehouse-path warehouse-path}))
+
+        ;; Create an IcebergSource for each unique table
+        ;; Note: Currently we use the same source for all tables in the same warehouse
+        ;; In the future, we could optimize by sharing the source instance
+        sources (into {}
+                      (for [table-name table-names]
+                        [table-name (create-source-fn)]))
+
+        ;; Build routing indexes for efficient pattern-to-table mapping
+        routing-indexes (build-routing-indexes mappings)]
 
     (log/info "Created Iceberg virtual graph:" base-alias
               (if store "store-backed" (str "warehouse:" warehouse-path))
+              "tables:" (vec table-names)
               "mappings:" (count mappings))
 
     (map->IcebergDatabase {:alias base-alias
                            :config (cond-> config
                                      metadata-location
                                      (assoc :metadata-location metadata-location))
-                           :source source
+                           :sources sources
                            :mappings mappings
+                           :routing-indexes routing-indexes
                            :time-travel nil})))

@@ -83,8 +83,8 @@
     (testing "Virtual graph has mappings"
       (is (seq (:mappings @vg))))
 
-    (testing "Virtual graph has Iceberg source"
-      (is (some? (:source @vg))))))
+    (testing "Virtual graph has Iceberg sources"
+      (is (seq (:sources @vg))))))
 
 (deftest r2rml-mapping-parsed-test
   (when @vg
@@ -383,6 +383,175 @@
                               "http://example.org/airlines/name" "?name"}}
               res @(fluree/query-connection @e2e-conn query)]
           (is (= [[6162]] res) "Should count all 6162 airlines"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-create-virtual-graph-api-test
+  (when (and (warehouse-exists?) (mapping-exists?))
+    (testing "End-to-end: Create Iceberg VG via fluree/create-virtual-graph API"
+      (setup-fluree-system)
+      (try
+        ;; Create the Iceberg virtual graph using the public API
+        (let [vg-result @(fluree/create-virtual-graph
+                          @e2e-conn
+                          {:name "iceberg/airlines-api"
+                           :type :iceberg
+                           :config {:warehouse-path warehouse-path
+                                    :mapping mapping-path}})]
+          ;; Verify the VG was created with expected properties
+          (is (map? vg-result) "Should return a map")
+          (is (= "iceberg/airlines-api:main" (:alias vg-result)) "Should have normalized alias")
+          (is (contains? (set (:type vg-result)) "fidx:Iceberg") "Should have Iceberg type"))
+
+        ;; Query to verify it works
+        (let [query {"from" ["iceberg/airlines-api"]
+                     "select" ["?name"]
+                     "where" {"@id" "?airline"
+                              "http://example.org/airlines/name" "?name"}
+                     "limit" 5}
+              res @(fluree/query-connection @e2e-conn query)]
+          (is (vector? res) "Should return results")
+          (is (= 5 (count res)) "Should return 5 results"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-create-virtual-graph-duplicate-error-test
+  (when (and (warehouse-exists?) (mapping-exists?))
+    (testing "End-to-end: Creating duplicate VG should error"
+      (setup-fluree-system)
+      (try
+        ;; Create the first VG
+        @(fluree/create-virtual-graph
+          @e2e-conn
+          {:name "iceberg/airlines-dup"
+           :type :iceberg
+           :config {:warehouse-path warehouse-path
+                    :mapping mapping-path}})
+
+        ;; Try to create a duplicate - API returns exception as value
+        (let [result @(fluree/create-virtual-graph
+                       @e2e-conn
+                       {:name "iceberg/airlines-dup"
+                        :type :iceberg
+                        :config {:warehouse-path warehouse-path
+                                 :mapping mapping-path}})]
+          (is (instance? Exception result) "Should return an exception")
+          (is (re-find #"already exists" (ex-message result))
+              "Error should mention 'already exists'"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Multi-Table Tests
+;;; ---------------------------------------------------------------------------
+
+(def ^:private multi-table-mapping-path
+  (str (System/getProperty "user.dir") "/dev-resources/openflights/openflights-r2rml.ttl"))
+
+(defn- multi-table-mapping-exists? []
+  (.exists (File. multi-table-mapping-path)))
+
+(deftest multi-table-vg-creation-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "Multi-table VG creation parses all tables from R2RML"
+      (let [vg (iceberg-vg/create {:alias "openflights"
+                                   :config {:warehouse-path warehouse-path
+                                            :mapping multi-table-mapping-path}})]
+        ;; Should have 3 mappings (airlines, airports, routes)
+        (is (= 3 (count (:mappings vg)))
+            "Should have 3 mappings from multi-table R2RML")
+
+        ;; Should have sources for each table
+        (is (= 3 (count (:sources vg)))
+            "Should have 3 sources (one per table)")
+
+        ;; Verify table names are present in sources
+        (is (contains? (:sources vg) "openflights/airlines"))
+        (is (contains? (:sources vg) "openflights/airports"))
+        (is (contains? (:sources vg) "openflights/routes"))
+
+        ;; Verify routing indexes were built
+        (let [routing (:routing-indexes vg)]
+          (is (some? (:class->mapping routing))
+              "Should have class->mapping index")
+          (is (some? (:predicate->mapping routing))
+              "Should have predicate->mapping index")
+          ;; Check class mappings
+          (is (contains? (:class->mapping routing) "http://example.org/Airline"))
+          (is (contains? (:class->mapping routing) "http://example.org/Airport"))
+          (is (contains? (:class->mapping routing) "http://example.org/Route")))))))
+
+(deftest multi-table-routing-indexes-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "Routing indexes correctly map predicates to tables"
+      (let [vg (iceberg-vg/create {:alias "openflights"
+                                   :config {:warehouse-path warehouse-path
+                                            :mapping multi-table-mapping-path}})
+            routing (:routing-indexes vg)
+            pred->mapping (:predicate->mapping routing)]
+        ;; Airline predicates should route to airlines table
+        (is (= "openflights/airlines"
+               (get-in pred->mapping ["http://example.org/callsign" :table])))
+
+        ;; Airport predicates should route to airports table
+        (is (= "openflights/airports"
+               (get-in pred->mapping ["http://example.org/city" :table])))
+
+        ;; Route predicates should route to routes table
+        (is (= "openflights/routes"
+               (get-in pred->mapping ["http://example.org/sourceAirport" :table])))))))
+
+(deftest multi-table-single-table-query-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "Query against single table in multi-table VG works"
+      (let [vg (iceberg-vg/create {:alias "openflights"
+                                   :config {:warehouse-path warehouse-path
+                                            :mapping multi-table-mapping-path}})
+            ;; Query airlines table via type pattern
+            patterns [(make-triple (var-map "?airline")
+                                   (iri-map "http://example.org/name")
+                                   (var-map "?name"))
+                      (make-triple (var-map "?airline")
+                                   (iri-map "http://example.org/country")
+                                   (var-map "?country"))]
+            solution {::iceberg-vg/iceberg-patterns patterns}
+            solution-ch (async/to-chan! [solution])
+            error-ch (async/chan 1)
+            result-ch (where/-finalize vg nil error-ch solution-ch)
+            results (take 10 (collect-solutions result-ch))]
+        (is (pos? (count results)) "Should return results from airlines table")
+        (is (every? #(and (contains? % (symbol "?name"))
+                          (contains? % (symbol "?country")))
+                    results)
+            "Each result should have ?name and ?country")))))
+
+(deftest e2e-multi-table-vg-query-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: Query multi-table VG via Fluree API"
+      (setup-fluree-system)
+      (try
+        ;; Register the multi-table Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; Query airlines from multi-table VG (single table query)
+        (let [query {"from" ["iceberg/openflights"]
+                     "select" ["?name" "?country"]
+                     "where" {"@id" "?airline"
+                              "http://example.org/name" "?name"
+                              "http://example.org/country" "?country"}
+                     "limit" 5}
+              res @(fluree/query-connection @e2e-conn query)]
+          (is (vector? res) "Should return results")
+          (is (= 5 (count res)) "Should return 5 results (limit)")
+          (is (every? #(= 2 (count %)) res) "Each result should have 2 values"))
 
         (finally
           (teardown-fluree-system))))))
