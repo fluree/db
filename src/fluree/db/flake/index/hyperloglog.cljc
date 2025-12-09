@@ -82,6 +82,7 @@
                          (str "fluree:file://" (sketch-filename ledger-name sid-obj :values old-t))
                          (str "fluree:file://" (sketch-filename ledger-name sid-obj :subjects old-t))))
                 (catch* e
+                  (log/error! ::sketch-write e {:object-sid sid-obj})
                   (log/error e "Error writing sketch for" sid-obj)))
               (recur rest-sids))))
         @old-paths))))
@@ -148,4 +149,3 @@
             ;; No t available at all (brand new property), skip loading
             (recur rest-sids result)))
         result))))
-

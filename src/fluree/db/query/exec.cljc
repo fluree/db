@@ -7,7 +7,8 @@
             [fluree.db.query.exec.order :as order]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.select.subject :as subject]
-            [fluree.db.query.exec.where :as where]))
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -23,7 +24,8 @@
   [{:keys [offset]} solution-ch]
   (if offset
     (async/pipe solution-ch
-                (async/chan 2 (drop offset)))
+                (async/chan 2 (comp (log/xf-debug! ::query-offset {:offset offset})
+                                    (drop offset))))
     solution-ch))
 
 (defn take-limit
@@ -32,7 +34,8 @@
   the original `solution-ch` if the supplied query has no specified limit."
   [{:keys [limit]} solution-ch]
   (if limit
-    (async/take limit solution-ch)
+    (-> (async/take limit solution-ch)
+        (async/pipe (async/chan 2 (log/xf-debug! ::query-limit {:limit limit}))))
     solution-ch))
 
 (defn paginate

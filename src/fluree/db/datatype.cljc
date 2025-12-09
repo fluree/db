@@ -416,6 +416,8 @@
           (vector.score/vectorize))
       (vector.score/vectorize value))
     (catch* e
+      (log/error! ::dense-vector-coercion-error e {:msg "Unrecognized value for dense vector: "
+                                                   :value value})
       (log/error e "Unrecognized value for dense vector: " value)
       (throw (ex-info (str "Unrecognized value for dense vector: " value)
                       {:status 400

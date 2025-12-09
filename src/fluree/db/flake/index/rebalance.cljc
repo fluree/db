@@ -105,6 +105,7 @@
             (update-node-id write-response)
             index/unresolve))
       (catch* e
+        (log/error! ::rebalanced-leaf-write e {:msg "Error writing rebalanced flake index leaf node"})
         (log/error e "Error writing rebalanced flake index leaf node")
         (>! error-ch e)))))
 
@@ -117,6 +118,7 @@
             (update-node-id write-response)
             index/unresolve))
       (catch* e
+        (log/error! ::rebalanced-branch-write e {:msg "Error writing rebalanced flake index branch node"})
         (log/error e "Error writing rebalanced flake index branch node")
         (>! error-ch e)))))
 

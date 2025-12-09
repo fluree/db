@@ -138,6 +138,13 @@
             (update-commit! ledger branch updated-db)
             ::updated
             (catch* e
+              (log/warn! ::notify-commit-sequence-conflict
+                         {:msg "notify commit sequencing conflict; marking ledger stale to reload"
+                          :error e
+                          :alias (:alias ledger)
+                          :branch branch
+                          :current-t current-t
+                          :commit-t commit-t})
               (log/warn e "notify commit sequencing conflict; marking ledger stale to reload"
                         {:alias (:alias ledger)
                          :branch branch

@@ -1,7 +1,8 @@
 (ns fluree.db.util.log
   (:require #?@(:clj  [[clojure.core.async :as async]
                        [clojure.tools.logging.readable :as log] ; readable variants use pr-str automatically
-                       [fluree.db.util :refer [if-cljs]]]
+                       [fluree.db.util :refer [if-cljs]]
+                       [taoensso.telemere :as tel]]
                 :cljs [[goog.log :as glog]]))
   #?(:cljs (:require-macros [fluree.db.util.log :refer
                              [debug->val debug->>val debug-async->vals
@@ -124,3 +125,57 @@
      them."
      [msg c]
      `(debug-async->vals ~c ~msg)))
+
+#?(:clj
+   (defmacro error!
+     [id err data]
+     `(tel/error! {:level :info :id ~id :data ~data} ~err)))
+
+#?(:clj
+   (defmacro warn!
+     [id data]
+     `(tel/log! {:level :warn :id ~id :data ~data})))
+
+#?(:clj
+   (defmacro info!
+     [id data & forms]
+     `(tel/trace! {:level :info :id ~id :data ~data} (do ~@forms))))
+
+#?(:clj
+   (defmacro debug!
+     [id data & forms]
+     `(tel/trace! {:level :debug :id ~id :data ~data} (do ~@forms))))
+
+(defn xf-debug-impl
+  "Logs the first time a transducer receives a value."
+  [id data]
+  (fn [rf]
+    (let [logged? (volatile! false)]
+      (fn
+        ([] (rf))
+        ([result x]
+         (when-not @logged?
+           (debug! id data)
+           (vreset! logged? true))
+         (rf result x))
+        ([result] (rf result))))))
+
+#?(:clj
+   (defmacro xf-debug!
+     "Logs the first time a transducer receives a value."
+     [id data]
+     `(fn [rf#]
+        (let [logged?# (volatile! false)]
+          (fn
+            ([] (rf#))
+            ([result# x#]
+             (when-not @logged?#
+               (debug! ~id ~data)
+               (vreset! logged?# true))
+             (rf# result# x#))
+            ([result#] (rf# result#)))))))
+
+#?(:clj
+   (defmacro trace!
+     [id data]
+     `(tel/log! {:level :trace :id ~id :data ~data})))

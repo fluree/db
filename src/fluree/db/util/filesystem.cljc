@@ -151,6 +151,8 @@
              (with-open [out (io/output-stream (io/file path))]
                (.write out val))
              (catch Exception e
+               (log/error! ::write-file-error e {:msg "Unable to create storage directory"
+                                                 :path path})
                (log/error e "Unable to create storage directory:" path ".")
                (log/error "Fatal Error, shutting down!")
                (System/exit 1))))
@@ -166,6 +168,8 @@
                (try
                  (fs/writeFileSync path val)
                  (catch :default e
+                   (log/error! ::write-file-error e {:msg "Unable to write file to path"
+                                                     :path path})
                    (log/error e "Unable to write file to path" path ".")
                    (log/error (str "Fatal Error, shutting down! "
                                    {"errno"   ^String (.-errno e)
@@ -174,6 +178,8 @@
                                     "path"    (.-path e)}))
                    (js/process.exit 1)))
                (catch :default e
+                 (log/error! ::write-file-error e {:msg "Unable to create storage directory"
+                                                   :path path})
                  (log/error e "Unable to create storage directory:" path ".")
                  (log/error "Fatal Error, shutting down!")
                  (js/process.exit 1)))
@@ -265,6 +271,8 @@
          (map #(.getName ^File %)
               (.listFiles (io/file path)))
          (catch Exception e
+           (log/error! ::list-files-error e {:msg "Failed to list files at path"
+                                             :path path})
            (log/error e (str "Failed to list files at path: " path))
            (throw e))))
      :cljs

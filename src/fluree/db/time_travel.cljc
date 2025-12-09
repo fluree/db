@@ -15,12 +15,13 @@
 (defn as-of
   "Gets database as of a specific moment. Resolves 't' value provided to internal Fluree indexing
   negative 't' long integer value.
-  
+
   Accepts:
   - Positive integer: Direct t value
   - String: ISO-8601 datetime
   - Map with :sha key: Commit SHA for lookup"
   [db t]
+  (log/debug :time-travel {:db db :t t})
   (let [pc (async/promise-chan)]
     (async/go
       (try*

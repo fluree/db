@@ -66,6 +66,9 @@
     [_ _ _ _ _ _ error-ch solution]
     (go (try* (:value (agg-fn solution))
               (catch* e
+                (log/error! ::aggregate-formatting-error e {:msg "Error applying aggregate selector"
+                                                            :solution solution-value
+                                                            :agg-fn (meta agg-fn)})
                 (log/error e "Error applying aggregate selector")
                 (>! error-ch e))))))
 
@@ -149,12 +152,14 @@
                                 (:select-one q)
                                 (:select-distinct q))
         modifying-selectors (filter #(satisfies? SolutionModifier %) (util/sequential selectors))
-        mods-xf             (map (fn [solution]
-                                   (reduce
-                                    (fn [sol sel]
-                                      (log/trace "Updating solution:" sol)
-                                      (update-solution sel sol))
-                                    solution modifying-selectors)))
+        mods-xf             (comp
+                             (log/xf-debug! ::query-projection-modification {:solution-modifiers modifying-selectors})
+                             (map (fn [solution]
+                                    (reduce
+                                     (fn [sol sel]
+                                       (log/trace "Updating solution:" sol)
+                                       (update-solution sel sol))
+                                     solution modifying-selectors))))
         modify-ch               (chan 1 mods-xf)]
     (async/pipe solution-ch modify-ch)))
 
@@ -190,7 +195,8 @@
                                 (:select-one q)
                                 (:select-distinct q))
         iri-cache           (volatile! {})
-        format-xf           (some->> [(when (contains? q :select-distinct) (distinct))
+        format-xf           (some->> [(log/xf-debug! ::query-format {:selectors selectors})
+                                      (when (contains? q :select-distinct) (distinct))
                                       (when (contains? q :construct) cat)
                                       (when (= output-format :sparql) (mapcat select.sparql/disaggregate))]
                                      (remove nil?)

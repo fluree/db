@@ -53,7 +53,9 @@
                          :xhttp/exception
 
                          :else
-                         (do (log/error "XHTTP Request Error:" (.-request e))
+                         (do (log/error! ::xhttp-request-error e {:msg "XHTTP Request Error"
+                                                                  :request (.-request e)})
+                             (log/error "XHTTP Request Error:" (.-request e))
                              :xhttp/unknown-error))
 
                  :clj  (cond
@@ -469,6 +471,8 @@
               (async/put! resp-chan true)
               (async/close! resp-chan))
             (catch* e
+              (log/error! ::ws-send-error e {:msg "Error sending websocket message"
+                                             :payload msg})
               (log/error e "Error sending websocket message:" msg)
               (when resp-chan
                 (async/put! resp-chan false))))

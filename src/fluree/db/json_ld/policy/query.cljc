@@ -62,6 +62,8 @@
             id-flake (flake/create sid const/$id nil nil nil nil nil)]
         (allow-flake? db tracker id-flake))
       (catch* e
+        (log/error! ::permission-query-check-error e {:msg "Unexpected exception in allow-iri? checking permission."
+                                                      :iri iri})
         (log/error e "Unexpected exception in allow-iri? checking permission for iri: " iri)
         (go (ex-info (str "Unexpected exception in allow-iri? checking permission for iri: " iri
                           "Exception encoding IRI to internal format.")

@@ -513,6 +513,8 @@
                idx*        (or idx
                                (try* (index/for-components s p o o-dt)
                                      (catch* e
+                                       (log/error! ::resolve-flake-range-error e {:msg "Error determining index for range"
+                                                                                  :pattern [s p o o-dt]})
                                        (log/error e "Error resolving flake range")
                                        (async/put! error-ch e))))
                [o* o-fn*]  (augment-object-fn db idx* s p o o-fn)
@@ -660,7 +662,10 @@
 (defn with-constraints
   [ds tracker patterns error-ch solution-ch]
   (reduce (fn [solution-ch pattern]
-            (with-constraint ds tracker pattern error-ch solution-ch))
+            (log/debug! ::pattern-start {:pattern pattern}
+              (let [solution-ch* (with-constraint ds tracker pattern error-ch solution-ch)]
+                (log/debug! ::pattern-complete {:pattern pattern}
+                  solution-ch*))))
           solution-ch patterns))
 
 (defn match-triples
@@ -699,6 +704,8 @@
           (-> (match-clause graph tracker solution clause error-ch)
               (async/pipe res-ch)))
         (catch* e
+          (log/error! ::match-alias-error e {:msg "Error activating alias"
+                                             :ledger-alias alias})
           (log/error e "Error activating alias" alias)
           (>! error-ch (ex-info (str "Error activating alias: " alias
                                      " due to exception: " (ex-message e))
@@ -927,6 +934,10 @@
 
 (defn sparql-service-error!
   [ex service sparql-q]
+  (log/warn! ::sparql-service-error {:msg "Error processing service response "
+                                     :service service
+                                     :sparql-query sparql-q
+                                     :error ex})
   (log/error ex "Error processing service response " service sparql-q)
   (ex-info (str "Error processing service response " service " due to exception: " (ex-message ex))
            {:status 400, :error :db/invalid-query}
@@ -976,15 +987,16 @@
   ([ds q tracker error-ch]
    (search ds q tracker error-ch nil))
   ([ds q tracker error-ch initial-solution-ch]
-   (let [out-ch               (async/chan 2)
-         initial-solution-ch* (or initial-solution-ch
-                                  (values-initial-solution q))]
-     (if-let [where-clause (:where q)]
-       (async/pipeline-async 2
-                             out-ch
-                             (fn [initial-solution ch]
-                               (-> (match-clause ds tracker initial-solution where-clause error-ch)
-                                   (async/pipe ch)))
-                             initial-solution-ch*)
-       (async/pipe initial-solution-ch* out-ch))
-     out-ch)))
+   (log/debug! ::query-where {:where (:where q)}
+     (let [out-ch               (async/chan 2)
+           initial-solution-ch* (or initial-solution-ch
+                                    (values-initial-solution q))]
+       (if-let [where-clause (:where q)]
+         (async/pipeline-async 2
+                               out-ch
+                               (fn [initial-solution ch]
+                                 (-> (match-clause ds tracker initial-solution where-clause error-ch)
+                                     (async/pipe ch)))
+                               initial-solution-ch*)
+         (async/pipe initial-solution-ch* out-ch))
+       out-ch))))
