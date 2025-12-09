@@ -77,7 +77,7 @@
                  org.testcontainers/localstack           {:mvn/version "1.19.3"}
                  com.h2database/h2                       {:mvn/version "2.2.224"}}
    :exec-fn     kaocha.runner/exec-fn
-   :exec-args   {:kaocha.filter/skip-meta [:pending :docker :iceberg]}}
+   :exec-args   {:kaocha.filter/skip-meta [:pending :docker]}}
 
   :cljtest-sci
   {:jvm-opts    ["-Dfluree.graalvm.build=true"]
@@ -92,6 +92,18 @@
                  com.h2database/h2                     {:mvn/version "2.2.224"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/focus-meta [:sci]}}
+
+  ;; Iceberg tests - separate from main test suite, requires :iceberg alias for deps
+  ;; Run with: clojure -X:dev:iceberg:cljtest-iceberg
+  :cljtest-iceberg
+  {:extra-paths ["test-iceberg" "dev-resources"]
+   :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}}
+   :exec-fn     kaocha.runner/exec-fn
+   :exec-args   {:kaocha/tests [{:kaocha.testable/id :iceberg
+                                 :kaocha.testable/type :kaocha.type/clojure.test
+                                 :kaocha/source-paths ["src"]
+                                 :kaocha/test-paths ["test-iceberg"]
+                                 :kaocha/ns-patterns [".*"]}]}}
 
   :pending-tests
   {:extra-paths ["test" "dev-resources" "test-resources"]

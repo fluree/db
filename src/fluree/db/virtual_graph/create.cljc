@@ -146,6 +146,33 @@
       ;; Return a minimal descriptor; callers will load via query paths
       {:id vg-name :alias vg-name :type ["fidx:R2RML"] :config (:config full-config)})))
 
+;; Iceberg implementation (JVM only - requires Iceberg deps)
+#?(:clj
+   (defn- validate-iceberg-config
+     [{:keys [config]}]
+     (let [{:keys [mapping mappingInline warehouse-path warehousePath]} config
+           wh-path (or warehouse-path warehousePath (get config "warehouse-path"))]
+       (when (and (nil? mapping) (nil? mappingInline) (nil? (get config "mappingInline")))
+         (throw (ex-info "Iceberg virtual graph requires :mapping or :mappingInline"
+                         {:error :db/invalid-config :type :iceberg})))
+       (when (nil? wh-path)
+         (throw (ex-info "Iceberg virtual graph requires :warehouse-path"
+                         {:error :db/invalid-config :type :iceberg}))))))
+
+#?(:clj
+   (defmethod create-vg :iceberg
+     [_conn vg-config]
+     (go-try
+       (validate-iceberg-config vg-config)
+       (let [{:keys [name config]} vg-config
+             normalized-name (util.ledger/ensure-ledger-branch name)
+             ;; Dynamic loading - only load iceberg ns when actually needed
+             ;; This avoids requiring Iceberg deps at compile time
+             create-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/create)]
+         ;; Create the Iceberg virtual graph directly (no nameservice for now)
+         ;; This returns an IcebergDatabase that implements where/Matcher
+         (create-fn {:alias normalized-name :config config})))))
+
 (defmethod create-vg :default
   [_conn {:keys [type]}]
   (go-try
