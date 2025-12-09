@@ -164,4 +164,24 @@
 
   :graalvm
   {:extra-deps  {com.github.clj-easy/graal-build-time {:mvn/version "1.0.5"}}
-   :extra-paths ["graalvm"]}}}
+   :extra-paths ["graalvm"]}
+
+  ;; Iceberg integration (experimental)
+  ;; Usage: clojure -M:dev:iceberg -m fluree.db.iceberg-smoke-test
+  :iceberg
+  {:extra-paths ["test"]
+   :extra-deps {;; Core Iceberg 1.10.0
+                org.apache.iceberg/iceberg-core    {:mvn/version "1.10.0"}
+                org.apache.iceberg/iceberg-parquet {:mvn/version "1.10.0"}
+                org.apache.iceberg/iceberg-data    {:mvn/version "1.10.0"}
+
+                ;; Hadoop catalog (for local filesystem testing)
+                ;; Note: Pulls in Hadoop deps - use REST/Glue catalogs for Lambda
+                org.apache.iceberg/iceberg-bundled-guava {:mvn/version "1.10.0"}
+                org.apache.hadoop/hadoop-common    {:mvn/version "3.3.6"
+                                                    :exclusions [org.slf4j/slf4j-log4j12
+                                                                 log4j/log4j
+                                                                 org.slf4j/slf4j-reload4j]}
+                org.apache.hadoop/hadoop-hdfs-client {:mvn/version "3.3.6"
+                                                      :exclusions [org.slf4j/slf4j-log4j12
+                                                                   log4j/log4j]}}}}}

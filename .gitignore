@@ -36,3 +36,5 @@ package-lock.json
 **report.html
 test/nodejs/store
 /dev/data/*
+/dev-resources/openflights/raw/
+/dev-resources/openflights/warehouse/

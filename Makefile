@@ -2,7 +2,7 @@
 	cljs-browser-test cljs-node-test cljstest test graaltest ci clean			\
 	js-packages sync-package-json publish-nodejs publish-browser		\
 	publish-webworker publish-js pending-tests pt clj-kondo-lint            \
-	clj-kondo-lint-ci cljfmt-check cljfmt-fix
+	clj-kondo-lint-ci cljfmt-check cljfmt-fix iceberg-openflights
 
 .DEFAULT_GOAL := help
 
@@ -167,3 +167,14 @@ clean: ## Remove build artifacts and caches
 	rm -rf js-packages/browser/fluree-browser-sdk.js
 	rm -rf js-packages/nodejs/fluree-node-sdk.js
 	rm -rf js-packages/webworker/fluree-webworker.js
+
+iceberg-openflights: ## Download OpenFlights CSVs and build local Iceberg warehouse (gitignored)
+	./script/fetch-openflights.sh
+	clojure -Sdeps '{:paths ["script"] :deps {org.apache.iceberg/iceberg-core {:mvn/version "1.10.0"} \
+org.apache.iceberg/iceberg-parquet {:mvn/version "1.10.0"} \
+org.apache.iceberg/iceberg-data {:mvn/version "1.10.0"} \
+org.apache.iceberg/iceberg-bundled-guava {:mvn/version "1.10.0"} \
+org.apache.parquet/parquet-hadoop {:mvn/version "1.16.0"} \
+org.apache.hadoop/hadoop-common {:mvn/version "3.3.6" :exclusions [org.slf4j/slf4j-log4j12 log4j/log4j org.slf4j/slf4j-reload4j]} \
+org.clojure/data.csv {:mvn/version "1.0.1"}}}' \
+		-M -m build-openflights-iceberg
