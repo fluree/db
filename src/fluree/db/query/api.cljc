@@ -205,6 +205,14 @@
     (let [types (get ns-record "@type")]
       (some #{"f:VirtualGraphDatabase"} types))))
 
+#?(:clj
+   (defn- r2rml-virtual-graph?
+     "Returns true if a nameservice record represents an R2RML virtual graph."
+     [ns-record]
+     (when ns-record
+       (let [types (set (get ns-record "@type" []))]
+         (contains? types "fidx:R2RML")))))
+
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
   (go-try
@@ -217,15 +225,17 @@
       (if (virtual-graph-record? ns-record)
         ;; Virtual graph - load via VG loader (JVM only)
         #?(:clj
-           (let [;; For VG queries, we need a source ledger's db to initialize the VG
-                 ;; Get it from the VG's dependencies
-                 deps          (get ns-record "fidx:dependencies")
-                 source-alias  (first deps)
-                 source-ledger (<? (connection/load-ledger-alias conn source-alias))
-                 source-db     (ledger/current-db source-ledger)
-                 vg            (<? (vg-loader/load-virtual-graph-from-nameservice
-                                    source-db publisher normalized-alias))]
-             vg)
+           (if (r2rml-virtual-graph? ns-record)
+             ;; R2RML VGs connect to external databases, don't need a source ledger
+             (<? (vg-loader/load-virtual-graph-from-nameservice nil publisher normalized-alias))
+             ;; Other VGs (BM25, etc.) need a source ledger from dependencies
+             (let [deps          (get ns-record "fidx:dependencies")
+                   source-alias  (first deps)
+                   source-ledger (<? (connection/load-ledger-alias conn source-alias))
+                   source-db     (ledger/current-db source-ledger)
+                   vg            (<? (vg-loader/load-virtual-graph-from-nameservice
+                                      source-db publisher normalized-alias))]
+               vg))
            :cljs
            (throw (ex-info "Virtual graphs are not supported in ClojureScript"
                            {:status 400 :error :db/unsupported})))

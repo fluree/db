@@ -110,6 +110,42 @@
         (<? (nameservice/publish-vg publisher full-config))
         (<? (initialize-bm25-for-ledgers loaded-ledgers publisher vg-name dependencies conn))))))
 
+;; R2RML implementation (minimal v1)
+(defn- validate-r2rml-config
+  [{:keys [config]}]
+  (let [{:keys [mapping mappingInline rdb]} config
+        {:keys [jdbcUrl driver]} rdb]
+    (when (and (nil? mapping) (nil? mappingInline))
+      (throw (ex-info "R2RML virtual graph requires :mapping (address) or :mappingInline (Turtle)."
+                      {:error :db/invalid-config :type :r2rml})))
+    (when (or (str/blank? jdbcUrl) (str/blank? driver))
+      (throw (ex-info "R2RML virtual graph requires :rdb {:jdbcUrl ... :driver ...}."
+                      {:error :db/invalid-config :type :r2rml})))))
+
+(defn- prepare-r2rml-config
+  [{:keys [name config dependencies]}]
+  (let [normalized-name (util.ledger/ensure-ledger-branch name)]
+    {:vg-name normalized-name
+     :vg-type "fidx:R2RML"
+     :config  config
+     :dependencies (or dependencies [])}))
+
+(defmethod create-vg :r2rml
+  [conn vg-config]
+  (go-try
+    (validate-r2rml-config vg-config)
+    (let [full-config (prepare-r2rml-config vg-config)
+          {:keys [vg-name]} full-config
+          publisher (connection/primary-publisher conn)]
+      ;; Check if VG already exists
+      (when (<? (nameservice/lookup publisher vg-name))
+        (throw (ex-info (str "Virtual graph already exists: " vg-name)
+                        {:error :db/invalid-config :vg-name vg-name})))
+      ;; Publish the R2RML VG record. Initialization occurs lazily on first use.
+      (<? (nameservice/publish-vg publisher full-config))
+      ;; Return a minimal descriptor; callers will load via query paths
+      {:id vg-name :alias vg-name :type ["fidx:R2RML"] :config (:config full-config)})))
+
 (defmethod create-vg :default
   [_conn {:keys [type]}]
   (go-try

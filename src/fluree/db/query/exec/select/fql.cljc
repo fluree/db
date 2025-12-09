@@ -29,7 +29,10 @@
 (defn format-variable-selector-value
   [var]
   (fn [_ _db _iri-cache _context compact _tracker error-ch solution]
-    (go (try* (-> solution (get var) (display compact))
+    (go (try* (let [m (get solution var)]
+                (when (nil? m)
+                  (log/info "format-variable-selector-value missing match for var" var "keys:" (keys solution) "solution:" solution))
+                (display m compact))
               (catch* e
                 (log/error e "Error formatting variable:" var)
                 (>! error-ch e))))))
