@@ -1,9 +1,10 @@
 (ns fluree.db.nameservice.virtual-graph-test
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async :refer [<!!]]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.connection :as connection]
-            [fluree.db.nameservice :as nameservice]))
+            [fluree.db.nameservice :as nameservice]
+            [fluree.db.virtual-graph :as vg]))
 
 (deftest create-virtual-graph-test
   (testing "Creating a BM25 virtual graph via API"
@@ -144,35 +145,35 @@
 (deftest bm25-subscription-update-test
   (testing "BM25 virtual graph receives subscription notifications when source ledger changes"
     (let [conn @(fluree/connect-memory {})
-          _ledger @(fluree/create conn "articles")]
+          _ledger @(fluree/create conn "articles")
 
-      ;; Insert initial data
-      @(fluree/insert! conn "articles"
-                       {"@context" {"ex" "http://example.org/ns/"}
-                        "@graph" [{"@id" "ex:article1"
-                                   "ex:title" "First Article"
-                                   "ex:content" "This is the first article about databases"}]})
+          ;; Insert initial data
+          _ @(fluree/insert! conn "articles"
+                             {"@context" {"ex" "http://example.org/ns/"}
+                              "@graph" [{"@id" "ex:article1"
+                                         "ex:title" "First Article"
+                                         "ex:content" "This is the first article about databases"}]})
 
-      ;; Create BM25 virtual graph - subscriptions start automatically
-      (let [vg @(fluree/create-virtual-graph
-                 conn
-                 {:name "article-search"
-                  :type :bm25
-                  :config {:stemmer "snowballStemmer-en"
-                           :stopwords "stopwords-en"
-                           :ledgers ["articles"]
-                           :query {"@context" {"ex" "http://example.org/ns/"}
-                                   "where" [{"@id" "?x"
-                                             "ex:title" "?title"
-                                             "ex:content" "?content"}]
-                                   "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})]
+          ;; Create BM25 virtual graph - subscriptions start automatically
+          vg @(fluree/create-virtual-graph
+               conn
+               {:name "article-search"
+                :type :bm25
+                :config {:stemmer "snowballStemmer-en"
+                         :stopwords "stopwords-en"
+                         :ledgers ["articles"]
+                         :query {"@context" {"ex" "http://example.org/ns/"}
+                                 "where" [{"@id" "?x"
+                                           "ex:title" "?title"
+                                           "ex:content" "?content"}]
+                                 "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})]
 
-        ;; Verify VG was created with subscription channels
-        (is (some? (:subscription-channels vg)) "VG should have subscription channels")
-        (is (some? (:subscription-loop-ch vg)) "VG should have subscription loop channel"))
+      ;; Verify VG was created with subscription channels
+      (is (some? (:subscription-channels vg)) "VG should have subscription channels")
+      (is (some? (:subscription-loop-ch vg)) "VG should have subscription loop channel")
 
-      ;; Give initial indexing time to complete
-      (Thread/sleep 500)
+      ;; Wait for initial indexing to complete
+      (<!! (vg/sync vg nil))
 
       ;; Insert NEW data into the source ledger - this should trigger subscription update
       @(fluree/insert! conn "articles"
@@ -181,12 +182,23 @@
                                    "ex:title" "Second Article"
                                    "ex:content" "This article discusses graph databases and queries"}]})
 
-      ;; Give the subscription a moment to process the update
-      ;; The logs should show "BM25 VG incremental update completed"
-      (Thread/sleep 500)
+      ;; Wait for the subscription to process the incremental update
+      (<!! (vg/sync vg nil))
 
-      ;; The test verifies that the subscription mechanism works - the logs will show
-      ;; that BM25 received the notification and processed the incremental update
-      (is true "Subscription mechanism test completed - check logs for 'incremental update completed'")
+      ;; Query the VG to verify the second article was indexed
+      (let [search-results @(fluree/query-connection
+                             conn
+                             {"@context" {"idx" "https://ns.flur.ee/index#"
+                                          "ex" "http://example.org/ns/"}
+                              "from" ["article-search"]
+                              "where" [{"@id" "?x"
+                                        "idx:target" "graph databases"
+                                        "idx:limit" 10
+                                        "idx:result" {"idx:id" "?article"
+                                                      "idx:score" "?score"}}]
+                              "select" ["?article" "?score"]})
+            article-ids (set (map first search-results))]
+        (is (contains? article-ids "ex:article2")
+            "Second article should be found after subscription update"))
 
       @(fluree/disconnect conn))))
