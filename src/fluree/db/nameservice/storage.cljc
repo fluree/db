@@ -1,5 +1,5 @@
 (ns fluree.db.nameservice.storage
-  (:require [clojure.core.async :refer [go]]
+  (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
@@ -138,16 +138,52 @@
     (new-ns-record ledger-alias commit-address commit-t
                    index-address index-t)))
 
-(defrecord StorageNameService [store]
+;; Subscription management functions
+(defn record-subscription
+  "Add a subscription channel for a ledger alias to the state."
+  [current-state ledger-alias sub-ch]
+  (if-not (contains? (:subscriptions current-state) ledger-alias)
+    (assoc-in current-state [:subscriptions ledger-alias] #{sub-ch})
+    (update-in current-state [:subscriptions ledger-alias] conj sub-ch)))
+
+(defn record-unsubscription
+  "Remove a subscription channel for a ledger alias from the state."
+  [current-state ledger-alias sub-ch]
+  (let [updated-subs (disj (get-in current-state [:subscriptions ledger-alias] #{}) sub-ch)]
+    (if (empty? updated-subs)
+      (update current-state :subscriptions dissoc ledger-alias)
+      (assoc-in current-state [:subscriptions ledger-alias] updated-subs))))
+
+(defn notify-subscribers
+  "Notify all subscribers for a ledger alias about a new commit."
+  [sub-state ledger-alias commit-address]
+  (when-let [subscribers (get-in @sub-state [:subscriptions ledger-alias])]
+    (let [message {"action" "new-commit"
+                   "ledger" ledger-alias
+                   "data" {"address" commit-address}}]
+      (log/debug "Notifying" (count subscribers) "subscribers for ledger:" ledger-alias)
+      (doseq [sub-ch subscribers]
+        ;; Use put! with callback - don't block the caller
+        (async/put! sub-ch message
+                    (fn [success]
+                      (when-not success
+                        (log/warn "Failed to notify subscriber for ledger:" ledger-alias))))))))
+
+(defrecord StorageNameService [store sub-state]
   nameservice/Publisher
   (publish-commit [_ ledger-alias commit-address commit-t]
-    (let [filename (local-filename ledger-alias)]
-      (log/debug "nameservice.storage/publish-commit start" {:ledger ledger-alias :filename filename})
-      (storage/swap-json store filename
-                         (fn [ns-record]
-                           (if (some? ns-record)
-                             (update-commit-address ns-record commit-address commit-t)
-                             (new-ns-record ledger-alias commit-address commit-t nil nil))))))
+    (go-try
+      (let [filename (local-filename ledger-alias)]
+        (log/debug "nameservice.storage/publish-commit start" {:ledger ledger-alias :filename filename})
+        (let [result (<? (storage/swap-json store filename
+                                            (fn [ns-record]
+                                              (if (some? ns-record)
+                                                (update-commit-address ns-record commit-address commit-t)
+                                                (new-ns-record ledger-alias commit-address commit-t nil nil)))))]
+          ;; Notify subscribers about the new commit
+          (when commit-address
+            (notify-subscribers sub-state ledger-alias commit-address))
+          result))))
 
   (publish-index [_ ledger-alias index-address index-t]
     (let [filename (index-filename ledger-alias)]
@@ -246,7 +282,33 @@
         ;; Fallback for stores that don't support ListableStore
         (do
           (log/warn "Storage backend does not support RecursiveListableStore protocol")
-          [])))))
+          []))))
+
+  nameservice/Publication
+  (subscribe [_ ledger-alias]
+    (let [sub-ch (async/chan)]
+      (swap! sub-state record-subscription ledger-alias sub-ch)
+      (log/debug "Created subscription channel for ledger:" ledger-alias)
+      sub-ch))
+
+  (unsubscribe [_ ledger-alias]
+    (if-let [subscribers (get-in @sub-state [:subscriptions ledger-alias])]
+      (do
+        (log/debug "Unsubscribing from updates to ledger:" ledger-alias)
+        ;; Close all subscription channels for this ledger
+        (doseq [sub-ch subscribers]
+          (async/close! sub-ch))
+        (swap! sub-state update :subscriptions dissoc ledger-alias)
+        :unsubscribed)
+      (do
+        (log/debug "Ledger" ledger-alias "not subscribed")
+        :not-subscribed)))
+
+  (known-addresses [this ledger-alias]
+    (go-try
+      ;; Return the current commit address for this ledger
+      (when-let [record (<? (nameservice/lookup this ledger-alias))]
+        [(get-in record ["f:commit" "@id"])]))))
 
 (defn start
   [store]
@@ -254,4 +316,4 @@
     (throw (ex-info "Storage backend must support RecursiveListableStore protocol for nameservice"
                     {:protocol storage/RecursiveListableStore
                      :store (type store)})))
-  (->StorageNameService store))
+  (->StorageNameService store (atom {})))

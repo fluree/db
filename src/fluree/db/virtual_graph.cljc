@@ -18,12 +18,25 @@
   (sync [this as-of] [this as-of opts]
     "Waits for the virtual graph to complete any pending indexing operations.
      Returns a promise-chan that resolves when the VG is fully synced.
-     
+
      Parameters:
        as-of - Transaction 't' value to sync to, or nil to sync to latest known
-     
+
      Options:
        :timeout - Maximum time to wait in milliseconds (default 10000)"))
+
+(defprotocol SubscribableVirtualGraph
+  (start-subscriptions [this nameservice dependencies]
+    "Starts subscriptions to dependent ledgers via the nameservice.
+     Returns updated VG with subscription state.
+
+     Parameters:
+       nameservice - Nameservice implementation (must implement Publication protocol)
+       dependencies - Vector of ledger aliases to subscribe to")
+
+  (stop-subscriptions [this nameservice]
+    "Stops all subscriptions for this virtual graph.
+     Returns updated VG with subscriptions removed."))
 
 (defn vg-type-name
   [vg]

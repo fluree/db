@@ -6,6 +6,7 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.ledger :as util.ledger]
+            [fluree.db.virtual-graph :as vg]
             [fluree.db.virtual-graph.nameservice-loader :as vg-loader]))
 
 (defmulti create-vg
@@ -78,13 +79,16 @@
 (defn- initialize-bm25-for-ledgers
   "Initializes the BM25 virtual graph for all dependent ledgers.
    Returns the loaded virtual graph instance."
-  [loaded-ledgers publisher vg-name]
+  [loaded-ledgers publisher vg-name dependencies conn]
   (go-try
     ;; Single ledger support only for now
     (let [[_alias ledger] (first loaded-ledgers)
           db (ledger/current-db ledger)
-          vg (<? (vg-loader/load-virtual-graph-from-nameservice db publisher vg-name))]
-      vg)))
+          vg (<? (vg-loader/load-virtual-graph-from-nameservice db publisher vg-name))
+          ;; Start subscriptions to source ledgers
+          vg-with-conn (assoc vg :conn conn)
+          vg-with-subs (vg/start-subscriptions vg-with-conn publisher dependencies)]
+      vg-with-subs)))
 
 (defmethod create-vg :bm25
   [conn vg-config]
@@ -92,7 +96,7 @@
     (validate-bm25-config vg-config)
 
     (let [full-config (prepare-bm25-config vg-config)
-          {:keys [vg-name]} full-config
+          {:keys [vg-name dependencies]} full-config
           publisher (connection/primary-publisher conn)
           ledger-aliases (get-in vg-config [:config :ledgers] [])]
 
@@ -104,7 +108,7 @@
 
       (let [loaded-ledgers (<? (load-and-validate-ledgers conn ledger-aliases))]
         (<? (nameservice/publish-vg publisher full-config))
-        (<? (initialize-bm25-for-ledgers loaded-ledgers publisher vg-name))))))
+        (<? (initialize-bm25-for-ledgers loaded-ledgers publisher vg-name dependencies conn))))))
 
 (defmethod create-vg :default
   [_conn {:keys [type]}]
