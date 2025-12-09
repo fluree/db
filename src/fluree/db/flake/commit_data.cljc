@@ -74,7 +74,8 @@
   [["id" :id]
    ["type" ["Index"]]
    ["address" :address]
-   ["data" :data]])
+   ["data" :data]
+   ["v" :v]])
 
 (defn merge-template
   "Merges provided map with template and places any
@@ -129,6 +130,7 @@
   [data]
   {:id      (get-id data)
    :t       (get-first-value data const/iri-fluree-t)
+   :v       (get-first-value data const/iri-v)
    :address (get-first-value data const/iri-address)
    :flakes  (get-first-value data const/iri-flakes)
    :size    (get-first-value data const/iri-size)})
@@ -154,7 +156,6 @@
         data        (get-first jsonld const/iri-data)
         ns          (get-first jsonld const/iri-ns)
         index       (get-first jsonld const/iri-index)]
-
     (cond-> {:id     id
              :v      v
              :alias  alias
@@ -171,9 +172,12 @@
                          util/sequential
                          (mapv (fn [namespace]
                                  {:id (get-id namespace)}))))
-      index (assoc :index {:id      (get-id index)
-                           :address (get-first-value index const/iri-address)
-                           :data    (parse-db-data (get-first index const/iri-data))})
+      index (assoc :index (cond-> {:id      (get-id index)
+                                   :address (get-first-value index const/iri-address)
+                                   :data    (parse-db-data (get-first index const/iri-data))}
+                            ;; Include index version if present for proper propagation
+                            (get-first-value index const/iri-v)
+                            (assoc :v (get-first-value index const/iri-v))))
       issuer (assoc :issuer {:id (get-id issuer)}))))
 
 (defn update-index-roots
@@ -241,12 +245,13 @@
 (defn new-index
   "Creates a new commit index record, given the commit-map used to trigger
   the indexing process (which contains the db info used for the index), the
-  index id, index address and optionally index-type-addresses which contain
-  the address for each index type top level branch node."
-  [data-map id address index-root-maps]
+  index id, index address, index version, and optionally index-type-addresses
+  which contain the address for each index type top level branch node."
+  [data-map id address index-version index-root-maps]
   (merge {:id      id
           :address address
-          :data    data-map}
+          :data    data-map
+          :v       index-version}
          index-root-maps))
 
 (defn t

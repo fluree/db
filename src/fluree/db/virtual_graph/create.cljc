@@ -100,7 +100,7 @@
                          :vg-name vg-name})))
 
       (let [loaded-ledgers (<? (load-and-validate-ledgers conn ledger-aliases))]
-        (<? (nameservice/publish publisher full-config))
+        (<? (nameservice/publish-vg publisher full-config))
         (<? (initialize-bm25-for-ledgers loaded-ledgers publisher vg-name))))))
 
 (defmethod create-vg :default

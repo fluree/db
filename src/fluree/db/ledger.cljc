@@ -3,17 +3,19 @@
             [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.did :as did]
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.index.novelty :as novelty]
+            [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.json-ld.credential :as credential]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.storage :as storage]
             [fluree.db.track :as track]
             [fluree.db.transact :as transact]
-            [fluree.db.util :as util :refer [get-first get-first-value]]
+            [fluree.db.util :as util :refer [get-first get-first-value try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
             [fluree.db.util.ledger :as util.ledger]
@@ -91,27 +93,26 @@
 (defn ledger-info
   "Returns comprehensive ledger information including statistics for specified branch (or default branch if nil).
    Computes current property and class statistics by replaying novelty on top of indexed stats.
-   Decodes SIDs to IRIs for user-friendly output."
+   Returns stats in native SID format - use fluree.db.api/ledger-info for IRI-decoded version."
   ([ledger]
    (ledger-info ledger const/default-branch-name))
-  ([{:keys [address alias] :as ledger} requested-branch]
-   (let [branch-data (get-branch-meta ledger requested-branch)
-         branch-name (:name branch-data)
-         current-db  (branch/current-db branch-data)
-         {:keys [commit stats t namespace-codes]} current-db
-         {:keys [size flakes]} stats
-         ;; Compute current stats by replaying novelty
-         current-stats (novelty/current-stats current-db)]
-     {:address    address
-      :alias      alias
-      :branch     branch-name
-      :t          t
-      :size       size
-      :flakes     flakes
-      :commit     commit
-      ;; Decode SIDs to IRIs for properties and classes
-      :properties (update-keys (:properties current-stats) #(iri/sid->iri % namespace-codes))
-      :classes    (update-keys (:classes current-stats) #(iri/sid->iri % namespace-codes))})))
+  ([{:keys [address alias primary-publisher] :as ledger} requested-branch]
+   (go-try
+     (let [branch-data (get-branch-meta ledger requested-branch)
+           current-db  (branch/current-db branch-data)
+           {:keys [stats namespace-codes novelty-post commit]} (<? (dbproto/-ledger-info current-db))
+           current-stats (novelty/current-stats {:stats stats :novelty {:post novelty-post}})
+           commit-jsonld (commit-data/->json-ld commit)
+           nameservice (when primary-publisher
+                         (try*
+                           (<? (nameservice/lookup primary-publisher address))
+                           (catch* e
+                             (log/debug "Unable to fetch nameservice record" {:alias alias :error (ex-message e)})
+                             nil)))]
+       {:commit          commit-jsonld
+        :nameservice     nameservice
+        :namespace-codes namespace-codes
+        :stats           (merge stats current-stats)}))))
 
 (defn notify
   "Returns false if provided commit update did not result in an update to the ledger because
@@ -133,8 +134,16 @@
       (cond
         (= commit-t (flake/next-t current-t))
         (let [updated-db (<? (transact/-merge-commit db expanded-commit expanded-data))]
-          (update-commit! ledger branch updated-db)
-          ::updated)
+          (try*
+            (update-commit! ledger branch updated-db)
+            ::updated
+            (catch* e
+              (log/warn e "notify commit sequencing conflict; marking ledger stale to reload"
+                        {:alias (:alias ledger)
+                         :branch branch
+                         :current-t current-t
+                         :commit-t commit-t})
+              ::stale)))
 
         ;; missing some updates, dump in-memory ledger forcing a reload
         (flake/t-after? commit-t (flake/next-t current-t))
@@ -157,6 +166,179 @@
                     current-t)
           ::newer)))))
 
+(defn expand-and-extract-ns
+  "Expands a nameservice record and extracts key fields via IRIs.
+
+  Returns map {:ledger-alias :branch :ns-t :commit-address :index-address}."
+  [ns-record]
+  (let [expanded (json-ld/expand ns-record)
+        ;; The @id field contains the full ledger:branch alias
+        ledger-alias (get-first-value expanded const/iri-id)]
+    {:ledger-alias   ledger-alias
+     :branch         (or (get-first-value expanded const/iri-branch)
+                         (second (util.ledger/ledger-parts ledger-alias)))
+     :ns-t           (get-first-value expanded const/iri-fluree-t)
+     :commit-address (-> (get-first expanded const/iri-commit)
+                         (get-first-value const/iri-id))
+     :index-address  (-> (get-first expanded const/iri-index)
+                         (get-first-value const/iri-id))}))
+
+(defn idx-address->idx-id
+  "Extracts the hash from a content-addressed index address and returns the index ID.
+  Uses storage/get-hash to properly extract the hash from any storage backend.
+  Returns: 'fluree:index:sha256:abc123def'"
+  [index-catalog index-address]
+  (go-try
+    (let [hash (<? (storage/get-hash (:storage index-catalog) index-address))]
+      (str "fluree:index:sha256:" hash))))
+
+(defn- apply-index-to-db
+  "Applies an index to a database and returns the updated db.
+  Returns a channel with the updated db."
+  [db index-catalog root index-address]
+  (go-try
+    (let [data          (-> db :commit :data)
+          index-id      (<? (idx-address->idx-id index-catalog index-address))
+          index-version (:v root)
+          index-map     (commit-data/new-index data index-id index-address index-version
+                                               (select-keys root [:spot :post :opst :tspo :stats]))]
+      (dbproto/-index-update db index-map))))
+
+(defn- update-branch-with-index
+  "Updates branch state with new index. If use-update-commit? is true,
+  uses update-commit! which enforces commit sequencing. Otherwise,
+  directly updates the branch state for index-only updates."
+  [ledger branch updated-db use-update-commit?]
+  (if use-update-commit?
+    (do (update-commit! ledger branch updated-db)
+        ::index-updated)
+    (let [branch-meta (get-branch-meta ledger branch)]
+      (swap! (:state branch-meta) branch/update-index updated-db)
+      ::index-updated)))
+
+(defn- compare-index-by-hash
+  "Tie-breaker for indexes at the same t value. Returns a channel that resolves to true
+  if new-idx should replace cur-idx. Uses lexicographic comparison of content hashes
+  for deterministic selection."
+  [index-catalog new-idx-addr cur-idx-addr]
+  (go-try
+    (let [new-hash (<? (idx-address->idx-id index-catalog new-idx-addr))
+          cur-hash (<? (idx-address->idx-id index-catalog cur-idx-addr))]
+      (pos? (compare new-hash cur-hash)))))
+
+(defn- handle-index-behind-commit
+  "Handles case where new index t is less than current commit t.
+  Compares against current index (if exists) to decide whether to apply."
+  [ledger branch db index-catalog new-root new-idx-t new-idx-addr cur-t cur-idx-addr]
+  (go-try
+    (if cur-idx-addr
+      (let [cur-root  (<? (index-storage/read-db-root index-catalog cur-idx-addr))
+            cur-idx-t (:t cur-root)]
+        (cond
+          (flake/t-after? new-idx-t cur-idx-t)
+          (do (log/debug "notify-index: applying newer index (behind commit but ahead of current)"
+                         {:new-idx-t new-idx-t :cur-idx-t cur-idx-t :cur-t cur-t})
+              (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
+                (update-branch-with-index ledger branch updated-db false)))
+
+          (= new-idx-t cur-idx-t)
+          (if (<? (compare-index-by-hash index-catalog new-idx-addr cur-idx-addr))
+            (do (log/debug "notify-index: same t behind commit, applying based on hash tie-breaker"
+                           {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
+                (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
+                  (update-branch-with-index ledger branch updated-db false)))
+            (do (log/debug "notify-index: same t behind commit, keeping current based on hash"
+                           {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
+                ::index-current))
+
+          :else
+          (do (log/debug "notify-index: ignoring older index"
+                         {:new-idx-t new-idx-t :cur-idx-t cur-idx-t})
+              ::index-current)))
+      (do (log/debug "notify-index: applying index behind commit (no current index)"
+                     {:new-idx-t new-idx-t :cur-t cur-t})
+          (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
+            (update-branch-with-index ledger branch updated-db false))))))
+
+(defn- handle-index-matches-commit
+  "Handles case where new index t equals current commit t.
+  Compares against current index (if exists) to decide whether to apply."
+  [ledger branch db index-catalog new-root new-idx-t new-idx-addr cur-idx-addr]
+  (go-try
+    (if cur-idx-addr
+      (let [cur-root  (<? (index-storage/read-db-root index-catalog cur-idx-addr))
+            cur-idx-t (:t cur-root)]
+        (cond
+          (flake/t-after? new-idx-t cur-idx-t)
+          (do (log/debug "notify-index: applying newer index at commit t"
+                         {:new-idx-t new-idx-t :cur-idx-t cur-idx-t})
+              (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
+                (update-branch-with-index ledger branch updated-db false)))
+
+          (= new-idx-t cur-idx-t)
+          (if (<? (compare-index-by-hash index-catalog new-idx-addr cur-idx-addr))
+            (do (log/debug "notify-index: same t at commit, applying based on hash tie-breaker"
+                           {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
+                (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
+                  (update-branch-with-index ledger branch updated-db false)))
+            (do (log/debug "notify-index: same t at commit, keeping current based on hash"
+                           {:new-idx-addr new-idx-addr :cur-idx-addr cur-idx-addr})
+                ::index-current))
+
+          :else
+          (do (log/warn "notify-index: current index newer than commit?"
+                        {:new-idx-t new-idx-t :cur-idx-t cur-idx-t})
+              ::index-current)))
+      (do (log/debug "notify-index: applying first index for this commit")
+          (let [updated-db (<? (apply-index-to-db db index-catalog new-root new-idx-addr))]
+            (update-branch-with-index ledger branch updated-db false))))))
+
+(defn notify-index
+  "Applies an index-only update when the provided index root matches the current commit t.
+
+  Returns one of:
+  - ::index-updated     when index was applied and address changed
+  - ::index-current     when index address is same or older
+  - ::stale             when index root.t is ahead of current commit t"
+  [ledger {:keys [index-address branch]}]
+  (go-try
+    (let [branch       (or branch (:branch @(:state ledger)))
+          db           (current-db ledger branch)
+          {:keys [index-catalog]} ledger
+          cur-t        (:t db)
+          cur-idx-addr (get-in db [:commit :index :address])]
+      (log/debug "notify-index called" {:alias (:alias ledger)
+                                        :branch branch
+                                        :cur-t cur-t
+                                        :cur-idx-addr cur-idx-addr
+                                        :new-idx-addr index-address})
+
+      (if (= index-address cur-idx-addr)
+        (do (log/debug "notify-index: same address, skipping")
+            ::index-current)
+
+        (let [new-root  (<? (index-storage/read-db-root index-catalog index-address))
+              new-idx-t (:t new-root)]
+          (log/debug "notify-index loaded" {:new-idx-t new-idx-t :cur-t cur-t})
+
+          (cond
+            (flake/t-after? new-idx-t cur-t)
+            (do (log/debug "notify-index: index ahead of commit; marking stale"
+                           {:new-idx-t new-idx-t :cur-t cur-t})
+                ::stale)
+
+            (= new-idx-t cur-t)
+            (<? (handle-index-matches-commit ledger branch db index-catalog
+                                             new-root new-idx-t index-address cur-idx-addr))
+
+            (flake/t-before? new-idx-t cur-t)
+            (<? (handle-index-behind-commit ledger branch db index-catalog
+                                            new-root new-idx-t index-address cur-t cur-idx-addr))
+
+            :else
+            (do (log/error "notify-index: unexpected state" {:new-idx-t new-idx-t :cur-t cur-t})
+                ::index-current)))))))
+
 (defrecord Ledger [id address alias did state cache commit-catalog
                    index-catalog reasoner primary-publisher secondary-publishers indexing-opts])
 
@@ -169,9 +351,9 @@
 (defn instantiate
   "Creates a new ledger, optionally bootstraps it as permissioned or with default
   context."
-  [alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
+  [combined-alias ledger-address commit-catalog index-catalog primary-publisher secondary-publishers
    indexing-opts did latest-commit]
-  (let [alias*     (util.ledger/ensure-ledger-branch alias)
+  (let [alias*     (util.ledger/ensure-ledger-branch combined-alias)
         branch     (util.ledger/ledger-branch alias*)
         publishers (cons primary-publisher secondary-publishers)
         branches   {branch (branch/state-map alias* branch commit-catalog index-catalog
@@ -196,16 +378,12 @@
            primary-publisher secondary-publishers]}
    {:keys [did indexing] :as _opts}]
   (go-try
-    (let [;; internal-only opt used for migrating ledgers without genesis commits
-          init-time      (util/current-time-iso)
+    (let [init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit
                               commit-catalog alias publish-addresses init-time))
-          ;; Publish genesis commit to nameservice - convert expanded to compact format first
+          commit-address (util/get-first-value genesis-commit const/iri-address)
           _              (when primary-publisher
-                           (let [;; Convert expanded genesis commit to compact JSON-ld format
-                                 commit-map (commit-data/json-ld->map genesis-commit nil)
-                                 compact-commit (commit-data/->json-ld commit-map)]
-                             (<? (nameservice/publish primary-publisher compact-commit))))]
+                           (<? (nameservice/publish-commit primary-publisher alias commit-address 0)))]
       (instantiate alias primary-address commit-catalog index-catalog
                    primary-publisher secondary-publishers indexing did genesis-commit))))
 
@@ -319,11 +497,22 @@
        :write-result  commit-res})))
 
 (defn publish-commit
-  "Publishes commit to all nameservices registered with the ledger."
+  "Publishes commit to all nameservices registered with the ledger.
+   Uses atomic publish-commit to update only commit fields, avoiding
+   overwriting index data that may have been updated by a separate indexer."
   [{:keys [primary-publisher secondary-publishers] :as _ledger} commit-jsonld]
   (go-try
-    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
-      (nameservice/publish-to-all commit-jsonld secondary-publishers)
+    (let [ledger-alias   (get commit-jsonld "alias")
+          commit-address (get commit-jsonld "address")
+          commit-t       (get-in commit-jsonld ["data" "t"])
+          _              (log/debug "publish-commit using atomic update"
+                                    {:alias ledger-alias :commit-t commit-t})
+          result         (<? (nameservice/publish-commit primary-publisher
+                                                         ledger-alias
+                                                         commit-address
+                                                         commit-t))]
+      (when-let [secondaries (seq secondary-publishers)]
+        (nameservice/publish-commit-to-all ledger-alias commit-address commit-t secondaries))
       result)))
 
 (defn formalize-commit

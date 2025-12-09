@@ -2,7 +2,9 @@
   (:require #?(:clj  [fluree.db.storage.s3 :as s3-storage]
                :cljs [fluree.db.storage.localstorage :as localstorage-store])
             #?(:clj [fluree.db.migrations.nameservice :as ns-migration])
+            #?(:clj [fluree.db.nameservice.dynamodb :as dynamodb-nameservice])
             #?(:clj [fluree.db.storage.file :as file-storage])
+            #?(:clj [fluree.db.util.log :as log])
             [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]
             [fluree.db.connection.config :as config]
@@ -46,6 +48,9 @@
 
 (derive :fluree.db.nameservice/ipns :fluree.db/publisher)
 (derive :fluree.db.nameservice/ipns :fluree.db/nameservice)
+
+#?(:clj (derive :fluree.db.nameservice/dynamodb :fluree.db/publisher))
+#?(:clj (derive :fluree.db.nameservice/dynamodb :fluree.db/nameservice))
 
 (derive :fluree.db.serializer/json :fluree.db/serializer)
 
@@ -177,6 +182,12 @@
 #?(:clj
    (defmethod ig/init-key :fluree.db.storage/s3
      [_ config]
+     ;; LOG RAW CONFIG - This will show if s3Endpoint is present at all
+     (log/error "S3-INIT-CONFIG-RAW [v2025-12-06T02:00]"
+                {:config-keys (keys config)
+                 :has-endpoint? (contains? config conn-vocab/s3-endpoint)
+                 :endpoint-raw (get config conn-vocab/s3-endpoint)
+                 :full-config config})
      (let [identifier  (config/get-first-string config conn-vocab/address-identifier)
            s3-bucket   (config/get-first-string config conn-vocab/s3-bucket)
            s3-prefix   (config/get-first-string config conn-vocab/s3-prefix)
@@ -187,6 +198,13 @@
            max-retries (config/get-first-integer config conn-vocab/s3-max-retries)
            retry-base-delay-ms (config/get-first-long config conn-vocab/s3-retry-base-delay-ms)
            retry-max-delay-ms (config/get-first-long config conn-vocab/s3-retry-max-delay-ms)]
+       ;; DIAGNOSTIC: This fires when loading from solo3 config
+       (log/warn "S3-DIAGNOSTIC: Initializing S3 storage from configuration [v2025-12-06T02:00]"
+                 {:identifier identifier
+                  :bucket s3-bucket
+                  :prefix s3-prefix
+                  :endpoint s3-endpoint
+                  :code-version "2025-12-06T02:00:00Z"})
        (s3-storage/open identifier s3-bucket s3-prefix s3-endpoint
                         {:read-timeout-ms read-timeout-ms
                          :write-timeout-ms write-timeout-ms
@@ -231,6 +249,18 @@
   (let [endpoint (config/get-first-string config conn-vocab/ipfs-endpoint)
         ipns-key (config/get-first-string config conn-vocab/ipns-key)]
     (ipns-nameservice/initialize endpoint ipns-key)))
+
+#?(:clj
+   (defmethod ig/init-key :fluree.db.nameservice/dynamodb
+     [_ config]
+     (let [table-name (config/get-first-string config conn-vocab/dynamodb-table)
+           region     (config/get-first-string config conn-vocab/dynamodb-region)
+           endpoint   (config/get-first-string config conn-vocab/dynamodb-endpoint)
+           timeout-ms (config/get-first-long config conn-vocab/dynamodb-timeout-ms)]
+       (dynamodb-nameservice/start (cond-> {:table-name table-name}
+                                     region     (assoc :region region)
+                                     endpoint   (assoc :endpoint endpoint)
+                                     timeout-ms (assoc :timeout-ms timeout-ms))))))
 
 (defmethod ig/init-key :fluree.db.serializer/json
   [_ _]

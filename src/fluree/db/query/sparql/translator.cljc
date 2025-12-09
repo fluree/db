@@ -141,6 +141,7 @@
    "minutes"        "minutes"
    "month"          "month"
    "now"            "now"
+   "power"          "power"
    "rand"           "rand"
    "round"          "round"
    "seconds"        "seconds"
@@ -198,6 +199,8 @@
       "minutes"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "month"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "now"          (str "(" f ")")
+      "power"        (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (second args))) ")")
       "rand"         (str "(" f ")")
       "round"        (str "(" f " " (parse-term (first args)) ")")
       "seconds"      (str "(" f " " (literal-quote (parse-term (first args))) ")")

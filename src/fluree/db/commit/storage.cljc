@@ -75,8 +75,11 @@
 (defn read-data-jsonld
   [storage address]
   (go-try
-    (let [jsonld (<? (storage/read-json storage address))]
+    (let [jsonld (<? (storage/read-json storage address))
+          hash   (<? (storage/get-hash storage address))
+          db-id  (commit-data/hash->db-id hash)]
       (-> jsonld
+          (assoc const/iri-id db-id)
           (assoc const/iri-address address)
           json-ld/expand))))
 
@@ -115,7 +118,8 @@
 (defn with-index-address
   [commit index-address]
   (if index-address
-    (let [index-reference {const/iri-address index-address}]
+    (let [existing-index  (get-first commit const/iri-index)
+          index-reference (assoc existing-index const/iri-address index-address)]
       (assoc commit const/iri-index [index-reference]))
     commit))
 

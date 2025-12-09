@@ -52,6 +52,11 @@
        (or (contains? node conn-vocab/ipfs-endpoint)
            (contains? node conn-vocab/ipns-key))))
 
+(defn dynamodb-nameservice?
+  [node]
+  (and (publisher? node)
+       (contains? node conn-vocab/dynamodb-table)))
+
 (defn storage?
   [node]
   (of-type? node conn-vocab/storage-type))
@@ -150,7 +155,8 @@
       (s3-storage? node)          (derive id :fluree.db.storage/s3)
       (ipfs-storage? node)        (derive id :fluree.db.storage/ipfs)
       (ipns-nameservice? node)    (derive id :fluree.db.nameservice/ipns)
-      (storage-nameservice? node) (derive id :fluree.db.nameservice/storage))
+      (storage-nameservice? node) (derive id :fluree.db.nameservice/storage)
+      (dynamodb-nameservice? node) (derive id :fluree.db.nameservice/dynamodb))
     node))
 
 (def component-exclusions
@@ -333,10 +339,11 @@
 (defn parse-index-options
   [defaults]
   (when-let [index-options (get-first defaults conn-vocab/index-options)]
-    {:reindex-min-bytes (get-first-long index-options conn-vocab/reindex-min-bytes)
-     :reindex-max-bytes (get-first-long index-options conn-vocab/reindex-max-bytes)
-     :max-old-indexes   (get-first-integer index-options conn-vocab/max-old-indexes)
-     :indexing-enabled  (not (false? (get-first-boolean index-options conn-vocab/indexing-enabled)))}))
+    {:reindex-min-bytes      (get-first-long index-options conn-vocab/reindex-min-bytes)
+     :reindex-max-bytes      (get-first-long index-options conn-vocab/reindex-max-bytes)
+     :max-old-indexes        (get-first-integer index-options conn-vocab/max-old-indexes)
+     :indexing-enabled       (not (false? (get-first-boolean index-options conn-vocab/indexing-enabled)))
+     :track-class-stats      (not (false? (get-first-boolean index-options conn-vocab/track-class-stats)))}))
 
 (defn parse-defaults
   [config]

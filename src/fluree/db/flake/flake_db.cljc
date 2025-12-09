@@ -16,6 +16,7 @@
             [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.flake.match :as match]
+            [fluree.db.flake.optimize :refer  [explain-query optimize-query]]
             [fluree.db.flake.reasoner :as flake.reasoner]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.indexer :as indexer]
@@ -38,8 +39,7 @@
                                              get-first get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
-            [fluree.db.util.reasoner :as reasoner-util]
-            [fluree.json-ld :as json-ld])
+            [fluree.db.util.reasoner :as reasoner-util])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -96,11 +96,21 @@
 
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
-  If it is not newer, returns original db."
-  [{:keys [commit] :as db} {data-map :data, :keys [spot psot post opst tspo] :as index-map}]
+  If it is not newer, returns original db.
+
+  The index-map may include :stats from the index root (with :properties and :classes)
+  which should be merged into the db's stats when applying the newer index."
+  [{:keys [commit] :as db} {data-map :data, :keys [spot psot post opst tspo stats] :as index-map}]
   (if (newer-index? commit index-map)
     (let [index-t (:t data-map)
-          commit* (assoc commit :index index-map)]
+          commit* (assoc commit :index index-map)
+          ;; Merge stats from index root, preserving flakes/size from current db
+          ;; and applying :properties/:classes from the index
+          current-stats (get db :stats {})
+          updated-stats (cond-> current-stats
+                          true                (assoc :indexed index-t)
+                          (:properties stats) (assoc :properties (:properties stats))
+                          (:classes stats)    (assoc :classes (:classes stats)))]
       (-> db
           (empty-novelty index-t)
           (assoc :commit commit*
@@ -108,8 +118,8 @@
                  :psot psot
                  :post post
                  :opst opst
-                 :tspo tspo)
-          (assoc-in [:stats :indexed] index-t)))
+                 :tspo tspo
+                 :stats updated-stats)))
     db))
 
 (defn with-namespaces
@@ -291,136 +301,28 @@
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
 
-(defn- component->user-value
-  "Convert an internal pattern component to user-readable format"
-  [component compact-fn]
-  (cond
-    (nil? component)
-    nil
-
-    (where/unmatched-var? component)
-    (str (where/get-variable component))
-
-    (where/matched-iri? component)
-    (let [iri (where/get-iri component)]
-      (json-ld/compact iri compact-fn))
-
-    (where/matched-value? component)
-    (where/get-value component)
-
-    :else
-    (throw (ex-info (str "Unexpected component type: " (pr-str component))
-                    {:component component}))))
-
-(defn- pattern->user-format
-  "Convert internal pattern to user-readable triple format"
-  [pattern compact-fn]
-  (let [ptype (where/pattern-type pattern)
-        pdata (where/pattern-data pattern)]
-    (case ptype
-      :class
-      (let [[s _ o] pdata]
-        {:subject (component->user-value s compact-fn)
-         :property const/iri-type
-         :object (component->user-value o compact-fn)})
-
-      :tuple
-      (let [[s p o] pdata]
-        {:subject (component->user-value s compact-fn)
-         :property (component->user-value p compact-fn)
-         :object (component->user-value o compact-fn)})
-
-      :id
-      {:subject (component->user-value pdata compact-fn)}
-
-      ;; Other pattern types (filter, bind, etc.)
-      {:type ptype
-       :data (pr-str pdata)})))
-
-(defn- pattern-type->user-type
-  "Convert internal pattern type to user-friendly type name"
-  [ptype]
-  (case ptype
-    :tuple :triple
-    ptype))
-
-(defn- pattern-explain
-  "Generate explain information for a single pattern"
-  [db stats pattern compact-fn]
-  (let [ptype       (where/pattern-type pattern)
-        optimizable? (optimize/optimizable-pattern? pattern)
-        selectivity (optimize/calculate-selectivity db stats pattern)]
-    {:type        (pattern-type->user-type ptype)
-     :pattern     (pattern->user-format pattern compact-fn)
-     :selectivity selectivity
-     :optimizable (when optimizable? (pattern-type->user-type optimizable?))}))
-
-(defn- segment-explain
-  "Generate explain information for pattern segments"
-  [db stats where-clause compact-fn]
-  (let [segments (optimize/split-by-optimization-boundaries where-clause)]
-    (mapv (fn [segment]
-            (if (= :optimizable (:type segment))
-              {:type     :optimizable
-               :patterns (mapv #(pattern-explain db stats % compact-fn) (:data segment))}
-              {:type    :boundary
-               :pattern (pattern-explain db stats (:data segment) compact-fn)}))
-          segments)))
-
-(defn optimize-query
-  "Optimize a parsed query using statistics if available.
-   Returns the optimized query with patterns reordered for optimal execution."
-  [db parsed-query]
-  (let [stats (:stats db)]
-    (if (and stats (not-empty stats) (:where parsed-query))
-      (let [optimized-where (optimize/optimize-patterns db (:where parsed-query))]
-        (assoc parsed-query :where optimized-where))
-      parsed-query)))
-
-(defn explain-query
-  "Generate an execution plan for the query showing optimization details.
-   Returns a query plan map with optimization information."
-  [db parsed-query]
-  (let [stats            (:stats db)
-        has-stat-counts? (and stats
-                              (or (seq (:properties stats))
-                                  (seq (:classes stats))))
-        context          (:context parsed-query)
-        compact-fn       (json-ld/compact-fn context)]
-    (if-not has-stat-counts?
-      {:query parsed-query
-       :plan  {:optimization :none
-               :reason       "No statistics available"
-               :where-clause (:where parsed-query)}}
-      (let [where-clause      (:where parsed-query)
-            optimized-where   (when where-clause
-                                (optimize/optimize-patterns db where-clause))
-            original-explain  (when where-clause
-                                (mapv #(pattern-explain db stats % compact-fn) where-clause))
-            optimized-explain (when optimized-where
-                                (mapv #(pattern-explain db stats % compact-fn) optimized-where))
-            segments          (when where-clause
-                                (segment-explain db stats where-clause compact-fn))
-            changed?          (not= where-clause optimized-where)]
-        {:query (assoc parsed-query :where optimized-where)
-         :plan  {:optimization (if changed? :reordered :unchanged)
-                 :statistics   {:property-counts (count (:properties stats))
-                                :class-counts    (count (:classes stats))
-                                :total-flakes    (:flakes stats)
-                                :indexed-at-t    (:indexed stats)}
-                 :original     original-explain
-                 :optimized    optimized-explain
-                 :segments     segments
-                 :changed?     changed?}}))))
-
 (defrecord FlakeDB [index-catalog commit-catalog alias commit t tt-id stats
                     spot post opst tspo vg schema comparators staged novelty policy
                     namespaces namespace-codes max-namespace-code
-                    reindex-min-bytes reindex-max-bytes max-old-indexes]
+                    reindex-min-bytes reindex-max-bytes max-old-indexes track-class-stats]
   dbproto/IFlureeDb
   (-query [this tracker query-map] (fql/query this tracker query-map))
   (-class-ids [this tracker subject] (match/class-ids this tracker subject))
   (-index-update [db commit-index] (index-update db commit-index))
+  (-ledger-info [_]
+    (async/go
+      (let [index-address (get-in commit [:index :address])
+            index-id      (get-in commit [:index :id])
+            index-t       (get-in commit [:index :data :t])]
+        {:stats           stats
+         :schema          schema
+         :namespace-codes namespace-codes
+         :t               t
+         :novelty-post    (get novelty :post)
+         :commit          commit
+         :index           {:id      index-id
+                           :t       index-t
+                           :address index-address}})))
 
   iri/IRICodec
   (encode-iri [_ iri]
@@ -720,16 +622,22 @@
         reindex-max-bytes (or (:reindex-max-bytes indexing-opts)
                               (:reindex-max-bytes config)
                               1000000) ; 1mb
-        max-old-indexes (or (:max-old-indexes indexing-opts)
-                            (:max-old-indexes config)
-                            3)] ;; default of 3 maximum old indexes not garbage collected
+        max-old-indexes   (or (:max-old-indexes indexing-opts)
+                              (:max-old-indexes config)
+                              3) ;; default of 3 maximum old indexes not garbage collected
+        track-class-stats (if (contains? indexing-opts :track-class-stats)
+                            (:track-class-stats indexing-opts)
+                            (if (contains? config :track-class-stats)
+                              (:track-class-stats config)
+                              true))]
     (when-not (and (int? max-old-indexes)
                    (>= max-old-indexes 0))
       (throw (ex-info "Invalid max-old-indexes value. Must be a non-negative integer."
                       {:status 400, :error :db/invalid-config})))
     (assoc root-map :reindex-min-bytes reindex-min-bytes
            :reindex-max-bytes reindex-max-bytes
-           :max-old-indexes max-old-indexes)))
+           :max-old-indexes max-old-indexes
+           :track-class-stats track-class-stats)))
 
 ;; TODO - VG - need to reify vg from db-root!!
 (defn load
@@ -743,13 +651,18 @@
            root-map    (if-let [{:keys [address]} (:index commit-map)]
                          (<? (index-storage/read-db-root index-catalog address))
                          (genesis-root-map ledger-alias))
+           ;; Propagate index version from root-map into commit-map so it's available
+           ;; for subsequent re-indexing operations (novelty.cljc, storage.cljc)
+           commit-map* (if-let [v (:v root-map)]
+                         (assoc-in commit-map [:index :v] v)
+                         commit-map)
            max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
            indexed-db  (-> root-map
                            (add-reindex-thresholds indexing-opts)
                            (assoc :index-catalog index-catalog
                                   :commit-catalog commit-catalog
                                   :alias ledger-alias
-                                  :commit commit-map
+                                  :commit commit-map*
                                   :tt-id nil
                                   :comparators index/comparators
                                   :staged nil

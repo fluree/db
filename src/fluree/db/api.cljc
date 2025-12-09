@@ -1,7 +1,10 @@
 (ns fluree.db.api
-  (:require [camel-snake-kebab.core :refer [->camelCaseString]]
+  (:require #?(:clj [fluree.db.virtual-graph.create :as vg-create])
+            #?(:clj [fluree.db.virtual-graph.drop :as vg-drop])
+            [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.core.async :as async :refer [go <!]]
             [clojure.walk :refer [postwalk]]
+            [fluree.db.api.decode :as decode]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.connection :as connection :refer [connection?]]
             [fluree.db.connection.config :as config]
@@ -20,8 +23,6 @@
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
             [fluree.db.util.parse :as util.parse]
-            [fluree.db.virtual-graph.create :as vg-create]
-            [fluree.db.virtual-graph.drop :as vg-drop]
             [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge load range exists? update drop]))
 
@@ -256,31 +257,6 @@
       (let [ledger (<? (connection/create-ledger conn ledger-alias opts))]
         (ledger/current-db ledger))))))
 
-(defn create-virtual-graph
-  "Creates a new virtual graph in the nameservice.
-
-  Parameters:
-    conn - Connection object
-    config - Virtual graph configuration map:
-      :name - Virtual graph name (any unique identifier)
-      :type - Virtual graph type (e.g. :bm25)
-      :config - Type-specific configuration
-      :dependencies - (optional) List of ledger dependencies
-
-  For BM25 virtual graphs, config should include:
-    :stemmer - Stemmer identifier (e.g. \"snowballStemmer-en\")
-    :stopwords - Stopwords identifier (e.g. \"stopwords-en\")
-    :query - FQL query defining documents to index
-    :ledgers - List of ledger aliases to index from
-
-  Returns promise resolving to virtual graph database object that supports:
-    - query operations via query-connection
-    - sync method to wait for indexing completion"
-  [conn config]
-  (validate-connection conn)
-  (promise-wrap
-   (vg-create/create conn config)))
-
 (defn alias->address
   "Resolves a ledger alias to its address.
 
@@ -305,21 +281,6 @@
   [conn ledger-alias]
   (promise-wrap
    (connection/drop-ledger conn ledger-alias)))
-
-(defn drop-virtual-graph
-  "Deletes a virtual graph and its associated data.
-  
-  Parameters:
-    conn - Connection object
-    vg-name - Virtual graph name
-  
-  Removes the virtual graph from nameservice, cleans up all index files,
-  and unregisters any dependencies. Returns a promise that resolves when
-  deletion is complete."
-  [conn vg-name]
-  (validate-connection conn)
-  (promise-wrap
-   (vg-drop/drop-virtual-graph conn vg-name)))
 
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
@@ -596,26 +557,49 @@
   Parameters:
     conn - Connection object
     ledger-id - Ledger alias (with optional :branch) or address
+    context - (optional) JSON-LD context for compacting IRIs in response
 
   Returns info map with:
-    - :address - Ledger address
-    - :alias - Ledger alias
-    - :branch - Branch name
-    - :t - Current transaction number
-    - :size - Total byte size
-    - :flakes - Total flake count
-    - :commit - Commit metadata
-    - :property-counts - Map of property SID -> count (if available)
-    - :class-counts - Map of class SID -> count (if available)
+    - :commit - Commit metadata (JSON-LD format) including:
+        - @id - Commit ID
+        - @type - Type (VerifiableCredential)
+        - alias - Ledger alias
+        - data - DB data including t (transaction number)
+        - index - Index metadata with id, t, and address
+        - ns - Namespace addresses
+        - previous - Previous commit reference
+        - time - Commit timestamp
+    - :nameservice - Nameservice record (JSON-LD format) if available, including:
+        - @id - Ledger alias with branch
+        - f:branch - Branch name
+        - f:t - Current transaction number
+        - f:commit - Commit address/reference
+        - f:index - Index address/reference
+    - :namespace-codes - Map of namespace IRIs to namespace codes
+    - :stats - Statistics map containing:
+      - :size - Total byte size
+      - :flakes - Total flake count
+      - :properties - Map of property IRI -> stats (count, NDV, selectivity, :sub-property-of)
+      - :classes - Map of class IRI -> stats (count, :subclass-of, nested property details)
 
   Property and class counts are computed from the most recent index plus
-  any novelty, providing absolutely current statistics."
-  [conn ledger-id]
-  (validate-connection conn)
-  (promise-wrap
-   (go-try
-     (let [ledger (<? (connection/load-ledger conn ledger-id))]
-       (ledger/ledger-info ledger)))))
+  any novelty, providing absolutely current statistics.
+
+  Hierarchy information (:sub-property-of, :subclass-of) shows direct parent relationships
+  for properties and classes that have them.
+
+  When context is provided, all IRIs in the stats maps will be compacted using
+  the context prefixes (e.g., \"http://example.org/name\" -> \"ex:name\")."
+  ([conn ledger-id] (ledger-info conn ledger-id nil))
+  ([conn ledger-id context]
+   (validate-connection conn)
+   (promise-wrap
+    (go-try
+      (let [ledger     (<? (connection/load-ledger conn ledger-id))
+            info       (<? (ledger/ledger-info ledger))
+            compact-fn (when context
+                         (json-ld/compact-fn (json-ld/parse-context context)))]
+        (decode/ledger-info info compact-fn))))))
 
 ;; db operations
 
@@ -767,10 +751,12 @@
             :optimized [{:pattern ... :selectivity 1}    ; email lookup first
                         {:pattern ... :selectivity 10000}] ; then verify type
             :changed? true}}"
-  [ds q]
-  (if (util/exception? ds)
-    (throw ds)
-    (promise-wrap (query-api/explain ds q))))
+  ([ds q]
+   (explain ds q {}))
+  ([ds q opts]
+   (if (util/exception? ds)
+     (throw ds)
+     (promise-wrap (query-api/explain ds q opts)))))
 
 (defn credential-query
   "Executes a query using a verifiable credential.
@@ -1042,3 +1028,47 @@
    (validate-connection conn)
    (promise-wrap
     (connection/trigger-ledger-index conn ledger-alias opts))))
+
+;; Virtual Graph APIs (JVM only)
+
+#?(:clj
+   (defn create-virtual-graph
+     "Creates a new virtual graph.
+
+     Parameters:
+       conn - Connection object
+       config - Configuration map:
+         :name - Name for the virtual graph (required)
+         :type - Virtual graph type, e.g. :bm25 (required)
+         :config - Type-specific configuration map:
+           :ledgers - Vector of ledger aliases to index
+           :query - Query defining what data to index
+
+     Returns promise resolving to the created virtual graph instance.
+
+     Example:
+       @(create-virtual-graph conn
+         {:name \"my-search\"
+          :type :bm25
+          :config {:ledgers [\"my-ledger\"]
+                   :query {\"@context\" {\"ex\" \"http://example.org/\"}
+                           \"where\" [{\"@id\" \"?x\" \"@type\" \"ex:Document\"}]
+                           \"select\" {\"?x\" [\"@id\" \"ex:title\" \"ex:content\"]}}}})"
+     [conn config]
+     (validate-connection conn)
+     (promise-wrap
+      (vg-create/create conn config))))
+
+#?(:clj
+   (defn drop-virtual-graph
+     "Drops a virtual graph and all its associated data.
+
+     Parameters:
+       conn - Connection object
+       vg-name - Name of the virtual graph to drop
+
+     Returns promise resolving to :dropped when complete."
+     [conn vg-name]
+     (validate-connection conn)
+     (promise-wrap
+      (vg-drop/drop-virtual-graph conn vg-name))))

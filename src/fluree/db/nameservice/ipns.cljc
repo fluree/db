@@ -54,10 +54,31 @@
                              "IPNS key: " ipns-key " does not exist on the server.")
                         {:status 400, :error :db/missing-ipns-key}))))))
 
+(defn build-commit-record
+  "Builds a minimal commit record for IPNS publishing."
+  [ledger-alias commit-address commit-t publishing-address]
+  {"alias"   ledger-alias
+   "address" commit-address
+   "ns"      [{"id" publishing-address}]
+   "data"    {"t" commit-t}})
+
 (defrecord IpnsNameService [ipfs-endpoint ipns-key]
   nameservice/Publisher
-  (publish [_ commit-jsonld]
-    (ipfs/push! ipfs-endpoint commit-jsonld))
+  (publish-commit [_ ledger-alias commit-address commit-t]
+    (go-try
+      (let [pub-addr (<? (ipns-address ipfs-endpoint ipns-key ledger-alias))
+            record   (build-commit-record ledger-alias commit-address commit-t pub-addr)]
+        (<? (ipfs/push! ipfs-endpoint record)))))
+  (publish-index [_ _ledger-alias _index-address _index-t]
+    ;; IPNS doesn't support atomic index updates - the full commit is published each time
+    ;; Index updates would require reading current record, merging, and republishing
+    (log/warn "publish-index not fully supported for IPNS nameservice")
+    (go-try nil))
+  (publish-vg [_ vg-config]
+    ;; TODO: Implement VG support for IPNS nameservice
+    (go-try
+      (throw (ex-info "Virtual graph publishing not yet supported for IPNS nameservice"
+                      {:status 501 :error :db/not-implemented :vg-config vg-config}))))
   (retract [_ _ledger-alias]
     (ipfs/write ipfs-endpoint "null"))
   (publishing-address [_ ledger-alias]
