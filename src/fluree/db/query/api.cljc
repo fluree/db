@@ -205,12 +205,13 @@
     (let [types (get ns-record "@type")]
       (some #{"f:VirtualGraphDatabase"} types))))
 
-(defn- r2rml-virtual-graph?
-  "Returns true if a nameservice record represents an R2RML virtual graph."
-  [ns-record]
-  (when ns-record
-    (let [types (set (get ns-record "@type" []))]
-      (contains? types "fidx:R2RML"))))
+#?(:clj
+   (defn- r2rml-virtual-graph?
+     "Returns true if a nameservice record represents an R2RML virtual graph."
+     [ns-record]
+     (when ns-record
+       (let [types (set (get ns-record "@type" []))]
+         (contains? types "fidx:R2RML")))))
 
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
