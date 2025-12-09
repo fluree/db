@@ -24,13 +24,13 @@
     ;; object cache takes (a) key and (b) fn to retrieve value if null
     (oc cache-key
         (fn [_]
-          (log/debug! ::query-cache-miss {:cache-key cache-key})
-          (let [pc (async/promise-chan)]
-            (go
-              (let [res (<! (query db (assoc-in query-map [:opts :cache]
-                                                false)))]
-                (async/put! pc res)))
-            pc)))))
+          (log/debug! ::query-cache-miss {:cache-key cache-key}
+            (let [pc (async/promise-chan)]
+              (go
+                (let [res (<! (query db (assoc-in query-map [:opts :cache]
+                                                  false)))]
+                  (async/put! pc res)))
+              pc))))))
 
 #?(:clj
    (defn cache?
@@ -52,10 +52,9 @@
    (if (cache? query-map)
      (cache-query ds query-map)
      (go-try
-       (let [pq (parse/parse-query query-map)
-             _  (log/debug! ::parsed-query {:query query-map :parsed-query pq})
+       (let [pq (log/debug! ::parsed-query {:query query-map}
+                  (parse/parse-query query-map))
              oq (<? (optimize/optimize ds pq))]
-         (log/debug! ::optimized-query {:query query-map :optimized-query pq})
          (<? (exec/query ds tracker oq)))))))
 
 (defn explain

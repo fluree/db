@@ -12,10 +12,10 @@
 (defn reason
   [db methods rule-sources {:keys [max-fuel reasoner-max]
                             :or   {reasoner-max 10} :as opts}]
-  (log/debug! ::reason {:db db :methods methods :rule-sources rule-sources :opts opts})
-  (let [methods* (set (util/sequential methods))
-        tracker  (track/init {:max-fuel max-fuel})]
-    (-reason db methods* rule-sources tracker reasoner-max)))
+  (log/debug! ::reason {:db db :methods methods :rule-sources rule-sources :opts opts}
+    (let [methods* (set (util/sequential methods))
+          tracker  (track/init {:max-fuel max-fuel})]
+      (-reason db methods* rule-sources tracker reasoner-max))))
 
 (defn reasoned-facts
   ([db]

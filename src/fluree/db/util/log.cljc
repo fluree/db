@@ -139,14 +139,12 @@
 #?(:clj
    (defmacro info!
      [id data & forms]
-     `(tel/trace!  {:level :info :id ~id :data ~data}
-                   (do
-                     ~@forms))))
+     `(tel/trace! {:level :info :id ~id :data ~data} (do ~@forms))))
 
 #?(:clj
    (defmacro debug!
-     [id data]
-     `(tel/log! {:level :debug :id ~id :data ~data})))
+     [id data & forms]
+     `(tel/trace! {:level :debug :id ~id :data ~data} (do ~@forms))))
 
 (defn xf-debug-impl
   "Logs the first time a transducer receives a value."

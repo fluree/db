@@ -134,19 +134,19 @@
   ([db parsed-context opts]
    (policy-enforce-db db nil parsed-context opts))
   ([db tracker parsed-context opts]
-   (log/debug! ::enforce-policy {:db db :opts opts})
-   (go-try
-     (let [{:keys [identity policy-class policy policy-values]} opts
-           policy-values* (util.parse/normalize-values policy-values)]
-       (cond
+   (log/debug! ::enforce-policy {:db db :opts opts}
+     (go-try
+       (let [{:keys [identity policy-class policy policy-values]} opts
+             policy-values* (util.parse/normalize-values policy-values)]
+         (cond
 
-         identity
-         (<? (wrap-identity-policy db tracker identity policy-values*))
+           identity
+           (<? (wrap-identity-policy db tracker identity policy-values*))
 
-         policy-class
-         (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policy-class))]
-           (<? (wrap-class-policy db tracker classes policy-values*)))
+           policy-class
+           (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policy-class))]
+             (<? (wrap-class-policy db tracker classes policy-values*)))
 
-         policy
-         (let [expanded-policy (json-ld/expand policy parsed-context)]
-           (<? (wrap-policy db tracker expanded-policy policy-values*))))))))
+           policy
+           (let [expanded-policy (json-ld/expand policy parsed-context)]
+             (<? (wrap-policy db tracker expanded-policy policy-values*)))))))))

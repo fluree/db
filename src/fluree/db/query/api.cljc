@@ -76,9 +76,9 @@
   [ds tracker exec-fn]
   (go-try
     (track/register-policies! tracker ds)
-    (log/debug! ::tally-tracker {:track (vec (keys tracker))})
     (try* (let [result        (<? (exec-fn))
-                tally         (track/tally tracker)]
+                tally         (log/debug! ::tally-tracker {:track (vec (keys tracker))}
+                                (track/tally tracker))]
             (assoc tally :status 200, :result result))
           (catch* e
             (let [data (-> tracker
@@ -129,10 +129,10 @@
 
 (defn query-sparql
   [db query override-opts]
-  (go-try
-    (let [fql (sparql/->fql query)]
-      (log/debug! ::query-sparql {:sparql query :jld-query fql})
-      (<? (query-fql db fql override-opts)))))
+  (log/debug! ::query-sparql {:sparql query}
+    (go-try
+      (let [fql (sparql/->fql query)]
+        (<? (query-fql db fql override-opts))))))
 
 (defn query
   [db query {:keys [format] :as override-opts :or {format :fql}}]

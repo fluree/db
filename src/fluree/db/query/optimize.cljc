@@ -1,7 +1,8 @@
 (ns fluree.db.query.optimize
   (:require [fluree.db.query.exec.eval :as eval]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util.async :refer [go-try <?]]))
+            [fluree.db.util.async :refer [go-try <?]]
+            [fluree.db.util.log :as log]))
 
 (defn compare-component
   [cmp-a cmp-b]
@@ -274,14 +275,15 @@
   Returns:
     Channel containing optimized query with inlined filters compiled"
   [db parsed-query]
-  (go-try
-    (let [;; First apply statistical optimization (reordering patterns)
-          reordered-query (<? (-reorder db parsed-query))
-          context         (:context reordered-query)]
-      ;; Then apply inline filter optimization
-      (if-let [where (:where reordered-query)]
-        (let [where-optimized  (->> where
-                                    optimize-inline-filters
-                                    (compile-filter-codes context))]
-          (assoc reordered-query :where where-optimized))
-        reordered-query))))
+  (log/debug! ::optimized-query {:parsed-query parsed-query}
+    (go-try
+      (let [ ;; First apply statistical optimization (reordering patterns)
+            reordered-query (<? (-reorder db parsed-query))
+            context         (:context reordered-query)]
+        ;; Then apply inline filter optimization
+        (if-let [where (:where reordered-query)]
+          (let [where-optimized  (->> where
+                                      optimize-inline-filters
+                                      (compile-filter-codes context))]
+            (assoc reordered-query :where where-optimized))
+          reordered-query)))))
