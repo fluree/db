@@ -45,8 +45,8 @@
   message (if available).
 
   Class policies are stored directly in [:modify :property pid] with a :class-policy? flag.
-  This enables a single O(1) lookup. Class applicability filtering is handled lazily
-  inside policies-allow-modification? using cached class membership lookups."
+  This enables a single O(1) lookup. Class applicability and required policy selection
+  are handled internally by policies-allow-modification?."
   [tracker {:keys [db-after add]}]
   (go-try
     (let [{:keys [policy] :as db-after*} (<? (refresh-modify-policies db-after tracker))
@@ -56,19 +56,14 @@
         db-after
         (loop [[flake & r] add]
           (if flake
-            (let [sid      (flake/s flake)
-                  pid      (flake/p flake)
-                  ;; Single O(1) lookup - gets both regular and class-derived policies
+            (let [sid (flake/s flake)
+                  pid (flake/p flake)
                   property-policies (enforce/modify-policies-for-property policy pid)
-                  ;; Collect all applicable policies
-                  policies (concat property-policies
-                                   (enforce/modify-policies-for-subject policy sid)
-                                   (enforce/modify-policies-for-flake db-after* flake))]
+                  candidate-policies (concat property-policies
+                                             (enforce/modify-policies-for-subject policy sid)
+                                             (enforce/modify-policies-for-flake db-after* flake))]
               ;; policies-allow-modification? will throw if access forbidden
-              ;; Class applicability is checked lazily inside policies-allow-modification?
-              (if-some [required-policies (not-empty (filter :required? policies))]
-                (<? (enforce/policies-allow-modification? db-after* tracker class-policy-cache sid required-policies))
-                (<? (enforce/policies-allow-modification? db-after* tracker class-policy-cache sid policies)))
+              (<? (enforce/policies-allow-modification? db-after* tracker class-policy-cache sid candidate-policies))
               (recur r))
             ;; no more flakes, all passed so return final db
             db-after))))))

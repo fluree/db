@@ -45,6 +45,19 @@
   (when-let [class-stats (get-in db [:stats :classes cid])]
     (set (keys (:properties class-stats)))))
 
+(defn- all-classes-using-property
+  "Returns the set of all class IDs that use a given property according to stats.
+   Used to determine if a class policy needs class membership checking."
+  [db pid]
+  (when-let [all-classes (get-in db [:stats :classes])]
+    (reduce-kv
+     (fn [acc cid class-data]
+       (if (contains? (:properties class-data) pid)
+         (conj acc cid)
+         acc))
+     #{}
+     all-classes)))
+
 (defn- build-property-to-classes-map
   "Builds a reverse mapping from property SID to the set of classes that use it.
    Returns {pid #{cid1 cid2 ...}}"
@@ -77,31 +90,45 @@
 
    When stats are available, policies are indexed by all properties used by the target classes.
    Additionally, implicit properties (@id, @type) are always indexed since every subject has them.
-   This ensures policies apply even when restricting classes with no existing instances."
+   This ensures policies apply even when restricting classes with no existing instances.
+
+   Optimization: For each property, determines if class membership checking is needed:
+   - If the property is ONLY used by the policy's target classes → no class check needed
+   - If OTHER classes also use the property → class check needed to filter appropriately"
   [restriction-map db policy-map]
   (let [cids (policy-cids db restriction-map)
-        ;; Build reverse mapping: property -> classes that use it
+        ;; Build reverse mapping: property -> classes that use it (for target classes only)
         property-classes-map (build-property-to-classes-map db cids)
         ;; Always add implicit properties (@id, @type) - every class instance has these
         ;; This ensures policies work even for classes with no existing instances
         property-classes-map* (add-implicit-class-properties property-classes-map cids)]
     ;; Store class-derived policies directly in [:view :property pid]
     ;; This is the same map as regular property policies, enabling single O(1) lookup
-    ;; The :class-policy? flag indicates class verification is needed during evaluation
     (reduce-kv
      (fn [policy pid classes-using-property]
-       (let [;; Create a class-derived restriction for this property
+       (let [;; Determine if class check is needed for this property:
+             ;; - Get ALL classes that use this property (from stats)
+             ;; - If for-classes covers all of them, no class check needed
+             ;; - For implicit properties (@id, @type), always need class check
+             ;;   since every subject has them
+             all-classes       (all-classes-using-property db pid)
+             implicit-prop?    (or (= pid const/$id) (= pid const/$rdf:type))
+             class-check-needed? (or implicit-prop?
+                                     (nil? all-classes) ; no stats, be safe
+                                     (not (every? classes-using-property all-classes)))
+             ;; Create a class-derived restriction for this property
              ;; It includes metadata about which classes use this property
-             class-policy {:id               (:id restriction-map)
-                           :class-policy?    true          ; marks this as needing class check
-                           :for-classes      classes-using-property ; classes this policy targets
-                           :on-class         (:on-class restriction-map)
-                           :required?        (:required? restriction-map)
-                           :ex-message       (:ex-message restriction-map)
-                           :view?            (:view? restriction-map)
-                           :modify?          (:modify? restriction-map)
-                           :allow?           (:allow? restriction-map)
-                           :query            (:query restriction-map)}]
+             class-policy {:id                  (:id restriction-map)
+                           :class-policy?       true
+                           :class-check-needed? class-check-needed?
+                           :for-classes         classes-using-property
+                           :on-class            (:on-class restriction-map)
+                           :required?           (:required? restriction-map)
+                           :ex-message          (:ex-message restriction-map)
+                           :view?               (:view? restriction-map)
+                           :modify?             (:modify? restriction-map)
+                           :allow?              (:allow? restriction-map)
+                           :query               (:query restriction-map)}]
          (cond-> policy
            (view-restriction? restriction-map)
            (update-in [:view :property pid] util/conjv class-policy)

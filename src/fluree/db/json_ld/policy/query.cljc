@@ -1,11 +1,10 @@
 (ns fluree.db.json-ld.policy.query
-  (:require [clojure.core.async :as async :refer [go]]
+  (:require [clojure.core.async :refer [go]]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy.enforce :as enforce]
-            [fluree.db.util :as util :refer [try* catch*]]
-            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -25,21 +24,17 @@
   hits this fn.
 
   Class policies are stored directly in [:view :property pid] with a :class-policy? flag.
-  This enables a single O(1) lookup. Class applicability filtering is handled lazily
-  inside policies-allow-viewing? using cached class membership lookups."
+  This enables a single O(1) lookup. Class applicability and required policy selection
+  are handled internally by policies-allow-viewing?."
   [{:keys [policy] :as db} tracker flake]
-  (go-try
-    (let [pid      (flake/p flake)
-          sid      (flake/s flake)
-          ;; Single O(1) lookup - gets both regular and class-derived policies
-          property-policies (enforce/view-policies-for-property policy pid)
-          ;; Collect all applicable policies
-          policies (concat property-policies
-                           (enforce/view-policies-for-subject policy sid)
-                           (enforce/view-policies-for-flake db flake))]
-      (if-some [required-policies (not-empty (filter :required? policies))]
-        (<? (enforce/policies-allow-viewing? db tracker sid required-policies))
-        (<? (enforce/policies-allow-viewing? db tracker sid policies))))))
+  (let [pid (flake/p flake)
+        sid (flake/s flake)
+        property-policies (enforce/view-policies-for-property policy pid)
+        ;; Collect all candidate policies - filtering is done inside policies-allow-viewing?
+        candidate-policies (concat property-policies
+                                   (enforce/view-policies-for-subject policy sid)
+                                   (enforce/view-policies-for-flake db flake))]
+    (enforce/policies-allow-viewing? db tracker sid candidate-policies)))
 
 (defn allow-iri?
   "Returns async channel with truthy value if iri is visible for query results"

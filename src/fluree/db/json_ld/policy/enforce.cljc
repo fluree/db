@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.policy.enforce
-  (:require [fluree.db.constants :as const]
+  (:require [clojure.core.async :refer [go]]
+            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy :refer [root]]
@@ -80,13 +81,12 @@
           classes))))
 
 (defn- policy-applies-to-subject?
-  "Checks if a policy applies to a subject. For class policies, verifies
-   the subject is an instance of one of the target classes."
-  [subject-classes {:keys [class-policy? for-classes] :as _policy}]
-  (if class-policy?
-    ;; Class policy - check if subject is of one of the target classes
+  "Checks if a policy applies to a subject.
+   Only class policies with :class-check-needed? true require verification
+   that the subject is an instance of one of the target classes."
+  [subject-classes {:keys [class-policy? class-check-needed? for-classes] :as _policy}]
+  (if (and class-policy? class-check-needed?)
     (some (set subject-classes) for-classes)
-    ;; Regular policy - always applies (filtering happened at lookup time)
     true))
 
 (defn view-policies-for-flake
@@ -111,72 +111,74 @@
 
 (def ^:const deny-query-result false)
 
-(defn- has-class-policies?
-  "Returns true if any policies in the collection are class policies."
+(defn- needs-class-lookup?
+  "Returns true if any policies require class membership lookup.
+   Only class policies with :class-check-needed? true require lookup.
+   Class policies on exclusive properties (only used by target classes)
+   don't need lookup since we know the subject must be of the target class."
   [policies]
-  (some :class-policy? policies))
+  (some (fn [{:keys [class-policy? class-check-needed?]}]
+          (and class-policy? class-check-needed?))
+        policies))
 
-(defn- policies-allow?
-  "Once narrowed to a specific set of policies, execute and return
-  appropriate policy response. If no policies apply, returns the value
-  of :default-allow? from the db's policy (defaults to false).
-
-  For class policies (those with :class-policy? true), verifies the subject
-  is an instance of one of the target classes before evaluating. This check
-  is performed lazily and cached per-subject via class-cache."
+(defn- filter-applicable-policies
+  "Filters policies to only those that apply to the subject.
+   For class policies with :class-check-needed? true, checks class membership."
   [db tracker class-cache sid policies]
   (go-try
-    (if (empty? policies)
-      ;; no policies apply - use default-allow? setting
-      (get-in db [:policy :default-allow?] false)
-      ;; Get subject classes once (lazily) if any class policies exist
-      (let [subject-classes (when (has-class-policies? policies)
-                              (<? (get-subject-classes db tracker class-cache sid)))]
-        (loop [[{:keys [id query allow?] :as policy} & r] policies]
-          ;; return first truthy response, else false
-          (if policy
-            ;; Check if policy applies to this subject (handles class policies)
-            (if (policy-applies-to-subject? subject-classes policy)
-              (let [result (cond
-                             ;; f:allow true - unconditional allow, no query needed
-                             (true? allow?)
-                             true
+    (if (needs-class-lookup? policies)
+      (let [subject-classes (<? (get-subject-classes db tracker class-cache sid))]
+        (filter #(policy-applies-to-subject? subject-classes %) policies))
+      policies)))
 
-                             ;; f:allow false - unconditional deny, no query needed
-                             (false? allow?)
-                             false
-
-                             ;; query exists - execute it
-                             query
-                             (seq (<? (dbproto/-query (root db) tracker (policy-query db sid query))))
-
-                             ;; no allow? and no query - deny
-                             :else
-                             deny-query-result)]
-                (track/policy-exec! tracker id)
-                (if result
-                  (do (track/policy-allow! tracker id)
-                      true)
-                  (recur r)))
-              ;; Policy doesn't apply to this subject (class mismatch), skip it
-              (recur r))
-            ;; policies exist but all returned false or didn't apply - deny
-            false))))))
+(defn- evaluate-policies
+  "Evaluates a list of policies, returning first truthy result or false if all deny."
+  [db tracker sid policies]
+  (go-try
+    (loop [[{:keys [id query allow?] :as policy} & r] policies]
+      (if policy
+        (let [result (cond
+                       (true? allow?) true
+                       (false? allow?) false
+                       query (seq (<? (dbproto/-query (root db) tracker (policy-query db sid query))))
+                       :else deny-query-result)]
+          (track/policy-exec! tracker id)
+          (if result
+            (do (track/policy-allow! tracker id)
+                true)
+            (recur r)))
+        false))))
 
 (defn policies-allow-viewing?
-  "Checks if policies allow viewing the subject. Uses the db's policy cache
-   for class membership lookups."
-  [db tracker sid policies]
-  (let [class-cache (get-in db [:policy :cache])]
-    (policies-allow? db tracker class-cache sid policies)))
+  "Evaluates view policies for a subject. Handles class filtering and required
+   policy selection internally. Returns immediately if no policies to check."
+  [db tracker sid candidate-policies]
+  (if (empty? candidate-policies)
+    (go (get-in db [:policy :default-allow?] false))
+    (let [class-cache (get-in db [:policy :cache])]
+      (go-try
+        (let [applicable (<? (filter-applicable-policies db tracker class-cache sid candidate-policies))
+              to-eval (if-some [required (not-empty (filter :required? applicable))]
+                        required
+                        applicable)]
+          (if (empty? to-eval)
+            (get-in db [:policy :default-allow?] false)
+            (<? (evaluate-policies db tracker sid to-eval))))))))
 
 (defn policies-allow-modification?
-  "Checks if policies allow modification. Uses provided class-cache for
-   class membership lookups (modifications use a separate cache per transaction)."
-  ([db tracker sid policies]
-   (policies-allow-modification? db tracker (get-in db [:policy :cache]) sid policies))
-  ([db tracker class-cache sid policies]
-   (go-try (or (<? (policies-allow? db tracker class-cache sid policies))
-               (ex-info (or (some :ex-message policies)
-                            "Policy enforcement prevents modification.")
-                        {:status 403 :error :db/policy-exception})))))
+  "Evaluates modify policies for a subject. Handles class filtering and required
+   policy selection internally. Returns immediately if no policies to check."
+  [db tracker class-cache sid candidate-policies]
+  (if (empty? candidate-policies)
+    (go (get-in db [:policy :default-allow?] false))
+    (go-try
+      (let [applicable (<? (filter-applicable-policies db tracker class-cache sid candidate-policies))
+            to-eval (if-some [required (not-empty (filter :required? applicable))]
+                      required
+                      applicable)]
+        (if (empty? to-eval)
+          (get-in db [:policy :default-allow?] false)
+          (or (<? (evaluate-policies db tracker sid to-eval))
+              (ex-info (or (some :ex-message to-eval)
+                           "Policy enforcement prevents modification.")
+                       {:status 403 :error :db/policy-exception})))))))
