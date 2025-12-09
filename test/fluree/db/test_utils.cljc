@@ -1,7 +1,8 @@
 (ns fluree.db.test-utils
-  (:require #?(:clj [fluree.db.storage.s3 :as s3])
-            #?@(:cljs [[clojure.core.async.interop :refer [<p!]]
-                       [clojure.core.async :as async #?@(:cljs [:refer [go go-loop]])]])
+  (:require #?(:clj [clojure.core.async :as async :refer [<!!]]
+               :cljs [clojure.core.async.interop :refer [<p!]])
+            #?(:clj [fluree.db.storage.s3 :as s3])
+            #?(:cljs [clojure.core.async :as async :refer [go go-loop <! timeout]])
             [clojure.string :as str]
             [fluree.db.api :as fluree]
             [fluree.db.did :as did]
@@ -363,7 +364,49 @@
      "Check if S3 is available (using AWS credentials)"
      []
      (try
-       (let [credentials (s3/get-credentials)]
+       (let [credentials (s3/get-base-credentials)]
          (boolean credentials))
        (catch Exception _
          false))))
+
+(defn block-until-index-complete
+  "Returns a channel that will receive a value when indexing completes.
+   Waits for the :root file message on index-files-ch, then includes a small delay
+   to ensure file handles are released.
+
+   Parameters:
+     index-files-ch - Channel that receives messages about index file writes
+     delay-ms - Optional delay in milliseconds after index completes (default 100ms)
+
+   Returns:
+     A channel that will receive `true` when indexing is complete and delay has elapsed.
+
+   Usage:
+     (let [index-ch (async/chan 10)
+           _        @(fluree/commit! conn db {:index-files-ch index-ch})]
+       (<!! (block-until-index-complete index-ch))
+       ;; Now safe to reload or access index files
+       )"
+  ([index-files-ch]
+   (block-until-index-complete index-files-ch 100))
+  ([index-files-ch delay-ms]
+   #?(:clj
+      (async/thread
+        ;; Wait for index completion (root file is written last)
+        (loop []
+          (when-let [msg (<!! index-files-ch)]
+            (when-not (= :root (:file-type msg))
+              (recur))))
+        ;; Small delay to ensure file handles are released
+        (<!! (async/timeout delay-ms))
+        true)
+      :cljs
+      (go
+        ;; Wait for index completion (root file is written last)
+        (loop []
+          (when-let [msg (<! index-files-ch)]
+            (when-not (= :root (:file-type msg))
+              (recur))))
+        ;; Small delay to ensure file handles are released
+        (<! (timeout delay-ms))
+        true))))

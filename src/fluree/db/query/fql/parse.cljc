@@ -1,6 +1,7 @@
 (ns fluree.db.query.fql.parse
   (:require #?(:cljs [cljs.reader :refer [read-string]])
             [clojure.set :as set]
+            [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
@@ -102,7 +103,9 @@
             (where/match-value v const/iri-lang-string)
             (where/link-lang-var lang))
         (where/match-lang where/unmatched v lang))
-      (where/anonymous-value v))))
+      (if (number? v)
+        (where/untyped-value v)
+        (where/anonymous-value v)))))
 
 (defn every-binary-pred
   [& fs]
@@ -503,7 +506,9 @@
       [(where/->pattern :class (flip-reverse-pattern [s-mch p-mch class-ref]))])
 
     :else
-    (let [o-mch (where/anonymous-value o)]
+    (let [o-mch (if (number? o)
+                  (where/untyped-value o)
+                  (where/anonymous-value o))]
       [(flip-reverse-pattern [s-mch p-mch o-mch])])))
 
 (defn parse-statement
@@ -529,13 +534,6 @@
   [attrs]
   (every? v/query-variable? (vals attrs)))
 
-(defn simple-property-join?
-  [id attrs]
-  (and (>= (count attrs) 2)
-       (v/query-variable? id)
-       (specified-properties? attrs)
-       (variable-objects? attrs)))
-
 (defn parse-id-map-pattern
   [m var-config context]
   (let [id    (get m const/iri-id)
@@ -544,9 +542,7 @@
     (if (empty? attrs)
       [(where/->pattern :id s-mch)]
       (let [statements (parse-statements s-mch attrs var-config context)]
-        (if (simple-property-join? id attrs)
-          [(where/->pattern :property-join statements)]
-          (sort optimize/compare-triples statements))))))
+        (sort optimize/compare-triples statements)))))
 
 (defn parse-node-map
   [m var-config context]
@@ -558,14 +554,21 @@
   [m var-config context]
   (parse-node-map m var-config context))
 
+(defn compile-filter-fn
+  [context parsed-codes]
+  (->> parsed-codes
+       (map (fn [code]
+              (comp (fn [typed-value]
+                      (:value typed-value))
+                    (eval/compile code context))))
+       (apply every-pred)))
+
 (defmethod parse-pattern :filter
   [[_ & codes] _var-config context]
-  (let [f (->> codes
-               (map parse-code)
-               (map (fn [code] (comp (fn [tv] (:value tv))
-                                     (eval/compile code context))))
-               (apply every-pred))]
-    [(where/->pattern :filter (with-meta f {:fns codes}))]))
+  (let [parsed-codes (map parse-code codes)
+        vars         (apply set/union (map variables parsed-codes))
+        f            (compile-filter-fn context parsed-codes)]
+    [(where/->pattern :filter (with-meta f {:forms parsed-codes, :vars vars}))]))
 
 (defmethod parse-pattern :union
   [[_ & unions] var-config context]
@@ -828,6 +831,13 @@
                        (update :opts merge {:object-var-parsing (:parse-object-vars? var-config)})
                        (parse-query* context))]
     [(where/->pattern :query sub-query*)]))
+
+(defmethod parse-pattern :service
+  [[_ {:keys [clause] :as data}] _var-config context]
+  (let [sparql (str/join " " (into (sparql/context->prefixes context)
+                                   ["SELECT *"
+                                    (str "WHERE " clause)]))]
+    [(where/->pattern :service (assoc data :sparql-q sparql))]))
 
 (defn parse-query
   [q]

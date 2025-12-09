@@ -5,13 +5,14 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.flake-db :as flake-db]
-            [fluree.db.flake.transact :as flake.transact]
             [fluree.db.indexer :as indexer]
             [fluree.db.json-ld.policy :as policy]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.history :as history]
+            [fluree.db.query.optimize :as optimize]
             [fluree.db.time-travel :as time-travel]
+            [fluree.db.transact :as transact]
             [fluree.db.util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log])
@@ -32,12 +33,23 @@
       (let [db (<? db-chan)]
         (<? (dbproto/-class-ids db tracker subject)))))
   (-index-update [_ commit-index]
-    (let [commit* (assoc commit :index commit-index)
+    (let [commit* (-> commit
+                      (assoc :index commit-index)
+                      (assoc :alias alias))  ; Ensure alias is on commit for nameservice publishing
           updated-db (->async-db alias commit* t)]
-      (go-try
-        (let [db (<? db-chan)]
-          (deliver! updated-db (dbproto/-index-update db commit-index))))
+      (go
+        (try*
+          (let [db  (<? db-chan)
+                db* (dbproto/-index-update db commit-index)]
+            (deliver! updated-db db*))
+          (catch* e
+            (deliver! updated-db e))))
       updated-db))
+  (-ledger-info [_]
+    (go-try
+      (let [db (<? db-chan)
+            info (<? (dbproto/-ledger-info db))]
+        info)))
   where/Matcher
   (-match-id [_ tracker solution s-match error-ch]
     (let [match-ch (async/chan)]
@@ -72,19 +84,6 @@
           (let [db (<? db-chan)]
             (-> db
                 (where/-match-class tracker solution triple error-ch)
-                (async/pipe match-ch)))
-          (catch* e
-            (log/error e "Error loading database")
-            (>! error-ch e))))
-      match-ch))
-
-  (-match-properties [_ tracker solution triples error-ch]
-    (let [match-ch (async/chan)]
-      (go
-        (try*
-          (let [db (<? db-chan)]
-            (-> db
-                (where/-match-properties tracker solution triples error-ch)
                 (async/pipe match-ch)))
           (catch* e
             (log/error e "Error loading database")
@@ -134,15 +133,15 @@
       (let [db (<? db-chan)]
         (<? (subject/-iri-visible? db tracker iri)))))
 
-  flake.transact/Transactable
+  transact/Transactable
   (-stage-txn [_ tracker context identity author annotation raw-txn parsed-txn]
     (go-try
       (let [db (<? db-chan)]
-        (<? (flake.transact/-stage-txn db tracker context identity author annotation raw-txn parsed-txn)))))
+        (<? (transact/-stage-txn db tracker context identity author annotation raw-txn parsed-txn)))))
   (-merge-commit [_ commit-jsonld commit-data-jsonld]
     (go-try
       (let [db (<? db-chan)]
-        (<? (flake.transact/-merge-commit db commit-jsonld commit-data-jsonld)))))
+        (<? (transact/-merge-commit db commit-jsonld commit-data-jsonld)))))
 
   indexer/Indexable
   (index [_ changes-ch]
@@ -215,7 +214,18 @@
           (catch* e
             (log/error e "Error loading db while setting root policy")
             (async/put! root-ch e))))
-      root-db)))
+      root-db))
+
+  optimize/Optimizable
+  (-reorder [_ parsed-query]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (optimize/-reorder db parsed-query)))))
+
+  (-explain [_ parsed-query]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (optimize/-explain db parsed-query))))))
 
 (defn db?
   [x]
@@ -260,6 +270,16 @@
   This is to be used in conjunction with `deliver!` that will deliver the
   loaded db to the async-db."
   [ledger-alias commit-map t]
+  (when-not (:alias commit-map)
+    (log/error "Creating AsyncDB with commit missing :alias field!"
+               {:ledger-alias ledger-alias
+                :commit-id (:id commit-map)
+                :commit-keys (keys commit-map)
+                :stack-trace (try
+                               (throw (ex-info "Stack trace capture" {}))
+                               (catch #?(:clj Exception :cljs js/Error) e
+                                 #?(:clj (.getStackTrace e)
+                                    :cljs (.-stack e))))}))
   (->AsyncDB ledger-alias commit-map t (async/promise-chan)))
 
 (defn load

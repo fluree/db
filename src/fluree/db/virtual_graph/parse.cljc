@@ -36,7 +36,7 @@
   "Returns the object as a map if it's a node reference"
   [triple]
   (let [obj (nth triple 2)]
-    (when (and (map? obj) (::where/var obj))
+    (when (where/get-variable obj)
       obj)))
 
 (defn match-search-triple
@@ -63,29 +63,23 @@
         ;; idx:result can have either a simple variable or a node reference
         ;; Store the node var so we can match nested properties later
         (if-let [node-ref (obj-node-ref triple)]
-          (assoc-in solution [::virtual-graph ::result-node-var] (::where/var node-ref))
+          (assoc-in solution [::virtual-graph ::result-node-var] (where/get-variable node-ref))
           (assoc-in solution [::virtual-graph ::result ::id] (obj-var triple)))
 
         (= const/iri-index-id p-iri)
         ;; Handle idx:id property on result nodes
-        (let [subj-var (-> triple first ::where/var)]
+        (let [subj-var (-> triple first where/get-variable)]
           (if (= subj-var (get-in solution [::virtual-graph ::result-node-var]))
             (assoc-in solution [::virtual-graph ::result ::id] (obj-var triple))
             solution))
 
         (= const/iri-index-score p-iri)
-        ;; Handle both direct score and score on result nodes  
-        (let [subj-var (-> triple first ::where/var)]
-          (if (= subj-var (get-in solution [::virtual-graph ::result-node-var]))
-            (assoc-in solution [::virtual-graph ::result ::score] (obj-var triple))
-            (assoc-in solution [::virtual-graph ::result ::score] (obj-var triple))))
+        ;; Set score var for result (works for both direct and nested result nodes)
+        (assoc-in solution [::virtual-graph ::result ::score] (obj-var triple))
 
         (= const/iri-index-vector p-iri)
-        ;; Handle both direct vector and vector on result nodes
-        (let [subj-var (-> triple first ::where/var)]
-          (if (= subj-var (get-in solution [::virtual-graph ::result-node-var]))
-            (assoc-in solution [::virtual-graph ::result ::vector] (obj-var triple))
-            (assoc-in solution [::virtual-graph ::result ::vector] (obj-var triple))))
+        ;; Set vector var for result (works for both direct and nested result nodes)
+        (assoc-in solution [::virtual-graph ::result ::vector] (obj-var triple))
 
         :else
         solution))))

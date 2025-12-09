@@ -13,6 +13,7 @@
             [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util :as util]
+            [fluree.db.util.graalvm :as graalvm]
             [fluree.db.util.log :as log]
             [fluree.db.vector.scoring :as score]
             [fluree.json-ld :as json-ld])
@@ -578,6 +579,10 @@
   [{num :value} {div :value}]
   (where/->typed-val (quot num div)))
 
+(defn power
+  [{base :value} {power :value}]
+  (where/->typed-val (math/pow base power)))
+
 (defn untyped-equal
   ([_]  (where/->typed-val true))
   ([{x :value} {y :value}] (where/->typed-val (= x y)))
@@ -667,6 +672,7 @@
     not-equal      fluree.db.query.exec.eval/typed-not-equal
     now            fluree.db.query.exec.eval/now
     or             fluree.db.query.exec.eval/-or
+    power          fluree.db.query.exec.eval/power
     quot           fluree.db.query.exec.eval/quotient
     rand           fluree.db.query.exec.eval/rand
     regex          fluree.db.query.exec.eval/regex
@@ -712,22 +718,6 @@
 ;;; =============================================================================
 ;;; This section contains all SCI-related code used for evaluating Clojure forms
 ;;; in GraalVM native images where regular eval is not available.
-
-(defn graalvm-build?
-  "Returns true if building for GraalVM.
-   Checks for environment variable or system property set during build."
-  []
-  #?(:clj (or (System/getenv "FLUREE_GRAALVM_BUILD")
-              (System/getProperty "fluree.graalvm.build"))
-     :cljs false))
-
-(defmacro if-graalvm
-  "Compile-time conditional for GraalVM-specific code.
-   Uses graalvm-branch when building for GraalVM, else-branch otherwise."
-  [graalvm-branch else-branch]
-  (if (graalvm-build?)
-    graalvm-branch
-    else-branch))
 
 ;; Forward declaration for functions referenced in SCI context setup
 (declare find-grouped-val)
@@ -889,7 +879,7 @@
      "Evaluates a form with additional context bindings for GraalVM builds.
       For JVM builds, ignores the context and uses regular eval."
      [form ctx]
-     (if-graalvm
+     (graalvm/if-graalvm
       ;; GraalVM branch - use our dedicated function
       `(eval-graalvm-with-context ~form ~ctx)
       ;; JVM branch - use direct eval, ignoring context
@@ -905,7 +895,7 @@
 
 (def allowed-scalar-fns
   '#{&& || ! > < >= <= = equal not-equal + - * / quot and bound coalesce if
-     nil? as not not= or re-find re-pattern in
+     nil? as not not= or re-find re-pattern in power
 
      ;; string fns
      strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter
@@ -974,7 +964,7 @@
 (defn transform-iri-calls
   "Transforms (iri x) calls to (iri-fn-base x $-CONTEXT) for GraalVM builds."
   [form]
-  (if (graalvm-build?)
+  (if (graalvm/build?)
     (walk/postwalk
      (fn [x]
        (if (and (sequential? x)
@@ -1056,7 +1046,7 @@
       For GraalVM builds, expands iri macro calls to their full form since SCI
       doesn't support runtime macro expansion. Decision is made at compile time."
      [code count-star-sym ctx allow-aggregates?]
-     (if (graalvm-build?)
+     (if (graalvm/build?)
        ;; GraalVM/SCI build - coerce then expand iri macro calls
        `(let [qualified-code# (coerce ~count-star-sym ~allow-aggregates? ~ctx ~code)]
           (walk/postwalk

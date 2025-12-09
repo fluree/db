@@ -1,8 +1,6 @@
 (ns fluree.db.nameservice
   (:refer-clojure :exclude [alias])
   (:require [clojure.core.async :as async :refer [go]]
-            [clojure.string :as str]
-            [fluree.db.storage :as storage]
             [fluree.db.util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
@@ -20,10 +18,20 @@
     "Returns a channel containing all nameservice records for building in-memory query ledger"))
 
 (defprotocol Publisher
-  (publish [publisher commit-map]
-    "Publishes new commit.")
+  (publish-commit [publisher ledger-alias commit-address commit-t]
+    "Publishes only commit data (address and t). This allows transactors to update
+    commit information without contending with indexers. Only updates if commit-t
+    is greater than the existing value.")
+  (publish-index [publisher ledger-alias index-address index-t]
+    "Publishes only index data (address and t). This allows indexers to update
+    index information without contending with transactors. Only updates if index-t
+    is greater than the existing value. Writes to a separate file/record to avoid
+    contention with commit updates.")
+  (publish-vg [publisher vg-config]
+    "Publishes a virtual graph configuration. The vg-config map should contain
+    :vg-name, :vg-type, :config, and optionally :dependencies.")
   (retract [publisher ledger-alias]
-    "Remove the nameservice record for the ledger.")
+    "Remove the nameservice record for the ledger or virtual graph.")
   (publishing-address [publisher ledger-alias]
     "Returns the value to write into the commit's ns field for this nameservice.
     This may be a full address/IRI (e.g., fluree:ipns://...) or a resolvable
@@ -39,58 +47,56 @@
     "Unsubscribes to publication for ledger events")
   (known-addresses [publication ledger-alias]))
 
-(defn publish-to-all
-  [commit-map publishers]
-  (->> publishers
-       (map (fn [ns]
-              (go
-                (try*
-                  (<? (publish ns commit-map))
-                  (catch* e
-                    (log/warn e "Publisher failed to publish commit")
-                    ::publishing-error)))))
-       async/merge))
+(defn primary-publisher
+  "Returns the primary publisher from a publishers list."
+  [publishers]
+  (first publishers))
+
+(defn secondary-publishers
+  "Returns the secondary publishers from a publishers list."
+  [publishers]
+  (rest publishers))
+
+(defn publish-commit-to-all
+  "Publishes commit data to all publishers using atomic conditional updates.
+   Each result is either the publish-commit response or ::publishing-error on failure.
+   This is the safe way to publish commit updates without overwriting index data."
+  [ledger-alias commit-address commit-t publishers]
+  (let [pub-chs (->> publishers
+                     (keep identity)
+                     (mapv (fn [ns]
+                             (go
+                               (try*
+                                 (<? (publish-commit ns ledger-alias commit-address commit-t))
+                                 (catch* e
+                                   (log/warn e "Publisher failed to publish commit"
+                                             {:alias ledger-alias :commit-t commit-t})
+                                   ::publishing-error))))))]
+    (if (seq pub-chs)
+      (async/into [] (async/merge pub-chs))
+      (go []))))
+
+(defn publish-index-to-all
+  "Publishes index data to all publishers using atomic conditional updates.
+   Each result is either the publish-index response or ::publishing-error on failure.
+   This is the safe way to publish index updates without overwriting commit data."
+  [ledger-alias index-address index-t publishers]
+  (let [pub-chs (->> publishers
+                     (keep identity)
+                     (mapv (fn [ns]
+                             (go
+                               (try*
+                                 (<? (publish-index ns ledger-alias index-address index-t))
+                                 (catch* e
+                                   (log/warn e "Publisher failed to publish index"
+                                             {:alias ledger-alias :index-t index-t})
+                                   ::publishing-error))))))]
+    (if (seq pub-chs)
+      (async/into [] (async/merge pub-chs))
+      (go []))))
 
 (defn published-ledger?
   [nsv ledger-alias]
   (go-try
     (let [addr (<? (publishing-address nsv ledger-alias))]
       (boolean (<? (lookup nsv addr))))))
-
-(defn address-path
-  [address]
-  (storage/get-local-path address))
-
-(defn extract-branch
-  "Splits a given namespace address into its nameservice and branch parts.
-  Returns two-tuple of [nameservice branch].
-  If no branch is found, returns nil as branch value and original ns-address as the nameservice."
-  [ns-address]
-  (if (str/ends-with? ns-address ")")
-    (let [[_ ns branch] (re-matches #"(.*)\((.*)\)" ns-address)]
-      [ns branch])
-    [ns-address nil]))
-
-(defn absolute-address?
-  [address location]
-  (str/starts-with? address location))
-
-(defn resolve-address
-  "Resolves a provided namespace address, which might be relative or absolute,
-   into three parts returned as a map:
-  - :alias - ledger alias
-  - :branch - branch (or nil if default)
-  - :address - absolute namespace address (including branch if provided)
-  If 'branch' parameter is provided will always use it as the branch regardless
-  of if a branch is specificed in the ns-address."
-  [location ns-address branch]
-  (let [[ns-address* extracted-branch] (extract-branch ns-address)
-        branch* (or branch extracted-branch "main")
-        [ns-address** alias] (if (absolute-address? ns-address location)
-                               [ns-address* (storage/get-local-path ns-address*)]
-                               [(storage/build-address location ns-address*) ns-address*])]
-    {:alias   alias
-     :branch  branch*
-     :address (if branch*
-                (str ns-address** "(" branch* ")")
-                ns-address*)}))

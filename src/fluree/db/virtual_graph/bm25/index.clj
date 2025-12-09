@@ -1,13 +1,20 @@
 (ns fluree.db.virtual-graph.bm25.index
-  (:require [clojure.core.async :as async :refer [go alts! put! promise-chan <! >!]]
+  (:require [clojure.core.async :as async :refer [go alts! put! promise-chan <! >! go-loop]]
+            [clojure.string :as str]
+            [fluree.db.commit.storage :as commit-storage]
+            [fluree.db.connection :as connection]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.json-ld.iri :as iri]
+            [fluree.db.ledger :as ledger]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.query.optimize :as optimize]
             [fluree.db.util :as util]
-            [fluree.db.util.async :refer [empty-channel]]
+            [fluree.db.util.async :refer [empty-channel <?]]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph :as vg]
             [fluree.db.virtual-graph.bm25.search :as bm25.search]
@@ -109,6 +116,9 @@
                 (throw (ex-info "No search target for virtual graph. Did you forget @context in your query?"
                                 {:status 400 :error
                                  :db/invalid-query})))
+            ;; Guard against empty/blank targets
+            _ (when (and (string? target) (str/blank? target))
+                (async/close! out-ch))
             {:keys [pending-ch index]} @index-state
 
             ;; TODO - check for "sync" options and don't wait for pending-ch if sync is false
@@ -141,45 +151,45 @@
 
 (defn bm25-upsert*
   [{:keys [index-state] :as bm25} {:keys [t alias namespaces namespace-codes] :as _db} items-count items-ch]
-  (let [{:keys [pending-ch index] :as prior-idx-state} @index-state
-        new-pending-ch  (promise-chan)
-        new-index-state (atom (assoc prior-idx-state :pending-ch new-pending-ch))]
+  (let [{:keys [pending-ch index]} @index-state
+        new-pending-ch (promise-chan)]
+
+    ;; Update the existing atom with new pending-ch
+    (swap! index-state assoc :pending-ch new-pending-ch)
 
     ;; following go-block happens asynchronously in the background
-    ;; TODO - VG - capture error conditions in async/<! or other opts below and resolve the response with an error.
     (go
       (try
         (let [latest-index  (if pending-ch
-                              (<! pending-ch)
+                              (<? pending-ch)
                               index)
               status-update (fn [status]
-                              (swap! new-index-state assoc :pending-status status))
-              new-index     (<! (bm25.update/upsert-items bm25 latest-index items-count items-ch status-update))
+                              (swap! index-state assoc :pending-status status))
+              new-index     (<? (bm25.update/upsert-items bm25 latest-index items-count items-ch status-update))
               catalog       (:index-catalog bm25)]
           ;; reset index state atom once index is complete, remove pending-ch
-          (swap! new-index-state (fn [idx-state]
-                                   (assoc idx-state :index new-index
-                                          :pending-ch nil)))
+          (swap! index-state (fn [idx-state]
+                               (assoc idx-state :index new-index
+                                      :pending-ch nil)))
           (log/debug "BM25 index update complete, writing to storage...")
           ;; Persist the updated BM25 index to storage
           (when catalog
-            (let [updated-bm25 (assoc bm25 :index-state new-index-state :t t)]
+            (let [updated-bm25 (assoc bm25 :t t)
+                  write-result (<! (vg/write-vg catalog updated-bm25))]
               (log/debug "Writing BM25 index to storage for VG:" (:alias updated-bm25))
-              (try
-                (<! (vg/write-vg catalog updated-bm25))
-                (catch Exception e
-                  (log/error e "Failed to write BM25 index to storage")))))
+              (when (util/exception? write-result)
+                (log/error write-result "Failed to write BM25 index to storage"))))
           (>! new-pending-ch new-index))
         (catch Exception e
-          (log/error e "Error in BM25 index update"))))
+          (log/error e "Error in BM25 index update")
+          (>! new-pending-ch e))))
 
     ;; new bm25 record returned to get attached to db
     (assoc bm25 :t t
            :namespaces namespaces
            :namespace-codes namespace-codes
                 ;; unlikely, but in case db's alias has been changed keep in sync
-           :db-alias alias
-           :index-state new-index-state)))
+           :db-alias alias)))
 
 (defn property-dependencies
   [vg]
@@ -244,11 +254,74 @@
     (async/pipeline-async 1 items-ch #(async/onto-chan! %2 %1) query-result)
     (bm25-upsert* bm25 db nil items-ch)))
 
+(defn process-commit-update
+  "Processes a commit update for incremental BM25 index updates.
+   Reads commit data, converts JSON-LD to Flakes, and calls bm25-upsert."
+  [bm25 conn ledger-alias commit-address]
+  (go
+    (try
+      (let [{:keys [vg-name]} bm25
+            commit-catalog (:commit-catalog conn)
+            expanded-commit (<? (commit-storage/read-commit-jsonld commit-catalog commit-address))]
+        (when expanded-commit
+          (let [db-address (-> expanded-commit
+                               (util/get-first const/iri-data)
+                               (util/get-first-value const/iri-address))
+                expanded-data (<? (commit-storage/read-data-jsonld commit-catalog db-address))
+                updated-ledger (<? (connection/load-ledger conn ledger-alias))
+                updated-db (ledger/current-db updated-ledger)
+                t-new (util/get-first-value expanded-data const/iri-fluree-t)
+                add-nodes (get expanded-data const/iri-assert)
+                remove-nodes (get expanded-data const/iri-retract)
+                add-flakes (when (seq add-nodes)
+                             (flake-db/create-flakes true updated-db t-new add-nodes))
+                remove-flakes (when (seq remove-nodes)
+                                (flake-db/create-flakes false updated-db t-new remove-nodes))]
+
+            (log/debug "BM25 VG" vg-name "incremental update:"
+                       (count add-flakes) "assertions,"
+                       (count remove-flakes) "retractions")
+
+            (bm25-upsert bm25 updated-db add-flakes remove-flakes)
+
+            (log/info "BM25 VG" vg-name "incremental update completed for" ledger-alias))))
+      (catch Exception e
+        (log/error e "Failed to process commit update for BM25 VG" (:vg-name bm25))
+        nil))))
+
+(defn subscription-loop
+  "Background loop that processes subscription messages for a BM25 virtual graph."
+  [bm25 conn merged-ch loop-ch]
+  (let [{:keys [vg-name]} bm25]
+    (go-loop []
+      (let [[msg ch] (alts! [merged-ch loop-ch])]
+        (cond
+          (= ch loop-ch)
+          (do
+            (log/debug "Stopping subscription loop for BM25 VG" vg-name)
+            (async/close! merged-ch))
+
+          (and (= ch merged-ch) msg)
+          (let [action (get msg "action")
+                ledger-alias (get msg "ledger")
+                commit-address (get-in msg ["data" "address"])]
+            (log/debug "BM25 VG" vg-name "received" action "for ledger" ledger-alias
+                       "commit:" commit-address)
+            (when (and (= action "new-commit") conn)
+              (log/info "BM25 VG" vg-name "processing new commit for" ledger-alias ":" commit-address)
+              (<! (process-commit-update bm25 conn ledger-alias commit-address)))
+            (recur))
+
+          :else
+          (log/debug "Subscription channel closed for BM25 VG" vg-name))))))
+
 (defrecord BM25-VirtualGraph
            [stemmer stopwords k1 b index-state initialized genesis-t t
             alias vg-name query parsed-query property-deps
    ;; following taken from db - needs to be kept up to date with new db updates
-            db-alias namespaces namespace-codes index-catalog]
+            db-alias namespaces namespace-codes index-catalog
+   ;; subscription state
+            subscription-channels subscription-loop-ch conn]
 
   iri/IRICodec
   (encode-iri [_ iri]
@@ -266,14 +339,13 @@
             ;; Wait for the async indexing to complete
             pending-ch (get @index-state :pending-ch)]
         (when pending-ch
-          (<! pending-ch))
+          (<? pending-ch))
         ;; Now write to storage
         (when index-catalog
-          (try
-            (<! (vg/write-vg index-catalog initialized-bm25))
-            (log/debug "Successfully wrote initial BM25 index to storage")
-            (catch Exception e
-              (log/error e "Failed to write initial BM25 index to storage"))))
+          (let [write-result (<! (vg/write-vg index-catalog initialized-bm25))]
+            (if (util/exception? write-result)
+              (log/error write-result "Failed to write initial BM25 index to storage")
+              (log/debug "Successfully wrote initial BM25 index to storage"))))
         initialized-bm25)))
 
   vg/SyncableVirtualGraph
@@ -328,18 +400,51 @@
   (-match-class [_ _tracker _solution _s-mch _error-ch]
     empty-channel)
 
-  (-match-properties [this tracker solution triples error-ch]
-    (where/match-triples this tracker solution triples error-ch))
-
-  ;; activate-alias returns the VG itself when the alias matches
-  (-activate-alias [this alias']
-    (go
-      (when (= alias alias')
-        this)))
+  ;; activate-alias should not be called on an index VG, return empty chan
+  (-activate-alias [_ _]
+    (let [ch (async/chan)]
+      (async/close! ch)
+      ch))
 
   ;; return the VG alias
   (-aliases [_]
     [alias])
+
+  optimize/Optimizable
+  (-reorder [_ parsed-query]
+    ;; BM25 indexes don't support query optimization
+    ;; Return query unchanged in a channel
+    (async/go parsed-query))
+
+  (-explain [_ parsed-query]
+    ;; BM25 indexes don't support explain
+    ;; Return empty explain in a channel
+    (async/go {:original parsed-query
+               :optimized parsed-query
+               :segments []
+               :changed? false}))
+
+  vg/SubscribableVirtualGraph
+  (start-subscriptions [this nameservice dependencies]
+    (log/debug "Starting subscriptions for BM25 VG" vg-name "to ledgers:" dependencies)
+    (let [sub-channels (mapv #(nameservice/subscribe nameservice %) dependencies)
+          loop-ch (async/chan)
+          merged-ch (async/merge sub-channels)]
+      (subscription-loop this conn merged-ch loop-ch)
+      (assoc this
+             :subscription-channels sub-channels
+             :subscription-loop-ch loop-ch)))
+
+  (stop-subscriptions [this nameservice]
+    (log/debug "Stopping subscriptions for BM25 VG" vg-name)
+    (when subscription-loop-ch
+      (async/close! subscription-loop-ch))
+    (when subscription-channels
+      (doseq [ledger-alias (get-in this [:config "ledgers"] [])]
+        (nameservice/unsubscribe nameservice ledger-alias)))
+    (assoc this
+           :subscription-channels nil
+           :subscription-loop-ch nil))
 
   dbproto/IFlureeDb
   (-query [_this _tracker _query]
@@ -356,7 +461,15 @@
   (-index-update [this _commit-index]
     ;; BM25 indexes are updated through the UpdatableVirtualGraph protocol
     ;; This is a no-op for compatibility
-    this))
+    this)
+
+  (-ledger-info [this]
+    ;; BM25 virtual graphs return minimal ledger info
+    (async/go
+      {:stats {:size 0 :flakes 0}
+       :t (:t this)
+       :schema {}
+       :namespace-codes (:namespace-codes this)})))
 
 ;; TODO - VG - triggering updates only works for queries for single subject, no nested nodes
 ;; TODO - VG - future feature - weighted properties

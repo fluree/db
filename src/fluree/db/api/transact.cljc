@@ -3,6 +3,7 @@
   (:require [clojure.core.async :as async]
             [fluree.db.connection :as connection]
             [fluree.db.json-ld.credential :as cred]
+            [fluree.db.ledger :as ledger]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.transact :as transact]
@@ -58,7 +59,7 @@
                             {:status 409 :error :db/ledger-not-exists}
                             ledger))
             (throw ledger))
-          (<? (transact/transact-ledger! ledger parsed-txn))))
+          (<? (ledger/transact! ledger parsed-txn))))
       (throw (ex-info "Missing ledger specification."
                       {:ledger-id ledger-id
                        :status 400})))))
@@ -133,7 +134,7 @@
            ledger-opts (-> parsed-txn :opts syntax/coerce-ledger-opts)
            _           (util.ledger/validate-ledger-name ledger-id)
            ledger      (<? (connection/create-ledger conn ledger-id ledger-opts))]
-       (<? (transact/transact-ledger! ledger parsed-txn))))))
+       (<? (ledger/transact! ledger parsed-txn))))))
 
 (defn credential-create-with-txn!
   [conn txn]

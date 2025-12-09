@@ -1,9 +1,11 @@
 (ns fluree.db.vector.bm25-filesystem-test
   (:require [babashka.fs :as fs]
+            [clojure.core.async :refer [<!!]]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.virtual-graph :as vg]))
 
 (deftest ^:integration bm25-filesystem-test
   (testing "BM25 virtual graph with filesystem storage"
@@ -41,20 +43,22 @@
             vg-name (:vg-name vg-obj)]
 
         (testing "virtual graph creation"
-          (is (= "article-search" vg-name)))
+          ;; VG names follow ledger convention - normalized with :main branch
+          (is (= "article-search:main" vg-name)))
 
         (testing "nameservice record persistence"
-          (let [ns-file (fs/file storage-path "ns@v2" "article-search.json")]
+          ;; VGs use the same storage pattern as ledgers: ns@v2/{name}/{branch}.json
+          (let [ns-file (fs/file storage-path "ns@v2" "article-search" "main.json")]
             (is (fs/exists? ns-file) "Nameservice file should exist")
 
             (when (fs/exists? ns-file)
               (let [ns-content (json/parse (slurp ns-file) false)]
-                (is (= "article-search" (get ns-content "@id")))
+                (is (= "article-search:main" (get ns-content "@id")))
                 (is (some #{"f:VirtualGraphDatabase"} (get ns-content "@type")))
                 (is (some #{"fidx:BM25"} (get ns-content "@type")))))))
 
-        ;; Allow time for BM25 index building
-        (Thread/sleep 3000)
+        ;; Wait for BM25 index initialization to complete to avoid flaky assertions
+        (<!! (vg/sync vg-obj nil))
 
         (testing "BM25 index file creation"
           (let [vg-dir (fs/file storage-path "virtual-graphs")]
@@ -80,8 +84,7 @@
 
             (testing "results contain expected articles"
               (let [article-ids (set (map first search-results))]
-                (is (or (contains? article-ids "ex:article1")
-                        (contains? article-ids "http://example.org/article1"))
+                (is (contains? article-ids "ex:article1")
                     "Should find article1 mentioning 'Fluree'")))
 
             (testing "results include BM25 scores"
@@ -103,8 +106,11 @@
             (testing "blockchain search returns results"
               (is (seq blockchain-results) "Should find articles about blockchain"))
 
+            (testing "blockchain scores are numeric"
+              (is (every? #(number? (second %)) blockchain-results)
+                  "All results should have numeric scores"))
+
             (testing "blockchain search finds correct article"
               (let [article-ids (set (map first blockchain-results))]
-                (is (or (contains? article-ids "ex:article3")
-                        (contains? article-ids "http://example.org/article3"))
+                (is (contains? article-ids "ex:article3")
                     "Should find article3 about blockchain")))))))))

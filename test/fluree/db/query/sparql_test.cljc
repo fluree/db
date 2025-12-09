@@ -89,6 +89,11 @@
                    }
                    GROUP BY ?author"]
         (is (= ["?author" "(as (groupconcat ?title \", \") ?books)"]
+               (:select (sparql/->fql query))))))
+    (testing "ROUND"
+      (let [query "SELECT (ROUND(?foo) * 100 AS ?bar)
+                   WHERE { ?s <ex:foo> ?foo . }"]
+        (is (= ["(as (* (round ?foo) 100) ?bar)"]
                (:select (sparql/->fql query))))))))
 
 (deftest parse-construct
@@ -332,7 +337,7 @@
                  }"
           {:keys [where]} (sparql/->fql query)]
       (is (= [{"@id" "?s", "?pred" "?o"}
-              [:filter "(not= \"schema:pred\" ?pred)"]]
+              [:filter "(not= {\"@id\" \"schema:pred\"} ?pred)"]]
              where)
           "filter string values"))
     (let [query "SELECT ?s
@@ -543,11 +548,11 @@
                  where))))
       (testing "with whitespace"
         (let [query "SELECT ?person ?prefix ?foofix ?num1
-                 WHERE {BIND (?age * 4 * 3 / -2 * (-4 / 2) AS ?num1)
+                 WHERE {BIND (POWER(?age * 4 * 3 / -2 * (-4 / 2), 2) AS ?num1)
                         ?person person:handle ?handle.
                         ?person person:age ?age}"
               {:keys [where]} (sparql/->fql query)]
-          (is (= [[:bind "?num1" "(* (/ (* (* ?age 4) 3) -2) (/ -4 2))"]
+          (is (= [[:bind "?num1" "(power (* (/ (* (* ?age 4) 3) -2) (/ -4 2)) 2)"]
                   {"@id" "?person", "person:handle" "?handle"}
                   {"@id" "?person", "person:age" "?age"}]
                  where)))))
@@ -629,8 +634,8 @@
                 [:bind "?floor" "(floor 1.8)"]
                 [:bind "?hours" "(hours \"2024-4-1T14:45:13.815-05:00\")"]
                 [:bind "?if" "(if \"true\" \"yes\" \"no\")"]
-                [:bind "?in" "(in ?age [1 2 3 \"foo\" \"ex:bar\"])"]
-                [:bind "?notIn" "(not (in ?age [1 2 3 \"foo\" \"ex:bar\"]))"]
+                [:bind "?in" "(in ?age [1 2 3 \"foo\" {\"@id\" \"ex:bar\"}])"]
+                [:bind "?notIn" "(not (in ?age [1 2 3 \"foo\" {\"@id\" \"ex:bar\"}]))"]
                 [:bind "?iri" "(iri \"http://example.com\")"]
                 [:bind "?lang" "(lang \"Robert\"\"@en\")"]
                 [:bind "?langMatches" "(langMatches ?lang \"FR\")"]
@@ -725,7 +730,7 @@
                     } GROUP BY ?y
                   }
                 }"]
-      (is (= {:context {"" "http://people.example/"},
+      (is (= {:context {":" "http://people.example/"},
               :select ["?y" "?minName"],
               :where
               [{"@id" ":alice", ":knows" "?y"}
@@ -733,7 +738,40 @@
                 {:select ["?y" "(as (min ?name) ?minName)"],
                  :where [{"@id" "?y", ":name" "?name"}],
                  :groupBy ["?y"]}]]}
-             (sparql/->fql query))))))
+             (sparql/->fql query)))))
+  (testing "SERVICE"
+    (let [q "PREFIX : <http://example.com/>
+             SELECT ?foo ?bar
+             WHERE {
+               ?s :foo ?foo .
+               SERVICE <https://query.wikidata.org/sparql> {
+                 ?s :bar ?bar .
+               }
+             }"]
+      (is (= [{"@id" "?s", ":foo" "?foo"}
+              [:service
+               {:silent? false,
+                :service "https://query.wikidata.org/sparql",
+                :clause "{
+                 ?s :bar ?bar .
+               }"}]]
+             (:where (sparql/->fql q)))))
+    (let [q "PREFIX : <http://example.com/>
+             SELECT ?foo ?bar
+             WHERE {
+               ?s :foo ?foo .
+               SERVICE SILENT <https://query.wikidata.org/sparql> {
+                 ?s :bar ?bar .
+               }
+             }"]
+      (is (= [{"@id" "?s", ":foo" "?foo"}
+              [:service
+               {:silent? true,
+                :service "https://query.wikidata.org/sparql",
+                :clause "{
+                 ?s :bar ?bar .
+               }"}]]
+             (:where (sparql/->fql q)))))))
 
 (deftest parse-prefixes
   (testing "PREFIX"
@@ -757,6 +795,22 @@
       (is (= {"foaf" "http://xmlns.com/foaf/0.1/"
               "ex"   "http://example.org/ns/"}
              context))))
+  (testing "PREFIX :"
+    (let [query "PREFIX : <http://example.com/>
+                 SELECT ?foo
+                 WHERE {?s :foo ?foo }"]
+      (is (= {:context {":" "http://example.com/"}
+              :select ["?foo"]
+              :where [{"@id" "?s" ":foo" "?foo"}]}
+             (sparql/->fql query)))))
+  (testing "BASE"
+    (let [query "BASE <http://example.com/>
+                 SELECT ?foo
+                 WHERE {?s <foo> ?foo }"]
+      (is (= {:context {"@base" "http://example.com/" "@vocab" "http://example.com/"}
+              :select ["?foo"],
+              :where [{"@id" "?s" "foo" "?foo"}]}
+             (sparql/->fql query)))))
   (testing "comments"
     (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
                  PREFIX ex: <http://example.org/ns/>
@@ -822,6 +876,19 @@
                    ORDER BY desc(?favNums)"
             {:keys [orderBy]} (sparql/->fql query)]
         (is (= [["desc" "?favNums"]]
+               orderBy))))
+    (testing "multiple vars"
+      (let [query "SELECT ?favNums
+                   WHERE {?person person:favNums ?favNums. ?person ex:name ?name .}
+                   ORDER BY desc(?favNums) ?name"
+            {:keys [orderBy]} (sparql/->fql query)]
+        (is (= [["desc" "?favNums"] "?name"]
+               orderBy)))
+      (let [query "SELECT ?favNums
+                   WHERE {?person person:favNums ?favNums. ?person ex:name ?name .}
+                   ORDER BY ?favNums ?name"
+            {:keys [orderBy]} (sparql/->fql query)]
+        (is (= ["?favNums" "?name"]
                orderBy)))))
   (testing "PRETTY-PRINT"
     (let [query "SELECT ?person
@@ -1091,9 +1158,37 @@
                       (done))))))
 
        :clj
-       (let [conn   @(fluree/connect-memory)
-             db0 @(fluree/create conn "people")
-             db     @(fluree/update db0 txn {:format :sparql})]
+       (let [conn @(fluree/connect-memory)
+             db0  @(fluree/create conn "people")
+             db   @(fluree/update db0 txn {:format :sparql})]
+         (testing "DELETE DATA removes specified triples"
+           (let [delete-txn "PREFIX person: <http://example.org/Person#>
+                             DELETE DATA {
+                               ex:jdoe person:favNums 3 .
+                               ex:jdoe person:favNums 7 .
+                             }"
+                 query "PREFIX person: <http://example.org/Person#>
+                        SELECT ?favNum
+                        WHERE { ex:jdoe person:favNums ?favNum }
+                        ORDER BY ?favNum"
+                 db2 @(fluree/update db delete-txn {:format :sparql})]
+             (is (= [[42] [99]]
+                    @(fluree/query db2 query {:format :sparql})))))
+         (testing "DELETE DATA with GRAPH removes triples from named graph"
+           (let [delete-txn "PREFIX person: <http://example.org/Person#>
+                             DELETE DATA {
+                               GRAPH <http://example.org/people> {
+                                 ex:jdoe person:favNums 3 .
+                                 ex:jdoe person:favNums 7 .
+                               }
+                             }"
+                 query "PREFIX person: <http://example.org/Person#>
+                        SELECT ?favNum
+                        WHERE { ex:jdoe person:favNums ?favNum }
+                        ORDER BY ?favNum"
+                 db2 @(fluree/update db delete-txn {:format :sparql})]
+             (is (= [[42] [99]]
+                    @(fluree/query db2 query {:format :sparql})))))
          (testing "basic query works"
            (let [query "PREFIX person: <http://example.org/Person#>
                           SELECT ?person ?fullName

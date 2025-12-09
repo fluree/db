@@ -193,12 +193,12 @@
     ;; Publish R2RML virtual graph
     (let [tmp-file (java.io.File/createTempFile "r2rml" ".ttl")]
       (spit tmp-file r2rml-ttl)
-      (async/<!! (nameservice/publish @test-publisher {:vg-name "vg/sql"
-                                                       :vg-type "fidx:R2RML"
-                                                       :engine  :r2rml
-                                                       :config  {:mapping (.getAbsolutePath tmp-file)
-                                                                 :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                       :driver  "org.h2.Driver"}}})))))
+      (async/<!! (nameservice/publish-vg @test-publisher {:vg-name "vg/sql"
+                                                          :vg-type "fidx:R2RML"
+                                                          :engine  :r2rml
+                                                          :config  {:mapping (.getAbsolutePath tmp-file)
+                                                                    :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                          :driver  "org.h2.Driver"}}})))))
 
 (use-fixtures :once (fn [f]
                       (setup-h2-database)
@@ -639,12 +639,12 @@
           conn-inline (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) test-system-inline)
           publisher-inline (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) test-system-inline)]
       ;; Publish R2RML with inline mapping
-      (async/<!! (nameservice/publish publisher-inline {:vg-name "vg/inline-sql"
-                                                        :vg-type "fidx:R2RML"
-                                                        :engine  :r2rml
-                                                        :config  {:mappingInline inline-ttl
-                                                                  :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                        :driver  "org.h2.Driver"}}}))
+      (async/<!! (nameservice/publish-vg publisher-inline {:vg-name "vg/inline-sql"
+                                                           :vg-type "fidx:R2RML"
+                                                           :engine  :r2rml
+                                                           :config  {:mappingInline inline-ttl
+                                                                     :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                           :driver  "org.h2.Driver"}}}))
       ;; Query using the inline mapping
       (let [query {"from" ["vg/inline-sql"]
                    "select" ["?s" "?name"]
@@ -695,12 +695,12 @@
           conn-sql (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) test-system-sql)
           publisher-sql (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) test-system-sql)]
       ;; Publish R2RML with SQL query mapping
-      (async/<!! (nameservice/publish publisher-sql {:vg-name "vg/sql-query"
-                                                     :vg-type "fidx:R2RML"
-                                                     :engine  :r2rml
-                                                     :config  {:mappingInline sql-query-ttl
-                                                               :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                     :driver  "org.h2.Driver"}}}))
+      (async/<!! (nameservice/publish-vg publisher-sql {:vg-name "vg/sql-query"
+                                                        :vg-type "fidx:R2RML"
+                                                        :engine  :r2rml
+                                                        :config  {:mappingInline sql-query-ttl
+                                                                  :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                        :driver  "org.h2.Driver"}}}))
       ;; Query using the SQL query mapping
       (let [query {"from" ["vg/sql-query"]
                    "select" ["?customer" "?name"]
@@ -733,12 +733,12 @@
                              "    rr:predicate ex:orderCount ;\n"
                              "    rr:objectMap [ rr:column \"order_count\" ]\n"
                              "  ] .\n")]
-      (async/<!! (nameservice/publish @test-publisher {:vg-name "vg/agg-sql"
-                                                       :vg-type "fidx:R2RML"
-                                                       :engine  :r2rml
-                                                       :config  {:mappingInline agg-query-ttl
-                                                                 :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                       :driver  "org.h2.Driver"}}}))
+      (async/<!! (nameservice/publish-vg @test-publisher {:vg-name "vg/agg-sql"
+                                                          :vg-type "fidx:R2RML"
+                                                          :engine  :r2rml
+                                                          :config  {:mappingInline agg-query-ttl
+                                                                    :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                          :driver  "org.h2.Driver"}}}))
       (let [query {"from" ["vg/agg-sql"]
                    "select" ["?customer" "?firstName" "?orderCount"]
                    "where" [["graph" "vg/agg-sql" {"@id" "?customer"
@@ -788,12 +788,12 @@
           conn-jsonld (some (fn [[k v]] (when (isa? k :fluree.db/connection) v)) test-system-jsonld)
           publisher-jsonld (some (fn [[k v]] (when (isa? k :fluree.db.nameservice/storage) v)) test-system-jsonld)]
       ;; Publish R2RML with JSON-LD mapping
-      (async/<!! (nameservice/publish publisher-jsonld {:vg-name "vg/jsonld-sql"
-                                                        :vg-type "fidx:R2RML"
-                                                        :engine  :r2rml
-                                                        :config  {:mappingInline json-ld-mapping
-                                                                  :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                        :driver  "org.h2.Driver"}}}))
+      (async/<!! (nameservice/publish-vg publisher-jsonld {:vg-name "vg/jsonld-sql"
+                                                           :vg-type "fidx:R2RML"
+                                                           :engine  :r2rml
+                                                           :config  {:mappingInline json-ld-mapping
+                                                                     :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                           :driver  "org.h2.Driver"}}}))
       ;; Query using the JSON-LD mapping
       (let [query {"from" ["vg/jsonld-sql"]
                    "select" ["?customer" "?firstName" "?lastName"]
@@ -834,12 +834,12 @@
                             "    rr:objectMap [ rr:constant ex:Active ]\n"
                             "  ] .\n")]
       ;; Publish R2RML with constant values
-      (async/<!! (nameservice/publish @test-publisher {:vg-name "vg/constants"
-                                                       :vg-type "fidx:R2RML"
-                                                       :engine  :r2rml
-                                                       :config  {:mappingInline constant-ttl
-                                                                 :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                       :driver  "org.h2.Driver"}}}))
+      (async/<!! (nameservice/publish-vg @test-publisher {:vg-name "vg/constants"
+                                                          :vg-type "fidx:R2RML"
+                                                          :engine  :r2rml
+                                                          :config  {:mappingInline constant-ttl
+                                                                    :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                          :driver  "org.h2.Driver"}}}))
       ;; Query using the constant values
       (let [query {"from" ["vg/constants"]
                    "select" ["?customer" "?firstName" "?source" "?status"]
@@ -884,12 +884,12 @@
                             "    ]\n"
                             "  ] .\n")]
       ;; Publish R2RML with datatypes
-      (async/<!! (nameservice/publish @test-publisher {:vg-name "vg/datatypes"
-                                                       :vg-type "fidx:R2RML"
-                                                       :engine  :r2rml
-                                                       :config  {:mappingInline datatype-ttl
-                                                                 :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                       :driver  "org.h2.Driver"}}}))
+      (async/<!! (nameservice/publish-vg @test-publisher {:vg-name "vg/datatypes"
+                                                          :vg-type "fidx:R2RML"
+                                                          :engine  :r2rml
+                                                          :config  {:mappingInline datatype-ttl
+                                                                    :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                          :driver  "org.h2.Driver"}}}))
       ;; Query using the datatyped values
       (let [query {"from" ["vg/datatypes"]
                    "select" ["?order" "?date" "?amount"]
@@ -924,12 +924,12 @@
                             "    rr:objectMap [ rr:template \"CUST-{customer_id}\" ]\n"
                             "  ] .\n")]
       ;; Publish R2RML with object templates
-      (async/<!! (nameservice/publish @test-publisher {:vg-name "vg/templates"
-                                                       :vg-type "fidx:R2RML"
-                                                       :engine  :r2rml
-                                                       :config  {:mappingInline template-ttl
-                                                                 :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                       :driver  "org.h2.Driver"}}}))
+      (async/<!! (nameservice/publish-vg @test-publisher {:vg-name "vg/templates"
+                                                          :vg-type "fidx:R2RML"
+                                                          :engine  :r2rml
+                                                          :config  {:mappingInline template-ttl
+                                                                    :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                          :driver  "org.h2.Driver"}}}))
       ;; Query using the template-generated values
       (let [query {"from" ["vg/templates"]
                    "select" ["?customer" "?name" "?id"]
@@ -979,12 +979,12 @@
                             "    ]\n"
                             "  ] .\n")]
       ;; Publish R2RML with language tags
-      (async/<!! (nameservice/publish @test-publisher {:vg-name "vg/language"
-                                                       :vg-type "fidx:R2RML"
-                                                       :engine  :r2rml
-                                                       :config  {:mappingInline language-ttl
-                                                                 :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
-                                                                       :driver  "org.h2.Driver"}}}))
+      (async/<!! (nameservice/publish-vg @test-publisher {:vg-name "vg/language"
+                                                          :vg-type "fidx:R2RML"
+                                                          :engine  :r2rml
+                                                          :config  {:mappingInline language-ttl
+                                                                    :rdb {:jdbcUrl "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+                                                                          :driver  "org.h2.Driver"}}}))
       ;; Query using the language-tagged values
       (let [query {"from" ["vg/language"]
                    "select" ["?customer" "?label" "?fullName" "?description"]

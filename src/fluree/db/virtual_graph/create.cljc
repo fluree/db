@@ -4,8 +4,9 @@
             [fluree.db.connection :as connection]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
-            [fluree.db.nameservice.virtual-graph :as ns-vg]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]
+            [fluree.db.virtual-graph :as vg]
             [fluree.db.virtual-graph.nameservice-loader :as vg-loader]))
 
 (defmulti create-vg
@@ -14,17 +15,21 @@
 
 (defn- validate-common-config
   "Validates common configuration parameters for all virtual graph types."
-  [{:keys [name type] :as config}]
+  [{vg-type :type :keys [name] :as config}]
   (cond
     (not name)
     (throw (ex-info "Virtual graph requires :name"
                     {:error :db/invalid-config :config config}))
 
-    (not type)
+    (not (string? name))
+    (throw (ex-info "Virtual graph :name must be a string"
+                    {:error :db/invalid-config :name name :type (type name)}))
+
+    (not vg-type)
     (throw (ex-info "Virtual graph requires :type"
                     {:error :db/invalid-config :config config}))
 
-    (and (string? name) (str/includes? name "@"))
+    (str/includes? name "@")
     (throw (ex-info "Virtual graph name cannot contain '@' symbol"
                     {:error :db/invalid-config :name name}))))
 
@@ -35,7 +40,6 @@
     (validate-common-config config)
     (<? (create-vg conn config))))
 
-;; BM25 implementation
 (defn- validate-bm25-config
   "Validates BM25-specific configuration."
   [{:keys [config]}]
@@ -47,23 +51,16 @@
                        :ledgers ledgers
                        :count (count ledgers)})))))
 
-(defn- ensure-string-name
-  "Converts keyword names to strings."
-  [name]
-  (if (keyword? name)
-    (clojure.core/name name)
-    name))
-
 (defn- prepare-bm25-config
-  "Prepares the BM25 configuration for publishing."
+  "Prepares the BM25 configuration for publishing.
+   VG names follow the same convention as ledgers - normalized with branch (default :main)."
   [{:keys [name config dependencies]}]
-  (let [vg-name (ensure-string-name name)
-        ledgers (get-in config [:ledgers] [])]
-    {:vg-name vg-name
+  (let [normalized-name (util.ledger/ensure-ledger-branch name)]
+    {:vg-name normalized-name
      :vg-type "fidx:BM25"
      :config config
      :dependencies (or dependencies
-                       (mapv #(str % ":main") ledgers))}))
+                       (mapv util.ledger/ensure-ledger-branch (get-in config [:ledgers] [])))}))
 
 (defn- load-and-validate-ledgers
   "Loads all ledgers and validates they exist. Returns loaded ledgers."
@@ -82,13 +79,16 @@
 (defn- initialize-bm25-for-ledgers
   "Initializes the BM25 virtual graph for all dependent ledgers.
    Returns the loaded virtual graph instance."
-  [loaded-ledgers publisher vg-name]
+  [loaded-ledgers publisher vg-name dependencies conn]
   (go-try
-    ;; Since we only support single ledger for now, we can return the VG directly
+    ;; Single ledger support only for now
     (let [[_alias ledger] (first loaded-ledgers)
           db (ledger/current-db ledger)
-          vg (<? (vg-loader/load-virtual-graph-from-nameservice db publisher vg-name))]
-      vg)))
+          vg (<? (vg-loader/load-virtual-graph-from-nameservice db publisher vg-name))
+          ;; Start subscriptions to source ledgers
+          vg-with-conn (assoc vg :conn conn)
+          vg-with-subs (vg/start-subscriptions vg-with-conn publisher dependencies)]
+      vg-with-subs)))
 
 (defmethod create-vg :bm25
   [conn vg-config]
@@ -96,24 +96,19 @@
     (validate-bm25-config vg-config)
 
     (let [full-config (prepare-bm25-config vg-config)
-          {:keys [vg-name]} full-config
+          {:keys [vg-name dependencies]} full-config
           publisher (connection/primary-publisher conn)
           ledger-aliases (get-in vg-config [:config :ledgers] [])]
 
       ;; Check if virtual graph already exists
-      (when (<? (ns-vg/virtual-graph-exists? publisher vg-name))
+      (when (<? (nameservice/lookup publisher vg-name))
         (throw (ex-info (str "Virtual graph already exists: " vg-name)
                         {:error :db/invalid-config
                          :vg-name vg-name})))
 
-      ;; Load and validate ledgers exist before publishing
       (let [loaded-ledgers (<? (load-and-validate-ledgers conn ledger-aliases))]
-
-        ;; Publish to nameservice only after ledgers are validated
-        (<? (nameservice/publish publisher full-config))
-
-        ;; Initialize the virtual graph with pre-loaded ledgers and return the VG instance
-        (<? (initialize-bm25-for-ledgers loaded-ledgers publisher vg-name))))))
+        (<? (nameservice/publish-vg publisher full-config))
+        (<? (initialize-bm25-for-ledgers loaded-ledgers publisher vg-name dependencies conn))))))
 
 ;; R2RML implementation (minimal v1)
 (defn- validate-r2rml-config
@@ -129,11 +124,11 @@
 
 (defn- prepare-r2rml-config
   [{:keys [name config dependencies]}]
-  {:vg-name (ensure-string-name name)
-   :vg-type "fidx:R2RML"
-   :engine  :r2rml
-   :config  config
-   :dependencies (or dependencies [])})
+  (let [normalized-name (util.ledger/ensure-ledger-branch name)]
+    {:vg-name normalized-name
+     :vg-type "fidx:R2RML"
+     :config  config
+     :dependencies (or dependencies [])}))
 
 (defmethod create-vg :r2rml
   [conn vg-config]
@@ -142,15 +137,15 @@
     (let [full-config (prepare-r2rml-config vg-config)
           {:keys [vg-name]} full-config
           publisher (connection/primary-publisher conn)]
-      (when (<? (ns-vg/virtual-graph-exists? publisher vg-name))
+      ;; Check if VG already exists
+      (when (<? (nameservice/lookup publisher vg-name))
         (throw (ex-info (str "Virtual graph already exists: " vg-name)
                         {:error :db/invalid-config :vg-name vg-name})))
       ;; Publish the R2RML VG record. Initialization occurs lazily on first use.
-      (<? (nameservice/publish publisher full-config))
+      (<? (nameservice/publish-vg publisher full-config))
       ;; Return a minimal descriptor; callers will load via query paths
       {:id vg-name :alias vg-name :type ["fidx:R2RML"] :config (:config full-config)})))
 
-;; Default implementation for unknown types
 (defmethod create-vg :default
   [_conn {:keys [type]}]
   (go-try

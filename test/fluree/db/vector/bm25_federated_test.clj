@@ -52,7 +52,7 @@
           vg-name (:vg-name vg-obj)]
 
       (testing "virtual graph created"
-        (is (= "book-search" vg-name)))
+        (is (= "book-search:main" vg-name)))
 
       ;; Wait for initial indexing
       (<!! (vg/sync vg-obj nil))

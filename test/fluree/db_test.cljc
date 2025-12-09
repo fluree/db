@@ -34,7 +34,7 @@
   (testing "returns true after committing data to a ledger"
     #?(:clj
        (let [conn         (test-utils/create-conn)
-             ledger-alias "testledger"
+             ledger-alias "testledger2"
              db0          @(fluree/create conn ledger-alias)
              db           @(fluree/update db0
                                           {"@context" ["https://ns.flur.ee"
@@ -1097,7 +1097,7 @@
            ;; initial create call generates an initial commit, each commit has two files
            (is (= (* 2 (inc tx-count))
                   (count (async/<!! (fs/list-files (str primary-path "/" alias "/commit"))))))
-           (is (= ["garbage" "opst" "post" "psot" "root" "spot" "tspo"]
+           (is (= ["garbage" "opst" "post" "root" "spot" "stats-sketches" "tspo"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias "/index"))))))
            ;; one new index root per tx
            (is (= tx-count
@@ -1129,11 +1129,10 @@
                   (async/<!! (fs/list-files (str secondary-path "/ns@v2/destined-for-drop")))))
            (is (= ["commit" "index" "txn"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias))))))
-           (is (= ["garbage" "opst" "post" "psot" "root" "spot" "tspo"]
+           (is (= ["garbage" "opst" "post" "root" "spot" "stats-sketches" "tspo"]
                   (sort (async/<!! (fs/list-files (str primary-path "/" alias "/index"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/txn"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/commit"))))))
-           (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/root"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/root"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/garbage"))))))
            (is (zero? (count (async/<!! (fs/list-files (str primary-path "/" alias "/index/spot"))))))

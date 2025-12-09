@@ -70,3 +70,26 @@
 (defn sparql-format?
   [opts]
   (= :sparql (:format opts)))
+
+(defn extract-prefix
+  "A context key is a prefix if:
+   - it is a string with no colon
+   - it is a keyword with no namespace
+  Returns the string prefix if it is a prefix, falsey if not."
+  [k]
+  (or
+   (and (string? k) (not (str/includes? k ":")) k)
+   (and (keyword? k) (not (namespace k)) (name k))))
+
+(defn context->prefixes
+  [parsed-context]
+  (reduce-kv (fn [prefixes k v]
+               (if-let [prefix (extract-prefix k)]
+                 (case prefix
+                   "base"  (conj prefixes (str "BASE <" v ">"))
+                   "vocab" prefixes    ; not supported in SPARQL
+                   ;; else
+                   (conj prefixes (str "PREFIX "  prefix ": <" (:id v) ">")))
+                 prefixes))
+             []
+             (dissoc parsed-context :type-key)))

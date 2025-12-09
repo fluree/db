@@ -65,7 +65,11 @@ TriplesBlock	  ::=  WS TriplesSameSubjectPath WS ( <'.'> TriplesBlock? WS )?
 GraphPatternNotTriples	  ::=  	GroupOrUnionGraphPattern | OptionalGraphPattern | MinusGraphPattern | GraphGraphPattern | ServiceGraphPattern | Filter | Bind | InlineData
 OptionalGraphPattern	  ::=  	<'OPTIONAL'> GroupGraphPattern
 GraphGraphPattern	  ::=  	<'GRAPH'> WS VarOrIri WS GroupGraphPattern
-ServiceGraphPattern	  ::=  	<'SERVICE'> WS 'SILENT'? WS VarOrIri GroupGraphPattern
+ServiceGraphPattern ::= <'SERVICE'> WS 'SILENT'? WS VarOrIri ServiceClause
+ServiceClause ::= WS '{' ServiceContent '}' WS
+<ServiceContent> ::= (NonBrace | NestedBrace)*
+<NestedBrace> ::= '{' ServiceContent '}'
+<NonBrace> ::= #"[^{}]"
 Bind	  ::=  	<'BIND' WS '(' WS>  Expression <As> Var <WS ')' WS>
 InlineData	  ::=  	<'VALUES'> WS DataBlock
 <DataBlock>	  ::=  	InlineDataOneVar | InlineDataFull
@@ -133,13 +137,13 @@ As ::= WS <('AS' | 'as')> WS
 <AdditiveExpression>	  ::=  	MultiplicativeExpression (WS '+' WS MultiplicativeExpression | WS '-' WS MultiplicativeExpression | ( NumericLiteralPositive | NumericLiteralNegative ) ( (WS '*' WS UnaryExpression ) | (WS '/' WS UnaryExpression ) )* )*
 
 
-MultiplicativeExpression ::= UnaryExpression ( '*' WS UnaryExpression | '/' WS UnaryExpression )*
+MultiplicativeExpression ::= UnaryExpression WS ( '*' WS UnaryExpression WS | '/' WS UnaryExpression WS )*
 UnaryExpression ::= '!' PrimaryExpression
 | '+' PrimaryExpression
 | '-' PrimaryExpression
 | PrimaryExpression
 <PrimaryExpression>	  ::=  	BrackettedExpression | BuiltInCall | iriOrFunction | RDFLiteral | NumericLiteral | BooleanLiteral | Var
-BrackettedExpression	  ::=  	<'('> WS Expression WS <')'>
+BrackettedExpression	  ::=  	<'('> WS Expression WS <')'> WS
 
 <BuiltInCall> ::= Aggregate
 | ExistsFunc
@@ -170,6 +174,7 @@ Func ::= ('ABS'|'abs') <'('> Expression <')'>
 | ('MINUTES'|'minutes') <'('> Expression <')'>
 | ('MONTH'|'month') <'('> Expression <')'>
 | ('NOW'|'now') NIL
+| ('POWER' | 'power') <'('> Expression <','> Expression <')'>
 | ('RAND'|'rand') NIL
 | ('ROUND'|'round') <'('> Expression <')'>
 | ('SECONDS'|'seconds') <'('> Expression <')'>

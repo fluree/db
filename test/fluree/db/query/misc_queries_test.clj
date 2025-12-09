@@ -1,5 +1,6 @@
 (ns fluree.db.query.misc-queries-test
   (:require [babashka.fs :refer [with-temp-dir]]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
@@ -59,6 +60,22 @@
              @(fluree/query db {"@context" []
                                 :select    {"http://example.org/ns/dan" ["*"]}}))
           "empty context vector"))
+
+    (testing "@type returns all values in select graph crawl"
+      (let [conn2         (test-utils/create-conn)
+            ledger2       "query-multitype"
+            _             @(fluree/create conn2 ledger2)
+            db2           @(fluree/update @(fluree/db conn2 ledger2)
+                                          {"@context" [test-utils/default-context
+                                                       {:ex "http://example.org/ns/"}]
+                                           "insert"   [{:id   :ex/item
+                                                        :type [:ex/Foo :ex/Bar]}]})
+            db2           @(fluree/commit! conn2 db2)
+            res           @(fluree/query db2 {:context [test-utils/default-context
+                                                        {:ex "http://example.org/ns/"}]
+                                              :select  {:ex/item ["*"]}})]
+        (is (= [{:id :ex/item, :type [:ex/Bar :ex/Foo]}]
+               res))))
     (testing "history query"
       (is (= [{:f/t       1
                :f/assert  [{:id :ex/dan :ex/x 1}]
@@ -170,23 +187,34 @@
               result @(fluree/query db* {:context [test-utils/default-context
                                                    {:ex "http://example.org/ns/"}]
                                          :select  ['?s '?p '?o]
-                                         :where   {:id '?s, '?p '?o}})
-              expected-commit-id   "fluree:commit:sha256:bbssolklwzebg6jgcjki3bsg3wbnybtzvaqymkai5loz7sixr4iav"
-              expected-commit-addr "fluree:memory://bssolklwzebg6jgcjki3bsg3wbnybtzvaqymkai5loz7sixr4iav"
-              expected-commit-previous "fluree:commit:sha256:bsx5gbgyyigspr2yuswue4lprez7ykj63n7gmpb3nzfzbs7f5bvo"
-              expected-db-id       "fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"
-              expected-db-addr     "fluree:memory://tqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"]
-          (is (= [[expected-db-id  :f/address  expected-db-addr]
-                  [expected-db-id :f/flakes 11]
-                  [expected-db-id :f/size 1266]
-                  [expected-db-id :f/t 1]
-                  [expected-commit-id "https://www.w3.org/2018/credentials#issuer" "did:key:z6Mkf2bJEm3KiDeCzrxbQDvT8jfYiz5t2Lo3fuvwPL6E6duw"]
-                  [expected-commit-id  :f/address  expected-commit-addr]
-                  [expected-commit-id  :f/alias  "query/everything:main"]
-                  [expected-commit-id :f/data expected-db-id]
-                  [expected-commit-id :f/previous  expected-commit-previous]
-                  [expected-commit-id :f/time 720000]
-                  [expected-commit-id :f/v 2]
+                                         :where   {:id '?s, '?p '?o}})]
+          (is (= [["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"
+                   :f/address
+                   "fluree:memory://tqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"]
+                  ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn" :f/flakes 11]
+                  ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn" :f/size 1266]
+                  ["fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn" :f/t 1]
+                  ["fluree:commit:sha256:bbssolklwzebg6jgcjki3bsg3wbnybtzvaqymkai5loz7sixr4iav"
+                   "https://www.w3.org/2018/credentials#issuer"
+                   "did:key:z6Mkf2bJEm3KiDeCzrxbQDvT8jfYiz5t2Lo3fuvwPL6E6duw"]
+                  ["fluree:commit:sha256:bbssolklwzebg6jgcjki3bsg3wbnybtzvaqymkai5loz7sixr4iav"
+                   :f/address
+                   "fluree:memory://bssolklwzebg6jgcjki3bsg3wbnybtzvaqymkai5loz7sixr4iav"]
+                  ["fluree:commit:sha256:bbssolklwzebg6jgcjki3bsg3wbnybtzvaqymkai5loz7sixr4iav"
+                   :f/alias
+                   "query/everything:main"]
+                  ["fluree:commit:sha256:bbssolklwzebg6jgcjki3bsg3wbnybtzvaqymkai5loz7sixr4iav"
+                   :f/data
+                   "fluree:db:sha256:btqomzs3uzs7dspzbs5ht4e7af7qrahnvomx4s4id7apr5jm7dxn"]
+                  ["fluree:commit:sha256:bbssolklwzebg6jgcjki3bsg3wbnybtzvaqymkai5loz7sixr4iav"
+                   :f/previous
+                   "fluree:commit:sha256:bsx5gbgyyigspr2yuswue4lprez7ykj63n7gmpb3nzfzbs7f5bvo"]
+                  ["fluree:commit:sha256:bbssolklwzebg6jgcjki3bsg3wbnybtzvaqymkai5loz7sixr4iav"
+                   :f/time
+                   720000]
+                  ["fluree:commit:sha256:bbssolklwzebg6jgcjki3bsg3wbnybtzvaqymkai5loz7sixr4iav"
+                   :f/v
+                   2]
                   [:ex/alice :type :ex/User]
                   [:ex/alice :schema/age 42]
                   [:ex/alice :schema/email "alice@flur.ee"]
@@ -422,3 +450,45 @@
         (is (= [:ex/alice :ex/bob :ex/charlie] result)
             "Should return all inserted subjects in alphabetical order")))))
 
+(deftest ^:integration untyped-value-matching-test
+  (testing "Untyped integer values in queries should match typed values in storage via loose matching"
+    (let [conn         (test-utils/create-conn)
+          ledger-alias "untyped-test"
+          _            @(fluree/create conn ledger-alias)
+          db1          @(fluree/update @(fluree/db conn ledger-alias)
+                                       {"@context" [test-utils/default-context
+                                                    {"ex" "http://example.org/ns/"}]
+                                        "insert"   [{"@id"     "ex:alice"
+                                                     "ex:name" "Alice"}]})
+          db2          @(fluree/update db1
+                                       {"@context" [test-utils/default-context
+                                                    {"ex" "http://example.org/ns/"}]
+                                        "insert"   [{"@id"     "ex:bob"
+                                                     "ex:name" "Bob"}]})
+          db2          @(fluree/commit! conn db2)]
+
+      (testing "Query with explicit datatype matches"
+        (let [result @(fluree/query db2
+                                    {"@context" {"ex"  "http://example.org/ns/"
+                                                 "f"   "https://ns.flur.ee/ledger#"
+                                                 "xsd" "http://www.w3.org/2001/XMLSchema#"}
+                                     "select"   "?db"
+                                     "where"    [{"@id" "?db"
+                                                  "f:t" {"@value" 1
+                                                         "@type"  "xsd:int"}}]})]
+          (is (= 1 (count result))
+              "Should find exactly one db with t=1")
+          (is (str/starts-with? (first result) "fluree:db:sha256:")
+              "Result should be db IRI starting with fluree:db:sha256:")))
+
+      (testing "Query with untyped integer matches via loose matching"
+        (let [result @(fluree/query db2
+                                    {"@context" {"ex" "http://example.org/ns/"
+                                                 "f"  "https://ns.flur.ee/ledger#"}
+                                     "select"   "?db"
+                                     "where"    [{"@id" "?db"
+                                                  "f:t" 1}]})]
+          (is (= 1 (count result))
+              "Should find exactly one db with t=1 via loose matching")
+          (is (str/starts-with? (first result) "fluree:db:sha256:")
+              "Result should be db IRI starting with fluree:db:sha256:"))))))

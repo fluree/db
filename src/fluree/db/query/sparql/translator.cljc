@@ -141,6 +141,7 @@
    "minutes"        "minutes"
    "month"          "month"
    "now"            "now"
+   "power"          "power"
    "rand"           "rand"
    "round"          "round"
    "seconds"        "seconds"
@@ -198,6 +199,8 @@
       "minutes"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "month"        (str "(" f " " (literal-quote (parse-term (first args))) ")")
       "now"          (str "(" f ")")
+      "power"        (str "(" f " " (literal-quote (parse-term (first args))) " "
+                          (literal-quote (parse-term (second args))) ")")
       "rand"         (str "(" f ")")
       "round"        (str "(" f " " (parse-term (first args)) ")")
       "seconds"      (str "(" f " " (literal-quote (parse-term (first args))) ")")
@@ -259,7 +262,7 @@
   (when arglist
     (throw (ex-info "Unsupported syntax."
                     {:status 400 :error :db/invalid-query :term arglist})))
-  (parse-term iri))
+  {const/iri-id (parse-term iri)})
 
 (defmethod parse-term :UnaryExpression
   [[_ op-or-expr expr]]
@@ -362,12 +365,15 @@
   ;; PrefixDecl ::= <'PREFIX'> WS PNAME_NS WS IRIREF
   ;; [:PrefixDecl "e" "x" ":" [:IRIREF "<http://example.com/>"]]
   [[_ & prefix-decl]]
-  (let [prefix (->> (drop-last 2 prefix-decl) vec str/join)
-        iri    (->> prefix-decl
-                    (drop-while (comp not sequential?))
-                    first
-                    parse-term)]
-    [[prefix iri]]))
+  (let [prefix  (->> (drop-last 2 prefix-decl) vec str/join not-empty)
+        ;; sometimes no prefix is specified: PREFIX : <my:IRI> and
+        ;; all IRIs are just prefixed with a colon
+        prefix* (or prefix ":")
+        iri     (->> prefix-decl
+                     (drop-while (comp not sequential?))
+                     first
+                     parse-term)]
+    [[prefix* iri]]))
 
 (defmethod parse-rule :BaseDecl
   ;; BaseDecl ::= <'BASE'> WS IRIREF
@@ -524,13 +530,7 @@
   [[_ & bindings]]
   ;; bindings come in as val, var; need to be reversed to var, val.
   (into [:bind] (->> bindings
-                     (mapv (fn [term]
-                             (let [terms (into #{} (flatten term))
-                                   parsed (parse-term term)]
-                               (if (and (terms :iriOrFunction) (not= \( (first parsed)))
-                                 ;; static iri
-                                 {const/iri-id parsed}
-                                 (parse-term term)))))
+                     (mapv parse-term)
                      (partition-all 2)
                      (mapcat reverse))))
 
@@ -561,10 +561,20 @@
   [[_ & patterns]]
   (into [:minus] (mapv parse-term patterns)))
 
+(defmethod parse-term :ServiceClause
+  [[_ & chars]]
+  (apply str chars))
+
+(defn service-pattern
+  [silent? [service clause]]
+  [:service {:silent? silent? :service (parse-term service) :clause (parse-term clause)}])
+
 (defmethod parse-term :ServiceGraphPattern
-  [_]
-  (throw (ex-info "SERVICE is not a supported SPARQL pattern"
-                  {:status 400 :error :db/invalid-query})))
+  ;; ServiceGraphPattern ::= <'SERVICE'> WS 'SILENT'? WS VarOrIri GroupGraphPattern
+  [[_ & terms]]
+  (if (= "SILENT" (first terms))
+    (service-pattern true (rest terms))
+    (service-pattern false terms)))
 
 (defmethod parse-term :DataBlockValue
   ;; DataBlockValue ::= iri | RDFLiteral | NumericLiteral | BooleanLiteral | 'UNDEF' WS
@@ -897,7 +907,7 @@
                           {:status 400 :error :db/invalid-update}))
           (= (count graph-patterns) 1)
           (let [[[_ graph-iri data]] graph-patterns]
-            [[:ledger graph-iri] [:insert data]])
+            [[:ledger graph-iri] [:delete data]])
           :else
           [[:delete default-patterns]])))
 

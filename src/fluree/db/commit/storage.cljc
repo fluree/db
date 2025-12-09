@@ -26,6 +26,10 @@
   [commit-data]
   (contains? commit-data const/iri-cred-subj))
 
+(defn compact-credential?
+  [commit-data]
+  (contains? commit-data "credentialSubject"))
+
 (defn verify-commit
   "Given a full commit json, returns two-tuple of [commit-data commit-proof]"
   [commit-data]
@@ -35,24 +39,31 @@
       [credential-subject commit-data])
     [commit-data nil]))
 
+(defn inject-commit-metadata
+  [commit-data commit-id commit-address]
+  (if (compact-credential? commit-data)
+    (-> commit-data
+        (assoc-in ["credentialSubject" "id"] commit-id) ;; Note before expansion
+        (assoc-in ["credentialSubject" "address"] commit-address))
+    (-> commit-data
+        (assoc "id" commit-id) ;; Note before expansion
+        (assoc "address" commit-address))))
+
 (defn read-verified-commit
   [storage commit-address]
   (go-try
     (when-let [commit-data (<? (storage/content-read-json storage commit-address))]
       (log/trace "read-commit at:" commit-address "data:" commit-data)
-      (let [addr-key-path  (if (contains? commit-data "credentialSubject")
-                             ["credentialSubject" "address"]
-                             ["address"])
-            [commit proof] (-> commit-data
-                               (assoc-in addr-key-path commit-address)
-                               json-ld/expand
-                               verify-commit)
-            commit-hash    (<? (storage/get-hash storage commit-address))
-            commit-id      (commit-data/hash->commit-id commit-hash)
-            commit*        (assoc commit
-                                  const/iri-id commit-id
-                                  const/iri-address commit-address)]
-        [commit* proof]))))
+      (let [commit-hash (<? (storage/get-hash storage commit-address))
+            commit-id   (commit-data/hash->commit-id commit-hash)]
+        (log/trace "read-verified-commit: computed commit-id"
+                   {:address   commit-address
+                    :hash      commit-hash
+                    :commit-id commit-id})
+        (-> commit-data
+            (inject-commit-metadata commit-id commit-address)
+            json-ld/expand
+            verify-commit)))))
 
 ;; TODO: Verify hash
 (defn read-commit-jsonld
@@ -64,8 +75,11 @@
 (defn read-data-jsonld
   [storage address]
   (go-try
-    (let [jsonld (<? (storage/read-json storage address))]
+    (let [jsonld (<? (storage/read-json storage address))
+          hash   (<? (storage/get-hash storage address))
+          db-id  (commit-data/hash->db-id hash)]
       (-> jsonld
+          (assoc const/iri-id db-id)
           (assoc const/iri-address address)
           json-ld/expand))))
 
@@ -101,21 +115,22 @@
                                       (str (subs (str commit) 0 500) "...")
                                       (str commit))})))))
 
+(defn with-index-address
+  [commit index-address]
+  (if index-address
+    (let [existing-index  (get-first commit const/iri-index)
+          index-reference (assoc existing-index const/iri-address index-address)]
+      (assoc commit const/iri-index [index-reference]))
+    commit))
+
 (defn load-commit-with-metadata
   "Loads commit from disk and merges nameservice metadata (address, index)"
   [storage commit-address index-address]
   (go-try
     (log/debug "commit.storage/load-commit-with-metadata start" {:address commit-address :index-address index-address})
-    (when-let [commit-data (<? (storage/read-json storage commit-address))]
-      (let [addr-key-path (if (contains? commit-data "credentialSubject")
-                            ["credentialSubject" "address"]
-                            ["address"])
-            index-key-path (if (contains? commit-data "credentialSubject")
-                             ["credentialSubject" "index" "address"]
-                             ["index" "address"])
-            result (-> commit-data
-                       (assoc-in addr-key-path commit-address)
-                       (cond-> index-address (assoc-in index-key-path index-address)))]
+    (when-let [verified-commit (<? (read-verified-commit storage commit-address))]
+      (let [[commit _proof] verified-commit
+            result          (with-index-address commit index-address)]
         (log/debug "commit.storage/load-commit-with-metadata done" {:address commit-address})
         result))))
 

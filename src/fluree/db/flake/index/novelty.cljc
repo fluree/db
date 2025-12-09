@@ -1,18 +1,21 @@
 (ns fluree.db.flake.index.novelty
   (:require [clojure.core.async :as async :refer [<! >! go go-loop]]
+            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
             [fluree.db.flake.index :as index]
-            [fluree.db.flake.index.storage :as storage]
+            [fluree.db.flake.index.stats :as stats]
+            [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.indexer.garbage :as garbage]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(def ^:dynamic *overflow-bytes* 500000)
+(def ^:dynamic *overflow-bytes* const/default-overflow-bytes)
 (defn overflow-leaf?
   [{:keys [flakes]}]
   (> (flake/size-bytes flakes) *overflow-bytes*))
@@ -110,12 +113,13 @@
   `*overflow-bytes*`."
   [{:keys [flakes leftmost? rhs] :as leaf}]
   (if (overflow-leaf? leaf)
-    (let [target-size (/ *overflow-bytes* 2)]
+    (let [target-size (/ *overflow-bytes* 2)
+          [fflake & remaining] flakes]
       (log/debug "Rebalancing index leaf:"
                  (select-keys leaf [:id :ledger-alias]))
-      (loop [[f & r] flakes
-             cur-size  0
-             cur-first f
+      (loop [[f & r]   remaining
+             cur-size  (flake/size-flake fflake)
+             cur-first fflake
              leaves    []]
         (if (empty? r)
           (let [subrange  (flake/subrange flakes >= cur-first)
@@ -127,7 +131,8 @@
                                                      leftmost?))
                               (dissoc :id))]
             (conj leaves last-leaf))
-          (let [new-size (-> f flake/size-flake (+ cur-size) long)]
+          (let [flake-size (flake/size-flake f)
+                new-size   (+ cur-size flake-size)]
             (if (> new-size target-size)
               (let [subrange (flake/subrange flakes >= cur-first < f)
                     new-leaf (-> leaf
@@ -137,7 +142,7 @@
                                         :leftmost? (and (empty? leaves)
                                                         leftmost?))
                                  (dissoc :id))]
-                (recur r 0 f (conj leaves new-leaf)))
+                (recur r flake-size f (conj leaves new-leaf)))
               (recur r new-size cur-first leaves))))))
     [leaf]))
 
@@ -286,12 +291,15 @@
   [write-response file-type t changes-ch]
   (go
     (when changes-ch
-      (>! changes-ch {:event     :new-index-file
-                      :file-type file-type
-                      :data      write-response
-                      :address   (:address write-response)
-                      :t         t})
-      true)))
+      (let [event {:event     :new-index-file
+                   :file-type file-type
+                   :data      write-response
+                   :address   (:address write-response)
+                   :t         t}]
+        (log/debug "Broadcasting new index file:" file-type "address:" (:address write-response))
+        (>! changes-ch event)
+        (log/debug "Broadcast success:" file-type "address:" (:address event))
+        true))))
 
 (defn write-node
   "Writes `node` to storage, and puts any errors onto the `error-ch`"
@@ -303,13 +311,13 @@
       (try*
         (if (index/leaf? node)
           (do (log/debug "Writing index leaf:" display-node)
-              (let [write-response (<? (storage/write-leaf index-catalog alias idx node))]
+              (let [write-response (<? (index-storage/write-leaf index-catalog alias idx node))]
                 (<! (notify-new-index-file write-response :leaf t changes-ch))
                 (update-node-id node write-response)))
 
           (do (log/debug "Writing index branch:" display-node)
               (let [node*          (update-child-ids updated-ids node)
-                    write-response (<? (storage/write-branch index-catalog alias idx node*))]
+                    write-response (<? (index-storage/write-branch index-catalog alias idx node*))]
                 (<! (notify-new-index-file write-response :branch t changes-ch))
                 (update-node-id node* write-response))))
 
@@ -317,6 +325,105 @@
           (log/error e
                      "Error writing novel index node:" display-node)
           (async/>! error-ch e))))))
+
+(defn add-computed-fields
+  "Add computed selectivity estimates to properties map for O(1) optimizer lookups.
+
+   Computes and rounds selectivity estimates to integers (clamped to at least 1):
+   - :selectivity-value = max(1, ceil(count / ndv-values)) - estimates results for (?s p o) patterns
+   - :selectivity-subject = max(1, ceil(count / ndv-subjects)) - estimates results for (s p ?o) patterns
+
+   Computing ceil and max here (once during indexing) avoids repeating the calculation
+   on every query optimization."
+  [properties]
+  (reduce-kv
+   (fn [props sid prop-data]
+     (let [count        (or (:count prop-data) 0)
+           ndv-values   (or (:ndv-values prop-data) 0)
+           ndv-subjects (or (:ndv-subjects prop-data) 0)
+           ;; Compute selectivity, ceil, and clamp to min 1 - all in one place
+           sel-value    (if (pos? ndv-values)
+                          (max 1 (long (Math/ceil (/ (double count) (double ndv-values)))))
+                          count)
+           sel-subject  (if (pos? ndv-subjects)
+                          (max 1 (long (Math/ceil (/ (double count) (double ndv-subjects)))))
+                          count)]
+       (assoc props sid
+              (assoc prop-data
+                     :selectivity-value sel-value
+                     :selectivity-subject sel-subject))))
+   {}
+   properties))
+
+(defn- update-property-count
+  "Update count for a single property from novelty flakes.
+   Does NOT update NDV - keeps indexed NDV values as-is.
+   This is used for ledger-info to provide fast, accurate counts without loading sketches."
+  [property-flakes prev-prop-data]
+  (let [delta (reduce (fn [acc f]
+                        (if (flake/op f)
+                          (inc acc)
+                          (dec acc)))
+                      0
+                      property-flakes)
+        new-count (max 0 (+ (:count prev-prop-data 0) delta))]
+    (assoc prev-prop-data :count new-count)))
+
+(defn- compute-counts-from-novelty
+  "Update property and class counts from novelty, keeping NDV/selectivity from indexed stats.
+   Also updates class property details (types, ref-classes, langs) from novelty.
+   This is a fast, synchronous computation for ledger-info.
+   NDV values require loading sketches from disk (expensive), so we keep indexed NDV as-is.
+
+   Returns {:properties {sid -> {:count n :ndv-values n :ndv-subjects n :selectivity-* n}}
+            :classes {sid -> {:count n :properties {prop -> {:types {...} :ref-classes {...} :langs {...}}}}}}"
+  [novelty-flakes prev-properties prev-classes]
+  (let [property-groups (partition-by flake/p novelty-flakes)
+        ;; First pass: update property counts and class counts
+        updated-counts
+        (reduce
+         (fn [acc property-flakes]
+           (let [p (flake/p (first property-flakes))
+                 prev-prop-data (get prev-properties p {:count 0})
+
+                 property-data (update-property-count property-flakes prev-prop-data)
+
+                 classes* (if (flake/class-flake? (first property-flakes))
+                            (stats/update-class-counts property-flakes (:classes acc))
+                            (:classes acc))]
+
+             {:properties (assoc (:properties acc) p property-data)
+              :classes classes*}))
+         {:properties prev-properties
+          :classes prev-classes}
+         property-groups)
+
+        ;; Second pass: update class property details (types, ref-classes, langs)
+        updated-class-props (stats/compute-class-property-stats-from-novelty
+                             novelty-flakes
+                             (:classes updated-counts))]
+
+    {:properties (:properties updated-counts)
+     :classes updated-class-props}))
+
+(defn current-stats
+  "Compute current property and class statistics for ledger-info.
+
+   Updates counts by replaying novelty (fast, exact).
+   Keeps NDV and selectivity from last index (approximations, but avoids loading sketches from disk)."
+  [db]
+  (let [indexed-stats     (get db :stats {})
+        indexed-properties (get indexed-stats :properties {})
+        indexed-classes    (get indexed-stats :classes {})
+        post-novelty       (get-in db [:novelty :post])]
+    (if (not-empty post-novelty)
+      ;; Update counts from novelty, keep indexed NDV/selectivity
+      (let [novelty-updates (compute-counts-from-novelty post-novelty indexed-properties indexed-classes)]
+        (assoc indexed-stats
+               :properties (:properties novelty-updates)
+               :classes    (:classes novelty-updates)))
+      ;; No novelty, return indexed stats as-is
+      indexed-stats)))
 
 (defn write-resolved-nodes
   [db idx changes-ch error-ch index-ch]
@@ -361,15 +468,74 @@
       (update :indexes conj idx)
       (update :garbage into garbage)))
 
+(defn compute-stats-async
+  "Computes HLL-based statistics asynchronously with property-by-property processing.
+   Each property is: loaded from disk → updated → written back to disk immediately.
+
+   Returns a channel with {:properties {...} :classes {...} :old-sketch-paths #{...}}
+   NO sketches in return value - they're written to disk during processing.
+
+   If stats computation fails, returns previous stats with empty old-sketch-paths."
+  [db]
+  (go-try
+    (let [post-novelty (get-in db [:novelty :post])]
+      (if (empty? post-novelty)
+        {:properties (get-in db [:stats :properties] {})
+         :classes (get-in db [:stats :classes] {})
+         :old-sketch-paths #{}}
+
+        (let [{:keys [index-catalog alias t]} db
+              ledger-name (util.ledger/ledger-base-name alias)
+              prev-properties (get-in db [:stats :properties] {})
+              prev-classes (get-in db [:stats :classes] {})]
+          (<? (stats/compute-stats-with-writes index-catalog ledger-name t post-novelty
+                                               prev-properties prev-classes)))))))
+
 (defn refresh-all
   ([db error-ch]
    (refresh-all db nil error-ch))
   ([db changes-ch error-ch]
-   (->> index/types
-        (map (partial extract-root db))
-        (map (partial refresh-index db changes-ch error-ch))
-        async/merge
-        (async/reduce tally {:db db, :indexes [], :garbage #{}}))))
+   (go-try
+     ;; Check if this is a v1 index - if so, skip stats computation entirely
+     ;; v1 indexes should not generate stats until fully reindexed
+     (let [prev-index-version  (get-in db [:commit :index :v])
+           is-v1-index?        (and prev-index-version (< prev-index-version 2))
+           track-class-stats?  (get db :track-class-stats true)
+
+           ;; Kick off stats computation in parallel (v2 only)
+           stats-ch (when-not is-v1-index?
+                      (compute-stats-async db))
+
+           ;; Kick off class property tracking in parallel (v2 only, if enabled)
+           class-props-ch (when (and (not is-v1-index?)
+                                     track-class-stats?)
+                            (stats/compute-class-property-stats-async db))
+
+           ;; Run index refresh (always required)
+           index-result (<? (->> index/types
+                                 (map (partial extract-root db))
+                                 (map (partial refresh-index db changes-ch error-ch))
+                                 async/merge
+                                 (async/reduce tally {:db      db
+                                                      :indexes []
+                                                      :garbage #{}})))
+
+           ;; Collect stats results (or use empty stats for v1)
+           stats-result (if is-v1-index?
+                          (do
+                            (log/info "Skipping statistics computation for v1 index (will be enabled after full reindex)")
+                            {:properties {}
+                             :classes {}
+                             :old-sketch-paths #{}})
+                          (<? stats-ch))
+
+           class-props-result (if class-props-ch
+                                (<? class-props-ch)
+                                {})
+
+           merged-classes (merge-with merge (:classes stats-result) class-props-result)]
+
+       (merge index-result (assoc stats-result :classes merged-classes))))))
 
 (defn refresh
   [{:keys [novelty t alias] :as db} changes-ch max-old-indexes]
@@ -390,24 +556,44 @@
            (throw e))
 
           refresh-ch
-          ([{:keys [garbage], refreshed-db :db, :as _status}]
-           (let [{:keys [index-catalog alias] :as refreshed-db*}
-                 (assoc-in refreshed-db [:stats :indexed] t)
+          ([{:keys [garbage properties old-sketch-paths classes], refreshed-db :db, :as _status}]
+           (let [;; Add computed fields to properties for O(1) optimizer lookups
+                 properties-with-computed (add-computed-fields properties)
+
+                 {:keys [index-catalog alias] :as refreshed-db*}
+                 (-> refreshed-db
+                     (assoc-in [:stats :indexed] t)
+                     (assoc-in [:stats :properties] properties-with-computed)
+                     (assoc-in [:stats :classes] classes))
+
+                 garbage-with-sketches (into garbage (or old-sketch-paths #{}))
+
                 ;; TODO - ideally issue garbage/root writes to RAFT together
                 ;;        as a tx, currently requires waiting for both
                 ;;        through raft sync
-                 garbage-res   (when (seq garbage)
-                                 (let [write-res (<? (storage/write-garbage index-catalog alias t garbage))]
+                 garbage-res   (when (seq garbage-with-sketches)
+                                 (let [write-res (<? (index-storage/write-garbage index-catalog alias t garbage-with-sketches))]
                                    (<! (notify-new-index-file write-res :garbage t changes-ch))
                                    write-res))
-                 db-root-res   (<? (storage/write-db-root index-catalog refreshed-db* (:address garbage-res)))
+
+                 ;; No need to update db with sketches pointer - using fixed filenames
+                 refreshed-db**  refreshed-db*
+
+                 db-root-res   (<? (index-storage/write-db-root index-catalog refreshed-db** (:address garbage-res)))
                  _             (<! (notify-new-index-file db-root-res :root t changes-ch))
 
                  index-address (:address db-root-res)
                  index-id      (str "fluree:index:sha256:" (:hash db-root-res))
+
+                 prev-idx-v    (get-in refreshed-db* [:commit :index :v])
+                 index-version (if (get-in refreshed-db* [:commit :index :data :t])
+                                 (or prev-idx-v 1)
+                                 2)
+
                  commit-index  (commit-data/new-index (-> refreshed-db* :commit :data)
                                                       index-id
                                                       index-address
+                                                      index-version
                                                       (select-keys refreshed-db* index/types))
                  indexed-db    (dbproto/-index-update refreshed-db* commit-index)
                  duration      (- (util/current-time-millis) start-time-ms)

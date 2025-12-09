@@ -11,6 +11,7 @@
             [fluree.db.util :as util :refer [get-id get-first get-first-value
                                              get-value try* catch*]]
             [fluree.db.util.json :as json]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
             [fluree.db.util.reasoner :as reasoner-util]))
 
@@ -73,7 +74,8 @@
   [["id" :id]
    ["type" ["Index"]]
    ["address" :address]
-   ["data" :data]])
+   ["data" :data]
+   ["v" :v]])
 
 (defn merge-template
   "Merges provided map with template and places any
@@ -128,6 +130,7 @@
   [data]
   {:id      (get-id data)
    :t       (get-first-value data const/iri-fluree-t)
+   :v       (get-first-value data const/iri-v)
    :address (get-first-value data const/iri-address)
    :flakes  (get-first-value data const/iri-flakes)
    :size    (get-first-value data const/iri-size)})
@@ -136,7 +139,9 @@
   [jsonld]
   (let [id          (get-id jsonld)
         v           (get-first-value jsonld const/iri-v)
-        alias       (get-first-value jsonld const/iri-alias)
+        alias       (-> jsonld
+                        (get-first-value const/iri-alias)
+                        util.ledger/ensure-ledger-branch)
         address     (-> jsonld
                         (get-first-value const/iri-address)
                         not-empty)
@@ -151,7 +156,6 @@
         data        (get-first jsonld const/iri-data)
         ns          (get-first jsonld const/iri-ns)
         index       (get-first jsonld const/iri-index)]
-
     (cond-> {:id     id
              :v      v
              :alias  alias
@@ -168,15 +172,18 @@
                          util/sequential
                          (mapv (fn [namespace]
                                  {:id (get-id namespace)}))))
-      index (assoc :index {:id      (get-id index)
-                           :address (get-first-value index const/iri-address)
-                           :data    (parse-db-data (get-first index const/iri-data))})
+      index (assoc :index (cond-> {:id      (get-id index)
+                                   :address (get-first-value index const/iri-address)
+                                   :data    (parse-db-data (get-first index const/iri-data))}
+                            ;; Include index version if present for proper propagation
+                            (get-first-value index const/iri-v)
+                            (assoc :v (get-first-value index const/iri-v))))
       issuer (assoc :issuer {:id (get-id issuer)}))))
 
 (defn update-index-roots
-  [commit-map {:keys [spot psot post opst tspo]}]
+  [commit-map {:keys [spot post opst tspo]}]
   (if (contains? commit-map :index)
-    (update commit-map :index assoc :spot spot, :psot psot, :post post, :opst opst, :tspo tspo)
+    (update commit-map :index assoc :spot spot, :post post, :opst opst, :tspo tspo)
     commit-map))
 
 (defn json-ld->map
@@ -238,12 +245,13 @@
 (defn new-index
   "Creates a new commit index record, given the commit-map used to trigger
   the indexing process (which contains the db info used for the index), the
-  index id, index address and optionally index-type-addresses which contain
-  the address for each index type top level branch node."
-  [data-map id address index-root-maps]
+  index id, index address, index version, and optionally index-type-addresses
+  which contain the address for each index type top level branch node."
+  [data-map id address index-version index-root-maps]
   (merge {:id      id
           :address address
-          :data    data-map}
+          :data    data-map
+          :v       index-version}
          index-root-maps))
 
 (defn t
@@ -359,8 +367,6 @@
            ;; launch futures for parallellism on JVM
            flake-size  #?(:clj  (future (calc-flake-size add rem))
                           :cljs (calc-flake-size add rem))
-           psot        #?(:clj  (future (flake/revise (get-in db [:novelty :psot]) add rem))
-                          :cljs (flake/revise (get-in db [:novelty :psot]) add rem))
            post        #?(:clj  (future (flake/revise (get-in db [:novelty :post]) add rem))
                           :cljs (flake/revise (get-in db [:novelty :post]) add rem))
            opst        #?(:clj  (future (flake/revise (get-in db [:novelty :opst]) (ref-flakes add) (ref-flakes rem)))
@@ -368,8 +374,6 @@
        (-> db
            (update-in [:novelty :spot] flake/revise add rem)
            (update-in [:novelty :tspo] flake/revise add rem)
-           (assoc-in [:novelty :psot] #?(:clj  @psot
-                                         :cljs psot))
            (assoc-in [:novelty :post] #?(:clj  @post
                                          :cljs post))
            (assoc-in [:novelty :opst] #?(:clj  @opst
@@ -394,7 +398,7 @@
   data as its own entity."
   [db]
   (let [tt-id   (random-uuid)
-        indexes [:spot :psot :post :opst :tspo]]
+        indexes [:spot :post :opst :tspo]]
     (-> (reduce
          (fn [db* idx]
            (let [{:keys [children] :as node} (get db* idx)

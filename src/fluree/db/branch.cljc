@@ -1,5 +1,5 @@
 (ns fluree.db.branch
-  (:require [clojure.core.async :as async :refer [go <! go-loop]]
+  (:require [clojure.core.async :as async :refer [<! go-loop]]
             [fluree.db.async-db :as async-db]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake.commit-data :as commit-data]
@@ -56,28 +56,28 @@
   return immediately - and for a large amount of novelty,
   updating the db to reflect the latest index can take some time
   which would lead to atom contention."
-  [{:keys [alias commit t] :as current-db} index-map]
-  (if (async-db/db? current-db)
-    (dbproto/-index-update current-db index-map)
-    (let [updated-commit (assoc commit :index index-map)
-          updated-db     (async-db/->async-db alias updated-commit t)]
-      (go ;; update index in the background, return updated db immediately
-        (->> (dbproto/-index-update current-db index-map)
-             (async-db/deliver! updated-db)))
-      updated-db)))
+  [{:keys [alias commit t] :as current-db} index-map stats]
+  (let [to-update (async-db/->async-db alias commit t)
+        db-with-stats (if stats
+                        (assoc current-db :stats stats)
+                        current-db)]
+    (async-db/deliver! to-update db-with-stats)
+    (dbproto/-index-update to-update index-map)))
 
 (defn update-index
   [{current-commit :commit, current-db :current-db, :as current-state}
    {indexed-commit :commit, :as indexed-db}]
   (if (same-t? current-commit indexed-commit)
     (if (newer-index? indexed-commit current-commit)
-      (assoc current-state
-             :commit     indexed-commit
-             :current-db indexed-db)
+      (let [updated-commit (assoc current-commit :index (:index indexed-commit))
+            updated-db (assoc indexed-db :commit updated-commit)]
+        (assoc current-state
+               :commit     updated-commit
+               :current-db updated-db))
       current-state)
     (if (newer-commit? current-commit indexed-commit)
       (if (newer-index? indexed-commit current-commit)
-        (let [latest-db (update-index-async current-db (:index indexed-commit))]
+        (let [latest-db (update-index-async current-db (:index indexed-commit) (:stats indexed-db))]
           (assoc current-state
                  :commit     (:commit latest-db)
                  :current-db latest-db))
@@ -124,12 +124,20 @@
       (when-let [{:keys [db index-files-ch complete-ch]} (<! queue)]
         (let [db* (use-latest-index db last-index-commit branch-state)
               result (try*
-                       (let [indexed-db (<? (indexer/index db* index-files-ch)) ;; indexer/index always returns a FlakeDB (never AsyncDB)
+                       (let [indexed-db (<? (indexer/index db* index-files-ch)) ; indexer/index always returns a FlakeDB (never AsyncDB)
                              [{prev-commit :commit} {indexed-commit :commit}]
                              (swap-vals! branch-state update-index indexed-db)]
-                         (when (not= prev-commit indexed-commit)
-                           (let [commit-jsonld (commit-data/->json-ld indexed-commit)]
-                             (nameservice/publish-to-all commit-jsonld publishers)))
+                         (when-not (= prev-commit indexed-commit)
+                           (let [ledger-alias  (:alias indexed-db)
+                                 index-address (-> indexed-commit :index :address)
+                                 index-t       (commit-data/index-t indexed-commit)]
+                             (log/debug "Publishing new index" {:alias ledger-alias
+                                                                :index-address index-address
+                                                                :index-t index-t})
+                             (when-let [primary (nameservice/primary-publisher publishers)]
+                               (<? (nameservice/publish-index primary ledger-alias index-address index-t)))
+                             (when-let [secondaries (seq (nameservice/secondary-publishers publishers))]
+                               (nameservice/publish-index-to-all ledger-alias index-address index-t secondaries))))
                          {:status :success, :db indexed-db, :commit indexed-commit})
                        (catch* e
                          (log/error e "Error updating index")
@@ -180,35 +188,61 @@
   (= (previous-id new-commit)
      (:id current-commit)))
 
+(defn same-commit-except-index?
+  "Checks if two commits are the same except for their :index field.
+  This handles the case where an index update changed the current commit
+  between when a transaction captured the parent ID and when it tries to commit."
+  [commit1 commit2]
+  (and commit1 commit2
+       (= (commit-data/t commit1) (commit-data/t commit2))
+       (= (dissoc commit1 :index) (dissoc commit2 :index))))
+
 (defn update-commit
-  [{current-commit :commit, :as current-state}
+  [{current-commit :commit, current-db :current-db, :as current-state}
    {new-commit :commit, :as new-db}]
   (if (and (next-t? current-commit new-commit)
            (previous-id? current-commit new-commit))
     (if (newer-index? current-commit new-commit)
-      (let [latest-db (update-index-async new-db (:index current-commit))]
+      (let [latest-db (update-index-async new-db (:index current-commit) (:stats current-db))]
         (assoc current-state
                :commit     (:commit latest-db)
                :current-db latest-db))
       (assoc current-state
              :commit     new-commit
              :current-db new-db))
-    (do (log/warn "Commit update failure.\n  Current commit:" current-commit
-                  "\n  New commit:" new-commit)
-        (if-not (next-t? current-commit new-commit)
-          (throw (ex-info (str "Commit failed, latest committed db t is "
-                               (commit-data/t current-commit)
-                               " and you are trying to commit at db at t value of: "
-                               (commit-data/t new-commit)
-                               ". These should be one apart. Likely db was "
-                               "updated by another user or process.")
-                          {:status 400 :error :db/invalid-commit}))
-          (throw (ex-info (str "Commit failed, The previous commit id of the new commit: '"
-                               (previous-id new-commit)
-                               "' does not match the current commit id: '"
-                               (commit-data/t new-commit)
-                               "'.")
-                          {:status 400 :error :db/invalid-commit}))))))
+    ;; Parent ID doesn't match - check if it's just an index update race
+    (let [new-parent (get-in new-commit [:previous])]
+      (if (and (next-t? current-commit new-commit)
+               new-parent
+               (same-commit-except-index? current-commit new-parent))
+        (let [updated-new-commit (-> new-commit
+                                     (assoc-in [:previous :id] (:id current-commit))
+                                     (assoc-in [:previous :index] (:index current-commit)))
+              updated-new-db (assoc new-db :commit updated-new-commit)]
+          (if (newer-index? current-commit updated-new-commit)
+            (let [latest-db (update-index-async updated-new-db (:index current-commit) (:stats current-db))]
+              (assoc current-state
+                     :commit     (:commit latest-db)
+                     :current-db latest-db))
+            (assoc current-state
+                   :commit     updated-new-commit
+                   :current-db updated-new-db)))
+        (do (log/warn "Commit update failure.\n  Current commit:" current-commit
+                      "\n  New commit:" new-commit)
+            (if-not (next-t? current-commit new-commit)
+              (throw (ex-info (str "Commit failed, latest committed db t is "
+                                   (commit-data/t current-commit)
+                                   " and you are trying to commit at db at t value of: "
+                                   (commit-data/t new-commit)
+                                   ". These should be one apart. Likely db was "
+                                   "updated by another user or process.")
+                              {:status 400 :error :db/invalid-commit}))
+              (throw (ex-info (str "Commit failed, The previous commit id of the new commit: '"
+                                   (previous-id new-commit)
+                                   "' does not match the current commit id: '"
+                                   (:id current-commit)
+                                   "'.")
+                              {:status 400 :error :db/invalid-commit}))))))))
 
 (defn indexing-disabled?
   [branch-map]
@@ -226,8 +260,10 @@
   (let [updated-db (-> state
                        (swap! update-commit (policy/root-db new-db))
                        :current-db)]
-    (when (indexing-enabled? branch-map)
-      (enqueue-index! index-queue updated-db index-files-ch))
+    (if (indexing-enabled? branch-map)
+      (do (log/debug "Enqueueing new commit reindex for branch:" (:name branch-map) "alias:" (:alias branch-map))
+          (enqueue-index! index-queue updated-db index-files-ch))
+      (log/debug "Indexing disabled for branch:" (:name branch-map) "alias:" (:alias branch-map)))
     branch-map))
 
 (defn current-db
