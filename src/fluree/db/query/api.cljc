@@ -213,6 +213,14 @@
        (let [types (set (get ns-record "@type" []))]
          (contains? types "fidx:R2RML")))))
 
+#?(:clj
+   (defn- iceberg-virtual-graph?
+     "Returns true if a nameservice record represents an Iceberg virtual graph."
+     [ns-record]
+     (when ns-record
+       (let [types (set (get ns-record "@type" []))]
+         (contains? types "fidx:Iceberg")))))
+
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
   (go-try
@@ -225,9 +233,24 @@
       (if (virtual-graph-record? ns-record)
         ;; Virtual graph - load via VG loader (JVM only)
         #?(:clj
-           (if (r2rml-virtual-graph? ns-record)
+           (cond
+             (r2rml-virtual-graph? ns-record)
              ;; R2RML VGs connect to external databases, don't need a source ledger
              (<? (vg-loader/load-virtual-graph-from-nameservice nil publisher normalized-alias))
+
+             (iceberg-virtual-graph? ns-record)
+             ;; Iceberg VGs - create directly and apply time-travel if specified
+             (let [config (get ns-record "fidx:config")
+                   ;; Dynamic loading to avoid requiring Iceberg deps at compile time
+                   create-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/create)
+                   with-time-travel-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/with-time-travel)
+                   parse-time-travel-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/parse-time-travel)
+                   vg (create-fn {:alias normalized-alias :config config})
+                   ;; Apply time-travel if specified in alias (e.g., airlines@t:12345)
+                   time-travel (when explicit-t (parse-time-travel-fn explicit-t))]
+               (with-time-travel-fn vg time-travel))
+
+             :else
              ;; Other VGs (BM25, etc.) need a source ledger from dependencies
              (let [deps          (get ns-record "fidx:dependencies")
                    source-alias  (first deps)

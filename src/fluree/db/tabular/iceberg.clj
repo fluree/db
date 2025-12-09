@@ -1,6 +1,10 @@
 (ns fluree.db.tabular.iceberg
   "Iceberg implementation of ITabularSource.
 
+   Two implementations provided:
+   1. IcebergSource - Uses HadoopTables (requires Hadoop deps, simple for local dev)
+   2. FlureeIcebergSource - Uses StaticTableOperations + FlureeFileIO (no Hadoop deps)
+
    Uses IcebergGenerics for row-oriented reads. For production workloads
    with large tables, consider upgrading to Arrow vectorized reads via
    iceberg-arrow module.
@@ -11,15 +15,19 @@
    - Time-travel via snapshot-id or as-of-time
    - Schema introspection
    - Statistics from snapshot summary"
-  (:require [fluree.db.tabular.protocol :as proto])
+  (:require [clojure.string :as str]
+            [fluree.db.tabular.file-io :as file-io]
+            [fluree.db.tabular.protocol :as proto]
+            [fluree.db.util.log :as log])
   (:import [java.time Instant]
            [org.apache.hadoop.conf Configuration]
            [org.apache.hadoop.fs FileSystem]
-           [org.apache.iceberg Schema Snapshot Table]
+           [org.apache.iceberg BaseTable Schema Snapshot StaticTableOperations Table]
+           [org.apache.iceberg.catalog TableIdentifier]
            [org.apache.iceberg.data IcebergGenerics]
            [org.apache.iceberg.expressions Expressions Expression]
            [org.apache.iceberg.hadoop HadoopTables]
-           [org.apache.iceberg.io CloseableIterable]
+           [org.apache.iceberg.io CloseableIterable FileIO]
            [org.apache.iceberg.types Type Types$NestedField]))
 
 (set! *warn-on-reflection* true)
@@ -226,3 +234,158 @@
   (let [conf (Configuration.)
         tables (HadoopTables. conf)]
     (->IcebergSource tables conf warehouse-path)))
+
+;;; ---------------------------------------------------------------------------
+;;; FlureeIcebergSource - No Hadoop Dependencies
+;;; ---------------------------------------------------------------------------
+
+(defn- load-table-from-metadata
+  "Load an Iceberg Table from a metadata location using StaticTableOperations.
+   This avoids needing a full catalog - just point to the metadata JSON."
+  ^Table [^FileIO file-io ^String metadata-location ^String table-name]
+  (let [ops (StaticTableOperations. metadata-location file-io)
+        table-id (TableIdentifier/of "fluree" table-name)]
+    (BaseTable. ops table-id)))
+
+(defn- resolve-metadata-location
+  "Resolve the metadata location for an Iceberg table.
+
+   If metadata-location is provided directly, use it.
+   Otherwise, read version-hint.text from the table directory to find latest metadata."
+  [^FileIO file-io warehouse-path table-name metadata-location]
+  (or metadata-location
+      ;; Read version-hint.text to find current metadata
+      (let [hint-path (str warehouse-path "/" table-name "/metadata/version-hint.text")]
+        (try
+          (with-open [stream (.newStream (.newInputFile file-io hint-path))]
+            (let [version (-> (slurp stream) str/trim)]
+              (str warehouse-path "/" table-name "/metadata/v" version ".metadata.json")))
+          (catch Exception e
+            ;; Fall back to scanning metadata directory for latest
+            (log/warn "Could not read version-hint.text for" table-name ":" (.getMessage e))
+            nil)))))
+
+(defrecord FlureeIcebergSource [^FileIO file-io warehouse-path metadata-cache]
+  proto/ITabularSource
+
+  (scan-rows [_ table-name {:keys [columns predicates snapshot-id as-of-time limit metadata-location]}]
+    (let [meta-loc (or metadata-location
+                       (get @metadata-cache table-name)
+                       (let [loc (resolve-metadata-location file-io warehouse-path table-name nil)]
+                         (when loc (swap! metadata-cache assoc table-name loc))
+                         loc))
+          _ (when-not meta-loc
+              (throw (ex-info (str "Cannot resolve metadata for table: " table-name)
+                              {:table table-name :warehouse warehouse-path})))
+          ^Table table (load-table-from-metadata file-io meta-loc table-name)
+          schema (.schema table)
+          ;; Build scan with all pushdowns
+          ^CloseableIterable scan (cond-> (IcebergGenerics/read table)
+                                    ;; Column projection
+                                    (seq columns)
+                                    (.select ^java.util.Collection (vec columns))
+
+                                    ;; Predicate pushdown
+                                    (seq predicates)
+                                    (.where (predicates->expression predicates))
+
+                                    ;; Time travel
+                                    snapshot-id
+                                    (.useSnapshot ^long snapshot-id)
+
+                                    as-of-time
+                                    (.asOfTime (.toEpochMilli ^Instant as-of-time))
+
+                                    ;; Build the scan
+                                    true
+                                    (.build))]
+      (log/debug "FlureeIcebergSource: Scanning" table-name "from" meta-loc)
+      (with-open [_ scan]
+        (let [rows (iterator-seq (.iterator scan))
+              row-maps (map #(generic-record->map % schema) rows)
+              result (if limit (take limit row-maps) row-maps)]
+          (doall result)))))
+
+  (get-schema [_ table-name {:keys [snapshot-id as-of-time metadata-location]}]
+    (let [meta-loc (or metadata-location (get @metadata-cache table-name))
+          _ (when-not meta-loc
+              (throw (ex-info (str "Cannot resolve metadata for table: " table-name)
+                              {:table table-name})))
+          ^Table table (load-table-from-metadata file-io meta-loc table-name)
+          ^Schema schema (cond
+                           snapshot-id
+                           (if-let [^Snapshot snapshot (.snapshot table ^long snapshot-id)]
+                             (let [schema-id (.schemaId snapshot)]
+                               (.get (.schemas table) (int schema-id)))
+                             (.schema table))
+
+                           as-of-time
+                           (let [snap-id (.snapshotIdAsOfTime table (.toEpochMilli ^Instant as-of-time))]
+                             (if (pos? snap-id)
+                               (let [^Snapshot snapshot (.snapshot table snap-id)
+                                     schema-id (.schemaId snapshot)]
+                                 (.get (.schemas table) (int schema-id)))
+                               (.schema table)))
+
+                           :else
+                           (.schema table))
+          partition-spec (.spec table)
+          partition-fields (set (for [field (.fields partition-spec)]
+                                  (let [source-id (.sourceId field)]
+                                    (.name (.findField schema source-id)))))]
+      {:columns (for [^Types$NestedField field (.columns schema)]
+                  {:name (.name field)
+                   :type (iceberg-type->keyword (.type field))
+                   :nullable? (.isOptional field)
+                   :is-partition-key? (contains? partition-fields (.name field))})
+       :partition-spec {:fields (for [field (.fields partition-spec)]
+                                  {:source-id (.sourceId field)
+                                   :name (.name field)
+                                   :transform (str (.transform field))})}}))
+
+  (get-statistics [_ table-name {:keys [snapshot-id metadata-location]}]
+    (let [meta-loc (or metadata-location (get @metadata-cache table-name))
+          _ (when-not meta-loc
+              (throw (ex-info (str "Cannot resolve metadata for table: " table-name)
+                              {:table table-name})))
+          ^Table table (load-table-from-metadata file-io meta-loc table-name)
+          snapshot (if snapshot-id
+                     (.snapshot table ^long snapshot-id)
+                     (.currentSnapshot table))]
+      (when snapshot
+        (let [summary (.summary snapshot)]
+          {:row-count (some-> (get summary "total-records") parse-long)
+           :file-count (some-> (get summary "total-data-files") parse-long)
+           :added-records (some-> (get summary "added-records") parse-long)
+           :snapshot-id (.snapshotId snapshot)
+           :timestamp-ms (.timestampMillis snapshot)}))))
+
+  (supported-predicates [_]
+    #{:eq :ne :gt :gte :lt :lte :in :between :is-null :not-null :and :or})
+
+  proto/ICloseable
+  (close [_]
+    (.close file-io)))
+
+(defn create-fluree-iceberg-source
+  "Create an IcebergSource backed by Fluree storage (no Hadoop dependencies).
+
+   This uses StaticTableOperations to load tables from known metadata locations,
+   with file I/O provided by Fluree's storage protocols.
+
+   Config:
+     :store          - Fluree storage store (required) - must implement ByteStore
+     :warehouse-path - Root path prefix for tables (optional, for path resolution)
+
+   Example:
+     (create-fluree-iceberg-source {:store my-s3-store
+                                    :warehouse-path \"s3://bucket/warehouse\"})
+
+   Tables are loaded by:
+   1. Direct metadata-location in scan opts
+   2. Cached metadata location from previous scan
+   3. Reading version-hint.text from table directory"
+  [{:keys [store warehouse-path]}]
+  {:pre [(some? store)]}
+  (let [file-io (file-io/create-fluree-file-io store)]
+    (->FlureeIcebergSource file-io (or warehouse-path "") (atom {}))))

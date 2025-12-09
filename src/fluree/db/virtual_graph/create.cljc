@@ -29,8 +29,9 @@
     (throw (ex-info "Virtual graph requires :type"
                     {:error :db/invalid-config :config config}))
 
+    ;; @ is reserved for query-time time-travel, not registration
     (str/includes? name "@")
-    (throw (ex-info "Virtual graph name cannot contain '@' symbol"
+    (throw (ex-info (str "Virtual graph name cannot contain '@' character. Provided: " name)
                     {:error :db/invalid-config :name name}))))
 
 (defn create
@@ -150,28 +151,42 @@
 #?(:clj
    (defn- validate-iceberg-config
      [{:keys [config]}]
-     (let [{:keys [mapping mappingInline warehouse-path warehousePath]} config
-           wh-path (or warehouse-path warehousePath (get config "warehouse-path"))]
+     (let [{:keys [mapping mappingInline warehouse-path warehousePath store]} config
+           wh-path (or warehouse-path warehousePath (get config "warehouse-path"))
+           has-store (or store (get config "store"))]
        (when (and (nil? mapping) (nil? mappingInline) (nil? (get config "mappingInline")))
          (throw (ex-info "Iceberg virtual graph requires :mapping or :mappingInline"
                          {:error :db/invalid-config :type :iceberg})))
-       (when (nil? wh-path)
-         (throw (ex-info "Iceberg virtual graph requires :warehouse-path"
+       ;; Either warehouse-path (HadoopTables) or store (FlureeIcebergSource) required
+       (when (and (nil? wh-path) (nil? has-store))
+         (throw (ex-info "Iceberg virtual graph requires :warehouse-path or :store"
                          {:error :db/invalid-config :type :iceberg}))))))
 
 #?(:clj
+   (defn- prepare-iceberg-config
+     [{:keys [name config dependencies]}]
+     (let [normalized-name (util.ledger/ensure-ledger-branch name)]
+       {:vg-name normalized-name
+        :vg-type "fidx:Iceberg"
+        :config config
+        :dependencies (or dependencies [])})))
+
+#?(:clj
    (defmethod create-vg :iceberg
-     [_conn vg-config]
+     [conn vg-config]
      (go-try
        (validate-iceberg-config vg-config)
-       (let [{:keys [name config]} vg-config
-             normalized-name (util.ledger/ensure-ledger-branch name)
-             ;; Dynamic loading - only load iceberg ns when actually needed
-             ;; This avoids requiring Iceberg deps at compile time
-             create-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/create)]
-         ;; Create the Iceberg virtual graph directly (no nameservice for now)
-         ;; This returns an IcebergDatabase that implements where/Matcher
-         (create-fn {:alias normalized-name :config config})))))
+       (let [full-config (prepare-iceberg-config vg-config)
+             {:keys [vg-name]} full-config
+             publisher (connection/primary-publisher conn)]
+         ;; Check if VG already exists
+         (when (<? (nameservice/lookup publisher vg-name))
+           (throw (ex-info (str "Virtual graph already exists: " vg-name)
+                           {:error :db/invalid-config :vg-name vg-name})))
+         ;; Publish to nameservice so alias resolution works in queries
+         (<? (nameservice/publish-vg publisher full-config))
+         ;; Return a minimal descriptor; actual VG is loaded lazily on first query
+         {:id vg-name :alias vg-name :type ["fidx:Iceberg"] :config (:config full-config)}))))
 
 (defmethod create-vg :default
   [_conn {:keys [type]}]

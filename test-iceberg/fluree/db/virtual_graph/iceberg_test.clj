@@ -191,6 +191,55 @@
             "Each result should have both ?name and ?country")))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Alias Parsing Tests (Fluree naming convention)
+;;; ---------------------------------------------------------------------------
+
+(deftest create-with-branch-test
+  (when (and (warehouse-exists?) (mapping-exists?))
+    (testing "Virtual graph with explicit branch in alias"
+      (let [vg (iceberg-vg/create {:alias "airlines:main"
+                                   :config {:warehouse-path warehouse-path
+                                            :mapping mapping-path}})]
+        (is (= "airlines:main" (:alias vg)))
+        (is (nil? (:time-travel vg)))))
+
+    (testing "Virtual graph without branch defaults correctly"
+      (let [vg (iceberg-vg/create {:alias "airlines"
+                                   :config {:warehouse-path warehouse-path
+                                            :mapping mapping-path}})]
+        (is (= "airlines" (:alias vg)))
+        (is (nil? (:time-travel vg)))))))
+
+(deftest time-travel-rejected-at-registration-test
+  (when (and (warehouse-exists?) (mapping-exists?))
+    (testing "Time-travel in alias is rejected at registration"
+      ;; Time-travel should be a query-time concern, not registration-time
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"cannot contain '@'"
+           (iceberg-vg/create {:alias "airlines@t:12345"
+                               :config {:warehouse-path warehouse-path
+                                        :mapping mapping-path}}))))))
+
+(deftest create-requires-store-or-warehouse-test
+  (when (mapping-exists?)
+    (testing "Create throws when neither store nor warehouse-path provided"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"requires :warehouse-path or :store"
+           (iceberg-vg/create {:alias "test"
+                               :config {:mapping mapping-path}}))))))
+
+(deftest create-requires-mapping-test
+  (when (warehouse-exists?)
+    (testing "Create throws when mapping not provided"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"requires :mapping or :mappingInline"
+           (iceberg-vg/create {:alias "test"
+                               :config {:warehouse-path warehouse-path}}))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Run from REPL
 ;;; ---------------------------------------------------------------------------
 
