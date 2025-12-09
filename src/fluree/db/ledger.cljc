@@ -102,7 +102,6 @@
      (let [branch-data (get-branch-meta ledger requested-branch)
            current-db  (branch/current-db branch-data)
            {:keys [stats namespace-codes commit]} (<? (dbproto/-ledger-info current-db))
-           ;; Use cached stats - shared with f:onClass policy optimization
            current-stats (<? (novelty/cached-current-stats current-db))
            commit-jsonld (commit-data/->json-ld commit)
            nameservice (when primary-publisher

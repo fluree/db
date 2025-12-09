@@ -12,8 +12,6 @@
   [db-after tracker error-ch policy-values {:keys [subject-specs target-property on-property-specs] :as policy}]
   (go-try
     (cond-> policy
-      ;; subject-specs combines both onSubject (preferred) and targetSubject (legacy)
-      ;; Refreshes :on-subject for O(1) indexed lookup
       subject-specs     (update :on-subject into (<? (policy.rules/parse-targets db-after tracker error-ch policy-values subject-specs)))
       target-property   (update :p-targets into (<? (policy.rules/parse-targets db-after tracker error-ch policy-values target-property)))
       on-property-specs (update :on-property into (<? (policy.rules/parse-targets db-after tracker error-ch policy-values on-property-specs))))))
@@ -65,7 +63,6 @@
               ;; policies-allow-modification? will throw if access forbidden
               (<? (enforce/policies-allow-modification? db-after* tracker class-policy-cache sid candidate-policies))
               (recur r))
-            ;; no more flakes, all passed so return final db
             db-after))))))
 
 (defn deny-all?

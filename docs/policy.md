@@ -1,6 +1,6 @@
 # Fluree Policy System
 
-This document provides a comprehensive reference for Fluree's policy system, which enables fine-grained access control over data viewing and modification.
+This document provides a reference for Fluree's policy system, which enables fine-grained access control over data viewing and modification.
 
 ## Overview
 

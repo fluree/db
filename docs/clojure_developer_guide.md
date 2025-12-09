@@ -483,7 +483,7 @@ graph database flexibility with cryptographic verifiability.
     :type :f/AccessPolicy
     :f/policyClass :ex/HRManager
     :f/action [:f/view]
-    :f/targetProperty :ex/salary}])
+    :f/onProperty :ex/salary}])
 
 ;; Only HR managers can see salary data
 @(fluree/insert! ledger (fluree/db ledger)
@@ -544,8 +544,8 @@ This is useful for composable policies where:
                "f"  "https://ns.flur.ee/ledger#"}
    "@id"      "ex:secretRestriction"
    "@type"    "f:AccessPolicy"
-   "f:targetSubject" {"@type"  "@json"
-                      "@value" {"where" [{"@id" "?$target" "@type" {"@id" "ex:Secret"}}]}}
+   "f:onSubject" {"@type"  "@json"
+                  "@value" {"where" [{"@id" "?$this" "@type" {"@id" "ex:Secret"}}]}}
    "f:action" {"@id" "f:view"}
    ;; Only allows if classification is "public" (returns false for "top-secret")
    "f:query"  {"@type"  "@json"

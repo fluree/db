@@ -58,6 +58,13 @@
      #{}
      all-classes)))
 
+(defn- implicit-property?
+  "Returns true if the property is an implicit property (@id or @type).
+   Every subject has these properties, so class policies indexed by them
+   always require class membership checking."
+  [pid]
+  (or (= pid const/$id) (= pid const/$rdf:type)))
+
 (defn- build-property-to-classes-map
   "Builds a reverse mapping from property SID to the set of classes that use it.
    Returns {pid #{cid1 cid2 ...}}"
@@ -88,6 +95,9 @@
    (the same map as regular property policies) with a :class-policy? flag. This enables
    a single O(1) lookup at query time - the class check is done inline during policy evaluation.
 
+   Each class-derived restriction includes metadata about which classes use that property,
+   enabling efficient class membership verification during enforcement.
+
    When stats are available, policies are indexed by all properties used by the target classes.
    Additionally, implicit properties (@id, @type) are always indexed since every subject has them.
    This ensures policies apply even when restricting classes with no existing instances.
@@ -97,13 +107,9 @@
    - If OTHER classes also use the property → class check needed to filter appropriately"
   [restriction-map db policy-map]
   (let [cids (policy-cids db restriction-map)
-        ;; Build reverse mapping: property -> classes that use it (for target classes only)
         property-classes-map (build-property-to-classes-map db cids)
-        ;; Always add implicit properties (@id, @type) - every class instance has these
-        ;; This ensures policies work even for classes with no existing instances
         property-classes-map* (add-implicit-class-properties property-classes-map cids)]
     ;; Store class-derived policies directly in [:view :property pid]
-    ;; This is the same map as regular property policies, enabling single O(1) lookup
     (reduce-kv
      (fn [policy pid classes-using-property]
        (let [;; Determine if class check is needed for this property:
@@ -112,12 +118,8 @@
              ;; - For implicit properties (@id, @type), always need class check
              ;;   since every subject has them
              all-classes       (all-classes-using-property db pid)
-             implicit-prop?    (or (= pid const/$id) (= pid const/$rdf:type))
-             class-check-needed? (or implicit-prop?
-                                     (nil? all-classes) ; no stats, be safe
+             class-check-needed? (or (implicit-property? pid)
                                      (not (every? classes-using-property all-classes)))
-             ;; Create a class-derived restriction for this property
-             ;; It includes metadata about which classes use this property
              class-policy {:id                  (:id restriction-map)
                            :class-policy?       true
                            :class-check-needed? class-check-needed?
@@ -193,13 +195,11 @@
 
 (defn- detect-target-var
   "Detects which target variable the user used in their query.
-  Prefers ?$this (modern) over ?$target (legacy) for new queries."
+  Returns ?$target only if explicitly used (legacy), otherwise ?$this."
   [query-map]
-  (cond
-    (query-contains-var? query-map "?$this")   "?$this"
-    (query-contains-var? query-map "?$target") "?$target"
-    ;; Default to ?$this for queries that don't use either (shouldn't happen normally)
-    :else "?$this"))
+  (if (query-contains-var? query-map "?$target")
+    "?$target"
+    "?$this"))
 
 (defn parse-targets
   [db tracker error-ch policy-values target-exprs]
@@ -210,9 +210,8 @@
                           (fn [target-expr ch]
                             (async/go
                               (try*
-                                (if (query-target? target-expr)
-                                  ;; Support both ?$this (preferred) and ?$target (legacy)
-                                  (let [target-var (detect-target-var target-expr)
+                                (if (query-target? target-expr) 
+                                  (let [target-var (detect-target-var target-expr) ;; Support both ?$this (preferred) and ?$target (legacy)
                                         target-q   (cond-> (assoc target-expr
                                                                   "select" target-var
                                                                   :selection-context {}) ;; don't compact selection results
@@ -321,12 +320,8 @@
             ;; Store raw on-property specs for modify refresh (when they contain queries)
             (some query-target? on-property-specs) (assoc :on-property-specs on-property-specs)
             (not-empty property-targets)    (assoc :p-targets property-targets)
-            ;; onSubject targets stored for O(1) indexed lookup via add-subject-restriction
             (not-empty subject-targets)     (assoc :on-subject subject-targets)
-            ;; onProperty targets stored for O(1) indexed lookup via add-property-restriction
             (not-empty on-property-targets) (assoc :on-property on-property-targets))
-        ;; policy-doc has incorrectly formatted view? and/or modify?
-        ;; this might allow data through that was intended to be restricted, so throw.
           (throw (ex-info (str "Invalid policy definition. Policies must have f:action of {@id: f:view} or {@id: f:modify}. "
                                "Policy data that failed: " policy-doc)
                           {:status 400
@@ -368,7 +363,6 @@
 (defn parse-policies
   [db tracker error-ch policy-values policy-docs]
   (let [policy-ch     (async/chan)]
-    ;; parse policies and put them on the policy-ch, output to error-ch in case of error
     (->> policy-docs
          async/to-chan!
          (async/pipeline-async 2
@@ -377,7 +371,6 @@
                                  (-> (parse-policy db tracker error-ch policy-values policy-doc)
                                      (async/pipe ch)))))
 
-    ;; build policy wrapper attached to db containing parsed policies
     (async/reduce (build-wrapper db) {} policy-ch)))
 
 (defn ensure-ground-identity
