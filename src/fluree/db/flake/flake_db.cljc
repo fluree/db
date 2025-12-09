@@ -312,12 +312,14 @@
   (-query [this tracker query-map] (fql/query this tracker query-map))
   (-class-ids [this tracker subject] (match/class-ids this tracker subject))
   (-index-update [db commit-index] (index-update db commit-index))
-  (-ledger-info [_]
-    (async/go
+  (-ledger-info [this]
+    (go-try
       (let [index-address (get-in commit [:index :address])
             index-id      (get-in commit [:index :id])
-            index-t       (get-in commit [:index :data :t])]
+            index-t       (get-in commit [:index :data :t])
+            current-stats (<? (novelty/cached-current-stats this))]
         {:stats           stats
+         :current-stats   current-stats
          :schema          schema
          :namespace-codes namespace-codes
          :t               t

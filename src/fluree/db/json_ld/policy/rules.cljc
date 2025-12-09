@@ -210,7 +210,7 @@
                           (fn [target-expr ch]
                             (async/go
                               (try*
-                                (if (query-target? target-expr) 
+                                (if (query-target? target-expr)
                                   (let [target-var (detect-target-var target-expr) ;; Support both ?$this (preferred) and ?$target (legacy)
                                         target-q   (cond-> (assoc target-expr
                                                                   "select" target-var
