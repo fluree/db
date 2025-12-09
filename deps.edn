@@ -77,7 +77,7 @@
                  org.testcontainers/localstack           {:mvn/version "1.19.3"}
                  com.h2database/h2                       {:mvn/version "2.2.224"}}
    :exec-fn     kaocha.runner/exec-fn
-   :exec-args   {:kaocha.filter/skip-meta [:pending :docker]}}
+   :exec-args   {:kaocha.filter/skip-meta [:pending :docker :iceberg]}}
 
   :cljtest-sci
   {:jvm-opts    ["-Dfluree.graalvm.build=true"]

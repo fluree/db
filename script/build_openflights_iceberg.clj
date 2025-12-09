@@ -1,15 +1,13 @@
 (ns build-openflights-iceberg
   "Builds a small local Iceberg warehouse from OpenFlights CSVs.
 
-  Usage:
-    clojure -Sdeps '{:deps {org.apache.iceberg/iceberg-core {:mvn/version \"1.4.3\"}
-                            org.apache.iceberg/iceberg-parquet {:mvn/version \"1.4.3\"}
-                            org.apache.iceberg/iceberg-hadoop {:mvn/version \"1.4.3\"}
-                            org.apache.parquet/parquet-hadoop {:mvn/version \"1.13.1\"}
-                            org.apache.hadoop/hadoop-common {:mvn/version \"3.3.4\"}
-                            org.apache.hadoop/hadoop-client {:mvn/version \"3.3.4\"}
-                            org.clojure/data.csv {:mvn/version \"1.0.1\"}}}'
-            -M -m script.build-openflights-iceberg
+  Usage (preferred):
+    make iceberg-openflights
+
+  Or manually (note :paths adds script/ to classpath):
+    clojure -Sdeps '{:paths [\"script\"] :deps {...}}' -M -m build-openflights-iceberg
+
+  See Makefile for full deps specification.
   "
   (:require [clojure.data.csv :as csv]
             [clojure.java.io :as io])
