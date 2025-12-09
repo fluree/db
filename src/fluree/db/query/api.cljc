@@ -1,10 +1,12 @@
 (ns fluree.db.query.api
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
-  (:require [fluree.db.connection :as connection]
+  (:require #?(:clj [fluree.db.virtual-graph.nameservice-loader :as vg-loader])
+            [fluree.db.connection :as connection]
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.ledger :as ledger]
+            [fluree.db.nameservice :as nameservice]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.history :as history]
@@ -196,6 +198,13 @@
                         (some-> opts (get base-name) (select-keys ledger-specific-opts)))]
     (update q :opts merge ledger-opts)))
 
+(defn- virtual-graph-record?
+  "Returns true if a nameservice record represents a virtual graph."
+  [ns-record]
+  (when ns-record
+    (let [types (get ns-record "@type")]
+      (some #{"f:VirtualGraphDatabase"} types))))
+
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
   (go-try
@@ -203,13 +212,34 @@
     (let [[base-alias explicit-t] (extract-query-string-t alias)
           ;; Normalize to ensure branch (e.g., "docs" -> "docs:main")
           normalized-alias (ledger-util/ensure-ledger-branch base-alias)
-          ledger           (<? (connection/load-ledger-alias conn normalized-alias))
-          db               (ledger/current-db ledger)
-          t*               (or explicit-t t)
-          query*           (-> sanitized-query
-                               (assoc :t t*)
-                               (ledger-opts-override db))]
-      (<? (restrict-db db tracker query* conn)))))
+          publisher        (connection/primary-publisher conn)
+          ns-record        (<? (nameservice/lookup publisher normalized-alias))]
+      (if (virtual-graph-record? ns-record)
+        ;; Virtual graph - load via VG loader (JVM only)
+        #?(:clj
+           (let [;; For VG queries, we need a source ledger's db to initialize the VG
+                 ;; Get it from the VG's dependencies
+                 deps          (get ns-record "fidx:dependencies")
+                 source-alias  (first deps)
+                 source-ledger (<? (connection/load-ledger-alias conn source-alias))
+                 source-db     (ledger/current-db source-ledger)
+                 vg            (<? (vg-loader/load-virtual-graph-from-nameservice
+                                    source-db publisher normalized-alias))]
+             vg)
+           :cljs
+           (throw (ex-info "Virtual graphs are not supported in ClojureScript"
+                           {:status 400 :error :db/unsupported})))
+        ;; Regular ledger
+        (if ns-record
+          (let [ledger (<? (connection/load-ledger-alias conn normalized-alias))
+                db     (ledger/current-db ledger)
+                t*     (or explicit-t t)
+                query* (-> sanitized-query
+                           (assoc :t t*)
+                           (ledger-opts-override db))]
+            (<? (restrict-db db tracker query* conn)))
+          (throw (ex-info (str "Load for " normalized-alias " failed due to failed address lookup.")
+                          {:status 404 :error :db/unkown-ledger})))))))
 
 (defn load-aliases
   [conn tracker aliases sanitized-query]

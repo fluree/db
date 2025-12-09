@@ -43,15 +43,17 @@
             vg-name (:vg-name vg-obj)]
 
         (testing "virtual graph creation"
-          (is (= "article-search" vg-name)))
+          ;; VG names follow ledger convention - normalized with :main branch
+          (is (= "article-search:main" vg-name)))
 
         (testing "nameservice record persistence"
-          (let [ns-file (fs/file storage-path "ns@v2" "article-search.json")]
+          ;; VGs use the same storage pattern as ledgers: ns@v2/{name}/{branch}.json
+          (let [ns-file (fs/file storage-path "ns@v2" "article-search" "main.json")]
             (is (fs/exists? ns-file) "Nameservice file should exist")
 
             (when (fs/exists? ns-file)
               (let [ns-content (json/parse (slurp ns-file) false)]
-                (is (= "article-search" (get ns-content "@id")))
+                (is (= "article-search:main" (get ns-content "@id")))
                 (is (some #{"f:VirtualGraphDatabase"} (get ns-content "@type")))
                 (is (some #{"fidx:BM25"} (get ns-content "@type")))))))
 

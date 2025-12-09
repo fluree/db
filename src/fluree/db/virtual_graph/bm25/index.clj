@@ -371,7 +371,15 @@
   (-index-update [this _commit-index]
     ;; BM25 indexes are updated through the UpdatableVirtualGraph protocol
     ;; This is a no-op for compatibility
-    this))
+    this)
+
+  (-ledger-info [this]
+    ;; BM25 virtual graphs return minimal ledger info
+    (async/go
+      {:stats {:size 0 :flakes 0}
+       :t (:t this)
+       :schema {}
+       :namespace-codes (:namespace-codes this)})))
 
 ;; TODO - VG - triggering updates only works for queries for single subject, no nested nodes
 ;; TODO - VG - future feature - weighted properties

@@ -4,6 +4,7 @@
             [fluree.db.storage :as storage]
             [fluree.db.util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
 (defn drop-artifacts
@@ -30,19 +31,22 @@
           :vg-artifacts-not-dropped)))))
 
 (defn drop-virtual-graph
-  "Drops a virtual graph and all its associated data"
+  "Drops a virtual graph and all its associated data.
+   VG names follow the same convention as ledgers - normalized with branch."
   [conn vg-name]
   (go-try
-    (let [{:keys [primary-publisher]} conn]
-      (log/info "Dropping virtual graph:" vg-name)
+    (let [{:keys [primary-publisher]} conn
+          ;; Normalize name to include branch (e.g., "my-vg" -> "my-vg:main")
+          normalized-name (util.ledger/ensure-ledger-branch vg-name)]
+      (log/info "Dropping virtual graph:" normalized-name)
 
       ;; 1. Remove from nameservice (which also unregisters dependencies)
-      (<? (nameservice/retract primary-publisher vg-name))
+      (<? (nameservice/retract primary-publisher normalized-name))
 
       ;; 2. Delete all index files for this VG
-      (<? (drop-artifacts conn vg-name))
+      (<? (drop-artifacts conn normalized-name))
 
       ;; 3. No cache to clear since VGs aren't cached in connection
 
-      (log/info "Dropped virtual graph:" vg-name)
+      (log/info "Dropped virtual graph:" normalized-name)
       :dropped)))

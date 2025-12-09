@@ -10,27 +10,20 @@
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
-(defn ledger-alias?
-  "Returns true if the target is a ledger alias (contains branch separator :).
-  Virtual graph names do not contain the separator."
-  [target]
-  (str/includes? target ":"))
-
-(defn vg-filename
-  "Returns the local filename for a virtual graph's nameservice record.
-   Returns path like 'ns@v2/vg/vg-name.json'."
-  [vg-name]
-  (str const/ns-version "/vg/" vg-name ".json"))
-
 (defn new-vg-record
-  "Generates nameservice metadata map for a virtual graph."
+  "Generates nameservice metadata map for a virtual graph.
+   VG names follow the same convention as ledgers - fully qualified with branch."
   [{:keys [vg-name vg-type config dependencies]}]
-  {"@context"        {"f" iri/f-ns
-                      "fidx" "https://ns.flur.ee/index#"}
-   "@id"             vg-name
-   "@type"           [vg-type]
-   "fidx:config"     {"@value" (json/stringify config)}
-   "fidx:dependencies" dependencies})
+  (let [[base-name branch] (util.ledger/ledger-parts vg-name)
+        branch (or branch const/default-branch-name)]
+    {"@context"           {"f" iri/f-ns
+                           "fidx" "https://ns.flur.ee/index#"}
+     "@id"                vg-name
+     "@type"              ["f:VirtualGraphDatabase" vg-type]
+     "f:name"             base-name
+     "f:branch"           branch
+     "fidx:config"        {"@value" (json/stringify config)}
+     "fidx:dependencies"  dependencies}))
 
 (defn ledger-filename
   "Returns the local filename for a ledger's nameservice record.
@@ -164,27 +157,24 @@
                            (update-index-record index-record ledger-alias index-address index-t)))))
 
   (publish-vg [_ vg-config]
+    ;; VGs use the same storage pattern as ledgers (name:branch -> name/branch.json)
     (let [{:keys [vg-name]} vg-config
-          filename (vg-filename vg-name)]
+          filename (local-filename vg-name)]
       (log/debug "nameservice.storage/publish-vg start" {:vg-name vg-name :filename filename})
       (storage/swap-json store filename
                          (fn [_existing]
                            (new-vg-record vg-config)))))
 
   (retract [_ target]
+    ;; Both ledgers and VGs use the same storage pattern
     (go-try
-      (if (ledger-alias? target)
-        ;; Ledger: delete both main and index files
-        (let [main-filename  (local-filename target)
-              index-filename* (index-filename target)
-              main-address   (-> store storage/location (storage/build-address main-filename))
-              index-address  (-> store storage/location (storage/build-address index-filename*))]
-          (<? (storage/delete store main-address))
-          (<? (storage/delete store index-address)))
-        ;; Virtual graph: delete just the VG file
-        (let [filename (vg-filename target)
-              address  (-> store storage/location (storage/build-address filename))]
-          (<? (storage/delete store address))))))
+      (let [main-filename   (local-filename target)
+            index-filename* (index-filename target)
+            main-address    (-> store storage/location (storage/build-address main-filename))
+            index-address   (-> store storage/location (storage/build-address index-filename*))]
+        ;; Delete main file and index file (index may not exist for VGs, which is fine)
+        (<? (storage/delete store main-address))
+        (<? (storage/delete store index-address)))))
 
   (publishing-address [_ ledger-alias]
     ;; Just return the alias - lookup will handle branch extraction via local-filename
@@ -192,31 +182,26 @@
 
   nameservice/iNameService
   (lookup [_ target]
+    ;; Both ledgers and VGs use the same storage pattern (name:branch -> name/branch.json)
+    ;; The @type field in the record distinguishes ledgers from virtual graphs
     (go-try
-      (if (ledger-alias? target)
-        ;; Ledger: read both main file and index file in parallel, then merge
-        (let [main-filename  (local-filename target)
-              index-filename* (index-filename target)
-              _              (log/debug "StorageNameService lookup ledger:" {:ledger-address target
-                                                                             :main-filename  main-filename
-                                                                             :index-filename index-filename*})
-              ;; Start both reads in parallel
-              main-ch        (storage/read-bytes store main-filename)
-              index-ch       (storage/read-bytes store index-filename*)
-              ;; Await both results
-              main-bytes     (<? main-ch)
-              index-bytes    (<? index-ch)]
-          (when main-bytes
-            (let [main-record  (json/parse main-bytes false)
-                  index-record (when index-bytes (json/parse index-bytes false))]
-              ;; Merge index file data into main record (index file takes precedence if newer)
-              (merge-index-into-record main-record index-record))))
-        ;; Virtual graph: read the VG file
-        (let [filename (vg-filename target)
-              _        (log/debug "StorageNameService lookup VG:" {:vg-name target :filename filename})
-              bytes    (<? (storage/read-bytes store filename))]
-          (when bytes
-            (json/parse bytes false))))))
+      (let [main-filename   (local-filename target)
+            index-filename* (index-filename target)
+            _               (log/debug "StorageNameService lookup:" {:target target
+                                                                     :main-filename main-filename
+                                                                     :index-filename index-filename*})
+            ;; Start both reads in parallel
+            main-ch         (storage/read-bytes store main-filename)
+            index-ch        (storage/read-bytes store index-filename*)
+            ;; Await both results
+            main-bytes      (<? main-ch)
+            index-bytes     (<? index-ch)]
+        (when main-bytes
+          (let [main-record  (json/parse main-bytes false)
+                index-record (when index-bytes (json/parse index-bytes false))]
+            ;; Merge index file data into main record (index file takes precedence if newer)
+            ;; VGs won't have index files, but merge-index-into-record handles nil gracefully
+            (merge-index-into-record main-record index-record))))))
 
   (alias [_ ledger-address]
     ;; TODO: need to validate that the branch doesn't have a slash?

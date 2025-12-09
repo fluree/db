@@ -5,6 +5,7 @@
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.ledger :as util.ledger]
             [fluree.db.virtual-graph.nameservice-loader :as vg-loader]))
 
 (defmulti create-vg
@@ -50,13 +51,15 @@
                        :count (count ledgers)})))))
 
 (defn- prepare-bm25-config
-  "Prepares the BM25 configuration for publishing."
+  "Prepares the BM25 configuration for publishing.
+   VG names follow the same convention as ledgers - normalized with branch (default :main)."
   [{:keys [name config dependencies]}]
-  {:vg-name name
-   :vg-type "fidx:BM25"
-   :config config
-   :dependencies (or dependencies
-                     (mapv #(str % ":main") (get-in config [:ledgers] [])))})
+  (let [normalized-name (util.ledger/ensure-ledger-branch name)]
+    {:vg-name normalized-name
+     :vg-type "fidx:BM25"
+     :config config
+     :dependencies (or dependencies
+                       (mapv util.ledger/ensure-ledger-branch (get-in config [:ledgers] [])))}))
 
 (defn- load-and-validate-ledgers
   "Loads all ledgers and validates they exist. Returns loaded ledgers."

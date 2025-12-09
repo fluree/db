@@ -37,7 +37,7 @@
 
       (testing "virtual graph creation succeeds"
         (is (some? vg-obj) "Should return VG object")
-        (is (= "book-search" (:vg-name vg-obj)) "VG should have correct name"))
+        (is (= "book-search:main" (:vg-name vg-obj)) "VG should have correct name"))
 
       ;; Wait for initial indexing using sync method
       (<!! (vg/sync vg-obj nil))

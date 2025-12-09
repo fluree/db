@@ -40,7 +40,7 @@
           vg-name (:vg-name vg-obj)]
 
       (testing "virtual graph creation returns correct name"
-        (is (= "doc-search" vg-name)))
+        (is (= "doc-search:main" vg-name)))
 
       ;; Wait for initial indexing using sync method
       (<!! (vg/sync vg-obj nil))
