@@ -127,6 +127,5 @@
   against the ledger's 'reindex-min-bytes' setting."
   [{:keys [index-catalog commit] :as db} max-indexes]
   (let [index-address (-> commit :index :address)]
-    (log/info! ::collect-garbage-start {:ledger-alias (:alias db) :max-indexes max-indexes})
-    (clean-garbage* index-catalog index-address max-indexes)
-    (log/info! ::collect-garbage-complete {:ledger-alias (:alias db) :max-indexes max-indexes})))
+    (log/info! ::clean-garbage {:ledger-alias (:alias db) :max-indexes max-indexes})
+    (clean-garbage* index-catalog index-address max-indexes)))

@@ -10,23 +10,25 @@
     (let [conn (test-utils/create-conn)]
 
       (testing "rejects ledger names containing ':' character"
-        (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo
-             #"Ledger name cannot contain ':' character"
-             (fluree/create conn "invalid:name"))
+        (is (= "Ledger name cannot contain ':' character. Branches must be created separately. Provided: invalid:name"
+               (try
+                 (fluree/create conn "invalid:name")
+                 (catch Exception e
+                   (-> (test-utils/unwrap-error-signal e) ex-message))))
             "Should reject name with colon")
 
         (try
           (fluree/create conn "test:branch")
           (is false "Should have thrown exception")
           (catch clojure.lang.ExceptionInfo e
-            (is (= :db/invalid-ledger-name (-> e ex-data :error))
+            (is (= :db/invalid-ledger-name (-> (test-utils/unwrap-error-signal e) ex-data :error))
                 "Should return correct error code")))
 
-        (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo
-             #"Ledger name cannot contain ':' character"
-             (fluree/create conn "test:feature:v2"))
+        (is (= "Ledger name cannot contain ':' character. Branches must be created separately. Provided: test:feature:v2"
+               (try
+                 (fluree/create conn "test:feature:v2")
+                 (catch Exception e
+                   (-> (test-utils/unwrap-error-signal e) ex-message))))
             "Should reject name with multiple colons"))
 
       (testing "accepts valid ledger names"
@@ -88,22 +90,25 @@
     (let [conn (test-utils/create-conn)]
 
       (testing "empty colon cases"
-        (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo
-             #"Ledger name cannot contain ':' character"
-             (fluree/create conn ":"))
+        (is (= "Ledger name cannot contain ':' character. Branches must be created separately. Provided: :"
+               (try
+                 (fluree/create conn ":")
+                 (catch Exception e
+                   (-> (test-utils/unwrap-error-signal e) ex-message))))
             "Should reject single colon")
 
-        (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo
-             #"Ledger name cannot contain ':' character"
-             (fluree/create conn ":branch"))
+        (is (= "Ledger name cannot contain ':' character. Branches must be created separately. Provided: :branch"
+               (try
+                 (fluree/create conn ":branch")
+                 (catch Exception e
+                   (-> (test-utils/unwrap-error-signal e) ex-message))))
             "Should reject name starting with colon")
 
-        (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo
-             #"Ledger name cannot contain ':' character"
-             (fluree/create conn "ledger:"))
+        (is (= "Ledger name cannot contain ':' character. Branches must be created separately. Provided: ledger:"
+               (try
+                 (fluree/create conn "ledger:")
+                 (catch Exception e
+                   (-> (test-utils/unwrap-error-signal e) ex-message))))
             "Should reject name ending with colon"))
 
       (testing "special characters that ARE allowed"
@@ -133,8 +138,9 @@
           "Duplicate creation should fail")
 
       ;; Trying with explicit :main should be rejected by validation
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo
-           #"Ledger name cannot contain ':' character"
-           (fluree/create conn (str ledger-name ":main")))
+      (is (= "Ledger name cannot contain ':' character. Branches must be created separately. Provided: unique-test:main"
+             (try
+               (fluree/create conn (str ledger-name ":main"))
+               (catch Exception e
+                 (-> (test-utils/unwrap-error-signal e) ex-message))))
           "Should reject explicit :main branch in name"))))

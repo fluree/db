@@ -549,8 +549,8 @@
                            :start-time   (util/current-time-iso)}
             error-ch   (async/chan)
             refresh-ch (refresh-all db changes-ch error-ch)]
-        (log/info! ::index-start {:ledger-alias alias :novelty-size novelty-size :t t})
         (log/info "Refreshing Index:" init-stats)
+        (log/info! ::index-start init-stats)
         (async/alt!
           error-ch
           ([e]
@@ -558,7 +558,7 @@
 
           refresh-ch
           ([{:keys [garbage properties old-sketch-paths classes], refreshed-db :db, :as _status}]
-           (let [;; Add computed fields to properties for O(1) optimizer lookups
+           (let [ ;; Add computed fields to properties for O(1) optimizer lookups
                  properties-with-computed (add-computed-fields properties)
 
                  {:keys [index-catalog alias] :as refreshed-db*}
@@ -569,9 +569,9 @@
 
                  garbage-with-sketches (into garbage (or old-sketch-paths #{}))
 
-                ;; TODO - ideally issue garbage/root writes to RAFT together
-                ;;        as a tx, currently requires waiting for both
-                ;;        through raft sync
+                 ;; TODO - ideally issue garbage/root writes to RAFT together
+                 ;;        as a tx, currently requires waiting for both
+                 ;;        through raft sync
                  garbage-res   (when (seq garbage-with-sketches)
                                  (let [write-res (<? (index-storage/write-garbage index-catalog alias t garbage-with-sketches))]
                                    (<! (notify-new-index-file write-res :garbage t changes-ch))
@@ -605,7 +605,7 @@
                                       :garbage (:address garbage-res))]
              (log/info! ::index-complete {:ledger-alias alias :root index-address :garbage (:address garbage-res)})
              (log/info "Index refresh complete:" end-stats)
-            ;; kick off automatic garbage collection in the background
+             ;; kick off automatic garbage collection in the background
              (garbage/clean-garbage indexed-db max-old-indexes)
 
              indexed-db))))

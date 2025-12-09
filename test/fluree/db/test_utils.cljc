@@ -418,3 +418,8 @@
    (fn a-handler:memory-handler
      ([signal] (swap! store conj signal))
      ([] :closed))))
+
+(defn unwrap-error-signal
+  "Exceptions thrown inside of a trace! are wrapped to provide additional context."
+  [e]
+  (-> e ex-data :taoensso.telemere/signal :error))

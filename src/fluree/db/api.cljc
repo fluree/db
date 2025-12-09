@@ -63,24 +63,25 @@
   See documentation for configuration schema."
   [config]
   ;; TODO - do some validation
-  (log/info! ::connect {:config config})
-  (promise-wrap
-   (go-try
-     (let [system-map (-> config config/parse system/initialize)
-           conn       (reduce-kv (fn [x k v]
-                                   (if (isa? k :fluree.db/connection)
-                                     (reduced v)
-                                     x))
-                                 nil system-map)]
-       (assoc conn ::system-map system-map)))))
+  (log/info! ::connect {:config config}
+    (promise-wrap
+     (go-try
+       (let [system-map (-> config config/parse system/initialize)
+             conn (reduce-kv (fn [x k v]
+                               (if (isa? k :fluree.db/connection)
+                                 (reduced v)
+                                 x))
+                             nil system-map)]
+         (assoc conn ::system-map system-map))))))
 
 (defn disconnect
   "Terminates a connection and releases associated resources.
   Returns a promise that resolves when disconnection is complete."
   [conn]
-  (promise-wrap
-   (go-try
-     (-> conn ::system-map system/terminate))))
+  (log/info! ::disconnect {:id (:id conn)}
+    (promise-wrap
+     (go-try
+       (-> conn ::system-map system/terminate)))))
 
 (defn convert-config-key
   [[k v]]
@@ -249,14 +250,14 @@
       :indexing - Indexing configuration"
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
-   (log/info! ::create {:ledger-alias ledger-alias :opts opts})
-   (validate-connection conn)
-   (util.ledger/validate-ledger-name ledger-alias)
-   (promise-wrap
-    (go-try
-      (log/info "Creating ledger" ledger-alias)
-      (let [ledger (<? (connection/create-ledger conn ledger-alias opts))]
-        (ledger/current-db ledger))))))
+   (log/info! ::create {:ledger-alias ledger-alias :opts opts}
+     (validate-connection conn)
+     (util.ledger/validate-ledger-name ledger-alias)
+     (promise-wrap
+      (go-try
+        (log/info "Creating ledger" ledger-alias)
+        (let [ledger (<? (connection/create-ledger conn ledger-alias opts))]
+          (ledger/current-db ledger)))))))
 
 (defn alias->address
   "Resolves a ledger alias to its address.
@@ -270,33 +271,34 @@
   "Loads an existing ledger by alias or address.
   Returns a promise that resolves to the latest database."
   [conn alias-or-address]
-  (log/info! ::load {:ledger-alias alias-or-address})
-  (validate-connection conn)
-  (promise-wrap
-   (go-try
-     (let [ledger (<? (connection/load-ledger conn alias-or-address))]
-       (ledger/current-db ledger)))))
+  (log/info! ::load {:ledger-alias alias-or-address}
+    (validate-connection conn)
+    (promise-wrap
+     (go-try
+       (let [ledger (<? (connection/load-ledger conn alias-or-address))]
+         (ledger/current-db ledger))))))
 
 (defn drop
   "Deletes a ledger and its associated data.
   Returns a promise that resolves when deletion is complete."
   [conn ledger-alias]
-  (log/info! ::drop {:ledger-alias ledger-alias})
-  (promise-wrap
-   (connection/drop-ledger conn ledger-alias)))
+  (log/info! ::drop {:ledger-alias ledger-alias}
+    (promise-wrap
+     (connection/drop-ledger conn ledger-alias))))
 
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
   otherwise."
   [conn ledger-alias-or-address]
-  (validate-connection conn)
-  (promise-wrap
-   (go-try
-     (let [address (if (address? ledger-alias-or-address)
-                     ledger-alias-or-address
-                     (<? (alias->address conn ledger-alias-or-address)))]
-       (log/debug "exists? - ledger address:" address)
-       (<? (connection/ledger-exists? conn address))))))
+  (log/info! ::exists? {:ledger-alias ledger-alias-or-address}
+    (validate-connection conn)
+    (promise-wrap
+     (go-try
+       (let [address (if (address? ledger-alias-or-address)
+                       ledger-alias-or-address
+                       (<? (alias->address conn ledger-alias-or-address)))]
+         (log/debug "exists? - ledger address:" address)
+         (<? (connection/ledger-exists? conn address)))))))
 
 (defn notify
   "Notifies the connection of a new commit for maintaining current db state.
@@ -309,9 +311,10 @@
   Updates in-memory ledger if commit is next in sequence.
   Returns promise resolving when notification is processed."
   [conn commit-address]
-  (validate-connection conn)
-  (promise-wrap
-   (connection/notify conn commit-address)))
+  (log/info! ::notify {:commit-address commit-address}
+    (validate-connection conn)
+    (promise-wrap
+     (connection/notify conn commit-address))))
 
 (defn insert
   "Stages insertion of new entities into a database.
@@ -329,9 +332,9 @@
   Returns promise resolving to updated database."
   ([db rdf] (insert db rdf nil))
   ([db rdf opts]
-   (log/info! ::insert {:opts opts})
-   (promise-wrap
-    (transact-api/insert db rdf opts))))
+   (log/info! ::insert {:opts opts}
+     (promise-wrap
+      (transact-api/insert db rdf opts)))))
 
 (defn upsert
   "Stages insertion or update of entities.
@@ -348,9 +351,9 @@
   Returns promise resolving to updated database."
   ([db rdf] (upsert db rdf nil))
   ([db rdf opts]
-   (log/info! ::upsert {:opts opts})
-   (promise-wrap
-    (transact-api/upsert db rdf opts))))
+   (log/info! ::upsert {:opts opts}
+     (promise-wrap
+      (transact-api/upsert db rdf opts)))))
 
 (defn update
   "Stages updates to a database without committing.
@@ -365,9 +368,9 @@
   Returns promise resolving to updated database."
   ([db json-ld] (update db json-ld nil))
   ([db json-ld opts]
-   (log/info! ::update {:opts opts})
-   (promise-wrap
-    (transact-api/update db json-ld opts))))
+   (log/info! ::update {:opts opts}
+     (promise-wrap
+      (transact-api/update db json-ld opts)))))
 
 ;; TODO - deprecate `stage` in favor of `update` eventually
 (defn ^:deprecated stage
@@ -403,15 +406,15 @@
   ([conn db]
    (commit! conn db {}))
   ([conn db opts]
-   (log/info! ::commit {:opts opts})
-   (validate-connection conn)
-   (promise-wrap
-    (go-try
-      (let [alias (:alias db)
-            ;; For newly created ledgers, we need to commit through the alias
-            ;; not the full ledger-id, as the branch info may not be in nameservice yet
-            ledger (<? (connection/load-ledger conn alias))]
-        (<? (ledger/commit! ledger db opts)))))))
+   (log/info! ::commit! {:opts opts}
+     (validate-connection conn)
+     (promise-wrap
+      (go-try
+        (let [alias (:alias db)
+               ;; For newly created ledgers, we need to commit through the alias
+               ;; not the full ledger-id, as the branch info may not be in nameservice yet
+              ledger (<? (connection/load-ledger conn alias))]
+          (<? (ledger/commit! ledger db opts))))))))
 
 (defn ^:deprecated transact!
   "Deprecated: Use `update!` instead.
@@ -419,10 +422,10 @@
   Updates a ledger and commits the changes in one operation."
   ([conn txn] (transact! conn txn nil))
   ([conn txn opts]
-   (log/info! ::transact {:opts opts})
-   (validate-connection conn)
-   (promise-wrap
-    (transact-api/update! conn txn opts))))
+   (log/info! ::transact! {:opts opts}
+     (validate-connection conn)
+     (promise-wrap
+      (transact-api/update! conn txn opts)))))
 
 (defn update!
   "Stages updates to a database and commits in one atomic operation.
@@ -438,10 +441,10 @@
   Returns promise resolving to committed database."
   ;; New preferred arity matching insert!/upsert!
   ([conn ledger-id txn opts]
-   (log/info! ::update {:opts opts})
-   (validate-connection conn)
-   (promise-wrap
-    (transact-api/update! conn ledger-id txn opts)))
+   (log/info! ::update! {:opts opts}
+     (validate-connection conn)
+     (promise-wrap
+      (transact-api/update! conn ledger-id txn opts))))
   ;; 3-arity dispatcher to support both new and legacy usage without arity conflicts
   ([conn a b]
    (validate-connection conn)
@@ -473,10 +476,10 @@
   Returns promise resolving to committed database."
   ([conn ledger-id txn] (upsert! conn ledger-id txn nil))
   ([conn ledger-id txn opts]
-   (log/info! ::upsert {:ledger-alias ledger-id :opts opts})
-   (validate-connection conn)
-   (promise-wrap
-    (transact-api/upsert! conn ledger-id txn opts))))
+   (log/info! ::upsert! {:ledger-alias ledger-id :opts opts}
+     (validate-connection conn)
+     (promise-wrap
+      (transact-api/upsert! conn ledger-id txn opts)))))
 
 (defn insert!
   "Stages insertion of new entities and commits in one atomic operation.
@@ -495,10 +498,10 @@
   Returns promise resolving to committed database."
   ([conn ledger-id txn] (insert! conn ledger-id txn nil))
   ([conn ledger-id txn opts]
-   (log/info! ::insert {:ledger-alias ledger-id :opts opts})
-   (validate-connection conn)
-   (promise-wrap
-    (transact-api/insert! conn ledger-id txn opts))))
+   (log/info! ::insert! {:ledger-alias ledger-id :opts opts}
+     (validate-connection conn)
+     (promise-wrap
+      (transact-api/insert! conn ledger-id txn opts)))))
 
 (defn credential-update!
   "Stages updates to a database and commits using a verifiable credential.
@@ -516,10 +519,10 @@
   Returns promise resolving to committed database."
   ([conn credential] (credential-update! conn credential nil))
   ([conn credential opts]
-   (log/info! ::credential {:opts opts})
-   (validate-connection conn)
-   (promise-wrap
-    (transact-api/credential-transact! conn credential opts))))
+   (log/info! ::credential-update! {:opts opts}
+     (validate-connection conn)
+     (promise-wrap
+      (transact-api/credential-transact! conn credential opts)))))
 
 (defn ^:deprecated credential-transact!
   "Deprecated: Use `credential-update!` instead.
@@ -543,10 +546,10 @@
    (validate-connection conn)
    (create-with-txn conn txn nil))
   ([conn txn opts]
-   (log/info! ::create {:opts opts})
-   (validate-connection conn)
-   (promise-wrap
-    (transact-api/create-with-txn conn txn opts))))
+   (log/info! ::create-with-txn {:opts opts}
+     (validate-connection conn)
+     (promise-wrap
+      (transact-api/create-with-txn conn txn opts)))))
 
 (defn status
   "Returns current status of a ledger.
@@ -557,11 +560,12 @@
 
   Returns status map with commit and index information."
   [conn ledger-id]
-  (validate-connection conn)
-  (promise-wrap
-   (go-try
-     (let [ledger (<? (connection/load-ledger conn ledger-id))]
-       (ledger/status ledger)))))
+  (log/info! ::status {:ledger-alias ledger-id}
+    (validate-connection conn)
+    (promise-wrap
+     (go-try
+       (let [ledger (<? (connection/load-ledger conn ledger-id))]
+         (ledger/status ledger))))))
 
 (defn ledger-info
   "Returns comprehensive ledger information including detailed statistics.
@@ -604,14 +608,15 @@
   the context prefixes (e.g., \"http://example.org/name\" -> \"ex:name\")."
   ([conn ledger-id] (ledger-info conn ledger-id nil))
   ([conn ledger-id context]
-   (validate-connection conn)
-   (promise-wrap
-    (go-try
-      (let [ledger     (<? (connection/load-ledger conn ledger-id))
-            info       (<? (ledger/ledger-info ledger))
-            compact-fn (when context
-                         (json-ld/compact-fn (json-ld/parse-context context)))]
-        (decode/ledger-info info compact-fn))))))
+   (log/info! ::ledger-info {:ledger-alias ledger-id}
+     (validate-connection conn)
+     (promise-wrap
+      (go-try
+        (let [ledger     (<? (connection/load-ledger conn ledger-id))
+              info       (<? (ledger/ledger-info ledger))
+              compact-fn (when context
+                           (json-ld/compact-fn (json-ld/parse-context context)))]
+          (decode/ledger-info info compact-fn)))))))
 
 ;; db operations
 
@@ -721,10 +726,10 @@
   ([ds q]
    (query ds q {}))
   ([ds q opts]
-   (log/info! ::query {:query q :opts opts})
-   (if (util/exception? ds)
-     (throw ds)
-     (promise-wrap (query-api/query ds q opts)))))
+   (log/info! ::query {:query q :opts opts}
+     (if (util/exception? ds)
+       (throw ds)
+       (promise-wrap (query-api/query ds q opts))))))
 
 (defn explain
   "Returns a query execution plan without executing the query.
@@ -785,15 +790,15 @@
   Returns promise resolving to query results."
   ([ds cred-query] (credential-query ds cred-query {}))
   ([ds cred-query {:keys [values-map format] :as opts}]
-   (log/info! ::credential {:credential-query cred-query :opts opts})
-   (promise-wrap
-    (go-try
-      (let [{query :subject, identity :did} (if (= :sparql format)
-                                              (cred/verify-jws cred-query)
-                                              (<? (cred/verify cred-query)))]
-        (log/debug "Credential query with identity: " identity " and query: " query)
-        (let [policy-db (<? (policy/wrap-identity-policy ds nil identity values-map))]
-          (<? (query-api/query policy-db query opts))))))))
+   (log/info! ::credential {:credential-query cred-query :opts opts}
+     (promise-wrap
+      (go-try
+        (let [{query :subject, identity :did} (if (= :sparql format)
+                                                (cred/verify-jws cred-query)
+                                                (<? (cred/verify cred-query)))]
+          (log/debug "Credential query with identity: " identity " and query: " query)
+          (let [policy-db (<? (policy/wrap-identity-policy ds nil identity values-map))]
+            (<? (query-api/query policy-db query opts)))))))))
 
 (defn query-connection
   "Executes a query using the connection's query engine.
@@ -822,15 +827,15 @@
   Returns promise resolving to query results."
   ([conn cred-query] (credential-query-connection conn cred-query {}))
   ([conn cred-query {:keys [format] :as opts}]
-   (log/info! ::credential {:credential-query cred-query :opts opts})
-   (validate-connection conn)
-   (promise-wrap
-    (go-try
-      (let [{query :subject, identity :did} (if (= :sparql format)
-                                              (cred/verify-jws cred-query)
-                                              (<? (cred/verify cred-query)))]
-        (log/debug "Credential query connection with identity: " identity " and query: " query)
-        @(query-connection conn query (assoc opts :identity identity)))))))
+   (log/info! ::credential-query-connection {:credential-query cred-query :opts opts}
+     (validate-connection conn)
+     (promise-wrap
+      (go-try
+        (let [{query :subject, identity :did} (if (= :sparql format)
+                                                (cred/verify-jws cred-query)
+                                                (<? (cred/verify cred-query)))]
+          (log/debug "Credential query connection with identity: " identity " and query: " query)
+          @(query-connection conn query (assoc opts :identity identity))))))))
 
 (defn query-nameservice
   "Executes a query against all nameservice records.
@@ -847,15 +852,15 @@
   Returns promise resolving to query results."
   ([conn query] (query-nameservice conn query {}))
   ([conn query opts]
-   (log/info! ::query {:query query :opts opts})
-   (validate-connection conn)
-   (promise-wrap
-    (go-try
-      ;; Get the nameservice from the connection's primary publisher
-      (if-some [primary-publisher (:primary-publisher conn)]
-        (<? (ns-query/query-nameservice primary-publisher query opts))
-        (throw (ex-info "No nameservice available for querying"
-                        {:status 400 :error :db/no-nameservice})))))))
+   (log/info! ::query {:query query :opts opts}
+     (validate-connection conn)
+     (promise-wrap
+      (go-try
+         ;; Get the nameservice from the connection's primary publisher
+        (if-some [primary-publisher (:primary-publisher conn)]
+          (<? (ns-query/query-nameservice primary-publisher query opts))
+          (throw (ex-info "No nameservice available for querying"
+                          {:status 400 :error :db/no-nameservice}))))))))
 
 (defn history
   "Queries the history of entities across commits.
@@ -873,12 +878,12 @@
   ([conn ledger-id query]
    (history conn ledger-id query nil))
   ([conn ledger-id query override-opts]
-   (log/info! ::history {:ledger-alias ledger-id :query query :opts override-opts})
-   (validate-connection conn)
-   (promise-wrap
-    (go-try
-      (let [ledger (<? (connection/load-ledger conn ledger-id))]
-        (<? (query-api/history ledger query override-opts)))))))
+   (log/info! ::history {:ledger-alias ledger-id :query query :opts override-opts}
+     (validate-connection conn)
+     (promise-wrap
+      (go-try
+        (let [ledger (<? (connection/load-ledger conn ledger-id))]
+          (<? (query-api/history ledger query override-opts))))))))
 
 (defn credential-history
   "Executes a history query using a verifiable credential.
@@ -894,13 +899,13 @@
   ([conn ledger-id cred-query]
    (credential-history conn ledger-id cred-query {}))
   ([conn ledger-id cred-query override-opts]
-   (log/info! ::credential-history {:ledger-alias ledger-id :credential-query cred-query :opts override-opts})
-   (validate-connection conn)
-   (promise-wrap
-    (go-try
-      (let [ledger (<? (connection/load-ledger conn ledger-id))
-            {query :subject, identity :did} (<? (cred/verify cred-query))]
-        (<? (query-api/history ledger query (assoc override-opts :identity identity))))))))
+   (log/info! ::credential-history {:ledger-alias ledger-id :credential-query cred-query :opts override-opts}
+     (validate-connection conn)
+     (promise-wrap
+      (go-try
+        (let [ledger (<? (connection/load-ledger conn ledger-id))
+              {query :subject, identity :did} (<? (cred/verify cred-query))]
+          (<? (query-api/history ledger query (assoc override-opts :identity identity)))))))))
 
 (defn range
   "Performs a range scan on a database index.
@@ -990,9 +995,9 @@
   ([db methods] (reason db methods nil nil))
   ([db methods rule-sources] (reason db methods rule-sources nil))
   ([db methods rule-sources opts]
-   (log/info! ::reason {:methods methods :rule-sources rule-sources :opts opts})
-   (promise-wrap
-    (reasoner/reason db methods rule-sources opts))))
+   (log/info! ::reason {:methods methods :rule-sources rule-sources :opts opts}
+     (promise-wrap
+      (reasoner/reason db methods rule-sources opts)))))
 
 (defn reasoned-count
   "Returns the number of facts inferred by reasoning.
@@ -1044,7 +1049,7 @@
   ([conn ledger-alias]
    (trigger-index conn ledger-alias nil))
   ([conn ledger-alias opts]
-   (log/info! ::trigger {:ledger-alias ledger-alias :opts opts})
-   (validate-connection conn)
-   (promise-wrap
-    (connection/trigger-ledger-index conn ledger-alias opts))))
+   (log/info! ::trigger {:ledger-alias ledger-alias :opts opts}
+     (validate-connection conn)
+     (promise-wrap
+      (connection/trigger-ledger-index conn ledger-alias opts)))))

@@ -138,8 +138,10 @@
 
 #?(:clj
    (defmacro info!
-     [id data]
-     `(tel/log! {:level :info :id ~id :data ~data})))
+     [id data & forms]
+     `(tel/trace!  {:level :info :id ~id :data ~data}
+                   (do
+                     ~@forms))))
 
 #?(:clj
    (defmacro debug!

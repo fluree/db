@@ -4,4 +4,5 @@
  :extra-indents
  {go-try [[:block 0]]
   try*   [[:block 0]]
-  catch* [[:block 1]]}}
+  catch* [[:block 1]]
+  info!  [[:block 2]]}}
