@@ -321,6 +321,176 @@
     {:column column :op :eq :value literal-val}))
 
 ;;; ---------------------------------------------------------------------------
+;;; FILTER Pushdown Analysis (for Optimizable protocol)
+;;; ---------------------------------------------------------------------------
+
+(def ^:private pushable-ops
+  "Comparison operators that can be pushed down to Iceberg.
+   Maps from parsed form symbols to Iceberg predicate ops."
+  {'> :gt
+   '>= :gte
+   '< :lt
+   '<= :lte
+   '= :eq
+   'equal :eq
+   'not= :ne
+   'not-equal :ne
+   'in :in
+   'nil? :is-null
+   'bound :not-null})
+
+(defn- extract-comparison
+  "Extract comparison details from a parsed filter form.
+   Returns {:op :var :value} or nil if not a simple pushable comparison.
+
+   Handles forms like:
+     (> ?x 100)     -> {:op :gt, :var ?x, :value 100}
+     (= ?x \"foo\") -> {:op :eq, :var ?x, :value \"foo\"}
+     (in ?x [1 2])  -> {:op :in, :var ?x, :value [1 2]}
+     (nil? ?x)      -> {:op :is-null, :var ?x, :value nil}
+     (bound ?x)     -> {:op :not-null, :var ?x, :value nil}"
+  [form]
+  (when (sequential? form)
+    (let [[op-sym & args] form
+          iceberg-op (get pushable-ops op-sym)]
+      (when iceberg-op
+        (cond
+          ;; Unary: (nil? ?x) or (bound ?x)
+          (#{:is-null :not-null} iceberg-op)
+          (let [[arg] args]
+            (when (where/variable? arg)
+              {:op iceberg-op :var arg :value nil}))
+
+          ;; IN: (in ?x [values...])
+          (= :in iceberg-op)
+          (let [[arg values] args]
+            (when (and (where/variable? arg) (vector? values))
+              {:op iceberg-op :var arg :value values}))
+
+          ;; Binary comparison: (> ?x 100) or (> 100 ?x)
+          :else
+          (let [[arg1 arg2] args
+                var1? (where/variable? arg1)
+                var2? (where/variable? arg2)]
+            (cond
+              ;; (?x op literal) - normal order
+              (and var1? (not var2?))
+              {:op iceberg-op :var arg1 :value arg2}
+
+              ;; (literal op ?x) - reversed, flip comparison
+              (and var2? (not var1?))
+              (let [flipped-op (case iceberg-op
+                                 :gt :lt
+                                 :gte :lte
+                                 :lt :gt
+                                 :lte :gte
+                                 iceberg-op)] ; eq, ne don't need flipping
+                {:op flipped-op :var arg2 :value arg1})
+
+              ;; Both vars or both literals - not pushable
+              :else nil)))))))
+
+(defn- analyze-filter-pattern
+  "Analyze a :filter pattern for pushability.
+   Returns {:pushable? true :comparisons [...]} or {:pushable? false}."
+  [pattern]
+  (let [filter-fn (second pattern)
+        {:keys [forms vars]} (meta filter-fn)]
+    (if (and (= 1 (count vars))  ; Single variable only
+             (seq forms))
+      (let [comparisons (keep extract-comparison forms)]
+        (if (= (count comparisons) (count forms))
+          ;; All forms are pushable comparisons
+          {:pushable? true
+           :comparisons comparisons
+           :vars vars
+           :pattern pattern}
+          ;; Some forms not pushable - keep whole filter
+          {:pushable? false :pattern pattern}))
+      ;; Multi-var or no forms - not pushable
+      {:pushable? false :pattern pattern})))
+
+(defn- find-first-binding-pattern
+  "Find the index of the first pattern that binds the given variable.
+   Skips :optional and :union patterns (don't inline into those)."
+  [patterns var]
+  (first
+   (keep-indexed
+    (fn [idx pattern]
+      (let [pattern-type (first pattern)]
+        (when (and (not (#{:optional :union :filter :bind} pattern-type))
+                   (let [pattern-data (second pattern)
+                         ;; Check if this pattern references the variable
+                         pattern-vars (cond
+                                        ;; Triple pattern [s p o]
+                                        (vector? pattern-data)
+                                        (keep #(when (where/variable? %) %) pattern-data)
+
+                                        ;; Class pattern [:class [s p o]]
+                                        (and (= :class pattern-type)
+                                             (vector? pattern-data))
+                                        (keep #(when (where/variable? %) %) pattern-data)
+
+                                        :else nil)]
+                     (some #{var} pattern-vars)))
+          idx)))
+    patterns)))
+
+(defn- var->predicate-iri
+  "Find the predicate IRI that binds a variable in the given patterns."
+  [patterns var mappings]
+  (some
+   (fn [pattern]
+     (let [pattern-type (first pattern)
+           pattern-data (second pattern)]
+       (when (or (vector? pattern-data)
+                 (= :class pattern-type))
+         (let [triple (if (= :class pattern-type)
+                        pattern-data
+                        pattern-data)
+               [_s p o] triple]
+           (when (and (map? p) (::where/iri p)
+                      (or (= var o)
+                          (and (map? o) (= var (::where/var o)))))
+             (::where/iri p))))))
+   patterns))
+
+(defn- annotate-patterns-with-pushdown
+  "Attach :pushdown-filters metadata to patterns that first bind pushed-down vars.
+   Returns updated patterns vector.
+
+   Uses routing-indexes to find the correct mapping for each predicate,
+   ensuring filters are only pushed down to the table that owns that predicate."
+  [patterns pushable-analyses mappings routing-indexes]
+  (let [pred->mapping (:predicate->mapping routing-indexes)]
+    (reduce
+     (fn [patterns {:keys [comparisons vars]}]
+       (let [var (first vars)
+             binding-idx (find-first-binding-pattern patterns var)]
+         (if binding-idx
+           ;; Find the predicate IRI that binds this var
+           (let [pred-iri (var->predicate-iri patterns var mappings)
+                 ;; Use routing to find the correct mapping for this predicate
+                 routed-mapping (get pred->mapping pred-iri)
+                 ;; Only look up column from the routed mapping
+                 column (when routed-mapping
+                          (when-let [obj-map (get-in routed-mapping [:predicates pred-iri])]
+                            (when (= :column (:type obj-map))
+                              (:value obj-map))))]
+             (if column
+               ;; Annotate the pattern with pushdown filters
+               (let [pushdown-filters (mapv #(assoc % :column column) comparisons)]
+                 (update patterns binding-idx
+                         (fn [pattern]
+                           (vary-meta pattern update ::pushdown-filters
+                                      (fnil into []) pushdown-filters))))
+               ;; No routed mapping or column found - skip pushdown
+               patterns))
+           patterns)))
+     (vec patterns)
+     pushable-analyses)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Result Transformation
 ;;; ---------------------------------------------------------------------------
 
@@ -381,6 +551,15 @@
 ;;; Query Execution
 ;;; ---------------------------------------------------------------------------
 
+(defn- extract-pushdown-filters
+  "Extract pushed-down filters from pattern metadata.
+   These were attached by the Optimizable -reorder pass."
+  [patterns]
+  (->> patterns
+       (mapcat #(::pushdown-filters (meta %)))
+       (remove nil?)
+       vec))
+
 (defn- execute-iceberg-query
   "Execute query against Iceberg source with predicate pushdown.
 
@@ -405,18 +584,26 @@
                      distinct
                      vec)
 
-        ;; Build predicates for pushdown
-        predicates (vec (literal-filters->predicates pred->literal mapping))
+        ;; Build predicates for pushdown from triple patterns (equality)
+        literal-predicates (vec (literal-filters->predicates pred->literal mapping))
+
+        ;; Extract pushed-down FILTER predicates from pattern metadata
+        pushed-predicates (extract-pushdown-filters patterns)
+
+        ;; Combine all predicates
+        all-predicates (into literal-predicates pushed-predicates)
 
         _ (log/debug "Iceberg query:" {:table table-name
                                        :columns columns
-                                       :predicates predicates
+                                       :literal-predicates (count literal-predicates)
+                                       :pushed-predicates (count pushed-predicates)
+                                       :total-predicates (count all-predicates)
                                        :time-travel time-travel})
 
         ;; Execute scan with time-travel options
         rows (tabular/scan-rows source table-name
                                 (cond-> {:columns (when (seq columns) columns)
-                                         :predicates (when (seq predicates) predicates)}
+                                         :predicates (when (seq all-predicates) all-predicates)}
                                   (:snapshot-id time-travel)
                                   (assoc :snapshot-id (:snapshot-id time-travel))
 
@@ -527,12 +714,52 @@
 
   optimize/Optimizable
   (-reorder [_ parsed-query]
-    (go parsed-query))
+    (go
+      (let [where-patterns (:where parsed-query)]
+        (if (seq where-patterns)
+          ;; Separate filters from other patterns
+          (let [{filters true, non-filters false}
+                (group-by #(= :filter (first %)) where-patterns)
+
+                ;; Analyze each filter for pushability
+                analyzed (map analyze-filter-pattern filters)
+                {pushable true, not-pushable false}
+                (group-by :pushable? analyzed)
+
+                ;; Annotate patterns with pushdown metadata
+                annotated-patterns (if (seq pushable)
+                                     (annotate-patterns-with-pushdown
+                                      non-filters pushable mappings routing-indexes)
+                                     (vec non-filters))
+
+                ;; Reconstruct where: annotated patterns + ALL original filters
+                ;; (keep filters as post-filter safety net)
+                new-where (into annotated-patterns filters)]
+
+            (log/debug "Iceberg filter pushdown:"
+                       {:total-filters (count filters)
+                        :pushable (count pushable)
+                        :patterns-annotated (count (filter #(::pushdown-filters (meta %))
+                                                           annotated-patterns))})
+
+            (assoc parsed-query :where new-where))
+          parsed-query))))
+
   (-explain [_ parsed-query]
-    (go {:original parsed-query
+    (go
+      (let [where-patterns (:where parsed-query)
+            {filters true, _non-filters false}
+            (group-by #(= :filter (first %)) where-patterns)
+            analyzed (map analyze-filter-pattern filters)
+            {pushable true, _not-pushable false}
+            (group-by :pushable? analyzed)]
+        {:original parsed-query
          :optimized parsed-query
          :segments []
-         :changed? false})))
+         :changed? (boolean (seq pushable))
+         :iceberg-pushdown {:total-filters (count filters)
+                            :pushable-filters (count pushable)
+                            :pushed-ops (mapv #(-> % :comparisons first :op) pushable)}}))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Factory
