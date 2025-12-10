@@ -2,7 +2,8 @@
   (:require #?@(:clj  [[clojure.core.async :as async]
                        [clojure.tools.logging.readable :as log] ; readable variants use pr-str automatically
                        [fluree.db.util :refer [if-cljs]]
-                       [taoensso.telemere :as tel]]
+                       [taoensso.telemere :as tel]
+                       [taoensso.telemere.tools-logging :as tel-log]]
                 :cljs [[goog.log :as glog]]))
   #?(:cljs (:require-macros [fluree.db.util.log :refer
                              [debug->val debug->>val debug-async->vals
@@ -11,6 +12,8 @@
                     [goog.log Level])))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+#?(:clj (tel-log/tools-logging->telemere!))
 
 #?(:cljs
    (def levels {:severe  Level.SEVERE
