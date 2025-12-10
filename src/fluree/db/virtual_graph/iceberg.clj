@@ -566,52 +566,63 @@
    time-travel can be:
    - nil (latest snapshot)
    - {:snapshot-id Long} (specific Iceberg snapshot)
-   - {:as-of-time Instant} (time-travel to specific time)"
-  [source mapping patterns base-solution time-travel]
-  (let [table-name (:table mapping)
-        pred->var (extract-predicate-bindings patterns)
-        pred->literal (extract-literal-filters patterns)
-        subject-var (some extract-subject-variable patterns)
+   - {:as-of-time Instant} (time-travel to specific time)
 
-        ;; Build columns to select
-        columns (->> pred->var
-                     keys
-                     (keep (fn [pred-iri]
-                             (let [om (get-in mapping [:predicates pred-iri])]
-                               (when (= :column (:type om))
-                                 (:value om)))))
-                     (concat (extract-template-cols (:subject-template mapping)))
-                     distinct
-                     vec)
+   limit is an optional hint to limit the number of rows scanned.
+   Returns a lazy seq of solutions - limit is enforced at the scan level
+   for early termination."
+  ([source mapping patterns base-solution time-travel]
+   (execute-iceberg-query source mapping patterns base-solution time-travel nil))
+  ([source mapping patterns base-solution time-travel limit]
+   (let [table-name (:table mapping)
+         pred->var (extract-predicate-bindings patterns)
+         pred->literal (extract-literal-filters patterns)
+         subject-var (some extract-subject-variable patterns)
 
-        ;; Build predicates for pushdown from triple patterns (equality)
-        literal-predicates (vec (literal-filters->predicates pred->literal mapping))
+         ;; Build columns to select
+         columns (->> pred->var
+                      keys
+                      (keep (fn [pred-iri]
+                              (let [om (get-in mapping [:predicates pred-iri])]
+                                (when (= :column (:type om))
+                                  (:value om)))))
+                      (concat (extract-template-cols (:subject-template mapping)))
+                      distinct
+                      vec)
 
-        ;; Extract pushed-down FILTER predicates from pattern metadata
-        pushed-predicates (extract-pushdown-filters patterns)
+         ;; Build predicates for pushdown from triple patterns (equality)
+         literal-predicates (vec (literal-filters->predicates pred->literal mapping))
 
-        ;; Combine all predicates
-        all-predicates (into literal-predicates pushed-predicates)
+         ;; Extract pushed-down FILTER predicates from pattern metadata
+         pushed-predicates (extract-pushdown-filters patterns)
 
-        _ (log/debug "Iceberg query:" {:table table-name
-                                       :columns columns
-                                       :literal-predicates (count literal-predicates)
-                                       :pushed-predicates (count pushed-predicates)
-                                       :total-predicates (count all-predicates)
-                                       :time-travel time-travel})
+         ;; Combine all predicates
+         all-predicates (into literal-predicates pushed-predicates)
 
-        ;; Execute scan with time-travel options
-        rows (tabular/scan-rows source table-name
-                                (cond-> {:columns (when (seq columns) columns)
-                                         :predicates (when (seq all-predicates) all-predicates)}
-                                  (:snapshot-id time-travel)
-                                  (assoc :snapshot-id (:snapshot-id time-travel))
+         _ (log/debug "Iceberg query:" {:table table-name
+                                        :columns columns
+                                        :literal-predicates (count literal-predicates)
+                                        :pushed-predicates (count pushed-predicates)
+                                        :total-predicates (count all-predicates)
+                                        :time-travel time-travel
+                                        :limit limit})
 
-                                  (:as-of-time time-travel)
-                                  (assoc :as-of-time (:as-of-time time-travel))))]
+         ;; Execute scan with time-travel and limit options
+         ;; Returns a lazy seq - limit is enforced at iterator level for early termination
+         rows (tabular/scan-rows source table-name
+                                 (cond-> {:columns (when (seq columns) columns)
+                                          :predicates (when (seq all-predicates) all-predicates)}
+                                   (:snapshot-id time-travel)
+                                   (assoc :snapshot-id (:snapshot-id time-travel))
 
-    ;; Transform to solutions
-    (map #(row->solution % mapping pred->var subject-var base-solution) rows)))
+                                   (:as-of-time time-travel)
+                                   (assoc :as-of-time (:as-of-time time-travel))
+
+                                   limit
+                                   (assoc :limit limit)))]
+
+     ;; Transform to solutions - this is also lazy
+     (map #(row->solution % mapping pred->var subject-var base-solution) rows))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; IcebergDatabase Record (Multi-Table Support)

@@ -110,6 +110,66 @@
             [name value]))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Lazy Scan Iteration
+;;; ---------------------------------------------------------------------------
+
+(defn- closeable-lazy-seq
+  "Create a lazy seq from a CloseableIterable that closes when exhausted or limit reached.
+
+   This enables early termination: if the consumer stops iterating (e.g., via take/limit),
+   the scan won't continue reading. The closeable is closed when:
+   - The seq is fully consumed
+   - A limit is reached
+   - An exception occurs during iteration
+
+   IMPORTANT - Resource Management:
+   If iteration stops before exhaustion without hitting limit (e.g., consumer abandons
+   the seq via (take n ...) where n < limit), the scan remains open until GC finalizes
+   the iterator. This is a known limitation of lazy seqs with external resources.
+
+   For strict resource management, callers should either:
+   1. Fully consume the seq (via doall, reduce, count, etc.)
+   2. Pass a limit that will be reached
+   3. Use reducers/transducers for streaming with guaranteed cleanup
+
+   Thread Safety: Assumes single-threaded consumption. Do not share across threads.
+
+   Limit Semantics: The limit parameter is per-scan. In multi-table joins, do NOT pass
+   per-scan limits as they may drop needed rows for the join. Keep global limit
+   enforcement at the join layer and treat per-scan limits as hints only."
+  [^CloseableIterable closeable ^Schema schema limit]
+  (let [iter (.iterator closeable)
+        remaining (atom (or limit Long/MAX_VALUE))
+        closed? (atom false)
+        close-scan! (fn []
+                      (when (compare-and-set! closed? false true)
+                        (try (.close closeable)
+                             (catch Exception e
+                               (log/debug "Error closing scan:" (.getMessage e))))))]
+    (letfn [(lazy-iter []
+              (lazy-seq
+                (cond
+                  ;; Limit reached - close and stop
+                  (<= @remaining 0)
+                  (do (close-scan!) nil)
+
+                  ;; More rows available
+                  (.hasNext iter)
+                  (try
+                    (let [record (.next iter)
+                          row-map (generic-record->map record schema)]
+                      (swap! remaining dec)
+                      (cons row-map (lazy-iter)))
+                    (catch Exception e
+                      (close-scan!)
+                      (throw e)))
+
+                  ;; No more rows - close and stop
+                  :else
+                  (do (close-scan!) nil))))]
+      (lazy-iter))))
+
+;;; ---------------------------------------------------------------------------
 ;;; IcebergSource Implementation
 ;;; ---------------------------------------------------------------------------
 
@@ -140,16 +200,8 @@
                                     ;; Build the scan
                                     true
                                     (.build))]
-      ;; Use with-open to ensure CloseableIterable is closed after iteration.
-      ;; Results are fully realized with doall to allow closing before return.
-      (with-open [_ scan]
-        (let [rows (iterator-seq (.iterator scan))
-              row-maps (map #(generic-record->map % schema) rows)
-              result (if limit
-                       (take limit row-maps)
-                       row-maps)]
-          ;; Realize the seq before closing scan
-          (doall result)))))
+      ;; Return lazy seq - closes scan when exhausted or limit reached
+      (closeable-lazy-seq scan schema limit)))
 
   (get-schema [_ table-name {:keys [snapshot-id as-of-time]}]
     (let [table-path (str warehouse-path "/" table-name)
@@ -300,11 +352,8 @@
                                     true
                                     (.build))]
       (log/debug "FlureeIcebergSource: Scanning" table-name "from" meta-loc)
-      (with-open [_ scan]
-        (let [rows (iterator-seq (.iterator scan))
-              row-maps (map #(generic-record->map % schema) rows)
-              result (if limit (take limit row-maps) row-maps)]
-          (doall result)))))
+      ;; Return lazy seq - closes scan when exhausted or limit reached
+      (closeable-lazy-seq scan schema limit)))
 
   (get-schema [_ table-name {:keys [snapshot-id as-of-time metadata-location]}]
     (let [meta-loc (or metadata-location (get @metadata-cache table-name))
