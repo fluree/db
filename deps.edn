@@ -42,11 +42,7 @@
 
         ;; AWS SDK v2 for S3 Express One Zone session management
         ;; Using minimal dependencies - only for CreateSession API
-        software.amazon.awssdk/s3 {:mvn/version "2.29.40"}
-
-        ;; r2rml
-        org.clojure/java.jdbc             {:mvn/version "0.7.12"}
-        com.mysql/mysql-connector-j       {:mvn/version "8.0.33"}}
+        software.amazon.awssdk/s3 {:mvn/version "2.29.40"}}
 
  :paths ["src" "resources" "target/classes"]
 
@@ -62,8 +58,7 @@
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.5.0"}
                  criterium/criterium               {:mvn/version "0.4.6"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
-                 thheller/shadow-cljs              {:mvn/version "2.28.15"}
-                 com.h2database/h2                 {:mvn/version "2.2.224"}}
+                 thheller/shadow-cljs              {:mvn/version "2.28.15"}}
    :jvm-opts    ["-Dlogback.configurationFile=dev-resources/logback.xml"]}
 
   :cljtest
@@ -74,8 +69,7 @@
                  babashka/fs                             {:mvn/version "0.5.20"}
                  clj-test-containers/clj-test-containers {:mvn/version "0.7.4"}
                  org.testcontainers/testcontainers       {:mvn/version "1.19.3"}
-                 org.testcontainers/localstack           {:mvn/version "1.19.3"}
-                 com.h2database/h2                       {:mvn/version "2.2.224"}}
+                 org.testcontainers/localstack           {:mvn/version "1.19.3"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/skip-meta [:pending :docker]}}
 
@@ -88,8 +82,7 @@
                  babashka/fs                           {:mvn/version "0.5.20"}
                  clj-test-containers/clj-test-containers {:mvn/version "0.7.4"}
                  org.testcontainers/testcontainers     {:mvn/version "1.19.3"}
-                 org.testcontainers/localstack         {:mvn/version "1.19.3"}
-                 com.h2database/h2                     {:mvn/version "2.2.224"}}
+                 org.testcontainers/localstack         {:mvn/version "1.19.3"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/focus-meta [:sci]}}
 

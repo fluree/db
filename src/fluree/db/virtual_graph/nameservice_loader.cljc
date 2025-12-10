@@ -1,7 +1,6 @@
 (ns fluree.db.virtual-graph.nameservice-loader
   (:require ;; Register VG type loaders
    #?(:clj [fluree.db.virtual-graph.bm25.index :as bm25])
-   #?(:clj [fluree.db.virtual-graph.r2rml.db :as r2rml-db])
    [fluree.db.nameservice :as nameservice]
    [fluree.db.util.async :refer [<? go-try]]
    [fluree.db.util.json :as json]
@@ -45,7 +44,6 @@
     (let [types (:type vg-config)]
       (cond
         (some #{"fidx:BM25"} types) :bm25
-        (some #{"fidx:R2RML"} types) :r2rml
         :else :unknown))))
 
 (defmethod create-vg-impl :unknown
@@ -87,9 +85,3 @@
    (defmethod create-vg-impl :bm25
      [db vg-opts _vg-config]
      (bm25/new-bm25-index db [] vg-opts)))
-
-;; R2RML implementation hook – returns a DB-like matcher that can push down whole GRAPH clauses.
-#?(:clj
-   (defmethod create-vg-impl :r2rml
-     [_db vg-opts _vg-config]
-     (r2rml-db/create vg-opts)))

@@ -148,25 +148,25 @@
                                (log/debug "Error closing scan:" (.getMessage e))))))]
     (letfn [(lazy-iter []
               (lazy-seq
-                (cond
+               (cond
                   ;; Limit reached - close and stop
-                  (<= @remaining 0)
-                  (do (close-scan!) nil)
+                 (<= @remaining 0)
+                 (do (close-scan!) nil)
 
                   ;; More rows available
-                  (.hasNext iter)
-                  (try
-                    (let [record (.next iter)
-                          row-map (generic-record->map record schema)]
-                      (swap! remaining dec)
-                      (cons row-map (lazy-iter)))
-                    (catch Exception e
-                      (close-scan!)
-                      (throw e)))
+                 (.hasNext iter)
+                 (try
+                   (let [record (.next iter)
+                         row-map (generic-record->map record schema)]
+                     (swap! remaining dec)
+                     (cons row-map (lazy-iter)))
+                   (catch Exception e
+                     (close-scan!)
+                     (throw e)))
 
                   ;; No more rows - close and stop
-                  :else
-                  (do (close-scan!) nil))))]
+                 :else
+                 (do (close-scan!) nil))))]
       (lazy-iter))))
 
 ;;; ---------------------------------------------------------------------------

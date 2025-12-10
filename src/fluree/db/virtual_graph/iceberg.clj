@@ -40,7 +40,7 @@
 (set! *warn-on-reflection* true)
 
 ;;; ---------------------------------------------------------------------------
-;;; R2RML Vocabulary (shared with r2rml.db)
+;;; R2RML Vocabulary
 ;;; ---------------------------------------------------------------------------
 
 (def ^:const r2rml-ns "http://www.w3.org/ns/r2rml#")
@@ -56,7 +56,7 @@
 (def ^:const r2rml-column (str r2rml-ns "column"))
 
 ;;; ---------------------------------------------------------------------------
-;;; R2RML Parsing (reused from r2rml.db)
+;;; R2RML Parsing
 ;;; ---------------------------------------------------------------------------
 
 (defn- extract-template-cols
@@ -1004,22 +1004,22 @@
                                                (execute-iceberg-query source mapping patterns base-solution
                                                                       time-travel nil solution-pushdown)))
                            ;; Execute first group to get initial solutions
-                           first-group (first pattern-groups)
-                           initial-solutions (execute-group solution first-group)]
+                             first-group (first pattern-groups)
+                             initial-solutions (execute-group solution first-group)]
                        ;; Short-circuit if first group returns empty
-                       (if (empty? initial-solutions)
-                         (async/close! ch)
+                         (if (empty? initial-solutions)
+                           (async/close! ch)
                          ;; For each subsequent group, join with existing solutions
-                         (let [final-solutions (reduce
-                                                (fn [solutions group]
-                                                  (if (empty? solutions)
-                                                    (reduced []) ;; Short-circuit on empty
-                                                    (mapcat #(execute-group % group) solutions)))
-                                                initial-solutions
-                                                (rest pattern-groups))]
-                           (doseq [sol final-solutions]
-                             (async/>! ch sol))
-                           (async/close! ch)))))))
+                           (let [final-solutions (reduce
+                                                  (fn [solutions group]
+                                                    (if (empty? solutions)
+                                                      (reduced []) ;; Short-circuit on empty
+                                                      (mapcat #(execute-group % group) solutions)))
+                                                  initial-solutions
+                                                  (rest pattern-groups))]
+                             (doseq [sol final-solutions]
+                               (async/>! ch sol))
+                             (async/close! ch)))))))
                  (do (async/>! ch solution)
                      (async/close! ch))))
              (catch Exception e
@@ -1136,7 +1136,7 @@
                             :values-patterns (count values-patterns)
                             :values-in-predicates (count values-predicates)
                             :values-vars (mapv :var values-predicates)}}))) ;; closes -explain
-  ) ;; closes defrecord IcebergDatabase
+) ;; closes defrecord IcebergDatabase
 
 ;;; ---------------------------------------------------------------------------
 ;;; Factory
