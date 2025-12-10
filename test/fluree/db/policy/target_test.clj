@@ -138,7 +138,7 @@
           ;; Only tracks policies that were actually executed (no pre-registration)
           (is (valid-policy-tracker? (:policy (ex-data unauthorized)))
               "Policy tracker should have no nil keys")
-          (is (= {"http://a.co/wishlistCreatePolicy" {:executed 1}}
+          (is (= {"http://a.co/wishlistCreatePolicy" {:executed 1, :allowed 0}}
                  (:policy (ex-data unauthorized))))
           (is (= 3
                  (:fuel (ex-data unauthorized))))))
@@ -201,7 +201,7 @@
             (is (= "User can only create an item on their own wishlist."
                    (ex-message unauthorized)))
             ;; Only tracks policies that were actually executed (no pre-registration)
-            (is (= {"http://a.co/wishlistItemCreatePolicy" {:executed 1}}
+            (is (= {"http://a.co/wishlistItemCreatePolicy" {:executed 1, :allowed 0}}
                    (:policy (ex-data unauthorized))))
             (is (= 5
                    (:fuel (ex-data unauthorized))))))
@@ -268,7 +268,7 @@
               (is (= "User cannot modify available status on their own items."
                      (ex-message unauthorized)))
               ;; Only tracks policies that were actually executed (no pre-registration)
-              (is (= {"http://a.co/availableModifyPolicy" {:executed 1}}
+              (is (= {"http://a.co/availableModifyPolicy" {:executed 1, :allowed 0}}
                      (:policy (ex-data unauthorized))))
               (is (= 3
                      (:fuel (ex-data unauthorized)))))
@@ -283,7 +283,7 @@
                 ;; Only tracks policies that were actually executed (no pre-registration)
                 ;; availableModifyPolicy is checked for the available property but doesn't grant view
                 (is (= {"http://a.co/wishlistItemViewPolicy" {:executed 3, :allowed 3}
-                        "http://a.co/availableModifyPolicy"  {:executed 1}}
+                        "http://a.co/availableModifyPolicy"  {:executed 1, :allowed 0}}
                        (:policy result)))
                 (is (= 6
                        (:fuel result)))))))

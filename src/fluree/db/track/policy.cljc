@@ -10,7 +10,10 @@
 (defn track-exec!
   [tracker policy-id]
   (when policy-id
-    (swap! tracker update-in [policy-id :executed] (fnil inc 0))))
+    (swap! tracker update policy-id
+           (fn [m]
+             (-> (or m {:allowed 0})
+                 (update :executed (fnil inc 0)))))))
 
 (defn track-allow!
   [tracker policy-id]
