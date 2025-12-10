@@ -175,10 +175,19 @@
   ;; Usage: clojure -M:dev:iceberg -m fluree.db.iceberg-smoke-test
   :iceberg
   {:extra-paths ["test"]
+   ;; Arrow requires these JVM flags for direct memory access on Java 9+
+   :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+              "--add-opens=java.base/java.lang=ALL-UNNAMED"
+              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
    :extra-deps {;; Core Iceberg 1.10.0
                 org.apache.iceberg/iceberg-core    {:mvn/version "1.10.0"}
                 org.apache.iceberg/iceberg-parquet {:mvn/version "1.10.0"}
                 org.apache.iceberg/iceberg-data    {:mvn/version "1.10.0"}
+
+                ;; Arrow integration for vectorized reads
+                org.apache.iceberg/iceberg-arrow   {:mvn/version "1.10.0"}
+                org.apache.arrow/arrow-vector      {:mvn/version "17.0.0"}
+                org.apache.arrow/arrow-memory-netty {:mvn/version "17.0.0"}
 
                 ;; Hadoop catalog (for local filesystem testing)
                 ;; Note: Pulls in Hadoop deps - use REST/Glue catalogs for Lambda

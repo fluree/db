@@ -841,9 +841,13 @@
             result (async/<!! (optimize/-reorder @vg parsed-query))]
         (is (map? result))
         (is (contains? result :where))
-        ;; VALUES pattern should be preserved
-        (is (some #(= :values (first %)) (:where result))
-            "VALUES pattern should be in result")))))
+        ;; VALUES pattern should be REMOVED when successfully pushed to Iceberg
+        ;; This prevents double-application (VALUES decomposition + IN pushdown)
+        (is (not (some #(= :values (first %)) (:where result)))
+            "Pushed VALUES pattern should be removed from :where to avoid double-application")
+        ;; Triple patterns should still be present
+        (is (>= (count (:where result)) 2)
+            "Triple patterns should still be present")))))
 
 (deftest e2e-values-in-pushdown-test
   (when (and (warehouse-exists?) (mapping-exists?))

@@ -13,6 +13,22 @@
    - Time-travel via snapshots (for Iceberg)
    - Statistics for query planning"
 
+  (scan-batches [this table-name opts]
+    "Scan table returning lazy seq of Arrow VectorSchemaRoot batches.
+
+     Options:
+       :columns     - seq of column names to project (nil = all)
+       :predicates  - seq of predicate maps (see Predicate Format)
+       :snapshot-id - specific snapshot ID for time travel
+       :as-of-time  - java.time.Instant for time travel
+       :batch-size  - rows per batch (default 4096)
+       :limit       - max total rows to return
+
+     Returns: lazy seq of VectorSchemaRoot batches.
+
+     IMPORTANT: Caller must fully consume the seq or the scan will leak resources.
+     Each batch should be used before requesting the next one.")
+
   (scan-rows [this table-name opts]
     "Scan table returning lazy seq of row maps.
 
@@ -23,7 +39,10 @@
        :as-of-time  - java.time.Instant for time travel
        :limit       - max total rows to return
 
-     Returns: lazy seq of row maps {\"column-name\" value ...}")
+     Returns: lazy seq of row maps {\"column-name\" value ...}
+
+     Note: This is a convenience method. Implementations may delegate to
+     scan-batches internally for better performance.")
 
   (get-schema [this table-name opts]
     "Returns schema for a table.

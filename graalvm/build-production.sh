@@ -44,7 +44,7 @@ native-image \
     -H:EnableURLProtocols=http,https \
     -H:IncludeResources='logback.xml|.*\.properties|contexts/.*\.jsonld|contexts/.*\.edn|.*\.edn' \
     --initialize-at-build-time \
-    --initialize-at-run-time=jdk.internal.net.http,com.apicatalog.jsonld.loader,com.apicatalog.jsonld.http,com.apicatalog.rdf,io.setl.rdf \
+    --initialize-at-run-time=jdk.internal.net.http,com.apicatalog.jsonld.loader,com.apicatalog.jsonld.http,com.apicatalog.rdf,io.setl.rdf,org.apache.http.impl.auth.NTLMEngineImpl \
     --no-fallback \
     -O2 \
     -H:+RemoveUnusedSymbols \

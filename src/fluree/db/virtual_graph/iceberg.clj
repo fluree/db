@@ -561,11 +561,19 @@
              (if column
                ;; Annotate the pattern with pushdown filters
                (let [pushdown-filters (mapv #(assoc % :column column) comparisons)]
+                 (log/debug "Annotating pattern with FILTER pushdown:"
+                            {:var var :column column :ops (mapv :op comparisons)})
                  (update patterns binding-idx
                          #(annotate-pattern-with-filters % pushdown-filters)))
                ;; No routed mapping or column found - skip pushdown
-               patterns))
-           patterns)))
+               (do
+                 (log/debug "Skipping FILTER pushdown - no column mapping:"
+                            {:var var :pred-iri pred-iri
+                             :has-routed-mapping? (boolean routed-mapping)})
+                 patterns)))
+           (do
+             (log/debug "Skipping FILTER pushdown - no binding pattern for var:" var)
+             patterns))))
      (vec patterns)
      pushable-analyses)))
 
@@ -701,10 +709,18 @@
                               (:value obj-map))))]
              (if column
                (let [pushdown-filter [{:op :in :column column :value values}]]
+                 (log/debug "Annotating pattern with VALUES IN pushdown:"
+                            {:var var :column column :values-count (count values)})
                  (update patterns binding-idx
                          #(annotate-pattern-with-filters % pushdown-filter)))
-               patterns))
-           patterns)))
+               (do
+                 (log/debug "Skipping VALUES annotation - no column mapping:"
+                            {:var var :pred-iri pred-iri
+                             :has-routed-mapping? (boolean routed-mapping)})
+                 patterns)))
+           (do
+             (log/debug "Skipping VALUES annotation - no binding pattern for var:" var)
+             patterns))))
      (vec patterns)
      values-predicates)))
 
@@ -958,12 +974,11 @@
 
   (-finalize [_ _tracker error-ch solution-ch]
     (let [out-ch (async/chan 1 (map #(dissoc % ::iceberg-patterns)))
-          ;; Note: VALUES pushdown via atom is disabled because VALUES decomposition
-          ;; in the SPARQL engine creates separate sub-queries with bound values.
-          ;; Each bound value should flow through as a literal equality predicate.
-          ;; If we push the full IN predicate here, it conflicts with VALUES decomposition.
-          ;; TODO: Fix VALUES decomposition to ensure bound values are detected as literals.
-          values-pushdown nil #_(when query-pushdown @query-pushdown)]
+          ;; VALUES pushdown from atom - this is the primary path since pattern metadata
+          ;; doesn't survive through the WHERE executor (known limitation)
+          values-pushdown (when query-pushdown @query-pushdown)]
+      (when (seq values-pushdown)
+        (log/debug "Iceberg -finalize using VALUES pushdown from atom:" values-pushdown))
       (async/pipeline-async
        2
        out-ch
@@ -974,9 +989,12 @@
                (if (seq patterns)
                  ;; Group patterns by table and execute each group
                  (let [pattern-groups (group-patterns-by-table patterns mappings routing-indexes)]
-                   ;; Combine solution-level pushdown with VALUES pushdown from atom
+                   ;; Combine: pattern metadata pushdown (FILTER) + atom pushdown (VALUES)
+                   ;; Pattern metadata may not survive WHERE executor, but atom path is reliable
                    (let [solution-pushdown (into (or (get solution ::solution-pushdown-filters) [])
                                                  (or values-pushdown []))]
+                     (when (seq solution-pushdown)
+                       (log/debug "Iceberg -finalize combined solution pushdown:" solution-pushdown))
                      (if (= 1 (count pattern-groups))
                        ;; Single table - simple case
                        (let [{:keys [mapping patterns]} (first pattern-groups)
@@ -1065,8 +1083,14 @@
                                           (:value obj-map))))]
                          (if column
                            (update m column (fnil conj []) {:op :in :value values})
-                           m))
-                       m)))
+                           (do
+                             (log/debug "Skipping VALUES pushdown - no column mapping for var:"
+                                        {:var var :pred-iri pred-iri
+                                         :routed-mapping (boolean routed-mapping)})
+                             m)))
+                       (do
+                         (log/debug "Skipping VALUES pushdown - no binding pattern for var:" var)
+                         m))))
                  {}
                  values-predicates)
 
@@ -1082,11 +1106,40 @@
                                   annotated-patterns values-predicates mappings routing-indexes)
                                  annotated-patterns)
 
-                ;; Reconstruct where: annotated patterns + ALL original filters + VALUES patterns
-                ;; (keep filters as post-filter safety net, keep VALUES for non-pushed vars)
+                ;; Track which vars were successfully pushed to Iceberg
+                ;; These VALUES patterns should be REMOVED from WHERE to avoid double-application
+                pushed-vars (set (keep (fn [{:keys [var]}]
+                                         (let [binding-idx (find-first-binding-pattern other-patterns var)]
+                                           (when binding-idx
+                                             (let [pred-iri (var->predicate-iri other-patterns var mappings)
+                                                   pred->mapping (:predicate->mapping routing-indexes)
+                                                   routed-mapping (get pred->mapping pred-iri)
+                                                   column (when routed-mapping
+                                                            (when-let [obj-map (get-in routed-mapping [:predicates pred-iri])]
+                                                              (when (= :column (:type obj-map))
+                                                                (:value obj-map))))]
+                                               (when column var)))))
+                                       values-predicates))
+
+                ;; Filter out VALUES patterns that were fully pushed to avoid double-application
+                ;; Keep VALUES patterns for vars that couldn't be pushed (no column mapping, etc.)
+                unpushed-values-patterns
+                (remove (fn [vp]
+                          (when-let [{:keys [var]} (extract-values-in-predicate vp)]
+                            (contains? pushed-vars var)))
+                        values-patterns)
+
+                _ (when (and (seq values-patterns) (seq pushed-vars))
+                    (log/debug "VALUES pushdown - removing pushed patterns from WHERE:"
+                               {:pushed-vars pushed-vars
+                                :original-count (count values-patterns)
+                                :remaining-count (count unpushed-values-patterns)}))
+
+                ;; Reconstruct where: annotated patterns + filters + only UNPUSHED VALUES patterns
+                ;; Pushed VALUES are handled via pattern metadata, not VALUES decomposition
                 new-where (-> final-patterns
                               (into filters)
-                              (into values-patterns))
+                              (into unpushed-values-patterns))
 
                 ;; Flatten direct-pushdown-map to a vector of predicates
                 ;; Format: [{:op :in :column "country" :value ["US" "Canada"]} ...]
