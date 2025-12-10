@@ -294,6 +294,27 @@
        (remove nil?)
        (into {})))
 
+(defn- extract-solution-predicates
+  "Extract pushdown predicates from solution bindings.
+
+   When a pattern has a variable in object position, and that variable is
+   already bound in the solution (e.g., from VALUES decomposition), we can
+   push that binding as an equality predicate to Iceberg.
+
+   Returns a seq of {:column :op :value} predicate maps."
+  [patterns solution mapping]
+  (let [pred->var (extract-predicate-bindings patterns)]
+    (for [[pred-iri var-name] pred->var
+          :let [match (get solution var-name)
+                ;; Get the literal value from the match
+                literal-val (when match (where/get-value match))
+                ;; Map predicate IRI to column name
+                object-map (get-in mapping [:predicates pred-iri])
+                column (when (and (map? object-map) (= :column (:type object-map)))
+                         (:value object-map))]
+          :when (and column literal-val)]
+      {:column column :op :eq :value literal-val})))
+
 (defn- extract-subject-variable
   [item]
   (cond
@@ -410,50 +431,110 @@
       ;; Multi-var or no forms - not pushable
       {:pushable? false :pattern pattern})))
 
+(defn- raw-triple?
+  "Check if pattern is a raw triple [s p o] (not a tagged pattern like [:filter ...])."
+  [pattern]
+  (and (vector? pattern)
+       (= 3 (count pattern))
+       (map? (first pattern))))
+
 (defn- find-first-binding-pattern
   "Find the index of the first pattern that binds the given variable.
-   Skips :optional and :union patterns (don't inline into those)."
+   Skips :optional, :union, :filter, :bind, and :values patterns.
+
+   Handles both raw triples [s p o] and tagged patterns [:class [s p o]]."
   [patterns var]
   (first
    (keep-indexed
     (fn [idx pattern]
-      (let [pattern-type (first pattern)]
-        (when (and (not (#{:optional :union :filter :bind} pattern-type))
-                   (let [pattern-data (second pattern)
-                         ;; Check if this pattern references the variable
-                         pattern-vars (cond
-                                        ;; Triple pattern [s p o]
-                                        (vector? pattern-data)
-                                        (keep #(when (where/variable? %) %) pattern-data)
+      (let [pattern-type (first pattern)
+            ;; Check for tagged pattern types to skip
+            skip-pattern? (#{:optional :union :filter :bind :values} pattern-type)]
+        (when-not skip-pattern?
+          (let [;; Determine the actual triple data
+                triple-data (cond
+                              ;; Raw triple [s p o] - pattern itself is the triple
+                              (raw-triple? pattern)
+                              pattern
 
-                                        ;; Class pattern [:class [s p o]]
-                                        (and (= :class pattern-type)
-                                             (vector? pattern-data))
-                                        (keep #(when (where/variable? %) %) pattern-data)
+                              ;; Tagged pattern [:class [s p o]] or similar
+                              (vector? (second pattern))
+                              (second pattern)
 
-                                        :else nil)]
-                     (some #{var} pattern-vars)))
-          idx)))
+                              :else nil)
+                ;; Extract variables from the triple
+                pattern-vars (when triple-data
+                               (keep #(cond
+                                        (where/variable? %) %
+                                        (and (map? %) (::where/var %)) (::where/var %))
+                                     triple-data))]
+            (when (some #{var} pattern-vars)
+              idx)))))
     patterns)))
 
 (defn- var->predicate-iri
-  "Find the predicate IRI that binds a variable in the given patterns."
-  [patterns var mappings]
+  "Find the predicate IRI that binds a variable in the given patterns.
+
+   Handles both raw triples [s p o] and tagged patterns [:class [s p o]]."
+  [patterns var _mappings]
   (some
    (fn [pattern]
-     (let [pattern-type (first pattern)
-           pattern-data (second pattern)]
-       (when (or (vector? pattern-data)
-                 (= :class pattern-type))
-         (let [triple (if (= :class pattern-type)
-                        pattern-data
-                        pattern-data)
-               [_s p o] triple]
+     (let [;; Determine the actual triple data
+           triple (cond
+                    ;; Raw triple [s p o]
+                    (raw-triple? pattern)
+                    pattern
+
+                    ;; Tagged pattern [:class [s p o]] or similar
+                    (vector? (second pattern))
+                    (second pattern)
+
+                    :else nil)]
+       (when triple
+         (let [[_s p o] triple]
            (when (and (map? p) (::where/iri p)
                       (or (= var o)
                           (and (map? o) (= var (::where/var o)))))
              (::where/iri p))))))
    patterns))
+
+(defn- annotate-pattern-with-filters
+  "Attach pushdown filters to a pattern, handling both raw triples and MapEntry patterns.
+   For MapEntry patterns like [:tuple [s p o]], attaches metadata to the inner tuple
+   so it survives pattern-data extraction in the WHERE executor."
+  [pattern pushdown-filters]
+  (let [add-meta #(vary-meta % update ::pushdown-filters
+                             (fnil into []) pushdown-filters)]
+    (cond
+      ;; Raw triple [s p o] - just add metadata
+      (raw-triple? pattern)
+      (add-meta pattern)
+
+      ;; MapEntry pattern - extract inner data, add metadata, rebuild MapEntry
+      (instance? clojure.lang.MapEntry pattern)
+      (let [pattern-type (key pattern)
+            pattern-data (val pattern)
+            ;; Add metadata to the inner data (which becomes the 'triple' in -match-triple)
+            annotated-data (if (vector? pattern-data)
+                             (add-meta pattern-data)
+                             pattern-data)]
+        ;; Return a new MapEntry with annotated data
+        (clojure.lang.MapEntry/create pattern-type annotated-data))
+
+      ;; Vector pattern like [:class [s p o]] - also handle as pseudo-MapEntry
+      (and (vector? pattern)
+           (= 2 (count pattern))
+           (keyword? (first pattern)))
+      (let [pattern-type (first pattern)
+            pattern-data (second pattern)
+            annotated-data (if (vector? pattern-data)
+                             (add-meta pattern-data)
+                             pattern-data)]
+        ;; Convert to MapEntry for proper handling by WHERE executor
+        (clojure.lang.MapEntry/create pattern-type annotated-data))
+
+      ;; Unknown pattern type - return unchanged
+      :else pattern)))
 
 (defn- annotate-patterns-with-pushdown
   "Attach :pushdown-filters metadata to patterns that first bind pushed-down vars.
@@ -481,14 +562,151 @@
                ;; Annotate the pattern with pushdown filters
                (let [pushdown-filters (mapv #(assoc % :column column) comparisons)]
                  (update patterns binding-idx
-                         (fn [pattern]
-                           (vary-meta pattern update ::pushdown-filters
-                                      (fnil into []) pushdown-filters))))
+                         #(annotate-pattern-with-filters % pushdown-filters)))
                ;; No routed mapping or column found - skip pushdown
                patterns))
            patterns)))
      (vec patterns)
      pushable-analyses)))
+
+;;; ---------------------------------------------------------------------------
+;;; VALUES Clause -> IN Predicate Pushdown
+;;; ---------------------------------------------------------------------------
+
+(defn- extract-value
+  "Extract literal value from various formats.
+   Returns the value or nil if not a pushable literal."
+  [v]
+  (cond
+    ;; Wrapped match object {::where/val value}
+    (and (map? v) (contains? v ::where/val))
+    (::where/val v)
+
+    ;; Raw string/number literal (from SPARQL translator)
+    (or (string? v) (number? v))
+    v
+
+    ;; IRI or other non-pushable format
+    :else nil))
+
+(defn- extract-values-in-predicate
+  "Extract IN predicate from a VALUES pattern.
+
+   VALUES patterns that bind a single variable to multiple literal values
+   can be pushed down as IN predicates.
+
+   VALUES pattern structure can be:
+   1. After FQL parsing: [:values [{var match-obj} {var match-obj} ...]]
+      - Vector of solution maps, each binding the same var to a value
+   2. From SPARQL translator: [:values [var [values...]]]
+      - var is symbol or string, values is vector of match objects or raw values
+
+   Returns {:var symbol :values [v1 v2 ...]} or nil if not pushable.
+
+   Only single-variable VALUES with all literal values are pushable.
+   Multi-variable VALUES or VALUES with IRIs are not currently supported."
+  [pattern]
+  (when (= :values (first pattern))
+    (let [pattern-data (second pattern)]
+      (cond
+        ;; Format 1: [:values [{?var match-obj} ...]] - parsed FQL format
+        ;; Each solution map should have exactly one key (the variable)
+        (and (sequential? pattern-data)
+             (seq pattern-data)
+             (every? map? pattern-data))
+        (let [;; All solutions should bind the same single variable
+              vars-per-solution (map keys pattern-data)
+              all-single-var? (every? #(= 1 (count %)) vars-per-solution)
+              var-sets (map (comp set keys) pattern-data)
+              same-var? (apply = var-sets)]
+          (when (and all-single-var? same-var?)
+            (let [;; Get the variable key from the first solution map
+                  var-key (first (keys (first pattern-data)))
+                  var-sym (cond
+                            (symbol? var-key) var-key
+                            (string? var-key) (symbol var-key)
+                            :else nil)
+                  ;; Extract values from each solution map
+                  extracted (keep (fn [sol]
+                                    (let [match-obj (first (vals sol))]
+                                      (extract-value match-obj)))
+                                  pattern-data)]
+              (when (and var-sym
+                         (seq extracted)
+                         (= (count extracted) (count pattern-data)))
+                {:var var-sym
+                 :values (vec extracted)}))))
+
+        ;; Format 2: [:values [var solutions]] - SPARQL translator format
+        (and (vector? pattern-data)
+             (= 2 (count pattern-data))
+             (let [var-elem (first pattern-data)]
+               (or (symbol? var-elem)
+                   (string? var-elem))))
+        (let [[var-elem solutions] pattern-data
+              var-sym (if (symbol? var-elem)
+                        var-elem
+                        (symbol var-elem))
+              ;; Extract values from various formats
+              extracted (when (sequential? solutions)
+                          (keep extract-value solutions))]
+          ;; Only pushable if all values were extracted successfully
+          (when (and (seq extracted)
+                     (= (count extracted) (count solutions)))
+            {:var var-sym
+             :values (vec extracted)}))
+
+        ;; Format 3: [:values {?var [values...]}] - map format
+        (and (map? pattern-data)
+             (= 1 (count pattern-data)))
+        (let [[var-key solutions] (first pattern-data)
+              var-name (cond
+                         (symbol? var-key) var-key
+                         (string? var-key) (symbol var-key)
+                         :else nil)
+              extracted (when (and var-name (sequential? solutions))
+                          (keep extract-value solutions))]
+          (when (and (seq extracted)
+                     (= (count extracted) (count solutions)))
+            {:var var-name
+             :values (vec extracted)}))
+
+        ;; Other formats - not pushable
+        :else nil))))
+
+(defn- annotate-values-pushdown
+  "Annotate patterns with IN predicates from VALUES clauses.
+
+   For each VALUES clause with a single variable and multiple literal values,
+   find the triple pattern that binds that variable and attach an :in predicate.
+
+   This allows VALUES clauses like:
+     VALUES ?country { 'US' 'Canada' 'Mexico' }
+   to be pushed down to Iceberg as:
+     column IN ('US', 'Canada', 'Mexico')
+
+   Uses routing-indexes to ensure the IN predicate is only pushed to the
+   table that owns the column."
+  [patterns values-predicates mappings routing-indexes]
+  (let [pred->mapping (:predicate->mapping routing-indexes)]
+    (reduce
+     (fn [patterns {:keys [var values]}]
+       (let [binding-idx (find-first-binding-pattern patterns var)]
+         (if binding-idx
+           (let [pred-iri (var->predicate-iri patterns var mappings)
+                 routed-mapping (get pred->mapping pred-iri)
+                 column (when routed-mapping
+                          (when-let [obj-map (get-in routed-mapping [:predicates pred-iri])]
+                            (when (= :column (:type obj-map))
+                              (:value obj-map))))]
+             (if column
+               (let [pushdown-filter [{:op :in :column column :value values}]]
+                 (update patterns binding-idx
+                         #(annotate-pattern-with-filters % pushdown-filter)))
+               patterns))
+           patterns)))
+     (vec patterns)
+     values-predicates)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Result Transformation
@@ -560,6 +778,53 @@
        (remove nil?)
        vec))
 
+(defn- coalesce-predicates
+  "Coalesce multiple equality predicates on the same column into a single IN predicate.
+
+   This normalizes the predicate representation so that:
+   - Single :eq predicates remain as :eq
+   - Multiple :eq predicates on the same column become :in
+   - Existing :in predicates are merged with :eq predicates on the same column
+
+   Example:
+     [{:op :eq :column \"country\" :value \"US\"}
+      {:op :eq :column \"country\" :value \"Canada\"}
+      {:op :eq :column \"name\" :value \"Delta\"}]
+     =>
+     [{:op :in :column \"country\" :value [\"US\" \"Canada\"]}
+      {:op :eq :column \"name\" :value \"Delta\"}]"
+  [predicates]
+  (if (empty? predicates)
+    predicates
+    (let [;; Group predicates by column
+          by-column (group-by :column predicates)
+          ;; For each column, coalesce eq predicates
+          coalesced (mapcat
+                     (fn [[column preds]]
+                       (let [{eq-preds :eq, in-preds :in, other-preds nil}
+                             (group-by #(#{:eq :in} (:op %)) preds)
+                             ;; Collect all values from :eq predicates
+                             eq-values (mapv :value eq-preds)
+                             ;; Collect all values from :in predicates
+                             in-values (mapcat :value in-preds)
+                             ;; Combine all values
+                             all-values (into (vec eq-values) in-values)]
+                         (concat
+                          ;; Non-eq/in predicates pass through unchanged
+                          other-preds
+                          ;; Coalesce eq/in predicates
+                          (cond
+                            ;; No equality-type predicates
+                            (empty? all-values) nil
+                            ;; Single value - use :eq
+                            (= 1 (count all-values))
+                            [{:op :eq :column column :value (first all-values)}]
+                            ;; Multiple values - use :in
+                            :else
+                            [{:op :in :column column :value (vec all-values)}]))))
+                     by-column)]
+      (vec coalesced))))
+
 (defn- execute-iceberg-query
   "Execute query against Iceberg source with predicate pushdown.
 
@@ -569,11 +834,14 @@
    - {:as-of-time Instant} (time-travel to specific time)
 
    limit is an optional hint to limit the number of rows scanned.
+   solution-pushdown is an optional vector of pushdown filters from the solution map.
    Returns a lazy seq of solutions - limit is enforced at the scan level
    for early termination."
   ([source mapping patterns base-solution time-travel]
-   (execute-iceberg-query source mapping patterns base-solution time-travel nil))
+   (execute-iceberg-query source mapping patterns base-solution time-travel nil nil))
   ([source mapping patterns base-solution time-travel limit]
+   (execute-iceberg-query source mapping patterns base-solution time-travel limit nil))
+  ([source mapping patterns base-solution time-travel limit solution-pushdown]
    (let [table-name (:table mapping)
          pred->var (extract-predicate-bindings patterns)
          pred->literal (extract-literal-filters patterns)
@@ -596,14 +864,28 @@
          ;; Extract pushed-down FILTER predicates from pattern metadata
          pushed-predicates (extract-pushdown-filters patterns)
 
-         ;; Combine all predicates
-         all-predicates (into literal-predicates pushed-predicates)
+         ;; Extract predicates from solution bindings (from VALUES decomposition)
+         ;; When a variable is already bound in the solution, we can push it as equality
+         solution-bound-predicates (vec (extract-solution-predicates patterns base-solution mapping))
+
+         ;; Include explicit solution-level pushdown filters
+         all-solution-pushdown (or solution-pushdown [])
+
+         ;; Combine all predicates and coalesce eq predicates on same column into IN
+         all-predicates (-> literal-predicates
+                            (into pushed-predicates)
+                            (into solution-bound-predicates)
+                            (into all-solution-pushdown)
+                            coalesce-predicates)
 
          _ (log/debug "Iceberg query:" {:table table-name
                                         :columns columns
                                         :literal-predicates (count literal-predicates)
                                         :pushed-predicates (count pushed-predicates)
+                                        :solution-bound-predicates (count solution-bound-predicates)
+                                        :solution-pushdown (count all-solution-pushdown)
                                         :total-predicates (count all-predicates)
+                                        :coalesced-predicates all-predicates
                                         :time-travel time-travel
                                         :limit limit})
 
@@ -628,10 +910,11 @@
 ;;; IcebergDatabase Record (Multi-Table Support)
 ;;; ---------------------------------------------------------------------------
 
-(defrecord IcebergDatabase [alias config sources mappings routing-indexes time-travel]
+(defrecord IcebergDatabase [alias config sources mappings routing-indexes time-travel query-pushdown]
   ;; sources: {table-name -> IcebergSource}
   ;; mappings: {table-key -> {:table, :class, :predicates, ...}}
   ;; routing-indexes: {:class->mapping {...} :predicate->mapping {...}}
+  ;; query-pushdown: atom holding query-time pushdown predicates (set in -reorder, used in -finalize)
 
   vg/UpdatableVirtualGraph
   (upsert [this _source-db _new-flakes _remove-flakes]
@@ -646,8 +929,20 @@
   (-match-triple [_this _tracker solution triple _error-ch]
     (go
       (let [iceberg-patterns (get solution ::iceberg-patterns [])
-            updated (conj iceberg-patterns triple)]
-        (assoc solution ::iceberg-patterns updated))))
+            updated (conj iceberg-patterns triple)
+            ;; Extract any pushdown filters from pattern metadata
+            triple-meta (meta triple)
+            pushdown-filters (::pushdown-filters triple-meta)
+            ;; Accumulate pushdown filters in solution
+            existing-pushdown (get solution ::solution-pushdown-filters [])
+            new-pushdown (if pushdown-filters
+                           (into existing-pushdown pushdown-filters)
+                           existing-pushdown)]
+        (when pushdown-filters
+          (log/debug "Iceberg -match-triple received pattern with pushdown filters:"
+                     pushdown-filters))
+        (cond-> (assoc solution ::iceberg-patterns updated)
+          (seq new-pushdown) (assoc ::solution-pushdown-filters new-pushdown)))))
 
   (-match-class [_this _tracker solution class-triple _error-ch]
     (go
@@ -662,7 +957,13 @@
     [alias])
 
   (-finalize [_ _tracker error-ch solution-ch]
-    (let [out-ch (async/chan 1 (map #(dissoc % ::iceberg-patterns)))]
+    (let [out-ch (async/chan 1 (map #(dissoc % ::iceberg-patterns)))
+          ;; Note: VALUES pushdown via atom is disabled because VALUES decomposition
+          ;; in the SPARQL engine creates separate sub-queries with bound values.
+          ;; Each bound value should flow through as a literal equality predicate.
+          ;; If we push the full IN predicate here, it conflicts with VALUES decomposition.
+          ;; TODO: Fix VALUES decomposition to ensure bound values are detected as literals.
+          values-pushdown nil #_(when query-pushdown @query-pushdown)]
       (async/pipeline-async
        2
        out-ch
@@ -673,30 +974,35 @@
                (if (seq patterns)
                  ;; Group patterns by table and execute each group
                  (let [pattern-groups (group-patterns-by-table patterns mappings routing-indexes)]
-                   (if (= 1 (count pattern-groups))
-                     ;; Single table - simple case
-                     (let [{:keys [mapping patterns]} (first pattern-groups)
-                           table-name (:table mapping)
-                           source (get sources table-name)]
-                       (when-not source
-                         (throw (ex-info (str "No source found for table: " table-name)
-                                         {:error :db/missing-source
-                                          :table table-name
-                                          :available-sources (keys sources)})))
-                       (let [solutions (execute-iceberg-query source mapping patterns solution time-travel)]
-                         (doseq [sol solutions]
-                           (async/>! ch sol))
-                         (async/close! ch)))
-                     ;; Multiple tables - nested loop join
-                     (let [execute-group (fn [base-solution {:keys [mapping patterns]}]
-                                           (let [table-name (:table mapping)
-                                                 source (get sources table-name)]
-                                             (when-not source
-                                               (throw (ex-info (str "No source found for table: " table-name)
-                                                               {:error :db/missing-source
-                                                                :table table-name
-                                                                :available-sources (keys sources)})))
-                                             (execute-iceberg-query source mapping patterns base-solution time-travel)))
+                   ;; Combine solution-level pushdown with VALUES pushdown from atom
+                   (let [solution-pushdown (into (or (get solution ::solution-pushdown-filters) [])
+                                                 (or values-pushdown []))]
+                     (if (= 1 (count pattern-groups))
+                       ;; Single table - simple case
+                       (let [{:keys [mapping patterns]} (first pattern-groups)
+                             table-name (:table mapping)
+                             source (get sources table-name)]
+                         (when-not source
+                           (throw (ex-info (str "No source found for table: " table-name)
+                                           {:error :db/missing-source
+                                            :table table-name
+                                            :available-sources (keys sources)})))
+                         (let [solutions (execute-iceberg-query source mapping patterns solution
+                                                                time-travel nil solution-pushdown)]
+                           (doseq [sol solutions]
+                             (async/>! ch sol))
+                           (async/close! ch)))
+                       ;; Multiple tables - nested loop join
+                       (let [execute-group (fn [base-solution {:keys [mapping patterns]}]
+                                             (let [table-name (:table mapping)
+                                                   source (get sources table-name)]
+                                               (when-not source
+                                                 (throw (ex-info (str "No source found for table: " table-name)
+                                                                 {:error :db/missing-source
+                                                                  :table table-name
+                                                                  :available-sources (keys sources)})))
+                                               (execute-iceberg-query source mapping patterns base-solution
+                                                                      time-travel nil solution-pushdown)))
                            ;; Execute first group to get initial solutions
                            first-group (first pattern-groups)
                            initial-solutions (execute-group solution first-group)]
@@ -713,7 +1019,7 @@
                                                 (rest pattern-groups))]
                            (doseq [sol final-solutions]
                              (async/>! ch sol))
-                           (async/close! ch))))))
+                           (async/close! ch)))))))
                  (do (async/>! ch solution)
                      (async/close! ch))))
              (catch Exception e
@@ -728,49 +1034,109 @@
     (go
       (let [where-patterns (:where parsed-query)]
         (if (seq where-patterns)
-          ;; Separate filters from other patterns
+          ;; Separate different pattern types
           (let [{filters true, non-filters false}
                 (group-by #(= :filter (first %)) where-patterns)
 
+                {values-patterns true, other-patterns false}
+                (group-by #(= :values (first %)) non-filters)
+
                 ;; Analyze each filter for pushability
                 analyzed (map analyze-filter-pattern filters)
-                {pushable true, not-pushable false}
+                {pushable true, _not-pushable false}
                 (group-by :pushable? analyzed)
 
-                ;; Annotate patterns with pushdown metadata
+                ;; Extract pushable VALUES patterns (single-var with literals)
+                values-predicates (keep extract-values-in-predicate values-patterns)
+
+                ;; Build direct pushdown map {predicate-iri -> [predicates]}
+                ;; This survives the query optimization pipeline
+                direct-pushdown-map
+                (reduce
+                 (fn [m {:keys [var values]}]
+                   (let [binding-idx (find-first-binding-pattern other-patterns var)]
+                     (if binding-idx
+                       (let [pred-iri (var->predicate-iri other-patterns var mappings)
+                             pred->mapping (:predicate->mapping routing-indexes)
+                             routed-mapping (get pred->mapping pred-iri)
+                             column (when routed-mapping
+                                      (when-let [obj-map (get-in routed-mapping [:predicates pred-iri])]
+                                        (when (= :column (:type obj-map))
+                                          (:value obj-map))))]
+                         (if column
+                           (update m column (fnil conj []) {:op :in :value values})
+                           m))
+                       m)))
+                 {}
+                 values-predicates)
+
+                ;; Annotate patterns with FILTER pushdown metadata
                 annotated-patterns (if (seq pushable)
                                      (annotate-patterns-with-pushdown
-                                      non-filters pushable mappings routing-indexes)
-                                     (vec non-filters))
+                                      other-patterns pushable mappings routing-indexes)
+                                     (vec other-patterns))
 
-                ;; Reconstruct where: annotated patterns + ALL original filters
-                ;; (keep filters as post-filter safety net)
-                new-where (into annotated-patterns filters)]
+                ;; Annotate patterns with VALUES/IN pushdown metadata
+                final-patterns (if (seq values-predicates)
+                                 (annotate-values-pushdown
+                                  annotated-patterns values-predicates mappings routing-indexes)
+                                 annotated-patterns)
 
-            (log/debug "Iceberg filter pushdown:"
-                       {:total-filters (count filters)
-                        :pushable (count pushable)
-                        :patterns-annotated (count (filter #(::pushdown-filters (meta %))
-                                                           annotated-patterns))})
+                ;; Reconstruct where: annotated patterns + ALL original filters + VALUES patterns
+                ;; (keep filters as post-filter safety net, keep VALUES for non-pushed vars)
+                new-where (-> final-patterns
+                              (into filters)
+                              (into values-patterns))
 
-            (assoc parsed-query :where new-where))
+                ;; Flatten direct-pushdown-map to a vector of predicates
+                ;; Format: [{:op :in :column "country" :value ["US" "Canada"]} ...]
+                values-pushdown-predicates
+                (->> direct-pushdown-map
+                     (mapcat (fn [[column preds]]
+                               (map #(assoc % :column column) preds)))
+                     vec)
+
+                _ (log/debug "Iceberg filter pushdown:"
+                             {:total-filters (count filters)
+                              :pushable-filters (count pushable)
+                              :values-patterns (count values-patterns)
+                              :values-in-predicates (count values-predicates)
+                              :values-pushdown-predicates values-pushdown-predicates
+                              :patterns-annotated (count (filter #(::pushdown-filters (meta %))
+                                                                 final-patterns))})
+
+                ;; Store VALUES predicates in the atom for retrieval in -finalize
+                _ (when (and query-pushdown (seq values-pushdown-predicates))
+                    (reset! query-pushdown values-pushdown-predicates))]
+
+            ;; Store direct pushdown map in query opts for retrieval in -finalize
+            (-> parsed-query
+                (assoc :where new-where)
+                (assoc-in [:opts ::iceberg-direct-pushdown] direct-pushdown-map)))
           parsed-query))))
 
   (-explain [_ parsed-query]
     (go
       (let [where-patterns (:where parsed-query)
-            {filters true, _non-filters false}
+            {filters true, non-filters false}
             (group-by #(= :filter (first %)) where-patterns)
+            {values-patterns true, _other-patterns false}
+            (group-by #(= :values (first %)) non-filters)
             analyzed (map analyze-filter-pattern filters)
             {pushable true, _not-pushable false}
-            (group-by :pushable? analyzed)]
+            (group-by :pushable? analyzed)
+            values-predicates (keep extract-values-in-predicate values-patterns)]
         {:original parsed-query
          :optimized parsed-query
          :segments []
-         :changed? (boolean (seq pushable))
+         :changed? (or (boolean (seq pushable)) (boolean (seq values-predicates)))
          :iceberg-pushdown {:total-filters (count filters)
                             :pushable-filters (count pushable)
-                            :pushed-ops (mapv #(-> % :comparisons first :op) pushable)}}))))
+                            :pushed-ops (mapv #(-> % :comparisons first :op) pushable)
+                            :values-patterns (count values-patterns)
+                            :values-in-predicates (count values-predicates)
+                            :values-vars (mapv :var values-predicates)}}))) ;; closes -explain
+  ) ;; closes defrecord IcebergDatabase
 
 ;;; ---------------------------------------------------------------------------
 ;;; Factory
@@ -963,4 +1329,5 @@
                            :sources sources
                            :mappings mappings
                            :routing-indexes routing-indexes
-                           :time-travel nil})))
+                           :time-travel nil
+                           :query-pushdown (atom nil)})))
