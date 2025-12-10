@@ -1,5 +1,6 @@
 (ns fluree.db.flake.index.novelty
   (:require [clojure.core.async :as async :refer [<! >! go go-loop]]
+            [fluree.db.cache :as cache]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
@@ -424,6 +425,27 @@
                :classes    (:classes novelty-updates)))
       ;; No novelty, return indexed stats as-is
       indexed-stats)))
+
+(defn cached-current-stats
+  "Returns current-stats using connection's LRU cache.
+
+   Cache key: [::ledger-stats ledger-alias t]
+   This ensures stats are computed once per ledger state and shared across:
+   - ledger-info API calls
+   - f:onClass policy optimization
+
+   Returns a channel containing the stats."
+  [db]
+  (let [lru-cache (-> db :index-catalog :cache)
+        cache-key [::ledger-stats (:alias db) (:t db)]]
+    (cache/lru-lookup
+     lru-cache
+     cache-key
+     (fn [_]
+       (async/go
+         (log/debug "Computing class->property stats"
+                    {:ledger (:alias db) :t (:t db)})
+         (current-stats db))))))
 
 (defn write-resolved-nodes
   [db idx changes-ch error-ch index-ch]

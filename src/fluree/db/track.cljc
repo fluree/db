@@ -68,11 +68,6 @@
   (when-let [fuel-tracker (:fuel tracker)]
     (fuel/track! fuel-tracker error-ch)))
 
-(defn register-policies!
-  [tracker policy-db]
-  (when-let [policy-tracker (:policy tracker)]
-    (policy/register-policies! policy-tracker policy-db)))
-
 (defn policy-exec!
   [tracker policy-id]
   (when-let [policy-tracker (:policy tracker)]

@@ -74,7 +74,6 @@
               policy-db (if (policy/policy-enforced-opts? parsed-opts)
                           (<? (policy/policy-enforce-db db tracker parsed-context parsed-opts))
                           db)]
-          (track/register-policies! tracker policy-db)
           (try*
             (let [staged-db     (<? (stage policy-db tracker identity parsed-txn parsed-opts))
                   tally         (track/tally tracker)]
