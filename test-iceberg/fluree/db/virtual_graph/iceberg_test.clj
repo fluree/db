@@ -11,7 +11,8 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.optimize :as optimize]
-            [fluree.db.virtual-graph.iceberg :as iceberg-vg])
+            [fluree.db.virtual-graph.iceberg :as iceberg-vg]
+            [fluree.db.virtual-graph.iceberg.pushdown :as pushdown])
   (:import [java.io File]))
 
 ;;; ---------------------------------------------------------------------------
@@ -563,8 +564,8 @@
 
 (deftest extract-comparison-test
   (testing "Extract comparison from parsed filter forms"
-    ;; Test the private function via the public interface
-    (let [extract-fn #'iceberg-vg/extract-comparison]
+    ;; Test the private function via var resolution
+    (let [extract-fn #'pushdown/extract-comparison]
 
       (testing "Greater than"
         (is (= {:op :gt :var '?x :value 100}
@@ -602,7 +603,7 @@
 
 (deftest analyze-filter-pattern-test
   (testing "Analyze filter patterns for pushability"
-    (let [analyze-fn #'iceberg-vg/analyze-filter-pattern]
+    (let [analyze-fn pushdown/analyze-filter-pattern]
 
       (testing "Single-var equality filter is pushable"
         (let [filter-fn (with-meta identity {:forms '((= ?x 100)) :vars #{'?x}})
@@ -745,7 +746,7 @@
 
 (deftest extract-values-in-predicate-test
   (testing "Extract IN predicate from VALUES patterns"
-    (let [extract-fn #'iceberg-vg/extract-values-in-predicate]
+    (let [extract-fn pushdown/extract-values-in-predicate]
 
       (testing "FQL parsed format: vector of solution maps"
         ;; This is the format after FQL parsing: [:values [{?var match-obj} ...]]
@@ -802,7 +803,7 @@
 (deftest annotate-values-pushdown-test
   (when @vg
     (testing "Annotate patterns with VALUES/IN pushdown"
-      (let [annotate-fn #'iceberg-vg/annotate-values-pushdown
+      (let [annotate-fn pushdown/annotate-values-pushdown
             mappings (:mappings @vg)
             routing-indexes (:routing-indexes @vg)
 
@@ -819,7 +820,7 @@
 
         (is (= 1 (count result)))
         (let [annotated (first result)
-              pushdown-filters (::iceberg-vg/pushdown-filters (meta annotated))]
+              pushdown-filters (::pushdown/pushdown-filters (meta annotated))]
           (is (vector? pushdown-filters) "Should have pushdown filters")
           (is (= 1 (count pushdown-filters)))
           (is (= :in (-> pushdown-filters first :op)))

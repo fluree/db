@@ -240,12 +240,112 @@
   (let [^VectorSchemaRoot root (.createVectorSchemaRootFromVectors batch)]
     (batch->row-maps root)))
 
+;;; ---------------------------------------------------------------------------
+;;; Columnar Predicate Evaluation (avoid row-by-row conversion overhead)
+;;; ---------------------------------------------------------------------------
+
+(declare row-matches-predicate-columnar?)
+
+(defn- vector-matches-predicate?
+  "Check if value at index in vector matches predicate.
+   Operates directly on Arrow vector without conversion to map.
+   For compound predicates (:and/:or), delegates to row-matches-predicate-columnar?."
+  [vectors ^long idx {:keys [column op value predicates]}]
+  (case op
+    ;; Compound predicates - recurse
+    :and (every? #(row-matches-predicate-columnar? vectors idx %) predicates)
+    :or  (some #(row-matches-predicate-columnar? vectors idx %) predicates)
+    ;; Simple predicates - evaluate directly on vector
+    (if-let [^FieldVector vector (get vectors column)]
+      (let [v (get-arrow-value vector idx)]
+        (case op
+          :eq      (= v value)
+          :ne      (not= v value)
+          :gt      (when v (> (compare v value) 0))
+          :gte     (when v (>= (compare v value) 0))
+          :lt      (when v (< (compare v value) 0))
+          :lte     (when v (<= (compare v value) 0))
+          :in      (contains? (if (set? value) value (set value)) v)
+          :between (when v
+                     (and (>= (compare v (first value)) 0)
+                          (<= (compare v (second value)) 0)))
+          :is-null (nil? v)
+          :not-null (some? v)
+          ;; Unknown op - pass through
+          true))
+      ;; Unknown column - pass through
+      true)))
+
+(defn- row-matches-predicate-columnar?
+  "Check if row at index matches a single predicate using columnar evaluation."
+  [vectors ^long idx pred]
+  (vector-matches-predicate? vectors idx pred))
+
+(defn- find-matching-row-indices
+  "Find row indices that match all predicates using columnar evaluation.
+   Returns a vector of matching indices, avoiding conversion of non-matching rows.
+
+   This is more efficient than converting all rows to maps then filtering because:
+   1. Only extracts values from columns referenced in predicates
+   2. Short-circuits on first failing predicate per row
+   3. Only matching rows will be fully converted to maps later"
+  [^VectorSchemaRoot root predicates]
+  (if (empty? predicates)
+    ;; No predicates - return nil to signal 'all rows match'
+    nil
+    ;; Build column name -> vector map for O(1) lookup
+    (let [vectors (into {}
+                        (for [^FieldVector v (.getFieldVectors root)]
+                          [(.getName (.getField v)) v]))
+          row-count (.getRowCount root)]
+      ;; For each row, check all predicates (AND semantics, short-circuit on failure)
+      (persistent!
+       (reduce
+        (fn [matches ^long i]
+          (if (every? #(row-matches-predicate-columnar? vectors i %) predicates)
+            (conj! matches i)
+            matches))
+        (transient [])
+        (range row-count))))))
+
+(defn- extract-row-at-index
+  "Extract a single row map at given index from VectorSchemaRoot.
+   Only called for rows that passed predicate filtering."
+  [field-vectors column-names ^long idx]
+  (into {}
+        (map (fn [^FieldVector v col-name]
+               [col-name (get-arrow-value v idx)])
+             field-vectors
+             column-names)))
+
+(defn- columnar-batch->filtered-rows
+  "Convert ColumnarBatch to row maps, filtering at columnar level first.
+
+   When predicates are provided:
+   1. Evaluate predicates directly on Arrow vectors (no map boxing)
+   2. Build list of matching row indices
+   3. Only convert matching rows to Clojure maps
+
+   This avoids creating map objects for filtered-out rows."
+  [^ColumnarBatch batch predicates]
+  (let [^VectorSchemaRoot root (.createVectorSchemaRootFromVectors batch)
+        field-vectors (.getFieldVectors root)
+        column-names (mapv #(.getName (.getField ^FieldVector %)) field-vectors)
+        matching-indices (find-matching-row-indices root predicates)]
+    (if matching-indices
+      ;; Predicates present - only convert matching rows
+      (map #(extract-row-at-index field-vectors column-names %) matching-indices)
+      ;; No predicates - convert all rows
+      (batch->row-maps root))))
+
 (defn arrow-batch-lazy-seq
   "Create lazy seq of row maps from ArrowReader's CloseableIterator.
 
-   Row-level filtering is applied here since Arrow reads only do file/row-group
-   pruning based on statistics. The predicates parameter enables Clojure-level
-   filtering of individual rows.
+   Row-level filtering is applied at the columnar level before converting to maps.
+   This is more efficient because:
+   1. Predicates are evaluated directly on Arrow vectors
+   2. Only matching rows are converted to Clojure maps
+   3. Non-matching rows never allocate map objects
 
    IMPORTANT: Resources are closed when:
    - The seq is fully consumed
@@ -257,9 +357,6 @@
   [^java.util.Iterator iter ^java.io.Closeable closeable predicates limit]
   (let [remaining (atom (or limit Long/MAX_VALUE))
         closed? (atom false)
-        row-filter (if (seq predicates)
-                     (partial row-matches-predicates? predicates)
-                     identity)
         close-all! (fn []
                      (when (compare-and-set! closed? false true)
                        (try
@@ -277,11 +374,8 @@
                  (.hasNext iter)
                  (try
                    (let [^ColumnarBatch batch (.next iter)
-                         all-rows (columnar-batch->row-maps batch)
-                         ;; Apply row-level filtering (Arrow only does file/row-group pruning)
-                         filtered-rows (if (seq predicates)
-                                         (filter row-filter all-rows)
-                                         all-rows)
+                         ;; Filter at columnar level - only converts matching rows to maps
+                         filtered-rows (columnar-batch->filtered-rows batch predicates)
                          limit-remaining @remaining
                          rows-to-take (take limit-remaining filtered-rows)
                          num-taken (count rows-to-take)]
@@ -418,6 +512,34 @@
         scan-tasks (.planTasks scan)
         iter (.open reader scan-tasks)]
     (arrow-batch-lazy-seq iter reader predicates limit)))
+
+;;; ---------------------------------------------------------------------------
+;;; IcebergGenerics Scan (non-vectorized, for comparison)
+;;; ---------------------------------------------------------------------------
+
+(defn scan-with-generics
+  "Execute an Iceberg table scan using IcebergGenerics (row-at-a-time).
+
+   This is slower than Arrow but useful for comparison/debugging.
+
+   Args:
+     table      - Iceberg Table instance
+     opts       - Scan options (same as scan-with-arrow)
+
+   Returns: lazy seq of row maps"
+  [^Table table {:keys [columns predicates limit]}]
+  (let [^Schema schema (.schema table)
+        builder (IcebergGenerics/read table)
+        ;; Apply column projection
+        builder (if (seq columns)
+                  (.select builder ^"[Ljava.lang.String;" (into-array String columns))
+                  builder)
+        ;; Apply predicate filter
+        builder (if (seq predicates)
+                  (.where builder (predicates->expression predicates))
+                  builder)
+        ^CloseableIterable rows (.build builder)]
+    (closeable-lazy-seq rows schema limit)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Supported Predicates
