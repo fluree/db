@@ -2,8 +2,7 @@
   (:require #?@(:clj  [[clojure.core.async :as async]
                        [clojure.tools.logging.readable :as log] ; readable variants use pr-str automatically
                        [fluree.db.util :refer [if-cljs]]
-                       [taoensso.telemere :as tel]
-                       [taoensso.telemere.tools-logging :as tel-log]]
+                       [taoensso.trove :as trove]]
                 :cljs [[goog.log :as glog]]))
   #?(:cljs (:require-macros [fluree.db.util.log :refer
                              [debug->val debug->>val debug-async->vals
@@ -12,8 +11,6 @@
                     [goog.log Level])))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-#?(:clj (tel-log/tools-logging->telemere!))
 
 #?(:cljs
    (def levels {:severe  Level.SEVERE
@@ -132,36 +129,22 @@
 #?(:clj
    (defmacro error!
      [id err data]
-     `(tel/error! {:level :info :id ~id :data ~data} ~err)))
+     `(trove/log! {:kind :log :level :info :id ~id :data ~data :error ~err})))
 
 #?(:clj
    (defmacro warn!
      [id data]
-     `(tel/log! {:level :warn :id ~id :data ~data})))
+     `(trove/log! {:level :warn :id ~id :data ~data})))
 
 #?(:clj
    (defmacro info!
      [id data & forms]
-     `(tel/trace! {:level :info :id ~id :data ~data} (do ~@forms))))
+     `(do (trove/log! {:level :info :id ~id :data ~data}) ~@forms)))
 
 #?(:clj
    (defmacro debug!
      [id data & forms]
-     `(tel/trace! {:level :debug :id ~id :data ~data} (do ~@forms))))
-
-(defn xf-debug-impl
-  "Logs the first time a transducer receives a value."
-  [id data]
-  (fn [rf]
-    (let [logged? (volatile! false)]
-      (fn
-        ([] (rf))
-        ([result x]
-         (when-not @logged?
-           (debug! id data)
-           (vreset! logged? true))
-         (rf result x))
-        ([result] (rf result))))))
+     `(do (trove/log! {:level :debug :id ~id :data ~data}) ~@forms)))
 
 #?(:clj
    (defmacro xf-debug!
@@ -181,4 +164,4 @@
 #?(:clj
    (defmacro trace!
      [id data]
-     `(tel/log! {:level :trace :id ~id :data ~data})))
+     `(trove/log! {:level :trace :id ~id :data ~data})))

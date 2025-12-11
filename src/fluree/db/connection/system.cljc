@@ -7,7 +7,6 @@
             [fluree.db.cache :as cache]
             [fluree.db.connection :as connection]
             [fluree.db.connection.config :as config]
-            [fluree.db.connection.telemetry.otel :as otel]
             [fluree.db.connection.vocab :as conn-vocab]
             [fluree.db.constants :as const]
             [fluree.db.flake.index.storage :as index-storage]
@@ -256,11 +255,6 @@
 (defmethod ig/init-key :fluree.db/connection
   [_ config]
   (-> config config/parse-connection-map connection/connect))
-
-(defmethod ig/init-key :fluree.db/telemetry
-  [_ config]
-  (-> (config/parse-telemetry config)
-      (otel/configure-otel)))
 
 (defn prepare
   [parsed-config]

@@ -16,12 +16,6 @@
 (def config-val-type
   (system-iri "ConfigurationValue"))
 
-(def telemetry-type
-  (system-iri "Telemetry"))
-
-(def telemetry-endpoint
-  (system-iri "telemetryEndpoint"))
-
 (def connection-type
   (system-iri "Connection"))
 
