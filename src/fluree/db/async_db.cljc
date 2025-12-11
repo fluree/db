@@ -50,6 +50,12 @@
       (let [db (<? db-chan)
             info (<? (dbproto/-ledger-info db))]
         info)))
+
+  (-index-range [_ idx test match opts]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (dbproto/-index-range db idx test match opts)))))
+
   where/Matcher
   (-match-id [_ tracker solution s-match error-ch]
     (let [match-ch (async/chan)]
