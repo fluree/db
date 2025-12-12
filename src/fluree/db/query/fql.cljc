@@ -1,5 +1,8 @@
 (ns fluree.db.query.fql
-  (:require [clojure.core.async :as async :refer [<! go]]
+  (:require #?(:clj  [clojure.edn :as edn]
+               :cljs [cljs.reader :as reader])
+            [clojure.core.async :as async :refer [<! go]]
+            [fluree.db.constants :as const]
             [fluree.db.dataset :as dataset]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
@@ -25,8 +28,8 @@
     (let [s (first select)]
       (when (string? s)
         (try
-          (let [form (#?(:clj clojure.core/read-string
-                         :cljs js/eval)
+          (let [form (#?(:clj  edn/read-string
+                         :cljs reader/read-string)
                       s)]
             (cond
               ;; (as (count-distinct ?v) ?alias)
@@ -66,55 +69,73 @@
   or nil if the optimization does not apply."
   [q]
   (when (map? q)
-    (let [{:keys [select where group-by groupBy having order-by orderBy values construct context]} q]
+    (let [{:keys [select where group-by groupBy having order-by orderBy values construct context limit offset opts]} q
+          select-one      (or (:select-one q) (:selectOne q))
+          select-distinct (or (:select-distinct q) (:selectDistinct q))
+          output          (or (:output opts) :fql)]
       (when (and (sequential? select)
                  (seq select)
+                 (nil? select-one)
+                 (nil? select-distinct)
                  ;; Guard against non-seq values in group-by keys (e.g. symbols or errors)
                  (not (or (and (sequential? group-by) (seq group-by))
                           (and (sequential? groupBy) (seq groupBy))))
                  (nil? having)
-                 (nil? (:having q))
                  (nil? order-by)
                  (nil? orderBy)
                  ;; Only treat :values as present if it's a non-empty sequential;
                  ;; avoid calling seq on non-sequential values.
                  (not (and (sequential? values) (seq values)))
                  (nil? construct)
+                 (or (nil? offset) (zero? offset))
+                 (or (nil? limit) (pos-int? limit))
                  (vector? where)
                  (= 1 (count where)))
         (when-let [{:keys [agg-var alias]} (parse-count-distinct-selector select)]
-          (let [subj-var-str (str agg-var)
-                clause       (first where)]
-            (when (and (map? clause)
-                       (= subj-var-str (get clause "@id")))
-              (let [pred-keys (remove #{"@id" "@context"} (keys clause))]
-                (when (= 1 (count pred-keys))
-                  (let [pred-key (first pred-keys)
-                        ;; Expand predicate using the query context so it matches
-                        ;; the IRI stored in flakes. Context must be parsed first.
-                        parsed-ctx (json-ld/parse-context context)
-                        pred-iri   (json-ld/expand-iri pred-key parsed-ctx)]
-                    {:subject-var subj-var-str
-                     :pred-iri    pred-iri
-                     :alias       alias}))))))))))
+          ;; SPARQL JSON output needs a binding variable name; require an alias.
+          (when (or (= :fql output)
+                    (and (= :sparql output) (some? alias)))
+            (let [subj-var-str (str agg-var)
+                  clause       (first where)]
+              (when (and (map? clause)
+                         (= subj-var-str (get clause "@id")))
+                (let [pred-keys (remove #{"@id" "@context"} (keys clause))]
+                  (when (= 1 (count pred-keys))
+                    (let [pred-key (first pred-keys)
+                          ;; Expand predicate using the query context so it matches
+                          ;; the IRI stored in flakes. Context must be parsed first.
+                          parsed-ctx (json-ld/parse-context context)
+                          pred-iri   (json-ld/expand-iri pred-key parsed-ctx)]
+                      {:subject-var subj-var-str
+                       :pred-iri    pred-iri
+                       :alias       alias
+                       :output      output})))))))))))
 
 (defn- count-distinct-subject-fast
   "Execute a simple COUNT(DISTINCT ?s) query directly against an index without
   building full query solutions.
 
-  Returns a channel containing a single FQL-style result vector [[n]].
+  Returns a channel containing either:
+    - FQL output: a single FQL-style result vector [[n]]
+    - SPARQL output: a SPARQL JSON results map
+
   Only used when simple-count-distinct-subject-spec has matched."
-  [ds {:keys [pred-iri]}]
+  [ds {:keys [pred-iri alias output]}]
   (go-try
     (let [;; unwrap dataset if present – for now we only handle a single active
           ;; graph, which matches the common FROM <graph> use case.
           db   (if (dataset/dataset? ds)
-                 (or (dataset/get-active-graph ds)
-                     ;; no active graph – behave like empty result
-                     (reduced nil))
+                 (dataset/get-active-graph ds)
                  ds)]
       (if (nil? db)
-        []
+        ;; Shouldn't happen with properly constructed DataSets, but handle gracefully.
+        (if (= :sparql output)
+          (let [v (-> alias name (subs 1))]
+            {"head" {"vars" [v]}
+             "results" {"bindings" [{v {"value" "0"
+                                        "type" "literal"
+                                        "datatype" const/iri-xsd-integer}}]}})
+          [[0]])
         (let [;; Scan the :post index for all flakes with the given predicate.
               ;; This returns a vector of flakes sorted by predicate, then
               ;; object, then subject. To ensure correctness even when a
@@ -131,9 +152,13 @@
                                      (transient #{})
                                      flakes))
               cnt          (count distinct-sids)]
-          ;; FQL :output :fql expects a vector of rows, each a vector of values.
-          ;; For COUNT queries there is a single row with a single numeric value.
-          [[cnt]])))))
+          (if (= :sparql output)
+            (let [v (-> alias name (subs 1))]
+              {"head" {"vars" [v]}
+               "results" {"bindings" [{v {"value" (str cnt)
+                                          "type" "literal"
+                                          "datatype" const/iri-xsd-integer}}]}})
+            [[cnt]]))))))
 (defn cache-query
   "Returns already cached query from cache if available, else
   executes and stores query into cache."
