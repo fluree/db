@@ -389,6 +389,69 @@
   [where-clause]
   (inline-where-clause where-clause #{}))
 
+(declare reorder-where-clause reorder-union-pattern)
+
+(defn reorder-union-pattern
+  "Reorder each branch of a union pattern. Returns a channel that yields a map
+  with keys `:clauses` and `:changed?` to indicate whether any branch changed."
+  [db union-pattern]
+  (go-try
+    (loop [remaining (where/pattern-data union-pattern)
+           clauses   []
+           changed?  false]
+      (if-let [clause (first remaining)]
+        (let [clause* (<? (reorder-where-clause db clause))]
+          (recur (rest remaining)
+                 (conj clauses clause*)
+                 (or changed? (not (identical? clause clause*)))))
+        (if changed?
+          (where/->pattern :union clauses)
+          union-pattern)))))
+
+(defn reorder-nested-clause
+  "Reorder nested patterns that contain where clauses.
+
+  Returns a channel yielding the updated pattern (or the original pattern when
+  no changes are necessary)."
+  [db pattern]
+  (go-try
+    (let [ptype (where/pattern-type pattern)]
+      (case ptype
+        (:optional :exists :not-exists :minus)
+        (let [clause  (where/pattern-data pattern)
+              clause* (<? (reorder-where-clause db clause))]
+          (if (identical? clause clause*)
+            pattern
+            (where/->pattern ptype clause*)))
+
+        :union
+        (<? (reorder-union-pattern db (where/pattern-data pattern)))
+
+        :graph
+        (let [[graph-clause where-clause] (where/pattern-data pattern)
+              where-clause*               (<? (reorder-where-clause db where-clause))]
+          (if (identical? where-clause where-clause*)
+            pattern
+            (where/->pattern ptype [graph-clause where-clause*])))
+
+        pattern))))
+
+(defn reorder-where-clause
+  "Recursively reorder a parsed where clause using the Optimizable protocol.
+  Returns a channel that yields the reordered clause or the original clause when
+  reordering is not possible."
+  [db clause]
+  (go-try
+    (if-not (seq clause)
+      clause
+      (let [top-level (<? (-reorder db clause))]
+        (loop [remaining top-level
+               acc       []]
+          (if-let [pattern (first remaining)]
+            (let [pattern* (<? (reorder-nested-clause db pattern))]
+              (recur (rest remaining) (conj acc pattern*)))
+            acc))))))
+
 (defn optimize
   "Optimize a parsed query by first reordering patterns based on statistics,
   then applying inline filter optimizations.
@@ -404,10 +467,10 @@
   [db parsed-query]
   (go-try
     (if-let [where-clause (-> parsed-query :where not-empty)]
-      (let [reordered-clause (<? (-reorder db where-clause))
-            context          (:context parsed-query)
+      (let [context         (:context parsed-query)
+            reordered-clause (<? (reorder-where-clause db where-clause))
             where-optimized  (->> reordered-clause
-                                 optimize-inline-filters
-                                 (compile-filter-codes context))]
+                                  optimize-inline-filters
+                                  (compile-filter-codes context))]
         (assoc parsed-query :where where-optimized))
       parsed-query)))
