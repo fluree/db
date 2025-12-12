@@ -1,17 +1,16 @@
 (ns fluree.db.query.fql
-  (:require #?(:clj  [clojure.edn :as edn]
-               :cljs [cljs.reader :as reader])
-            [clojure.core.async :as async :refer [<! go]]
+  (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.constants :as const]
             [fluree.db.dataset :as dataset]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.query.exec :as exec]
+            [fluree.db.query.exec.select :as select]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.optimize :as optimize]
             [fluree.db.util :as util :refer [try* catch*]]
-            [fluree.db.util.async :refer [go-try <?]]
-            [fluree.json-ld :as json-ld])
+            [fluree.db.util.async :refer [go-try <?]])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -19,97 +18,65 @@
 
 (declare query)
 
-(defn- parse-count-distinct-selector
-  "Given a FQL :select vector, detect a single COUNT(DISTINCT ?var) selector and
-  return {:agg-var sym, :alias sym-or-nil} if present."
-  [select]
-  (when (and (vector? select)
-             (= 1 (count select)))
-    (let [s (first select)]
-      (when (string? s)
-        (try
-          (let [form (#?(:clj  edn/read-string
-                         :cljs reader/read-string)
-                      s)]
-            (cond
-              ;; (as (count-distinct ?v) ?alias)
-              (and (seq? form)
-                   (= 'as (first form)))
-              (let [[_ inner alias] form]
-                (when (and (seq? inner)
-                           (= 'count-distinct (first inner))
-                           (= 2 (count inner)))
-                  {:agg-var (second inner)
-                   :alias   alias}))
+(defn- get-aggregate-info
+  "Extract aggregate metadata from a selector, if present."
+  [selector]
+  (-> selector meta ::select/aggregate-info))
 
-              ;; (count-distinct ?v)
-              (and (seq? form)
-                   (= 'count-distinct (first form))
-                   (= 2 (count form)))
-              {:agg-var (second form)
-               :alias   nil}
+(defn- simple-count-distinct-spec
+  "Check a PARSED query for a simple COUNT(DISTINCT ?s) pattern that can be
+  optimized with a direct index scan.
 
-              :else
-              nil))
-          (catch #?(:clj Exception :cljs :default) _nil
-            nil))))))
+  Requirements:
+    - Single selector that is a count-distinct aggregate
+    - Single tuple pattern in :where
+    - Subject is a variable matching the aggregated variable
+    - Predicate is a concrete IRI (not a variable)
+    - No GROUP BY, HAVING, ORDER BY, VALUES, or CONSTRUCT
 
-(defn- simple-count-distinct-subject-spec
-  "Detect a very simple COUNT(DISTINCT ?s) query shape that we can execute
-  directly against the index without building full solutions:
-
-    - single triple in :where
-    - single aggregate COUNT(DISTINCT ?s)
-    - no GROUP BY, HAVING, ORDER BY, VALUES, subqueries, or CONSTRUCT
-
-  Note: FROM clauses are ignored when a db is passed directly to query.
-  FROM is only meaningful for query-connection which loads ledgers.
-
-  Returns a spec map {:subject-var \"?s\", :pred-iri <iri>, :alias sym-or-nil}
+  Returns a spec map {:pred-iri <iri>, :alias sym-or-nil, :output keyword}
   or nil if the optimization does not apply."
-  [q]
-  (when (map? q)
-    (let [{:keys [select where group-by groupBy having order-by orderBy values construct context limit offset opts]} q
-          select-one      (or (:select-one q) (:selectOne q))
-          select-distinct (or (:select-distinct q) (:selectDistinct q))
-          output          (or (:output opts) :fql)]
-      (when (and (sequential? select)
-                 (seq select)
-                 (nil? select-one)
-                 (nil? select-distinct)
-                 ;; Guard against non-seq values in group-by keys (e.g. symbols or errors)
-                 (not (or (and (sequential? group-by) (seq group-by))
-                          (and (sequential? groupBy) (seq groupBy))))
-                 (nil? having)
-                 (nil? order-by)
-                 (nil? orderBy)
-                 ;; Only treat :values as present if it's a non-empty sequential;
-                 ;; avoid calling seq on non-sequential values.
-                 (not (and (sequential? values) (seq values)))
-                 (nil? construct)
-                 (or (nil? offset) (zero? offset))
-                 (or (nil? limit) (pos-int? limit))
-                 (vector? where)
-                 (= 1 (count where)))
-        (when-let [{:keys [agg-var alias]} (parse-count-distinct-selector select)]
-          ;; SPARQL JSON output needs a binding variable name; require an alias.
-          (when (or (= :fql output)
-                    (and (= :sparql output) (some? alias)))
-            (let [subj-var-str (str agg-var)
-                  clause       (first where)]
-              (when (and (map? clause)
-                         (= subj-var-str (get clause "@id")))
-                (let [pred-keys (remove #{"@id" "@context"} (keys clause))]
-                  (when (= 1 (count pred-keys))
-                    (let [pred-key (first pred-keys)
-                          ;; Expand predicate using the query context so it matches
-                          ;; the IRI stored in flakes. Context must be parsed first.
-                          parsed-ctx (json-ld/parse-context context)
-                          pred-iri   (json-ld/expand-iri pred-key parsed-ctx)]
-                      {:subject-var subj-var-str
-                       :pred-iri    pred-iri
-                       :alias       alias
-                       :output      output})))))))))))
+  [parsed-query]
+  (let [{:keys [select where group-by order-by having values construct opts]} parsed-query
+        output (or (:output opts) :fql)]
+    (when (and (vector? select)
+               (= 1 (count select))
+               (vector? where)
+               (= 1 (count where))
+               (nil? group-by)
+               (nil? order-by)
+               (nil? having)
+               (nil? values)
+               (nil? construct))
+      (let [selector  (first select)
+            agg-info  (get-aggregate-info selector)
+            pattern   (first where)
+            ;; Pattern is either a MapEntry (with type key) or plain tuple
+            ptype     (where/pattern-type pattern)
+            pdata     (where/pattern-data pattern)]
+        (when (and agg-info
+                   (= 'count-distinct (:fn-name agg-info))
+                   (= 1 (count (:vars agg-info)))
+                   (#{:tuple :class} ptype)
+                   (vector? pdata)
+                   (= 3 (count pdata)))
+          (let [[s-mch p-mch _o-mch] pdata
+                agg-var    (first (:vars agg-info))
+                subj-var   (where/get-variable s-mch)
+                pred-iri   (where/get-iri p-mch)
+                ;; For AsSelector, get the bind-var for the alias
+                alias      (when (instance? fluree.db.query.exec.select.AsSelector selector)
+                             (:bind-var selector))]
+            (when (and subj-var
+                       (= subj-var agg-var)
+                       pred-iri
+                       (not (where/get-variable p-mch)) ;; predicate must not be a variable
+                       ;; SPARQL output needs alias for binding name
+                       (or (= :fql output)
+                           (and (= :sparql output) (some? alias))))
+              {:pred-iri pred-iri
+               :alias    alias
+               :output   output})))))))
 
 (defn- count-distinct-subject-fast
   "Execute a simple COUNT(DISTINCT ?s) query directly against an index without
@@ -197,13 +164,11 @@
    (if (cache? query-map)
      (cache-query ds query-map)
      (go-try
-       (if-let [spec (simple-count-distinct-subject-spec query-map)]
-         ;; Fast path: execute simple COUNT(DISTINCT ?s) directly against index.
-         (<? (count-distinct-subject-fast ds spec))
-         ;; General path: full parse/optimize/exec pipeline.
-         (let [pq (parse/parse-query query-map)
-               oq (<? (optimize/optimize ds pq))]
-           (<? (exec/query ds tracker oq))))))))
+       (let [pq (parse/parse-query query-map)]
+         (if-let [spec (simple-count-distinct-spec pq)]
+           (<? (count-distinct-subject-fast ds spec))
+           (let [oq (<? (optimize/optimize ds pq))]
+             (<? (exec/query ds tracker oq)))))))))
 
 (defn explain
   "Returns query execution plan without executing the query.
