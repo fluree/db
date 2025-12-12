@@ -21,12 +21,22 @@
 ;;; IcebergSource Implementation (Hadoop-based)
 ;;; ---------------------------------------------------------------------------
 
+(defn- table-id->hadoop-path
+  "Convert table identifier to Hadoop path.
+
+   Accepts both canonical (namespace.table) and path (namespace/table) formats.
+   Always produces a slash-separated path for Hadoop filesystem access."
+  [warehouse-path table-name]
+  ;; Convert canonical format to path format if needed
+  (let [path-form (core/table-id->path table-name)]
+    (str warehouse-path "/" path-form)))
+
 (defrecord IcebergSource [^HadoopTables tables ^Configuration conf warehouse-path]
   proto/ITabularSource
 
   (scan-batches [_ table-name {:keys [columns predicates snapshot-id as-of-time batch-size limit]
                                :or {batch-size 4096}}]
-    (let [table-path (str warehouse-path "/" table-name)
+    (let [table-path (table-id->hadoop-path warehouse-path table-name)
           ^Table table (.load tables table-path)]
       (log/debug "IcebergSource scan-batches (Arrow):" {:table table-name
                                                         :batch-size batch-size
@@ -44,12 +54,12 @@
     (proto/scan-batches this table-name opts))
 
   (get-schema [_ table-name opts]
-    (let [table-path (str warehouse-path "/" table-name)
+    (let [table-path (table-id->hadoop-path warehouse-path table-name)
           ^Table table (.load tables table-path)]
       (core/extract-schema table opts)))
 
   (get-statistics [_ table-name opts]
-    (let [table-path (str warehouse-path "/" table-name)
+    (let [table-path (table-id->hadoop-path warehouse-path table-name)
           ^Table table (.load tables table-path)]
       (core/extract-statistics table opts)))
 

@@ -6,11 +6,13 @@
    - FlureeIcebergSource (Fluree FileIO, for production)
 
    Key components:
+   - Table identifiers: Canonical format and conversion utilities
    - Predicate translation: Convert internal predicates to Iceberg Expressions
    - Arrow reading: Vectorized batch reading with row-level filtering
    - Type mapping: Iceberg types to Clojure keywords
    - Table scanning: Build scans with projections and pushdown"
-  (:require [fluree.db.util.log :as log])
+  (:require [clojure.string :as str]
+            [fluree.db.util.log :as log])
   (:import [java.nio ByteBuffer]
            [java.time Instant]
            [org.apache.arrow.vector VectorSchemaRoot FieldVector
@@ -26,6 +28,115 @@
            [org.apache.iceberg.types Conversions Type Types$NestedField]))
 
 (set! *warn-on-reflection* true)
+
+;;; ---------------------------------------------------------------------------
+;;; Table Identifier Utilities
+;;; ---------------------------------------------------------------------------
+;;
+;; Canonical Format: "namespace.table" (e.g., "openflights.airlines")
+;;
+;; Different catalog types use different formats:
+;; - REST catalogs:  "namespace.table" (canonical)
+;; - Hadoop paths:   "namespace/table" (slash-separated)
+;; - Multi-level:    "db.schema.table" -> ["db" "schema"] namespace + "table"
+;;
+;; These utilities ensure consistent handling across all catalog types.
+
+(defn parse-table-identifier
+  "Parse a table identifier into namespace and table components.
+
+   Supports multiple formats:
+   - Canonical (dot): 'namespace.table' or 'ns1.ns2.table'
+   - Path (slash):    'namespace/table' or 'ns1/ns2/table'
+
+   Returns: {:namespace 'ns1.ns2' :table 'table'}
+
+   The namespace is always returned in dot-separated format (canonical)."
+  [table-id]
+  (cond
+    ;; Slash-separated (path format)
+    (str/includes? table-id "/")
+    (let [parts (str/split table-id #"/")
+          namespace (str/join "." (butlast parts))
+          table (last parts)]
+      {:namespace namespace :table table})
+
+    ;; Dot-separated (canonical format)
+    (str/includes? table-id ".")
+    (let [last-dot (str/last-index-of table-id ".")
+          namespace (subs table-id 0 last-dot)
+          table (subs table-id (inc last-dot))]
+      {:namespace namespace :table table})
+
+    ;; No separator - just a table name, no namespace
+    :else
+    {:namespace nil :table table-id}))
+
+(defn canonical-table-id
+  "Convert a table identifier to canonical format (namespace.table).
+
+   Handles:
+   - Already canonical: 'ns.table' -> 'ns.table'
+   - Path format:       'ns/table' -> 'ns.table'
+   - Multi-level:       'db/schema/table' -> 'db.schema.table'"
+  [table-id]
+  (if (str/includes? table-id "/")
+    (str/replace table-id "/" ".")
+    table-id))
+
+(defn table-id->path
+  "Convert a table identifier to path format (namespace/table).
+
+   Used for Hadoop-based catalogs that expect path-separated identifiers.
+
+   Examples:
+   - 'ns.table' -> 'ns/table'
+   - 'db.schema.table' -> 'db/schema/table'"
+  [table-id]
+  (str/replace table-id "." "/"))
+
+(defn table-id->rest-path
+  "Convert a table identifier to REST API path format.
+
+   REST catalogs use URL-encoded paths with unit separator (\\u001F) for
+   multi-level namespaces.
+
+   Returns: {:namespace-path 'encoded-ns' :table 'table'}
+
+   Example:
+   - 'openflights.airlines' -> {:namespace-path 'openflights' :table 'airlines'}
+   - 'db.schema.table' -> {:namespace-path 'db%1Fschema' :table 'table'}"
+  [table-id]
+  (let [{:keys [namespace table]} (parse-table-identifier table-id)]
+    (when namespace
+      {:namespace-path (-> namespace
+                           (str/replace "." "\u001F")
+                           (java.net.URLEncoder/encode "UTF-8"))
+       :table table})))
+
+(defn namespace-levels
+  "Split a namespace into its component levels.
+
+   Examples:
+   - 'openflights' -> ['openflights']
+   - 'db.schema' -> ['db' 'schema']"
+  [namespace-str]
+  (when namespace-str
+    (str/split namespace-str #"\.")))
+
+(defn join-table-id
+  "Join namespace and table into canonical table identifier.
+
+   Examples:
+   - 'openflights' 'airlines' -> 'openflights.airlines'
+   - ['db' 'schema'] 'table' -> 'db.schema.table'"
+  [namespace table]
+  (let [ns-str (if (sequential? namespace)
+                 (str/join "." namespace)
+                 namespace)]
+    (if ns-str
+      (str ns-str "." table)
+      table)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Predicate Translation

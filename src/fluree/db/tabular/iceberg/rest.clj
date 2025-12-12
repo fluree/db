@@ -59,25 +59,17 @@
 
 (defn- get-table-metadata-location
   "Get the metadata-location for a table from the REST catalog API.
-   table-name should be in format 'namespace.tablename' or 'ns1.ns2.tablename' for multi-level."
+
+   Uses canonical table identifier format (namespace.table).
+   Multi-level namespaces are supported (e.g., db.schema.table)."
   [uri auth-token table-name]
-  ;; Split on last dot to separate namespace from table name
-  (let [last-dot (str/last-index-of table-name ".")
-        [ns-part table-part] (if last-dot
-                               [(subs table-name 0 last-dot)
-                                (subs table-name (inc last-dot))]
-                               [nil table-name])
-        _ (when-not ns-part
-            (throw (ex-info "Table name must include namespace prefix"
-                            {:table-name table-name})))
-        ;; URL-encode namespace for multi-level namespaces
-        encoded-ns (-> ns-part
-                       (str/replace "." "\u001F")
-                       (java.net.URLEncoder/encode "UTF-8"))
-        path (str "/v1/namespaces/" encoded-ns "/tables/" table-part)
-        response (rest-request uri path auth-token)]
-    (when response
-      (:metadata-location response))))
+  (if-let [{:keys [namespace-path table]} (core/table-id->rest-path table-name)]
+    (let [path (str "/v1/namespaces/" namespace-path "/tables/" table)
+          response (rest-request uri path auth-token)]
+      (when response
+        (:metadata-location response)))
+    (throw (ex-info "Table name must include namespace prefix"
+                    {:table-name table-name}))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; REST Iceberg Source (Fluree FileIO mode)
@@ -141,16 +133,15 @@
 
   (list-tables [_ namespace-name]
     ;; URL-encode namespace for multi-level namespaces (e.g., "db.schema" -> "db%1Fschema")
-    ;; REST catalogs expect unit separator (\u001F) between namespace levels
-    (let [encoded-ns (-> namespace-name
-                         (str/replace "." "\u001F")
-                         (java.net.URLEncoder/encode "UTF-8"))
-          path (str "/v1/namespaces/" encoded-ns "/tables")
+    ;; Use a dummy table name with table-id->rest-path to get encoded namespace
+    (let [{:keys [namespace-path]} (core/table-id->rest-path (str namespace-name ".dummy"))
+          path (str "/v1/namespaces/" namespace-path "/tables")
           response (rest-request uri path auth-token)]
       (if response
         (->> (:identifiers response)
              (mapv (fn [{:keys [namespace] table-name :name}]
-                     (str (str/join "." namespace) "." table-name))))
+                     ;; Use join-table-id for consistent canonical formatting
+                     (core/join-table-id namespace table-name))))
         (throw (ex-info (str "Failed to list tables in namespace: " namespace-name)
                         {:error :db/catalog-error :namespace namespace-name :uri uri})))))
 
