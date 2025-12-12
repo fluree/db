@@ -44,28 +44,27 @@
 (defprotocol Optimizable
   "Protocol for query optimization based on database statistics."
 
-  (-reorder [db parsed-query]
-    "Reorder query patterns based on database statistics.
+  (-reorder [db where-clause]
+    "Reorder the patterns within a parsed where clause based on database statistics.
 
-    Returns a channel that will contain the optimized query with patterns
-    reordered for optimal execution. If the database has no statistics
-    available, returns the query unchanged.
+    Returns a channel that will contain the reordered where clause. If the
+    database has no statistics available, returns the clause unchanged.
 
     Parameters:
-      db - The database (FlakeDB, AsyncDB, etc.)
-      parsed-query - The parsed query from fql/parse-query
+      db           - Database instance (FlakeDB, AsyncDB, etc.)
+      where-clause - Parsed where clause (vector of patterns)
 
     Returns:
-      Channel containing optimized query")
+      Channel containing reordered where clause")
 
   (-explain [db parsed-query]
     "Generate an execution plan for the query showing optimization details.
 
-    Returns a channel that will contain a query plan map
+    Returns a channel that will contain a query plan map.
 
     Parameters:
-      db - The database (FlakeDB, AsyncDB, etc.)
-      parsed-query - The parsed query from fql/parse-query
+      db           - Database instance (FlakeDB, AsyncDB, etc.)
+      parsed-query - Parsed query produced by `fql/parse-query`
 
     Returns:
       Channel containing query plan map"))
@@ -404,13 +403,11 @@
     Channel containing optimized query with inlined filters compiled"
   [db parsed-query]
   (go-try
-    (let [;; First apply statistical optimization (reordering patterns)
-          reordered-query (<? (-reorder db parsed-query))
-          context         (:context reordered-query)]
-      ;; Then apply inline filter optimization
-      (if-let [where (:where reordered-query)]
-        (let [where-optimized  (->> where
-                                    optimize-inline-filters
-                                    (compile-filter-codes context))]
-          (assoc reordered-query :where where-optimized))
-        reordered-query))))
+    (if-let [where-clause (-> parsed-query :where not-empty)]
+      (let [reordered-clause (<? (-reorder db where-clause))
+            context          (:context parsed-query)
+            where-optimized  (->> reordered-clause
+                                 optimize-inline-filters
+                                 (compile-filter-codes context))]
+        (assoc parsed-query :where where-optimized))
+      parsed-query)))
