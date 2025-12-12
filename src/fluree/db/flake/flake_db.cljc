@@ -329,6 +329,9 @@
                            :t       index-t
                            :address index-address}})))
 
+  (-index-range [db idx test match opts]
+    (query-range/index-range db (:tracker opts) idx test match (dissoc opts :tracker)))
+
   iri/IRICodec
   (encode-iri [_ iri]
     (iri/iri->sid iri namespaces))

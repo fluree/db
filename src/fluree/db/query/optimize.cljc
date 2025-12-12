@@ -277,11 +277,12 @@
   (go-try
     (let [;; First apply statistical optimization (reordering patterns)
           reordered-query (<? (-reorder db parsed-query))
-          context         (:context reordered-query)]
-      ;; Then apply inline filter optimization
-      (if-let [where (:where reordered-query)]
-        (let [where-optimized  (->> where
-                                    optimize-inline-filters
-                                    (compile-filter-codes context))]
-          (assoc reordered-query :where where-optimized))
-        reordered-query))))
+          context         (:context reordered-query)
+          ;; Then apply inline filter optimization
+          reordered-query (if-let [where (:where reordered-query)]
+                            (let [where-optimized (->> where
+                                                       optimize-inline-filters
+                                                       (compile-filter-codes context))]
+                              (assoc reordered-query :where where-optimized))
+                            reordered-query)]
+      reordered-query)))

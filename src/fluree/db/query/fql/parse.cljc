@@ -660,14 +660,25 @@
   (let [parsed-fn  (parse-code f)
         fn-name    (some-> parsed-fn second first)
         bind-var   (last parsed-fn)
-        aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
+        aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))
+        agg-vars   (variables parsed-fn)
+        agg-info   (when aggregate?
+                     {:fn-name fn-name
+                      :vars    agg-vars})]
     (-> parsed-fn
         (eval/compile context)
-        (select/as-selector output bind-var aggregate?))))
+        (select/as-selector output bind-var aggregate? agg-info))))
 
 (defn parse-select-aggregate
   [f context]
-  (-> f parse-code (eval/compile context) select/aggregate-selector))
+  (let [parsed   (parse-code f)
+        fn-name  (when (seq? parsed) (first parsed))
+        agg-vars (variables parsed)
+        agg-info {:fn-name fn-name
+                  :vars    agg-vars}]
+    (-> parsed
+        (eval/compile context)
+        (select/aggregate-selector agg-info))))
 
 (defn reverse?
   [context k]

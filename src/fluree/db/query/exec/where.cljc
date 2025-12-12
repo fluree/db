@@ -850,13 +850,19 @@
   in subsequent patterns so that we don't erroneously consider them unmatched and
   therefore able to match any value."
   [solution optional-vars]
-  (reduce (fn [solution* var]
-            (update solution* var (fn [match]
-                                    (if (nil? match)
-                                      (optional-var var)
-                                      match))))
-          solution
-          optional-vars))
+  (if (empty? optional-vars)
+    solution
+    ;; Use a transient map so we can add optional vars in a single pass
+    ;; with `assoc!` while keeping the original persistent map semantics.
+    (let [t-solution (transient solution)]
+      (persistent!
+       (reduce (fn [sol var]
+                 (let [match (get sol var)]
+                   (if (nil? match)
+                     (assoc! sol var (optional-var var))
+                     sol)))
+               t-solution
+               optional-vars)))))
 
 (defmethod match-pattern :optional
   [db tracker solution pattern error-ch]
@@ -900,30 +906,47 @@
 
 (defn binding->solution
   [solution vars binding]
-  (reduce (fn [solution* var]
-            (if-let [{type "type" v "value" dt "datatype" lang "xml:lang"}
-                     (get binding var)]
-              (let [var-name (symbol (str "?" var))
-                    mch      (cond (= "literal" type)
-                                   (cond-> (-> (unmatched-var var-name)
-                                               (match-value v dt))
-                                     lang (match-lang v lang))
-                                   (#{"uri" "bnode"} type)
-                                   (-> (unmatched-var var-name)
-                                       (match-iri v))
-                                   :else
-                                   (throw (ex-info "Invalid SPARQL Query Results JSON Format."
-                                                   {:status 400, :error :db/invalid-query
-                                                    :spec "https://www.w3.org/TR/sparql11-results-json"
-                                                    :binding binding})))]
-                (or
-                  ;; add new var binding to solution
-                 (update-solution-binding solution* var-name mch)
-                  ;; already have a binding for the given var, no join
-                 (reduced nil)))
-              solution*))
-          solution
-          vars))
+  ;; Build up a solution for this SPARQL binding using a transient map so
+  ;; multiple var additions happen against a single, mutable backing map.
+  ;; This mirrors `update-solution-binding` semantics while avoiding repeated
+  ;; persistent map churn in tight loops.
+  (let [t-solution (transient solution)]
+    (loop [sol t-solution
+           vs  vars]
+      (if-let [var (first vs)]
+        (if-let [{type "type" v "value" dt "datatype" lang "xml:lang"}
+                 (get binding var)]
+          (let [var-name (symbol (str "?" var))
+                mch      (cond
+                           (= "literal" type)
+                           (cond-> (-> (unmatched-var var-name)
+                                       (match-value v dt))
+                             lang (match-lang v lang))
+
+                           (#{"uri" "bnode"} type)
+                           (-> (unmatched-var var-name)
+                               (match-iri v))
+
+                           :else
+                           (throw (ex-info "Invalid SPARQL Query Results JSON Format."
+                                           {:status 400, :error :db/invalid-query
+                                            :spec "https://www.w3.org/TR/sparql11-results-json"
+                                            :binding binding})))
+                current  (get sol var-name)]
+            ;; If there is an existing binding for this var, only keep it if it
+            ;; exactly matches; otherwise abort the join for this binding.
+            (if current
+              (if (and (= (get-binding mch) (get-binding current))
+                       (= (get-datatype-iri mch) (get-datatype-iri current))
+                       (= (get-lang mch) (get-lang current)))
+                (recur sol (rest vs))
+                ;; conflicting binding – no join for this binding
+                nil)
+              (recur (assoc! sol var-name mch) (rest vs))))
+          ;; No binding for this var in this row; move on.
+          (recur sol (rest vs)))
+        ;; All vars processed successfully – return persistent solution.
+        (persistent! sol)))))
 
 (defn sparql-service-error!
   [ex service sparql-q]
