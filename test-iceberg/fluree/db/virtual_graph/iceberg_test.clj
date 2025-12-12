@@ -475,16 +475,16 @@
         (is (contains? (:sources vg) "openflights/airports"))
         (is (contains? (:sources vg) "openflights/routes"))
 
-        ;; Verify routing indexes were built
+        ;; Verify routing indexes were built (multi-map structure for Bug #3 fix)
         (let [routing (:routing-indexes vg)]
-          (is (some? (:class->mapping routing))
-              "Should have class->mapping index")
-          (is (some? (:predicate->mapping routing))
-              "Should have predicate->mapping index")
+          (is (some? (:class->mappings routing))
+              "Should have class->mappings index")
+          (is (some? (:predicate->mappings routing))
+              "Should have predicate->mappings index")
           ;; Check class mappings
-          (is (contains? (:class->mapping routing) "http://example.org/Airline"))
-          (is (contains? (:class->mapping routing) "http://example.org/Airport"))
-          (is (contains? (:class->mapping routing) "http://example.org/Route")))))))
+          (is (contains? (:class->mappings routing) "http://example.org/Airline"))
+          (is (contains? (:class->mappings routing) "http://example.org/Airport"))
+          (is (contains? (:class->mappings routing) "http://example.org/Route")))))))
 
 (deftest multi-table-routing-indexes-test
   (when (and (warehouse-exists?) (multi-table-mapping-exists?))
@@ -493,18 +493,19 @@
                                    :config {:warehouse-path warehouse-path
                                             :mapping multi-table-mapping-path}})
             routing (:routing-indexes vg)
-            pred->mapping (:predicate->mapping routing)]
-        ;; Airline predicates should route to airlines table
+            ;; Multi-map structure: predicate -> [mapping1 mapping2 ...]
+            pred->mappings (:predicate->mappings routing)]
+        ;; Airline predicates should route to airlines table (first mapping)
         (is (= "openflights/airlines"
-               (get-in pred->mapping ["http://example.org/callsign" :table])))
+               (:table (first (get pred->mappings "http://example.org/callsign")))))
 
         ;; Airport predicates should route to airports table
         (is (= "openflights/airports"
-               (get-in pred->mapping ["http://example.org/city" :table])))
+               (:table (first (get pred->mappings "http://example.org/city")))))
 
         ;; Route predicates should route to routes table
         (is (= "openflights/routes"
-               (get-in pred->mapping ["http://example.org/sourceAirport" :table])))))))
+               (:table (first (get pred->mappings "http://example.org/sourceAirport")))))))))
 
 (deftest multi-table-single-table-query-test
   (when (and (warehouse-exists?) (multi-table-mapping-exists?))

@@ -339,7 +339,7 @@
    ensuring filters are only pushed down to the table that owns that predicate.
    Values are coerced based on column datatype from mapping."
   [patterns pushable-analyses mappings routing-indexes]
-  (let [pred->mapping (:predicate->mapping routing-indexes)]
+  (let [pred->mappings (:predicate->mappings routing-indexes)]
     (reduce
      (fn [patterns {:keys [comparisons vars]}]
        (let [var (first vars)
@@ -348,7 +348,8 @@
            ;; Find the predicate IRI that binds this var
            (let [pred-iri (var->predicate-iri patterns var)
                  ;; Use routing to find the correct mapping for this predicate
-                 routed-mapping (get pred->mapping pred-iri)
+                 ;; Takes first when multiple mappings exist
+                 routed-mapping (first (get pred->mappings pred-iri))
                  ;; Get the full object-map for column and datatype
                  obj-map (get-in routed-mapping [:predicates pred-iri])
                  column (when (and obj-map (= :column (:type obj-map)))
@@ -497,13 +498,14 @@
    Uses routing-indexes to ensure the IN predicate is only pushed to the
    table that owns the column. Values are coerced based on column datatype."
   [patterns values-predicates mappings routing-indexes]
-  (let [pred->mapping (:predicate->mapping routing-indexes)]
+  (let [pred->mappings (:predicate->mappings routing-indexes)]
     (reduce
      (fn [patterns {:keys [var values]}]
        (let [binding-idx (find-first-binding-pattern patterns var)]
          (if binding-idx
            (let [pred-iri (var->predicate-iri patterns var)
-                 routed-mapping (get pred->mapping pred-iri)
+                 ;; Takes first when multiple mappings exist
+                 routed-mapping (first (get pred->mappings pred-iri))
                  obj-map (get-in routed-mapping [:predicates pred-iri])
                  column (when (and obj-map (= :column (:type obj-map)))
                           (:value obj-map))

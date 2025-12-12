@@ -26,23 +26,31 @@
 (defn build-routing-indexes
   "Build indexes for routing patterns to the correct table.
 
+   Uses multi-maps to support multiple tables mapping the same class/predicate.
+   This is common in RDF where the same predicate may appear in multiple tables.
+
    Returns:
-     {:class->mapping {rdf-class -> mapping}
-      :predicate->mapping {predicate-iri -> mapping}}"
+     {:class->mappings {rdf-class -> [mapping...]}
+      :predicate->mappings {predicate-iri -> [mapping...]}}"
   [mappings]
-  (let [class->mapping (->> mappings
-                            vals
-                            (filter :class)
-                            (map (fn [m] [(:class m) m]))
-                            (into {}))
-        predicate->mapping (->> mappings
-                                vals
-                                (mapcat (fn [m]
-                                          (for [pred (keys (:predicates m))]
-                                            [pred m])))
-                                (into {}))]
-    {:class->mapping class->mapping
-     :predicate->mapping predicate->mapping}))
+  (let [;; Build class -> [mappings] multi-map
+        class->mappings (->> mappings
+                             vals
+                             (filter :class)
+                             (reduce (fn [acc m]
+                                       (update acc (:class m) (fnil conj []) m))
+                                     {}))
+        ;; Build predicate -> [mappings] multi-map
+        predicate->mappings (->> mappings
+                                 vals
+                                 (reduce (fn [acc m]
+                                           (reduce (fn [a pred]
+                                                     (update a pred (fnil conj []) m))
+                                                   acc
+                                                   (keys (:predicates m))))
+                                         {}))]
+    {:class->mappings class->mappings
+     :predicate->mappings predicate->mappings}))
 
 (defn- extract-pattern-info
   "Extract type and predicates from a pattern item."
@@ -67,15 +75,18 @@
    Uses the routing indexes to determine which table handles each pattern.
    Patterns are grouped by subject variable to keep related patterns together.
 
+   Note: When multiple tables map the same class/predicate, the first mapping
+   is used. For multi-table joins, use find-all-mappings instead.
+
    Returns: [{:mapping mapping :patterns [...]} ...]"
   [patterns mappings routing-indexes]
-  (let [{:keys [class->mapping predicate->mapping]} routing-indexes
+  (let [{:keys [class->mappings predicate->mappings]} routing-indexes
         pattern-infos (map extract-pattern-info patterns)
 
-        ;; Find mapping for each pattern
+        ;; Find mapping for each pattern (takes first when multiple exist)
         find-mapping (fn [{:keys [rdf-type predicate]}]
-                       (or (when rdf-type (get class->mapping rdf-type))
-                           (when predicate (get predicate->mapping predicate))
+                       (or (when rdf-type (first (get class->mappings rdf-type)))
+                           (when predicate (first (get predicate->mappings predicate)))
                            (first (vals mappings))))
 
         ;; Group by subject variable first, then by mapping

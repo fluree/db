@@ -46,7 +46,7 @@
 (defrecord IcebergDatabase [alias config sources mappings routing-indexes time-travel query-pushdown]
   ;; sources: {table-name -> IcebergSource}
   ;; mappings: {table-key -> {:table, :class, :predicates, ...}}
-  ;; routing-indexes: {:class->mapping {...} :predicate->mapping {...}}
+  ;; routing-indexes: {:class->mappings {rdf-class -> [mappings...]}, :predicate->mappings {pred -> [mappings...]}}
   ;; query-pushdown: atom holding query-time pushdown predicates (set in -reorder, used in -finalize)
 
   vg/UpdatableVirtualGraph
@@ -96,11 +96,14 @@
           values-pushdown (when query-pushdown @query-pushdown)]
       (when (seq values-pushdown)
         (log/debug "Iceberg -finalize using VALUES pushdown from atom:" values-pushdown))
+      ;; Use pipeline-async with thread (not go) for blocking I/O operations
+      ;; Iceberg queries involve lazy seq realization with actual I/O, which would
+      ;; block the limited go thread pool and cause contention under load
       (async/pipeline-async
        2
        out-ch
        (fn [solution ch]
-         (go
+         (async/thread
            (try
              (let [patterns (get solution ::iceberg-patterns)]
                (if (seq patterns)
@@ -125,7 +128,7 @@
                          (let [solutions (query/execute-iceberg-query source mapping patterns solution
                                                                       time-travel nil solution-pushdown)]
                            (doseq [sol solutions]
-                             (async/>! ch sol))
+                             (async/>!! ch sol))
                            (async/close! ch)))
                        ;; Multiple tables - nested loop join
                        (let [execute-group (fn [base-solution {:keys [mapping patterns]}]
@@ -153,13 +156,13 @@
                                                   initial-solutions
                                                   (rest pattern-groups))]
                              (doseq [sol final-solutions]
-                               (async/>! ch sol))
+                               (async/>!! ch sol))
                              (async/close! ch)))))))
-                 (do (async/>! ch solution)
+                 (do (async/>!! ch solution)
                      (async/close! ch))))
              (catch Exception e
                (log/error e "Error in Iceberg query execution")
-               (async/>! error-ch e)
+               (async/>!! error-ch e)
                (async/close! ch)))))
        solution-ch)
       out-ch))
@@ -167,6 +170,9 @@
   optimize/Optimizable
   (-reorder [_ parsed-query]
     (go
+      ;; Clear any stale VALUES pushdown from previous queries
+      (when query-pushdown
+        (reset! query-pushdown nil))
       (let [where-patterns (:where parsed-query)]
         (if (seq where-patterns)
           ;; Separate different pattern types
@@ -193,8 +199,9 @@
                    (let [binding-idx (pushdown/find-first-binding-pattern other-patterns var)]
                      (if binding-idx
                        (let [pred-iri (pushdown/var->predicate-iri other-patterns var)
-                             pred->mapping (:predicate->mapping routing-indexes)
-                             routed-mapping (get pred->mapping pred-iri)
+                             pred->mappings (:predicate->mappings routing-indexes)
+                             ;; Takes first when multiple mappings exist
+                             routed-mapping (first (get pred->mappings pred-iri))
                              obj-map (get-in routed-mapping [:predicates pred-iri])
                              column (when (and obj-map (= :column (:type obj-map)))
                                       (:value obj-map))
@@ -232,8 +239,9 @@
                                          (let [binding-idx (pushdown/find-first-binding-pattern other-patterns var)]
                                            (when binding-idx
                                              (let [pred-iri (pushdown/var->predicate-iri other-patterns var)
-                                                   pred->mapping (:predicate->mapping routing-indexes)
-                                                   routed-mapping (get pred->mapping pred-iri)
+                                                   pred->mappings (:predicate->mappings routing-indexes)
+                                                   ;; Takes first when multiple mappings exist
+                                                   routed-mapping (first (get pred->mappings pred-iri))
                                                    column (when routed-mapping
                                                             (when-let [obj-map (get-in routed-mapping [:predicates pred-iri])]
                                                               (when (= :column (:type obj-map))
@@ -308,8 +316,7 @@
                             :pushed-ops (mapv #(-> % :comparisons first :op) pushable)
                             :values-patterns (count values-patterns)
                             :values-in-predicates (count values-predicates)
-                            :values-vars (mapv :var values-predicates)}}))) ;; closes -explain
-) ;; closes defrecord IcebergDatabase
+                            :values-vars (mapv :var values-predicates)}}))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Factory
