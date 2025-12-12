@@ -452,6 +452,17 @@
               (recur (rest remaining) (conj acc pattern*)))
             acc))))))
 
+(defn optimize-where-clause
+  "Optimize a parsed where clause by reordering patterns, inlining filters, and
+  compiling filter code. Returns a channel yielding the optimized clause or the
+  original clause when optimization is unnecessary."
+  [db context where-clause]
+  (go-try
+    (let [reordered (<? (reorder-where-clause db where-clause))]
+      (->> reordered
+           optimize-inline-filters
+           (compile-filter-codes context)))))
+
 (defn optimize
   "Optimize a parsed query by first reordering patterns based on statistics,
   then applying inline filter optimizations.
@@ -467,10 +478,7 @@
   [db parsed-query]
   (go-try
     (if-let [where-clause (-> parsed-query :where not-empty)]
-      (let [context         (:context parsed-query)
-            reordered-clause (<? (reorder-where-clause db where-clause))
-            where-optimized  (->> reordered-clause
-                                  optimize-inline-filters
-                                  (compile-filter-codes context))]
+      (let [context        (:context parsed-query)
+            where-optimized (<? (optimize-where-clause db context where-clause))]
         (assoc parsed-query :where where-optimized))
       parsed-query)))
