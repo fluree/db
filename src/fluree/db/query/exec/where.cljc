@@ -500,7 +500,10 @@
            p (or (get-sid p-mch db)
                  (get-value p-mch))
            o (or (get-value o-mch)
-                 (get-sid o-mch db))]
+                 (get-sid o-mch db))
+           ;; Optional range constraint extracted from inlined single-var filters.
+           ;; Used to narrow scans by setting start/end object bounds when possible.
+           o-range (::range o-mch)]
        (if (or (not (comparable-iri? s))
                (not (comparable-iri? p)))
          ;; no flakes will ever match the given triple pattern
@@ -516,8 +519,17 @@
                                        (log/error e "Error resolving flake range")
                                        (async/put! error-ch e))))
                [o* o-fn*]  (augment-object-fn db idx* s p o o-fn)
-               start-flake (flake/create s p o* o-dt nil nil util/min-integer)
-               end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
+               ;; Use range bounds from filter analysis when object isn't explicitly bound
+               o-start     (cond
+                             (some? o*) o*
+                             (some? (:start-o o-range)) (:start-o o-range)
+                             :else nil)
+               o-end       (cond
+                             (some? o*) o*
+                             (some? (:end-o o-range)) (:end-o o-range)
+                             :else nil)
+               start-flake (flake/create s p o-start o-dt nil nil util/min-integer)
+               end-flake   (flake/create s p o-end o-dt nil nil util/max-integer)
                track-fuel  (track/track-fuel! tracker error-ch)
                subj-filter (when s-fn
                              (filter (fn [f]

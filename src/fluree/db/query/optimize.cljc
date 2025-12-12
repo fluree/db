@@ -99,9 +99,101 @@
 
 (defn with-filter-code
   "Attach filter code to a match object for later compilation.
-  Stores the code and variable in metadata for later compilation."
+  Stores the code and variable in metadata for later compilation.
+
+  Also extracts range bounds from simple comparison filters like:
+    (< ?v n), (<= ?v n), (> ?v n), (>= ?v n)
+  and nested (and ...) combinations of those.
+
+  Stores derived range on the match object as ::where/range with :start-o / :end-o."
   [mch variable codes]
-  (assoc mch ::filter-code {:variable variable, :forms codes}))
+  (let [cmp-ops #{'> '>= '< '<=}
+
+        ;; Extract comparison forms from potentially nested (and ...) expressions
+        comparison-forms (fn comparison-forms [form]
+                           (cond
+                             (and (seq? form) (= 'and (first form)))
+                             (mapcat comparison-forms (rest form))
+
+                             (and (seq? form) (contains? cmp-ops (first form)))
+                             [form]
+
+                             :else
+                             []))
+
+        ;; Convert a single comparison form to a range bound
+        form->range (fn [form]
+                      (when (and (seq? form) (= 3 (count form)))
+                        (let [[op a b] form]
+                          (when (contains? cmp-ops op)
+                            (cond
+                              ;; (< ?v 10) means ?v < 10, so upper bound
+                              (and (= a variable) (number? b))
+                              (case op
+                                >  {:lower {:value b :strict? true}}
+                                >= {:lower {:value b :strict? false}}
+                                <  {:upper {:value b :strict? true}}
+                                <= {:upper {:value b :strict? false}})
+
+                              ;; (< 10 ?v) means 10 < ?v, so lower bound
+                              (and (number? a) (= b variable))
+                              (case op
+                                >  {:upper {:value a :strict? true}}
+                                >= {:upper {:value a :strict? false}}
+                                <  {:lower {:value a :strict? true}}
+                                <= {:lower {:value a :strict? false}})
+
+                              :else
+                              nil)))))
+
+        ;; Pick the tighter of two bounds
+        tighter-bound (fn [a b pick-fn]
+                        (cond
+                          (nil? a) b
+                          (nil? b) a
+                          :else
+                          (let [va (:value a)
+                                vb (:value b)
+                                c  (compare va vb)]
+                            (pick-fn a b c))))
+
+        ;; Merge two range maps, keeping tighter bounds
+        merge-bounds (fn [r1 r2]
+                       (when (or r1 r2)
+                         (let [l1 (:lower r1) l2 (:lower r2)
+                               u1 (:upper r1) u2 (:upper r2)
+                               ;; For lower bound, pick the larger value (tighter constraint)
+                               lower (tighter-bound l1 l2 (fn [a b c] (if (neg? c) b a)))
+                               ;; For upper bound, pick the smaller value (tighter constraint)
+                               upper (tighter-bound u1 u2 (fn [a b c] (if (pos? c) b a)))]
+                           (cond-> {}
+                             lower (assoc :lower lower)
+                             upper (assoc :upper upper)))))
+
+        ;; Convert a bound to a scan value, handling strict bounds for doubles
+        bound->scan-val (fn [{:keys [value strict?]} dir]
+                          (if (and strict?
+                                   (instance? #?(:clj Double :cljs js/Number) value))
+                            (case dir
+                              :lower #?(:clj (Math/nextUp (double value))
+                                        :cljs (+ value js/Number.EPSILON))
+                              :upper #?(:clj (Math/nextDown (double value))
+                                        :cljs (- value js/Number.EPSILON)))
+                            value))
+
+        ;; Extract range from all filter codes
+        range-from-codes (let [ranges (->> codes
+                                           (mapcat comparison-forms)
+                                           (keep form->range))]
+                           (when (seq ranges)
+                             (let [r (reduce merge-bounds nil ranges)]
+                               (when (seq r)
+                                 (cond-> r
+                                   (:lower r) (assoc :start-o (bound->scan-val (:lower r) :lower))
+                                   (:upper r) (assoc :end-o (bound->scan-val (:upper r) :upper)))))))]
+
+    (cond-> (assoc mch ::filter-code {:variable variable, :forms codes})
+      range-from-codes (assoc ::where/range range-from-codes))))
 
 (defn with-var-filter
   "Add filter code to the match object for the variable in tuple."
