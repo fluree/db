@@ -8,14 +8,29 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn- dissoc-many
+  "Like `dissoc`, but accepts a set of keys and is implemented via a single
+  pass over `m` using transients to reduce allocations. Returns a persistent
+  map."
+  [m ks-set]
+  (if (or (nil? m) (empty? ks-set))
+    m
+    (persistent!
+     (reduce-kv (fn [m* k v]
+                  (if (contains? ks-set k)
+                    m*
+                    (assoc! m* k v)))
+                (transient {})
+                m))))
+
 (defn split-solution-by
-  [variables solution]
+  [variables variable-set solution]
   (let [group-key   (mapv (fn [v]
                             (-> solution
                                 (get v)
                                 where/sanitize-match))
                           variables)
-        grouped-val (apply dissoc solution variables)]
+        grouped-val (dissoc-many solution variable-set)]
     [group-key grouped-val]))
 
 (defn assoc-coll
@@ -35,19 +50,27 @@
 
 (defn unwind-groups
   [grouping groups]
-  (reduce-kv (fn [solutions group-key grouped-vals]
-               (let [merged-vals (->> grouped-vals
-                                      (reduce merge-with-colls {})
-                                      (reduce-kv (fn [soln var val]
-                                                   (let [match (-> var
-                                                                   where/unmatched-var
-                                                                   (where/match-value val ::grouping))]
-                                                     (assoc soln var match)))
-                                                 {}))
-                     solution    (into merged-vals
-                                       (map vector grouping group-key))]
-                 (conj solutions solution)))
-             [] groups))
+  (persistent!
+   (reduce-kv
+    (fn [solutions group-key grouped-vals]
+      (let [merged-vals (reduce merge-with-colls {} grouped-vals)
+            merged-vals* (persistent!
+                          (reduce-kv
+                           (fn [soln var val]
+                             (let [match (-> var
+                                             where/unmatched-var
+                                             (where/match-value val ::grouping))]
+                               (assoc! soln var match)))
+                           (transient merged-vals)
+                           merged-vals))
+            solution     (persistent!
+                          (reduce (fn [soln [var val]]
+                                    (assoc! soln var val))
+                                  (transient merged-vals*)
+                                  (map vector grouping group-key)))]
+        (conj! solutions solution)))
+    (transient [])
+    groups)))
 
 (defn implicit-grouping
   [select]
@@ -92,6 +115,7 @@
   [{:keys [group-by select having]} solution-ch]
   (let [selectors      (util/sequential select)
         group-vars     (vec group-by)
+        group-vars-set (set group-vars)
         ;; Extract streaming-agg from record fields
         streaming-aggs (->> selectors
                             (keep get-streaming-agg)
@@ -108,7 +132,7 @@
                             (every? (fn [sel]
                                       (cond
                                         (instance? fluree.db.query.exec.select.VariableSelector sel)
-                                        (contains? (set group-vars) (:var sel))
+                                        (contains? group-vars-set (:var sel))
 
                                         (instance? fluree.db.query.exec.select.AggregateSelector sel)
                                         (some? (:streaming-agg sel))
@@ -124,7 +148,7 @@
       ;; avoid collecting full grouped value collections.
       (let [update-groups
             (fn [groups solution]
-              (let [[group-key _] (split-solution-by group-vars solution)
+              (let [[group-key _] (split-solution-by group-vars group-vars-set solution)
                     {:keys [group-vars-map agg-states]}
                     (get groups group-key
                          {:group-vars-map (zipmap group-vars group-key)
@@ -170,10 +194,11 @@
       ;; matches for collection-based aggregate evaluation.
       (if-let [grouping (or group-by
                             (implicit-grouping select))]
-        (-> (async/transduce (map (partial split-solution-by grouping))
-                             (completing group-solution
-                                         (partial unwind-groups grouping))
-                             {}
-                             solution-ch)
-            (async/pipe (async/chan 2 cat)))
+        (let [grouping-set (set grouping)]
+          (-> (async/transduce (map (partial split-solution-by grouping grouping-set))
+                               (completing group-solution
+                                           (partial unwind-groups grouping))
+                               {}
+                               solution-ch)
+              (async/pipe (async/chan 2 cat))))
         solution-ch))))

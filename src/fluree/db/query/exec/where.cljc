@@ -519,10 +519,7 @@
                                        (log/error e "Error resolving flake range")
                                        (async/put! error-ch e))))
                [o* o-fn*]  (augment-object-fn db idx* s p o o-fn)
-               ;; If the object isn't explicitly bound, but we have a derived
-               ;; range (e.g. from FILTER(?o > 0.4)), use it to narrow the scan
-               ;; interval. This is especially impactful for :post scans where
-               ;; predicate is fixed and object is the next comparator key.
+               ;; Use range bounds from filter analysis when object isn't explicitly bound
                o-start     (cond
                              (some? o*) o*
                              (some? (:start-o o-range)) (:start-o o-range)

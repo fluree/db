@@ -700,21 +700,30 @@
         fn-name       (when (seq? inner-form) (first inner-form))
         bind-var      (last parsed-fn)
         aggregate?    (when fn-name (eval/allowed-aggregate-fns fn-name))
+        agg-vars      (variables parsed-fn)
         ;; For AS-wrapped aggregates, detect if the inner is streamable
         streaming-agg (when aggregate?
                         (when-let [sagg (build-streaming-agg inner-form)]
                           ;; Override result-var with the explicit bind-var from AS
-                          (assoc sagg :result-var bind-var)))]
+                          (assoc sagg :result-var bind-var)))
+        ;; Aggregate info for count-distinct optimization
+        agg-info      (when aggregate?
+                        {:fn-name fn-name
+                         :vars    agg-vars})]
     (-> parsed-fn
         (eval/compile context)
-        (select/as-selector output bind-var aggregate? streaming-agg))))
+        (select/as-selector output bind-var aggregate? streaming-agg agg-info))))
 
 (defn parse-select-aggregate
   [f context]
-  (let [code         (parse-code f)
-        agg-fn       (eval/compile code context)
-        streaming-agg (build-streaming-agg code)]
-    (select/aggregate-selector agg-fn streaming-agg)))
+  (let [code          (parse-code f)
+        fn-name       (when (seq? code) (first code))
+        agg-vars      (variables code)
+        agg-fn        (eval/compile code context)
+        streaming-agg (build-streaming-agg code)
+        agg-info      {:fn-name fn-name
+                       :vars    agg-vars}]
+    (select/aggregate-selector agg-fn streaming-agg agg-info)))
 
 (defn reverse?
   [context k]

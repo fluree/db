@@ -97,93 +97,142 @@
   [tuple variable]
   (some #(binds-var? % variable) tuple))
 
+;; --- Range extraction helpers for filter pushdown ---
+
+(def ^:private comparison-ops
+  "Set of comparison operators that can be used to derive range bounds."
+  #{'> '>= '< '<=})
+
+(defn- scalar-literal?
+  "Returns true if x is a scalar literal (number or string) that can be used
+  as a range bound."
+  [x]
+  (or (number? x) (string? x)))
+
+(defn- extract-comparison-forms
+  "Extract comparison forms from potentially nested (and ...) expressions.
+  Returns a sequence of comparison forms."
+  [form]
+  (cond
+    (and (seq? form) (= 'and (first form)))
+    (mapcat extract-comparison-forms (rest form))
+
+    (and (seq? form) (contains? comparison-ops (first form)))
+    [form]
+
+    :else
+    []))
+
+(defn- comparison-form->range
+  "Convert a single comparison form to a range bound map.
+  Returns nil if the form doesn't match the expected pattern.
+
+  Examples:
+    (> ?v 10)  with variable=?v -> {:lower {:value 10 :strict? true}}
+    (< 5 ?v)  with variable=?v -> {:lower {:value 5 :strict? true}}"
+  [form variable]
+  (when (and (seq? form) (= 3 (count form)))
+    (let [[op a b] form]
+      (when (contains? comparison-ops op)
+        (cond
+          ;; (< ?v 10) means ?v < 10, so upper bound
+          (and (= a variable) (scalar-literal? b))
+          (case op
+            >  {:lower {:value b :strict? true}}
+            >= {:lower {:value b :strict? false}}
+            <  {:upper {:value b :strict? true}}
+            <= {:upper {:value b :strict? false}})
+
+          ;; (< 10 ?v) means 10 < ?v, so lower bound
+          (and (scalar-literal? a) (= b variable))
+          (case op
+            >  {:upper {:value a :strict? true}}
+            >= {:upper {:value a :strict? false}}
+            <  {:lower {:value a :strict? true}}
+            <= {:lower {:value a :strict? false}})
+
+          :else
+          nil)))))
+
+(defn- tighter-bound
+  "Pick the tighter of two bounds using pick-fn to decide based on comparison.
+  pick-fn receives [bound-a bound-b comparison-result] and returns the tighter bound."
+  [a b pick-fn]
+  (cond
+    (nil? a) b
+    (nil? b) a
+    :else
+    (let [va (:value a)
+          vb (:value b)
+          c  (compare va vb)]
+      (pick-fn a b c))))
+
+(defn- merge-range-bounds
+  "Merge two range maps, keeping tighter bounds.
+  For lower bounds, picks the larger value. For upper bounds, picks the smaller value.
+  When values are equal, prefers strict bounds (> or <) over non-strict (>= or <=)."
+  [r1 r2]
+  (when (or r1 r2)
+    (let [l1 (:lower r1) l2 (:lower r2)
+          u1 (:upper r1) u2 (:upper r2)
+          ;; For lower bound, pick the larger value (tighter constraint)
+          lower (tighter-bound l1 l2 (fn [a b c]
+                                       (cond
+                                         (neg? c) b
+                                         (pos? c) a
+                                         ;; equal values - prefer strict bounds
+                                         :else (if (:strict? a) a b))))
+          ;; For upper bound, pick the smaller value (tighter constraint)
+          upper (tighter-bound u1 u2 (fn [a b c]
+                                       (cond
+                                         (pos? c) b
+                                         (neg? c) a
+                                         ;; equal values - prefer strict bounds
+                                         :else (if (:strict? a) a b))))]
+      (cond-> {}
+        lower (assoc :lower lower)
+        upper (assoc :upper upper)))))
+
+(defn- bound->scan-value
+  "Convert a bound to a scan value for index range queries.
+  For strict bounds on doubles (CLJ only), uses nextUp/nextDown to adjust the value
+  so the range scan excludes the boundary value.
+  In CLJS, returns the value as-is and relies on the filter fn to enforce strictness."
+  [{:keys [value strict?]} direction]
+  (if (and strict?
+           #?(:clj (instance? Double value) :cljs false))
+    (case direction
+      :lower #?(:clj (Math/nextUp (double value)) :cljs value)
+      :upper #?(:clj (Math/nextDown (double value)) :cljs value))
+    value))
+
+(defn- extract-range-from-codes
+  "Extract a range map from filter code forms for a given variable.
+  Returns a map with :start-o and/or :end-o keys for index scanning,
+  or nil if no range bounds could be extracted."
+  [codes variable]
+  (let [ranges (->> codes
+                    (mapcat extract-comparison-forms)
+                    (keep #(comparison-form->range % variable)))]
+    (when (seq ranges)
+      (let [r (reduce merge-range-bounds nil ranges)]
+        (when (seq r)
+          (cond-> r
+            (:lower r) (assoc :start-o (bound->scan-value (:lower r) :lower))
+            (:upper r) (assoc :end-o (bound->scan-value (:upper r) :upper))))))))
+
 (defn with-filter-code
   "Attach filter code to a match object for later compilation.
-  Stores the code and variable in metadata for later compilation."
+  Stores the code and variable in metadata for later compilation.
+
+  Also extracts range bounds from simple comparison filters like:
+    (< ?v n), (<= ?v n), (> ?v n), (>= ?v n)
+    (< ?v \"str\"), (<= ?v \"str\"), (> ?v \"str\"), (>= ?v \"str\")
+  and nested (and ...) combinations of those.
+
+  Stores derived range on the match object as ::where/range with :start-o / :end-o."
   [mch variable codes]
-  (let [cmp-ops #{'> '>= '< '<=}
-        ;; Extract simple comparison forms from a possibly nested filter form.
-        ;; We only extract comparisons that are safe to treat as range bounds:
-        ;; - (and ...) is flattened
-        ;; - (or ...) is ignored (cannot safely convert to a single range)
-        ;; - only binary comparisons against a literal number are considered
-        comparison-forms (fn comparison-forms [form]
-                           (cond
-                             (and (seq? form) (= 'and (first form)))
-                             (mapcat comparison-forms (rest form))
-
-                             (and (seq? form) (contains? cmp-ops (first form)))
-                             [form]
-
-                             :else
-                             []))
-        ;; Given a comparison form, derive a lower/upper bound on `variable` if possible.
-        ;; Returns {:lower {:value n :strict? bool} :upper ...} with only one side set, or nil.
-        form->range (fn [form]
-                      (when (and (seq? form) (= 3 (count form)))
-                        (let [[op a b] form]
-                          (when (contains? cmp-ops op)
-                            (cond
-                              ;; (?v op n)
-                              (and (= a variable) (number? b))
-                              (case op
-                                >  {:lower {:value b :strict? true}}
-                                >= {:lower {:value b :strict? false}}
-                                <  {:upper {:value b :strict? true}}
-                                <= {:upper {:value b :strict? false}})
-
-                              ;; (n op ?v)  ==>  ?v (invert op) n
-                              (and (number? a) (= b variable))
-                              (case op
-                                >  {:upper {:value a :strict? true}}   ;; a > ?v  =>  ?v < a
-                                >= {:upper {:value a :strict? false}}  ;; a >= ?v =>  ?v <= a
-                                <  {:lower {:value a :strict? true}}   ;; a < ?v  =>  ?v > a
-                                <= {:lower {:value a :strict? false}}) ;; a <= ?v =>  ?v >= a
-
-                              :else
-                              nil)))))
-        ;; Merge two bound maps by taking the tighter range:
-        ;; - lower bound: max
-        ;; - upper bound: min
-        tighter-bound (fn [a b pick-fn]
-                        (cond
-                          (nil? a) b
-                          (nil? b) a
-                          :else
-                          (let [va (:value a)
-                                vb (:value b)
-                                c  (compare va vb)]
-                            (pick-fn a b c))))
-        merge-bounds (fn [r1 r2]
-                       (when (or r1 r2)
-                         (let [l1 (:lower r1) l2 (:lower r2)
-                               u1 (:upper r1) u2 (:upper r2)
-                               ;; for lower: choose larger value; if equal prefer non-strict? false? doesn't matter much
-                               lower (tighter-bound l1 l2 (fn [a b c] (if (neg? c) b a)))
-                               ;; for upper: choose smaller value
-                               upper (tighter-bound u1 u2 (fn [a b c] (if (pos? c) b a)))]
-                           (cond-> {}
-                             lower (assoc :lower lower)
-                             upper (assoc :upper upper)))))
-        ;; Convert strict bounds to inclusive scan boundaries when possible.
-        ;; For strict comparisons on Doubles we can use nextUp/nextDown to avoid
-        ;; scanning equality values. For other numeric types we keep the same
-        ;; boundary and rely on the filter function to enforce strictness.
-        bound->scan-val (fn [{:keys [value strict?]} dir]
-                          (if (and strict? (instance? #?(:clj Double :cljs js/Number) value))
-                            (case dir
-                              :lower (Math/nextUp (double value))
-                              :upper (Math/nextDown (double value)))
-                            value))
-        range-from-codes (let [ranges (->> codes
-                                           (mapcat comparison-forms)
-                                           (keep form->range))]
-                           (when (seq ranges)
-                             (let [r (reduce merge-bounds nil ranges)]
-                               (when (seq r)
-                                 (cond-> r
-                                   (:lower r) (assoc :start-o (bound->scan-val (:lower r) :lower))
-                                   (:upper r) (assoc :end-o   (bound->scan-val (:upper r) :upper)))))))]
+  (let [range-from-codes (extract-range-from-codes codes variable)]
     (cond-> (assoc mch ::filter-code {:variable variable, :forms codes})
       range-from-codes (assoc ::where/range range-from-codes))))
 
