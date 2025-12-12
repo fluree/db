@@ -103,11 +103,15 @@
 
   Also extracts range bounds from simple comparison filters like:
     (< ?v n), (<= ?v n), (> ?v n), (>= ?v n)
+    (< ?v \"str\"), (<= ?v \"str\"), (> ?v \"str\"), (>= ?v \"str\")
   and nested (and ...) combinations of those.
 
   Stores derived range on the match object as ::where/range with :start-o / :end-o."
   [mch variable codes]
   (let [cmp-ops #{'> '>= '< '<=}
+        scalar-literal? (fn [x]
+                          (or (number? x)
+                              (string? x)))
 
         ;; Extract comparison forms from potentially nested (and ...) expressions
         comparison-forms (fn comparison-forms [form]
@@ -128,7 +132,7 @@
                           (when (contains? cmp-ops op)
                             (cond
                               ;; (< ?v 10) means ?v < 10, so upper bound
-                              (and (= a variable) (number? b))
+                              (and (= a variable) (scalar-literal? b))
                               (case op
                                 >  {:lower {:value b :strict? true}}
                                 >= {:lower {:value b :strict? false}}
@@ -136,7 +140,7 @@
                                 <= {:upper {:value b :strict? false}})
 
                               ;; (< 10 ?v) means 10 < ?v, so lower bound
-                              (and (number? a) (= b variable))
+                              (and (scalar-literal? a) (= b variable))
                               (case op
                                 >  {:upper {:value a :strict? true}}
                                 >= {:upper {:value a :strict? false}}
@@ -165,23 +169,23 @@
                                ;; For lower bound, pick the larger value (tighter constraint)
                                ;; If values are equal, prefer strict bounds (>) over non-strict (>=)
                                lower (tighter-bound l1 l2 (fn [a b c]
-                                                           (cond
-                                                             (neg? c) b
-                                                             (pos? c) a
+                                                            (cond
+                                                              (neg? c) b
+                                                              (pos? c) a
                                                              ;; equal numeric value
-                                                             :else (if (= (:strict? a) (:strict? b))
-                                                                     a
-                                                                     (if (:strict? a) a b)))))
+                                                              :else (if (= (:strict? a) (:strict? b))
+                                                                      a
+                                                                      (if (:strict? a) a b)))))
                                ;; For upper bound, pick the smaller value (tighter constraint)
                                ;; If values are equal, prefer strict bounds (<) over non-strict (<=)
                                upper (tighter-bound u1 u2 (fn [a b c]
-                                                           (cond
-                                                             (pos? c) b
-                                                             (neg? c) a
+                                                            (cond
+                                                              (pos? c) b
+                                                              (neg? c) a
                                                              ;; equal numeric value
-                                                             :else (if (= (:strict? a) (:strict? b))
-                                                                     a
-                                                                     (if (:strict? a) a b)))))]
+                                                              :else (if (= (:strict? a) (:strict? b))
+                                                                      a
+                                                                      (if (:strict? a) a b)))))]
                            (cond-> {}
                              lower (assoc :lower lower)
                              upper (assoc :upper upper)))))
