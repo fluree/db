@@ -612,7 +612,12 @@
      table      - Iceberg Table instance
      opts       - Scan options (same as scan-with-arrow)
 
-   Returns: lazy seq of row maps"
+   Returns: lazy seq of row maps
+
+   Resource Safety:
+     If an exception occurs during scan setup, resources are cleaned up before
+     re-throwing. Once the lazy seq is returned, resource cleanup is handled
+     by closeable-lazy-seq (closes on exhaustion, limit, or exception)."
   [^Table table {:keys [columns predicates limit]}]
   (let [^Schema schema (.schema table)
         builder (IcebergGenerics/read table)
@@ -625,7 +630,81 @@
                   (.where builder (predicates->expression predicates))
                   builder)
         ^CloseableIterable rows (.build builder)]
-    (closeable-lazy-seq rows schema limit)))
+    (try
+      (closeable-lazy-seq rows schema limit)
+      (catch Exception e
+        ;; Clean up if setup fails before lazy-seq takes ownership
+        (try (.close rows) (catch Exception _ nil))
+        (throw e)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Safe Reducible Scan (guaranteed resource cleanup)
+;;; ---------------------------------------------------------------------------
+
+(defn reduce-arrow-scan
+  "Execute an Iceberg table scan with guaranteed resource cleanup.
+
+   Unlike scan-with-arrow which returns a lazy seq, this function uses
+   reduce semantics for guaranteed cleanup. The ArrowReader is always
+   closed, even if the reduction is short-circuited via `reduced`.
+
+   Args:
+     table      - Iceberg Table instance
+     opts       - Scan options (same as scan-with-arrow)
+     f          - Reducing function (fn [acc row-map] ...)
+     init       - Initial accumulator value
+
+   Returns: Final accumulated value
+
+   Example:
+     ;; Count rows
+     (reduce-arrow-scan table {} (fn [n _] (inc n)) 0)
+
+     ;; Collect first 10 rows
+     (reduce-arrow-scan table {:limit 10}
+       (fn [acc row] (conj acc row)) [])"
+  [^Table table opts f init]
+  (let [{:keys [columns predicates snapshot-id as-of-time batch-size limit]
+         :or {batch-size 4096}} opts
+        ^TableScan scan (build-table-scan table {:columns columns
+                                                 :predicates predicates
+                                                 :snapshot-id snapshot-id
+                                                 :as-of-time as-of-time})
+        ^ArrowReader reader (ArrowReader. scan (int batch-size) false)]
+    (try
+      (let [scan-tasks (.planTasks scan)
+            iter (.open reader scan-tasks)
+            remaining (atom (or limit Long/MAX_VALUE))]
+        (loop [acc init]
+          (cond
+            ;; Limit reached
+            (<= @remaining 0) acc
+
+            ;; More batches available
+            (.hasNext iter)
+            (let [^ColumnarBatch batch (.next iter)
+                  filtered-rows (columnar-batch->filtered-rows batch predicates)
+                  limit-remaining @remaining]
+              (let [result (reduce
+                            (fn [acc' row]
+                              (if (<= @remaining 0)
+                                (reduced acc')
+                                (do
+                                  (swap! remaining dec)
+                                  (let [res (f acc' row)]
+                                    (if (reduced? res)
+                                      res
+                                      res)))))
+                            acc
+                            (take limit-remaining filtered-rows))]
+                (if (reduced? result)
+                  @result
+                  (recur result))))
+
+            ;; No more batches
+            :else acc)))
+      (finally
+        (.close reader)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Supported Predicates
