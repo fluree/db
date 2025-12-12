@@ -163,22 +163,39 @@
                          (let [l1 (:lower r1) l2 (:lower r2)
                                u1 (:upper r1) u2 (:upper r2)
                                ;; For lower bound, pick the larger value (tighter constraint)
-                               lower (tighter-bound l1 l2 (fn [a b c] (if (neg? c) b a)))
+                               ;; If values are equal, prefer strict bounds (>) over non-strict (>=)
+                               lower (tighter-bound l1 l2 (fn [a b c]
+                                                           (cond
+                                                             (neg? c) b
+                                                             (pos? c) a
+                                                             ;; equal numeric value
+                                                             :else (if (= (:strict? a) (:strict? b))
+                                                                     a
+                                                                     (if (:strict? a) a b)))))
                                ;; For upper bound, pick the smaller value (tighter constraint)
-                               upper (tighter-bound u1 u2 (fn [a b c] (if (pos? c) b a)))]
+                               ;; If values are equal, prefer strict bounds (<) over non-strict (<=)
+                               upper (tighter-bound u1 u2 (fn [a b c]
+                                                           (cond
+                                                             (pos? c) b
+                                                             (neg? c) a
+                                                             ;; equal numeric value
+                                                             :else (if (= (:strict? a) (:strict? b))
+                                                                     a
+                                                                     (if (:strict? a) a b)))))]
                            (cond-> {}
                              lower (assoc :lower lower)
                              upper (assoc :upper upper)))))
 
         ;; Convert a bound to a scan value, handling strict bounds for doubles
         bound->scan-val (fn [{:keys [value strict?]} dir]
+                          ;; In CLJ we can precisely shift strict bounds using nextUp/nextDown.
+                          ;; In CLJS we keep the bound as-is and rely on the filter fn to enforce strictness,
+                          ;; because a naive EPSILON adjustment is not generally correct across magnitudes.
                           (if (and strict?
-                                   (instance? #?(:clj Double :cljs js/Number) value))
+                                   #?(:clj (instance? Double value) :cljs false))
                             (case dir
-                              :lower #?(:clj (Math/nextUp (double value))
-                                        :cljs (+ value js/Number.EPSILON))
-                              :upper #?(:clj (Math/nextDown (double value))
-                                        :cljs (- value js/Number.EPSILON)))
+                              :lower (Math/nextUp (double value))
+                              :upper (Math/nextDown (double value)))
                             value))
 
         ;; Extract range from all filter codes
