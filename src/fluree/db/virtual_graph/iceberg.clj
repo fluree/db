@@ -449,8 +449,13 @@
                               (get config "metadata-location")
                               (get config "metadataLocation"))
 
-        _ (when-not (or warehouse-path store)
-            (throw (ex-info "Iceberg virtual graph requires :warehouse-path or :store"
+        ;; Catalog config (REST)
+        catalog (or (:catalog config) (get config "catalog"))
+        catalog-type (keyword (or (:type catalog) (get catalog "type")))
+        rest-catalog? (= catalog-type :rest)
+
+        _ (when-not (or warehouse-path store rest-catalog?)
+            (throw (ex-info "Iceberg virtual graph requires :warehouse-path, :store, or REST :catalog"
                             {:error :db/invalid-config :config config})))
 
         ;; Get mapping
@@ -473,12 +478,28 @@
                          distinct)
 
         ;; Create source factory function
-        create-source-fn (if store
+        create-source-fn (cond
+                           store
                            #(iceberg/create-fluree-iceberg-source
                              {:store store
                               :warehouse-path (or warehouse-path "")})
+
+                           (= catalog-type :rest)
+                           #(iceberg/create-rest-iceberg-source
+                             {:uri (or (:uri catalog) (get catalog "uri"))
+                              :warehouse (or (:warehouse catalog) (get catalog "warehouse"))
+                              :auth-token (or (:auth-token catalog) (get catalog "auth-token"))
+                              :headers (or (:headers catalog) (get catalog "headers"))
+                              :properties (or (:properties catalog) (get catalog "properties"))})
+
+                           :else
                            #(iceberg/create-iceberg-source
                              {:warehouse-path warehouse-path}))
+
+        backend-desc (cond
+                       store "store-backed"
+                       rest-catalog? (str "rest:" (or (:uri catalog) (get catalog "uri")))
+                       :else (str "warehouse:" warehouse-path))
 
         ;; Create an IcebergSource for each unique table
         ;; Note: Currently we use the same source for all tables in the same warehouse
@@ -490,8 +511,7 @@
         ;; Build routing indexes for efficient pattern-to-table mapping
         routing-indexes (query/build-routing-indexes mappings)]
 
-    (log/info "Created Iceberg virtual graph:" base-alias
-              (if store "store-backed" (str "warehouse:" warehouse-path))
+    (log/info "Created Iceberg virtual graph:" base-alias backend-desc
               "tables:" (vec table-names)
               "mappings:" (count mappings))
 

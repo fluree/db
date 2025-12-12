@@ -266,6 +266,64 @@
 
 (declare with-retries parse-list-objects-response)
 
+;; HTTP client for binary requests (avoids xhttp which uses String body handlers)
+(def ^:private ^java.net.http.HttpClient binary-http-client
+  (-> (java.net.http.HttpClient/newBuilder)
+      (.connectTimeout (java.time.Duration/ofSeconds 30))
+      (.build)))
+
+(defn s3-get-binary
+  "Make an S3 GET request returning raw bytes.
+   This bypasses xhttp to properly handle binary data like Parquet/Avro files."
+  [{:keys [bucket region path credentials request-timeout endpoint headers]
+    :or   {request-timeout 20000 headers {}}}]
+  (go-try
+    (let [start        (System/nanoTime)
+          encoded-path (encode-s3-path path)
+          query-string nil  ;; No query params for simple GET
+          url          (str (build-s3-url bucket region encoded-path endpoint)
+                            (when query-string (str "?" query-string)))
+          signed-hdrs  (sign-request {:method       "GET"
+                                      :path         encoded-path
+                                      :headers      headers
+                                      :payload      nil
+                                      :region       region
+                                      :bucket       bucket
+                                      :credentials  credentials
+                                      :query-params nil
+                                      :endpoint     endpoint})
+          ;; Build request with signed headers
+          builder      (-> (java.net.http.HttpRequest/newBuilder)
+                           (.uri (java.net.URI/create url))
+                           (.timeout (java.time.Duration/ofMillis request-timeout))
+                           (.GET))
+          _            (doseq [[k v] signed-hdrs]
+                         (.header builder k v))
+          request      (.build builder)
+          ;; Use byte array body handler for binary data
+          response     (.send binary-http-client request
+                              (java.net.http.HttpResponse$BodyHandlers/ofByteArray))
+          status       (.statusCode response)
+          body         (.body response)]
+      (log/trace "s3-get-binary done" {:bucket      bucket
+                                       :path        encoded-path
+                                       :status      status
+                                       :size        (when body (alength body))
+                                       :duration-ms (long (/ (- (System/nanoTime) start)
+                                                             1000000))})
+      (cond
+        (= status 404)
+        (throw (ex-info "Not found" {:status 404 :path path}))
+
+        (< 299 status)
+        (throw (ex-info (str "S3 error: " status)
+                        {:status status :path path}))
+
+        :else
+        {:status  status
+         :body    body
+         :headers {}}))))
+
 (defn s3-request
   "Make an S3 REST API request"
   [{:keys [method bucket region path headers body credentials query-params request-timeout endpoint]
@@ -525,11 +583,24 @@
     (write-s3-data this path bytes))
 
   (read-bytes [this path]
-    (go-try
-      (let [resp (<? (read-s3-data this path))]
-        (when-not (or (= resp ::not-found)
-                      (nil? resp))
-          (.getBytes ^String (:body resp))))))
+    ;; Use s3-get-binary for proper binary data handling (Parquet, Avro, etc.)
+    (let [{:keys [base-credentials bucket region prefix endpoint read-timeout-ms]} this
+          credentials (get-credentials bucket region base-credentials)
+          full-path   (str prefix path)]
+      (go-try
+        (try
+          (let [resp (<? (s3-get-binary {:bucket          bucket
+                                         :region          region
+                                         :path            full-path
+                                         :credentials     credentials
+                                         :endpoint        endpoint
+                                         :request-timeout read-timeout-ms}))]
+            (:body resp))
+          (catch Exception e
+            ;; Return nil for not-found to match expected behavior
+            (if (= 404 (:status (ex-data e)))
+              nil
+              (throw e)))))))
 
   (swap-bytes [this path f]
     (go-try

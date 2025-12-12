@@ -189,6 +189,10 @@
                 org.apache.arrow/arrow-vector      {:mvn/version "17.0.0"}
                 org.apache.arrow/arrow-memory-netty {:mvn/version "17.0.0"}
 
+                ;; AWS support for S3 FileIO (REST catalog with S3 storage)
+                org.apache.iceberg/iceberg-aws       {:mvn/version "1.10.0"}
+                org.apache.iceberg/iceberg-aws-bundle {:mvn/version "1.10.0"}
+
                 ;; Hadoop catalog (for local filesystem testing)
                 ;; Note: Pulls in Hadoop deps - use REST/Glue catalogs for Lambda
                 org.apache.iceberg/iceberg-bundled-guava {:mvn/version "1.10.0"}

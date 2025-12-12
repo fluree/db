@@ -9,12 +9,48 @@
      (create-fluree-file-io store)
      ;; Returns a FileIO that can be used with StaticTableOperations"
   (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.db.storage :as storage]
             [fluree.db.util.log :as log])
   (:import [java.io ByteArrayInputStream ByteArrayOutputStream InputStream OutputStream]
            [org.apache.iceberg.io FileIO InputFile OutputFile PositionOutputStream SeekableInputStream]))
 
 (set! *warn-on-reflection* true)
+
+;;; ---------------------------------------------------------------------------
+;;; Path Parsing
+;;; ---------------------------------------------------------------------------
+
+(defn- parse-storage-path
+  "Parse an Iceberg path (which may be an S3 URL) into a path suitable for Fluree storage.
+
+   Iceberg provides paths like:
+   - s3://bucket/path/to/file
+   - s3a://bucket/path/to/file
+   - file:///path/to/file
+   - /path/to/file
+
+   For S3 URLs, strips the s3://bucket/ prefix since the S3Store already knows the bucket.
+   For file URLs, strips the file:// prefix.
+   For other paths, returns as-is."
+  [^String path]
+  (cond
+    ;; S3 URL: s3://bucket/path or s3a://bucket/path
+    (or (str/starts-with? path "s3://")
+        (str/starts-with? path "s3a://"))
+    (let [without-scheme (str/replace-first path #"^s3a?://" "")
+          ;; Skip bucket name (everything before first /)
+          slash-idx (str/index-of without-scheme "/")]
+      (if slash-idx
+        (subs without-scheme (inc slash-idx))
+        ""))
+
+    ;; File URL: file:///path
+    (str/starts-with? path "file://")
+    (str/replace-first path #"^file://" "")
+
+    ;; Already a plain path
+    :else path))
 
 ;;; ---------------------------------------------------------------------------
 ;;; SeekableInputStream Implementation
@@ -92,30 +128,31 @@
 (defn- create-input-file
   "Creates an Iceberg InputFile backed by Fluree storage."
   [store ^String path]
-  (reify InputFile
-    (location [_] path)
+  (let [storage-path (parse-storage-path path)]
+    (reify InputFile
+      (location [_] path)
 
-    (exists [_]
-      ;; Try to read - if nil or exception, doesn't exist
-      (try
-        (let [result (async/<!! (storage/read-bytes store path))]
-          (some? result))
-        (catch Exception _
-          false)))
+      (exists [_]
+        ;; Try to read - if nil or exception, doesn't exist
+        (try
+          (let [result (async/<!! (storage/read-bytes store storage-path))]
+            (some? result))
+          (catch Exception _
+            false)))
 
-    (getLength [this]
-      ;; Read and get length - cached on first access would be better
-      (let [data (async/<!! (storage/read-bytes store path))]
-        (if data
-          (alength ^bytes data)
-          (throw (java.io.FileNotFoundException. path)))))
+      (getLength [this]
+        ;; Read and get length - cached on first access would be better
+        (let [data (async/<!! (storage/read-bytes store storage-path))]
+          (if data
+            (alength ^bytes data)
+            (throw (java.io.FileNotFoundException. path)))))
 
-    (newStream [_]
-      (log/debug "FlureeFileIO: Reading" path)
-      (let [data (async/<!! (storage/read-bytes store path))]
-        (if data
-          (create-seekable-input-stream data)
-          (throw (java.io.FileNotFoundException. path)))))))
+      (newStream [_]
+        (log/debug "FlureeFileIO: Reading" path "as storage path:" storage-path)
+        (let [data (async/<!! (storage/read-bytes store storage-path))]
+          (if data
+            (create-seekable-input-stream data)
+            (throw (java.io.FileNotFoundException. path))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; OutputFile Implementation
@@ -124,32 +161,33 @@
 (defn- create-output-file
   "Creates an Iceberg OutputFile backed by Fluree storage."
   [store ^String path]
-  (reify OutputFile
-    (location [_] path)
+  (let [storage-path (parse-storage-path path)]
+    (reify OutputFile
+      (location [_] path)
 
-    (create [_]
-      (log/debug "FlureeFileIO: Creating" path)
-      (let [[stream result-promise] (create-position-output-stream)]
-        ;; Return a wrapped stream that writes to store on close
-        (proxy [PositionOutputStream] []
-          (getPos [] (.getPos ^PositionOutputStream stream))
-          (write
-            ([b]
-             (if (instance? Integer b)
-               (.write ^PositionOutputStream stream ^int b)
-               (.write ^PositionOutputStream stream ^bytes b)))
-            ([^bytes buf off len] (.write ^PositionOutputStream stream buf (int off) (int len))))
-          (flush [] (.flush ^PositionOutputStream stream))
-          (close []
-            (.close ^PositionOutputStream stream)
-            (let [data @result-promise]
-              (async/<!! (storage/write-bytes store path data)))))))
+      (create [_]
+        (log/debug "FlureeFileIO: Creating" path "as storage path:" storage-path)
+        (let [[stream result-promise] (create-position-output-stream)]
+          ;; Return a wrapped stream that writes to store on close
+          (proxy [PositionOutputStream] []
+            (getPos [] (.getPos ^PositionOutputStream stream))
+            (write
+              ([b]
+               (if (instance? Integer b)
+                 (.write ^PositionOutputStream stream ^int b)
+                 (.write ^PositionOutputStream stream ^bytes b)))
+              ([^bytes buf off len] (.write ^PositionOutputStream stream buf (int off) (int len))))
+            (flush [] (.flush ^PositionOutputStream stream))
+            (close []
+              (.close ^PositionOutputStream stream)
+              (let [data @result-promise]
+                (async/<!! (storage/write-bytes store storage-path data)))))))
 
-    (createOrOverwrite [this]
-      (.create this))
+      (createOrOverwrite [this]
+        (.create this))
 
-    (toInputFile [_]
-      (create-input-file store path))))
+      (toInputFile [_]
+        (create-input-file store path)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; FlureeFileIO - Main FileIO Implementation
@@ -174,11 +212,12 @@
       (create-output-file store path))
 
     (^void deleteFile [_ ^String path]
-      (log/debug "FlureeFileIO: Deleting" path)
-      ;; Note: Not all stores support delete - this may be a no-op
-      (when (satisfies? storage/EraseableStore store)
-        (async/<!! (storage/delete store path)))
-      nil)
+      (let [storage-path (parse-storage-path path)]
+        (log/debug "FlureeFileIO: Deleting" path "as storage path:" storage-path)
+        ;; Note: Not all stores support delete - this may be a no-op
+        (when (satisfies? storage/EraseableStore store)
+          (async/<!! (storage/delete store storage-path)))
+        nil))
 
     (initialize [_ _properties]
       ;; No-op - store is already initialized

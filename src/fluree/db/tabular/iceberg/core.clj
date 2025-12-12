@@ -12,16 +12,16 @@
    - Table scanning: Build scans with projections and pushdown"
   (:require [fluree.db.util.log :as log])
   (:import [java.time Instant]
+           [org.apache.arrow.vector VectorSchemaRoot FieldVector
+            BigIntVector IntVector Float4Vector Float8Vector
+            VarCharVector BitVector]
            [org.apache.iceberg PartitionField PartitionSpec Schema Snapshot Table TableScan]
+           ;; Arrow imports for vectorized reads
+           [org.apache.iceberg.arrow.vectorized ArrowReader ColumnarBatch]
            [org.apache.iceberg.data IcebergGenerics Record]
            [org.apache.iceberg.expressions Expressions Expression]
            [org.apache.iceberg.io CloseableIterable]
-           [org.apache.iceberg.types Type Types$NestedField]
-           ;; Arrow imports for vectorized reads
-           [org.apache.iceberg.arrow.vectorized ArrowReader ColumnarBatch]
-           [org.apache.arrow.vector VectorSchemaRoot FieldVector
-            BigIntVector IntVector Float4Vector Float8Vector
-            VarCharVector BitVector]))
+           [org.apache.iceberg.types Type Types$NestedField]))
 
 (set! *warn-on-reflection* true)
 

@@ -29,9 +29,9 @@
     (let [table-path (str warehouse-path "/" table-name)
           ^Table table (.load tables table-path)]
       (log/debug "IcebergSource scan-batches (Arrow):" {:table table-name
-                                                         :batch-size batch-size
-                                                         :columns (count columns)
-                                                         :predicates (count predicates)})
+                                                        :batch-size batch-size
+                                                        :columns (count columns)
+                                                        :predicates (count predicates)})
       (core/scan-with-arrow table {:columns columns
                                    :predicates predicates
                                    :snapshot-id snapshot-id

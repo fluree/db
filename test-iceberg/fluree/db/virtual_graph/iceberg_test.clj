@@ -232,7 +232,7 @@
     (testing "Create throws when neither store nor warehouse-path provided"
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo
-           #"requires :warehouse-path or :store"
+           #"requires :warehouse-path, :store, or REST :catalog"
            (iceberg-vg/create {:alias "test"
                                :config {:mapping mapping-path}}))))))
 

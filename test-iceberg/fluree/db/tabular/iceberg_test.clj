@@ -9,8 +9,12 @@
      (t/run-tests)"
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [fluree.db.tabular.iceberg :as iceberg]
+            [fluree.db.tabular.iceberg.core :as core]
             [fluree.db.tabular.protocol :as proto])
-  (:import [java.io File]))
+  (:import [java.io File]
+           [org.apache.iceberg Table]
+           [org.apache.iceberg.hadoop HadoopTables]
+           [org.apache.hadoop.conf Configuration]))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Test Fixtures
@@ -246,6 +250,158 @@
         (is (contains? preds :is-null))
         (is (contains? preds :and))
         (is (contains? preds :or))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Partition Pruning Tests (requires make iceberg-partitioned)
+;;; ---------------------------------------------------------------------------
+
+(def ^:private partitioned-table-path
+  "openflights/airlines_partitioned")
+
+(defn- partitioned-table-exists? []
+  (.exists (java.io.File. (str warehouse-path "/" partitioned-table-path))))
+
+(deftest partitioned-schema-test
+  (when (and @source (partitioned-table-exists?))
+    (testing "Partitioned table schema shows partition columns"
+      (let [schema (proto/get-schema @source partitioned-table-path {})]
+        (is (map? schema))
+        (is (seq (:columns schema)))
+
+        (testing "active column is marked as partition key"
+          (let [cols-by-name (into {} (map (juxt :name identity) (:columns schema)))
+                active-col (get cols-by-name "active")]
+            (is (some? active-col) "Should have 'active' column")
+            (is (:is-partition-key? active-col)
+                "active column should be marked as partition key")))
+
+        (testing "non-partition columns are not marked"
+          (let [cols-by-name (into {} (map (juxt :name identity) (:columns schema)))
+                name-col (get cols-by-name "name")]
+            (is (some? name-col))
+            (is (not (:is-partition-key? name-col))
+                "name column should NOT be marked as partition key")))
+
+        (testing "partition spec is populated"
+          (let [partition-spec (:partition-spec schema)]
+            (is (map? partition-spec))
+            (is (= 1 (count (:fields partition-spec))))
+            (is (= "identity" (:transform (first (:fields partition-spec)))))))))))
+
+(deftest partitioned-statistics-test
+  (when (and @source (partitioned-table-exists?))
+    (testing "Partitioned table has multiple data files"
+      (let [stats (proto/get-statistics @source partitioned-table-path {})]
+        (is (map? stats))
+        ;; With Y, N, and potentially 'n' partitions, we should have 2-3 files
+        (is (>= (:file-count stats) 2)
+            "Partitioned table should have at least 2 data files (one per partition)")
+        (is (= 6162 (:row-count stats))
+            "Should still have all 6162 airline records")))))
+
+(deftest partition-pruning-equality-test
+  (when (and @source (partitioned-table-exists?))
+    (testing "Query with equality on partition column returns correct data"
+      (let [rows-active-y (proto/scan-rows @source partitioned-table-path
+                                            {:predicates [{:column "active"
+                                                           :op :eq
+                                                           :value "Y"}]})
+            rows-active-n (proto/scan-rows @source partitioned-table-path
+                                            {:predicates [{:column "active"
+                                                           :op :eq
+                                                           :value "N"}]})]
+        ;; Verify we get data for each partition
+        (is (seq rows-active-y) "Should have active=Y airlines")
+        (is (seq rows-active-n) "Should have active=N airlines")
+
+        ;; Verify filtering is correct
+        (is (every? #(= "Y" (get % "active")) rows-active-y)
+            "All Y-partition results should have active=Y")
+        (is (every? #(= "N" (get % "active")) rows-active-n)
+            "All N-partition results should have active=N")
+
+        ;; Combined should equal total
+        ;; Note: there may be a small 'n' partition from CSV data quirks
+        (let [total (+ (count rows-active-y) (count rows-active-n))
+              all-rows (count (proto/scan-rows @source partitioned-table-path {}))]
+          (is (<= total all-rows)
+              "Y + N partitions should not exceed total"))))))
+
+(deftest partition-pruning-in-test
+  (when (and @source (partitioned-table-exists?))
+    (testing "Query with IN on partition column"
+      (let [rows (proto/scan-rows @source partitioned-table-path
+                                   {:predicates [{:column "active"
+                                                  :op :in
+                                                  :value ["Y"]}]})]
+        (is (seq rows) "Should have results for IN query")
+        (is (every? #(= "Y" (get % "active")) rows)
+            "All results should have active=Y")))))
+
+(deftest partition-pruning-combined-filter-test
+  (when (and @source (partitioned-table-exists?))
+    (testing "Query with partition and non-partition predicates"
+      (let [rows (proto/scan-rows @source partitioned-table-path
+                                   {:predicates [{:op :and
+                                                  :predicates [{:column "active"
+                                                                :op :eq
+                                                                :value "Y"}
+                                                               {:column "country"
+                                                                :op :eq
+                                                                :value "United States"}]}]})]
+        (is (seq rows) "Should have active US airlines")
+        (is (every? #(and (= "Y" (get % "active"))
+                          (= "United States" (get % "country")))
+                    rows)
+            "All results should be active US airlines")
+        ;; This is the 156 active US airlines from our data
+        (is (= 156 (count rows))
+            "Should return exactly 156 active US airlines")))))
+
+(defn- count-planned-files
+  "Count the number of files that would be scanned for a given query.
+   This uses Iceberg's planFiles() to get actual scan planning metrics."
+  [table-path predicates]
+  (let [conf (Configuration.)
+        tables (HadoopTables. conf)
+        full-path (str warehouse-path "/" table-path)
+        ^Table table (.load tables full-path)
+        scan (core/build-table-scan table {:predicates predicates})
+        ;; planFiles() returns a CloseableIterable of FileScanTask
+        ;; Each FileScanTask represents one file to scan
+        file-iterable (.planFiles scan)]
+    (try
+      (let [file-tasks (vec (iterator-seq (.iterator file-iterable)))]
+        ;; Force realization of all tasks before counting
+        (count file-tasks))
+      (finally
+        (.close file-iterable)))))
+
+(deftest partition-pruning-file-count-test
+  (when (and @source (partitioned-table-exists?))
+    (testing "Partition predicate reduces files scanned"
+      ;; Use fresh table loads for each measurement to ensure consistency
+      (let [;; Count files for partition-filtered scan (active=Y)
+            files-active-y (count-planned-files partitioned-table-path
+                                                [{:column "active" :op :eq :value "Y"}])
+
+            ;; Count files for full scan (no predicate)
+            files-all (count-planned-files partitioned-table-path nil)]
+
+        ;; Full scan should hit all files (2-3 depending on how many partitions)
+        (is (>= files-all 2)
+            "Full scan should plan to scan all partition files")
+
+        ;; Partition-filtered scan should hit fewer files - THIS IS THE KEY TEST
+        ;; Demonstrates that Iceberg's partition pruning is working
+        (is (< files-active-y files-all)
+            (str "Partition filter should prune files. "
+                 "Full scan: " files-all " files, Partition filtered: " files-active-y " files"))
+
+        ;; Specifically, filtering on active=Y should only scan 1 file
+        ;; (there's exactly one data file in the active=Y partition)
+        (is (= 1 files-active-y)
+            "Filtering on active=Y should scan exactly 1 partition file")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Run from REPL

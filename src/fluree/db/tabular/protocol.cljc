@@ -104,6 +104,26 @@
 ;; Partition column hint (enables partition pruning):
 ;;   {:column \"year\" :op :eq :value 2024 :partition-key? true}
 
+(defprotocol ICatalogDiscovery
+  "Optional protocol for sources that support table/namespace discovery.
+
+   Not all sources support this - e.g., HadoopTables is path-based and doesn't
+   have a catalog concept. REST catalogs and HadoopCatalog do support discovery."
+
+  (list-namespaces [this]
+    "List all namespaces in the catalog.
+
+     Returns: seq of namespace strings, e.g. [\"db\" \"analytics\" \"staging\"]")
+
+  (list-tables [this namespace]
+    "List all tables in a namespace.
+
+     Arguments:
+       namespace - string namespace name (e.g. \"openflights\")
+
+     Returns: seq of table identifier strings, e.g.
+       [\"openflights.airlines\" \"openflights.airports\" \"openflights.routes\"]"))
+
 (defprotocol ICloseable
   "Lifecycle protocol for resource cleanup."
   (close [this] "Release resources held by this source."))

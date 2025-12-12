@@ -151,15 +151,17 @@
 #?(:clj
    (defn- validate-iceberg-config
      [{:keys [config]}]
-     (let [{:keys [mapping mappingInline warehouse-path warehousePath store]} config
+     (let [{:keys [mapping mappingInline warehouse-path warehousePath store catalog]} config
            wh-path (or warehouse-path warehousePath (get config "warehouse-path"))
-           has-store (or store (get config "store"))]
+           has-store (or store (get config "store"))
+           catalog-map (or catalog (get config "catalog"))
+           catalog-type (keyword (or (:type catalog-map) (get catalog-map "type")))]
        (when (and (nil? mapping) (nil? mappingInline) (nil? (get config "mappingInline")))
          (throw (ex-info "Iceberg virtual graph requires :mapping or :mappingInline"
                          {:error :db/invalid-config :type :iceberg})))
-       ;; Either warehouse-path (HadoopTables) or store (FlureeIcebergSource) required
-       (when (and (nil? wh-path) (nil? has-store))
-         (throw (ex-info "Iceberg virtual graph requires :warehouse-path or :store"
+       ;; Either warehouse-path (HadoopTables) or store (FlureeIcebergSource) or catalog (REST) required
+       (when (and (nil? wh-path) (nil? has-store) (not= catalog-type :rest))
+         (throw (ex-info "Iceberg virtual graph requires :warehouse-path, :store, or REST :catalog"
                          {:error :db/invalid-config :type :iceberg}))))))
 
 #?(:clj

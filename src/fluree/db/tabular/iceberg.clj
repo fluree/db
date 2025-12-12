@@ -7,7 +7,8 @@
 
    For local development/testing, you can use either:
    1. create-iceberg-source (Hadoop-based, just needs a path)
-   2. create-fluree-iceberg-source (Fluree storage, needs a store)
+   2. create-rest-iceberg-source (REST catalog, cloud-agnostic)
+   3. create-fluree-iceberg-source (Fluree storage, needs a store)
 
    Supports:
    - Predicate pushdown (eq, ne, gt, gte, lt, lte, in, between, is-null, not-null, and, or)
@@ -20,10 +21,10 @@
             [fluree.db.tabular.file-io :as file-io]
             [fluree.db.tabular.iceberg.core :as core]
             [fluree.db.tabular.iceberg.hadoop :as hadoop]
+            [fluree.db.tabular.iceberg.rest :as rest]
             [fluree.db.tabular.protocol :as proto]
             [fluree.db.util.log :as log])
   (:import [org.apache.iceberg BaseTable Table StaticTableOperations]
-           [org.apache.iceberg.catalog TableIdentifier]
            [org.apache.iceberg.io FileIO]))
 
 (set! *warn-on-reflection* true)
@@ -44,6 +45,22 @@
    See fluree.db.tabular.iceberg.hadoop for details."
   hadoop/create-iceberg-source)
 
+(def create-rest-iceberg-source
+  "Create an IcebergSource using a REST catalog for discovery and
+   Fluree's storage protocols for data access.
+
+   Config:
+     :uri        - REST catalog endpoint (required)
+     :store      - Fluree storage store (required) - S3Store, FileStore, etc.
+     :auth-token - Optional bearer token for REST API auth
+
+   This approach uses REST API only for catalog discovery (list namespaces,
+   tables, get metadata locations) while all file reads go through Fluree's
+   existing storage infrastructure.
+
+   See fluree.db.tabular.iceberg.rest for details."
+  rest/create-rest-iceberg-source)
+
 ;;; ---------------------------------------------------------------------------
 ;;; FlureeIcebergSource Implementation
 ;;; ---------------------------------------------------------------------------
@@ -52,9 +69,9 @@
   "Load an Iceberg Table from a metadata location using StaticTableOperations.
    This avoids needing a full catalog - just point to the metadata JSON."
   ^Table [^FileIO file-io ^String metadata-location ^String table-name]
-  (let [ops (StaticTableOperations. metadata-location file-io)
-        table-id (TableIdentifier/of "fluree" table-name)]
-    (BaseTable. ops table-id)))
+  (let [ops (StaticTableOperations. metadata-location file-io)]
+    ;; BaseTable constructor takes (TableOperations, String name)
+    (BaseTable. ops table-name)))
 
 (defn- resolve-metadata-location
   "Resolve the metadata location for an Iceberg table.
@@ -89,8 +106,8 @@
                               {:table table-name :warehouse warehouse-path})))
           ^Table table (load-table-from-metadata file-io meta-loc table-name)]
       (log/debug "FlureeIcebergSource scan-batches (Arrow):" {:table table-name
-                                                               :batch-size batch-size
-                                                               :metadata meta-loc})
+                                                              :batch-size batch-size
+                                                              :metadata meta-loc})
       (core/scan-with-arrow table {:columns columns
                                    :predicates predicates
                                    :snapshot-id snapshot-id
