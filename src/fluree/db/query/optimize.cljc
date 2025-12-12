@@ -101,7 +101,91 @@
   "Attach filter code to a match object for later compilation.
   Stores the code and variable in metadata for later compilation."
   [mch variable codes]
-  (assoc mch ::filter-code {:variable variable, :forms codes}))
+  (let [cmp-ops #{'> '>= '< '<=}
+        ;; Extract simple comparison forms from a possibly nested filter form.
+        ;; We only extract comparisons that are safe to treat as range bounds:
+        ;; - (and ...) is flattened
+        ;; - (or ...) is ignored (cannot safely convert to a single range)
+        ;; - only binary comparisons against a literal number are considered
+        comparison-forms (fn comparison-forms [form]
+                           (cond
+                             (and (seq? form) (= 'and (first form)))
+                             (mapcat comparison-forms (rest form))
+
+                             (and (seq? form) (contains? cmp-ops (first form)))
+                             [form]
+
+                             :else
+                             []))
+        ;; Given a comparison form, derive a lower/upper bound on `variable` if possible.
+        ;; Returns {:lower {:value n :strict? bool} :upper ...} with only one side set, or nil.
+        form->range (fn [form]
+                      (when (and (seq? form) (= 3 (count form)))
+                        (let [[op a b] form]
+                          (when (contains? cmp-ops op)
+                            (cond
+                              ;; (?v op n)
+                              (and (= a variable) (number? b))
+                              (case op
+                                >  {:lower {:value b :strict? true}}
+                                >= {:lower {:value b :strict? false}}
+                                <  {:upper {:value b :strict? true}}
+                                <= {:upper {:value b :strict? false}})
+
+                              ;; (n op ?v)  ==>  ?v (invert op) n
+                              (and (number? a) (= b variable))
+                              (case op
+                                >  {:upper {:value a :strict? true}}   ;; a > ?v  =>  ?v < a
+                                >= {:upper {:value a :strict? false}}  ;; a >= ?v =>  ?v <= a
+                                <  {:lower {:value a :strict? true}}   ;; a < ?v  =>  ?v > a
+                                <= {:lower {:value a :strict? false}}) ;; a <= ?v =>  ?v >= a
+
+                              :else
+                              nil)))))
+        ;; Merge two bound maps by taking the tighter range:
+        ;; - lower bound: max
+        ;; - upper bound: min
+        tighter-bound (fn [a b pick-fn]
+                        (cond
+                          (nil? a) b
+                          (nil? b) a
+                          :else
+                          (let [va (:value a)
+                                vb (:value b)
+                                c  (compare va vb)]
+                            (pick-fn a b c))))
+        merge-bounds (fn [r1 r2]
+                       (when (or r1 r2)
+                         (let [l1 (:lower r1) l2 (:lower r2)
+                               u1 (:upper r1) u2 (:upper r2)
+                               ;; for lower: choose larger value; if equal prefer non-strict? false? doesn't matter much
+                               lower (tighter-bound l1 l2 (fn [a b c] (if (neg? c) b a)))
+                               ;; for upper: choose smaller value
+                               upper (tighter-bound u1 u2 (fn [a b c] (if (pos? c) b a)))]
+                           (cond-> {}
+                             lower (assoc :lower lower)
+                             upper (assoc :upper upper)))))
+        ;; Convert strict bounds to inclusive scan boundaries when possible.
+        ;; For strict comparisons on Doubles we can use nextUp/nextDown to avoid
+        ;; scanning equality values. For other numeric types we keep the same
+        ;; boundary and rely on the filter function to enforce strictness.
+        bound->scan-val (fn [{:keys [value strict?]} dir]
+                          (if (and strict? (instance? #?(:clj Double :cljs js/Number) value))
+                            (case dir
+                              :lower (Math/nextUp (double value))
+                              :upper (Math/nextDown (double value)))
+                            value))
+        range-from-codes (let [ranges (->> codes
+                                           (mapcat comparison-forms)
+                                           (keep form->range))]
+                           (when (seq ranges)
+                             (let [r (reduce merge-bounds nil ranges)]
+                               (when (seq r)
+                                 (cond-> r
+                                   (:lower r) (assoc :start-o (bound->scan-val (:lower r) :lower))
+                                   (:upper r) (assoc :end-o   (bound->scan-val (:upper r) :upper)))))))]
+    (cond-> (assoc mch ::filter-code {:variable variable, :forms codes})
+      range-from-codes (assoc ::where/range range-from-codes))))
 
 (defn with-var-filter
   "Add filter code to the match object for the variable in tuple."

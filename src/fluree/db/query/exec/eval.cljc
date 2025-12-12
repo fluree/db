@@ -90,6 +90,98 @@
   [coll]
   (where/->typed-val (count coll)))
 
+;; -----------------------------------------------------------------------------
+;; Streaming aggregate descriptors
+;; -----------------------------------------------------------------------------
+
+(declare compare*)
+
+(def streaming-aggregate-registry
+  "Registry of simple aggregates that can be evaluated incrementally
+  using a small per-group state instead of full grouped collections.
+
+  Each entry is a map:
+    {:init  (fn [] state)
+     :step! (fn [state typed-val] new-state)
+     :final (fn [state] TypedValue)}"
+  {'count        {:init  (fn [] 0)
+                  :step! (fn [state tv]
+                           (if (some-> tv :value some?)
+                             (inc state)
+                             state))
+                  :final (fn [state]
+                           (where/->typed-val state))}
+
+   'count-star   {:init  (fn [] 0)
+                  :step! (fn [state _tv]
+                           (inc state))
+                  :final (fn [state]
+                           (where/->typed-val state))}
+
+   'count-distinct {:init  (fn [] (transient #{}))
+                    :step! (fn [state tv]
+                             (if (some-> tv :value some?)
+                               (conj! state tv)
+                               state))
+                    :final (fn [state]
+                             (where/->typed-val
+                              (count (persistent! state))))}
+
+   'sum          {:init  (fn [] nil)
+                  :step! (fn [state tv]
+                           (if-let [v (:value tv)]
+                             (if (nil? state)
+                               v
+                               (+ state v))
+                             state))
+                  :final (fn [state]
+                           (where/->typed-val (or state 0)))}
+
+   'avg          {:init  (fn [] {:sum nil :cnt 0})
+                  :step! (fn [{:keys [sum cnt]} tv]
+                           (if-let [v (:value tv)]
+                             {:sum (if (nil? sum) v (+ sum v))
+                              :cnt (inc cnt)}
+                             {:sum sum :cnt cnt}))
+                  :final (fn [{:keys [sum cnt]}]
+                           ;; Division result - convert ratio to double for display
+                           (let [raw (if (pos? cnt)
+                                       (/ sum cnt)
+                                       0)
+                                 ;; Convert ratio to double, keep integers as-is
+                                 res (if (ratio? raw)
+                                       (double raw)
+                                       raw)]
+                             (where/->typed-val res)))}
+
+   'min          {:init  (fn [] nil)
+                  :step! (fn [state tv]
+                           (cond
+                             (nil? tv) state
+                             (nil? state) tv
+                             (neg? (compare* tv state)) tv
+                             :else state))
+                  :final (fn [state]
+                           ;; state is already a TypedValue when present
+                           (or state (where/->typed-val nil)))}
+
+   'max          {:init  (fn [] nil)
+                  :step! (fn [state tv]
+                           (cond
+                             (nil? tv) state
+                             (nil? state) tv
+                             (pos? (compare* tv state)) tv
+                             :else state))
+                  :final (fn [state]
+                           ;; state is already a TypedValue when present
+                           (or state (where/->typed-val nil)))}})
+
+(defn streaming-agg-descriptor
+  "Look up a streaming aggregate descriptor for aggregate op symbol `op`.
+  Returns nil if the op is not supported for streaming."
+  [op]
+  (get streaming-aggregate-registry op))
+
 (defn groupconcat
   "GroupConcat is a set function which performs a string concatenation across the values
   of an expression with a group. The order of the strings is not specified. The

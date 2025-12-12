@@ -655,19 +655,66 @@
         unwrap-tuple-patterns
         select/construct-selector)))
 
+(defn- extract-simple-agg-op
+  "Detects if code is a simple aggregate form like (agg ?var) or (count *).
+  Returns {:agg-op symbol, :arg-var symbol-or-nil} or nil."
+  [code]
+  (when (and (seq? code)
+             (symbol? (first code)))
+    (let [op   (first code)
+          args (rest code)]
+      (cond
+        ;; (count *) → count-star (row-count)
+        (and (= 'count op)
+             (= 1 (count args))
+             (= '* (first args)))
+        {:agg-op 'count-star
+         :arg-var nil}
+
+        ;; (agg ?v) where agg is an allowed aggregate fn
+        (and (= 1 (count args))
+             (symbol? (first args))
+             (v/query-variable? (first args))
+             (contains? eval/allowed-aggregate-fns op))
+        {:agg-op  op
+         :arg-var (symbol (first args))}
+
+        :else
+        nil))))
+
+(defn- build-streaming-agg
+  "Builds streaming-agg map if the code represents a simple streamable aggregate.
+  Returns the streaming-agg map or nil."
+  [code]
+  (when-let [{:keys [agg-op arg-var]} (extract-simple-agg-op code)]
+    (when-let [descriptor (eval/streaming-agg-descriptor agg-op)]
+      {:agg-op     agg-op
+       :arg-var    arg-var
+       :result-var (gensym "?agg")
+       :descriptor descriptor})))
+
 (defn parse-select-as-fn
   [f context output]
-  (let [parsed-fn  (parse-code f)
-        fn-name    (some-> parsed-fn second first)
-        bind-var   (last parsed-fn)
-        aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
+  (let [parsed-fn     (parse-code f)
+        inner-form    (second parsed-fn)
+        fn-name       (when (seq? inner-form) (first inner-form))
+        bind-var      (last parsed-fn)
+        aggregate?    (when fn-name (eval/allowed-aggregate-fns fn-name))
+        ;; For AS-wrapped aggregates, detect if the inner is streamable
+        streaming-agg (when aggregate?
+                        (when-let [sagg (build-streaming-agg inner-form)]
+                          ;; Override result-var with the explicit bind-var from AS
+                          (assoc sagg :result-var bind-var)))]
     (-> parsed-fn
         (eval/compile context)
-        (select/as-selector output bind-var aggregate?))))
+        (select/as-selector output bind-var aggregate? streaming-agg))))
 
 (defn parse-select-aggregate
   [f context]
-  (-> f parse-code (eval/compile context) select/aggregate-selector))
+  (let [code         (parse-code f)
+        agg-fn       (eval/compile code context)
+        streaming-agg (build-streaming-agg code)]
+    (select/aggregate-selector agg-fn streaming-agg)))
 
 (defn reverse?
   [context k]

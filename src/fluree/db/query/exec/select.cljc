@@ -60,44 +60,81 @@
       :sparql (with-meta selector {`format-value select.sparql/format-wildcard-selector-value})
       (with-meta selector {`format-value select.fql/format-wildcard-selector-value}))))
 
-(defrecord AggregateSelector [agg-fn]
+(defrecord AggregateSelector [agg-fn streaming-agg]
   ValueSelector
   (format-value
-    [_ _ _ _ _ _ error-ch solution]
-    (go (try* (:value (agg-fn solution))
-              (catch* e
-                (log/error e "Error applying aggregate selector")
-                (>! error-ch e))))))
+    [_this _db _iri-cache _context compact _tracker error-ch solution]
+    (if-let [{:keys [result-var]} streaming-agg]
+      ;; Streaming mode: group/combine has populated `result-var` in the
+      ;; solution when streaming mode is active. If result-var is not in
+      ;; the solution, fall back to legacy mode (e.g., implicit grouping).
+      (if (contains? solution result-var)
+        (go (try* (some-> solution
+                          (get result-var)
+                          (select.fql/display compact))
+                  (catch* e
+                    (log/error e "Error formatting streaming aggregate selector")
+                    (>! error-ch e))))
+        ;; Fallback to legacy mode when result-var not populated
+        (go (try* (:value (agg-fn solution))
+                  (catch* e
+                    (log/error e "Error applying aggregate selector")
+                    (>! error-ch e)))))
+      ;; Legacy mode: apply the compiled aggregate function over grouped
+      ;; values wrapped in ::grouping matches.
+      (go (try* (:value (agg-fn solution))
+                (catch* e
+                  (log/error e "Error applying aggregate selector")
+                  (>! error-ch e)))))))
 
 (defn aggregate-selector
   "Returns a selector that extracts the grouped values bound to the specified
   variables referenced in the supplied `agg-function` from a where solution,
   formats each item in the group, and processes the formatted group with the
-  supplied `agg-function` to generate the final aggregated result for display."
-  [agg-function]
-  (->AggregateSelector agg-function))
+  supplied `agg-function` to generate the final aggregated result for display.
 
-(defrecord AsSelector [as-fn bind-var aggregate?]
+  `streaming-agg` is an optional map containing streaming aggregate descriptor
+  when the aggregate can be computed incrementally (e.g., count, sum, avg, min, max)."
+  ([agg-function]
+   (->AggregateSelector agg-function nil))
+  ([agg-function streaming-agg]
+   (->AggregateSelector agg-function streaming-agg)))
+
+(defrecord AsSelector [as-fn bind-var aggregate? streaming-agg]
   SolutionModifier
   (update-solution
     [_ solution]
-    (log/trace "AsSelector update-solution solution:" solution)
-    (let [{v :value dt :datatype-iri lang :lang} (as-fn solution)]
-      (log/trace "AsSelector update-solution result:" v)
-      (assoc solution bind-var (-> (where/unmatched-var bind-var)
-                                   (where/match-value v (or dt (datatype/infer-iri v)))
-                                   (cond-> lang (where/match-lang v lang))))))
+    (if (and streaming-agg (contains? solution bind-var))
+      ;; Streaming mode: group/combine has already populated bind-var in
+      ;; the solution, so skip the as-fn evaluation here.
+      solution
+      ;; Legacy mode or streaming not active: apply the as-fn to compute
+      ;; the bound value.
+      (do
+        (log/trace "AsSelector update-solution solution:" solution)
+        (let [{v :value dt :datatype-iri lang :lang} (as-fn solution)]
+          (log/trace "AsSelector update-solution result:" v)
+          (assoc solution bind-var (-> (where/unmatched-var bind-var)
+                                       (where/match-value v (or dt (datatype/infer-iri v)))
+                                       (cond-> lang (where/match-lang v lang))))))))
   ValueAdapter
   (solution-value
     [_ _ solution]
     [bind-var (get solution bind-var)]))
 
 (defn as-selector
-  [as-fn output bind-var aggregate?]
-  (let [selector (->AsSelector as-fn bind-var aggregate?)]
-    (case output
-      :sparql (with-meta selector {`format-value (select.sparql/format-as-selector-value bind-var)})
-      (with-meta selector {`format-value (select.fql/format-as-selector-value bind-var)}))))
+  "Creates an AS selector that binds the result of `as-fn` to `bind-var`.
+
+  `streaming-agg` is an optional map containing streaming aggregate descriptor
+  when the inner expression is a streamable aggregate. When present, the
+  `update-solution` becomes a no-op since group/combine handles the aggregation."
+  ([as-fn output bind-var aggregate?]
+   (as-selector as-fn output bind-var aggregate? nil))
+  ([as-fn output bind-var aggregate? streaming-agg]
+   (let [selector (->AsSelector as-fn bind-var aggregate? streaming-agg)]
+     (case output
+       :sparql (with-meta selector {`format-value (select.sparql/format-as-selector-value bind-var)})
+       (with-meta selector {`format-value (select.fql/format-as-selector-value bind-var)})))))
 
 (defn get-subject-iri
   [solution subj]
