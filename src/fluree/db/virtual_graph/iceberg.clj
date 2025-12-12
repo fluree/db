@@ -23,7 +23,9 @@
                :mapping \"path/to/mapping.ttl\"
                :table \"namespace/tablename\"}}"
   (:require [clojure.core.async :as async :refer [go]]
+            [clojure.set]
             [clojure.string :as str]
+            [fluree.db.constants :as const]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.optimize :as optimize]
             [fluree.db.tabular.iceberg :as iceberg]
@@ -32,6 +34,8 @@
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph :as vg]
+            [fluree.db.virtual-graph.iceberg.join :as join]
+            [fluree.db.virtual-graph.iceberg.join.hash :as hash-join]
             [fluree.db.virtual-graph.iceberg.pushdown :as pushdown]
             [fluree.db.virtual-graph.iceberg.query :as query]
             [fluree.db.virtual-graph.iceberg.r2rml :as r2rml])
@@ -40,13 +44,282 @@
 (set! *warn-on-reflection* true)
 
 ;;; ---------------------------------------------------------------------------
+;;; Multi-Table Join Execution
+;;; ---------------------------------------------------------------------------
+
+(defn- collect-join-columns-for-table
+  "Collect all join column names for a table from the join graph.
+
+   Returns a set of column names (strings) that this table uses in joins,
+   both as child and parent columns."
+  [join-graph table-name]
+  (when join-graph
+    (let [edges (join/edges-for-table join-graph table-name)]
+      (into #{}
+            (for [edge edges
+                  col (if (= table-name (:child-table edge))
+                        (join/child-columns edge)
+                        (join/parent-columns edge))]
+              col)))))
+
+(defn- extract-pattern-predicate
+  "Extract the predicate IRI from a pattern item."
+  [item]
+  (let [triple (if (and (vector? item) (= :class (first item)))
+                 (second item)
+                 item)
+        [_s p _o] triple]
+    (when (map? p)
+      (::where/iri p))))
+
+(defn- extract-pattern-subject-var
+  "Extract the subject variable from a pattern item."
+  [item]
+  (let [triple (if (and (vector? item) (= :class (first item)))
+                 (second item)
+                 item)
+        [s _p _o] triple]
+    (when (and (map? s) (::where/var s))
+      (::where/var s))))
+
+(defn- extract-pattern-object-var
+  "Extract the object variable from a pattern item."
+  [item]
+  (let [triple (if (and (vector? item) (= :class (first item)))
+                 (second item)
+                 item)
+        [_s _p o] triple]
+    (when (and (map? o) (::where/var o))
+      (::where/var o))))
+
+(defn- patterns-traverse-join-edge?
+  "Check if patterns actually traverse a join edge via shared variables.
+
+   A join edge is traversed when:
+   1. The child patterns use the RefObjectMap predicate (:predicate on edge)
+   2. The object variable of that pattern matches the subject of parent patterns
+
+   This ensures joins are only applied when the SPARQL query explicitly
+   traverses the FK relationship, not just because tables happen to be related.
+
+   Arguments:
+     child-patterns  - Patterns for the child table (with FK)
+     parent-patterns - Patterns for the parent table (with PK)
+     edge            - Join edge containing :predicate for the FK relationship
+
+   Returns true if the join should be applied."
+  [child-patterns parent-patterns edge]
+  (let [fk-predicate (:predicate edge)]
+    (when fk-predicate
+      ;; Find patterns in child that use the FK predicate
+      (let [fk-patterns (filter #(= fk-predicate (extract-pattern-predicate %)) child-patterns)]
+        (when (seq fk-patterns)
+          ;; Get object variables from FK patterns
+          (let [fk-object-vars (set (keep extract-pattern-object-var fk-patterns))
+                ;; Get subject variables from parent patterns
+                parent-subject-vars (set (keep extract-pattern-subject-var parent-patterns))]
+            ;; Join is traversed if any FK object var matches a parent subject var
+            (boolean (seq (clojure.set/intersection fk-object-vars parent-subject-vars)))))))))
+
+(defn- find-traversed-edge
+  "Find a join edge that is actually traversed by the query patterns.
+
+   Checks both directions (child->parent and parent->child) to find an
+   edge where the patterns explicitly use the FK predicate with matching variables.
+
+   Returns {:edge edge :child-table :parent-table} or nil if no traversed edge found."
+  [join-graph accumulated-patterns current-patterns accumulated-tables current-table]
+  (first
+   (for [acc-table accumulated-tables
+         edge (join/edges-between join-graph acc-table current-table)
+         :let [child-table (:child-table edge)
+               parent-table (:parent-table edge)
+               ;; Determine which patterns belong to child vs parent
+               ;; When current-table is child: child-patterns = current, parent = acc-table
+               ;; When current-table is parent: child-patterns = acc-table, parent = current
+               [child-patterns parent-patterns]
+               (if (= current-table child-table)
+                 [current-patterns (get accumulated-patterns acc-table)]
+                 [(get accumulated-patterns acc-table) current-patterns])]
+         :when (patterns-traverse-join-edge? child-patterns parent-patterns edge)]
+     {:edge edge
+      :child-table child-table
+      :parent-table parent-table
+      :acc-table acc-table})))
+
+(defn- execute-pattern-group
+  "Execute a single pattern group against its Iceberg source.
+
+   When join-columns is provided, those columns are included in the scan
+   and their raw values are stored in the solution for hash join operations.
+
+   Returns a lazy seq of solutions."
+  [sources mapping patterns base-solution time-travel solution-pushdown join-columns]
+  (let [table-name (:table mapping)
+        source (get sources table-name)]
+    (when-not source
+      (throw (ex-info (str "No source found for table: " table-name)
+                      {:error :db/missing-source
+                       :table table-name
+                       :available-sources (keys sources)})))
+    (query/execute-iceberg-query source mapping patterns base-solution
+                                 time-travel nil solution-pushdown join-columns)))
+
+(defn- execute-multi-table-hash-join
+  "Execute a multi-table query using hash joins.
+
+   Strategy:
+   1. Collect join columns for each table from join graph
+   2. Execute each table query independently (with join columns projected)
+   3. Find join edges that are actually traversed by the query patterns
+   4. Apply hash join only when patterns traverse the FK relationship
+   5. Use SPARQL-compatible merge for overlapping variable bindings
+
+   IMPORTANT: Join edges are only applied when the SPARQL query explicitly
+   traverses the FK relationship via the RefObjectMap predicate. This prevents
+   implicit joins from changing query semantics. If two tables appear in a query
+   but the patterns don't traverse the FK, a Cartesian product is used.
+
+   Falls back to Cartesian product with compatible-merge if no traversed edges exist."
+  [sources pattern-groups solution time-travel solution-pushdown join-graph]
+  (let [;; Collect join columns for each table so they're included in results
+        table->join-cols (into {}
+                               (for [{:keys [mapping]} pattern-groups
+                                     :let [table (:table mapping)
+                                           cols (collect-join-columns-for-table join-graph table)]
+                                     :when (seq cols)]
+                                 [table cols]))
+
+        ;; Build table->patterns map for traversal checking
+        table->patterns (into {}
+                              (for [{:keys [mapping patterns]} pattern-groups]
+                                [(:table mapping) patterns]))
+
+        _ (log/debug "Join columns by table:" table->join-cols)
+
+        ;; Execute all table queries with join columns projected
+        group-results (mapv (fn [{:keys [mapping patterns]}]
+                              (let [table (:table mapping)
+                                    join-cols (get table->join-cols table)]
+                                {:mapping mapping
+                                 :patterns patterns
+                                 :solutions (vec (execute-pattern-group
+                                                  sources mapping patterns solution
+                                                  time-travel solution-pushdown join-cols))}))
+                            pattern-groups)
+
+        _ (log/debug "Multi-table query executed:"
+                     {:groups (count group-results)
+                      :solution-counts (mapv #(count (:solutions %)) group-results)})]
+
+    ;; Short-circuit if any group returns empty
+    (if (some #(empty? (:solutions %)) group-results)
+      []
+
+      ;; Check if we have join edges to potentially use
+      (if (and join-graph (join/has-join-edges? join-graph))
+        ;; Use hash join strategy - but only for traversed edges
+        (:accumulated-solutions
+         (reduce
+          (fn [{:keys [accumulated-solutions accumulated-tables accumulated-patterns]}
+               {:keys [mapping patterns] :as current-group}]
+            (if (empty? accumulated-solutions)
+              {:accumulated-solutions []
+               :accumulated-tables accumulated-tables
+               :accumulated-patterns accumulated-patterns}
+
+              ;; Find join relationship that is actually traversed by patterns
+              (let [current-table (:table mapping)
+                    current-solutions (:solutions current-group)
+
+                    ;; Find a traversed edge (checks if patterns use the FK predicate)
+                    traversed-edge (find-traversed-edge
+                                    join-graph
+                                    accumulated-patterns
+                                    patterns
+                                    accumulated-tables
+                                    current-table)
+
+                    _ (when traversed-edge
+                        (log/debug "Found traversed join edge:" traversed-edge))
+
+                    new-solutions
+                    (if traversed-edge
+                      ;; Hash join path - edge is actually traversed by patterns
+                      (let [edge (:edge traversed-edge)
+                            ;; Determine build vs probe based on child/parent relationship
+                            current-is-child? (= current-table (:child-table edge))
+                            [build-solutions probe-solutions build-cols probe-cols]
+                            (if current-is-child?
+                              ;; Current is child (fact table) -> accumulated is parent
+                              [accumulated-solutions current-solutions
+                               (mapv keyword (join/parent-columns edge))
+                               (mapv keyword (join/child-columns edge))]
+                              ;; Current is parent (dimension table) -> build with current
+                              [current-solutions accumulated-solutions
+                               (mapv keyword (join/parent-columns edge))
+                               (mapv keyword (join/child-columns edge))])
+
+                            _ (log/debug "Hash join execution:"
+                                         {:build-count (count build-solutions)
+                                          :probe-count (count probe-solutions)
+                                          :build-cols build-cols
+                                          :probe-cols probe-cols})
+
+                            joined (hash-join/hash-join build-solutions probe-solutions
+                                                        build-cols probe-cols)]
+                        (log/debug "Hash join result count:" (count joined))
+                        joined)
+
+                      ;; No traversed edge - patterns don't use FK relationship
+                      ;; Use Cartesian product with compatible-merge (SPARQL semantics)
+                      (do
+                        (log/debug "No traversed join edge, using Cartesian product:"
+                                   {:accumulated-tables accumulated-tables
+                                    :current-table current-table})
+                        (vec (keep (fn [[acc curr]]
+                                     (hash-join/compatible-merge acc curr))
+                                   (for [acc accumulated-solutions
+                                         curr current-solutions]
+                                     [acc curr])))))]
+
+                {:accumulated-solutions new-solutions
+                 :accumulated-tables (conj accumulated-tables current-table)
+                 :accumulated-patterns (assoc accumulated-patterns current-table patterns)})))
+
+          ;; Start with first group's solutions and its table/patterns
+          (let [first-group (first group-results)]
+            {:accumulated-solutions (:solutions first-group)
+             :accumulated-tables #{(get-in first-group [:mapping :table])}
+             :accumulated-patterns {(get-in first-group [:mapping :table])
+                                    (:patterns first-group)}})
+          (rest group-results)))
+
+        ;; No join graph - fall back to Cartesian with compatible-merge
+        (do
+          (log/debug "No join graph available, using Cartesian product")
+          (reduce
+           (fn [accumulated {:keys [solutions]}]
+             (if (empty? accumulated)
+               []
+               ;; Use compatible-merge for SPARQL semantics
+               (vec (keep (fn [[acc curr]]
+                            (hash-join/compatible-merge acc curr))
+                          (for [acc accumulated
+                                curr solutions]
+                            [acc curr])))))
+           (:solutions (first group-results))
+           (rest group-results)))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; IcebergDatabase Record (Multi-Table Support)
 ;;; ---------------------------------------------------------------------------
 
-(defrecord IcebergDatabase [alias config sources mappings routing-indexes time-travel query-pushdown]
+(defrecord IcebergDatabase [alias config sources mappings routing-indexes join-graph time-travel query-pushdown]
   ;; sources: {table-name -> IcebergSource}
   ;; mappings: {table-key -> {:table, :class, :predicates, ...}}
   ;; routing-indexes: {:class->mappings {rdf-class -> [mappings...]}, :predicate->mappings {pred -> [mappings...]}}
+  ;; join-graph: {:edges [JoinEdge...], :by-table {table -> [edges]}, :tm->table {iri -> table}}
   ;; query-pushdown: atom holding query-time pushdown predicates (set in -reorder, used in -finalize)
 
   vg/UpdatableVirtualGraph
@@ -108,56 +381,35 @@
              (let [patterns (get solution ::iceberg-patterns)]
                (if (seq patterns)
                  ;; Group patterns by table and execute each group
-                 (let [pattern-groups (query/group-patterns-by-table patterns mappings routing-indexes)]
-                   ;; Combine: pattern metadata pushdown (FILTER) + atom pushdown (VALUES)
-                   ;; Pattern metadata may not survive WHERE executor, but atom path is reliable
-                   (let [solution-pushdown (into (or (get solution ::solution-pushdown-filters) [])
-                                                 (or values-pushdown []))]
-                     (when (seq solution-pushdown)
-                       (log/debug "Iceberg -finalize combined solution pushdown:" solution-pushdown))
-                     (if (= 1 (count pattern-groups))
+                 ;; Combine: pattern metadata pushdown (FILTER) + atom pushdown (VALUES)
+                 ;; Pattern metadata may not survive WHERE executor, but atom path is reliable
+                 (let [pattern-groups (query/group-patterns-by-table patterns mappings routing-indexes)
+                       solution-pushdown (into (or (get solution ::solution-pushdown-filters) [])
+                                               (or values-pushdown []))]
+                   (when (seq solution-pushdown)
+                     (log/debug "Iceberg -finalize combined solution pushdown:" solution-pushdown))
+                   (if (= 1 (count pattern-groups))
                        ;; Single table - simple case
-                       (let [{:keys [mapping patterns]} (first pattern-groups)
-                             table-name (:table mapping)
-                             source (get sources table-name)]
-                         (when-not source
-                           (throw (ex-info (str "No source found for table: " table-name)
-                                           {:error :db/missing-source
-                                            :table table-name
-                                            :available-sources (keys sources)})))
-                         (let [solutions (query/execute-iceberg-query source mapping patterns solution
-                                                                      time-travel nil solution-pushdown)]
-                           (doseq [sol solutions]
-                             (async/>!! ch sol))
-                           (async/close! ch)))
-                       ;; Multiple tables - nested loop join
-                       (let [execute-group (fn [base-solution {:keys [mapping patterns]}]
-                                             (let [table-name (:table mapping)
-                                                   source (get sources table-name)]
-                                               (when-not source
-                                                 (throw (ex-info (str "No source found for table: " table-name)
-                                                                 {:error :db/missing-source
-                                                                  :table table-name
-                                                                  :available-sources (keys sources)})))
-                                               (query/execute-iceberg-query source mapping patterns base-solution
-                                                                            time-travel nil solution-pushdown)))
-                             ;; Execute first group to get initial solutions
-                             first-group (first pattern-groups)
-                             initial-solutions (execute-group solution first-group)]
-                         ;; Short-circuit if first group returns empty
-                         (if (empty? initial-solutions)
-                           (async/close! ch)
-                           ;; For each subsequent group, join with existing solutions
-                           (let [final-solutions (reduce
-                                                  (fn [solutions group]
-                                                    (if (empty? solutions)
-                                                      (reduced []) ;; Short-circuit on empty
-                                                      (mapcat #(execute-group % group) solutions)))
-                                                  initial-solutions
-                                                  (rest pattern-groups))]
-                             (doseq [sol final-solutions]
-                               (async/>!! ch sol))
-                             (async/close! ch)))))))
+                     (let [{:keys [mapping patterns]} (first pattern-groups)
+                           table-name (:table mapping)
+                           source (get sources table-name)]
+                       (when-not source
+                         (throw (ex-info (str "No source found for table: " table-name)
+                                         {:error :db/missing-source
+                                          :table table-name
+                                          :available-sources (keys sources)})))
+                       (let [solutions (query/execute-iceberg-query source mapping patterns solution
+                                                                    time-travel nil solution-pushdown)]
+                         (doseq [sol solutions]
+                           (async/>!! ch sol))
+                         (async/close! ch)))
+                       ;; Multiple tables - use hash join when join graph available
+                     (let [final-solutions (execute-multi-table-hash-join
+                                            sources pattern-groups solution
+                                            time-travel solution-pushdown join-graph)]
+                       (doseq [sol final-solutions]
+                         (async/>!! ch sol))
+                       (async/close! ch))))
                  (do (async/>!! ch solution)
                      (async/close! ch))))
              (catch Exception e
@@ -516,11 +768,15 @@
                         [table-name (create-source-fn)]))
 
         ;; Build routing indexes for efficient pattern-to-table mapping
-        routing-indexes (query/build-routing-indexes mappings)]
+        routing-indexes (query/build-routing-indexes mappings)
+
+        ;; Build join graph from RefObjectMap declarations
+        join-graph (join/build-join-graph mappings)]
 
     (log/info "Created Iceberg virtual graph:" base-alias backend-desc
               "tables:" (vec table-names)
-              "mappings:" (count mappings))
+              "mappings:" (count mappings)
+              "join-edges:" (count (:edges join-graph)))
 
     (map->IcebergDatabase {:alias base-alias
                            :config (cond-> config
@@ -529,5 +785,6 @@
                            :sources sources
                            :mappings mappings
                            :routing-indexes routing-indexes
+                           :join-graph join-graph
                            :time-travel nil
                            :query-pushdown (atom nil)})))

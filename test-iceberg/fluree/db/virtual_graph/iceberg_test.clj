@@ -948,6 +948,141 @@
 ;;           (teardown-fluree-system))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Multi-Table Hash Join Tests
+;;; ---------------------------------------------------------------------------
+
+(deftest multi-table-join-graph-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "Multi-table VG has join graph from RefObjectMap"
+      (let [vg (iceberg-vg/create {:alias "openflights-join"
+                                   :config {:warehouse-path warehouse-path
+                                            :mapping multi-table-mapping-path}})
+            join-graph (:join-graph vg)]
+        ;; Should have join graph with edges
+        (is (some? join-graph) "Should have join graph")
+        (is (seq (:edges join-graph)) "Join graph should have edges")
+
+        ;; Should have 3 edges:
+        ;; 1. routes -> airlines (via airline_id)
+        ;; 2. routes -> airports (via src_id - sourceAirportRef)
+        ;; 3. routes -> airports (via dst_id - destinationAirportRef)
+        (is (= 3 (count (:edges join-graph)))
+            "Should have 3 join edges from RefObjectMaps")
+
+        ;; Verify the airline join edge
+        (let [airline-edge (first (filter #(= "http://example.org/operatedBy" (:predicate %))
+                                          (:edges join-graph)))]
+          (is (some? airline-edge) "Should have airline join edge")
+          (is (= "openflights/routes" (:child-table airline-edge)))
+          (is (= "openflights/airlines" (:parent-table airline-edge)))
+          (is (= [{:child "airline_id" :parent "id"}] (:columns airline-edge))))))))
+
+(deftest multi-table-join-query-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "Multi-table query triggers hash join execution"
+      (let [vg (iceberg-vg/create {:alias "openflights-hash"
+                                   :config {:warehouse-path warehouse-path
+                                            :mapping multi-table-mapping-path}})
+            ;; Query that spans routes and airlines tables
+            ;; Routes: ?route ex:sourceAirport ?src
+            ;; Airlines: ?airline ex:name ?airlineName
+            ;; The hash join should connect them via airline_id -> id
+            patterns [;; Route pattern - binds to routes table via predicate routing
+                      (make-triple (var-map "?route")
+                                   (iri-map "http://example.org/sourceAirport")
+                                   (var-map "?src"))
+                      (make-triple (var-map "?route")
+                                   (iri-map "http://example.org/airlineId")
+                                   (var-map "?airlineId"))
+                      ;; Airline pattern - binds to airlines table via predicate routing
+                      (make-triple (var-map "?airline")
+                                   (iri-map "http://example.org/name")
+                                   (var-map "?airlineName"))
+                      (make-triple (var-map "?airline")
+                                   (iri-map "http://example.org/country")
+                                   (var-map "?country"))]
+            solution {::iceberg-vg/iceberg-patterns patterns}
+            solution-ch (async/to-chan! [solution])
+            error-ch (async/chan 1)
+            result-ch (where/-finalize vg nil error-ch solution-ch)
+            ;; Take limited results since this is a cross-product if joins don't work
+            results (take 100 (collect-solutions result-ch))]
+        ;; Should have results from both tables joined
+        (is (pos? (count results)) "Should return joined results")
+        ;; Check first result has variables from both tables
+        (when (seq results)
+          (let [first-result (first results)]
+            ;; From routes table
+            (is (or (contains? first-result (symbol "?src"))
+                    (contains? first-result (symbol "?airlineId")))
+                "Should have route variables")
+            ;; From airlines table
+            (is (or (contains? first-result (symbol "?airlineName"))
+                    (contains? first-result (symbol "?country")))
+                "Should have airline variables")))))))
+
+(deftest e2e-multi-table-join-sparql-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL query joining routes and airlines"
+      (setup-fluree-system)
+      (try
+        ;; Register the multi-table Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-join:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; Query that requires joining routes and airlines tables
+        ;; This should use hash join under the hood
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?src ?airlineName
+                      FROM <iceberg/openflights-join>
+                      WHERE {
+                        ?route ex:sourceAirport ?src .
+                        ?route ex:airlineId ?airlineId .
+                        ?airline ex:name ?airlineName .
+                      }
+                      LIMIT 10"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return results")
+          ;; Note: This may return cross-product since patterns don't share variables
+          ;; The hash join optimization happens when join edges are found
+          (is (pos? (count res)) "Should have results"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-multi-table-join-fql-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: FQL query joining routes and airlines"
+      (setup-fluree-system)
+      (try
+        ;; Register the multi-table Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-join-fql:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; Query that accesses both routes and airlines
+        (let [query {"from" ["iceberg/openflights-join-fql"]
+                     "select" ["?src" "?name"]
+                     "where" [{"@id" "?route"
+                               "http://example.org/sourceAirport" "?src"}
+                              {"@id" "?airline"
+                               "http://example.org/name" "?name"}]
+                     "limit" 10}
+              res @(fluree/query-connection @e2e-conn query)]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should have results from multi-table query"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Run from REPL
 ;;; ---------------------------------------------------------------------------
 

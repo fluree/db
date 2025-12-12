@@ -34,6 +34,12 @@
 (def ^:const r2rml-column (str r2rml-ns "column"))
 (def ^:const r2rml-datatype (str r2rml-ns "datatype"))
 
+;; RefObjectMap vocabulary (for multi-table joins)
+(def ^:const r2rml-parent-triples-map (str r2rml-ns "parentTriplesMap"))
+(def ^:const r2rml-join-condition (str r2rml-ns "joinCondition"))
+(def ^:const r2rml-child (str r2rml-ns "child"))
+(def ^:const r2rml-parent (str r2rml-ns "parent"))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Parsing Helpers
 ;;; ---------------------------------------------------------------------------
@@ -53,6 +59,34 @@
   "Extract IRI from a value, handling both raw strings and where-match maps."
   [x]
   (if (string? x) x (::where/iri x)))
+
+(defn- parse-join-conditions
+  "Parse join conditions from a RefObjectMap.
+
+   Each joinCondition specifies a pair of columns:
+   - rr:child - column in the child table (the one with this mapping)
+   - rr:parent - column in the parent table (the one referenced by parentTriplesMap)
+
+   Returns a vector of {:child \"col\" :parent \"col\"} maps.
+   Supports composite keys (multiple joinConditions)."
+  [by-subject om-triples]
+  (let [jc-nodes (keep (fn [[_s p o]]
+                         (when (= r2rml-join-condition (get-iri p))
+                           (get-iri o)))
+                       om-triples)]
+    (vec
+     (for [jc-node jc-nodes
+           :let [jc-triples (get by-subject jc-node)
+                 child-col (some (fn [[_s p o]]
+                                   (when (= r2rml-child (get-iri p))
+                                     (::where/val o)))
+                                 jc-triples)
+                 parent-col (some (fn [[_s p o]]
+                                    (when (= r2rml-parent (get-iri p))
+                                      (::where/val o)))
+                                  jc-triples)]
+           :when (and child-col parent-col)]
+       {:child child-col :parent parent-col}))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; R2RML Parsing
@@ -75,8 +109,9 @@
                          (and (= const/iri-rdf-type (get-iri p))
                               (= r2rml-triples-map (get-iri o))))
                        triples)))
-       (map (fn [[_subject triples]]
-              (let [props (into {} (map (fn [[_s p o]] [(get-iri p) o]) triples))
+       (map (fn [[subject triples]]
+              (let [triples-map-iri subject  ;; Capture TriplesMap IRI for RefObjectMap resolution
+                    props (into {} (map (fn [[_s p o]] [(get-iri p) o]) triples))
                     logical-table-node (get-iri (get props r2rml-logical-table))
                     logical-table (when logical-table-node
                                     (let [lt-triples (get by-subject logical-table-node)
@@ -115,6 +150,7 @@
                                                                   pom-triples)
                                                object-map (when obj-map-node
                                                             (let [om-triples (get by-subject obj-map-node)
+                                                                  ;; Check for column mapping (TermMap)
                                                                   column (some (fn [[_s p o]]
                                                                                  (when (= r2rml-column (get-iri p))
                                                                                    (::where/val o)))
@@ -122,9 +158,25 @@
                                                                   datatype (some (fn [[_s p o]]
                                                                                    (when (= r2rml-datatype (get-iri p))
                                                                                      (get-iri o)))
-                                                                                 om-triples)]
-                                                              (when column
-                                                                {:type :column :value column :datatype datatype})))]
+                                                                                 om-triples)
+                                                                  ;; Check for RefObjectMap (parentTriplesMap)
+                                                                  parent-tm (some (fn [[_s p o]]
+                                                                                    (when (= r2rml-parent-triples-map (get-iri p))
+                                                                                      (get-iri o)))
+                                                                                  om-triples)]
+                                                              (cond
+                                                                ;; Column mapping (TermMap)
+                                                                column
+                                                                {:type :column :value column :datatype datatype}
+
+                                                                ;; RefObjectMap with join conditions
+                                                                parent-tm
+                                                                (let [join-conditions (parse-join-conditions by-subject om-triples)]
+                                                                  {:type :ref
+                                                                   :parent-triples-map parent-tm
+                                                                   :join-conditions join-conditions})
+
+                                                                :else nil)))]
                                            (if (and pred object-map)
                                              (assoc acc pred object-map)
                                              acc)))
@@ -133,7 +185,8 @@
                 (when logical-table
                   (let [table-key (keyword (str/replace (:name logical-table) "\"" ""))]
                     [table-key
-                     {:logical-table logical-table
+                     {:triples-map-iri triples-map-iri  ;; For RefObjectMap resolution
+                      :logical-table logical-table
                       :table (:name logical-table)
                       :subject-template template
                       :class rdf-class
@@ -151,15 +204,23 @@
        - Inline JSON-LD map/vector
 
    Returns a map of {table-key -> mapping} where each mapping contains:
+     :triples-map-iri  - IRI of the TriplesMap (for RefObjectMap resolution)
      :logical-table    - {:type :table-name :name \"table\"}
      :table            - Table name string
      :subject-template - IRI template for subjects
      :class            - RDF class IRI
-     :predicates       - Map of {predicate-iri -> {:type :column :value \"col\" :datatype \"xsd:...\"}}
+     :predicates       - Map of {predicate-iri -> object-map}
+
+   Object maps can be:
+     {:type :column :value \"col\" :datatype \"xsd:...\"}  - Column mapping (TermMap)
+     {:type :ref                                          - Reference mapping (RefObjectMap)
+      :parent-triples-map \"<#OtherMapping>\"
+      :join-conditions [{:child \"fk_col\" :parent \"pk_col\"}]}
 
    Example:
      (parse-r2rml \"/path/to/mapping.ttl\")
-     ;; => {:airlines {:table \"openflights/airlines\"
+     ;; => {:airlines {:triples-map-iri \"<#AirlineMapping>\"
+     ;;                :table \"openflights/airlines\"
      ;;                :class \"http://example.org/Airline\"
      ;;                :predicates {...}}}"
   [mapping-source]

@@ -256,26 +256,42 @@
     (where/match-value {} value const/iri-string)))
 
 (defn row->solution
-  "Transform an Iceberg row to a SPARQL solution map."
-  [row mapping var-mappings subject-var base-solution]
-  (let [subject-id (process-template-subject (:subject-template mapping) row)
-        subject-binding (when subject-var
-                          (let [subj-sym (if (symbol? subject-var) subject-var (symbol subject-var))]
-                            [[subj-sym (where/match-iri {} (or subject-id "urn:unknown"))]]))
-        pred-bindings (for [[pred-iri var-name] var-mappings
-                            :when (and var-name
-                                       (not= pred-iri const/iri-rdf-type))
-                            :let [object-map (get-in mapping [:predicates pred-iri])
-                                  column (when (and (map? object-map) (= :column (:type object-map)))
-                                           (:value object-map))
-                                  value (when column
-                                          (or (get row column)
-                                              (get row (str/lower-case column))))
-                                  var-sym (if (symbol? var-name) var-name (symbol var-name))]
-                            :when value]
-                        [var-sym (value->rdf-match value var-sym)])]
-    (into (or base-solution {})
-          (concat subject-binding pred-bindings))))
+  "Transform an Iceberg row to a SPARQL solution map.
+
+   When join-columns are provided, stores raw column values under
+   ::join-col-vals for use by hash join operators."
+  ([row mapping var-mappings subject-var base-solution]
+   (row->solution row mapping var-mappings subject-var base-solution nil))
+  ([row mapping var-mappings subject-var base-solution join-columns]
+   (let [subject-id (process-template-subject (:subject-template mapping) row)
+         subject-binding (when subject-var
+                           (let [subj-sym (if (symbol? subject-var) subject-var (symbol subject-var))]
+                             [[subj-sym (where/match-iri {} (or subject-id "urn:unknown"))]]))
+         pred-bindings (for [[pred-iri var-name] var-mappings
+                             :when (and var-name
+                                        (not= pred-iri const/iri-rdf-type))
+                             :let [object-map (get-in mapping [:predicates pred-iri])
+                                   column (when (and (map? object-map) (= :column (:type object-map)))
+                                            (:value object-map))
+                                   value (when column
+                                           (or (get row column)
+                                               (get row (str/lower-case column))))
+                                   var-sym (if (symbol? var-name) var-name (symbol var-name))]
+                             :when value]
+                         [var-sym (value->rdf-match value var-sym)])
+         ;; Store raw join column values for hash join operators
+         ;; These are stored under keywords (not symbols) for efficient lookup
+         join-col-vals (when (seq join-columns)
+                         (into {}
+                               (for [col join-columns
+                                     :let [value (or (get row col)
+                                                     (get row (str/lower-case col))
+                                                     (get row (str/upper-case col)))]
+                                     :when (some? value)]
+                                 [(keyword col) value])))]
+     (cond-> (into (or base-solution {})
+                   (concat subject-binding pred-bindings))
+       (seq join-col-vals) (assoc ::join-col-vals join-col-vals)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Query Execution
@@ -291,28 +307,32 @@
 
    limit is an optional hint to limit the number of rows scanned.
    solution-pushdown is an optional vector of pushdown filters from the solution map.
+   join-columns is an optional set of column names to include for join operations.
    Returns a lazy seq of solutions - limit is enforced at the scan level
    for early termination."
   ([source mapping patterns base-solution time-travel]
-   (execute-iceberg-query source mapping patterns base-solution time-travel nil nil))
+   (execute-iceberg-query source mapping patterns base-solution time-travel nil nil nil))
   ([source mapping patterns base-solution time-travel limit]
-   (execute-iceberg-query source mapping patterns base-solution time-travel limit nil))
+   (execute-iceberg-query source mapping patterns base-solution time-travel limit nil nil))
   ([source mapping patterns base-solution time-travel limit solution-pushdown]
+   (execute-iceberg-query source mapping patterns base-solution time-travel limit solution-pushdown nil))
+  ([source mapping patterns base-solution time-travel limit solution-pushdown join-columns]
    (let [table-name (:table mapping)
          pred->var (extract-predicate-bindings patterns)
          pred->literal (extract-literal-filters patterns)
          subject-var (some extract-subject-variable patterns)
 
-         ;; Build columns to select
-         columns (->> pred->var
-                      keys
-                      (keep (fn [pred-iri]
-                              (let [om (get-in mapping [:predicates pred-iri])]
-                                (when (= :column (:type om))
-                                  (:value om)))))
-                      (concat (r2rml/extract-template-cols (:subject-template mapping)))
-                      distinct
-                      vec)
+         ;; Build columns to select (include join columns for hash join support)
+         query-columns (->> pred->var
+                            keys
+                            (keep (fn [pred-iri]
+                                    (let [om (get-in mapping [:predicates pred-iri])]
+                                      (when (= :column (:type om))
+                                        (:value om)))))
+                            (concat (r2rml/extract-template-cols (:subject-template mapping))))
+         columns (-> (concat query-columns (or join-columns []))
+                     distinct
+                     vec)
 
          ;; Build predicates for pushdown from triple patterns (equality)
          literal-predicates (vec (literal-filters->predicates pred->literal mapping))
@@ -336,6 +356,7 @@
 
          _ (log/debug "Iceberg query:" {:table table-name
                                         :columns columns
+                                        :join-columns join-columns
                                         :literal-predicates (count literal-predicates)
                                         :pushed-predicates (count pushed-predicates)
                                         :solution-bound-predicates (count solution-bound-predicates)
@@ -360,4 +381,5 @@
                                    (assoc :limit limit)))]
 
      ;; Transform to solutions - this is also lazy
-     (map #(row->solution % mapping pred->var subject-var base-solution) rows))))
+     ;; Pass join-columns so raw values are stored for hash join
+     (map #(row->solution % mapping pred->var subject-var base-solution join-columns) rows))))
