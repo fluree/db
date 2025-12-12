@@ -11,17 +11,19 @@
    - Type mapping: Iceberg types to Clojure keywords
    - Table scanning: Build scans with projections and pushdown"
   (:require [fluree.db.util.log :as log])
-  (:import [java.time Instant]
+  (:import [java.nio ByteBuffer]
+           [java.time Instant]
            [org.apache.arrow.vector VectorSchemaRoot FieldVector
             BigIntVector IntVector Float4Vector Float8Vector
             VarCharVector BitVector]
-           [org.apache.iceberg PartitionField PartitionSpec Schema Snapshot Table TableScan]
+           [org.apache.iceberg DataFile ManifestFile ManifestFiles PartitionField
+            PartitionSpec Schema Snapshot Table TableScan]
            ;; Arrow imports for vectorized reads
            [org.apache.iceberg.arrow.vectorized ArrowReader ColumnarBatch]
            [org.apache.iceberg.data IcebergGenerics Record]
            [org.apache.iceberg.expressions Expressions Expression]
            [org.apache.iceberg.io CloseableIterable]
-           [org.apache.iceberg.types Type Types$NestedField]))
+           [org.apache.iceberg.types Conversions Type Types$NestedField]))
 
 (set! *warn-on-reflection* true)
 
@@ -464,25 +466,99 @@
 ;;; Statistics Extraction
 ;;; ---------------------------------------------------------------------------
 
+(defn- decode-bound-value
+  "Decode a ByteBuffer bound value to a Clojure value using the field type."
+  [^ByteBuffer buf ^Type field-type]
+  (when buf
+    (try
+      (Conversions/fromByteBuffer field-type (.duplicate buf))
+      (catch Exception _
+        nil))))
+
+(defn- aggregate-column-stats
+  "Aggregate column statistics from all data files in a snapshot.
+
+   Returns a map of column-name -> {:min :max :null-count :value-count}"
+  [^Table table ^Snapshot snapshot]
+  (let [^Schema schema (.schema table)
+        file-io (.io table)
+        ;; Build field-id -> field map for type lookups
+        field-by-id (into {}
+                          (for [^Types$NestedField field (.columns schema)]
+                            [(.fieldId field) field]))
+        ;; Accumulator: field-id -> {:min :max :null-count :value-count}
+        stats-acc (atom {})]
+    ;; Read all manifest files
+    (doseq [^ManifestFile manifest (.dataManifests snapshot file-io)]
+      (with-open [^CloseableIterable reader (ManifestFiles/read manifest file-io)]
+        (doseq [^DataFile data-file reader]
+          (let [lower-bounds (.lowerBounds data-file)
+                upper-bounds (.upperBounds data-file)
+                null-counts  (.nullValueCounts data-file)
+                value-counts (.valueCounts data-file)]
+            ;; Process each column's stats
+            (doseq [[^Integer field-id ^Types$NestedField field] field-by-id
+                    :let [field-type (.type field)
+                          col-name (.name field)]]
+              (let [existing (get @stats-acc field-id)
+                    lower-buf (when lower-bounds (.get lower-bounds field-id))
+                    upper-buf (when upper-bounds (.get upper-bounds field-id))
+                    lower-val (decode-bound-value lower-buf field-type)
+                    upper-val (decode-bound-value upper-buf field-type)
+                    null-cnt  (when null-counts (or (.get null-counts field-id) 0))
+                    val-cnt   (when value-counts (or (.get value-counts field-id) 0))]
+                (swap! stats-acc assoc field-id
+                       {:name col-name
+                        :min (if (and lower-val (:min existing))
+                               (if (neg? (compare lower-val (:min existing)))
+                                 lower-val
+                                 (:min existing))
+                               (or lower-val (:min existing)))
+                        :max (if (and upper-val (:max existing))
+                               (if (pos? (compare upper-val (:max existing)))
+                                 upper-val
+                                 (:max existing))
+                               (or upper-val (:max existing)))
+                        :null-count (+ (or null-cnt 0) (or (:null-count existing) 0))
+                        :value-count (+ (or val-cnt 0) (or (:value-count existing) 0))})))))))
+    ;; Convert to column-name keyed map
+    (into {}
+          (for [[_ stats] @stats-acc]
+            [(:name stats) (dissoc stats :name)]))))
+
 (defn extract-statistics
   "Extract statistics from an Iceberg Table snapshot.
 
    Options:
      :snapshot-id - specific snapshot ID (nil = current)
+     :columns     - seq of column names to include (nil = all)
+     :include-column-stats? - include per-column min/max/null-count (default false)
 
    Returns:
-     {:row-count :file-count :added-records :snapshot-id :timestamp-ms}"
-  [^Table table {:keys [snapshot-id]}]
+     {:row-count long
+      :file-count long
+      :added-records long
+      :snapshot-id long
+      :timestamp-ms long
+      :column-stats {col-name {:min :max :null-count :value-count}}}  ; when include-column-stats? true"
+  [^Table table {:keys [snapshot-id columns include-column-stats?]}]
   (let [snapshot (if snapshot-id
                    (.snapshot table ^long snapshot-id)
                    (.currentSnapshot table))]
     (when snapshot
-      (let [summary (.summary snapshot)]
-        {:row-count (some-> (get summary "total-records") parse-long)
-         :file-count (some-> (get summary "total-data-files") parse-long)
-         :added-records (some-> (get summary "added-records") parse-long)
-         :snapshot-id (.snapshotId snapshot)
-         :timestamp-ms (.timestampMillis snapshot)}))))
+      (let [summary (.summary snapshot)
+            base-stats {:row-count (some-> (get summary "total-records") parse-long)
+                        :file-count (some-> (get summary "total-data-files") parse-long)
+                        :added-records (some-> (get summary "added-records") parse-long)
+                        :snapshot-id (.snapshotId snapshot)
+                        :timestamp-ms (.timestampMillis snapshot)}]
+        (if include-column-stats?
+          (let [all-col-stats (aggregate-column-stats table snapshot)
+                col-stats (if columns
+                            (select-keys all-col-stats columns)
+                            all-col-stats)]
+            (assoc base-stats :column-stats col-stats))
+          base-stats)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Arrow Scan Execution
@@ -501,17 +577,27 @@
        :batch-size  - rows per Arrow batch (default 4096)
        :limit       - max rows to return
 
-   Returns: lazy seq of row maps"
+   Returns: lazy seq of row maps
+
+   Resource Safety:
+     If an exception occurs during scan setup, resources are cleaned up before
+     re-throwing. Once the lazy seq is returned, resource cleanup is handled
+     by arrow-batch-lazy-seq (closes on exhaustion, limit, or exception)."
   [^Table table {:keys [columns predicates snapshot-id as-of-time batch-size limit]
                  :or {batch-size 4096}}]
   (let [^TableScan scan (build-table-scan table {:columns columns
                                                  :predicates predicates
                                                  :snapshot-id snapshot-id
                                                  :as-of-time as-of-time})
-        ^ArrowReader reader (ArrowReader. scan (int batch-size) false)
-        scan-tasks (.planTasks scan)
-        iter (.open reader scan-tasks)]
-    (arrow-batch-lazy-seq iter reader predicates limit)))
+        ^ArrowReader reader (ArrowReader. scan (int batch-size) false)]
+    (try
+      (let [scan-tasks (.planTasks scan)
+            iter (.open reader scan-tasks)]
+        (arrow-batch-lazy-seq iter reader predicates limit))
+      (catch Exception e
+        ;; Clean up reader if setup fails before lazy-seq takes ownership
+        (try (.close reader) (catch Exception _ nil))
+        (throw e)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; IcebergGenerics Scan (non-vectorized, for comparison)
