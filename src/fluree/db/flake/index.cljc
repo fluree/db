@@ -414,7 +414,8 @@
   "Start async resolution for up to `n` unresolved leaves from the stack.
   The cache stores promise-chans, so subsequent resolves get cache hits."
   [r start-flake end-flake error-ch stack n]
-  (loop [xs (rseq stack), remaining (long n)]
+  (loop [xs (rseq stack)
+         remaining n]
     (when (and xs (pos? remaining))
       (let [node (first xs)]
         (if (and (leaf? node) (not (resolved? node)))
@@ -442,11 +443,11 @@
   leaves, pre-fetches up to `prefetch-n` leaves ahead. The cache stores
   promise-chans, so subsequent resolves get cache hits."
   ([r root resolve? error-ch]
-   (tree-chan r root nil nil resolve? default-prefetch-n identity error-ch))
+   (tree-chan r root nil nil resolve? nil identity error-ch))
   ([r root resolve? prefetch-n xf error-ch]
    (tree-chan r root nil nil resolve? prefetch-n xf error-ch))
   ([r root start-flake end-flake resolve? prefetch-n xf error-ch]
-   (let [n   (long (max 0 (or prefetch-n 0)))
+   (let [n   (long (or prefetch-n default-prefetch-n))
          out (chan 1 xf)]
      (go
        (let [root-node (<! (resolve-when r start-flake end-flake resolve? error-ch root))]
