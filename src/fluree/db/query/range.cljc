@@ -149,19 +149,24 @@
      flake-slices))
 
 (defn resolve-flake-slices
-  "Returns a channel that will contain a stream of chunked flake collections that
-  contain the flakes between `start-flake` and `end-flake` and are within the
-  transaction range starting at `from-t` and ending at `to-t`."
+  "Returns a channel containing a stream of flake collections from the index.
+
+  Options:
+  - :to-t        - transaction time upper bound for the range
+  - :start-flake - starting flake bound (inclusive)
+  - :end-flake   - ending flake bound (inclusive)
+  - :prefetch-n  - max concurrent leaf resolves for cold index loads (default 3)
+  - :flake-xf    - transducer to apply to each leaf's flakes"
   ([db idx error-ch opts]
    (resolve-flake-slices db nil idx error-ch opts))
   ([{:keys [index-catalog] :as db} tracker idx error-ch
-    {:keys [to-t start-flake end-flake] :as opts}]
+    {:keys [to-t start-flake end-flake prefetch-n] :or {prefetch-n 3} :as opts}]
    (let [root      (get db idx)
          novelty   (get-in db [:novelty idx])
          novelty-t (get-in db [:novelty :t])
          resolver  (index/index-catalog->t-range-resolver index-catalog novelty-t novelty to-t)
          query-xf  (extract-query-flakes opts)]
-     (->> (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)
+     (->> (index/tree-chan resolver root start-flake end-flake any? prefetch-n query-xf error-ch)
           (filter-authorized db tracker error-ch)))))
 
 (defn filter-subject-page
