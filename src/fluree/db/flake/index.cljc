@@ -472,9 +472,8 @@
                  (let [resolved-branch (<! (resolve-when r start-flake end-flake resolve? error-ch node))]
                    (if-not (resolved? resolved-branch)
                      (recur stack*)
-                     (let [children    (->> resolved-branch :children vals (filterv resolve?))
-                           all-leaves? (every? leaf? children)]
-                       (if all-leaves?
+                     (let [children (->> resolved-branch :children vals (filterv resolve?))]
+                       (if (every? leaf? children)
                          (recur (-> stack* (conj (mark-expanded resolved-branch)) (into (rseq children))))
                          (let [resolved-children (<! (resolve-children-when r start-flake end-flake
                                                                             resolve? error-ch resolved-branch))
