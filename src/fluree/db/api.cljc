@@ -1,5 +1,7 @@
 (ns fluree.db.api
-  (:require [camel-snake-kebab.core :refer [->camelCaseString]]
+  (:require #?(:clj [fluree.db.virtual-graph.create :as vg-create])
+            #?(:clj [fluree.db.virtual-graph.drop :as vg-drop])
+            [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.core.async :as async :refer [go <!]]
             [clojure.walk :refer [postwalk]]
             [fluree.db.api.decode :as decode]
@@ -1036,3 +1038,47 @@
    (validate-connection conn)
    (promise-wrap
     (connection/trigger-ledger-index conn ledger-alias opts))))
+
+;; Virtual Graph APIs (JVM only)
+
+#?(:clj
+   (defn create-virtual-graph
+     "Creates a new virtual graph.
+
+     Parameters:
+       conn - Connection object
+       config - Configuration map:
+         :name - Name for the virtual graph (required)
+         :type - Virtual graph type, e.g. :bm25 (required)
+         :config - Type-specific configuration map:
+           :ledgers - Vector of ledger aliases to index
+           :query - Query defining what data to index
+
+     Returns promise resolving to the created virtual graph instance.
+
+     Example:
+       @(create-virtual-graph conn
+         {:name \"my-search\"
+          :type :bm25
+          :config {:ledgers [\"my-ledger\"]
+                   :query {\"@context\" {\"ex\" \"http://example.org/\"}
+                           \"where\" [{\"@id\" \"?x\" \"@type\" \"ex:Document\"}]
+                           \"select\" {\"?x\" [\"@id\" \"ex:title\" \"ex:content\"]}}}})"
+     [conn config]
+     (validate-connection conn)
+     (promise-wrap
+      (vg-create/create conn config))))
+
+#?(:clj
+   (defn drop-virtual-graph
+     "Drops a virtual graph and all its associated data.
+
+     Parameters:
+       conn - Connection object
+       vg-name - Name of the virtual graph to drop
+
+     Returns promise resolving to :dropped when complete."
+     [conn vg-name]
+     (validate-connection conn)
+     (promise-wrap
+      (vg-drop/drop-virtual-graph conn vg-name))))
