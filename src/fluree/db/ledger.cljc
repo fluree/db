@@ -1,5 +1,6 @@
 (ns fluree.db.ledger
-  (:require [clojure.string :as str]
+  (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.db.branch :as branch]
             [fluree.db.commit.storage :as commit-storage]
             [fluree.db.constants :as const]
@@ -7,7 +8,9 @@
             [fluree.db.did :as did]
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
+            [fluree.db.flake.flake-db :as flake-db]
             [fluree.db.flake.index.storage :as index-storage]
+            [fluree.db.indexer.garbage :as garbage]
             [fluree.db.json-ld.credential :as credential]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.nameservice :as nameservice]
@@ -398,6 +401,138 @@
   ([ledger branch]
    (let [branch-meta (get-branch-meta ledger branch)]
      (branch/trigger-index! branch-meta))))
+
+(defn- update-branch-after-reindex!
+  "Swap in a reindexed db, but only if the branch didn't advance."
+  [branch-meta expected-t expected-commit-id expected-commit-address reindexed-db]
+  (swap! (:state branch-meta)
+         (fn [{:keys [current-db] :as current-state}]
+           (let [cur-t         (:t current-db)
+                 cur-commit-id (get-in current-db [:commit :id])
+                 cur-commit-address (get-in current-db [:commit :address])
+                 id-match?     (if (some? expected-commit-id)
+                                 (= cur-commit-id expected-commit-id)
+                                 true)
+                 address-match? (if (some? expected-commit-address)
+                                  (= cur-commit-address expected-commit-address)
+                                  true)]
+             (when-not (and (= cur-t expected-t) id-match? address-match?)
+               (throw (ex-info "Ledger advanced during reindex; refusing to overwrite newer state."
+                               {:status 409
+                                :error :db/reindex-conflict
+                                :expected {:t expected-t :commit-id expected-commit-id :commit-address expected-commit-address}
+                                :current  {:t cur-t :commit-id cur-commit-id :commit-address cur-commit-address}})))
+             (assoc current-state
+                    :commit     (:commit reindexed-db)
+                    :current-db reindexed-db)))))
+
+(defn reindex!
+  "Rebuilds the index from commit history (offline), regenerating stats.
+
+  Options:
+    :from-t        - Start t (default 1; t=0 is genesis)
+    :batch-bytes   - Novelty threshold per batch
+    :index-files-ch - Optional channel for index file notifications
+    :branch        - Branch to reindex (default current branch)
+
+  Note: new transactions should be blocked during reindex."
+  ([ledger]
+   (reindex! ledger {}))
+  ([{:keys [commit-catalog index-catalog indexing-opts primary-publisher alias] :as ledger}
+    {:keys [from-t batch-bytes index-files-ch branch] :or {from-t 1}}]
+   (go-try
+     ;; Validate branch early - current-db throws if branch is invalid
+     (let [branch-name (or branch (:branch @(:state ledger)))
+           db*         (current-db ledger branch-name)
+           ;; current-db can be an AsyncDB; realize for config fields like :max-old-indexes.
+           db          (if-let [db-chan (:db-chan db*)] (<? db-chan) db*)
+           current-t   (:t db)
+           ledger-alias (:alias db)]
+
+       ;; Validate from-t
+       (when (< from-t 1)
+         (throw (ex-info "from-t must be >= 1 (t=0 is genesis commit with no data)"
+                         {:status 400 :error :db/invalid-reindex-options :from-t from-t})))
+       (when (> from-t current-t)
+         (throw (ex-info (str "from-t cannot exceed current t value of " current-t)
+                         {:status 400 :error :db/invalid-reindex-options
+                          :from-t from-t :current-t current-t})))
+
+       ;; Check if ledger only has genesis (t=0)
+       (when (= current-t 0)
+         (throw (ex-info "Cannot reindex ledger with only genesis commit (t=0). No data to reindex."
+                         {:status 400 :error :db/invalid-reindex-options :current-t current-t})))
+
+       ;; Clean existing garbage records before reindex (only applies if an index exists).
+       (when-let [index-address (get-in db [:commit :index :address])]
+         (let [max-old-indexes (:max-old-indexes db)]
+           (log/info "Running garbage collection before reindex"
+                     {:alias ledger-alias
+                      :index-address index-address
+                      :max-old-indexes max-old-indexes})
+           (async/<! (garbage/clean-garbage db max-old-indexes))))
+
+       (let [branch-meta   (get-branch-meta ledger branch-name)
+             commit-map    (:commit db)
+             expected-commit-id (:id commit-map)
+             expected-commit-address (:address commit-map)
+             commit-jsonld (branch/commit-map->commit-jsonld commit-map)
+             ;; Use configured batch-bytes or default from indexing-opts
+             batch-bytes*  (or batch-bytes
+                               (:reindex-max-bytes indexing-opts)
+                               (:reindex-max-bytes db)
+                               10000000) ;; 10MB default
+             ;; Use buffered channel to prevent deadlock if error happens before consumer reads
+             error-ch      (async/chan 1)
+             ;; Create genesis db for rebuilding (old index will be orphaned)
+             genesis-db    (flake-db/genesis-db ledger-alias commit-catalog index-catalog indexing-opts)
+             ;; Trace all commits from from-t and enrich with data
+             commits-ch    (->> (commit-storage/trace-commits
+                                 commit-catalog
+                                 commit-jsonld
+                                 from-t
+                                 error-ch)
+                                (flake-db/with-commit-data commit-catalog error-ch))]
+
+         (log/info "Starting reindex for ledger" ledger-alias
+                   {:from-t from-t
+                    :batch-bytes batch-bytes*
+                    :current-t current-t
+                    :branch branch-name})
+
+         ;; Run reindex, watching for errors
+         (let [result-ch (flake-db/reindex-from-commits genesis-db commits-ch batch-bytes* index-files-ch)]
+           (async/alt!
+             error-ch ([e]
+                       (log/error e "Reindex failed for" ledger-alias)
+                       (throw e))
+
+             result-ch ([reindexed-db]
+                        (if (util/exception? reindexed-db)
+                          (throw reindexed-db)
+                          (do
+                            ;; Validate reindexed db before swap
+                            (when-not (= (:t reindexed-db) current-t)
+                              (throw (ex-info "Reindexed db t doesn't match expected t"
+                                              {:status 500 :error :db/reindex-mismatch
+                                               :expected-t current-t :actual-t (:t reindexed-db)})))
+
+                            ;; Update branch state with reindexed db
+                            (update-branch-after-reindex! branch-meta current-t expected-commit-id expected-commit-address reindexed-db)
+
+                            ;; Publish new index to nameservice
+                            (when-let [index-address (get-in reindexed-db [:commit :index :address])]
+                              (let [index-t (get-in reindexed-db [:commit :index :data :t])]
+                                (log/info "Publishing reindexed index" {:alias alias
+                                                                        :index-address index-address
+                                                                        :index-t index-t})
+                                (when primary-publisher
+                                  (<? (nameservice/publish-index primary-publisher ledger-alias index-address index-t)))))
+
+                            (log/info "Reindex complete for" ledger-alias
+                                      {:stats-properties (count (get-in reindexed-db [:stats :properties]))
+                                       :stats-classes (count (get-in reindexed-db [:stats :classes]))})
+                            reindexed-db))))))))))
 
 (defn parse-commit-context
   [context]
