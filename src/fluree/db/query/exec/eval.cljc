@@ -156,8 +156,9 @@
 
    'min          {:init  (fn [] nil)
                   :step! (fn [state tv]
+                           ;; Ignore nil tv or tv with nil :value (same as count/count-distinct)
                            (cond
-                             (nil? tv) state
+                             (nil? (some-> tv :value)) state
                              (nil? state) tv
                              (neg? (compare* tv state)) tv
                              :else state))
@@ -167,8 +168,9 @@
 
    'max          {:init  (fn [] nil)
                   :step! (fn [state tv]
+                           ;; Ignore nil tv or tv with nil :value (same as count/count-distinct)
                            (cond
-                             (nil? tv) state
+                             (nil? (some-> tv :value)) state
                              (nil? state) tv
                              (pos? (compare* tv state)) tv
                              :else state))
