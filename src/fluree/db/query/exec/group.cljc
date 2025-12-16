@@ -100,22 +100,71 @@
   [match compact]
   (display-sparql-aggregate match compact))
 
-(defn- get-streaming-agg
-  "Returns selector's streaming aggregate descriptor map, or nil."
-  [sel]
-  (cond
-    (instance? fluree.db.query.exec.select.AggregateSelector sel)
-    (:streaming-agg sel)
-
-    (instance? fluree.db.query.exec.select.AsSelector sel)
-    (:streaming-agg sel)
-
-    :else
-    nil))
-
 (defn- streaming-agg-selector?
   [sel]
-  (some? (get-streaming-agg sel)))
+  (some? (:streaming-agg sel)))
+
+(defn- streaming-eligible?
+  "Returns true if the query can use streaming aggregation.
+  Streaming is possible when:
+  - No HAVING clause (requires all solutions to evaluate)
+  - Has streaming aggregates
+  - Either implicit grouping with all aggregate selectors,
+    or explicit group-by with all selectors being group vars or aggregates"
+  [having streaming-aggs implicit? selectors group-vars group-vars-set]
+  (and (nil? having)
+       (seq streaming-aggs)
+       (if implicit?
+         (every? streaming-agg-selector? selectors)
+         (and (seq group-vars)
+              (every? (fn [sel]
+                        (or (and (instance? fluree.db.query.exec.select.VariableSelector sel)
+                                 (contains? group-vars-set (:var sel)))
+                            (streaming-agg-selector? sel)))
+                      selectors)))))
+
+(defn- update-streaming-groups
+  "Reducer function that updates streaming aggregate states for each solution.
+  Returns updated groups map with accumulated aggregate states per group key."
+  [group-vars streaming-aggs groups solution]
+  (let [group-key (extract-group-key group-vars solution)
+        {:keys [group-vars-map agg-states]}
+        (get groups group-key
+             {:group-vars-map (zipmap group-vars group-key)
+              :agg-states     {}})
+        agg-states'
+        (reduce (fn [states {:keys [arg-var result-var descriptor]}]
+                  (let [{:keys [init step!]} descriptor
+                        state   (get states result-var (init))
+                        tv      (when arg-var
+                                  (some-> solution
+                                          (get arg-var)
+                                          where/mch->typed-val))
+                        new-st  (step! state tv)]
+                    (assoc states result-var new-st)))
+                agg-states
+                streaming-aggs)]
+    (assoc groups group-key {:group-vars-map group-vars-map
+                             :agg-states     agg-states'})))
+
+(defn- finalize-streaming-groups
+  "Completion function that converts accumulated aggregate states into final solutions.
+  Called once after all solutions have been processed."
+  [streaming-aggs groups]
+  (reduce-kv
+   (fn [solutions _group-key {:keys [group-vars-map agg-states]}]
+     (let [solution-with-aggs
+           (reduce (fn [sol {:keys [result-var descriptor]}]
+                     (let [state    (get agg-states result-var)
+                           tv       ((:final descriptor) state)
+                           base-mch (where/unmatched-var result-var)
+                           mch      (where/typed-val->mch base-mch tv)]
+                       (assoc sol result-var mch)))
+                   group-vars-map
+                   streaming-aggs)]
+       (conj solutions solution-with-aggs)))
+   []
+   groups))
 
 (defn combine
   "Returns a channel of solutions from `solution-ch` collected into groups defined
@@ -124,66 +173,18 @@
   (let [selectors      (util/sequential select)
         group-vars     (vec group-by)
         group-vars-set (set group-vars)
-        streaming-aggs (->> selectors (keep get-streaming-agg) vec)
+        streaming-aggs (->> selectors (keep :streaming-agg) vec)
         implicit?      (and (empty? group-vars)
                             (some select/implicit-grouping? selectors))
-        streaming?     (and (nil? having)
-                            (seq streaming-aggs)
-                            (if implicit?
-                              (every? streaming-agg-selector? selectors)
-                              (and (seq group-vars)
-                                   (every? (fn [sel]
-                                             (cond
-                                               (instance? fluree.db.query.exec.select.VariableSelector sel)
-                                               (contains? group-vars-set (:var sel))
-
-                                               :else
-                                               (streaming-agg-selector? sel)))
-                                           selectors))))]
+        streaming?     (streaming-eligible? having streaming-aggs implicit?
+                                            selectors group-vars group-vars-set)]
     (if streaming?
-      (let [update-groups
-            (fn [groups solution]
-              (let [group-key (extract-group-key group-vars solution)
-                    {:keys [group-vars-map agg-states]}
-                    (get groups group-key
-                         {:group-vars-map (zipmap group-vars group-key)
-                          :agg-states     {}})
-                    agg-states'
-                    (reduce (fn [states {:keys [arg-var result-var descriptor]}]
-                              (let [{:keys [init step!]} descriptor
-                                    state   (get states result-var (init))
-                                    tv      (when arg-var
-                                              (some-> solution
-                                                      (get arg-var)
-                                                      where/mch->typed-val))
-                                    new-st  (step! state tv)]
-                                (assoc states result-var new-st)))
-                            agg-states
-                            streaming-aggs)]
-                (assoc groups group-key {:group-vars-map group-vars-map
-                                         :agg-states     agg-states'})))
-
-            finalize-groups
-            (fn [groups]
-              (reduce-kv
-               (fn [solutions _group-key {:keys [group-vars-map agg-states]}]
-                 (let [solution-with-aggs
-                       (reduce (fn [sol {:keys [result-var descriptor]}]
-                                 (let [state   (get agg-states result-var)
-                                       tv      ((:final descriptor) state)
-                                       base-mch (where/unmatched-var result-var)
-                                       mch     (where/typed-val->mch base-mch tv)]
-                                   (assoc sol result-var mch)))
-                               group-vars-map
-                               streaming-aggs)]
-                   (conj solutions solution-with-aggs)))
-               []
-               groups))]
-        (-> (async/transduce (map identity)
-                             (completing update-groups finalize-groups)
-                             {}
-                             solution-ch)
-            (async/pipe (async/chan 2 cat))))
+      (-> (async/transduce (map identity)
+                           (completing (partial update-streaming-groups group-vars streaming-aggs)
+                                       (partial finalize-streaming-groups streaming-aggs))
+                           {}
+                           solution-ch)
+          (async/pipe (async/chan 2 cat)))
 
       (if-let [grouping (or group-by
                             (implicit-grouping select))]
