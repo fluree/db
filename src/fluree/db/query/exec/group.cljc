@@ -24,13 +24,19 @@
                 (transient {})
                 m))))
 
+(defn extract-group-key
+  "Extracts just the group key from a solution without building grouped-val.
+  Used by streaming mode to avoid the dissoc-many overhead per row."
+  [variables solution]
+  (mapv (fn [v]
+          (-> solution
+              (get v)
+              where/sanitize-match))
+        variables))
+
 (defn split-solution-by
   [variables variable-set solution]
-  (let [group-key   (mapv (fn [v]
-                            (-> solution
-                                (get v)
-                                where/sanitize-match))
-                          variables)
+  (let [group-key   (extract-group-key variables solution)
         grouped-val (dissoc-many solution variable-set)]
     [group-key grouped-val]))
 
@@ -165,7 +171,8 @@
       ;; avoid collecting full grouped value collections.
       (let [update-groups
             (fn [groups solution]
-              (let [[group-key _] (split-solution-by group-vars group-vars-set solution)
+              ;; Use extract-group-key to avoid dissoc-many overhead per row
+              (let [group-key (extract-group-key group-vars solution)
                     {:keys [group-vars-map agg-states]}
                     (get groups group-key
                          {:group-vars-map (zipmap group-vars group-key)
