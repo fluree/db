@@ -64,28 +64,20 @@
   ValueSelector
   (format-value
     [_this _db _iri-cache _context compact _tracker error-ch solution]
-    (if-let [{:keys [result-var]} streaming-agg]
-      ;; Streaming mode: group/combine has populated `result-var` in the
-      ;; solution when streaming mode is active. If result-var is not in
-      ;; the solution, fall back to legacy mode (e.g., implicit grouping).
-      (if (contains? solution result-var)
-        (go (try* (some-> solution
-                          (get result-var)
-                          (select.fql/display compact))
-                  (catch* e
-                    (log/error e "Error formatting streaming aggregate selector")
-                    (>! error-ch e))))
-        ;; Fallback to legacy mode when result-var not populated
-        (go (try* (:value (agg-fn solution))
-                  (catch* e
-                    (log/error e "Error applying aggregate selector")
-                    (>! error-ch e)))))
-      ;; Legacy mode: apply the compiled aggregate function over grouped
-      ;; values wrapped in ::grouping matches.
-      (go (try* (:value (agg-fn solution))
-                (catch* e
-                  (log/error e "Error applying aggregate selector")
-                  (>! error-ch e)))))))
+    (let [result-var (:result-var streaming-agg)]
+      (if (and result-var (contains? solution result-var))
+        (go
+          (try*
+            (some-> solution (get result-var) (select.fql/display compact))
+            (catch* e
+              (log/error e "Error formatting streaming aggregate selector")
+              (>! error-ch e))))
+        (go
+          (try*
+            (:value (agg-fn solution))
+            (catch* e
+              (log/error e "Error applying aggregate selector")
+              (>! error-ch e))))))))
 
 (defn aggregate-selector
   "Returns a selector that extracts the grouped values bound to the specified
@@ -94,9 +86,8 @@
   supplied `agg-function` to generate the final aggregated result for display.
 
   Optional parameters:
-    `streaming-agg` - map containing streaming aggregate descriptor when the
-                      aggregate can be computed incrementally (count, sum, avg, min, max)
-    `agg-info` - map with :fn-name and :vars for aggregate metadata"
+    `streaming-agg` - descriptor map for incremental aggregates
+    `agg-info` - {:fn-name sym, :vars #{?v ...}}"
   ([agg-function]
    (->AggregateSelector agg-function nil))
   ([agg-function streaming-agg]
@@ -110,31 +101,26 @@
   (update-solution
     [_ solution]
     (if (and streaming-agg (contains? solution bind-var))
-      ;; Streaming mode: group/combine has already populated bind-var in
-      ;; the solution, so skip the as-fn evaluation here.
       solution
-      ;; Legacy mode or streaming not active: apply the as-fn to compute
-      ;; the bound value.
-      (do
-        (log/trace "AsSelector update-solution solution:" solution)
-        (let [{v :value dt :datatype-iri lang :lang} (as-fn solution)]
-          (log/trace "AsSelector update-solution result:" v)
-          (assoc solution bind-var (-> (where/unmatched-var bind-var)
-                                       (where/match-value v (or dt (datatype/infer-iri v)))
-                                       (cond-> lang (where/match-lang v lang))))))))
+      (let [{v :value dt :datatype-iri lang :lang} (as-fn solution)
+            mch0 (-> (where/unmatched-var bind-var)
+                     (where/match-value v (or dt (datatype/infer-iri v))))
+            mch  (if lang
+                   (where/match-lang mch0 v lang)
+                   mch0)]
+        (assoc solution bind-var mch))))
+
   ValueAdapter
   (solution-value
-    [_ _ solution]
+    [_ _error-ch solution]
     [bind-var (get solution bind-var)]))
 
 (defn as-selector
   "Creates an AS selector that binds the result of `as-fn` to `bind-var`.
 
   Optional parameters:
-    `streaming-agg` - map containing streaming aggregate descriptor when the
-                      inner expression is a streamable aggregate. When present,
-                      `update-solution` becomes a no-op since group/combine handles it.
-    `agg-info` - map with :fn-name and :vars for aggregate metadata"
+    `streaming-agg` - descriptor map for incremental aggregates
+    `agg-info` - {:fn-name sym, :vars #{?v ...}}"
   ([as-fn output bind-var aggregate?]
    (as-selector as-fn output bind-var aggregate? nil nil))
   ([as-fn output bind-var aggregate? streaming-agg]

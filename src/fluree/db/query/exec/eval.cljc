@@ -90,20 +90,12 @@
   [coll]
   (where/->typed-val (count coll)))
 
-;; -----------------------------------------------------------------------------
-;; Streaming aggregate descriptors
-;; -----------------------------------------------------------------------------
+;; Streaming aggregate descriptors (incremental group aggregation)
 
 (declare compare*)
 
 (def streaming-aggregate-registry
-  "Registry of simple aggregates that can be evaluated incrementally
-  using a small per-group state instead of full grouped collections.
-
-  Each entry is a map:
-    {:init  (fn [] state)
-     :step! (fn [state typed-val] new-state)
-     :final (fn [state] TypedValue)}"
+  "Streaming aggregate registry: op -> {:init :step! :final}."
   {'count        {:init  (fn [] 0)
                   :step! (fn [state tv]
                            (if (some-> tv :value some?)
@@ -129,7 +121,6 @@
 
    'sum          {:init  (fn [] nil)
                   :step! (fn [state tv]
-                           ;; Use some? to include 0 and false values
                            (let [v (:value tv)]
                              (if (some? v)
                                (if (nil? state)
@@ -141,18 +132,15 @@
 
    'avg          {:init  (fn [] {:sum nil :cnt 0})
                   :step! (fn [{:keys [sum cnt]} tv]
-                           ;; Use some? to include 0 and false values
                            (let [v (:value tv)]
                              (if (some? v)
                                {:sum (if (nil? sum) v (+ sum v))
                                 :cnt (inc cnt)}
                                {:sum sum :cnt cnt})))
                   :final (fn [{:keys [sum cnt]}]
-                           ;; Division result - convert ratio to double for display
                            (let [raw (if (pos? cnt)
                                        (/ sum cnt)
                                        0)
-                                 ;; Convert ratio to double, keep integers as-is
                                  res (if (ratio? raw)
                                        (double raw)
                                        raw)]
@@ -160,31 +148,26 @@
 
    'min          {:init  (fn [] nil)
                   :step! (fn [state tv]
-                           ;; Ignore nil tv or tv with nil :value (same as count/count-distinct)
                            (cond
                              (nil? (some-> tv :value)) state
                              (nil? state) tv
                              (neg? (compare* tv state)) tv
                              :else state))
                   :final (fn [state]
-                           ;; state is already a TypedValue when present
                            (or state (where/->typed-val nil)))}
 
    'max          {:init  (fn [] nil)
                   :step! (fn [state tv]
-                           ;; Ignore nil tv or tv with nil :value (same as count/count-distinct)
                            (cond
                              (nil? (some-> tv :value)) state
                              (nil? state) tv
                              (pos? (compare* tv state)) tv
                              :else state))
                   :final (fn [state]
-                           ;; state is already a TypedValue when present
                            (or state (where/->typed-val nil)))}})
 
 (defn streaming-agg-descriptor
-  "Look up a streaming aggregate descriptor for aggregate op symbol `op`.
-  Returns nil if the op is not supported for streaming."
+  "Returns streaming aggregate descriptor for `op`, or nil."
   [op]
   (get streaming-aggregate-registry op))
 

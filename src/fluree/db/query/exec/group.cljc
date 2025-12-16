@@ -4,8 +4,7 @@
             [fluree.db.query.exec.select.fql :as select.fql]
             [fluree.db.query.exec.select.sparql :as select.sparql]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util :as util]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -25,8 +24,7 @@
                 m))))
 
 (defn extract-group-key
-  "Extracts just the group key from a solution without building grouped-val.
-  Used by streaming mode to avoid the dissoc-many overhead per row."
+  "Extracts the group key from a solution."
   [variables solution]
   (mapv (fn [v]
           (-> solution
@@ -103,8 +101,7 @@
   (display-sparql-aggregate match compact))
 
 (defn- get-streaming-agg
-  "Extracts streaming-agg from a selector. Checks record field for AggregateSelector
-  and AsSelector, returns nil for other selector types."
+  "Returns selector's streaming aggregate descriptor map, or nil."
   [sel]
   (cond
     (instance? fluree.db.query.exec.select.AggregateSelector sel)
@@ -116,6 +113,10 @@
     :else
     nil))
 
+(defn- streaming-agg-selector?
+  [sel]
+  (some? (get-streaming-agg sel)))
+
 (defn combine
   "Returns a channel of solutions from `solution-ch` collected into groups defined
   by the `:group-by` clause specified in the supplied query."
@@ -123,55 +124,25 @@
   (let [selectors      (util/sequential select)
         group-vars     (vec group-by)
         group-vars-set (set group-vars)
-        ;; Extract streaming-agg from record fields
-        streaming-aggs (->> selectors
-                            (keep get-streaming-agg)
-                            vec)
-        ;; Check if this is implicit grouping (global aggregate without GROUP BY)
+        streaming-aggs (->> selectors (keep get-streaming-agg) vec)
         implicit?      (and (empty? group-vars)
                             (some select/implicit-grouping? selectors))
-        ;; Streaming mode is enabled when:
-        ;;  - there is no HAVING clause (HAVING needs grouped collections), and
-        ;;  - there are streaming-agg descriptors, and
-        ;;  - either:
-        ;;    a) explicit GROUP BY with all selectors being group vars or streaming aggs, or
-        ;;    b) implicit grouping with all selectors being streaming aggs
         streaming?     (and (nil? having)
                             (seq streaming-aggs)
                             (if implicit?
-                              ;; Implicit grouping: all selectors must be streaming aggs
-                              (every? (fn [sel]
-                                        (or (and (instance? fluree.db.query.exec.select.AggregateSelector sel)
-                                                 (some? (:streaming-agg sel)))
-                                            (and (instance? fluree.db.query.exec.select.AsSelector sel)
-                                                 (some? (:streaming-agg sel)))))
-                                      selectors)
-                              ;; Explicit GROUP BY: need group vars and matching selectors
+                              (every? streaming-agg-selector? selectors)
                               (and (seq group-vars)
                                    (every? (fn [sel]
                                              (cond
                                                (instance? fluree.db.query.exec.select.VariableSelector sel)
                                                (contains? group-vars-set (:var sel))
 
-                                               (instance? fluree.db.query.exec.select.AggregateSelector sel)
-                                               (some? (:streaming-agg sel))
-
-                                               (instance? fluree.db.query.exec.select.AsSelector sel)
-                                               (some? (:streaming-agg sel))
-
                                                :else
-                                               false))
+                                               (streaming-agg-selector? sel)))
                                            selectors))))]
-    (log/debug "group/combine streaming?" streaming?
-                "implicit?" implicit?
-                "group-vars" group-vars
-                "streaming-aggs" (count streaming-aggs))
     (if streaming?
-      ;; New streaming mode: maintain per-group aggregate state and
-      ;; avoid collecting full grouped value collections.
       (let [update-groups
             (fn [groups solution]
-              ;; Use extract-group-key to avoid dissoc-many overhead per row
               (let [group-key (extract-group-key group-vars solution)
                     {:keys [group-vars-map agg-states]}
                     (get groups group-key
@@ -214,8 +185,6 @@
                              solution-ch)
             (async/pipe (async/chan 2 cat))))
 
-      ;; Legacy mode: collect grouped values and wrap them in ::grouping
-      ;; matches for collection-based aggregate evaluation.
       (if-let [grouping (or group-by
                             (implicit-grouping select))]
         (let [grouping-set (set grouping)]

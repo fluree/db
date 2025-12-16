@@ -656,22 +656,19 @@
         select/construct-selector)))
 
 (defn- extract-simple-agg-op
-  "Detects if code is a simple aggregate form like (agg ?var) or (count *).
-  Returns {:agg-op symbol, :arg-var symbol-or-nil} or nil."
+  "Returns {:agg-op op, :arg-var ?v} for simple (op ?v)/(count *) aggregates."
   [code]
   (when (and (seq? code)
              (symbol? (first code)))
     (let [op   (first code)
           args (rest code)]
       (cond
-        ;; (count *) → count-star (row-count)
         (and (= 'count op)
              (= 1 (count args))
              (= '* (first args)))
         {:agg-op 'count-star
          :arg-var nil}
 
-        ;; (agg ?v) where agg is an allowed aggregate fn
         (and (= 1 (count args))
              (symbol? (first args))
              (v/query-variable? (first args))
@@ -683,8 +680,7 @@
         nil))))
 
 (defn- build-streaming-agg
-  "Builds streaming-agg map if the code represents a simple streamable aggregate.
-  Returns the streaming-agg map or nil."
+  "Returns streaming-agg descriptor map for `code`, or nil."
   [code]
   (when-let [{:keys [agg-op arg-var]} (extract-simple-agg-op code)]
     (when-let [descriptor (eval/streaming-agg-descriptor agg-op)]
@@ -701,12 +697,9 @@
         bind-var      (last parsed-fn)
         aggregate?    (when fn-name (eval/allowed-aggregate-fns fn-name))
         agg-vars      (variables parsed-fn)
-        ;; For AS-wrapped aggregates, detect if the inner is streamable
         streaming-agg (when aggregate?
                         (when-let [sagg (build-streaming-agg inner-form)]
-                          ;; Override result-var with the explicit bind-var from AS
                           (assoc sagg :result-var bind-var)))
-        ;; Aggregate info for count-distinct optimization
         agg-info      (when aggregate?
                         {:fn-name fn-name
                          :vars    agg-vars})]
