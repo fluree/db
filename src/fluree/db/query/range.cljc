@@ -6,7 +6,7 @@
             [fluree.db.json-ld.policy.query :as policy]
             [fluree.db.track :as track]
             [fluree.db.util :as util :refer [try* catch*]]
-            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.async :refer [<? empty-channel go-try]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.schema :as schema-util]))
 
@@ -29,6 +29,7 @@
   (let [[p1 p2 p3 p4 op m] match]
     (case idx
       :spot [p1 (coerce-predicate db p2) p3 p4 op m]
+      :psot [p2 (coerce-predicate db p1) p3 p4 op m]
       :post [p3 (coerce-predicate db p1) p2 p4 op m]
       :opst [p3 (coerce-predicate db p2) p1 p4 op m]
       :tspo [p2 (coerce-predicate db p3) p4 p1 op m])))
@@ -46,6 +47,7 @@
   (case idx
     :spot subject-min-match
     :post pred-min-match
+    :psot pred-min-match
     :opst subject-min-match
     :tspo txn-min-match))
 
@@ -55,6 +57,7 @@
   (case idx
     :spot subject-max-match
     :post pred-max-match
+    :psot pred-max-match
     :opst subject-max-match
     :tspo txn-max-match))
 
@@ -161,13 +164,14 @@
    (resolve-flake-slices db nil idx error-ch opts))
   ([{:keys [index-catalog] :as db} tracker idx error-ch
     {:keys [to-t start-flake end-flake prefetch-n] :or {prefetch-n 3} :as opts}]
-   (let [root      (get db idx)
-         novelty   (get-in db [:novelty idx])
-         novelty-t (get-in db [:novelty :t])
-         resolver  (index/index-catalog->t-range-resolver index-catalog novelty-t novelty to-t)
-         query-xf  (extract-query-flakes opts)]
-     (->> (index/tree-chan resolver root start-flake end-flake any? prefetch-n query-xf error-ch)
-          (filter-authorized db tracker error-ch)))))
+   (if-let [root (get db idx)]
+     (let [novelty   (get-in db [:novelty idx])
+           novelty-t (get-in db [:novelty :t])
+           resolver  (index/index-catalog->t-range-resolver index-catalog novelty-t novelty to-t)
+           query-xf  (extract-query-flakes opts)]
+       (->> (index/tree-chan resolver root start-flake end-flake any? prefetch-n query-xf error-ch)
+            (filter-authorized db tracker error-ch)))
+     empty-channel)))
 
 (defn filter-subject-page
   "Returns a transducer to filter a stream of flakes to only contain flakes from
@@ -232,42 +236,43 @@
          (expand-range-interval idx test match)]
      (time-range db tracker idx start-test start-match end-test end-match opts)))
   ([{:keys [t index-catalog] :as db} tracker idx start-test start-match end-test end-match opts]
-   (let [{:keys [limit offset flake-limit from-t to-t]
-          :or   {from-t t, to-t t}}
-         opts
+   (if-let [idx-root (get db idx)]
+     (let [{:keys [limit offset flake-limit from-t to-t]
+            :or   {from-t t, to-t t}}
+           opts
 
-         start-parts (match->flake-parts db idx start-match)
-         end-parts   (match->flake-parts db idx end-match)
+           start-parts (match->flake-parts db idx start-match)
+           end-parts   (match->flake-parts db idx end-match)
 
-         start-flake (apply resolve-match-flake start-test start-parts)
-         end-flake   (apply resolve-match-flake end-test end-parts)
-         error-ch    (chan)
+           start-flake (apply resolve-match-flake start-test start-parts)
+           end-flake   (apply resolve-match-flake end-test end-parts)
+           error-ch    (chan)
 
-         ;; index-range*
-         idx-root (get db idx)
-         idx-cmp  (get-in db [:comparators idx])
-         novelty  (get-in db [:novelty idx])
+           ;; index-range*
+           idx-cmp  (get-in db [:comparators idx])
+           novelty  (get-in db [:novelty idx])
 
-         ;; resolve-flake-slices
-         {:keys [cache]} index-catalog
-         resolver        (index/->CachedHistoryRangeResolver index-catalog t novelty from-t to-t cache)
-         range-set       (flake/sorted-set-by idx-cmp start-flake end-flake)
-         in-range?       (fn [node] (intersects-range? node range-set))
-         query-xf        (extract-query-flakes {:idx         idx
-                                                :start-test  start-test
-                                                :start-flake start-flake
-                                                :end-test    end-test
-                                                :end-flake   end-flake})]
-     (go-try
-       (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake
-                                              in-range? 1 query-xf error-ch)
-                             (filter-authorized db tracker error-ch)
-                             (into-page limit offset flake-limit))]
-         (async/alt!
-           error-ch ([e]
-                     (throw e))
-           history-ch ([hist-range]
-                       hist-range)))))))
+           ;; resolve-flake-slices
+           {:keys [cache]} index-catalog
+           resolver        (index/->CachedHistoryRangeResolver index-catalog t novelty from-t to-t cache)
+           range-set       (flake/sorted-set-by idx-cmp start-flake end-flake)
+           in-range?       (fn [node] (intersects-range? node range-set))
+           query-xf        (extract-query-flakes {:idx         idx
+                                                  :start-test  start-test
+                                                  :start-flake start-flake
+                                                  :end-test    end-test
+                                                  :end-flake   end-flake})]
+       (go-try
+         (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake
+                                                in-range? 1 query-xf error-ch)
+                               (filter-authorized db tracker error-ch)
+                               (into-page limit offset flake-limit))]
+           (async/alt!
+             error-ch ([e]
+                       (throw e))
+             history-ch ([hist-range]
+                         hist-range)))))
+     empty-channel)))
 
 (defn index-range
   "Range query across an index as of a 't' defined by the db.

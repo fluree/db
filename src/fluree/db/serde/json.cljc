@@ -266,7 +266,8 @@
   (let [version  (or (:v db-root) 1)  ; default to v1 for legacy indexes
         db-root* (reduce (fn [root-data idx]
                            (update root-data idx deserialize-child-node))
-                         db-root index/types)]
+                         db-root
+                         (index/indexes-for db-root))]
     (-> db-root*
         (update :namespace-codes numerize-keys)
         (update :stats deserialize-stats version))))
@@ -367,7 +368,7 @@
                 (:config :garbage :prev-index)
                 (util/stringify-keys v)
 
-                (:spot :post :opst :tspo)
+                (:spot :psot :post :opst :tspo)
                 (stringify-child v)
 
                 v)))
