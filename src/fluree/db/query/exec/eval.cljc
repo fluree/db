@@ -129,20 +129,24 @@
 
    'sum          {:init  (fn [] nil)
                   :step! (fn [state tv]
-                           (if-let [v (:value tv)]
-                             (if (nil? state)
-                               v
-                               (+ state v))
-                             state))
+                           ;; Use some? to include 0 and false values
+                           (let [v (:value tv)]
+                             (if (some? v)
+                               (if (nil? state)
+                                 v
+                                 (+ state v))
+                               state)))
                   :final (fn [state]
                            (where/->typed-val (or state 0)))}
 
    'avg          {:init  (fn [] {:sum nil :cnt 0})
                   :step! (fn [{:keys [sum cnt]} tv]
-                           (if-let [v (:value tv)]
-                             {:sum (if (nil? sum) v (+ sum v))
-                              :cnt (inc cnt)}
-                             {:sum sum :cnt cnt}))
+                           ;; Use some? to include 0 and false values
+                           (let [v (:value tv)]
+                             (if (some? v)
+                               {:sum (if (nil? sum) v (+ sum v))
+                                :cnt (inc cnt)}
+                               {:sum sum :cnt cnt})))
                   :final (fn [{:keys [sum cnt]}]
                            ;; Division result - convert ratio to double for display
                            (let [raw (if (pos? cnt)
