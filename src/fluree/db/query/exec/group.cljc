@@ -101,8 +101,11 @@
   (display-sparql-aggregate match compact))
 
 (defn- streaming-agg-selector?
+  "Returns true if selector supports streaming aggregation."
   [sel]
-  (some? (:streaming-agg sel)))
+  (or (instance? fluree.db.query.exec.select.StreamingAggregateSelector sel)
+      (and (instance? fluree.db.query.exec.select.AsSelector sel)
+           (some? (:streaming-agg sel)))))
 
 (defn- streaming-eligible?
   "Returns true if the query can use streaming aggregation.
@@ -134,13 +137,13 @@
               :agg-states     {}})
         agg-states'
         (reduce (fn [states {:keys [arg-var result-var descriptor]}]
-                  (let [{:keys [init step!]} descriptor
+                  (let [{:keys [init step]} descriptor
                         state   (get states result-var (init))
                         tv      (when arg-var
                                   (some-> solution
                                           (get arg-var)
                                           where/mch->typed-val))
-                        new-st  (step! state tv)]
+                        new-st  (step state tv)]
                     (assoc states result-var new-st)))
                 agg-states
                 streaming-aggs)]
@@ -173,7 +176,9 @@
   (let [selectors      (util/sequential select)
         group-vars     (vec group-by)
         group-vars-set (set group-vars)
-        streaming-aggs (->> selectors (keep :streaming-agg) vec)
+        streaming-aggs (->> selectors
+                            (filter streaming-agg-selector?)
+                            (mapv :streaming-agg))
         implicit?      (and (empty? group-vars)
                             (some select/implicit-grouping? selectors))
         streaming?     (streaming-eligible? having streaming-aggs implicit?

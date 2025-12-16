@@ -60,24 +60,28 @@
       :sparql (with-meta selector {`format-value select.sparql/format-wildcard-selector-value})
       (with-meta selector {`format-value select.fql/format-wildcard-selector-value}))))
 
-(defrecord AggregateSelector [agg-fn streaming-agg]
+(defrecord AggregateSelector [agg-fn]
+  ValueSelector
+  (format-value
+    [_this _db _iri-cache _context _compact _tracker error-ch solution]
+    (go
+      (try*
+        (:value (agg-fn solution))
+        (catch* e
+          (log/error e "Error applying aggregate selector")
+          (>! error-ch e))))))
+
+(defrecord StreamingAggregateSelector [streaming-agg]
   ValueSelector
   (format-value
     [_this _db _iri-cache _context compact _tracker error-ch solution]
     (let [result-var (:result-var streaming-agg)]
-      (if (and result-var (contains? solution result-var))
-        (go
-          (try*
-            (some-> solution (get result-var) (select.fql/display compact))
-            (catch* e
-              (log/error e "Error formatting streaming aggregate selector")
-              (>! error-ch e))))
-        (go
-          (try*
-            (:value (agg-fn solution))
-            (catch* e
-              (log/error e "Error applying aggregate selector")
-              (>! error-ch e))))))))
+      (go
+        (try*
+          (some-> solution (get result-var) (select.fql/display compact))
+          (catch* e
+            (log/error e "Error formatting streaming aggregate selector")
+            (>! error-ch e)))))))
 
 (defn aggregate-selector
   "Returns a selector that extracts the grouped values bound to the specified
@@ -85,15 +89,23 @@
   formats each item in the group, and processes the formatted group with the
   supplied `agg-function` to generate the final aggregated result for display.
 
+  If `streaming-agg` is provided, returns a StreamingAggregateSelector that
+  reads pre-computed results from the solution. Otherwise returns an
+  AggregateSelector that applies `agg-function` to collected groups.
+
   Optional parameters:
     `streaming-agg` - descriptor map for incremental aggregates
     `agg-info` - {:fn-name sym, :vars #{?v ...}}"
   ([agg-function]
-   (->AggregateSelector agg-function nil))
+   (->AggregateSelector agg-function))
   ([agg-function streaming-agg]
-   (->AggregateSelector agg-function streaming-agg))
+   (if streaming-agg
+     (->StreamingAggregateSelector streaming-agg)
+     (->AggregateSelector agg-function)))
   ([agg-function streaming-agg agg-info]
-   (cond-> (->AggregateSelector agg-function streaming-agg)
+   (cond-> (if streaming-agg
+             (->StreamingAggregateSelector streaming-agg)
+             (->AggregateSelector agg-function))
      agg-info (with-meta {::aggregate-info agg-info}))))
 
 (defrecord AsSelector [as-fn bind-var aggregate? streaming-agg]
@@ -273,6 +285,7 @@
 (defn implicit-grouping?
   [selector]
   (or (instance? AggregateSelector selector)
+      (instance? StreamingAggregateSelector selector)
       (and (instance? AsSelector selector)
            (:aggregate? selector))))
 

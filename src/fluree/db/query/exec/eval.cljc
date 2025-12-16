@@ -95,9 +95,9 @@
 (declare compare*)
 
 (def streaming-aggregate-registry
-  "Streaming aggregate registry: op -> {:init :step! :final}."
+  "Streaming aggregate registry: op -> {:init :step :final}."
   {'count        {:init  (fn [] 0)
-                  :step! (fn [state tv]
+                  :step  (fn [state tv]
                            (if (some-> tv :value some?)
                              (inc state)
                              state))
@@ -105,13 +105,13 @@
                            (where/->typed-val state))}
 
    'count-star   {:init  (fn [] 0)
-                  :step! (fn [state _tv]
+                  :step  (fn [state _tv]
                            (inc state))
                   :final (fn [state]
                            (where/->typed-val state))}
 
    'count-distinct {:init  (fn [] (transient #{}))
-                    :step! (fn [state tv]
+                    :step  (fn [state tv]
                              (if (some-> tv :value some?)
                                (conj! state tv)
                                state))
@@ -120,7 +120,7 @@
                               (count (persistent! state))))}
 
    'sum          {:init  (fn [] nil)
-                  :step! (fn [state tv]
+                  :step  (fn [state tv]
                            (let [v (:value tv)]
                              (if (some? v)
                                (if (nil? state)
@@ -131,7 +131,7 @@
                            (where/->typed-val (or state 0)))}
 
    'avg          {:init  (fn [] {:sum nil :cnt 0})
-                  :step! (fn [{:keys [sum cnt]} tv]
+                  :step  (fn [{:keys [sum cnt]} tv]
                            (let [v (:value tv)]
                              (if (some? v)
                                {:sum (if (nil? sum) v (+ sum v))
@@ -147,7 +147,7 @@
                              (where/->typed-val res)))}
 
    'min          {:init  (fn [] nil)
-                  :step! (fn [state tv]
+                  :step  (fn [state tv]
                            (cond
                              (nil? (some-> tv :value)) state
                              (nil? state) tv
@@ -157,7 +157,7 @@
                            (or state (where/->typed-val nil)))}
 
    'max          {:init  (fn [] nil)
-                  :step! (fn [state tv]
+                  :step  (fn [state tv]
                            (cond
                              (nil? (some-> tv :value)) state
                              (nil? state) tv
