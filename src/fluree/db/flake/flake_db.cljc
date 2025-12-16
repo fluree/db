@@ -309,12 +309,14 @@
   (-query [this tracker query-map] (fql/query this tracker query-map))
   (-class-ids [this tracker subject] (match/class-ids this tracker subject))
   (-index-update [db commit-index] (index-update db commit-index))
-  (-ledger-info [_]
-    (async/go
+  (-ledger-info [this]
+    (go-try
       (let [index-address (get-in commit [:index :address])
             index-id      (get-in commit [:index :id])
-            index-t       (get-in commit [:index :data :t])]
+            index-t       (get-in commit [:index :data :t])
+            current-stats (<? (novelty/cached-current-stats this))]
         {:stats           stats
+         :current-stats   current-stats
          :schema          schema
          :namespace-codes namespace-codes
          :t               t
@@ -323,6 +325,9 @@
          :index           {:id      index-id
                            :t       index-t
                            :address index-address}})))
+
+  (-index-range [db idx test match opts]
+    (query-range/index-range db (:tracker opts) idx test match (dissoc opts :tracker)))
 
   iri/IRICodec
   (encode-iri [_ iri]
@@ -482,10 +487,8 @@
     (history/query-commits db tracker context from-t to-t include error-ch))
 
   policy/Restrictable
-  (wrap-policy [db policy policy-values]
-    (policy-rules/wrap-policy db policy policy-values))
-  (wrap-policy [db tracker policy policy-values]
-    (policy-rules/wrap-policy db tracker policy policy-values))
+  (wrap-policy [db tracker policy policy-values default-allow?]
+    (policy-rules/wrap-policy db tracker policy policy-values default-allow?))
   (root [db]
     (policy/root-db db))
 

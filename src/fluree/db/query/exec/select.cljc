@@ -73,9 +73,16 @@
   "Returns a selector that extracts the grouped values bound to the specified
   variables referenced in the supplied `agg-function` from a where solution,
   formats each item in the group, and processes the formatted group with the
-  supplied `agg-function` to generate the final aggregated result for display."
-  [agg-function]
-  (->AggregateSelector agg-function))
+  supplied `agg-function` to generate the final aggregated result for display.
+
+  Optional `agg-info` map can include:
+    :fn-name - symbol of the aggregate function (e.g., 'count-distinct)
+    :vars    - set of variable symbols referenced by the aggregate"
+  ([agg-function]
+   (aggregate-selector agg-function nil))
+  ([agg-function agg-info]
+   (cond-> (->AggregateSelector agg-function)
+     agg-info (with-meta {::aggregate-info agg-info}))))
 
 (defrecord AsSelector [as-fn bind-var aggregate?]
   SolutionModifier
@@ -93,11 +100,18 @@
     [bind-var (get solution bind-var)]))
 
 (defn as-selector
-  [as-fn output bind-var aggregate?]
-  (let [selector (->AsSelector as-fn bind-var aggregate?)]
-    (case output
-      :sparql (with-meta selector {`format-value (select.sparql/format-as-selector-value bind-var)})
-      (with-meta selector {`format-value (select.fql/format-as-selector-value bind-var)}))))
+  "Returns an AsSelector. Optional `agg-info` map can include:
+    :fn-name - symbol of the aggregate function (e.g., 'count-distinct)
+    :vars    - set of variable symbols referenced by the aggregate"
+  ([as-fn output bind-var aggregate?]
+   (as-selector as-fn output bind-var aggregate? nil))
+  ([as-fn output bind-var aggregate? agg-info]
+   (let [selector (->AsSelector as-fn bind-var aggregate?)
+         base-meta (case output
+                     :sparql {`format-value (select.sparql/format-as-selector-value bind-var)}
+                     {`format-value (select.fql/format-as-selector-value bind-var)})]
+     (with-meta selector (cond-> base-meta
+                           agg-info (assoc ::aggregate-info agg-info))))))
 
 (defn get-subject-iri
   [solution subj]

@@ -12,6 +12,7 @@
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
+            [fluree.db.json-ld.policy.rules :as policy-rules]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice.query :as ns-query]
             [fluree.db.query.api :as query-api]
@@ -625,15 +626,18 @@
     db - Database value
     policy - JSON-LD policy document
     policy-values - (optional) Values for policy variables
+    default-allow? - (optional) If truthy, allow access when no policies apply (default false)
 
   Returns promise resolving to policy-wrapped database."
   ([db policy]
    (wrap-policy db policy nil))
   ([db policy policy-values]
+   (wrap-policy db policy policy-values nil))
+  ([db policy policy-values default-allow?]
    (promise-wrap
-    (let [policy* (json-ld/expand policy)
+    (let [policy*        (json-ld/expand policy)
           policy-values* (util.parse/normalize-values policy-values)]
-      (policy/wrap-policy db policy* policy-values*)))))
+      (policy-rules/wrap-policy db nil policy* policy-values* default-allow?)))))
 
 (defn wrap-class-policy
   "Applies policy restrictions based on policy classes in the database.
@@ -642,15 +646,18 @@
     db - Database value
     policy-classes - IRI or vector of IRIs of policy classes
     policy-values - (optional) Values for policy variables
+    default-allow? - (optional) If truthy, allow access when no policies apply (default false)
 
   Finds and applies all policies with matching @type.
   Returns promise resolving to policy-wrapped database."
   ([db policy-classes]
    (wrap-class-policy db policy-classes nil))
   ([db policy-classes policy-values]
+   (wrap-class-policy db policy-classes policy-values nil))
+  ([db policy-classes policy-values default-allow?]
    (promise-wrap
     (let [policy-values* (util.parse/normalize-values policy-values)]
-      (policy/wrap-class-policy db nil policy-classes policy-values*)))))
+      (policy/wrap-class-policy db nil policy-classes policy-values* default-allow?)))))
 
 (defn wrap-identity-policy
   "Applies policy restrictions based on an identity's policy classes.
@@ -659,6 +666,7 @@
     db - Database value
     identity - IRI of the identity
     policy-values - (optional) Values for policy variables
+    default-allow? - (optional) If truthy, allow access when no policies apply (default false)
 
   Looks up the identity's f:policyClass property and applies
   all policies with those class IRIs.
@@ -667,9 +675,11 @@
   ([db identity]
    (wrap-identity-policy db identity nil))
   ([db identity policy-values]
+   (wrap-identity-policy db identity policy-values nil))
+  ([db identity policy-values default-allow?]
    (promise-wrap
     (let [policy-values* (util.parse/normalize-values policy-values)]
-      (policy/wrap-identity-policy db nil identity policy-values*)))))
+      (policy/wrap-identity-policy db nil identity policy-values* default-allow?)))))
 
 (defn dataset
   "Creates a composed dataset from multiple resolved graph databases.

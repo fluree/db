@@ -191,6 +191,7 @@ Transaction calls accept an `opts` map (or JSON object) to control behavior. Bel
 - `author` (commit only): Author identity.
 - `private` (commit only): Marks commit as private (string identifier).
 - `policy-values`: Data made available to policy evaluation.
+- `default-allow`: If `true`, allow access when no policies apply (default: `false` = deny).
 - `max-fuel`: Limit on computational resources available to the operation.
 - `format`: For `insert`/`upsert`, can be `:turtle` to accept Turtle input (default is JSON-LD). For `update`, use `{:format :sparql}` to parse SPARQL Update.
 

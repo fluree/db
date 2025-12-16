@@ -1,11 +1,13 @@
 (ns fluree.db.cache
   "A simple default connection-level cache."
   (:require #?(:clj [fluree.db.util.graalvm :as graalvm])
-            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
+            #?(:cljs [cljs.cache :as cache])
             [clojure.core.async :as async]
             [fluree.db.constants :as const]
             [fluree.db.util :as util :refer [exception?]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log])
+  #?(:clj (:import (com.github.benmanes.caffeine.cache Cache Caffeine)
+                   (java.util.function Function))))
 
 (defn default-cache-max-mb
   "Calculates default cache size based on available memory.
@@ -38,7 +40,12 @@
   "Create a cache that holds `cache-size` number of entries, bumping out the least
   recently used value after the size is exceeded."
   [cache-size]
-  (cache/lru-cache-factory {} :threshold cache-size))
+  #?(:clj
+     (-> (Caffeine/newBuilder)
+         (.maximumSize (long cache-size))
+         (.build))
+     :cljs
+     (cache/lru-cache-factory {} :threshold cache-size)))
 
 (defn memory->cache-size
   "Validate system memory is enough to build a usable cache, then derive cache size.
@@ -72,24 +79,51 @@
      cache-size)))
 
 (defn lru-lookup
-  "Given an LRU cache atom, look up value for `k`. If not found, use `value-fn` (a
-  function that accepts `k` as its only argument and returns an async channel) to
-  produce the value and add it to the cache."
-  [cache-atom k value-fn]
-  (if-let [v (get @cache-atom k)]
-    (do (swap! cache-atom cache/hit k)
-        v)
-    (let [c (async/promise-chan)]
-      (swap! cache-atom cache/miss k c)
-      (async/go
-        (let [v (async/<! (value-fn k))]
-          (async/put! c v)
-          (when (exception? v)
-            (log/error v "Error resolving cache value for key: " k "with exception:" (ex-message v))
-            (swap! cache-atom cache/evict k))))
-      c)))
+  "Look up value for `k` in the connection cache.
+
+   - On JVM, `cache` is a Caffeine Cache.
+   - On CLJS, `cache` is an atom holding a cljs.cache LRU cache.
+
+   If not found, `value-fn` (a function of `k` returning an async channel) will
+   be invoked to produce the value, which is stored in the cache."
+  [cache k value-fn]
+  #?(:clj
+     (let [^Cache ccache cache]
+       (.get ccache k
+             (reify Function
+               (apply [_ _k]
+                 (let [p (async/promise-chan)]
+                   (async/go
+                     (let [v (async/<! (value-fn k))]
+                       (async/put! p v)
+                       (when (exception? v)
+                         (log/error v "Error resolving cache value for key: " k "with exception:" (ex-message v))
+                         (.invalidate ccache k))))
+                   p)))))
+     :cljs
+     (let [p (async/promise-chan)
+           out (volatile! nil)]
+       (swap! cache
+              (fn [c]
+                (if-let [existing (cache/lookup c k)]
+                  (do (vreset! out existing)
+                      (cache/hit c k))
+                  (do (vreset! out p)
+                      (cache/miss c k p)))))
+       (let [ch @out]
+         (when (identical? ch p)
+           (async/go
+             (let [v (async/<! (value-fn k))]
+               (async/put! ch v)
+               (when (exception? v)
+                 (log/error v "Error resolving cache value for key: " k "with exception:" (ex-message v))
+                 (swap! cache cache/evict k)))))
+         ch))))
 
 (defn lru-evict
   "Evict the key `k` from the cache."
-  [cache-atom k]
-  (swap! cache-atom cache/evict k))
+  [cache k]
+  #?(:clj
+     (.invalidate ^Cache cache k)
+     :cljs
+     (swap! cache cache/evict k)))

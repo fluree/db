@@ -41,7 +41,7 @@
                                    {"@id"          "ex:ssnRestriction"
                                     "@type"        ["f:AccessPolicy" "ex:EmployeePolicy"]
                                     "f:required"   true
-                                    "f:targetProperty" [{"@id" "schema:ssn"}]
+                                    "f:onProperty" [{"@id" "schema:ssn"}]
                                     "f:action"     {"@id" "f:view"}
                                     "f:query"      {"@type"  "@json"
                                                     "@value" {"@context" {"ex" "http://example.org/ns/"}
@@ -118,7 +118,7 @@
                                                    {"@id" "ex:ssnRestriction"
                                                     "@type" ["f:AccessPolicy" "ex:AuthenticatedPolicy"]
                                                     "f:required" true
-                                                    "f:targetProperty" [{"@id" "ex:ssn"}]
+                                                    "f:onProperty" [{"@id" "ex:ssn"}]
                                                     "f:action" {"@id" "f:view"}
                                                     "f:query" {"@type" "@json"
                                                                "@value" {"@context" {"ex" "https://example.com/"}

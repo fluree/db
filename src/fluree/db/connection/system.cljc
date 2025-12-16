@@ -161,7 +161,10 @@
 
 (defmethod ig/init-key :fluree.db/cache
   [_ max-mb]
-  (-> max-mb cache/memory->cache-size cache/create-lru-cache atom))
+  #?(:clj
+     (-> max-mb cache/memory->cache-size cache/create-lru-cache)
+     :cljs
+     (-> max-mb cache/memory->cache-size cache/create-lru-cache atom)))
 
 #?(:clj
    (defmethod ig/init-key :fluree.db.storage/file
