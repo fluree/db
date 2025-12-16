@@ -4,7 +4,8 @@
             [fluree.db.query.exec.select.fql :as select.fql]
             [fluree.db.query.exec.select.sparql :as select.sparql]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util :as util]))
+            [fluree.db.util :as util]
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -120,29 +121,45 @@
         streaming-aggs (->> selectors
                             (keep get-streaming-agg)
                             vec)
-        ;; Streaming mode is enabled only when:
-        ;;  - there is an explicit :group-by (no implicit grouping), and
+        ;; Check if this is implicit grouping (global aggregate without GROUP BY)
+        implicit?      (and (empty? group-vars)
+                            (some select/implicit-grouping? selectors))
+        ;; Streaming mode is enabled when:
         ;;  - there is no HAVING clause (HAVING needs grouped collections), and
-        ;;  - every selector is either:
-        ;;      * a VariableSelector whose var is in group-by, or
-        ;;      * an AggregateSelector or AsSelector with streaming-agg field.
-        streaming?     (and (seq group-vars)
-                            (nil? having)
+        ;;  - there are streaming-agg descriptors, and
+        ;;  - either:
+        ;;    a) explicit GROUP BY with all selectors being group vars or streaming aggs, or
+        ;;    b) implicit grouping with all selectors being streaming aggs
+        streaming?     (and (nil? having)
                             (seq streaming-aggs)
-                            (every? (fn [sel]
-                                      (cond
-                                        (instance? fluree.db.query.exec.select.VariableSelector sel)
-                                        (contains? group-vars-set (:var sel))
+                            (if implicit?
+                              ;; Implicit grouping: all selectors must be streaming aggs
+                              (every? (fn [sel]
+                                        (or (and (instance? fluree.db.query.exec.select.AggregateSelector sel)
+                                                 (some? (:streaming-agg sel)))
+                                            (and (instance? fluree.db.query.exec.select.AsSelector sel)
+                                                 (some? (:streaming-agg sel)))))
+                                      selectors)
+                              ;; Explicit GROUP BY: need group vars and matching selectors
+                              (and (seq group-vars)
+                                   (every? (fn [sel]
+                                             (cond
+                                               (instance? fluree.db.query.exec.select.VariableSelector sel)
+                                               (contains? group-vars-set (:var sel))
 
-                                        (instance? fluree.db.query.exec.select.AggregateSelector sel)
-                                        (some? (:streaming-agg sel))
+                                               (instance? fluree.db.query.exec.select.AggregateSelector sel)
+                                               (some? (:streaming-agg sel))
 
-                                        (instance? fluree.db.query.exec.select.AsSelector sel)
-                                        (some? (:streaming-agg sel))
+                                               (instance? fluree.db.query.exec.select.AsSelector sel)
+                                               (some? (:streaming-agg sel))
 
-                                        :else
-                                        false))
-                                    selectors))]
+                                               :else
+                                               false))
+                                           selectors))))]
+    (log/debug "group/combine streaming?" streaming?
+                "implicit?" implicit?
+                "group-vars" group-vars
+                "streaming-aggs" (count streaming-aggs))
     (if streaming?
       ;; New streaming mode: maintain per-group aggregate state and
       ;; avoid collecting full grouped value collections.
