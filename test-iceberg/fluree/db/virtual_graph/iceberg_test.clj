@@ -983,43 +983,44 @@
       (let [vg (iceberg-vg/create {:alias "openflights-hash"
                                    :config {:warehouse-path warehouse-path
                                             :mapping multi-table-mapping-path}})
-            ;; Query that spans routes and airlines tables
-            ;; Routes: ?route ex:sourceAirport ?src
-            ;; Airlines: ?airline ex:name ?airlineName
-            ;; The hash join should connect them via airline_id -> id
-            patterns [;; Route pattern - binds to routes table via predicate routing
+            ;; Query that spans routes and airlines tables using FK predicate
+            ;; The ex:operatedBy predicate is the RefObjectMap FK that links routes -> airlines
+            ;; The ?airline variable is shared between the FK object and airline subject
+            ;; This triggers the hash join via find-traversed-edge
+            patterns [;; Route patterns - bind to routes table
                       (make-triple (var-map "?route")
                                    (iri-map "http://example.org/sourceAirport")
                                    (var-map "?src"))
+                      ;; FK predicate - links route to airline via join edge
                       (make-triple (var-map "?route")
-                                   (iri-map "http://example.org/airlineId")
-                                   (var-map "?airlineId"))
-                      ;; Airline pattern - binds to airlines table via predicate routing
+                                   (iri-map "http://example.org/operatedBy")
+                                   (var-map "?airline"))
+                      ;; Airline patterns - bind to airlines table
+                      ;; ?airline subject matches the FK object above
                       (make-triple (var-map "?airline")
                                    (iri-map "http://example.org/name")
-                                   (var-map "?airlineName"))
-                      (make-triple (var-map "?airline")
-                                   (iri-map "http://example.org/country")
-                                   (var-map "?country"))]
+                                   (var-map "?airlineName"))]
             solution {::iceberg-vg/iceberg-patterns patterns}
             solution-ch (async/to-chan! [solution])
             error-ch (async/chan 1)
             result-ch (where/-finalize vg nil error-ch solution-ch)
-            ;; Take limited results since this is a cross-product if joins don't work
+            ;; Take limited results - should be joined, not Cartesian
             results (take 100 (collect-solutions result-ch))]
-        ;; Should have results from both tables joined
+        ;; Should have results from both tables joined via hash join
         (is (pos? (count results)) "Should return joined results")
         ;; Check first result has variables from both tables
         (when (seq results)
           (let [first-result (first results)]
             ;; From routes table
-            (is (or (contains? first-result (symbol "?src"))
-                    (contains? first-result (symbol "?airlineId")))
-                "Should have route variables")
+            (is (contains? first-result (symbol "?src"))
+                "Should have route source airport")
+            (is (contains? first-result (symbol "?route"))
+                "Should have route subject")
             ;; From airlines table
-            (is (or (contains? first-result (symbol "?airlineName"))
-                    (contains? first-result (symbol "?country")))
-                "Should have airline variables")))))))
+            (is (contains? first-result (symbol "?airlineName"))
+                "Should have airline name")
+            (is (contains? first-result (symbol "?airline"))
+                "Should have airline subject")))))))
 
 (deftest e2e-multi-table-join-sparql-test
   (when (and (warehouse-exists?) (multi-table-mapping-exists?))
@@ -1034,22 +1035,20 @@
                      :config {:warehouse-path warehouse-path
                               :mapping multi-table-mapping-path}}))
 
-        ;; Query that requires joining routes and airlines tables
-        ;; This should use hash join under the hood
+        ;; Query that joins routes and airlines via ex:operatedBy FK predicate
+        ;; The ?airline variable is shared, triggering the hash join
         (let [sparql "PREFIX ex: <http://example.org/>
                       SELECT ?src ?airlineName
                       FROM <iceberg/openflights-join>
                       WHERE {
                         ?route ex:sourceAirport ?src .
-                        ?route ex:airlineId ?airlineId .
+                        ?route ex:operatedBy ?airline .
                         ?airline ex:name ?airlineName .
                       }
                       LIMIT 10"
               res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
           (is (vector? res) "Should return results")
-          ;; Note: This may return cross-product since patterns don't share variables
-          ;; The hash join optimization happens when join edges are found
-          (is (pos? (count res)) "Should have results"))
+          (is (pos? (count res)) "Should have results from hash-joined query"))
 
         (finally
           (teardown-fluree-system))))))
@@ -1067,17 +1066,19 @@
                      :config {:warehouse-path warehouse-path
                               :mapping multi-table-mapping-path}}))
 
-        ;; Query that accesses both routes and airlines
+        ;; Query that joins routes and airlines via ex:operatedBy FK predicate
+        ;; The ?airline variable links the FK object to airline subject
         (let [query {"from" ["iceberg/openflights-join-fql"]
-                     "select" ["?src" "?name"]
+                     "select" ["?src" "?airlineName"]
                      "where" [{"@id" "?route"
-                               "http://example.org/sourceAirport" "?src"}
+                               "http://example.org/sourceAirport" "?src"
+                               "http://example.org/operatedBy" "?airline"}
                               {"@id" "?airline"
-                               "http://example.org/name" "?name"}]
+                               "http://example.org/name" "?airlineName"}]
                      "limit" 10}
               res @(fluree/query-connection @e2e-conn query)]
           (is (vector? res) "Should return results")
-          (is (pos? (count res)) "Should have results from multi-table query"))
+          (is (pos? (count res)) "Should have results from hash-joined query"))
 
         (finally
           (teardown-fluree-system))))))

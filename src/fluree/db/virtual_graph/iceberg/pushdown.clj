@@ -338,7 +338,7 @@
    Uses routing-indexes to find the correct mapping for each predicate,
    ensuring filters are only pushed down to the table that owns that predicate.
    Values are coerced based on column datatype from mapping."
-  [patterns pushable-analyses mappings routing-indexes]
+  [patterns pushable-analyses _mappings routing-indexes]
   (let [pred->mappings (:predicate->mappings routing-indexes)]
     (reduce
      (fn [patterns {:keys [comparisons vars]}]
@@ -497,7 +497,7 @@
 
    Uses routing-indexes to ensure the IN predicate is only pushed to the
    table that owns the column. Values are coerced based on column datatype."
-  [patterns values-predicates mappings routing-indexes]
+  [patterns values-predicates _mappings routing-indexes]
   (let [pred->mappings (:predicate->mappings routing-indexes)]
     (reduce
      (fn [patterns {:keys [var values]}]
@@ -557,11 +557,17 @@
           ;; For each column, coalesce eq predicates
           coalesced (mapcat
                      (fn [[column preds]]
-                       (let [{eq-preds :eq, in-preds :in, other-preds nil}
-                             (group-by #(#{:eq :in} (:op %)) preds)
+                       (let [{eq-preds :eq
+                              in-preds :in
+                              ;; group-by returns nil key for missing ops; we'll treat "other"
+                              ;; as anything not :eq/:in explicitly.
+                              :as by-op} (group-by :op preds)
+                             other-preds (->> by-op
+                                              (remove (fn [[op _]] (#{:eq :in} op)))
+                                              (mapcat val))
                              ;; Collect all values from :eq predicates
                              eq-values (mapv :value eq-preds)
-                             ;; Collect all values from :in predicates
+                             ;; Collect all values from :in predicates (each :value should be sequential)
                              in-values (mapcat :value in-preds)
                              ;; Combine all values
                              all-values (into (vec eq-values) in-values)]

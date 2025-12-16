@@ -25,7 +25,6 @@
   (:require [clojure.core.async :as async :refer [go]]
             [clojure.set]
             [clojure.string :as str]
-            [fluree.db.constants :as const]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.optimize :as optimize]
             [fluree.db.tabular.iceberg :as iceberg]
@@ -42,6 +41,53 @@
   (:import [java.time Instant]))
 
 (set! *warn-on-reflection* true)
+
+;;; ---------------------------------------------------------------------------
+;;; Cartesian Product Safety
+;;; ---------------------------------------------------------------------------
+
+(def ^:dynamic *max-cartesian-product-size*
+  "Maximum allowed Cartesian product size before throwing an error.
+   Set to nil to disable the check (not recommended for production).
+   Default: 100,000 rows.
+
+   Can be overridden via binding:
+     (binding [*max-cartesian-product-size* 1000000]
+       (execute-query ...))
+
+   Or set to nil to allow unbounded Cartesian products:
+     (binding [*max-cartesian-product-size* nil]
+       (execute-query ...))"
+  100000)
+
+(defn- check-cartesian-product-size!
+  "Check if a Cartesian product would exceed the safety threshold.
+   Throws ex-info with helpful error message if threshold exceeded.
+
+   Args:
+     left-count  - Number of rows in left table
+     right-count - Number of rows in right table
+     left-table  - Name of left table (for error message)
+     right-table - Name of right table (for error message)"
+  [left-count right-count left-table right-table]
+  (when *max-cartesian-product-size*
+    (let [estimated-size (* left-count right-count)]
+      (when (> estimated-size *max-cartesian-product-size*)
+        (throw (ex-info
+                (str "Cartesian product would produce " estimated-size " rows, "
+                     "exceeding safety limit of " *max-cartesian-product-size* ". "
+                     "This typically means the query is missing a join condition. "
+                     "Ensure your SPARQL/FQL query uses the foreign key predicate "
+                     "(e.g., ex:operatedBy) to link tables, not just column mappings. "
+                     "Tables: " left-table " (" left-count " rows) × "
+                     right-table " (" right-count " rows)")
+                {:error :db/cartesian-product-too-large
+                 :left-table left-table
+                 :left-count left-count
+                 :right-table right-table
+                 :right-count right-count
+                 :estimated-size estimated-size
+                 :max-allowed *max-cartesian-product-size*}))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Multi-Table Join Execution
@@ -134,14 +180,20 @@
          edge (join/edges-between join-graph acc-table current-table)
          :let [child-table (:child-table edge)
                parent-table (:parent-table edge)
-               ;; Determine which patterns belong to child vs parent
-               ;; When current-table is child: child-patterns = current, parent = acc-table
-               ;; When current-table is parent: child-patterns = acc-table, parent = current
-               [child-patterns parent-patterns]
-               (if (= current-table child-table)
-                 [current-patterns (get accumulated-patterns acc-table)]
-                 [(get accumulated-patterns acc-table) current-patterns])]
-         :when (patterns-traverse-join-edge? child-patterns parent-patterns edge)]
+               ;; Determine patterns for child vs parent tables.
+               ;; One side is current (provided as current-patterns), and the other
+               ;; must already exist in accumulated-patterns.
+               child-patterns (cond
+                                (= current-table child-table) current-patterns
+                                (contains? accumulated-patterns child-table) (get accumulated-patterns child-table)
+                                :else nil)
+               parent-patterns (cond
+                                 (= current-table parent-table) current-patterns
+                                 (contains? accumulated-patterns parent-table) (get accumulated-patterns parent-table)
+                                 :else nil)]
+         :when (and (seq child-patterns)
+                    (seq parent-patterns)
+                    (patterns-traverse-join-edge? child-patterns parent-patterns edge))]
      {:edge edge
       :child-table child-table
       :parent-table parent-table
@@ -189,11 +241,6 @@
                                            cols (collect-join-columns-for-table join-graph table)]
                                      :when (seq cols)]
                                  [table cols]))
-
-        ;; Build table->patterns map for traversal checking
-        table->patterns (into {}
-                              (for [{:keys [mapping patterns]} pattern-groups]
-                                [(:table mapping) patterns]))
 
         _ (log/debug "Join columns by table:" table->join-cols)
 
@@ -273,10 +320,19 @@
 
                       ;; No traversed edge - patterns don't use FK relationship
                       ;; Use Cartesian product with compatible-merge (SPARQL semantics)
-                      (do
-                        (log/debug "No traversed join edge, using Cartesian product:"
-                                   {:accumulated-tables accumulated-tables
-                                    :current-table current-table})
+                      (let [acc-count (count accumulated-solutions)
+                            curr-count (count current-solutions)
+                            ;; Get a representative table name from accumulated-tables
+                            acc-table-str (str/join ", " accumulated-tables)]
+                        (log/warn "No traversed join edge, using Cartesian product:"
+                                  {:accumulated-tables accumulated-tables
+                                   :accumulated-count acc-count
+                                   :current-table current-table
+                                   :current-count curr-count
+                                   :estimated-product (* acc-count curr-count)})
+                        ;; Safety check - prevent memory explosion
+                        (check-cartesian-product-size! acc-count curr-count
+                                                       acc-table-str current-table)
                         (vec (keep (fn [[acc curr]]
                                      (hash-join/compatible-merge acc curr))
                                    (for [acc accumulated-solutions
@@ -297,19 +353,31 @@
 
         ;; No join graph - fall back to Cartesian with compatible-merge
         (do
-          (log/debug "No join graph available, using Cartesian product")
-          (reduce
-           (fn [accumulated {:keys [solutions]}]
-             (if (empty? accumulated)
-               []
-               ;; Use compatible-merge for SPARQL semantics
-               (vec (keep (fn [[acc curr]]
-                            (hash-join/compatible-merge acc curr))
-                          (for [acc accumulated
-                                curr solutions]
-                            [acc curr])))))
-           (:solutions (first group-results))
-           (rest group-results)))))))
+          (log/warn "No join graph available, using Cartesian product for"
+                    (count group-results) "table groups")
+          (:solutions
+           (reduce
+            (fn [{:keys [solutions table-names]} group]
+              (let [curr-solutions (:solutions group)
+                    curr-table (or (get-in group [:mapping :table]) "unknown")
+                    acc-count (count solutions)
+                    curr-count (count curr-solutions)]
+                (if (empty? solutions)
+                  {:solutions [] :table-names (conj table-names curr-table)}
+                  (do
+                    ;; Safety check - prevent memory explosion
+                    (check-cartesian-product-size! acc-count curr-count
+                                                   (str/join ", " table-names) curr-table)
+                    ;; Use compatible-merge for SPARQL semantics
+                    {:solutions (vec (keep (fn [[acc curr]]
+                                             (hash-join/compatible-merge acc curr))
+                                           (for [acc solutions
+                                                 curr curr-solutions]
+                                             [acc curr])))
+                     :table-names (conj table-names curr-table)}))))
+            {:solutions (:solutions (first group-results))
+             :table-names #{(get-in (first group-results) [:mapping :table] "first-table")}}
+            (rest group-results))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; IcebergDatabase Record (Multi-Table Support)
