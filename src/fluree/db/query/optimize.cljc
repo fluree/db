@@ -97,6 +97,29 @@
        :forms   forms
        :order   order})))
 
+(defn collect-top-level-filters
+  "Partition a where clause into binding patterns and top-level filter descriptors.
+
+  Filters nested inside higher-order patterns remain untouched so they can be
+  handled when those patterns are traversed recursively.
+
+  Returns {:binding-patterns [...], :filters [...]}, where :filters contains the
+  descriptor maps produced by `filter-info`."
+  [patterns]
+  (loop [remaining patterns
+         binding-patterns []
+         filters []]
+    (if-let [pattern (first remaining)]
+      (let [next-remaining (rest remaining)
+            pattern-type   (where/pattern-type pattern)]
+        (if (= :filter pattern-type)
+          (if-let [info (filter-info pattern)]
+            (recur next-remaining binding-patterns (conj filters info))
+            (recur next-remaining (conj binding-patterns pattern) filters))
+          (recur next-remaining (conj binding-patterns pattern) filters)))
+      {:binding-patterns binding-patterns
+       :filters          filters})))
+
 (defn get-filtered-variable
   "Get the variable from a filter pattern that references exactly one variable.
   Returns the variable symbol if it is a single-variable filter, nil otherwise."
@@ -158,13 +181,145 @@
                    var))))
        set))
 
-(defn pattern-bound-vars
-  [pattern pattern-type]
-  (when (binding-pattern? pattern-type)
-    (let [tuple (if (= :tuple pattern-type)
-                  (util/ensure-vector pattern)
-                  (util/ensure-vector (where/pattern-data pattern)))]
-      (tuple-bound-vars tuple))))
+(defn bound-vars
+  "Return the set of variables a binding pattern guarantees to bind.
+  Determines the pattern type internally. Returns nil for non-binding types."
+  [pattern]
+  (let [pattern-type (where/pattern-type pattern)]
+    (when (binding-pattern? pattern-type)
+      (->> pattern where/pattern-data util/ensure-vector tuple-bound-vars))))
+
+(declare clause-bindings)
+
+(defn- union-bindings
+  "Intersection of variables guaranteed to be bound across all union branches."
+  [branches]
+  (let [branch-vars (map clause-bindings branches)]
+    (if (seq branch-vars)
+      (reduce set/intersection branch-vars)
+      #{})))
+
+(def ^:private pattern-hierarchy
+  (-> (make-hierarchy)
+      (derive :tuple :simple/binding)
+      (derive :class :simple/binding)
+      (derive :id :simple/binding)
+      (derive :exists :nested/single)
+      (derive :not-exists :nested/single)
+      (derive :minus :nested/single)))
+
+(defmulti pattern-bindings
+  "Return the set of variables guaranteed to be bound by a single pattern."
+  where/pattern-type :hierarchy #'pattern-hierarchy)
+
+(defmethod pattern-bindings :simple/binding
+  [pattern]
+  (or (bound-vars pattern) #{}))
+
+(defmethod pattern-bindings :graph
+  [pattern]
+  (->> pattern where/pattern-data second clause-bindings))
+
+(defmethod pattern-bindings :union
+  [pattern]
+  (->> pattern where/pattern-data union-bindings))
+
+(defmethod pattern-bindings :nested/single
+  [pattern]
+  (->> pattern where/pattern-data clause-bindings))
+
+(defmethod pattern-bindings :default
+  [_]
+  #{})
+
+(defn clause-bindings
+  "Return the set of variables guaranteed to be bound by a where clause.
+  Aggregates over patterns using `pattern-bindings`."
+  [clause]
+  (reduce set/union #{} (map pattern-bindings clause)))
+
+(defn split-pushable
+  "Split filter descriptors into [to-push remain] based on a bound-var set."
+  [filters bound]
+  [(filter #(set/subset? (:vars %) bound) filters)
+   (remove #(set/subset? (:vars %) bound) filters)])
+
+(defn push-into-inner
+  "Inject to-push filters into a single inner clause, returning the new clause."
+  [inner to-push]
+  (into (vec inner) (map :pattern) to-push))
+
+(defn push-into-union
+  "Inject to-push filters into every union branch, returning new branches."
+  [branches to-push]
+  (mapv (fn [cl] (push-into-inner cl to-push)) branches))
+
+(defn inject-filters-into-pattern
+  "Push eligible filters into nested higher-order patterns when safe. The
+  decision to push considers variables already bound before this pattern
+  (bound-vars) together with variables guaranteed to be bound by the nested
+  clause.
+
+  Returns {:pattern p' :remaining-filters f'}. Optionals are left unchanged."
+  [pattern filter-descriptors bound-vars]
+  (let [t (where/pattern-type pattern)]
+    (case t
+      :optional
+      {:pattern pattern :remaining-filters filter-descriptors}
+
+      :graph
+      (let [[graph inner] (where/pattern-data pattern)]
+        (if (where/virtual-graph? graph) ; Do not push filters into virtual graphs
+          {:pattern pattern, :remaining-filters filter-descriptors}
+          (let [[to-push remaining] (->> inner
+                                         clause-bindings
+                                         (into bound-vars)
+                                         (split-pushable filter-descriptors))
+                inner*               (push-into-inner inner to-push)]
+            {:pattern (where/->pattern t [graph inner*])
+             :remaining-filters remaining})))
+
+      (:exists :not-exists :minus)
+      (let [inner                (where/pattern-data pattern)
+            [to-push remaining]  (->> inner
+                                      clause-bindings
+                                      (into bound-vars)
+                                      (split-pushable filter-descriptors))
+            inner*               (push-into-inner inner to-push)]
+        {:pattern (where/->pattern t inner*)
+         :remaining-filters remaining})
+
+      :union
+      (let [branches            (where/pattern-data pattern)
+            [to-push remaining] (->> branches
+                                     (union-bindings)
+                                     (into bound-vars)
+                                     (split-pushable filter-descriptors))
+            branches*           (push-into-union branches to-push)]
+        {:pattern (where/->pattern t branches*)
+         :remaining-filters remaining})
+
+      {:pattern pattern :remaining-filters filter-descriptors})))
+
+(defn propagate-filters-into-nested
+  "Walk one level of binding patterns and push any eligible top-level filters
+  into nested higher-order clauses, using the union of variables bound by prior
+  patterns (bound-so-far) and those guaranteed by the nested clause. Returns
+  updated patterns and remaining filters."
+  [binding-patterns filter-descriptors bound-vars]
+  (loop [remaining binding-patterns
+         acc []
+         filters filter-descriptors
+         bound bound-vars]
+    (if-let [p (first remaining)]
+      (let [t            (where/pattern-type p)
+            guaranteed   (pattern-bindings p)
+            bound-next   (into bound guaranteed)]
+        (if (contains? #{:optional :exists :not-exists :minus :union :graph} t)
+          (let [{:keys [pattern remaining-filters]} (inject-filters-into-pattern p filters bound)]
+            (recur (rest remaining) (conj acc pattern) remaining-filters bound-next))
+          (recur (rest remaining) (conj acc p) filters bound-next)))
+      {:patterns acc :filters filters})))
 
 (defn choose-target-var
   "Return the last variable from `ordered-vars` that is present in the set
@@ -223,18 +378,20 @@
   (case pattern-type
     (:optional :exists :not-exists :minus)
     (let [clause  (where/pattern-data pattern)
-          clause* (inline-where-clause clause bound)]
+          clause* (inline-where-clause bound clause)]
       (where/->pattern pattern-type clause*))
 
     :union
     (let [clauses  (where/pattern-data pattern)
-          clauses* (mapv #(inline-where-clause % bound) clauses)]
+          clauses* (mapv #(inline-where-clause bound %) clauses)]
       (where/->pattern pattern-type clauses*))
 
     :graph
-    (let [[graph-clause where-clause] (where/pattern-data pattern)
-          where-clause* (inline-where-clause where-clause bound)]
-      (where/->pattern pattern-type [graph-clause where-clause*]))
+    (let [[graph-clause where-clause] (where/pattern-data pattern)]
+      (if (where/virtual-graph? graph-clause)
+        pattern ; Do not inline within virtual graph clauses
+        (let [where-clause* (inline-where-clause bound where-clause)]
+          (where/->pattern pattern-type [graph-clause where-clause*]))))
 
     pattern))
 
@@ -252,7 +409,7 @@
         result))
 
 (defn inline-where-clause*
-  [patterns bound]
+  [bound patterns]
   (loop [remaining patterns
          result []
          bound bound
@@ -281,7 +438,7 @@
                    pending))
 
           (:tuple :class :id)
-          (let [pattern-vars (or (pattern-bound-vars pattern pattern-type) #{})
+          (let [pattern-vars (or (bound-vars pattern) #{})
                 {:keys [pattern pending]} (attach-inline-filters pattern pattern-type pending pattern-vars)
                 bound* (into bound pattern-vars)]
             (recur (rest remaining)
@@ -305,11 +462,11 @@
        :bound bound})))
 
 (defn inline-where-clause
-  [patterns bound]
-  (if (seq patterns)
-    (let [{:keys [result pending]} (inline-where-clause* patterns bound)]
+  [bound clause]
+  (if (seq clause)
+    (let [{:keys [result pending]} (inline-where-clause* bound clause)]
       (finalize-inline-result result pending))
-    patterns))
+    clause))
 
 (defn compile-filter
   "Compile filter code into an executable filter function.
@@ -386,8 +543,11 @@
 (defn optimize-inline-filters
   "Rewrite single-variable filters as inline filters attached to the pattern
   that binds the variable. Returns the optimized where clause."
-  [where-clause]
-  (inline-where-clause where-clause #{}))
+  [binding-patterns filter-descriptors]
+  (let [clause (into (vec binding-patterns)
+                     (map :pattern)
+                     filter-descriptors)]
+    (inline-where-clause #{} clause)))
 
 (declare reorder-where-clause reorder-union-pattern)
 
@@ -442,26 +602,31 @@
   reordering is not possible."
   [db clause]
   (go-try
-    (if-not (seq clause)
-      clause
+    (if (seq clause)
       (let [top-level (<? (-reorder db clause))]
         (loop [remaining top-level
                acc       []]
           (if-let [pattern (first remaining)]
             (let [pattern* (<? (reorder-nested-clause db pattern))]
               (recur (rest remaining) (conj acc pattern*)))
-            acc))))))
+            acc)))
+      clause)))
 
 (defn optimize-where-clause
-  "Optimize a parsed where clause by reordering patterns, inlining filters, and
-  compiling filter code. Returns a channel yielding the optimized clause or the
-  original clause when optimization is unnecessary."
+  "Optimize a parsed where clause by reordering binding patterns, applying inline
+  filter optimizations, and compiling filter code. Returns a channel yielding the
+  optimized clause or the original clause when optimization is unnecessary."
   [db context where-clause]
   (go-try
-    (let [reordered (<? (reorder-where-clause db where-clause))]
-      (->> reordered
-           optimize-inline-filters
-           (compile-filter-codes context)))))
+    (if (seq where-clause)
+      (let [{:keys [binding-patterns filters]} (collect-top-level-filters where-clause)
+            reordered   (<? (reorder-where-clause db binding-patterns))
+            ;; Phase A: opportunistically push eligible filters into nested clauses
+            {:keys [patterns filters]} (propagate-filters-into-nested reordered filters #{})
+            ;; Phase B: inline filters against binding points (existing pass)
+            inlined     (optimize-inline-filters patterns filters)]
+        (compile-filter-codes context inlined))
+      where-clause)))
 
 (defn optimize
   "Optimize a parsed query by first reordering patterns based on statistics,
