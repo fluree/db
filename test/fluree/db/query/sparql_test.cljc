@@ -548,11 +548,11 @@
                  where))))
       (testing "with whitespace"
         (let [query "SELECT ?person ?prefix ?foofix ?num1
-                 WHERE {BIND (?age * 4 * 3 / -2 * (-4 / 2) AS ?num1)
+                 WHERE {BIND (POWER(?age * 4 * 3 / -2 * (-4 / 2), 2) AS ?num1)
                         ?person person:handle ?handle.
                         ?person person:age ?age}"
               {:keys [where]} (sparql/->fql query)]
-          (is (= [[:bind "?num1" "(* (/ (* (* ?age 4) 3) -2) (/ -4 2))"]
+          (is (= [[:bind "?num1" "(power (* (/ (* (* ?age 4) 3) -2) (/ -4 2)) 2)"]
                   {"@id" "?person", "person:handle" "?handle"}
                   {"@id" "?person", "person:age" "?age"}]
                  where)))))

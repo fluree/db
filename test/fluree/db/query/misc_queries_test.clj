@@ -1,5 +1,6 @@
 (ns fluree.db.query.misc-queries-test
   (:require [babashka.fs :refer [with-temp-dir]]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [fluree.db.api :as fluree]
             [fluree.db.test-utils :as test-utils]
@@ -449,3 +450,45 @@
         (is (= [:ex/alice :ex/bob :ex/charlie] result)
             "Should return all inserted subjects in alphabetical order")))))
 
+(deftest ^:integration untyped-value-matching-test
+  (testing "Untyped integer values in queries should match typed values in storage via loose matching"
+    (let [conn         (test-utils/create-conn)
+          ledger-alias "untyped-test"
+          _            @(fluree/create conn ledger-alias)
+          db1          @(fluree/update @(fluree/db conn ledger-alias)
+                                       {"@context" [test-utils/default-context
+                                                    {"ex" "http://example.org/ns/"}]
+                                        "insert"   [{"@id"     "ex:alice"
+                                                     "ex:name" "Alice"}]})
+          db2          @(fluree/update db1
+                                       {"@context" [test-utils/default-context
+                                                    {"ex" "http://example.org/ns/"}]
+                                        "insert"   [{"@id"     "ex:bob"
+                                                     "ex:name" "Bob"}]})
+          db2          @(fluree/commit! conn db2)]
+
+      (testing "Query with explicit datatype matches"
+        (let [result @(fluree/query db2
+                                    {"@context" {"ex"  "http://example.org/ns/"
+                                                 "f"   "https://ns.flur.ee/ledger#"
+                                                 "xsd" "http://www.w3.org/2001/XMLSchema#"}
+                                     "select"   "?db"
+                                     "where"    [{"@id" "?db"
+                                                  "f:t" {"@value" 1
+                                                         "@type"  "xsd:int"}}]})]
+          (is (= 1 (count result))
+              "Should find exactly one db with t=1")
+          (is (str/starts-with? (first result) "fluree:db:sha256:")
+              "Result should be db IRI starting with fluree:db:sha256:")))
+
+      (testing "Query with untyped integer matches via loose matching"
+        (let [result @(fluree/query db2
+                                    {"@context" {"ex" "http://example.org/ns/"
+                                                 "f"  "https://ns.flur.ee/ledger#"}
+                                     "select"   "?db"
+                                     "where"    [{"@id" "?db"
+                                                  "f:t" 1}]})]
+          (is (= 1 (count result))
+              "Should find exactly one db with t=1 via loose matching")
+          (is (str/starts-with? (first result) "fluree:db:sha256:")
+              "Result should be db IRI starting with fluree:db:sha256:"))))))

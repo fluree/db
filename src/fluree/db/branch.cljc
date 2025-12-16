@@ -127,11 +127,17 @@
                        (let [indexed-db (<? (indexer/index db* index-files-ch)) ; indexer/index always returns a FlakeDB (never AsyncDB)
                              [{prev-commit :commit} {indexed-commit :commit}]
                              (swap-vals! branch-state update-index indexed-db)]
-                         (if-not (= prev-commit indexed-commit)
-                           (let [_ (log/debug "Publishing new index commit:" indexed-commit)
-                                 commit-jsonld (commit-data/->json-ld indexed-commit)]
-                             (nameservice/publish-to-all commit-jsonld publishers))
-                           (log/debug "Not publishing unchanged index commit:" indexed-commit))
+                         (when-not (= prev-commit indexed-commit)
+                           (let [ledger-alias  (:alias indexed-db)
+                                 index-address (-> indexed-commit :index :address)
+                                 index-t       (commit-data/index-t indexed-commit)]
+                             (log/debug "Publishing new index" {:alias ledger-alias
+                                                                :index-address index-address
+                                                                :index-t index-t})
+                             (when-let [primary (nameservice/primary-publisher publishers)]
+                               (<? (nameservice/publish-index primary ledger-alias index-address index-t)))
+                             (when-let [secondaries (seq (nameservice/secondary-publishers publishers))]
+                               (nameservice/publish-index-to-all ledger-alias index-address index-t secondaries))))
                          {:status :success, :db indexed-db, :commit indexed-commit})
                        (catch* e
                          (log/error e "Error updating index")

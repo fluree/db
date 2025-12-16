@@ -103,7 +103,9 @@
             (where/match-value v const/iri-lang-string)
             (where/link-lang-var lang))
         (where/match-lang where/unmatched v lang))
-      (where/anonymous-value v))))
+      (if (number? v)
+        (where/untyped-value v)
+        (where/anonymous-value v)))))
 
 (defn every-binary-pred
   [& fs]
@@ -504,7 +506,9 @@
       [(where/->pattern :class (flip-reverse-pattern [s-mch p-mch class-ref]))])
 
     :else
-    (let [o-mch (where/anonymous-value o)]
+    (let [o-mch (if (number? o)
+                  (where/untyped-value o)
+                  (where/anonymous-value o))]
       [(flip-reverse-pattern [s-mch p-mch o-mch])])))
 
 (defn parse-statement
@@ -561,14 +565,21 @@
   [m var-config context]
   (parse-node-map m var-config context))
 
+(defn compile-filter-fn
+  [context parsed-codes]
+  (->> parsed-codes
+       (map (fn [code]
+              (comp (fn [typed-value]
+                      (:value typed-value))
+                    (eval/compile code context))))
+       (apply every-pred)))
+
 (defmethod parse-pattern :filter
   [[_ & codes] _var-config context]
-  (let [f (->> codes
-               (map parse-code)
-               (map (fn [code] (comp (fn [tv] (:value tv))
-                                     (eval/compile code context))))
-               (apply every-pred))]
-    [(where/->pattern :filter (with-meta f {:fns codes}))]))
+  (let [parsed-codes (map parse-code codes)
+        vars         (apply set/union (map variables parsed-codes))
+        f            (compile-filter-fn context parsed-codes)]
+    [(where/->pattern :filter (with-meta f {:forms parsed-codes, :vars vars}))]))
 
 (defmethod parse-pattern :union
   [[_ & unions] var-config context]
@@ -660,14 +671,25 @@
   (let [parsed-fn  (parse-code f)
         fn-name    (some-> parsed-fn second first)
         bind-var   (last parsed-fn)
-        aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
+        aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))
+        agg-vars   (variables parsed-fn)
+        agg-info   (when aggregate?
+                     {:fn-name fn-name
+                      :vars    agg-vars})]
     (-> parsed-fn
         (eval/compile context)
-        (select/as-selector output bind-var aggregate?))))
+        (select/as-selector output bind-var aggregate? agg-info))))
 
 (defn parse-select-aggregate
   [f context]
-  (-> f parse-code (eval/compile context) select/aggregate-selector))
+  (let [parsed   (parse-code f)
+        fn-name  (when (seq? parsed) (first parsed))
+        agg-vars (variables parsed)
+        agg-info {:fn-name fn-name
+                  :vars    agg-vars}]
+    (-> parsed
+        (eval/compile context)
+        (select/aggregate-selector agg-info))))
 
 (defn reverse?
   [context k]

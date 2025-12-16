@@ -305,11 +305,25 @@
   (cmp-long t1 t2))
 
 (defn cmp-dt
-  "Used within cmp-obj to compare data types in more edge cases"
+  "Used within cmp-obj to compare data types in more edge cases.
+   When one datatype is nil (untyped query value), returns 0 to allow matching.
+   For numeric datatypes this enables loose matching; for non-numeric types,
+   the actual filtering happens in cmp-obj's type-specific comparisons to
+   maintain comparator transitivity."
   [dt1 dt2]
   (if (and dt1 dt2)
     (cmp-sid dt1 dt2)
     0))
+
+(defn cmp-same-type
+  "Helper for comparing values of the same type (numbers or strings).
+   Compares values first; if equal, compares datatypes only if both are non-nil,
+   otherwise returns 0 for loose matching."
+  [o1 o2 dt1 dt2]
+  (let [v-cmp (compare o1 o2)]
+    (if (= 0 v-cmp)
+      (cmp-dt dt1 dt2)
+      v-cmp)))
 
 (defn cmp-obj
   [o1 dt1 o2 dt2]
@@ -322,25 +336,21 @@
       ;; long, etc.)
       (compare o1 o2)
 
-      ;; different data types, but strings
-      (and (string? o1)
-           (string? o2))
-      (let [s-cmp (compare o1 o2)]
-        (if (= 0 s-cmp) ; could be identical values, but different data types
-          (cmp-dt dt1 dt2)
-          s-cmp))
+      ;; both are numbers - compare values, then datatypes
+      (and (number? o1) (number? o2))
+      (cmp-same-type o1 o2 dt1 dt2)
 
-      ;; different data types, but numbers
-      (and (number? o1)
-           (number? o2))
-      (let [s-cmp (compare o1 o2)]
-        (if (= 0 s-cmp)                                     ;; could be identical values, but different data types
-          (cmp-dt dt1 dt2)
-          s-cmp))
+      ;; both are strings - compare values, then datatypes
+      (and (string? o1) (string? o2))
+      (cmp-same-type o1 o2 dt1 dt2)
 
-      ;; different data types, not comparable
+      ;; different types - incompatible unless both have datatypes
       :else
-      (cmp-dt dt1 dt2))
+      (if (and dt1 dt2)
+        (cmp-dt dt1 dt2)
+        ;; One or both datatypes are nil with incompatible types (e.g., number vs string)
+        ;; Use Clojure's type ordering: numbers < strings
+        (if (number? o1) -1 1)))
     0))
 
 (defn cmp-op

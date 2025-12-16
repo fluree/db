@@ -7,7 +7,6 @@
             [fluree.db.did :as did]
             [fluree.db.flake :as flake]
             [fluree.db.flake.commit-data :as commit-data]
-            [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.json-ld.credential :as credential]
             [fluree.db.json-ld.iri :as iri]
@@ -93,24 +92,24 @@
 (defn ledger-info
   "Returns comprehensive ledger information including statistics for specified branch (or default branch if nil).
    Computes current property and class statistics by replaying novelty on top of indexed stats.
+   Uses connection's LRU cache to share stats computation with f:onClass policy optimization.
    Returns stats in native SID format - use fluree.db.api/ledger-info for IRI-decoded version."
   ([ledger]
    (ledger-info ledger const/default-branch-name))
-  ([{:keys [address alias] :as ledger} requested-branch]
+  ([{:keys [address alias primary-publisher] :as ledger} requested-branch]
    (go-try
      (let [branch-data (get-branch-meta ledger requested-branch)
-           branch-name (:name branch-data)
            current-db  (branch/current-db branch-data)
-           ;; Get stats, namespace-codes, commit, index, and novelty via protocol method
-           {:keys [stats namespace-codes t novelty-post commit index]} (<? (dbproto/-ledger-info current-db))
-           ;; Compute current stats by replaying novelty - need to pass a map with :stats and :novelty :post
-           current-stats (novelty/current-stats {:stats stats :novelty {:post novelty-post}})]
-       {:address         address
-        :alias           alias
-        :branch          branch-name
-        :t               t
-        :commit          commit
-        :index           index
+           {:keys [stats current-stats namespace-codes commit]} (<? (dbproto/-ledger-info current-db))
+           commit-jsonld (commit-data/->json-ld commit)
+           nameservice (when primary-publisher
+                         (try*
+                           (<? (nameservice/lookup primary-publisher address))
+                           (catch* e
+                             (log/debug "Unable to fetch nameservice record" {:alias alias :error (ex-message e)})
+                             nil)))]
+       {:commit          commit-jsonld
+        :nameservice     nameservice
         :namespace-codes namespace-codes
         :stats           (merge stats current-stats)}))))
 
@@ -189,7 +188,7 @@
   Returns: 'fluree:index:sha256:abc123def'"
   [index-catalog index-address]
   (go-try
-    (let [hash (<? (storage/get-hash index-catalog index-address))]
+    (let [hash (<? (storage/get-hash (:storage index-catalog) index-address))]
       (str "fluree:index:sha256:" hash))))
 
 (defn- apply-index-to-db
@@ -201,7 +200,7 @@
           index-id      (<? (idx-address->idx-id index-catalog index-address))
           index-version (:v root)
           index-map     (commit-data/new-index data index-id index-address index-version
-                                               (select-keys root [:spot :post :opst :tspo]))]
+                                               (select-keys root [:spot :post :opst :tspo :stats]))]
       (dbproto/-index-update db index-map))))
 
 (defn- update-branch-with-index
@@ -381,12 +380,9 @@
     (let [init-time      (util/current-time-iso)
           genesis-commit (<? (commit-storage/write-genesis-commit
                               commit-catalog alias publish-addresses init-time))
-          ;; Publish genesis commit to nameservice - convert expanded to compact format first
+          commit-address (util/get-first-value genesis-commit const/iri-address)
           _              (when primary-publisher
-                           (let [;; Convert expanded genesis commit to compact JSON-ld format
-                                 commit-map (commit-data/json-ld->map genesis-commit nil)
-                                 compact-commit (commit-data/->json-ld commit-map)]
-                             (<? (nameservice/publish primary-publisher compact-commit))))]
+                           (<? (nameservice/publish-commit primary-publisher alias commit-address 0)))]
       (instantiate alias primary-address commit-catalog index-catalog
                    primary-publisher secondary-publishers indexing did genesis-commit))))
 
@@ -500,11 +496,22 @@
        :write-result  commit-res})))
 
 (defn publish-commit
-  "Publishes commit to all nameservices registered with the ledger."
+  "Publishes commit to all nameservices registered with the ledger.
+   Uses atomic publish-commit to update only commit fields, avoiding
+   overwriting index data that may have been updated by a separate indexer."
   [{:keys [primary-publisher secondary-publishers] :as _ledger} commit-jsonld]
   (go-try
-    (let [result (<? (nameservice/publish primary-publisher commit-jsonld))]
-      (nameservice/publish-to-all commit-jsonld secondary-publishers)
+    (let [ledger-alias   (get commit-jsonld "alias")
+          commit-address (get commit-jsonld "address")
+          commit-t       (get-in commit-jsonld ["data" "t"])
+          _              (log/debug "publish-commit using atomic update"
+                                    {:alias ledger-alias :commit-t commit-t})
+          result         (<? (nameservice/publish-commit primary-publisher
+                                                         ledger-alias
+                                                         commit-address
+                                                         commit-t))]
+      (when-let [secondaries (seq secondary-publishers)]
+        (nameservice/publish-commit-to-all ledger-alias commit-address commit-t secondaries))
       result)))
 
 (defn formalize-commit

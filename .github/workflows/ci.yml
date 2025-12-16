@@ -68,10 +68,9 @@ jobs:
           load: true
       - name: Run tests
         run: |
-          docker create --name fluree-db fluree/db true
-          docker cp fluree-db:/usr/src/flureedb/docker-chrome-seccomp.json .
-          docker rm fluree-db
-          docker run --security-opt seccomp=docker-chrome-seccomp.json fluree/db make cljstest
+          # Run with --privileged to avoid runc /proc/thread-self issue
+          # This is needed for Chrome to run in the container for CLJS tests
+          docker run --privileged fluree/db make cljstest
 
   test-other:
     name: run other tests

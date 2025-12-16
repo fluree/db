@@ -73,9 +73,8 @@
 (defn track-execution
   "Track fuel usage in query. `exec-fn` is a thunk that when called with no arguments
   returns a result or throws an exception."
-  [ds tracker exec-fn]
+  [_ds tracker exec-fn]
   (go-try
-    (track/register-policies! tracker ds)
     (try* (let [result        (<? (exec-fn))
                 tally         (track/tally tracker)]
             (assoc tally :status 200, :result result))
