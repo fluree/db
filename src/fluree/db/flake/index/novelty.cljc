@@ -55,7 +55,7 @@
        seq
        boolean))
   ([db]
-   (->> index/types
+   (->> (index/indexes-for db)
         (some (partial dirty? db))
         boolean)))
 
@@ -534,7 +534,7 @@
                             (stats/compute-class-property-stats-async db))
 
            ;; Run index refresh (always required)
-           index-result (<? (->> index/types
+           index-result (<? (->> (index/indexes-for db)
                                  (map (partial extract-root db))
                                  (map (partial refresh-index db changes-ch error-ch))
                                  async/merge
@@ -616,7 +616,7 @@
                                                       index-id
                                                       index-address
                                                       index-version
-                                                      (select-keys refreshed-db* index/types))
+                                                      (index/select-roots refreshed-db*))
                  indexed-db    (dbproto/-index-update refreshed-db* commit-index)
                  duration      (- (util/current-time-millis) start-time-ms)
                  end-stats     (assoc init-stats
