@@ -499,3 +499,89 @@
                            (recur stack**))))))))
              (async/close! out)))))
      out)))
+
+;; Batched lookups over a single index by leaf.
+
+(defn- floor-child
+  "Return the child whose key is the greatest <= target (or the leftmost child)."
+  [children target]
+  (or (some-> (rsubseq children <= target) first val)
+      (some-> children first val)))
+
+(defn- resolve-node
+  [r node error-ch]
+  (go
+    (try*
+      (<? (resolve r node))
+      (catch* e
+        (>! error-ch e)
+        nil))))
+
+(defn- seek-leaf
+  "Resolve the leaf that should contain `target` (by index key ordering)."
+  [r root target error-ch]
+  (go
+    (loop [node root]
+      (when node
+        (let [node* (if (resolved? node) node (<! (resolve-node r node error-ch)))]
+          (cond
+            (nil? node*) nil
+
+            (leaf? node*)
+            (if (resolved? node*)
+              node*
+              (<! (resolve-node r node* error-ch)))
+
+            :else
+            (recur (floor-child (:children node*) target))))))))
+
+(defn streaming-index-lookup
+  "Streams `lookup-ch` (already sorted by `lookup->start`) and emits results by
+  batching all lookups that fall within a resolved leaf.
+
+  Callers provide:
+  - lookup->start: lookup -> flake (must match index comparator ordering)
+  - leaf->results: (fn [resolved-leaf lookups] (seq results))
+
+  Parameters:
+  - r               Resolver
+  - root            Index root node (must have :comparator)
+  - lookup-ch       Channel of lookup items (sorted by lookup->start)
+  - lookup->start   lookup -> flake (ordered by root comparator)
+  - leaf->results   (fn [resolved-leaf lookups] (seq results))
+  - error-ch        Channel for errors (required)
+  - opts:
+      :buffer out buffer size (default 64)"
+  [r root lookup-ch lookup->start leaf->results error-ch {:keys [buffer] :or {buffer 64}}]
+  (let [out (chan buffer)
+        cmp (:comparator root)]
+    (when-not (fn? cmp)
+      (throw (ex-info "streaming-index-lookup requires root with :comparator"
+                      {:status 500 :error :db/index-lookup})))
+    (go
+      (try*
+        (loop [cur (<! lookup-ch)]
+          (if cur
+            (let [target (lookup->start cur)
+                  leaf   (<! (seek-leaf r root target error-ch))]
+              (when-not leaf
+                (throw (ex-info "Unable to resolve leaf for lookup batch"
+                                {:status 500 :error :db/index-lookup
+                                 :lookup (pr-str cur)})))
+              (let [rhs (:rhs leaf)
+                    [batch carry]
+                    (loop [acc [cur]]
+                      (let [nxt (<! lookup-ch)]
+                        (cond
+                          (nil? nxt) [acc nil]
+                          (and rhs (not (neg? (cmp (lookup->start nxt) rhs)))) [acc nxt]
+                          :else (recur (conj acc nxt)))))]
+                (doseq [item (leaf->results leaf batch)]
+                  (>! out item))
+                (recur carry)))
+            (async/close! out)))
+        (catch* e
+          (log/error e "streaming-index-lookup failed")
+          (>! error-ch e)
+          (async/close! out))))
+    out))

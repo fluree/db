@@ -520,7 +520,10 @@
    (go-try
      ;; Check if this is a v1 index - if so, skip stats computation entirely
      ;; v1 indexes should not generate stats until fully reindexed
-     (let [prev-index-version  (get-in db [:commit :index :v])
+     (let [start-ms            (util/current-time-millis)
+           ledger-alias        (:alias db)
+           t                   (:t db)
+           prev-index-version  (get-in db [:commit :index :v])
            is-v1-index?        (and prev-index-version (< prev-index-version 2))
            track-class-stats?  (get db :track-class-stats true)
 
@@ -542,6 +545,10 @@
                                                       :indexes []
                                                       :garbage #{}})))
 
+           index-done-ms (util/current-time-millis)
+           _ (log/info "refresh-all PHASE: index-refresh complete"
+                       {:ledger ledger-alias :t t :elapsed-ms (- index-done-ms start-ms)})
+
            ;; Collect stats results (or use empty stats for v1)
            stats-result (if is-v1-index?
                           (do
@@ -551,9 +558,24 @@
                              :old-sketch-paths #{}})
                           (<? stats-ch))
 
+           hll-done-ms (util/current-time-millis)
+           _ (log/info "refresh-all PHASE: HLL-stats complete"
+                       {:ledger ledger-alias :t t
+                        :elapsed-ms (- hll-done-ms start-ms)
+                        :wait-after-index-ms (- hll-done-ms index-done-ms)
+                        :property-count (count (:properties stats-result))})
+
            class-props-result (if class-props-ch
                                 (<? class-props-ch)
                                 {})
+
+           class-done-ms (util/current-time-millis)
+           _ (when track-class-stats?
+               (log/info "refresh-all PHASE: class-properties complete"
+                         {:ledger ledger-alias :t t
+                          :elapsed-ms (- class-done-ms start-ms)
+                          :wait-after-hll-ms (- class-done-ms hll-done-ms)
+                          :class-count (count class-props-result)}))
 
            merged-classes (merge-with merge (:classes stats-result) class-props-result)]
 

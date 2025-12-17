@@ -1,11 +1,12 @@
 (ns fluree.db.flake.index.stats
   "Statistics tracking for ledger indexing.
    Tracks property usage per class including datatypes, reference classes, and language tags."
-  (:require [fluree.db.constants :as const]
+  (:require [clojure.core.async :as async :refer [go]]
+            [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.index :as index]
             [fluree.db.flake.index.hyperloglog :as hll-persist]
             [fluree.db.indexer.hll :as hll]
-            [fluree.db.query.range :as query-range]
             [fluree.db.storage :as storage]
             [fluree.db.util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
@@ -13,98 +14,111 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn- get-subject-classes
-  "Returns a channel with set of class SIDs for the given subject."
-  [db subject-sid]
-  (go-try
-    (let [flakes (<? (query-range/index-range db nil :spot = [subject-sid const/$rdf:type] {}))]
-      ;; flakes is already a sorted set from the index, just extract object values
-      (set (map flake/o flakes)))))
+;; Batched PSOT lookup for class retrieval
+
+(defn- subject->psot-flake
+  "Create a PSOT seek flake for a subject SID at rdf:type."
+  [subject-sid]
+  ;; flake/create args: s p o dt t op m
+  (flake/create subject-sid const/$rdf:type flake/min-s flake/min-dt flake/min-t flake/min-op flake/min-meta))
+
+(defn- extract-classes-from-leaf
+  "Returns seq of [sid #{class-sids}] pairs from a resolved leaf."
+  [leaf subject-sids]
+  (let [subject-set (set subject-sids)
+        flakes (:flakes leaf)]
+    ;; Group flakes by subject, filter to only rdf:type flakes for our subjects
+    (->> flakes
+         (filter (fn [f]
+                   (and (= const/$rdf:type (flake/p f))
+                        (contains? subject-set (flake/s f))
+                        (flake/op f)))) ; only assertions
+         (group-by flake/s)
+         (map (fn [[sid fs]]
+                [sid (set (map flake/o fs))])))))
+
+(defn- extract-classes-from-novelty
+  "Returns {sid #{class-sids}} computed from novelty (handles retractions)."
+  [novelty subject-sids]
+  ;; Handle both assertions and retractions (op true/false).
+  (let [wanted? (set subject-sids)]
+    (reduce
+     (fn [acc f]
+       (let [sid (flake/s f)]
+         (if (and (wanted? sid)
+                  (= const/$rdf:type (flake/p f)))
+           (let [class-sid (flake/o f)]
+             (if (flake/op f)
+               (update acc sid (fnil conj #{}) class-sid)
+               (update acc sid (fnil disj #{}) class-sid)))
+           acc)))
+     {}
+     (or novelty []))))
+
+(defn batched-get-subject-classes
+  "Returns a channel that yields {sid #{class-sids}}.
+
+  Uses PSOT (when present) + PSOT novelty."
+  ([db sids]
+   (batched-get-subject-classes db sids {:sorted? false}))
+  ([db sids {:keys [sorted?] :or {sorted? false}}]
+   (if (empty? sids)
+     (go {})
+     (let [psot-root (:psot db)
+           resolver  (:index-catalog db)
+           ;; Get classes from novelty (not yet persisted)
+           psot-novelty     (get-in db [:novelty :psot])
+           novelty-classes  (extract-classes-from-novelty psot-novelty sids)]
+       (if (nil? psot-root)
+         ;; No PSOT on this db (e.g. legacy ledgers) - return novelty-only classes.
+         (go novelty-classes)
+        (let [sorted-sids (if sorted? sids (sort sids))
+               input-ch    (async/to-chan! sorted-sids)
+              error-ch    (async/chan 1)
+              result-ch   (index/streaming-index-lookup
+                           resolver psot-root input-ch subject->psot-flake extract-classes-from-leaf
+                           error-ch {})]
+          ;; Collect results from index and merge with novelty (or throw on error)
+           (go-try
+            (loop [result novelty-classes]
+              (async/alt!
+                error-ch ([e] (throw e))
+                result-ch ([item]
+                           (if item
+                             (let [[sid classes] item]
+                               (recur (update result sid (fnil into #{}) classes)))
+                             result)))))))))))
+
+(defn- merge-class-maps
+  "Merge {sid -> #{class-sids}} maps."
+  [a b]
+  (merge-with into (or a {}) (or b {})))
+
+(defn- collect-subject-and-ref-sids
+  "Single pass over subject-ordered `spot-novelty` to collect:
+   - distinct subject SIDs in encounter order (already sorted)
+   - distinct referenced object SIDs (dt=@id), as a set"
+  [spot-novelty]
+  (reduce
+   (fn [{:keys [last-s] :as acc} f]
+     (let [s (flake/s f)
+           acc* (if (= s last-s)
+                  acc
+                  (-> acc
+                      (assoc :last-s s)
+                      (update :subjects conj! s)))]
+       (if (= const/$id (flake/dt f))
+         (update acc* :refs conj! (flake/o f))
+         acc*)))
+   {:last-s nil
+    :subjects (transient [])
+    :refs     (transient #{})}
+   spot-novelty))
 
 (defn- get-lang-tag
   "Extracts language tag from flake's m field."
   [flake]
   (:lang (flake/m flake)))
-
-(defn- track-property-usage
-  "Track property usage for a flake on given classes.
-   Updates the class-props map with:
-   - Property SID used with counts per datatype
-   - Referenced class SIDs with counts (if datatype is @id)
-   - Language tags with counts (if datatype is langString)
-
-   Processes both assertions (increment) and retractions (decrement).
-   Excludes @type/rdf:type as it's an internal JSON-LD construct.
-
-   class-cache: atom containing {sid -> #{classes}} to avoid redundant lookups"
-  [db class-props classes flake class-cache]
-  (go-try
-    (let [prop-sid (flake/p flake)]
-      (if (= prop-sid const/$rdf:type) ;; Skip tracking for @type/rdf:type property
-        class-props
-        (let [dt-sid (flake/dt flake)
-              assert? (flake/op flake)
-              delta (if assert? 1 -1)]
-          (loop [class-props* class-props
-                 [cls & rest-classes] (seq classes)]
-            (if-not cls
-              class-props*
-              (let [cls-data (get class-props* cls {})
-                    props    (get cls-data :properties {})
-                    prop-data    (get props prop-sid {:types {} :ref-classes {} :langs {}})
-
-                    ;; Update type count
-                    prop-data*   (update-in prop-data [:types dt-sid]
-                                            (fn [cnt] (max 0 (+ (or cnt 0) delta))))
-
-                    ;; Update ref-class counts if @id type (with caching)
-                    prop-data**  (if (= dt-sid const/$id)
-                                   (let [ref-sid (flake/o flake)
-                                         ;; Check cache first
-                                         ref-classes (or (@class-cache ref-sid)
-                                                         (let [classes (<? (get-subject-classes db ref-sid))]
-                                                           (swap! class-cache assoc ref-sid classes)
-                                                           classes))]
-                                     (reduce (fn [pd ref-cls]
-                                               (update-in pd [:ref-classes ref-cls]
-                                                          (fn [cnt] (max 0 (+ (or cnt 0) delta)))))
-                                             prop-data*
-                                             ref-classes))
-                                   prop-data*)
-
-                    ;; Update lang counts if langString type
-                    prop-data*** (if (= dt-sid const/$rdf:langString)
-                                   (if-let [lang (get-lang-tag flake)]
-                                     (update-in prop-data** [:langs lang]
-                                                (fn [cnt] (max 0 (+ (or cnt 0) delta))))
-                                     prop-data**)
-                                   prop-data**)
-
-                    props* (assoc props prop-sid prop-data***)
-                    cls-data* (assoc cls-data :properties props*)
-                    class-props** (assoc class-props* cls cls-data*)]
-                (recur class-props** rest-classes)))))))))
-
-(defn process-subject-group
-  "Process all flakes for a single subject, tracking property usage on its classes.
-   Returns updated class-props map.
-
-   subject-flakes: All flakes for a single subject (already grouped)
-   db: Database to query for class information
-   class-props: Accumulated class property tracking map
-   class-cache: atom for caching SID -> classes lookups"
-  [db subject-flakes class-props class-cache]
-  (go-try
-    (let [subject-sid (flake/s (first subject-flakes))
-          classes (<? (get-subject-classes db subject-sid))]
-      (if (empty? classes)
-        class-props
-        (loop [class-props* class-props
-               [f & rest-flakes] subject-flakes]
-          (if-not f
-            class-props*
-            (let [updated-props (<? (track-property-usage db class-props* classes f class-cache))]
-              (recur updated-props rest-flakes))))))))
 
 (defn update-class-counts
   "Update class counts for rdf:type flakes.
@@ -331,8 +345,21 @@
            :classes classes
            :old-sketch-paths old-paths})))))
 
+(defn- process-subject-group-with-classes
+  "Process all flakes for a subject using pre-fetched classes (no async lookup).
+   Returns updated class-props map."
+  [class-props classes subject-flakes subject-classes-map]
+  (if (empty? classes)
+    class-props
+    (reduce
+     (fn [cp f]
+       (track-property-usage-sync cp classes f subject-classes-map))
+     class-props
+     subject-flakes)))
+
 (defn compute-class-property-stats-async
   "Compute enhanced class property statistics by processing all subjects.
+   Uses batched PSOT lookup to efficiently get classes for all subjects at once.
    Returns a map of {class-sid {:properties {prop-sid {:types {dt-sid count} :ref-classes {ref-sid count} :langs {lang count}}}}}"
   [db]
   (go-try
@@ -347,28 +374,48 @@
           (log/debug "compute-class-property-stats-async EMPTY - returning {}")
           {})
         (try*
-          (let [subject-groups (partition-by flake/s post-novelty)
+          ;; Prefer grouping by subject using :spot novelty (already subject-ordered).
+          ;; We still use post-novelty for the overall "empty?" check above.
+          (let [spot-novelty   (or (get-in db [:novelty :spot]) [])
+                subject-groups (partition-by flake/s spot-novelty)
+                ;; Collect distinct subject SIDs (already sorted by :spot) and referenced SIDs.
+                {:keys [subjects refs] :as _sid-acc} (collect-subject-and-ref-sids spot-novelty)
+                subject-sids            (persistent! subjects)
+                ref-sids                (persistent! refs)
+                ;; If we have many ref lookups, sort them once (PSOT needs predicate then subject ordering).
+                sorted-ref-sids         (when (seq ref-sids) (sort ref-sids))
+                ;; Batched PSOT lookup for all subject classes at once
+                _ (log/debug "compute-class-property-stats-async: batched lookup for subjects"
+                             {:subject-count (count subject-sids)
+                              :ref-count     (count ref-sids)})
+                subject-classes-map     (<? (batched-get-subject-classes db subject-sids {:sorted? true}))
+                ref-classes-map         (if (seq sorted-ref-sids)
+                                          (<? (batched-get-subject-classes db sorted-ref-sids {:sorted? true}))
+                                          {})
+                all-classes-map         (merge-class-maps subject-classes-map ref-classes-map)
+                _ (log/debug "compute-class-property-stats-async: batched lookup complete"
+                             {:sids-with-classes (count all-classes-map)})
                 ;; Extract only :properties from previous classes
                 prev-class-props (reduce-kv (fn [acc class-sid class-data]
                                               (if-let [props (:properties class-data)]
                                                 (assoc acc class-sid {:properties props})
                                                 acc))
                                             {}
-                                            prev-classes)
-                ;; Create cache for SID -> classes lookups (process-specific, not persistent)
-                class-cache (atom {})]
+                                            prev-classes)]
             (log/debug "compute-class-property-stats-async processing"
                        {:subject-groups-count (count subject-groups)})
+            ;; Process all subject groups synchronously using pre-fetched classes
             (loop [[sg & rest-sgs] subject-groups
                    class-props* prev-class-props
                    idx 0]
               (if sg
-                (do
-                  (when (zero? (mod idx 10))
+                (let [subject-sid (flake/s (first sg))
+                      classes (get all-classes-map subject-sid #{})
+                      updated (process-subject-group-with-classes class-props* classes sg all-classes-map)]
+                  (when (zero? (mod idx 100))
                     (log/debug "compute-class-property-stats-async progress"
                                {:processed idx :remaining (count rest-sgs)}))
-                  (let [updated (<? (process-subject-group db sg class-props* class-cache))]
-                    (recur rest-sgs updated (inc idx))))
+                  (recur rest-sgs updated (inc idx)))
                 (do
                   (log/debug "compute-class-property-stats-async DONE"
                              {:processed idx})

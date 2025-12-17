@@ -69,12 +69,14 @@
 
 (defn merge-index-into-record
   "Merges index info from the separate index file into a main NS record.
-   Index file takes precedence if it has a higher index-t."
+   Index file takes precedence if it has an equal or higher index-t.
+   Equal t values favor the index file since it's written by reindex operations
+   and may point to a newer index root (e.g., v2 with stats vs v1 without)."
   [main-record index-record]
   (if index-record
     (let [main-index-t  (get-in main-record ["f:index" "f:t"] 0)
           file-index-t  (get-in index-record ["f:index" "f:t"] 0)]
-      (if (> file-index-t main-index-t)
+      (if (>= file-index-t main-index-t)
         (assoc main-record "f:index" (get index-record "f:index"))
         main-record))
     main-record))
