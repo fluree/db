@@ -72,22 +72,22 @@
        (if (nil? psot-root)
          ;; No PSOT on this db (e.g. legacy ledgers) - return novelty-only classes.
          (go novelty-classes)
-        (let [sorted-sids (if sorted? sids (sort sids))
+         (let [sorted-sids (if sorted? sids (sort sids))
                input-ch    (async/to-chan! sorted-sids)
-              error-ch    (async/chan 1)
-              result-ch   (index/streaming-index-lookup
-                           resolver psot-root input-ch subject->psot-flake extract-classes-from-leaf
-                           error-ch {})]
+               error-ch    (async/chan 1)
+               result-ch   (index/streaming-index-lookup
+                            resolver psot-root input-ch subject->psot-flake extract-classes-from-leaf
+                            error-ch {})]
           ;; Collect results from index and merge with novelty (or throw on error)
            (go-try
-            (loop [result novelty-classes]
-              (async/alt!
-                error-ch ([e] (throw e))
-                result-ch ([item]
-                           (if item
-                             (let [[sid classes] item]
-                               (recur (update result sid (fnil into #{}) classes)))
-                             result)))))))))))
+             (loop [result novelty-classes]
+               (async/alt!
+                 error-ch ([e] (throw e))
+                 result-ch ([item]
+                            (if item
+                              (let [[sid classes] item]
+                                (recur (update result sid (fnil into #{}) classes)))
+                              result)))))))))))
 
 (defn- merge-class-maps
   "Merge {sid -> #{class-sids}} maps."
