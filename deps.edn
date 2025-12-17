@@ -12,11 +12,7 @@
 
         ;; logging
         org.clojure/tools.logging      {:mvn/version "1.3.0"}
-        ch.qos.logback/logback-classic {:mvn/version "1.5.6"}
-        org.slf4j/slf4j-api            {:mvn/version "2.0.17"}
-        com.taoensso/trove             {:mvn/version "1.1.0"}
-
-
+        com.github.steffan-westcott/clj-otel-api {:mvn/version "0.2.10"}
 
         ;; Vector math, BM25
         net.mikera/vectorz-clj              {:mvn/version "0.48.0"}
@@ -55,10 +51,12 @@
   :dev
   {:extra-paths ["dev" "dev-resources"]
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.5.0"}
+                 ch.qos.logback/logback-classic {:mvn/version "1.5.6"}
+                 org.slf4j/slf4j-api            {:mvn/version "2.0.17"}
                  criterium/criterium               {:mvn/version "0.4.6"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
                  thheller/shadow-cljs              {:mvn/version "2.28.15"}
-                 com.taoensso/telemere             {:mvn/version "1.2.0"}}
+                 }
    :jvm-opts    ["-Dlogback.configurationFile=dev-resources/logback.xml"]}
 
   :cljtest

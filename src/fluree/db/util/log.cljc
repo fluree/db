@@ -2,7 +2,7 @@
   (:require #?@(:clj  [[clojure.core.async :as async]
                        [clojure.tools.logging.readable :as log] ; readable variants use pr-str automatically
                        [fluree.db.util :refer [if-cljs]]
-                       [taoensso.trove :as trove]]
+                       [steffan-westcott.clj-otel.api.trace.span :as span]]
                 :cljs [[goog.log :as glog]]))
   #?(:cljs (:require-macros [fluree.db.util.log :refer
                              [debug->val debug->>val debug-async->vals
@@ -129,22 +129,24 @@
 #?(:clj
    (defmacro error!
      [id err data]
-     `(trove/log! {:kind :log :level :info :id ~id :data ~data :error ~err})))
+     `(span/add-span-data! (into ~data :id ~id :level :error :error ~err))))
 
 #?(:clj
    (defmacro warn!
      [id data]
-     `(trove/log! {:level :warn :id ~id :data ~data})))
+     `(span/add-span-data! (into ~data :id ~id :level :warn))))
 
 #?(:clj
    (defmacro info!
      [id data & forms]
-     `(do (trove/log! {:level :info :id ~id :data ~data}) ~@forms)))
+     `(span/with-span! {:name ~id :attributes ~data}
+       ~@forms)))
 
 #?(:clj
    (defmacro debug!
      [id data & forms]
-     `(do (trove/log! {:level :debug :id ~id :data ~data}) ~@forms)))
+     `(span/with-span! {:name ~id :attributes ~data}
+       ~@forms)))
 
 #?(:clj
    (defmacro xf-debug!
@@ -163,5 +165,6 @@
 
 #?(:clj
    (defmacro trace!
-     [id data]
-     `(trove/log! {:level :trace :id ~id :data ~data})))
+     [id data & forms]
+     `(span/with-span! {:name ~id :attributes ~data}
+       ~@forms)))
