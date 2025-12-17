@@ -3,6 +3,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.optimize :refer [compare-triples]]
+            [clojure.set :as set]
             [fluree.json-ld :as json-ld]))
 
 ;; Selectivity score constants
@@ -202,19 +203,39 @@
 (defn optimize-segment-with-metadata
   "Optimize a single segment and return patterns with their scores and detailed inputs.
    Returns vector of maps with :pattern, :score, and :inputs (for explain)."
-  [db stats patterns]
+  [db stats patterns bound-vars]
   (let [with-details (mapv (fn [pattern]
                              (let [{:keys [score inputs]} (calculate-selectivity-with-details db stats pattern)]
                                {:pattern pattern
                                 :score (or score default-selectivity)
-                                :inputs inputs}))
+                                :inputs inputs
+                                :vars  (where/clause-variables (where/pattern-data pattern))}))
                            patterns)
         cmp          (fn [{sa :score pa :pattern} {sb :score pb :pattern}]
                        (let [c (compare sa sb)]
                          (if (zero? c)
                            (compare-triples pa pb)
                            c)))]
-    (vec (sort cmp with-details))))
+    ;; Greedy join ordering:
+    ;; - Prefer patterns that share vars with what is already bound (avoid cartesian explosions).
+    ;; - Within that set, prefer the lowest selectivity score.
+    (loop [bound     (or bound-vars #{})
+           remaining with-details
+           ordered   []]
+      (if (empty? remaining)
+        ordered
+        (let [candidates (filterv (fn [{:keys [vars]}]
+                                    (not-empty (set/intersection bound vars)))
+                                  remaining)
+              pick-from  (if (seq candidates) candidates remaining)
+              chosen     (first (sort cmp pick-from))
+              ;; remove a single instance (patterns can repeat)
+              remaining* (let [idx (.indexOf remaining chosen)]
+                           (if (neg? idx)
+                             (vec (remove #(identical? % chosen) remaining))
+                             (into (subvec remaining 0 idx) (subvec remaining (inc idx)))))
+              bound*     (into bound (:vars chosen))]
+          (recur bound* remaining* (conj ordered chosen)))))))
 
 (defn optimize-patterns-with-metadata
   "Reorder patterns for optimal execution and return rich metadata for explain.
@@ -229,18 +250,28 @@
   [db where-clause]
   (let [stats (:stats db)
         segments (split-by-optimization-boundaries where-clause)
-        ;; Process each segment and collect metadata
-        processed-segments
-        (mapv (fn [segment]
-                (if (= :optimizable (:type segment))
-                  (let [patterns (:data segment)
-                        optimized-with-meta (optimize-segment-with-metadata db stats patterns)]
-                    {:type :optimizable
-                     :original patterns
-                     :optimized optimized-with-meta})
-                  {:type :boundary
-                   :pattern (:data segment)}))
-              segments)
+        ;; Process each segment in order, carrying forward a bound var set so
+        ;; later segments prefer patterns that join with existing bindings.
+        [processed-segments _bound-vars]
+        (reduce
+         (fn [[processed bound] segment]
+           (if (= :optimizable (:type segment))
+             (let [patterns            (:data segment)
+                   optimized-with-meta (optimize-segment-with-metadata db stats patterns bound)
+                   bound'              (into bound (mapcat :vars optimized-with-meta))]
+               [(conj processed
+                      {:type :optimizable
+                       :original patterns
+                       :optimized optimized-with-meta})
+                bound'])
+             (let [pattern (:data segment)
+                   bound'  (into bound (where/clause-variables (where/pattern-data pattern)))]
+               [(conj processed
+                      {:type :boundary
+                       :pattern pattern})
+                bound'])))
+         [[] #{}]
+         segments)
         ;; Extract just the optimized patterns for the optimized clause
         optimized-clause
         (into []
