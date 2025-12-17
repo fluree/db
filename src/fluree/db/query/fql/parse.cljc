@@ -6,6 +6,7 @@
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.exec.aggregate :as agg]
             [fluree.db.query.exec.eval :as eval]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
@@ -691,14 +692,14 @@
         nil))))
 
 (defn- build-streaming-agg
-  "Returns streaming-agg descriptor map for `code`, or nil."
+  "Returns streaming-agg map for `code`, or nil."
   [code]
   (when-let [{:keys [agg-op arg-var]} (extract-simple-agg-op code)]
-    (when-let [descriptor (eval/streaming-agg-descriptor agg-op)]
+    (when-let [aggregator (agg/streaming-aggregator agg-op)]
       {:agg-op     agg-op
        :arg-var    arg-var
        :result-var (gensym "?agg")
-       :descriptor descriptor})))
+       :aggregator aggregator})))
 
 (defn parse-select-as-fn
   [f context output]

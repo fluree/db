@@ -1,5 +1,6 @@
 (ns fluree.db.query.exec.group
   (:require [clojure.core.async :as async]
+            [fluree.db.query.exec.aggregate :as agg]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.select.fql :as select.fql]
             [fluree.db.query.exec.select.sparql :as select.sparql]
@@ -136,14 +137,13 @@
              {:group-vars-map (zipmap group-vars group-key)
               :agg-states     {}})
         agg-states'
-        (reduce (fn [states {:keys [arg-var result-var descriptor]}]
-                  (let [{:keys [init step]} descriptor
-                        state   (get states result-var (init))
-                        tv      (when arg-var
-                                  (some-> solution
-                                          (get arg-var)
-                                          where/mch->typed-val))
-                        new-st  (step state tv)]
+        (reduce (fn [states {:keys [arg-var result-var aggregator]}]
+                  (let [state  (get states result-var (agg/initialize aggregator))
+                        tv     (when arg-var
+                                 (some-> solution
+                                         (get arg-var)
+                                         where/mch->typed-val))
+                        new-st (agg/step aggregator state tv)]
                     (assoc states result-var new-st)))
                 agg-states
                 streaming-aggs)]
@@ -157,9 +157,9 @@
   (reduce-kv
    (fn [solutions _group-key {:keys [group-vars-map agg-states]}]
      (let [solution-with-aggs
-           (reduce (fn [sol {:keys [result-var descriptor]}]
+           (reduce (fn [sol {:keys [result-var aggregator]}]
                      (let [state    (get agg-states result-var)
-                           tv       ((:final descriptor) state)
+                           tv       (agg/finalize aggregator state)
                            base-mch (where/unmatched-var result-var)
                            mch      (where/typed-val->mch base-mch tv)]
                        (assoc sol result-var mch)))
