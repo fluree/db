@@ -6,6 +6,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
             [fluree.db.util.parse :as util.parse]
+            [fluree.db.util.trace :as trace]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -134,7 +135,7 @@
   ([db parsed-context opts]
    (policy-enforce-db db nil parsed-context opts))
   ([db tracker parsed-context opts]
-   (log/debug! ::enforce-policy {:db db :opts opts}
+   (trace/form ::enforce-policy {:db db :opts opts}
      (go-try
        (let [{:keys [identity policy-class policy policy-values]} opts
              policy-values* (util.parse/normalize-values policy-values)]

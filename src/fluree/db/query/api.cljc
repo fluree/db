@@ -16,7 +16,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
             [fluree.db.util.ledger :as ledger-util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.util.trace :as trace]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -77,7 +78,7 @@
   (go-try
     (track/register-policies! tracker ds)
     (try* (let [result        (<? (exec-fn))
-                tally         (log/debug! ::tally-tracker {:track (vec (keys tracker))}
+                tally         (trace/form ::tally-tracker {:track (vec (keys tracker))}
                                 (track/tally tracker))]
             (assoc tally :status 200, :result result))
           (catch* e
@@ -129,7 +130,7 @@
 
 (defn query-sparql
   [db query override-opts]
-  (log/debug! ::query-sparql {:sparql query}
+  (trace/form ::query-sparql {:sparql query}
     (go-try
       (let [fql (sparql/->fql query)]
         (<? (query-fql db fql override-opts))))))

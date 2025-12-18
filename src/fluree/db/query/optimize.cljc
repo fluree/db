@@ -2,7 +2,7 @@
   (:require [fluree.db.query.exec.eval :as eval]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.trace :as trace]))
 
 (defn compare-component
   [cmp-a cmp-b]
@@ -275,7 +275,7 @@
   Returns:
     Channel containing optimized query with inlined filters compiled"
   [db parsed-query]
-  (log/debug! ::optimized-query {:parsed-query parsed-query}
+  (trace/form ::optimize-query {:parsed-query parsed-query}
     (go-try
       (let [ ;; First apply statistical optimization (reordering patterns)
             reordered-query (<? (-reorder db parsed-query))

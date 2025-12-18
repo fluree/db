@@ -10,6 +10,7 @@
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
+            [fluree.db.util.trace :as trace]
             [fluree.db.util.xhttp :as xhttp])
   (:import (java.net URLEncoder)
            (java.time Instant ZoneOffset)
@@ -612,7 +613,7 @@
               (async/close! out)))
           (do
             (when (pos? attempt)
-              (log/debug! ::s3-retry-succeeded (merge {:event "s3.success-after-retry"
+              (trace/form ::s3-retry-succeeded (merge {:event "s3.success-after-retry"
                                                        :attempts (inc attempt)
                                                        :duration-ms duration-ms}
                                                       log-context))

@@ -129,24 +129,24 @@
 #?(:clj
    (defmacro error!
      [id err data]
-     `(span/add-span-data! (into ~data :id ~id :level :error :error ~err))))
+     `(span/add-span-data! (assoc ~data :id ~id :level :error :error ~err))))
 
 #?(:clj
    (defmacro warn!
      [id data]
-     `(span/add-span-data! (into ~data :id ~id :level :warn))))
+     `(span/add-span-data! (assoc ~data :id ~id :level :warn))))
 
 #?(:clj
    (defmacro info!
      [id data & forms]
      `(span/with-span! {:name ~id :attributes ~data}
-       ~@forms)))
+        ~@forms)))
 
 #?(:clj
    (defmacro debug!
      [id data & forms]
      `(span/with-span! {:name ~id :attributes ~data}
-       ~@forms)))
+        ~@forms)))
 
 #?(:clj
    (defmacro xf-debug!
@@ -167,4 +167,4 @@
    (defmacro trace!
      [id data & forms]
      `(span/with-span! {:name ~id :attributes ~data}
-       ~@forms)))
+        ~@forms)))

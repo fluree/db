@@ -14,6 +14,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.util :as util :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.trace :as trace]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -153,7 +154,7 @@
                                 (:select-distinct q))
         modifying-selectors (filter #(satisfies? SolutionModifier %) (util/sequential selectors))
         mods-xf             (comp
-                             (log/xf-debug! ::query-projection-modification {:solution-modifiers modifying-selectors})
+                             (trace/xf ::query-projection-modification {:solution-modifiers modifying-selectors})
                              (map (fn [solution]
                                     (reduce
                                      (fn [sol sel]
@@ -195,7 +196,7 @@
                                 (:select-one q)
                                 (:select-distinct q))
         iri-cache           (volatile! {})
-        format-xf           (some->> [(log/xf-debug! ::query-format {:selectors selectors})
+        format-xf           (some->> [(trace/xf ::query-format {:selectors selectors})
                                       (when (contains? q :select-distinct) (distinct))
                                       (when (contains? q :construct) cat)
                                       (when (= output-format :sparql) (mapcat select.sparql/disaggregate))]
