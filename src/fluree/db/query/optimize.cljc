@@ -1,6 +1,5 @@
 (ns fluree.db.query.optimize
   (:require [clojure.set :as set]
-            [fluree.db.query.exec.eval :as eval]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try <?]]))
@@ -526,76 +525,57 @@
       (finalize-inline-result result pending))
     clause))
 
-(defn compile-filter
-  "Compile filter code into an executable filter function.
-  The returned function takes [solution var-value] and applies the filter.
-  Codes are expected to already be parsed (not strings)."
-  [variable codes context]
-  (let [compiled-filters (mapv #(eval/compile-filter % variable context)
-                               codes)]
-    (if (= 1 (count compiled-filters))
-      (nth compiled-filters 0)
-      (fn [solution var-value]
-        (every? (fn [f]
-                  (f solution var-value))
-                compiled-filters)))))
-
-(defn compile-inline-filters
-  "Compile any filter codes in a match object.
-
-  Filters compiled during parsing already carry runtime fns and do not need
-  recompilation."
-  [mch _context]
+(defn strip-filter-code
+  "Remove temporary `::filter-code` metadata from a match object, if present."
+  [mch]
   (if (::filter-code mch)
     (dissoc mch ::filter-code)
     mch))
 
-(declare compile-filter-codes)
+(declare strip-clause-filters)
 
-(defn compile-pattern-filters
-  "Recursively compile filter codes in a pattern."
+(defn strip-pattern-filters
+  "Recursively remove temporary filter-code metadata within a pattern."
   [pattern context]
   (let [pattern-type (where/pattern-type pattern)]
-    (case (where/pattern-type pattern)
+    (case pattern-type
 
       :tuple
       ;; Tuple patterns are vectors of match objects
-      (mapv #(compile-inline-filters % context) pattern)
+      (mapv strip-filter-code pattern)
 
       (:class :id)
       ;; Class and ID patterns have a single match object as data
-      (let [mch (-> pattern
-                    where/pattern-data
-                    (compile-inline-filters context))]
+      (let [mch (-> pattern where/pattern-data strip-filter-code)]
         (where/->pattern pattern-type mch))
 
       :union
       ;; Union patterns contain a vector of where clauses
       (let [clauses (->> (where/pattern-data pattern)
-                         (mapv (partial compile-filter-codes context)))]
+                         (mapv (partial strip-clause-filters context)))]
         (where/->pattern pattern-type clauses))
 
       (:optional :exists :not-exists :minus)
       ;; Optional, exists, not-exists, and minus patterns contain a single where
       ;; clause
       (let [where-clause (->> (where/pattern-data pattern)
-                              (compile-filter-codes context))]
+                              (strip-clause-filters context))]
         (where/->pattern pattern-type where-clause))
 
       :graph
       ;; Graph patterns contain [graph* where-clause]
       (let [[graph where-clause] (where/pattern-data pattern)
-            where-clause* (compile-filter-codes context where-clause)]
+            where-clause* (strip-clause-filters context where-clause)]
         (where/->pattern pattern-type [graph where-clause*]))
 
       ;; All other pattern types pass through unchanged
       pattern)))
 
-(defn compile-filter-codes
-  "Walk through where clause and compile all filter codes."
+(defn strip-clause-filters
+  "Walk a where clause and remove temporary filter-code metadata."
   [context where-clause]
   (if (seq where-clause)
-    (mapv #(compile-pattern-filters % context) where-clause)
+    (mapv #(strip-pattern-filters % context) where-clause)
     where-clause))
 
 (defn optimize-inline-filters
@@ -683,7 +663,7 @@
             {:keys [patterns filters]} (propagate-filters-into-nested reordered filters #{})
             ;; Phase B: inline filters against binding points (existing pass)
             inlined     (optimize-inline-filters patterns filters)]
-        (compile-filter-codes context inlined))
+        (strip-clause-filters context inlined))
       where-clause)))
 
 (defn optimize

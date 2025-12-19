@@ -1,5 +1,5 @@
 (ns fluree.db.query.inline-filter-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.optimize :as opt]))
 
@@ -66,8 +66,8 @@
 (deftest graph-skips-virtual
   (testing "virtual graphs never receive pushed filters"
     (let [inner-clause     [(vector (where/unmatched-var '?a)
-                                     (where/unmatched-var '?p)
-                                     (where/unmatched-var '?b))]
+                                    (where/unmatched-var '?p)
+                                    (where/unmatched-var '?b))]
           virtual-graph    (where/->pattern :graph ["##vector-index" inner-clause])
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
@@ -80,8 +80,8 @@
 (deftest graph-pushes-when-bound
   (testing "regular graphs receive pushed filters when inner binds all vars"
     (let [inner-clause     [(vector (where/unmatched-var '?a)
-                                     (where/unmatched-var '?p)
-                                     (where/unmatched-var '?b))]
+                                    (where/unmatched-var '?p)
+                                    (where/unmatched-var '?b))]
           graph-pattern    (where/->pattern :graph ["g" inner-clause])
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
@@ -95,8 +95,8 @@
 (deftest optional-keeps-filters
   (testing "optionals never receive pushed filters"
     (let [inner-clause       [(vector (where/unmatched-var '?a)
-                                       (where/unmatched-var '?p)
-                                       (where/unmatched-var '?b))]
+                                      (where/unmatched-var '?p)
+                                      (where/unmatched-var '?b))]
           optional-pattern   (where/->pattern :optional inner-clause)
           filter-descriptor  (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
@@ -127,17 +127,17 @@
 (deftest nested-union-pushes-recursively
   (testing "filters propagate through nested unions when all paths bind"
     (let [inner-branch-1 [(vector (where/unmatched-var '?a)
-                                   (where/unmatched-var '?p)
-                                   (where/unmatched-var '?o))
-                           (vector (where/unmatched-var '?s)
-                                   (where/unmatched-var '?p2)
-                                   (where/unmatched-var '?b))]
+                                  (where/unmatched-var '?p)
+                                  (where/unmatched-var '?o))
+                          (vector (where/unmatched-var '?s)
+                                  (where/unmatched-var '?p2)
+                                  (where/unmatched-var '?b))]
           inner-branch-2 [(vector (where/unmatched-var '?a)
-                                   (where/unmatched-var '?p)
-                                   (where/unmatched-var '?o2))
-                           (vector (where/unmatched-var '?s2)
-                                   (where/unmatched-var '?p2)
-                                   (where/unmatched-var '?b))]
+                                  (where/unmatched-var '?p)
+                                  (where/unmatched-var '?o2))
+                          (vector (where/unmatched-var '?s2)
+                                  (where/unmatched-var '?p2)
+                                  (where/unmatched-var '?b))]
           inner-union        (where/->pattern :union [inner-branch-1 inner-branch-2])
           outer-branch-1     [inner-union]
           outer-branch-2     [inner-union]
@@ -157,8 +157,8 @@
 (deftest exists-pushes-when-bound
   (testing ":exists receives pushed filters when inner binds all vars"
     (let [inner-clause      [(vector (where/unmatched-var '?a)
-                                      (where/unmatched-var '?p)
-                                      (where/unmatched-var '?b))]
+                                     (where/unmatched-var '?p)
+                                     (where/unmatched-var '?b))]
           exists-pattern    (where/->pattern :exists inner-clause)
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
@@ -172,8 +172,8 @@
 (deftest not-exists-pushes-when-bound
   (testing ":not-exists receives pushed filters when inner binds all vars"
     (let [inner-clause      [(vector (where/unmatched-var '?a)
-                                      (where/unmatched-var '?p)
-                                      (where/unmatched-var '?b))]
+                                     (where/unmatched-var '?p)
+                                     (where/unmatched-var '?b))]
           not-exists-pattern (where/->pattern :not-exists inner-clause)
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
@@ -187,8 +187,8 @@
 (deftest minus-keeps-when-not-all-bind
   (testing ":minus keeps filter top-level when inner does not bind all vars"
     (let [inner-clause      [(vector (where/unmatched-var '?a)
-                                      (where/unmatched-var '?p)
-                                      (where/unmatched-var '?o))] ;; only binds ?a
+                                     (where/unmatched-var '?p)
+                                     (where/unmatched-var '?o))] ;; only binds ?a
           minus-pattern     (where/->pattern :minus inner-clause)
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
@@ -201,8 +201,8 @@
 (deftest minus-pushes-when-bound
   (testing ":minus receives pushed filters when inner binds all vars"
     (let [inner-clause      [(vector (where/unmatched-var '?a)
-                                      (where/unmatched-var '?p)
-                                      (where/unmatched-var '?b))]
+                                     (where/unmatched-var '?p)
+                                     (where/unmatched-var '?b))]
           minus-pattern     (where/->pattern :minus inner-clause)
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
