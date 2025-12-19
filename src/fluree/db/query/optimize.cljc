@@ -255,12 +255,8 @@
   (mapv (fn [cl] (push-into-inner cl to-push)) branches))
 
 (defn inject-filters-into-pattern
-  "Push eligible filters into nested higher-order patterns when safe. The
-  decision to push considers variables already bound before this pattern
-  (bound-vars) together with variables guaranteed to be bound by the nested
-  clause.
-
-  Returns {:pattern p' :remaining-filters f'}. Optionals are left unchanged."
+  "Push eligible filters into nested higher-order patterns when safe.
+  Returns {:pattern p' :remaining-filters f'}."
   [pattern filter-descriptors bound-vars]
   (let [t (where/pattern-type pattern)]
     (case t
@@ -269,8 +265,8 @@
 
       :graph
       (let [[graph inner] (where/pattern-data pattern)]
-        (if (where/virtual-graph? graph) ; Do not push filters into virtual graphs
-          {:pattern pattern, :remaining-filters filter-descriptors}
+        (if (where/virtual-graph? graph)
+          {:pattern pattern :remaining-filters filter-descriptors}
           (let [[to-push remaining] (->> inner
                                          clause-bindings
                                          (into bound-vars)
@@ -301,11 +297,73 @@
 
       {:pattern pattern :remaining-filters filter-descriptors})))
 
+(declare propagate-filters-into-nested)
+
+(defn propagate-into-pattern
+  "Recursively push eligible filters into nested higher-order patterns beyond a
+  single level. Optionals remain opaque; unions currently use a conservative
+  single-level push (no recursive descent). Returns {:pattern p' :filters f'}."
+  [pattern filters bound]
+  (let [t (where/pattern-type pattern)]
+    (case t
+      :optional
+      {:pattern pattern :filters filters}
+
+      :graph
+      (let [[graph _]  (where/pattern-data pattern)
+            {:keys [pattern remaining-filters]}
+            (inject-filters-into-pattern pattern filters bound)
+            ;; Extract inner* back out for recursion when filters remain
+            [_ inner*] (where/pattern-data pattern)
+            filters'   remaining-filters]
+        (if (seq filters')
+          (let [{:keys [patterns filters]} (propagate-filters-into-nested inner* filters' bound)]
+            {:pattern (where/->pattern t [graph patterns])
+             :filters filters})
+          {:pattern (where/->pattern t [graph inner*])
+           :filters filters'}))
+
+      (:exists :not-exists :minus)
+      (let [{:keys [pattern remaining-filters]}
+            (inject-filters-into-pattern pattern filters bound)
+
+            inner*   (where/pattern-data pattern)
+            filters* remaining-filters]
+        (if (seq filters*)
+          (let [{:keys [patterns filters]}
+                (propagate-filters-into-nested inner* filters* bound)]
+            {:pattern (where/->pattern t patterns)
+             :filters filters})
+          {:pattern (where/->pattern t inner*)
+           :filters filters*}))
+
+      :union
+      (let [branches (where/pattern-data pattern)
+
+            ;; Push eligible filters into union branches using intersection
+            ;; of branch bindings. This yields updated branches (patterns)
+            ;; and remaining filters to attempt recursively.
+            {:keys [pattern remaining-filters]}
+            (inject-filters-into-pattern (where/->pattern :union branches)
+                                         filters
+                                         bound)
+
+            clauses       (where/pattern-data pattern)
+            ;; Recurse into each branch with remaining filters and
+            ;; accumulate any that still cannot be pushed.
+            branch-results (mapv #(propagate-filters-into-nested % remaining-filters bound)
+                                 clauses)
+            branches* (mapv :patterns branch-results)
+            leftovers (into [] (mapcat :filters) branch-results)]
+        {:pattern (where/->pattern :union branches*) :filters leftovers})
+
+      {:pattern pattern :filters filters})))
+
 (defn propagate-filters-into-nested
-  "Walk one level of binding patterns and push any eligible top-level filters
-  into nested higher-order clauses, using the union of variables bound by prior
-  patterns (bound-so-far) and those guaranteed by the nested clause. Returns
-  updated patterns and remaining filters."
+  "Walk binding patterns and push eligible top-level filters into nested
+  higher-order clauses. Recurses into graph/exists/not-exists/minus when
+  pending filters remain; optionals are opaque; unions currently only perform a
+  single-level push. Returns {:patterns [...], :filters [...]}."
   [binding-patterns filter-descriptors bound-vars]
   (loop [remaining binding-patterns
          acc []
@@ -316,8 +374,8 @@
             guaranteed   (pattern-bindings p)
             bound-next   (into bound guaranteed)]
         (if (contains? #{:optional :exists :not-exists :minus :union :graph} t)
-          (let [{:keys [pattern remaining-filters]} (inject-filters-into-pattern p filters bound)]
-            (recur (rest remaining) (conj acc pattern) remaining-filters bound-next))
+          (let [{:keys [pattern filters]} (propagate-into-pattern p filters bound)]
+            (recur (rest remaining) (conj acc pattern) filters bound-next))
           (recur (rest remaining) (conj acc p) filters bound-next)))
       {:patterns acc :filters filters})))
 
