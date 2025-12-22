@@ -43,21 +43,25 @@
 
  :aliases
  {:build
-  {:deps       {io.github.clojure/tools.build {:git/tag "v0.10.5"
-                                               :git/sha "2a21b7a"}
-                slipset/deps-deploy           {:mvn/version "0.2.2"}}
+  {:deps       {io.github.clojure/tools.build  {:git/tag "v0.10.5"
+                                                :git/sha "2a21b7a"}
+                slipset/deps-deploy            {:mvn/version "0.2.2"}
+                ch.qos.logback/logback-classic {:mvn/version "1.5.6"}
+                org.slf4j/slf4j-api            {:mvn/version "2.0.17"}}
    :ns-default build}
 
   :dev
   {:extra-paths ["dev" "dev-resources"]
-   :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.5.0"}
-                 ch.qos.logback/logback-classic {:mvn/version "1.5.6"}
-                 org.slf4j/slf4j-api            {:mvn/version "2.0.17"}
-                 criterium/criterium               {:mvn/version "0.4.6"}
-                 figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
-                 thheller/shadow-cljs              {:mvn/version "2.28.15"}
-                 }
-   :jvm-opts    ["-Dlogback.configurationFile=dev-resources/logback.xml"]}
+
+   :extra-deps {org.clojure/tools.namespace       {:mvn/version "1.5.0"}
+                criterium/criterium               {:mvn/version "0.4.6"}
+                figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
+                thheller/shadow-cljs              {:mvn/version "2.28.15"}
+                ch.qos.logback/logback-classic    {:mvn/version "1.5.6"}
+                org.slf4j/slf4j-api               {:mvn/version "2.0.17"}
+                com.taoensso/trove                {:mvn/version "1.1.0"}
+                com.taoensso/telemere             {:mvn/version "1.2.0"}}
+   :jvm-opts   ["-Dlogback.configurationFile=dev-resources/logback.xml"]}
 
   :cljtest
   {:extra-paths ["test" "dev-resources" "test-resources"]
@@ -67,20 +71,24 @@
                  babashka/fs                             {:mvn/version "0.5.20"}
                  clj-test-containers/clj-test-containers {:mvn/version "0.7.4"}
                  org.testcontainers/testcontainers       {:mvn/version "1.19.3"}
-                 org.testcontainers/localstack           {:mvn/version "1.19.3"}}
+                 org.testcontainers/localstack           {:mvn/version "1.19.3"}
+                 ch.qos.logback/logback-classic          {:mvn/version "1.5.6"}
+                 org.slf4j/slf4j-api                     {:mvn/version "2.0.17"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/skip-meta [:pending :docker]}}
 
   :cljtest-sci
   {:jvm-opts    ["-Dfluree.graalvm.build=true"]
    :extra-paths ["test" "dev-resources" "test-resources"]
-   :extra-deps  {lambdaisland/kaocha                   {:mvn/version "1.91.1392"}
-                 org.clojure/test.check                {:mvn/version "1.1.1"}
-                 com.gfredericks/test.chuck            {:mvn/version "0.2.13"}
-                 babashka/fs                           {:mvn/version "0.5.20"}
+   :extra-deps  {lambdaisland/kaocha                     {:mvn/version "1.91.1392"}
+                 org.clojure/test.check                  {:mvn/version "1.1.1"}
+                 com.gfredericks/test.chuck              {:mvn/version "0.2.13"}
+                 babashka/fs                             {:mvn/version "0.5.20"}
                  clj-test-containers/clj-test-containers {:mvn/version "0.7.4"}
-                 org.testcontainers/testcontainers     {:mvn/version "1.19.3"}
-                 org.testcontainers/localstack         {:mvn/version "1.19.3"}}
+                 org.testcontainers/testcontainers       {:mvn/version "1.19.3"}
+                 org.testcontainers/localstack           {:mvn/version "1.19.3"}
+                 ch.qos.logback/logback-classic          {:mvn/version "1.5.6"}
+                 org.slf4j/slf4j-api                     {:mvn/version "2.0.17"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/focus-meta [:sci]}}
 
@@ -91,7 +99,9 @@
                  babashka/fs                             {:mvn/version "0.5.20"}
                  clj-test-containers/clj-test-containers {:mvn/version "0.7.4"}
                  org.testcontainers/testcontainers       {:mvn/version "1.19.3"}
-                 org.testcontainers/localstack           {:mvn/version "1.19.3"}}
+                 org.testcontainers/localstack           {:mvn/version "1.19.3"}
+                 ch.qos.logback/logback-classic          {:mvn/version "1.5.6"}
+                 org.slf4j/slf4j-api                     {:mvn/version "2.0.17"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/focus-meta [:pending]}}
 
@@ -103,12 +113,16 @@
                  babashka/fs                             {:mvn/version "0.5.20"}
                  clj-test-containers/clj-test-containers {:mvn/version "0.7.4"}
                  org.testcontainers/testcontainers       {:mvn/version "1.19.3"}
-                 org.testcontainers/localstack           {:mvn/version "1.19.3"}}
+                 org.testcontainers/localstack           {:mvn/version "1.19.3"}
+                 ch.qos.logback/logback-classic          {:mvn/version "1.5.6"}
+                 org.slf4j/slf4j-api                     {:mvn/version "2.0.17"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/focus-meta [:docker]}}
 
   :cljstest
-  {:extra-paths ["test" "dev-resources"]}
+  {:extra-paths ["test" "dev-resources"]
+   :extra-deps  {ch.qos.logback/logback-classic {:mvn/version "1.5.6"}
+                 org.slf4j/slf4j-api            {:mvn/version "2.0.17"}}}
 
   :js-deps
   {:extra-deps {com.timetraveltoaster/target-bundle-libs {:mvn/version "RELEASE"}}
@@ -154,5 +168,7 @@
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}
 
   :graalvm
-  {:extra-deps  {com.github.clj-easy/graal-build-time {:mvn/version "1.0.5"}}
+  {:extra-deps  {com.github.clj-easy/graal-build-time {:mvn/version "1.0.5"}
+                 ch.qos.logback/logback-classic       {:mvn/version "1.5.6"}
+                 org.slf4j/slf4j-api                  {:mvn/version "2.0.17"}}
    :extra-paths ["graalvm"]}}}

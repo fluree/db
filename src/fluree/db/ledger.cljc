@@ -20,6 +20,7 @@
             [fluree.db.util.context :as context]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
+            [fluree.db.util.trace :as trace]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -508,19 +509,20 @@
    Uses atomic publish-commit to update only commit fields, avoiding
    overwriting index data that may have been updated by a separate indexer."
   [{:keys [primary-publisher secondary-publishers] :as _ledger} commit-jsonld]
-  (go-try
-    (let [ledger-alias   (get commit-jsonld "alias")
-          commit-address (get commit-jsonld "address")
-          commit-t       (get-in commit-jsonld ["data" "t"])
-          _              (log/debug "publish-commit using atomic update"
-                                    {:alias ledger-alias :commit-t commit-t})
-          result         (<? (nameservice/publish-commit primary-publisher
-                                                         ledger-alias
-                                                         commit-address
-                                                         commit-t))]
-      (when-let [secondaries (seq secondary-publishers)]
-        (nameservice/publish-commit-to-all ledger-alias commit-address commit-t secondaries))
-      result)))
+  (trace/form ::publish-commit {}
+    (go-try
+      (let [ledger-alias   (get commit-jsonld "alias")
+            commit-address (get commit-jsonld "address")
+            commit-t       (get-in commit-jsonld ["data" "t"])
+            _              (log/debug "publish-commit using atomic update"
+                                      {:alias ledger-alias :commit-t commit-t})
+            result         (<? (nameservice/publish-commit primary-publisher
+                                                           ledger-alias
+                                                           commit-address
+                                                           commit-t))]
+        (when-let [secondaries (seq secondary-publishers)]
+          (nameservice/publish-commit-to-all ledger-alias commit-address commit-t secondaries))
+        result))))
 
 (defn formalize-commit
   [{prev-commit :commit :as staged-db} new-commit]
@@ -546,77 +548,78 @@
     {:keys [branch t stats commit] :as staged-db}
     opts]
    (log/debug "commit!: write-transaction start" {:ledger ledger-alias})
-   (go-try
-     (let [{:keys [commit-catalog]} ledger
-           ledger-name (util.ledger/ledger-base-name ledger-alias)
+   (trace/form ::commit! {:t t}
+     (go-try
+       (let [{:keys [commit-catalog]} ledger
+             ledger-name (util.ledger/ledger-base-name ledger-alias)
 
-           {:keys [tag time message did private commit-data-opts index-files-ch]
-            :or   {time (util/current-time-iso)}}
-           (parse-commit-opts ledger opts)
+             {:keys [tag time message did private commit-data-opts index-files-ch]
+              :or   {time (util/current-time-iso)}}
+             (parse-commit-opts ledger opts)
 
-           {:keys [db-jsonld staged-txn]}
-           (commit-data/db->jsonld staged-db commit-data-opts)
+             {:keys [db-jsonld staged-txn]}
+             (commit-data/db->jsonld staged-db commit-data-opts)
 
-           {:keys [txn-id author annotation]}
-           (<? (write-transaction! ledger ledger-name staged-txn))
+             {:keys [txn-id author annotation]}
+             (<? (write-transaction! ledger ledger-name staged-txn))
 
-           _ (log/debug "commit!: write-jsonld(db) start" {:ledger ledger-alias})
+             _ (log/debug "commit!: write-jsonld(db) start" {:ledger ledger-alias})
 
-           data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-name db-jsonld))
+             data-write-result (<? (commit-storage/write-jsonld commit-catalog ledger-name db-jsonld))
 
-           _ (log/debug "commit!: write-jsonld(db) done" {:ledger ledger-alias :db-address (:address data-write-result)})
-           db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
-           dbid              (commit-data/hash->db-id (:hash data-write-result))
-           keypair           {:did did, :private private}
+             _ (log/debug "commit!: write-jsonld(db) done" {:ledger ledger-alias :db-address (:address data-write-result)})
+             db-address        (:address data-write-result) ; may not have address (e.g. IPFS) until after writing file
+             dbid              (commit-data/hash->db-id (:hash data-write-result))
+             keypair           {:did did, :private private}
 
-           new-commit (commit-data/new-db-commit-map {:old-commit commit
-                                                      :issuer     did
-                                                      :message    message
-                                                      :tag        tag
-                                                      :dbid       dbid
-                                                      :t          t
-                                                      :time       time
-                                                      :db-address db-address
-                                                      :author     author
-                                                      :annotation annotation
-                                                      :txn-id     txn-id
-                                                      :flakes     (:flakes stats)
-                                                      :size       (:size stats)})
+             new-commit (commit-data/new-db-commit-map {:old-commit commit
+                                                        :issuer     did
+                                                        :message    message
+                                                        :tag        tag
+                                                        :dbid       dbid
+                                                        :t          t
+                                                        :time       time
+                                                        :db-address db-address
+                                                        :author     author
+                                                        :annotation annotation
+                                                        :txn-id     txn-id
+                                                        :flakes     (:flakes stats)
+                                                        :size       (:size stats)})
 
-           _ (log/debug "commit!: write-commit start" {:ledger ledger-alias})
+             _ (log/debug "commit!: write-commit start" {:ledger ledger-alias})
 
-           {:keys [commit-map commit-jsonld write-result]}
-           (<? (write-commit commit-catalog ledger-name keypair new-commit))
+             {:keys [commit-map commit-jsonld write-result]}
+             (<? (write-commit commit-catalog ledger-name keypair new-commit))
 
-           _ (log/debug "commit!: write-commit done" {:ledger ledger-alias :commit-address (:address write-result)})
+             _ (log/debug "commit!: write-commit done" {:ledger ledger-alias :commit-address (:address write-result)})
 
-           db  (formalize-commit staged-db commit-map)
+             db  (formalize-commit staged-db commit-map)
 
-           _ (log/debug "commit!: ledger/update-commit! start" {:ledger ledger-alias :t t})
+             _ (log/debug "commit!: ledger/update-commit! start" {:ledger ledger-alias :t t})
 
-           db* (update-commit! ledger branch db index-files-ch)]
+             db* (update-commit! ledger branch db index-files-ch)]
 
-       (log/debug "commit!: ledger/update-commit! done, publish-commit start" {:ledger ledger-alias :t t :at time})
+         (log/debug "commit!: ledger/update-commit! done, publish-commit start" {:ledger ledger-alias :t t :at time})
 
-       (<? (publish-commit ledger commit-jsonld))
+         (<? (publish-commit ledger commit-jsonld))
 
-       (log/debug "commit!: publish-commit done" {:ledger ledger-alias})
+         (log/debug "commit!: publish-commit done" {:ledger ledger-alias})
 
-       (if (track/track-txn? opts)
-         (let [index-t (commit-data/index-t commit-map)
-               novelty-size (get-in db* [:novelty :size] 0)
-               ;; Always read threshold from realized FlakeDB; db* may be AsyncDB
-               reindex-min-bytes (or (:reindex-min-bytes db) 1000000)]
-           (-> write-result
-               (select-keys [:address :hash :size])
-               (assoc :ledger-id ledger-alias
-                      :t t
-                      :db db*
-                      :indexing-needed (indexing-needed? novelty-size reindex-min-bytes)
-                      :index-t index-t
-                      :indexing-enabled (indexing-enabled? ledger branch)
-                      :novelty-size novelty-size)))
-         db*)))))
+         (if (track/track-txn? opts)
+           (let [index-t (commit-data/index-t commit-map)
+                 novelty-size (get-in db* [:novelty :size] 0)
+                           ;; Always read threshold from realized FlakeDB; db* may be AsyncDB
+                 reindex-min-bytes (or (:reindex-min-bytes db) 1000000)]
+             (-> write-result
+                 (select-keys [:address :hash :size])
+                 (assoc :ledger-id ledger-alias
+                        :t t
+                        :db db*
+                        :indexing-needed (indexing-needed? novelty-size reindex-min-bytes)
+                        :index-t index-t
+                        :indexing-enabled (indexing-enabled? ledger branch)
+                        :novelty-size novelty-size)))
+           db*))))))
 
 (defn transact!
   [ledger parsed-txn]

@@ -11,6 +11,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.ledger :as util.ledger]
+            [fluree.db.util.trace :as trace]
             [fluree.json-ld :as json-ld]))
 
 (defn prep-opts
@@ -50,19 +51,20 @@
 
 (defn transact!
   [conn ledger-id parsed-txn]
-  (go-try
-    (if ledger-id
-      (let [ledger (async/<! (connection/load-ledger conn ledger-id))]
-        (if (util/exception? ledger)
-          (if (not-found? ledger)
-            (throw (ex-info (str "Ledger " ledger-id " does not exist")
-                            {:status 409 :error :db/ledger-not-exists}
-                            ledger))
-            (throw ledger))
-          (<? (ledger/transact! ledger parsed-txn))))
-      (throw (ex-info "Missing ledger specification."
-                      {:ledger-id ledger-id
-                       :status 400})))))
+  (trace/form ::transact! {:ledger-alias ledger-id}
+    (go-try
+      (if ledger-id
+        (let [ledger (async/<! (connection/load-ledger conn ledger-id))]
+          (if (util/exception? ledger)
+            (if (not-found? ledger)
+              (throw (ex-info (str "Ledger " ledger-id " does not exist")
+                              {:status 409 :error :db/ledger-not-exists}
+                              ledger))
+              (throw ledger))
+            (<? (ledger/transact! ledger parsed-txn))))
+        (throw (ex-info "Missing ledger specification."
+                        {:ledger-id ledger-id
+                         :status 400}))))))
 
 (defn insert!
   [conn ledger-id txn override-opts]

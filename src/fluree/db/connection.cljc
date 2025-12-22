@@ -15,6 +15,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.trace :as trace]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.io Writer))))
 
@@ -488,34 +489,36 @@
 (defn load-ledger*
   [{:keys [commit-catalog index-catalog primary-publisher secondary-publishers] :as conn}
    ledger-chan address]
-  (go-try
-    (if-let [ns-record (<? (lookup-commit conn address))]
-      (let [{:keys [commit-address index-address]} (ledger/expand-and-extract-ns ns-record)
+  (trace/form ::ledger-load-cold {:ledger-address address}
+    (go-try
+      (if-let [ns-record (<? (lookup-commit conn address))]
+        (let [{:keys [commit-address index-address]} (ledger/expand-and-extract-ns ns-record)
 
-            ;; Load full commit from disk
-            _              (log/debug "Attempting to load from address:" address)
-            commit         (<? (commit-storage/load-commit-with-metadata commit-catalog
-                                                                         commit-address
-                                                                         index-address))
-            expanded-commit (json-ld/expand commit)
-            combined-alias  (commit->ledger-alias conn address expanded-commit)
+              ;; Load full commit from disk
+              _              (log/debug "Attempting to load from address:" address)
+              commit         (<? (commit-storage/load-commit-with-metadata commit-catalog
+                                                                           commit-address
+                                                                           index-address))
+              expanded-commit (json-ld/expand commit)
+              combined-alias  (commit->ledger-alias conn address expanded-commit)
 
-            {:keys [did indexing]} (parse-ledger-options conn {})
-            ledger (ledger/instantiate combined-alias address commit-catalog index-catalog
-                                       primary-publisher secondary-publishers indexing did expanded-commit)]
-        (subscribe-ledger conn combined-alias)
-        (async/put! ledger-chan ledger)
-        ledger)
-      (throw (ex-info (str "Unable to load. No record of ledger at address: " address " exists.")
-                      {:status 404, :error :db/unkown-address})))))
+              {:keys [did indexing]} (parse-ledger-options conn {})
+              ledger (ledger/instantiate combined-alias address commit-catalog index-catalog
+                                         primary-publisher secondary-publishers indexing did expanded-commit)]
+          (subscribe-ledger conn combined-alias)
+          (async/put! ledger-chan ledger)
+          ledger)
+        (throw (ex-info (str "Unable to load. No record of ledger at address: " address " exists.")
+                        {:status 404, :error :db/unkown-address}))))))
 
 (defn load-ledger-address
   [conn address]
-  (let [alias (storage/get-local-path address)
-        [cached? ledger-chan] (register-ledger conn alias)]
-    (if cached?
-      ledger-chan
-      (load-ledger* conn ledger-chan address))))
+  (trace/form ::load-ledger-address {:ledger-address address}
+    (let [alias (storage/get-local-path address)
+          [cached? ledger-chan] (register-ledger conn alias)]
+      (if cached?
+        ledger-chan
+        (load-ledger* conn ledger-chan address)))))
 
 (defn try-load-address
   [conn ledger-chan alias addr]
