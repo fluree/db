@@ -1,8 +1,7 @@
 (ns fluree.db.util.log
   (:require #?@(:clj  [[clojure.core.async :as async]
                        [clojure.tools.logging.readable :as log] ; readable variants use pr-str automatically
-                       [fluree.db.util :refer [if-cljs]]
-                       [steffan-westcott.clj-otel.api.trace.span :as span]]
+                       [fluree.db.util :refer [if-cljs]]]
                 :cljs [[goog.log :as glog]]))
   #?(:cljs (:require-macros [fluree.db.util.log :refer
                              [debug->val debug->>val debug-async->vals
@@ -125,46 +124,3 @@
      them."
      [msg c]
      `(debug-async->vals ~c ~msg)))
-
-#?(:clj
-   (defmacro error!
-     [id err data]
-     `(span/add-span-data! (assoc ~data :id ~id :level :error :error ~err))))
-
-#?(:clj
-   (defmacro warn!
-     [id data]
-     `(span/add-span-data! (assoc ~data :id ~id :level :warn))))
-
-#?(:clj
-   (defmacro info!
-     [id data & forms]
-     `(span/with-span! {:name ~id :attributes ~data}
-        ~@forms)))
-
-#?(:clj
-   (defmacro debug!
-     [id data & forms]
-     `(span/with-span! {:name ~id :attributes ~data}
-        ~@forms)))
-
-#?(:clj
-   (defmacro xf-debug!
-     "Logs the first time a transducer receives a value."
-     [id data]
-     `(fn [rf#]
-        (let [logged?# (volatile! false)]
-          (fn
-            ([] (rf#))
-            ([result# x#]
-             (when-not @logged?#
-               (debug! ~id ~data)
-               (vreset! logged?# true))
-             (rf# result# x#))
-            ([result#] (rf# result#)))))))
-
-#?(:clj
-   (defmacro trace!
-     [id data & forms]
-     `(span/with-span! {:name ~id :attributes ~data}
-        ~@forms)))

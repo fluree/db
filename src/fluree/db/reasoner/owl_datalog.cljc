@@ -1211,8 +1211,6 @@
           transitive-property?
           (to-datalog ::prp-trp inserts owl-statement))))
     (catch* e
-      (log/error! ::owl-processing-error e {:msg (str "Error processing OWL statement: " owl-statement " - skipping!")
-                                            :owl-statement owl-statement})
       (log/error e (str "Error processing OWL statement: " owl-statement " - skipping!"))
       [])))
 

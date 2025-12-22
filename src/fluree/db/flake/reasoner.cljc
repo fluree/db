@@ -185,7 +185,6 @@
           parsed-rule-graphs    (try*
                                   (map parse-rules-graph rule-graphs)
                                   (catch* e
-                                    (log/error! ::rule-parsing-error e {:msg "Error parsing supplied rules graph"})
                                     (log/error e "Error parsing supplied rules graph:")
                                     (throw e)))
           all-rules-from-graphs (mapcat (fn [method]

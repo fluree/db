@@ -35,7 +35,6 @@
        (go
          (let [res (<! port)]
            (when (util/exception? res)
-             (log/error! ::result-error res {})
              (log/error res))
            (deliver p res)))
        p)

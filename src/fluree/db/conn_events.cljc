@@ -24,12 +24,6 @@
       (#?(:clj future :cljs do)
         (try* (f event-type event-data)
               (catch* e
-                (log/error! ::ws-callback-error e {:msg      (str "Error calling registered callback: " (pr-str k) " for db: " subject
-                                                                  ". Event: " event-type " Data: " (pr-str event-data) ".")
-                                                   :subject  subject
-                                                   :callback k
-                                                   :event    event-type
-                                                   :data     event-data})
                 (log/error e
                            (str "Error calling registered callback: " (pr-str k) " for db: " subject
                                 ". Event: " event-type " Data: " (pr-str event-data) "."))))))))
@@ -68,6 +62,4 @@
         ;; else
         (process-event conn event-type subject event-data)))
     (catch* e
-      (log/error! ::event-processing-error e {:msg "Failed to process-event"
-                                              :payload msg})
       (log/error e))))

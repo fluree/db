@@ -322,7 +322,6 @@
                 (update-node-id node* write-response))))
 
         (catch* e
-          (log/error! ::write-novel-node e {:msg "Error writing novel index node" :node display-node})
           (log/error e
                      "Error writing novel index node:" display-node)
           (async/>! error-ch e))))))
@@ -550,7 +549,6 @@
             error-ch   (async/chan)
             refresh-ch (refresh-all db changes-ch error-ch)]
         (log/info "Refreshing Index:" init-stats)
-        (log/info! ::index-start init-stats)
         (async/alt!
           error-ch
           ([e]
@@ -603,7 +601,6 @@
                                       :duration duration
                                       :address (:address db-root-res)
                                       :garbage (:address garbage-res))]
-             (log/info! ::index-complete {:ledger-alias alias :root index-address :garbage (:address garbage-res)})
              (log/info "Index refresh complete:" end-stats)
              ;; kick off automatic garbage collection in the background
              (garbage/clean-garbage indexed-db max-old-indexes)

@@ -101,8 +101,6 @@
                                                   :bigdecimals true}))]
                 (json/read-value json-str mapper))
               (catch Exception e
-                (log/error! ::json-parse-error e {:msg "Exception JSON-parsing"
-                                                  :x x})
                 (log/error e (str "Exception JSON-parsing: " x))
                 (throw e)))
       :cljs (-> (if (string? x)

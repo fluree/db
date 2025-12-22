@@ -16,7 +16,6 @@
                                           (>! ch solution))
                                         (async/close! ch)
                                         (catch* e
-                                          (log/error! ::having-error e {:msg "Error applying having function"})
                                           (log/error e "Error applying having function")
                                           (>! error-ch e)))))
                             solution-ch)

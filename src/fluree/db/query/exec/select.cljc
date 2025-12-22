@@ -67,9 +67,6 @@
     [_ _ _ _ _ _ error-ch solution]
     (go (try* (:value (agg-fn solution))
               (catch* e
-                (log/error! ::aggregate-formatting-error e {:msg "Error applying aggregate selector"
-                                                            :solution solution-value
-                                                            :agg-fn (meta agg-fn)})
                 (log/error e "Error applying aggregate selector")
                 (>! error-ch e))))))
 

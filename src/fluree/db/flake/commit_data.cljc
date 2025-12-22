@@ -385,9 +385,6 @@
                                           :cljs flake-size))
            (update-in [:stats :flakes] + flake-count)))
      (catch* e
-       (log/error! ::update-novelty-error e {:message (str "Novelty update failed: " (ex-message e))
-                                             :add-flakes add
-                                             :rem-flakes rem})
        (log/error (str "Update novelty unexpected error while attempting to updated db: "
                        (pr-str db) " due to exception: " (ex-message e))
                   {:add-flakes add

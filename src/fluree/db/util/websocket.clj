@@ -62,7 +62,6 @@
           (.request ^WebSocket websocket 1)
           nil
           (catch* e
-            (log/error! ::ws-on-text-error e {:msg "Error processing WebSocket text message"})
             (log/error e "Error processing WebSocket text message")
             nil)))
 
@@ -91,7 +90,6 @@
         nil)
 
       (onError [_ websocket error]
-        (log/error! ::ws-error error {:msg "WebSocket error"})
         (log/error error "WebSocket error")
         (when on-error
           (on-error websocket error))
@@ -211,7 +209,6 @@
           (try*
             (send-ping! ws (java.nio.ByteBuffer/allocate 0))
             (catch* e
-              (log/error! ::ws-send-ping-error e {:msg "Error sending ping"})
               (log/error e "Error sending ping")))
           (recur))
 
@@ -224,8 +221,6 @@
               (async/put! resp-chan true)
               (async/close! resp-chan))
             (catch* e
-              (log/error! ::ws-send-msg-error e {:msg "Error sending websocket message:"
-                                                 :payload msg})
               (log/error e "Error sending websocket message:" msg)
               (when resp-chan
                 (async/put! resp-chan false)

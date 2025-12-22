@@ -31,9 +31,6 @@
   (fn [_ _db _iri-cache _context compact _tracker error-ch solution]
     (go (try* (-> solution (get var) (display compact))
               (catch* e
-                (log/error! ::var-formatting-error e {:msg "Error formatting variable:"
-                                                      :var var
-                                                      :solution solution})
                 (log/error e "Error formatting variable:" var)
                 (>! error-ch e))))))
 
@@ -48,8 +45,6 @@
             (recur vars (assoc result var output)))
           result))
       (catch* e
-        (log/error! ::wildcard-formatting-error e {:msg "Error formatting wildcard"
-                                                   :solution solution})
         (log/error e "Error formatting wildcard")
         (>! error-ch e)))))
 

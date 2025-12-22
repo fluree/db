@@ -57,7 +57,6 @@
              (vg-parse/process-dense-results db solution search-params)
              (async/onto-chan! out-ch)))
       (catch* e
-        (log/error! ::vector-ranking-error e {:msg "Error ranking vectors"})
         (log/error e "Error ranking vectors")
         (>! error-ch e)))))
 

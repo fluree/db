@@ -88,8 +88,7 @@
     (if (nat-int? max-indexes)
       (let [all-garbage (<! (trace-idx-roots index-catalog index-address))
             to-clean    (if (util/exception? all-garbage)
-                          (do (log/error! ::garbage-tracing-error all-garbage {:index-address index-address})
-                              (log/error all-garbage "Garbage collection error, unable to trace index roots with error:" (ex-message all-garbage)))
+                          (log/error all-garbage "Garbage collection error, unable to trace index roots with error:" (ex-message all-garbage))
                           (->> all-garbage ;; garbage will be in order of newest to oldest
                                (drop max-indexes)
                                (sort-by :t))) ;; clean oldest 't' value first
@@ -107,12 +106,8 @@
                       (- (util/current-time-millis) start-time) "ms.")
             :done)))
       ;; Unexpected setting. In async chan, don't throw.
-      (do (log/error! ::garbage-invalid-max-indexes nil
-                      {:max-indexes max-indexes
-                       :msg (str "Garbage collection: Setting for max-old-indexes should be >=0, instead received: " max-indexes
-                                 "Unable to garbage collect.")})
-          (log/error (str "Garbage collection: Setting for max-old-indexes should be >=0, instead received: " max-indexes
-                          "Unable to garbage collect."))))))
+      (log/error (str "Garbage collection: Setting for max-old-indexes should be >=0, instead received: " max-indexes
+                      "Unable to garbage collect.")))))
 
 (defn clean-garbage
   "Cleans up garbage data for old indexes, but retains
@@ -125,7 +120,6 @@
   expected timeframe. The frequency of new indexes being created is
   dependent on the frequency and size of updates that is ledger-specific
   against the ledger's 'reindex-min-bytes' setting."
-  [{:keys [index-catalog commit] :as db} max-indexes]
+  [{:keys [index-catalog commit] :as _db} max-indexes]
   (let [index-address (-> commit :index :address)]
-    (log/info! ::clean-garbage {:ledger-alias (:alias db) :max-indexes max-indexes})
     (clean-garbage* index-catalog index-address max-indexes)))

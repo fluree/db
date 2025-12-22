@@ -597,7 +597,6 @@
                                :error       (ex-message res)}
                               (ex-data res)
                               log-context)]
-              (log/warn! ::s3-request-attempting-retry data)
               (log/warn "S3 request retrying" data)
               (<! (async/timeout wait-ms))
               (recur (inc attempt)))
@@ -607,7 +606,6 @@
                                :error (ex-message res)}
                               (ex-data res)
                               log-context)]
-              (log/error! ::s3-request-failed nil data)
               (log/error "S3 request failed permanently" data)
               (>! out res)
               (async/close! out)))

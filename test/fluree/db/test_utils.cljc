@@ -410,16 +410,3 @@
         ;; Small delay to ensure file handles are released
         (<! (timeout delay-ms))
         true))))
-
-(defn handler:memory
-  "A taoensso.telemere logging handler that stores all the logs it receives in memory."
-  ([] (handler:memory {:store (atom [])}))
-  ([{:keys [store]}]
-   (fn a-handler:memory-handler
-     ([signal] (swap! store conj signal))
-     ([] :closed))))
-
-(defn unwrap-error-signal
-  "Exceptions thrown inside of a trace! are wrapped to provide additional context."
-  [e]
-  (-> e ex-data :taoensso.telemere/signal :error))

@@ -112,8 +112,6 @@
     (let [updated-db (or (use-latest-db db idx-commit branch-state)
                          (try* (dbproto/-index-update db (:index idx-commit))
                                (catch* e
-                                 (log/error! ::new-index-update-error e
-                                             {:msg "Exception updating db with new index, attempting full reload"})
                                  (log/error e "Exception updating db with new index, attempting full reload. Exception:" (ex-message e))
                                  (reload-with-index db (:index idx-commit)))))]
       updated-db)
@@ -143,7 +141,6 @@
                                (nameservice/publish-index-to-all ledger-alias index-address index-t secondaries))))
                          {:status :success, :db indexed-db, :commit indexed-commit})
                        (catch* e
-                         (log/error! ::index-update-error e {:msg "Error updating index"})
                          (log/error e "Error updating index")
                          {:status :error, :error e}))]
           (when complete-ch

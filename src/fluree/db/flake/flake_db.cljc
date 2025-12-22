@@ -566,7 +566,6 @@
       (let [commit-data (<? (commit-storage/read-data-jsonld commit-storage db-address))]
         [commit-jsonld commit-data])
       (catch* e
-        (log/error! ::commit-data-read e {:address db-address :msg "Error reading commit data"})
         (log/error e "Error reading commit data")
         (>! error-ch e)))))
 
@@ -591,7 +590,6 @@
     (try*
       (<? (transact/-merge-commit db commit-jsonld db-data-jsonld))
       (catch* e
-        (log/error! ::merge-novelty-commit e {:msg "Error merging novelty commit"})
         (log/error e "Error merging novelty commit")
         (>! error-ch e)))))
 

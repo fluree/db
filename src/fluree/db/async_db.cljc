@@ -60,7 +60,6 @@
                 (where/-match-id tracker solution s-match error-ch)
                 (async/pipe match-ch)))
           (catch* e
-            (log/error! ::match-id-error e {:msg "Error loading database"})
             (log/error e "Error loading database")
             (>! error-ch e))))
       match-ch))
@@ -74,7 +73,6 @@
                 (where/-match-triple tracker solution triple error-ch)
                 (async/pipe match-ch)))
           (catch* e
-            (log/error! ::match-triple-error e {:msg "Error loading database"})
             (log/error e "Error loading database")
             (>! error-ch e))))
       match-ch))
@@ -88,7 +86,6 @@
                 (where/-match-class tracker solution triple error-ch)
                 (async/pipe match-ch)))
           (catch* e
-            (log/error! ::match-class-error e {:msg "Error loading database"})
             (log/error e "Error loading database")
             (>! error-ch e))))
       match-ch))
@@ -114,7 +111,6 @@
                 (subject/-forward-properties iri select-spec context compact-fn cache tracker error-ch)
                 (async/pipe prop-ch)))
           (catch* e
-            (log/error! ::forward-properties-error e {:msg "Error loading database"})
             (log/error e "Error loading database")
             (>! error-ch e))))
       prop-ch))
@@ -128,7 +124,6 @@
                 (subject/-reverse-property iri reverse-spec context tracker error-ch)
                 (async/pipe prop-ch)))
           (catch* e
-            (log/error! ::reverse-properties-error e {:msg "Error loading database"})
             (log/error e "Error loading database")
             (>! error-ch e))))
       prop-ch))
@@ -177,7 +172,6 @@
             (async/put! db-chan-at-t
                         (time-travel/-as-of db t)))
           (catch* e
-            (log/error! ::as-of-error e {:msg "Error in time-traveling database"})
             (log/error e "Error in time-traveling database")
             (async/put! db-chan-at-t e))))
       db-at-t))
@@ -197,7 +191,6 @@
                 (history/-commits context tracker from-t to-t include error-ch)
                 (async/pipe commit-ch)))
           (catch* e
-            (log/error! ::commits-error e {:msg "Error loading database for commit range"})
             (log/error e "Error loading database for commit range")
             (>! error-ch e))))
       commit-ch))
@@ -219,7 +212,6 @@
           (let [db (<? db-chan)]
             (async/put! root-ch (policy/root db)))
           (catch* e
-            (log/error! ::root-error e {:msg "Error loading db while setting root policy"})
             (log/error e "Error loading db while setting root policy")
             (async/put! root-ch e))))
       root-db))
@@ -279,16 +271,6 @@
   loaded db to the async-db."
   [ledger-alias commit-map t]
   (when-not (:alias commit-map)
-    (log/error! ::missing-alias nil
-                {:msg "Creating AsyncDB with commit missing :alias field!"
-                 :ledger-alias ledger-alias
-                 :commit-id (:id commit-map)
-                 :commit-keys (keys commit-map)
-                 :stack-trace (try
-                                (throw (ex-info "Stack trace capture" {}))
-                                (catch #?(:clj Exception :cljs js/Error) e
-                                  #?(:clj (.getStackTrace e)
-                                     :cljs (.-stack e))))})
     (log/error "Creating AsyncDB with commit missing :alias field!"
                {:ledger-alias ledger-alias
                 :commit-id (:id commit-map)

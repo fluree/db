@@ -514,8 +514,6 @@
                idx*        (or idx
                                (try* (index/for-components s p o o-dt)
                                      (catch* e
-                                       (log/error! ::resolve-flake-range-error e {:msg "Error determining index for range"
-                                                                                  :pattern [s p o o-dt]})
                                        (log/error e "Error resolving flake range")
                                        (async/put! error-ch e))))
                [o* o-fn*]  (augment-object-fn db idx* s p o o-fn)
@@ -705,8 +703,6 @@
           (-> (match-clause graph tracker solution clause error-ch)
               (async/pipe res-ch)))
         (catch* e
-          (log/error! ::match-alias-error e {:msg "Error activating alias"
-                                             :ledger-alias alias})
           (log/error e "Error activating alias" alias)
           (>! error-ch (ex-info (str "Error activating alias: " alias
                                      " due to exception: " (ex-message e))
@@ -935,10 +931,6 @@
 
 (defn sparql-service-error!
   [ex service sparql-q]
-  (log/warn! ::sparql-service-error {:msg "Error processing service response "
-                                     :service service
-                                     :sparql-query sparql-q
-                                     :error ex})
   (log/error ex "Error processing service response " service sparql-q)
   (ex-info (str "Error processing service response " service " due to exception: " (ex-message ex))
            {:status 400, :error :db/invalid-query}
