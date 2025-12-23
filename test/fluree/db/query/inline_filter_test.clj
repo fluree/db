@@ -35,7 +35,7 @@
           union-pattern     (where/->pattern :union [branch-a-binds-a-and-b branch-b-binds-a-and-b])
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
-          (opt/push-into-pattern union-pattern [filter-descriptor] #{})
+          (opt/append-pattern-filters union-pattern [filter-descriptor] #{})
           updated-branches (where/pattern-data pattern)]
       (is (empty? remaining-filters)
           "no filters remain at top level after push")
@@ -57,7 +57,7 @@
           union-pattern          (where/->pattern :union [branch-binds-a-and-b branch-binds-a-only])
           filter-descriptor      (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
-          (opt/push-into-pattern union-pattern [filter-descriptor] #{})]
+          (opt/append-pattern-filters union-pattern [filter-descriptor] #{})]
       (is (= 1 (count remaining-filters))
           "one filter remains because not all branches bind ?b")
       (is (= union-pattern pattern)
@@ -71,7 +71,7 @@
           virtual-graph    (where/->pattern :graph ["##vector-index" inner-clause])
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
-          (opt/push-into-pattern virtual-graph [filter-descriptor] #{})]
+          (opt/append-pattern-filters virtual-graph [filter-descriptor] #{})]
       (is (= 1 (count remaining-filters))
           "filter remains because graph is virtual")
       (is (= virtual-graph pattern)
@@ -85,7 +85,7 @@
           graph-pattern    (where/->pattern :graph ["g" inner-clause])
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
-          (opt/push-into-pattern graph-pattern [filter-descriptor] #{})
+          (opt/append-pattern-filters graph-pattern [filter-descriptor] #{})
           [_ updated-inner] (where/pattern-data pattern)]
       (is (empty? remaining-filters)
           "no filters remain at top level after push")
@@ -100,7 +100,7 @@
           optional-pattern   (where/->pattern :optional inner-clause)
           filter-descriptor  (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
-          (opt/push-into-pattern optional-pattern [filter-descriptor] #{})]
+          (opt/append-pattern-filters optional-pattern [filter-descriptor] #{})]
       (is (= 1 (count remaining-filters))
           "filter remains at top level for optionals")
       (is (= optional-pattern pattern)
@@ -144,7 +144,7 @@
           outer-union        (where/->pattern :union [outer-branch-1 outer-branch-2])
           filter-descriptor  (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [patterns filters]}
-          (opt/push-filters [outer-union] [filter-descriptor] #{})
+          (opt/nest-filters [outer-union] [filter-descriptor] #{})
           updated-union      (first patterns)
           updated-branches   (where/pattern-data updated-union)]
       (is (empty? filters)
@@ -162,7 +162,7 @@
           exists-pattern    (where/->pattern :exists inner-clause)
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
-          (opt/push-into-pattern exists-pattern [filter-descriptor] #{})
+          (opt/append-pattern-filters exists-pattern [filter-descriptor] #{})
           updated-inner     (where/pattern-data pattern)]
       (is (empty? remaining-filters)
           "no filters remain at top level after push into exists")
@@ -177,7 +177,7 @@
           not-exists-pattern (where/->pattern :not-exists inner-clause)
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
-          (opt/push-into-pattern not-exists-pattern [filter-descriptor] #{})
+          (opt/append-pattern-filters not-exists-pattern [filter-descriptor] #{})
           updated-inner     (where/pattern-data pattern)]
       (is (empty? remaining-filters)
           "no filters remain after push into not-exists")
@@ -192,7 +192,7 @@
           minus-pattern     (where/->pattern :minus inner-clause)
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
-          (opt/push-into-pattern minus-pattern [filter-descriptor] #{})]
+          (opt/append-pattern-filters minus-pattern [filter-descriptor] #{})]
       (is (= 1 (count remaining-filters))
           "filter remains top-level when :minus inner doesn't bind all vars")
       (is (= minus-pattern pattern)
@@ -206,7 +206,7 @@
           minus-pattern     (where/->pattern :minus inner-clause)
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
-          (opt/push-into-pattern minus-pattern [filter-descriptor] #{})
+          (opt/append-pattern-filters minus-pattern [filter-descriptor] #{})
           updated-inner     (where/pattern-data pattern)]
       (is (empty? remaining-filters)
           "no filters remain after push into :minus")
