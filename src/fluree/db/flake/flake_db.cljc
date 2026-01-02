@@ -297,8 +297,13 @@
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))
-      (log/debug "Updating db" (str/join "@" [(:alias db) (:t db)])
-                 "to t:" t-new "with new commit:" commit-metadata)
+      (log/trace "Updating db" (str/join "@" [(:alias db) (:t db)])
+                 "to t:" t-new "with new commit:"
+                 (assoc commit-metadata
+                        :index (some-> (:index commit-metadata)
+                                       (select-keys [:id :address :v :data])
+                                       (update :data #(when (map? %)
+                                                        (select-keys % [:t :address :id :v :flakes :size]))))))
       (-> db*
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
