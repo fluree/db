@@ -69,9 +69,7 @@
 
 (defn reconstruct-branch
   [{:keys [comparator], :as branch} t child-nodes]
-  (let [children    (->> child-nodes
-                         (sort-by :first comparator)
-                         (index/child-map comparator))
+  (let [children    (index/child-map comparator child-nodes)
         size        (->> child-nodes
                          (map :size)
                          (reduce +))
@@ -119,8 +117,10 @@
 
 (defn rebalance-children
   [branch t child-nodes]
-  (let [target-count (/ *overflow-children* 2)]
+  (let [target-count (/ *overflow-children* 2)
+        cmp          (:comparator branch)]
     (->> child-nodes
+         (sort-by :first cmp)
          (partition-all target-count)
          (map (fn [kids]
                 (reconstruct-branch branch t kids)))
