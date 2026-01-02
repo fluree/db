@@ -481,7 +481,9 @@
                  written-node))
         (recur (update stats :unchanged inc)
                node))
-      (assoc stats :root (index/unresolve last-node)))))
+      (assoc stats :root (-> last-node
+                             (assoc :rhs nil :leftmost? true)
+                             index/unresolve)))))
 
 (defn refresh-index
   [{:keys [index-catalog] :as db} changes-ch error-ch {::keys [idx t novelty root]}]
