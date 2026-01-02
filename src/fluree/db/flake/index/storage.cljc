@@ -144,10 +144,12 @@
 
 (defn reify-index-root
   [index-data ledger-alias comparator t]
-  (assoc index-data
-         :ledger-alias ledger-alias
-         :t t
-         :comparator comparator))
+  (-> index-data
+      (assoc :ledger-alias ledger-alias
+             :t t
+             :comparator comparator
+             :leftmost? true
+             :rhs nil)))
 
 (defn reify-index-roots
   [{:keys [t ledger-alias] :as root-data}]
