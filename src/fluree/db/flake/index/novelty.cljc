@@ -69,8 +69,9 @@
 
 (defn reconstruct-branch
   [{:keys [comparator], :as branch} t child-nodes]
-  (let [sorted-children (vec (sort-by :first comparator child-nodes))
-        children    (index/child-map comparator sorted-children)
+  (let [children    (->> child-nodes
+                         (sort-by :first comparator)
+                         (index/child-map comparator))
         size        (->> child-nodes
                          (map :size)
                          (reduce +))
