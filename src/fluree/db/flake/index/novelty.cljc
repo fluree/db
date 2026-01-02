@@ -274,8 +274,7 @@
                    (recur child-nodes*
                           (first child-nodes*)
                           result**))
-                 (let [root-node (-> (reconstruct-branch root-template t child-nodes)
-                                     (assoc :rhs nil :leftmost? true))]
+                 (let [root-node (reconstruct-branch root-template t child-nodes)]
                    (-> result
                        (xf root-node)
                        xf)))))))))))
@@ -485,9 +484,17 @@
                  written-node))
         (recur (update stats :unchanged inc)
                node))
-      (assoc stats :root (-> last-node
-                             (assoc :rhs nil :leftmost? true)
-                             index/unresolve)))))
+      (do
+        (when (or (:rhs last-node)
+                  (not (true? (:leftmost? last-node))))
+          (throw (ex-info "Index root invariant violated: root must have :rhs nil and :leftmost? true"
+                          {:idx        idx
+                           :root-id    (:id last-node)
+                           :root-first (:first last-node)
+                           :root-rhs   (:rhs last-node)
+                           :leftmost?  (:leftmost? last-node)
+                           :error      :db/index-invariant-failure})))
+        (assoc stats :root (index/unresolve last-node))))))
 
 (defn refresh-index
   [{:keys [index-catalog] :as db} changes-ch error-ch {::keys [idx t novelty root]}]
