@@ -141,10 +141,12 @@
              leaves    []]
         (if (empty? r)
           (let [subrange  (flake/subrange flakes >= cur-first)
+                last-size (+ cur-size (if f (flake/size-flake f) 0))
                 last-leaf (-> leaf
                               (assoc :flakes subrange
                                      :first cur-first
                                      :rhs rhs
+                                     :size last-size
                                      :leftmost? (and (empty? leaves)
                                                      leftmost?))
                               (dissoc :id))]
@@ -157,6 +159,7 @@
                                  (assoc :flakes subrange
                                         :first cur-first
                                         :rhs f
+                                        :size cur-size
                                         :leftmost? (and (empty? leaves)
                                                         leftmost?))
                                  (dissoc :id))]
