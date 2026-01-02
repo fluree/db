@@ -23,10 +23,10 @@
   "Check that child[i].rhs == child[i+1].first for all adjacent children.
    Returns a vector of error maps for any violations found."
   [branch]
-  (let [children   (:children branch)
-        comparator (:comparator branch)]
-    (when (and comparator (map? children) (> (count children) 1))
-      (let [child-vals (vec (vals (sort-by key comparator children)))]
+  (let [children (:children branch)
+        cmp      (:comparator branch)]
+    (when (and cmp (map? children) (> (count children) 1))
+      (let [child-vals (vec (vals (sort-by key cmp children)))]
         (->> (range (dec (count child-vals)))
              (keep (fn [i]
                      (let [child-a   (nth child-vals i)
@@ -34,7 +34,7 @@
                            rhs-a     (:rhs child-a)
                            first-b   (:first child-b)]
                        (when (and rhs-a first-b
-                                  (not (zero? (comparator rhs-a first-b))))
+                                  (not (zero? (cmp rhs-a first-b))))
                          {:error       :sibling-boundary-mismatch
                           :branch-id   (:id branch)
                           :child-i     i
