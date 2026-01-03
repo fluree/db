@@ -364,7 +364,7 @@
      "Check if S3 is available (using AWS credentials)"
      []
      (try
-       (let [credentials (s3/get-credentials)]
+       (let [credentials (s3/get-base-credentials)]
          (boolean credentials))
        (catch Exception _
          false))))

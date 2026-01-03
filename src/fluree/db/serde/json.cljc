@@ -99,25 +99,145 @@
      {}
      properties)))
 
+(defn serialize-class-property-data
+  "Serialize property data map for a class: {:types {sid count} :ref-classes {sid count} :langs {lang count}}
+   Uses compact tuple format: [types-vec, ref-classes-vec, langs-vec]
+   Each vec contains [sid/lang, count] tuples."
+  [prop-data]
+  (let [types (if (seq (:types prop-data))
+                (vec (map (fn [[sid cnt]] [(iri/serialize-sid sid) cnt])
+                          (:types prop-data)))
+                [])
+        ref-classes (if (seq (:ref-classes prop-data))
+                      (vec (map (fn [[sid cnt]] [(iri/serialize-sid sid) cnt])
+                                (:ref-classes prop-data)))
+                      [])
+        langs (if (seq (:langs prop-data))
+                (vec (map (fn [[lang cnt]] [lang cnt])
+                          (:langs prop-data)))
+                [])]
+    [types ref-classes langs]))
+
+(defn serialize-class-properties
+  "Serialize properties map for a class.
+   Returns vector of [prop-sid-vec [types ref-classes langs]] tuples using compact format."
+  [properties]
+  (when (seq properties)
+    (reduce-kv
+     (fn [acc prop-sid prop-data]
+       (conj acc [(iri/serialize-sid prop-sid)
+                  (serialize-class-property-data prop-data)]))
+     []
+     properties)))
+
 (defn serialize-class-stats
-  "Serialize class stats map. Classes only have :count field."
+  "Serialize class stats map using compact tuple format.
+   Format: [class-sid-vec [count properties-vec]]
+   Where properties-vec is [[prop-sid [types ref-classes langs]] ...]
+   This eliminates string keys like 'count', 'properties', 'types', etc."
   [classes]
   (when classes
     (reduce-kv
-     (fn [acc k v]
-       (conj acc [(iri/serialize-sid k) (:count v)]))
+     (fn [acc class-sid class-data]
+       (let [count (:count class-data)
+             props (serialize-class-properties (:properties class-data))]
+         (conj acc [(iri/serialize-sid class-sid) [count props]])))
      []
      classes)))
 
+(defn deserialize-class-property-data
+  "Deserialize property data from compact tuple format: [types ref-classes langs]
+   Also handles legacy map format for backward compatibility."
+  [prop-data]
+  (if (vector? prop-data)
+    ;; New compact tuple format: [types ref-classes langs]
+    (let [[types-val ref-classes-val langs-val] prop-data]
+      (cond-> {:types {} :ref-classes {} :langs {}}
+        (seq types-val)
+        (assoc :types (reduce (fn [acc [[ns-code nme] cnt]]
+                                (assoc acc (iri/->sid ns-code nme) cnt))
+                              {}
+                              types-val))
+
+        (seq ref-classes-val)
+        (assoc :ref-classes (reduce (fn [acc [[ns-code nme] cnt]]
+                                      (assoc acc (iri/->sid ns-code nme) cnt))
+                                    {}
+                                    ref-classes-val))
+
+        (seq langs-val)
+        (assoc :langs (reduce (fn [acc [lang cnt]]
+                                (assoc acc lang cnt))
+                              {}
+                              langs-val))))
+    ;; Legacy map format: {"types" [...] "refClasses" [...] "langs" [...]}
+    (let [types-val (or (get prop-data :types) (get prop-data "types"))
+          ref-classes-val (or (get prop-data :refClasses) (get prop-data "refClasses"))
+          langs-val (or (get prop-data :langs) (get prop-data "langs"))]
+      (cond-> {:types {} :ref-classes {} :langs {}}
+        types-val
+        (assoc :types (reduce (fn [acc [[ns-code nme] cnt]]
+                                (assoc acc (iri/->sid ns-code nme) cnt))
+                              {}
+                              types-val))
+
+        ref-classes-val
+        (assoc :ref-classes (reduce (fn [acc [[ns-code nme] cnt]]
+                                      (assoc acc (iri/->sid ns-code nme) cnt))
+                                    {}
+                                    ref-classes-val))
+
+        langs-val
+        (assoc :langs (reduce (fn [acc [lang cnt]]
+                                (assoc acc lang cnt))
+                              {}
+                              langs-val))))))
+
+(defn deserialize-class-properties
+  "Deserialize properties map for a class.
+   Expects vector of [prop-sid-vec prop-data] tuples where prop-data is compact tuple format."
+  [properties]
+  (when properties
+    (reduce
+     (fn [acc [prop-sid-vec prop-data]]
+       (let [[ns-code nme] prop-sid-vec
+             prop-sid (iri/->sid ns-code nme)]
+         (assoc acc prop-sid (deserialize-class-property-data prop-data))))
+     {}
+     properties)))
+
 (defn deserialize-class-stats
-  "Deserialize class stats. Classes only have :count field."
+  "Deserialize class stats from compact tuple format or legacy formats.
+   New format: [sid-vec [count properties-vec]]
+   Legacy map format: [sid-vec {:count ... :properties ...}]
+   Oldest format: [sid-vec count]"
   [classes]
   (when classes
     (reduce
-     (fn [acc [sid-vec count]]
+     (fn [acc [sid-vec class-data]]
        (let [[ns-code nme] sid-vec
-             sid (iri/->sid ns-code nme)]
-         (assoc acc sid {:count count})))
+             class-sid (iri/->sid ns-code nme)]
+         (cond
+           ;; New compact tuple format: [count props]
+           (and (vector? class-data) (number? (first class-data)))
+           (let [[count-val props] class-data
+                 deserialized (cond-> {:count count-val}
+                                (seq props)
+                                (assoc :properties (deserialize-class-properties props)))]
+             (assoc acc class-sid deserialized))
+
+           ;; Legacy map format: {:count ... :properties ...}
+           (map? class-data)
+           (let [count-val (or (get class-data :count) (get class-data "count"))
+                 props (or (get class-data :properties) (get class-data "properties"))
+                 deserialized (cond-> {:count count-val}
+                                props
+                                (assoc :properties (deserialize-class-properties props)))]
+             (assoc acc class-sid deserialized))
+
+           ;; Oldest format: just count number
+           :else
+           (assoc acc class-sid {:count class-data}))))
      {}
      classes)))
 
@@ -146,7 +266,8 @@
   (let [version  (or (:v db-root) 1)  ; default to v1 for legacy indexes
         db-root* (reduce (fn [root-data idx]
                            (update root-data idx deserialize-child-node))
-                         db-root index/types)]
+                         db-root
+                         (index/indexes-for db-root))]
     (-> db-root*
         (update :namespace-codes numerize-keys)
         (update :stats deserialize-stats version))))
@@ -247,7 +368,7 @@
                 (:config :garbage :prev-index)
                 (util/stringify-keys v)
 
-                (:spot :post :opst :tspo)
+                (:spot :psot :post :opst :tspo)
                 (stringify-child v)
 
                 v)))

@@ -44,7 +44,7 @@
                      "@graph"   [{"@id"          "ex:ssnRestriction"
                                   "@type"        ["f:AccessPolicy"]
                                   "f:required"   true
-                                  "f:targetProperty" [{"@id" "schema:ssn"}]
+                                  "f:onProperty" [{"@id" "schema:ssn"}]
                                   "f:action"     {"@id" "f:view"}
                                   "f:query"      {"@type"  "@json"
                                                   "@value" {"@context" {"ex" "http://example.org/ns/"}
@@ -421,7 +421,7 @@
                                        {"@id"       "ex:restrictAllSSNs"
                                         "@type"     ["f:AccessPolicy"]
                                         "f:required" true
-                                        "f:targetProperty" [{"@id" "schema:ssn"}]
+                                        "f:onProperty" [{"@id" "schema:ssn"}]
                                         "f:action"  {"@id" "f:view"}}]}
           policy-db  @(fluree/wrap-policy db policy)]
 
@@ -439,3 +439,67 @@
                   "select"   {"?s" ["*"]}
                   "where"    {"@id"   "?s"
                               "@type" "ex:User"}})))))))
+
+(deftest ^:integration default-allow-option-test
+  (testing "The :default-allow option allows access when no policies apply"
+    (let [conn @(fluree/connect-memory)
+          db   @(fluree/create-with-txn
+                 conn
+                 {"@context" {"ex" "http://example.org/ns/"
+                              "f"  "https://ns.flur.ee/ledger#"}
+                  "ledger"   "policy/default-allow-test"
+                  "insert"   [{"@id"               "ex:public-data"
+                               "@type"             "ex:Public"
+                               "ex:name"           "Public Info"}
+                              {"@id"               "ex:secret-data"
+                               "@type"             "ex:Secret"
+                               "ex:name"           "Secret Info"
+                               "ex:classification" "top-secret"}]})
+
+          ;; Policy that only applies to ex:Secret class - denies unless classification is "public"
+          deny-secret-policy {"@context" {"ex" "http://example.org/ns/"
+                                          "f"  "https://ns.flur.ee/ledger#"}
+                              "@id"      "ex:secretRestriction"
+                              "@type"    "f:AccessPolicy"
+                              "f:targetSubject"
+                              {"@type"  "@json"
+                               "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                         "where"    [{"@id" "?$target" "@type" {"@id" "ex:Secret"}}]}}
+                              "f:action" {"@id" "f:view"}
+                              ;; This query will fail (return false) for top-secret data
+                              "f:query"  {"@type"  "@json"
+                                          "@value" {"@context" {"ex" "http://example.org/ns/"}
+                                                    "where"    [{"@id"               "?$this"
+                                                                 "ex:classification" "public"}]}}}
+
+          public-query {"@context" {"ex" "http://example.org/ns/"}
+                        "select"   {"?s" ["*"]}
+                        "where"    {"@id" "?s" "@type" "ex:Public"}}
+
+          secret-query {"@context" {"ex" "http://example.org/ns/"}
+                        "select"   {"?s" ["*"]}
+                        "where"    {"@id" "?s" "@type" "ex:Secret"}}]
+
+      (testing "without default-allow, unmatched data is denied"
+        (let [policy-db @(fluree/wrap-policy db deny-secret-policy)]
+          ;; ex:Public has no policy targeting it, so it's denied (default deny)
+          (is (= []
+                 @(fluree/query policy-db public-query))
+              "Public data denied because no policy applies")
+          ;; ex:Secret has a policy but the query returns false (top-secret != public)
+          (is (= []
+                 @(fluree/query policy-db secret-query))
+              "Secret data denied because policy query returns false")))
+
+      (testing "with default-allow true, unmatched data is allowed"
+        (let [policy-db @(fluree/wrap-policy db deny-secret-policy nil true)]
+          ;; ex:Public has no policy targeting it, so default-allow kicks in
+          (is (= [{"@id"     "ex:public-data"
+                   "@type"   "ex:Public"
+                   "ex:name" "Public Info"}]
+                 @(fluree/query policy-db public-query))
+              "Public data allowed because default-allow is true")
+          ;; ex:Secret has a policy that evaluates to false, so still denied
+          (is (= []
+                 @(fluree/query policy-db secret-query))
+              "Secret data still denied because policy exists and returns false"))))))

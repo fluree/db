@@ -135,7 +135,7 @@
                   (is (= results reload-results) "Reloaded data should match")
 
                   ;; Check S3 object paths
-                  (let [store (s3/->S3Store nil (s3/get-credentials) bucket "us-east-1" "test"
+                  (let [store (s3/->S3Store nil (s3/get-base-credentials) bucket "us-east-1" "test" *s3-endpoint*
                                             20000 60000 20000
                                             4 150 2000)
                         list-ch (s3/s3-list store "")
@@ -202,7 +202,7 @@
                                                "where" {"@id" "?s"
                                                         "@type" "ex:Person"}})
                   ;; Verify index files were created in S3 using our s3-list
-                  store (s3/->S3Store nil (s3/get-credentials) bucket "us-east-1" "indexing"
+                  store (s3/->S3Store nil (s3/get-base-credentials) bucket "us-east-1" "indexing" *s3-endpoint*
                                       20000 60000 20000
                                       4 150 2000)
                   list-ch (s3/s3-list store "")

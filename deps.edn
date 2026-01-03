@@ -38,7 +38,11 @@
         org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
         ;; SCI for GraalVM-compatible code evaluation
-        org.babashka/sci {:mvn/version "0.10.47"}}
+        org.babashka/sci {:mvn/version "0.10.47"}
+
+        ;; AWS SDK v2 for S3 Express One Zone session management
+        ;; Using minimal dependencies - only for CreateSession API
+        software.amazon.awssdk/s3 {:mvn/version "2.29.40"}}
 
  :paths ["src" "resources" "target/classes"]
 

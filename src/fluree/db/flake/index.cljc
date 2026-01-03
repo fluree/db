@@ -10,17 +10,35 @@
             [fluree.db.util.log :as log :include-macros true]))
 
 (def comparators
-  "Map of default index comparators for the four index types"
+  "Map of default index comparators for the five index types"
   (array-map ;; when using futures, can base other calcs on :spot (e.g. size), so ensure comes first
    :spot flake/cmp-flakes-spot
+   :psot flake/cmp-flakes-psot
    :post flake/cmp-flakes-post
    :opst flake/cmp-flakes-opst
    :tspo flake/cmp-flakes-block))
 
 (def types
-  "The four possible index orderings based on the subject, predicate, object,
+  "The five possible index orderings based on the subject, predicate, object,
   and transaction flake attributes"
   (-> comparators keys vec))
+
+(defn supports?
+  [indexed idx]
+  (-> indexed (get idx) some?))
+
+(defn indexes-for
+  "Return a sequence of the indexes supported by `indexed`"
+  [indexed]
+  (filter (partial supports? indexed)
+          types))
+
+(defn select-roots
+  "Return a map with keys of indexes from `types` supported by `indexed`, and
+  values of the index root node for that index"
+  [indexed]
+  (let [index-keys (indexes-for indexed)]
+    (select-keys indexed index-keys)))
 
 (defn reference?
   [dt]
@@ -410,40 +428,74 @@
          (async/map vector))
     (go [])))
 
+(defn- prefetch-leaves
+  "Start async resolution for up to `n` unresolved leaves from the stack.
+  The cache stores promise-chans, so subsequent resolves get cache hits."
+  [r start-flake end-flake error-ch stack n]
+  (loop [xs (rseq stack)
+         remaining n]
+    (when (and xs (pos? remaining))
+      (let [node (first xs)]
+        (if (and (leaf? node) (not (resolved? node)))
+          (do (try-resolve r start-flake end-flake error-ch node)
+              (recur (next xs) (dec remaining)))
+          (recur (next xs) remaining))))))
+
+(def ^:private default-prefetch-n 3)
+
 (defn tree-chan
-  "Returns a channel that will eventually contain the stream of index nodes
-  descended from `root` in depth-first order. `resolve?` is a boolean function
-  that will be applied to each node to determine whether or not the data
-  associated with that node will be resolved from disk using the supplied
-  `Resolver` `r`. `start-flake` and `end-flake` are flakes for which only nodes
-  that contain flakes within the interval defined by them will be considered,
-  `n` is an optional parameter specifying the number of nodes to load
-  concurrently, and `xf` is an optional transducer that will transform the
-  output stream if supplied."
+  "Returns a channel containing the stream of index nodes descended from `root`
+  in depth-first order.
+
+  Parameters:
+  - `r`           - Resolver for loading nodes from storage
+  - `root`        - Root index node to traverse from
+  - `start-flake` - Lower bound flake (inclusive), or nil
+  - `end-flake`   - Upper bound flake (inclusive), or nil
+  - `resolve?`    - Predicate to filter which nodes to traverse
+  - `prefetch-n`  - Max concurrent leaf prefetches for cold loads (default 3)
+  - `xf`          - Transducer to transform output stream
+  - `error-ch`    - Channel for error reporting
+
+  Uses bounded leaf prefetch: when traversing a branch whose children are all
+  leaves, pre-fetches up to `prefetch-n` leaves ahead. The cache stores
+  promise-chans, so subsequent resolves get cache hits."
   ([r root resolve? error-ch]
-   (tree-chan r root resolve? 1 identity error-ch))
-  ([r root resolve? n xf error-ch]
-   (tree-chan r root nil nil resolve? n xf error-ch))
-  ([r root start-flake end-flake resolve? n xf error-ch]
-   (let [out (chan n xf)]
+   (tree-chan r root nil nil resolve? nil identity error-ch))
+  ([r root resolve? prefetch-n xf error-ch]
+   (tree-chan r root nil nil resolve? prefetch-n xf error-ch))
+  ([r root start-flake end-flake resolve? prefetch-n xf error-ch]
+   (let [n   (long (or prefetch-n default-prefetch-n))
+         out (chan 1 xf)]
      (go
-       (let [root-node (<! (resolve-when r start-flake end-flake
-                                         resolve? error-ch root))]
+       (let [root-node (<! (resolve-when r start-flake end-flake resolve? error-ch root))]
          (loop [stack [root-node]]
-           (when-let [node (peek stack)]
+           (if-let [node (peek stack)]
              (let [stack* (pop stack)]
-               (if (or (leaf? node)
-                       (expanded? node))
+               (cond
+                 (leaf? node)
+                 (let [resolved-leaf (if (resolved? node)
+                                       node
+                                       (<! (try-resolve r start-flake end-flake error-ch node)))]
+                   (prefetch-leaves r start-flake end-flake error-ch stack* n)
+                   (when resolved-leaf
+                     (>! out resolved-leaf))
+                   (recur stack*))
+
+                 (expanded? node)
                  (do (>! out (unmark-expanded node))
                      (recur stack*))
-                 (let [children (<! (resolve-children-when r start-flake end-flake
-                                                           resolve? error-ch node))
-                       stack**  (-> stack*
-                                    (conj (mark-expanded node))
-                                    (into (rseq children)))] ; reverse children
-                                                             ; to ensure final
-                                                             ; nodes are in
-                                                             ; depth-first order
-                   (recur stack**))))))
-         (async/close! out)))
+
+                 :else
+                 (let [resolved-branch (<! (resolve-when r start-flake end-flake resolve? error-ch node))]
+                   (if-not (resolved? resolved-branch)
+                     (recur stack*)
+                     (let [children (->> resolved-branch :children vals (filterv resolve?))]
+                       (if (every? leaf? children)
+                         (recur (-> stack* (conj (mark-expanded resolved-branch)) (into (rseq children))))
+                         (let [resolved-children (<! (resolve-children-when r start-flake end-flake
+                                                                            resolve? error-ch resolved-branch))
+                               stack** (-> stack* (conj (mark-expanded resolved-branch)) (into (rseq resolved-children)))]
+                           (recur stack**))))))))
+             (async/close! out)))))
      out)))
