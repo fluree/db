@@ -551,9 +551,18 @@
    (go-try
      ;; Check if this is a v1 index - if so, skip stats computation entirely
      ;; v1 indexes should not generate stats until fully reindexed
-     (let [prev-index-version  (get-in db [:commit :index :v])
-           is-v1-index?        (and prev-index-version (< prev-index-version 2))
-           track-class-stats?  (get db :track-class-stats true)
+     (let [prev-index-version (get-in db [:commit :index :v])
+           ;; If there's an existing index recorded on the commit, but no :v (or :v < 2),
+           ;; treat it as v1. (Nil version is assumed v1.)
+           ;;
+           ;; Note: during full reindex we replay commits but explicitly strip :index
+           ;; metadata; in that case there is no existing index to key off of and we
+           ;; should compute stats for the new v2 index.
+           has-existing-index? (some? (get-in db [:commit :index :data :t]))
+           is-v1-index?        (and has-existing-index?
+                                    (or (nil? prev-index-version)
+                                        (< prev-index-version 2)))
+           track-class-stats? (get db :track-class-stats true)
 
            ;; Kick off stats computation in parallel (v2 only)
            stats-ch (when-not is-v1-index?
