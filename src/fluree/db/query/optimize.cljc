@@ -68,11 +68,9 @@
     Returns:
       Channel containing query plan map"))
 
-;; Inline filter optimization
-
 (defn filter-info
-  "Describe a `:filter` pattern by returning a map of useful details, or nil if the
-  pattern is not a filter.
+  "Describe a `:filter` pattern with a details map, or nil if the pattern is not a
+  filter.
 
   {:pattern <original pattern entry>
    :fn      <compiled filter fn>
@@ -119,28 +117,10 @@
       {:binding-patterns binding-patterns
        :filters          filters})))
 
-(defn get-filtered-variable
-  "If a :filter pattern references exactly one variable, return it; else nil."
-  [pattern]
-  (let [vars (some-> pattern filter-info :vars)]
-    (when (= 1 (count vars))
-      (first vars))))
-
 (defn matches-var?
   "Return true if the match object references `variable`."
   [match variable]
-  (= variable (where/get-variable match)))
-
-(defn binds-var?
-  "Return true if match both references `variable` and is unmatched."
-  [match variable]
-  (and (where/unmatched? match)
-       (matches-var? match variable)))
-
-(defn tuple-binds-var?
-  "Return true if any element of `tuple` binds `variable`."
-  [tuple variable]
-  (some #(binds-var? % variable) tuple))
+  (-> match where/get-variable (= variable)))
 
 ;; --- Range extraction helpers for filter pushdown ---
 
@@ -290,33 +270,15 @@
             mch))
         tuple))
 
-(defn get-filter-codes
-  "Return parsed filter forms from a filter fn’s metadata."
-  [filter-fn]
-  (-> filter-fn meta :forms vec))
-
-(def binding-pattern-types
-  #{:tuple :class :id})
-
-(defn binding-pattern?
-  [pattern-type]
-  (contains? binding-pattern-types pattern-type))
-
 (defn tuple-bindings
-  [tuple]
-  (->> tuple
-       (keep (fn [m]
-               (let [var (where/get-variable m)]
-                 (when (and var (where/unmatched? m))
-                   var))))
-       set))
-
-(defn bound-vars
-  "Return vars guaranteed to be bound by a binding pattern, or nil otherwise."
   [pattern]
-  (let [pattern-type (where/pattern-type pattern)]
-    (when (binding-pattern? pattern-type)
-      (->> pattern where/pattern-data util/ensure-vector tuple-bindings))))
+  (->> pattern
+       where/pattern-data
+       util/ensure-vector
+       (keep (fn [m]
+               (when (where/unmatched? m)
+                 (where/get-variable m))))
+       set))
 
 (declare clause-bindings)
 
@@ -343,7 +305,7 @@
 
 (defmethod pattern-bindings :simple/binding
   [pattern]
-  (or (bound-vars pattern) #{}))
+  (tuple-bindings pattern))
 
 (defmethod pattern-bindings :graph
   [pattern]
@@ -595,19 +557,19 @@
 (defn inline-clause*
   [bound patterns]
   (loop [remaining patterns
-         result []
-         bound bound
-         pending {}]
+         result    []
+         bound     bound
+         pending   {}]
     (if-let [pattern (first remaining)]
       (let [pattern-type (where/pattern-type pattern)]
         (case pattern-type
           :filter
           (if-let [{:keys [vars] :as info} (filter-info pattern)]
             (if (seq vars)
-              (let [id (gensym "filter")
-                    pending-entry {:info info
+              (let [id            (gensym "filter")
+                    pending-entry {:info      info
                                    :remaining (set vars)
-                                   :inlined? false}]
+                                   :inlined?  false}]
                 (recur (rest remaining)
                        (conj result {pending-filter-key id})
                        bound
@@ -622,9 +584,11 @@
                    pending))
 
           (:tuple :class :id)
-          (let [pattern-vars (or (bound-vars pattern) #{})
-                {:keys [pattern pending]} (attach-inline-filters pattern pattern-type pending pattern-vars)
-                bound* (into bound pattern-vars)]
+          (let [pattern-vars (tuple-bindings pattern)
+                bound*       (into bound pattern-vars)
+
+                {:keys [pattern pending]}
+                (attach-inline-filters pattern pattern-type pending pattern-vars)]
             (recur (rest remaining)
                    (conj result pattern)
                    bound*
@@ -641,9 +605,9 @@
                  (conj result pattern)
                  bound
                  pending)))
-      {:result result
+      {:result  result
        :pending pending
-       :bound bound})))
+       :bound   bound})))
 
 (defn inline-clause
   [bound clause]
@@ -655,9 +619,7 @@
 (defn strip-filter-code
   "Remove temporary `::filter-code` metadata from a match object, if present."
   [mch]
-  (if (::filter-code mch)
-    (dissoc mch ::filter-code)
-    mch))
+  (dissoc mch ::filter-code))
 
 (declare strip-clause-filters)
 
