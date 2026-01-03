@@ -10,13 +10,13 @@
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql.syntax :as syntax]
-            [fluree.db.query.optimize :as optimize]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.query.sparql.translator :as sparql.translator]
             [fluree.db.query.turtle.parse :as turtle]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.order :as order]
             [fluree.db.util.parse :as util.parse]
             [fluree.db.validation :as v]
             [fluree.json-ld :as json-ld]))
@@ -542,7 +542,7 @@
     (if (empty? attrs)
       [(where/->pattern :id s-mch)]
       (let [statements (parse-statements s-mch attrs var-config context)]
-        (sort optimize/compare-triples statements)))))
+        (sort order/compare-triples statements)))))
 
 (defn parse-node-map
   [m var-config context]

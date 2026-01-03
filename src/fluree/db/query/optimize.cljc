@@ -1,72 +1,10 @@
 (ns fluree.db.query.optimize
-  (:require [clojure.set :as set]
+  (:require [clojure.core.async :as async]
+            [clojure.set :as set]
+            [fluree.db.flake.optimize :as flake-optimize]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try <?]]))
-
-(defn compare-component
-  [cmp-a cmp-b]
-  (if (where/matched-value? cmp-a)
-    (if (where/matched-value? cmp-b)
-      0
-      -1)
-    (if (where/matched-value? cmp-b)
-      1
-      0)))
-
-(def triple-pattern-types
-  #{:tuple :class})
-
-(defn triple-pattern?
-  [x]
-  (contains? triple-pattern-types (where/pattern-type x)))
-
-(defn coerce-triple
-  [x]
-  (if (triple-pattern? x)
-    (where/pattern-data x)
-    (throw (ex-info "Optimization failed on non triple pattern type"
-                    {:status   500
-                     :error    :db/optimization-failure
-                     ::pattern x}))))
-
-(defn compare-triples
-  [a b]
-  (let [a' (coerce-triple a)
-        b' (coerce-triple b)]
-    (reduce (fn [_ nxt]
-              (if (zero? nxt)
-                nxt
-                (reduced nxt)))
-            (map compare-component a' b'))))
-
-(defprotocol Optimizable
-  "Protocol for query optimization based on database statistics."
-
-  (-reorder [db where-clause]
-    "Reorder the patterns within a parsed where clause based on database statistics.
-
-    Returns a channel that will contain the reordered where clause. If the
-    database has no statistics available, returns the clause unchanged.
-
-    Parameters:
-      db           - Database instance (FlakeDB, AsyncDB, etc.)
-      where-clause - Parsed where clause (vector of patterns)
-
-    Returns:
-      Channel containing reordered where clause")
-
-  (-explain [db parsed-query]
-    "Generate an execution plan for the query showing optimization details.
-
-    Returns a channel that will contain a query plan map.
-
-    Parameters:
-      db           - Database instance (FlakeDB, AsyncDB, etc.)
-      parsed-query - Parsed query produced by `fql/parse-query`
-
-    Returns:
-      Channel containing query plan map"))
 
 ;; Inline filter optimization
 
@@ -232,6 +170,53 @@
   Aggregates over patterns using `pattern-bindings`."
   [clause]
   (reduce set/union #{} (map pattern-bindings clause)))
+
+;; -----------------------------------------------------------------------------
+;; Database-provided optimization scoring
+;; -----------------------------------------------------------------------------
+
+(defprotocol Optimizer
+  "Dispatch on the database to compute a baseline ordering score for a pattern
+  used by the optimizer. Returns a core.async channel that yields a non-negative
+  number (lower is better), or nil when unsupported."
+  (ordering-score [db pattern]))
+
+(def ^:const default-selectivity 1000)
+
+;; -----------------------------------------------------------------------------
+;; Pattern cost (tuple/class/id) — static facts + stats-based base cost
+;; -----------------------------------------------------------------------------
+
+(defn- pattern-refs
+  "Return the set of variables syntactically referenced by a tuple/class/id
+  pattern. Extracts variables from match components regardless of whether they
+  are matched or unmatched."
+  [pattern]
+  (->> (where/pattern-data pattern)
+       util/ensure-vector
+       (keep where/get-variable)
+       set))
+
+(defmulti pattern-cost
+  "Return static pattern facts and a stats-based base cost for scheduling.
+
+  Output map keys:
+  - :refs        — variables referenced by the pattern (set)
+  - :guarantees  — variables the pattern guarantees to bind (set)
+  - :base        — baseline cost/selectivity estimate from stats (number)
+
+  The base is computed using existing selectivity estimation for triple-like
+  patterns and class/id patterns, independent of the dynamic bound set."
+  (fn [_db pattern] (where/pattern-type pattern))
+  :hierarchy #'pattern-hierarchy)
+
+(defmethod pattern-cost :simple/binding
+  [_db pattern]
+  ;; Base is a static fallback for scheduling; dynamic ordering-score is fetched
+  ;; asynchronously during scheduling.
+  {:refs       (pattern-refs pattern)
+   :guarantees (or (bound-vars pattern) #{})
+   :base       default-selectivity})
 
 (defn partition-appendable
   "Partition filter descriptors into [appendable remaining] given `bound`."
@@ -573,7 +558,10 @@
 
 (defn optimize-inline-filters
   "Rewrite single-variable filters as inline filters attached to the pattern
-  that binds the variable. Returns the optimized where clause."
+  that binds the variable. Returns the optimized where clause.
+
+  Uses Optimizer/ordering-score indirectly via the reordering phase; this phase
+  assumes patterns have already been scheduled using Optimizer."
   [binding-patterns filter-descriptors]
   (let [clause (into (vec binding-patterns)
                      (map :pattern)
@@ -616,7 +604,7 @@
             (where/->pattern ptype clause*)))
 
         :union
-        (<? (reorder-union-pattern db (where/pattern-data pattern)))
+        (<? (reorder-union-pattern db pattern))
 
         :graph
         (let [[graph-clause where-clause] (where/pattern-data pattern)
@@ -627,20 +615,131 @@
 
         pattern))))
 
+(declare score-clause clause-rows)
+
+(defn- score-pattern
+  "Return a channel yielding a numeric score for `pattern`.
+  Binding patterns delegate to Optimizer/ordering-score.
+  Higher-order patterns score as the minimum score among their nested patterns."
+  [db pattern]
+  (go-try
+    (let [ptype (where/pattern-type pattern)]
+      (case ptype
+        (:tuple :class :id)
+        (let [s (<? (ordering-score db pattern))]
+          (or s default-selectivity))
+
+        :graph
+        (let [[_graph where-clause] (where/pattern-data pattern)]
+          (<? (score-clause db where-clause)))
+
+        :union
+        (let [branches    (where/pattern-data pattern)
+              avg-chs     (map #(score-clause db %) branches)
+              rows-chs    (map #(clause-rows db %) branches)
+              avgs        (<? (async/map (fn [& xs] (vec xs)) (vec avg-chs)))
+              rows        (<? (async/map (fn [& xs] (vec xs)) (vec rows-chs)))
+              pairs       (map vector avgs rows)
+              pairs*      (remove (fn [[a r]] (or (nil? a) (nil? r))) pairs)
+              total-rows  (reduce + 0 (map second pairs*))
+              weighted    (when (pos? total-rows)
+                            (/ (reduce + 0 (map (fn [[a r]] (* a r)) pairs*))
+                               total-rows))]
+          (or weighted default-selectivity))
+
+        (:optional :exists :not-exists :minus)
+        (let [clause (where/pattern-data pattern)
+              s      (<? (score-clause db clause))]
+          (or s default-selectivity))
+
+        ;; Default: no nested content; use conservative default
+        default-selectivity))))
+
+(defn- score-clause
+  "Return a channel yielding the average score among patterns in `clause`.
+  Returns default-selectivity for empty clauses."
+  [db clause]
+  (go-try
+    (if (seq clause)
+      (let [chs    (map #(score-pattern db %) clause)
+            result (<? (async/map (fn [& xs]
+                                    (let [ss (remove nil? xs)]
+                                      (when (seq ss)
+                                        (/ (reduce + ss) (count ss)))))
+                                  (vec chs)))]
+        (or result default-selectivity))
+      default-selectivity)))
+
+(defn- clause-rows
+  "Return a channel yielding an estimated row count for a clause as the sum of
+  per-pattern scores (using score-pattern recursively)."
+  [db clause]
+  (go-try
+    (if (seq clause)
+      (let [chs (map #(score-pattern db %) clause)
+            sum (<? (async/map (fn [& xs]
+                                 (let [ss (remove nil? xs)]
+                                   (when (seq ss)
+                                     (reduce + ss))))
+                               (vec chs)))]
+        (or sum default-selectivity))
+      default-selectivity)))
+
+;; Former run-min-score now unused after per-pattern ranking.
+
+(defn- order-top-level-clause
+  "Return a channel yielding an ordered top-level clause.
+  Strategy: rank each pattern individually by score, regardless of type.
+  - Binding patterns: Optimizer/ordering-score
+  - Higher-order patterns: score-pattern (nested scoring)
+  Stable tie-breaker by original index."
+  [db clause]
+  (go-try
+    (if (seq clause)
+      (let [scored-chs (map-indexed (fn [i pattern]
+                                      (go-try
+                                        (let [ptype  (where/pattern-type pattern)
+                                              score  (if (binding-pattern? ptype)
+                                                       (or (<? (ordering-score db pattern)) default-selectivity)
+                                                       (<? (score-pattern db pattern)))]
+                                          {:index i :pattern pattern :score score})))
+                                    clause)
+            scored     (<? (async/map (fn [& xs] (vec xs)) (vec scored-chs)))
+            ordered    (->> scored
+                            (sort-by (fn [{:keys [score index]}]
+                                       [(or score default-selectivity) index]))
+                            (mapv :pattern))]
+        ordered)
+      clause)))
+
+(defn- reorder-nested-patterns
+  "Return a channel yielding `top-level` with nested patterns reordered
+  recursively."
+  [db top-level]
+  (go-try
+    (loop [remaining top-level
+           reordered []]
+      (if-let [pattern (first remaining)]
+        (let [pattern* (<? (reorder-nested-clause db pattern))]
+          (recur (rest remaining) (conj reordered pattern*)))
+        reordered))))
+
 (defn reorder-where-clause
-  "Recursively reorder a parsed where clause using the Optimizable protocol.
+  "Recursively reorder a parsed where clause using Optimizer/ordering-score.
+
+  Strategy: treat contiguous runs of binding patterns (:tuple/:class/:id) as
+  reorderable segments. For each run, fetch scores via Optimizer and order by
+  ascending score (stable by original index for ties). Non-binding, higher-order
+  patterns act as boundaries and are left in place at top level. Nested clauses
+  are then reordered recursively.
+
   Returns a channel that yields the reordered clause or the original clause when
   reordering is not possible."
   [db clause]
   (go-try
     (if (seq clause)
-      (let [top-level (<? (-reorder db clause))]
-        (loop [remaining top-level
-               acc       []]
-          (if-let [pattern (first remaining)]
-            (let [pattern* (<? (reorder-nested-clause db pattern))]
-              (recur (rest remaining) (conj acc pattern*)))
-            acc)))
+      (let [top-level (<? (order-top-level-clause db clause))]
+        (<? (reorder-nested-patterns db top-level)))
       clause)))
 
 (defn optimize-where-clause
@@ -678,3 +777,17 @@
             where-optimized (<? (optimize-where-clause db context where-clause))]
         (assoc parsed-query :where where-optimized))
       parsed-query)))
+
+(defn explain
+  "Return a query plan. For FlakeDB instances (i.e., DBs with statistics),
+  delegate to flake-optimize/explain-query to preserve the rich explain output
+  expected by tests. For other DB types, return a minimal plan."
+  [db parsed-query]
+  (go-try
+    (let [stats (:stats db)]
+      (if (and stats (or (seq (:properties stats)) (seq (:classes stats))))
+        (flake-optimize/explain-query db parsed-query)
+        {:query parsed-query
+         :plan  {:optimization :none
+                 :reason       "No statistics available"
+                 :where-clause (:where parsed-query)}}))))

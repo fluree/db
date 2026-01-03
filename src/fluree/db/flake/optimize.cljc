@@ -2,7 +2,7 @@
   (:require [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.query.optimize :refer [compare-triples]]
+            [fluree.db.util.order :refer [compare-triples]]
             [fluree.json-ld :as json-ld]))
 
 ;; Selectivity score constants

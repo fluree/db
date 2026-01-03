@@ -63,4 +63,4 @@
              (catch* e e))]
     (if (util/exception? pq)
       (async/go pq)
-      (optimize/-explain ds pq))))
+      (optimize/explain ds pq))))

@@ -195,6 +195,12 @@
             (>! error-ch e))))
       commit-ch))
 
+  optimize/Optimizer
+  (ordering-score [_ pattern]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (optimize/ordering-score db pattern)))))
+
   policy/Restrictable
   (wrap-policy [_ policy policy-values]
     (go-try
@@ -214,18 +220,7 @@
           (catch* e
             (log/error e "Error loading db while setting root policy")
             (async/put! root-ch e))))
-      root-db))
-
-  optimize/Optimizable
-  (-reorder [_ where-clause]
-    (go-try
-      (let [db (<? db-chan)]
-        (<? (optimize/-reorder db where-clause)))))
-
-  (-explain [_ parsed-query]
-    (go-try
-      (let [db (<? db-chan)]
-        (<? (optimize/-explain db parsed-query))))))
+      root-db)))
 
 (defn db?
   [x]

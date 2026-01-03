@@ -16,7 +16,7 @@
             [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.flake.match :as match]
-            [fluree.db.flake.optimize :refer  [explain-query optimize-where]]
+            [fluree.db.flake.optimize :as flake-optimize]
             [fluree.db.flake.reasoner :as flake.reasoner]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.indexer :as indexer]
@@ -487,15 +487,15 @@
   (-reason [db methods rule-sources tracker reasoner-max]
     (flake.reasoner/reason db methods rule-sources tracker reasoner-max))
   (-reasoned-facts [db]
-    (reasoner-util/reasoned-facts db))
+    (reasoner-util/reasoned-facts db)))
 
-  optimize/Optimizable
-  (-reorder [db where-clause]
-    (async/go
-      (optimize-where db where-clause)))
-
-  (-explain [db parsed-query]
-    (async/go (explain-query db parsed-query))))
+(extend-type FlakeDB
+  optimize/Optimizer
+  (ordering-score [db pattern]
+    (go-try
+      (let [stats (:stats db)
+            {:keys [score]} (flake-optimize/calculate-selectivity-with-details db stats pattern)]
+        score))))
 
 (defn db?
   [x]

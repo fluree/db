@@ -5,6 +5,7 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.query.optimize :as optimize]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [empty-channel]]
             [fluree.db.util.log :as log]
@@ -268,7 +269,12 @@
 
   ;; return db-alias here, as it is used when encoding/decoding IRIs in the search function which is original db-dependent
   (-aliases [_]
-    [db-alias]))
+    [db-alias])
+
+  ;; Optimizer: BM25 virtual graphs do not expose selectivity estimates.
+  optimize/Optimizer
+  (ordering-score [_ _pattern]
+    (async/go optimize/default-selectivity)))
 
 (defn bm25-iri?
   [idx-rdf-type]

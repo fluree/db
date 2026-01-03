@@ -1,5 +1,5 @@
 (ns fluree.db.dataset
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.query.exec.select.subject :as subject]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.optimize :as optimize]
@@ -23,6 +23,12 @@
     (if (#{::default} active-graph)
       (:default ds)
       (-> ds :named (get active-graph)))))
+
+(defn get-default
+  "Returns the default graph(s) for the dataset as a sequential collection,
+  or nil when none are configured."
+  [ds]
+  (some-> (:default ds) util/sequential))
 
 (defn names
   [ds]
@@ -129,20 +135,23 @@
                    (recur r))
                  nil)))))
 
-  optimize/Optimizable
-  (-reorder [_ds where-clause]
-    ;; DataSets (federated queries) are not optimized.
-    ;; Return the clause unchanged wrapped in a channel to maintain the
-    ;; optimizer contract without performing any work.
-    (async/go where-clause))
-
-  (-explain [_ds parsed-query]
-    ;; DataSets (federated queries) cannot be explained
-    ;; Return simple plan indicating no optimization
-    (async/go
-      {:query parsed-query
-       :plan  {:optimization :none
-               :reason       "Federated queries are not optimized"}})))
+  optimize/Optimizer
+  (ordering-score [ds pattern]
+    (if (where/graph-pattern? pattern)
+      (let [[g _] (where/pattern-data pattern)]
+        (if (where/matched? g)
+          (let [alias (where/get-iri g)
+                named (:named ds)]
+            (if-let [db (get named alias)]
+              (optimize/ordering-score db pattern)
+              (go 0)))
+          (go optimize/default-selectivity)))
+      (->> (or (get-default ds) [])
+           (map #(optimize/ordering-score % pattern))
+           (async/map (fn [& scores]
+                        (let [ss (remove nil? scores)]
+                          (when (seq ss)
+                            (apply min ss)))))))))
 
 (defn combine
   [named-map defaults]

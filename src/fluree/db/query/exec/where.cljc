@@ -320,6 +320,11 @@
     (key pattern)
     :tuple))
 
+(defn graph-pattern?
+  "Returns true if `pattern` is a graph pattern."
+  [pattern]
+  (-> pattern pattern-type (= :graph)))
+
 (defn pattern-data
   [pattern]
   (if (map-entry? pattern)

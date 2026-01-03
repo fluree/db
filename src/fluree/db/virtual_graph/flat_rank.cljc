@@ -4,6 +4,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.query.optimize :as optimize]
             [fluree.db.query.range :as query-range]
             [fluree.db.track :as track]
             [fluree.db.util :refer [try* catch*]]
@@ -78,7 +79,12 @@
     (where/-activate-alias db alias'))
 
   (-aliases [_]
-    (where/-aliases db)))
+    (where/-aliases db))
+
+  ;; Optimizer: flat-rank graphs do not provide selectivity estimates.
+  optimize/Optimizer
+  (ordering-score [_ _pattern]
+    (async/go optimize/default-selectivity)))
 
 (defn dot-product-graph
   [db]
@@ -102,7 +108,11 @@
     (where/-activate-alias db alias'))
 
   (-aliases [_]
-    (where/-aliases db)))
+    (where/-aliases db))
+
+  optimize/Optimizer
+  (ordering-score [_ _pattern]
+    (async/go optimize/default-selectivity)))
 
 (defn cosine-graph
   [db]
@@ -126,7 +136,11 @@
     (where/-activate-alias db alias'))
 
   (-aliases [_]
-    (where/-aliases db)))
+    (where/-aliases db))
+
+  optimize/Optimizer
+  (ordering-score [_ _pattern]
+    (async/go optimize/default-selectivity)))
 
 (defn euclidean-graph
   [db]
