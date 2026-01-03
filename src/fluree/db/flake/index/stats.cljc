@@ -22,8 +22,8 @@
   ;; flake/create args: s p o dt t op m
   (flake/create subject-sid const/$rdf:type flake/min-s flake/min-dt flake/min-t flake/min-op flake/min-meta))
 
-(defn- extract-classes-from-leaf
-  "Returns seq of [sid #{class-sids}] pairs from a resolved leaf."
+(defn- lookup-subject-classes-in-leaf
+  "Returns seq of [sid #{class-sids}] pairs for the given subject-sids found in leaf."
   [leaf subject-sids]
   (let [subject-set (set subject-sids)
         flakes (:flakes leaf)]
@@ -76,7 +76,7 @@
                input-ch    (async/to-chan! sorted-sids)
                error-ch    (async/chan 1)
                result-ch   (index/streaming-index-lookup
-                            resolver psot-root input-ch subject->psot-flake extract-classes-from-leaf
+                            resolver psot-root input-ch subject->psot-flake lookup-subject-classes-in-leaf
                             error-ch {})]
           ;; Collect results from index and merge with novelty (or throw on error)
            (go-try
