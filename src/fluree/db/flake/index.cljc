@@ -560,26 +560,34 @@
                       {:status 500 :error :db/index-lookup})))
     (go
       (try*
-        (loop [cur (<! lookup-ch)]
-          (if cur
-            (let [target (lookup->start cur)
-                  leaf   (<! (seek-leaf r root target error-ch))]
-              (when-not leaf
-                (throw (ex-info "Unable to resolve leaf for lookup batch"
-                                {:status 500 :error :db/index-lookup
-                                 :lookup (pr-str cur)})))
-              (let [rhs (:rhs leaf)
-                    [batch carry]
-                    (loop [acc [cur]]
-                      (let [nxt (<! lookup-ch)]
-                        (cond
-                          (nil? nxt) [acc nil]
-                          (and rhs (not (neg? (cmp (lookup->start nxt) rhs)))) [acc nxt]
-                          :else (recur (conj acc nxt)))))]
-                (doseq [item (leaf->results leaf batch)]
-                  (>! out item))
-                (recur carry)))
-            (async/close! out)))
+        ;; Resolve the root once up-front; repeated `seek-leaf` calls then only
+        ;; resolve along the path and leaf nodes.
+        (let [root* (if (resolved? root) root (<! (resolve-node r root error-ch)))]
+          (when-not root*
+            (throw (ex-info "Unable to resolve index root for streaming-index-lookup"
+                            {:status 500 :error :db/index-lookup})))
+          (loop [cur (<! lookup-ch)]
+            (if cur
+              (let [target (lookup->start cur)
+                    leaf   (<! (seek-leaf r root* target error-ch))]
+                (when-not leaf
+                  (throw (ex-info "Unable to resolve leaf for lookup batch"
+                                  {:status 500 :error :db/index-lookup
+                                   :lookup (pr-str cur)})))
+                (let [rhs (:rhs leaf)
+                      [batch carry]
+                      (loop [acc [cur]]
+                        (let [nxt (<! lookup-ch)]
+                          (cond
+                            (nil? nxt) [acc nil]
+                            ;; rhs is an inclusive upper bound for a leaf's key-range. We only
+                            ;; carry when the next lookup falls strictly beyond rhs.
+                            (and rhs (pos? (cmp (lookup->start nxt) rhs))) [acc nxt]
+                            :else (recur (conj acc nxt)))))]
+                  (doseq [item (leaf->results leaf batch)]
+                    (>! out item))
+                  (recur carry)))
+              (async/close! out))))
         (catch* e
           (log/error e "streaming-index-lookup failed")
           (>! error-ch e)

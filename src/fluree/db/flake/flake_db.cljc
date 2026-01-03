@@ -710,6 +710,21 @@
                :elapsed-seconds   (Math/round ^double elapsed-secs)
                :commits-per-second (Math/round ^double rate)})))
 
+(defn- strip-replayed-index-metadata
+  "During reindex we want novelty/refresh to assign a v2 index and compute stats.
+  Commits in history may carry old :index metadata (including v1), which would
+  cause refresh to skip stats. Strip :index during replay."
+  [db]
+  (update db :commit dissoc :index))
+
+(defn- should-log-progress?
+  [commit-count last-log-count log-interval]
+  (>= (- commit-count last-log-count) log-interval))
+
+(defn- should-index-batch?
+  [novelty-size batch-bytes]
+  (>= novelty-size batch-bytes))
+
 (defn reindex-from-commits
   "Rebuilds database by replaying commits in batches.
 
@@ -738,19 +753,16 @@
              last-log-count   0]
         (if-let [[commit-jsonld commit-data] (<! commit-ch)]
           (let [merged-db     (<? (merge-commit db commit-jsonld commit-data))
-                ;; During reindex we want novelty/refresh to produce a v2 index and compute stats.
-                ;; Commits in history may carry old :index metadata (including v1), which would
-                ;; cause refresh-all to skip stats. Strip :index during replay.
-                db*           (update merged-db :commit dissoc :index)
+                db*           (strip-replayed-index-metadata merged-db)
                 novelty-size  (get-in db* [:novelty :size])
                 commit-count* (inc commit-count)
                 ;; Log progress periodically
-                last-log-count* (if (>= (- commit-count* last-log-count) log-interval)
-                                  (do (reindex-progress-log ledger-alias commit-count* batch-count start-time-ms)
-                                      commit-count*)
+                last-log-count* (if (should-log-progress? commit-count* last-log-count log-interval)
+                                  (do
+                                    (reindex-progress-log ledger-alias commit-count* batch-count start-time-ms)
+                                    commit-count*)
                                   last-log-count)]
-            (if (>= novelty-size batch-bytes)
-              ;; Index this batch
+            (if (should-index-batch? novelty-size batch-bytes)
               (do
                 (log/info "Reindex batch" (inc batch-count) "indexing..."
                           {:ledger ledger-alias
@@ -758,7 +770,6 @@
                            :novelty-bytes novelty-size})
                 (let [indexed-db (<? (novelty/refresh db* changes-ch max-old-indexes))]
                   (recur indexed-db (inc batch-count) commit-count* last-log-count*)))
-              ;; Continue accumulating
               (recur db* batch-count commit-count* last-log-count*)))
           ;; No more commits - final index pass
           (let [elapsed-ms (- (util/current-time-millis) start-time-ms)]

@@ -25,35 +25,45 @@
 (defn- lookup-subject-classes-in-leaf
   "Returns seq of [sid #{class-sids}] pairs for the given subject-sids found in leaf."
   [leaf subject-sids]
-  (let [subject-set (set subject-sids)
-        flakes (:flakes leaf)]
-    ;; Group flakes by subject, filter to only rdf:type flakes for our subjects
-    (->> flakes
-         (filter (fn [f]
-                   (and (= const/$rdf:type (flake/p f))
-                        (contains? subject-set (flake/s f))
-                        (flake/op f)))) ; only assertions
-         (group-by flake/s)
-         (map (fn [[sid fs]]
-                [sid (set (map flake/o fs))])))))
+  (let [subject-set (set subject-sids)]
+    (->> (:flakes leaf)
+         (reduce
+          (fn [m f]
+            (let [sid (flake/s f)]
+              (if (and (= const/$rdf:type (flake/p f))
+                       (contains? subject-set sid)
+                       (flake/op f)) ;; only assertions from the persisted index
+                (update m sid (fnil conj #{}) (flake/o f))
+                m)))
+          {})
+         (seq))))
 
-(defn- extract-classes-from-novelty
-  "Returns {sid #{class-sids}} computed from novelty (handles retractions)."
+(defn- type-novelty-by-subject
+  "Return {sid -> [type-flake ...]} for rdf:type flakes in novelty, restricted to
+  `subject-sids`. The vectors preserve novelty iteration order."
   [novelty subject-sids]
-  ;; Handle both assertions and retractions (op true/false).
   (let [wanted? (set subject-sids)]
     (reduce
      (fn [acc f]
        (let [sid (flake/s f)]
          (if (and (wanted? sid)
                   (= const/$rdf:type (flake/p f)))
-           (let [class-sid (flake/o f)]
-             (if (flake/op f)
-               (update acc sid (fnil conj #{}) class-sid)
-               (update acc sid (fnil disj #{}) class-sid)))
+           (update acc sid (fnil conj []) f)
            acc)))
      {}
      (or novelty []))))
+
+(defn- apply-type-novelty
+  "Apply rdf:type novelty flakes to a base class-set, producing final classes."
+  [base-class-sids type-flakes]
+  (reduce
+   (fn [classes f]
+     (let [cls (flake/o f)]
+       (if (flake/op f)
+         (conj classes cls)
+         (disj classes cls))))
+   (or base-class-sids #{})
+   (or type-flakes [])))
 
 (defn batched-get-subject-classes
   "Returns a channel that yields {sid #{class-sids}}.
@@ -67,11 +77,15 @@
      (let [psot-root (:psot db)
            resolver  (:index-catalog db)
            ;; Get classes from novelty (not yet persisted)
-           psot-novelty     (get-in db [:novelty :psot])
-           novelty-classes  (extract-classes-from-novelty psot-novelty sids)]
+           psot-novelty       (get-in db [:novelty :psot])
+           novelty-by-subject (type-novelty-by-subject psot-novelty sids)]
        (if (nil? psot-root)
          ;; No PSOT on this db (e.g. legacy ledgers) - return novelty-only classes.
-         (go novelty-classes)
+         ;; Note: without an index to start from, retractions can't remove prior state.
+         (go (reduce-kv (fn [m sid fs]
+                          (assoc m sid (apply-type-novelty #{} fs)))
+                        {}
+                        novelty-by-subject))
          (let [sorted-sids (if sorted? sids (sort sids))
                input-ch    (async/to-chan! sorted-sids)
                error-ch    (async/chan 1)
@@ -80,14 +94,22 @@
                             error-ch {})]
           ;; Collect results from index and merge with novelty (or throw on error)
            (go-try
-             (loop [result novelty-classes]
+             (loop [result {}]
                (async/alt!
                  error-ch ([e] (throw e))
                  result-ch ([item]
                             (if item
-                              (let [[sid classes] item]
-                                (recur (update result sid (fnil into #{}) classes)))
-                              result)))))))))))
+                              (let [[sid classes] item
+                                    classes* (apply-type-novelty classes (get novelty-by-subject sid))]
+                                (recur (assoc result sid classes*)))
+                              ;; Ensure we include subjects that only appeared in novelty
+                              ;; (or had only retractions) and never appeared in the index.
+                              (reduce-kv (fn [m sid fs]
+                                           (if (contains? m sid)
+                                             m
+                                             (assoc m sid (apply-type-novelty #{} fs))))
+                                         result
+                                         novelty-by-subject))))))))))))
 
 (defn- merge-class-maps
   "Merge {sid -> #{class-sids}} maps."
