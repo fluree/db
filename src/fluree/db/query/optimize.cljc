@@ -442,40 +442,41 @@
           (recur (rest remaining) (conj acc p) filters bound-next)))
       {:patterns acc :filters filters})))
 
-(defn select-target-var
-  "Return the last symbol in `ordered-vars` that is contained in `likely-vars`."
-  [likely-vars ordered-vars]
-  (some likely-vars (rseq ordered-vars)))
-
 (defn advance-pending
   [pending pattern-vars]
-  (reduce-kv
-   (fn [[pending* inline] id {:keys [info remaining inlined?] :as entry}]
-     (if inlined?
-       [(assoc pending* id entry) inline]
-       (let [remaining (or remaining #{})
-             newly-bound (set/intersection remaining pattern-vars)
-             remaining*  (set/difference remaining pattern-vars)]
-         (if (and (seq newly-bound) (empty? remaining*))
-           (let [target (select-target-var newly-bound (:order info))]
-             [(assoc pending* id (assoc entry
-                                        :remaining remaining*
-                                        :inlined? true
-                                        :target target))
-              (conj inline {:id id
-                            :target target
-                            :forms  (:forms info)})])
-           [(assoc pending* id (assoc entry :remaining remaining*))
-            inline]))))
-   [pending []]
-   pending))
+  (loop [ids        (keys pending)
+         pending*   pending
+         inline     []
+         standalone []]
+    (if-let [id (first ids)]
+      (let [{:keys [info remaining inlined?] :as entry} (get pending* id)]
+        (if inlined?
+          (recur (rest ids) pending* inline standalone)
+          (let [remaining   (or remaining #{})
+                newly-bound (set/intersection remaining pattern-vars)
+                remaining*  (set/difference remaining pattern-vars)]
+            (if (and (seq newly-bound) (empty? remaining*))
+              (if (= 1 (count newly-bound))
+                (let [target   (first newly-bound)
+                      entry*   (assoc entry :remaining remaining* :inlined? true :target target)
+                      inline*  (conj inline {:id id :target target :forms (:forms info)})
+                      pending** (assoc pending* id entry*)]
+                  (recur (rest ids) pending** inline* standalone))
+                (let [entry*   (assoc entry :remaining remaining* :inlined? true :target nil)
+                      pending** (assoc pending* id entry*)
+                      stand*    (conj standalone {:id id :info info})]
+                  (recur (rest ids) pending** inline stand*)))
+              (let [entry*   (assoc entry :remaining remaining*)
+                    pending** (assoc pending* id entry*)]
+                (recur (rest ids) pending** inline standalone))))))
+      [pending* inline standalone])))
 
 (defn attach-inline-filters
   [pattern pattern-type pending pattern-vars]
   (let [tuple (if (= :tuple pattern-type)
                 (util/ensure-vector pattern)
                 (util/ensure-vector (where/pattern-data pattern)))
-        [pending* inline] (advance-pending pending pattern-vars)
+        [pending* inline standalone] (advance-pending pending pattern-vars)
         tuple* (reduce (fn [tuple {:keys [target forms]}]
                          (with-var-filter tuple target forms))
                        tuple inline)
@@ -486,7 +487,11 @@
                    pattern)]
     {:pattern pattern*
      :pending pending*
-     :inlined? (seq inline)}))
+     :inlined? (seq inline)
+     :after   (when (seq standalone)
+                (mapv (fn [{:keys [info]}]
+                        (where/->pattern :filter info))
+                      standalone))}))
 
 (def ^:private pending-filter-key ::pending-filter)
 
@@ -556,10 +561,10 @@
           (let [pattern-vars (tuple-bindings pattern)
                 bound*       (into bound pattern-vars)
 
-                {:keys [pattern pending]}
+                {:keys [pattern pending after]}
                 (attach-inline-filters pattern pattern-type pending pattern-vars)]
             (recur (rest remaining)
-                   (conj result pattern)
+                   (into (conj result pattern) after)
                    bound*
                    pending))
 
