@@ -94,17 +94,80 @@
     (leaf? node)   (dissoc node :flakes)
     (branch? node) (dissoc node :children)))
 
+(defn- same-assertion-fact?
+  [f1 f2]
+  (and (= (flake/s f1) (flake/s f2))
+       (= (flake/p f1) (flake/p f2))
+       (= (flake/o f1) (flake/o f2))
+       (= (flake/dt f1) (flake/dt f2))))
+
+(defn- redundant-same-op
+  [flakes]
+  (loop [prev nil
+         xs   (seq flakes)
+         acc  (transient [])]
+    (if xs
+      (let [f (first xs)]
+        (if (and prev
+                 (same-assertion-fact? prev f)
+                 (= (flake/op prev) (flake/op f)))
+          (recur prev (next xs) (conj! acc f))
+          (recur f (next xs) acc)))
+      (persistent! acc))))
+
+(defn- conj-bytes
+  "Returns [ss' bytes-added]. bytes-added is an estimate based on input."
+  [ss flakes]
+  (loop [tset  (transient ss)
+         bytes 0
+         xs    (seq flakes)]
+    (if xs
+      (let [f (first xs)]
+        (recur (conj! tset f)
+               (+ bytes (flake/size-flake f))
+               (next xs)))
+      [(persistent! tset) bytes])))
+
+(defn- disj-bytes
+  "Returns [ss' bytes-removed]."
+  [ss flakes]
+  (loop [tset  (transient ss)
+         bytes 0
+         xs    (seq flakes)]
+    (if xs
+      (let [f (first xs)]
+        (recur (disj! tset f)
+               (+ bytes (flake/size-flake f))
+               (next xs)))
+      [(persistent! tset) bytes])))
+
 (defn add-flakes
+  "Adds flakes to a resolved leaf, dropping redundant same-op reassertions."
   [leaf flakes]
-  (let [new-leaf (-> leaf
-                     (update :flakes into flakes)
-                     (update :size (fn [size]
-                                     (->> flakes
-                                          (map flake/size-flake)
-                                          (reduce + size)))))
-        new-first (or (some-> new-leaf :flakes first)
-                      flake/maximum)]
-    (assoc new-leaf :first new-first)))
+  (let [[merged added-bytes] (conj-bytes (:flakes leaf) flakes)
+        redundant            (not-empty (redundant-same-op merged))
+        [deduped removed-bytes] (if redundant
+                                  (disj-bytes merged redundant)
+                                  [merged 0])
+        expected-first       (:first leaf)
+        actual-first         (first deduped)]
+    (when redundant
+      (log/info "Dropping redundant same-op reassertions in leaf"
+                {:leaf-id (:id leaf)
+                 :redundant-flakes (count redundant)}))
+    ;; For non-leftmost leaves, :first is a stable boundary and must not change.
+    ;; For the leftmost leaf, novelty may introduce smaller keys, so :first can move.
+    (when (and (not (:leftmost? leaf))
+               (not= expected-first actual-first))
+      (throw (ex-info "Leaf :first changed for non-leftmost leaf during add-flakes"
+                      {:leaf-id   (:id leaf)
+                       :expected  expected-first
+                       :actual    actual-first
+                       :error     :db/index-invariant-failure})))
+    (cond-> (assoc leaf
+                   :flakes deduped
+                   :size  (- (+ (:size leaf) added-bytes) removed-bytes))
+      (:leftmost? leaf) (assoc :first actual-first))))
 
 (defn empty-leaf
   "Returns a blank leaf node map for the provided `ledger-alias` and index
