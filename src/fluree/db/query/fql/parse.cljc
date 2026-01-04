@@ -584,10 +584,11 @@
                                       parsed-codes))
         vars         (not-empty (into #{} order))
         f            (compile-filter-fn context parsed-codes)
-        metadata     {:forms parsed-codes
+        info         {:fn    f
+                      :forms (vec parsed-codes)
                       :vars  vars
-                      :dependency-order (not-empty order)}]
-    [(where/->pattern :filter (with-meta f metadata))]))
+                      :order (not-empty (vec order))}]
+    [(where/->pattern :filter info)]))
 
 (defmethod parse-pattern :union
   [[_ & unions] var-config context]

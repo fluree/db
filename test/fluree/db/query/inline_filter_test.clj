@@ -4,19 +4,18 @@
             [fluree.db.query.optimize :as opt]))
 
 (defn mk-filter
-  "Build a :filter pattern with metadata describing vars and dependency order.
-  Forms are dummies; these tests only exercise optimizer structure, not compile."
+  "Build a :filter pattern using the new map-based descriptor shape produced by
+  the parser."
   [vars order]
-  (let [f (with-meta (constantly true)
-            {:forms            ['(constantly true)]
-             :vars             (set vars)
-             :dependency-order (vec order)})]
-    (where/->pattern :filter f)))
+  (let [info {:fn    (constantly true)
+              :forms ['(constantly true)]
+              :vars  (set vars)
+              :order (vec order)}]
+    (where/->pattern :filter info)))
 
 (defn build-filter-descriptor
   [vars order]
-  (-> (mk-filter vars order)
-      (opt/filter-info)))
+  (where/pattern-data (mk-filter vars order)))
 
 (deftest union-pushes-when-all-branches-bind
   (testing "filters push into all union branches when all vars are bound"

@@ -68,38 +68,12 @@
     Returns:
       Channel containing query plan map"))
 
-(defn filter-info
-  "Describe a `:filter` pattern with a details map, or nil if the pattern is not a
-  filter.
-
-  {:pattern <original pattern entry>
-   :fn      <compiled filter fn>
-   :vars    #{sym ...} ; symbols referenced by the filter
-   :forms   [form ...] ; parsed forms used to compile the filter
-   :order   [sym ...]} ; vars in a deterministic dependency order
-
-  The values mirror what the parser stored in the filter function's metadata, but
-  packaged in a plain map so downstream optimizations can reason about them without
-  digging through metadata directly."
-  [pattern]
-  (when (= :filter (where/pattern-type pattern))
-    (let [f     (where/pattern-data pattern)
-          forms (some-> f meta :forms vec)
-          vars  (-> f meta :vars)
-          order (or (some-> f meta :dependency-order vec)
-                    (some-> vars sort vec))]
-      {:pattern pattern
-       :fn      f
-       :vars    vars
-       :forms   forms
-       :order   order})))
-
 (defn collect-filters
   "Split a where clause into binding patterns and top-level filter descriptors.
 
   Returns a map with:
   - :binding-patterns — patterns excluding top-level :filter entries
-  - :filters — descriptor maps from `filter-info` for each top-level filter
+  - :filters — descriptor maps for each top-level filter (parser-emitted)
 
   Filters nested in higher‑order patterns are left in place."
   [patterns]
@@ -110,9 +84,8 @@
       (let [next-remaining (rest remaining)
             pattern-type   (where/pattern-type pattern)]
         (if (= :filter pattern-type)
-          (if-let [info (filter-info pattern)]
-            (recur next-remaining binding-patterns (conj filters info))
-            (recur next-remaining (conj binding-patterns pattern) filters))
+          (let [info (where/pattern-data pattern)]
+            (recur next-remaining binding-patterns (conj filters info)))
           (recur next-remaining (conj binding-patterns pattern) filters)))
       {:binding-patterns binding-patterns
        :filters          filters})))
@@ -336,9 +309,9 @@
    (remove #(set/subset? (:vars %) bound) filters)])
 
 (defn append-clause-filters
-  "Append `appendable` filter patterns to inner clause and return it."
+  "Append `appendable` filter descriptors to inner clause as :filter patterns and return it."
   [inner appendable]
-  (into (vec inner) (map :pattern) appendable))
+  (into (vec inner) (map #(where/->pattern :filter %)) appendable))
 
 (defn append-union-filters
   "Append filters to every union branch, returning updated branches."
@@ -550,7 +523,7 @@
                     (let [id (get entry pending-filter-key)
                           {:keys [info inlined?]} (get pending id)]
                       (when-not inlined?
-                        [(:pattern info)]))
+                        [(where/->pattern :filter info)]))
                     [entry])))
         result))
 
@@ -564,7 +537,7 @@
       (let [pattern-type (where/pattern-type pattern)]
         (case pattern-type
           :filter
-          (if-let [{:keys [vars] :as info} (filter-info pattern)]
+          (let [{:keys [vars] :as info} (where/pattern-data pattern)]
             (if (seq vars)
               (let [id            (gensym "filter")
                     pending-entry {:info      info
@@ -577,11 +550,7 @@
               (recur (rest remaining)
                      (conj result pattern)
                      bound
-                     pending))
-            (recur (rest remaining)
-                   (conj result pattern)
-                   bound
-                   pending))
+                     pending)))
 
           (:tuple :class :id)
           (let [pattern-vars (tuple-bindings pattern)
@@ -633,8 +602,16 @@
       ;; Tuple patterns are vectors of match objects
       (mapv strip-filter-code pattern)
 
-      (:class :id)
-      ;; Class and ID patterns have a single match object as data
+      :class
+      ;; Class patterns may carry a vector of matches after inlining
+      (let [data (where/pattern-data pattern)
+            data* (if (vector? data)
+                    (mapv strip-filter-code data)
+                    (strip-filter-code data))]
+        (where/->pattern pattern-type data*))
+
+      :id
+      ;; ID patterns always contain a single match
       (let [mch (-> pattern where/pattern-data strip-filter-code)]
         (where/->pattern pattern-type mch))
 
@@ -672,7 +649,7 @@
   that binds the variable. Returns the optimized where clause."
   [binding-patterns filter-descriptors]
   (let [clause (into (vec binding-patterns)
-                     (map :pattern)
+                     (map (partial where/->pattern :filter))
                      filter-descriptors)]
     (inline-clause #{} clause)))
 
