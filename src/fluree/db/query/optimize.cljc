@@ -348,7 +348,7 @@
   ;; Base is a static fallback for scheduling; dynamic ordering-score is fetched
   ;; asynchronously during scheduling.
   {:refs       (pattern-refs pattern)
-   :guarantees (or (bound-vars pattern) #{})
+   :guarantees (pattern-refs pattern)
    :base       default-selectivity})
 
 (defn partition-appendable
@@ -828,6 +828,13 @@
       default-selectivity)))
 
 ;; Former run-min-score now unused after per-pattern ranking.
+
+(def binding-pattern-types
+  #{:tuple :class :id})
+
+(defn binding-pattern?
+  [pattern-type]
+  (contains? binding-pattern-types pattern-type))
 
 (defn- order-top-level-clause
   "Return a channel yielding an ordered top-level clause.
