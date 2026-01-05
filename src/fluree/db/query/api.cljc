@@ -5,6 +5,7 @@
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.ledger :as ledger]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.history :as history]
@@ -23,14 +24,21 @@
 (defn sanitize-query-options
   [query override-opts]
   (update query :opts (fn [{:keys [max-fuel] :as opts}]
+                        ;; Support both call styles:
+                        ;; - (query db q {:subject-join-batch-size 10000})
+                        ;; - (query db q {:opts {:subject-join-batch-size 10000}})
+                        (let [override-opts* (cond-> (or override-opts {})
+                                               (map? (:opts override-opts))
+                                               (-> (merge (:opts override-opts))
+                                                   (dissoc :opts)))]
                         ;; ensure :max-fuel key is present
                         (-> opts
                             (assoc :max-fuel max-fuel)
-                            (merge override-opts)
+                            (merge override-opts*)
                             (update :output #(or % :fql))
                             ;; get rid of :did, :issuer opts
                             (update :identity #(or % (:did opts) (:issuer opts)))
-                            (dissoc :did :issuer)))))
+                            (dissoc :did :issuer))))))
 
 (defn load-aliased-rule-dbs
   [conn rule-sources]
@@ -120,10 +128,28 @@
            ds*      (if (dataset? ds)
                       ds
                       (<? (restrict-db ds tracker query*)))
-           query**  (update query* :opts dissoc :meta :max-fuel)]
-       (if (track/track-query? opts)
-         (<? (track-execution ds* tracker #(fql/query ds* tracker query**)))
-         (<? (fql/query ds* query**)))))))
+           ;; NOTE: When querying a DB value directly (FlakeDB/AsyncDB), :from/:from-named
+           ;; are not used to select ledgers (unlike connection/dataset queries). Ignore them.
+           ;; This matches the expectation that a DB query runs only against the provided DB.
+           query**  (-> query*
+                        (update :opts dissoc :meta :max-fuel)
+                        (cond-> (not (dataset? ds*)) (dissoc :from :from-named)))
+           batch-size     (:subject-join-batch-size opts)
+           use-psot?      (:subject-join-use-psot? opts)
+           range-mode     (:subject-join-range-mode opts)
+           join-log?      (:subject-join-log? opts)
+           join-trace?    (:subject-join-trace? opts)]
+       (binding [where/*enable-batched-subject-joins?* (pos-int? batch-size)
+                 where/*subject-join-batch-size*       (if (pos-int? batch-size)
+                                                         batch-size
+                                                         where/*subject-join-batch-size*)
+                 where/*subject-join-use-psot?*         (if (some? use-psot?) use-psot? where/*subject-join-use-psot?*)
+                 where/*subject-join-range-mode*        (if (some? range-mode) range-mode where/*subject-join-range-mode*)
+                 where/*batched-subject-join-log?*      (if (some? join-log?) join-log? where/*batched-subject-join-log?*)
+                 where/*batched-subject-join-trace?*    (if (some? join-trace?) join-trace? where/*batched-subject-join-trace?*)]
+         (if (track/track-query? opts)
+           (<? (track-execution ds* tracker #(fql/query ds* tracker query**)))
+           (<? (fql/query ds* query**))))))))
 
 (defn query-sparql
   [db query override-opts]

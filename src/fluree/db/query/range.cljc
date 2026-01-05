@@ -173,6 +173,103 @@
             (filter-authorized db tracker error-ch)))
      empty-channel)))
 
+(defn- subject->spot-range
+  "Returns [start-flake end-flake] for a subject SID in :spot ordering."
+  [sid]
+  [(flake/create sid flake/min-p flake/min-s flake/min-dt flake/min-t flake/min-op flake/min-meta)
+   (flake/create sid flake/max-p flake/max-s flake/max-dt flake/max-t flake/max-op flake/max-meta)])
+
+(defn resolve-subject-slices
+  "Returns a channel of [sid flakes] pairs by fetching all :spot flakes for each
+  subject SID in `sids` (which must be sorted ascending).
+
+  Intended for subject-star joins: first produce a selective subject SID list,
+  then fetch all predicate/object flakes for those subjects from :spot and
+  filter/join in-memory.
+
+  Notes:
+  - Uses the same resolver machinery as `resolve-flake-slices` (honors novelty and :to-t).
+  - Applies policy filtering (CLJ) just like `resolve-flake-slices`.
+
+  opts:
+  - :to-t        transaction time upper bound
+  - :prefetch-n  max concurrent leaf resolves for cold index loads (default 3)
+  - :buffer      output buffer size (default 64)"
+  [db tracker error-ch sids {:keys [to-t prefetch-n buffer] :or {prefetch-n 3 buffer 64}}]
+  (if (empty? sids)
+    empty-channel
+    (if-let [root (get db :spot)]
+      (let [novelty   (get-in db [:novelty :spot])
+            novelty-t (get-in db [:novelty :t])
+            resolver  (index/index-catalog->t-range-resolver (:index-catalog db) novelty-t novelty to-t)
+            raw-ch    (index/batched-prefix-range-lookup resolver root sids subject->spot-range error-ch
+                                                         {:mode :seek :prefetch-n prefetch-n :buffer buffer})
+            out-ch    (chan buffer)]
+        (if (policy/unrestricted? db)
+          (async/pipe raw-ch out-ch)
+          (async/pipeline-async
+           2
+           out-ch
+           (fn [[sid flakes] ch]
+             (go-try
+               (let [authorized (<? (authorize-flakes db tracker error-ch flakes))]
+                 (>! ch [sid authorized]))))
+           raw-ch))
+        out-ch)
+      empty-channel)))
+
+(defn resolve-subject-predicate-slices
+  "Returns a channel of [sid flakes] pairs by fetching all flakes for each
+  subject SID in `sids` (sorted ascending) restricted to the single predicate
+  `p-sid`.
+
+  Intended for joining a large stream of already-bound subject solutions against
+  a fixed predicate (e.g. ?s p ?o) without performing one index seek per
+  solution.
+
+  Notes:
+  - Uses the same resolver machinery as `resolve-flake-slices` (honors novelty and :to-t).
+  - Applies policy filtering (CLJ) just like `resolve-flake-slices`.
+
+  opts:
+  - :to-t        transaction time upper bound
+  - :prefetch-n  max concurrent leaf resolves for cold index loads (default 3)
+  - :buffer      output buffer size (default 64)
+  - :mode        :seek or :scan (passed to batched-prefix-range-lookup)
+  - :use-psot?   when true and :psot exists, use it; otherwise default to :spot"
+  [db tracker error-ch p-sid sids {:keys [to-t prefetch-n buffer mode use-psot?]
+                                  :or {prefetch-n 3 buffer 64}}]
+  (let [mode* (or mode :seek)]
+    (if (or (empty? sids) (nil? p-sid))
+      empty-channel
+      (let [idx  (if (and use-psot? (get db :psot)) :psot :spot)
+            root (get db idx)]
+        (if-not root
+          empty-channel
+          (let [novelty   (get-in db [:novelty idx])
+                novelty-t (get-in db [:novelty :t])
+                resolver  (index/index-catalog->t-range-resolver (:index-catalog db) novelty-t novelty to-t)
+                subject->range
+                (fn [sid]
+                  ;; Mirror `where/resolve-flake-range` bounds for (s p ?o):
+                  ;; only bracket on meta, leave o/dt/t/op nil.
+                  [(flake/create sid p-sid nil nil nil nil util/min-integer)
+                   (flake/create sid p-sid nil nil nil nil util/max-integer)])
+                raw-ch    (index/batched-prefix-range-lookup resolver root sids subject->range error-ch
+                                                             {:mode mode* :prefetch-n prefetch-n :buffer buffer})
+                out-ch    (chan buffer)]
+            (if (policy/unrestricted? db)
+              (async/pipe raw-ch out-ch)
+              (async/pipeline-async
+               2
+               out-ch
+               (fn [[sid flakes] ch]
+                 (go-try
+                   (let [authorized (<? (authorize-flakes db tracker error-ch flakes))]
+                     (>! ch [sid authorized]))))
+               raw-ch))
+            out-ch))))))
+
 (defn filter-subject-page
   "Returns a transducer to filter a stream of flakes to only contain flakes from
   at most `limit` subjects, skipping the flakes from the first `offset`
