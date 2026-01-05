@@ -91,7 +91,7 @@
           airlines-stats {:row-count 6162}]
       ;; Without NDV, assumes all unique: 67663 * 6162 / max(67663, 6162) = 6162
       (is (= 6162 (join/estimate-join-cardinality routes-stats airlines-stats
-                                                   "airline_id" "id")))))
+                                                  "airline_id" "id")))))
 
   (testing "Cardinality with NDV available"
     (let [routes-stats {:row-count 67663
@@ -100,7 +100,7 @@
                           :column-stats {"id" {:distinct-count 6162}}}]
       ;; 67663 * 6162 / max(1000, 6162) = 67663
       (is (= 67663 (join/estimate-join-cardinality routes-stats airlines-stats
-                                                    "airline_id" "id")))))
+                                                   "airline_id" "id")))))
 
   (testing "Cardinality with value-count fallback"
     (let [routes-stats {:row-count 67663
@@ -110,7 +110,7 @@
       ;; value-count < row-count for routes, so use 1000 as NDV
       ;; 67663 * 6162 / max(1000, 6162) = 67663
       (is (= 67663 (join/estimate-join-cardinality routes-stats airlines-stats
-                                                    "airline_id" "id"))))))
+                                                   "airline_id" "id"))))))
 
 (deftest estimate-selectivity-test
   (testing "No predicates = full selectivity"
@@ -133,7 +133,7 @@
 
   (testing "Combined predicates"
     (let [stats {:row-count 1000 :column-stats {"country" {:value-count 100}
-                                                 "status" {:value-count 5}}}]
+                                                "status" {:value-count 5}}}]
       ;; 1/100 * 3/5 = 0.006
       (is (< 0.005
              (join/estimate-selectivity stats [{:op :eq :column "country" :value "US"}
