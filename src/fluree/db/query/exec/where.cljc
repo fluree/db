@@ -306,6 +306,7 @@
   (-match-id [s tracker solution s-match error-ch])
   (-match-triple [s tracker solution triple error-ch])
   (-match-class [s tracker solution triple error-ch])
+  (-match-properties [s tracker solution triples error-ch])
   (-activate-alias [s alias])
   (-aliases [s])
   (-finalize [s tracker error-ch solution-ch]))
@@ -330,6 +331,10 @@
   (if (map-entry? pattern)
     (val pattern)
     pattern))
+
+(defn class-pattern?
+  [pattern-type]
+  (= :class pattern-type))
 
 (defmulti match-pattern
   "Return a channel that will contain all pattern match solutions from flakes in
@@ -505,7 +510,10 @@
            p (or (get-sid p-mch db)
                  (get-value p-mch))
            o (or (get-value o-mch)
-                 (get-sid o-mch db))]
+                 (get-sid o-mch db))
+           ;; Optional range constraint extracted from inlined single-var filters.
+           ;; Used to narrow scans by setting start/end object bounds when possible.
+           o-range (::range o-mch)]
        (if (or (not (comparable-iri? s))
                (not (comparable-iri? p)))
          ;; no flakes will ever match the given triple pattern
@@ -521,8 +529,17 @@
                                        (log/error e "Error resolving flake range")
                                        (async/put! error-ch e))))
                [o* o-fn*]  (augment-object-fn db idx* s p o o-fn)
-               start-flake (flake/create s p o* o-dt nil nil util/min-integer)
-               end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
+               ;; Use range bounds from filter analysis when object isn't explicitly bound
+               o-start     (cond
+                             (some? o*) o*
+                             (some? (:start-o o-range)) (:start-o o-range)
+                             :else nil)
+               o-end       (cond
+                             (some? o*) o*
+                             (some? (:end-o o-range)) (:end-o o-range)
+                             :else nil)
+               start-flake (flake/create s p o-start o-dt nil nil util/min-integer)
+               end-flake   (flake/create s p o-end o-dt nil nil util/max-integer)
                track-fuel  (track/track-fuel! tracker error-ch)
                subj-filter (when s-fn
                              (filter (fn [f]
@@ -600,10 +617,15 @@
   (let [triple (pattern-data pattern)]
     (-match-class ds tracker solution triple error-ch)))
 
+(defmethod match-pattern :property-join
+  [ds tracker solution pattern error-ch]
+  (let [triples (pattern-data pattern)]
+    (-match-properties ds tracker solution triples error-ch)))
+
 (defn filter-exception
   "Reformats raw filter exception to try to provide more useful feedback."
-  [e f]
-  (let [fn-str (->> f meta :forms (str/join " "))
+  [e filter-desc]
+  (let [fn-str (str/join " " (:forms filter-desc))
         ex-msg (or (ex-message e)
                    ;; note: NullPointerException is common but has no ex-message, create one
                    (let [ex-type (str (type e))] ;; attempt to make JS compatible
@@ -642,12 +664,13 @@
 (defmethod match-pattern :filter
   [_ds _tracker solution pattern error-ch]
   (go
-    (let [f (pattern-data pattern)]
+    (let [desc (pattern-data pattern)
+          f    (:fn desc)]
       (try*
         (let [result (f solution)]
           (when result
             solution))
-        (catch* e (>! error-ch (filter-exception e f)))))))
+        (catch* e (>! error-ch (filter-exception e desc)))))))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the
@@ -662,19 +685,12 @@
                           solution-ch)
     out-ch))
 
-(defn with-constraints
-  [ds tracker patterns error-ch solution-ch]
+(defn match-patterns
+  [ds tracker solution patterns error-ch]
   (reduce (fn [solution-ch pattern]
             (with-constraint ds tracker pattern error-ch solution-ch))
-          solution-ch patterns))
-
-(defn match-triples
-  [ds tracker triples error-ch solution]
-  (let [[triple & r] triples
-        ;; get initial solution channel from first triple
-        solution-ch  (match-pattern ds tracker solution triple error-ch)]
-    ;; refine solution channel with subsequent triples
-    (with-constraints ds tracker r error-ch solution-ch)))
+          (async/to-chan! [solution])
+          patterns))
 
 (defn subquery?
   [pattern]
@@ -690,9 +706,8 @@
          other-patterns    false} (group-by subquery? clause)
 
         ;; process subqueries before other patterns
-        patterns    (into (vec subquery-patterns) other-patterns)
-        solution-ch (async/to-chan! [solution])
-        result-ch   (with-constraints ds tracker patterns error-ch solution-ch)]
+        patterns  (into (vec subquery-patterns) other-patterns)
+        result-ch (match-patterns ds tracker solution patterns error-ch)]
     (-finalize ds tracker error-ch result-ch)))
 
 (defn match-alias
@@ -855,13 +870,19 @@
   in subsequent patterns so that we don't erroneously consider them unmatched and
   therefore able to match any value."
   [solution optional-vars]
-  (reduce (fn [solution* var]
-            (update solution* var (fn [match]
-                                    (if (nil? match)
-                                      (optional-var var)
-                                      match))))
-          solution
-          optional-vars))
+  (if (empty? optional-vars)
+    solution
+    ;; Use a transient map so we can add optional vars in a single pass
+    ;; with `assoc!` while keeping the original persistent map semantics.
+    (let [t-solution (transient solution)]
+      (persistent!
+       (reduce (fn [sol var]
+                 (let [match (get sol var)]
+                   (if (nil? match)
+                     (assoc! sol var (optional-var var))
+                     sol)))
+               t-solution
+               optional-vars)))))
 
 (defmethod match-pattern :optional
   [db tracker solution pattern error-ch]
@@ -905,30 +926,47 @@
 
 (defn binding->solution
   [solution vars binding]
-  (reduce (fn [solution* var]
-            (if-let [{type "type" v "value" dt "datatype" lang "xml:lang"}
-                     (get binding var)]
-              (let [var-name (symbol (str "?" var))
-                    mch      (cond (= "literal" type)
-                                   (cond-> (-> (unmatched-var var-name)
-                                               (match-value v dt))
-                                     lang (match-lang v lang))
-                                   (#{"uri" "bnode"} type)
-                                   (-> (unmatched-var var-name)
-                                       (match-iri v))
-                                   :else
-                                   (throw (ex-info "Invalid SPARQL Query Results JSON Format."
-                                                   {:status 400, :error :db/invalid-query
-                                                    :spec "https://www.w3.org/TR/sparql11-results-json"
-                                                    :binding binding})))]
-                (or
-                  ;; add new var binding to solution
-                 (update-solution-binding solution* var-name mch)
-                  ;; already have a binding for the given var, no join
-                 (reduced nil)))
-              solution*))
-          solution
-          vars))
+  ;; Build up a solution for this SPARQL binding using a transient map so
+  ;; multiple var additions happen against a single, mutable backing map.
+  ;; This mirrors `update-solution-binding` semantics while avoiding repeated
+  ;; persistent map churn in tight loops.
+  (let [t-solution (transient solution)]
+    (loop [sol t-solution
+           vs  vars]
+      (if-let [var (first vs)]
+        (if-let [{type "type" v "value" dt "datatype" lang "xml:lang"}
+                 (get binding var)]
+          (let [var-name (symbol (str "?" var))
+                mch      (cond
+                           (= "literal" type)
+                           (cond-> (-> (unmatched-var var-name)
+                                       (match-value v dt))
+                             lang (match-lang v lang))
+
+                           (#{"uri" "bnode"} type)
+                           (-> (unmatched-var var-name)
+                               (match-iri v))
+
+                           :else
+                           (throw (ex-info "Invalid SPARQL Query Results JSON Format."
+                                           {:status 400, :error :db/invalid-query
+                                            :spec "https://www.w3.org/TR/sparql11-results-json"
+                                            :binding binding})))
+                current  (get sol var-name)]
+            ;; If there is an existing binding for this var, only keep it if it
+            ;; exactly matches; otherwise abort the join for this binding.
+            (if current
+              (if (and (= (get-binding mch) (get-binding current))
+                       (= (get-datatype-iri mch) (get-datatype-iri current))
+                       (= (get-lang mch) (get-lang current)))
+                (recur sol (rest vs))
+                ;; conflicting binding – no join for this binding
+                nil)
+              (recur (assoc! sol var-name mch) (rest vs))))
+          ;; No binding for this var in this row; move on.
+          (recur sol (rest vs)))
+        ;; All vars processed successfully – return persistent solution.
+        (persistent! sol)))))
 
 (defn sparql-service-error!
   [ex service sparql-q]

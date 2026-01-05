@@ -501,6 +501,8 @@ Query execution options.
 - `meta` - Include metadata in results
 - `policy` - Policy restrictions
 - `policy-class` - Policy class restrictions
+- `policy-values` - Values passed to policy queries
+- `default-allow` - If `true`, allow access when no policies apply (default: `false` which means deny)
 - `objectVarParsing` - Controls whether bare object strings that look like variables (e.g., `"?x"`) are parsed as variables in the WHERE clause.
   - Default: `true`
   - When `false`, scalar object values like `"?not-a-var"` are treated as string literals. Use the explicit JSON-LD form to bind a variable: `{"@variable": "?v"}`.

@@ -8,7 +8,7 @@
 (deftest s3-storage-creation-test
   (testing "S3 storage can be created with valid parameters"
     ;; Set mock credentials for test
-    (with-redefs [s3-storage/get-credentials (fn [] {:access-key "test-key" :secret-key "test-secret"})]
+    (with-redefs [s3-storage/get-base-credentials (fn [] {:access-key "test-key" :secret-key "test-secret"})]
       (let [store (s3-storage/open "test-s3" "test-bucket" "test-prefix")]
         (is (some? store) "S3Store should be created")
         (is (= "test-s3" (:identifier store)) "Identifier should match")
@@ -18,20 +18,20 @@
 (deftest s3-storage-identifiers-test
   (testing "S3 storage returns correct identifiers"
     ;; Set mock credentials for test
-    (with-redefs [s3-storage/get-credentials (fn [] {:access-key "test-key" :secret-key "test-secret"})]
+    (with-redefs [s3-storage/get-base-credentials (fn [] {:access-key "test-key" :secret-key "test-secret"})]
       (let [store (s3-storage/open "test-s3" "test-bucket" "test-prefix")]
         (is (= #{"test-s3"} (storage/identifiers store)) "Should return identifier set")))))
 
 (deftest s3-storage-location-test
   (testing "S3 storage generates correct location URI"
     ;; Set mock credentials for test
-    (with-redefs [s3-storage/get-credentials (fn [] {:access-key "test-key" :secret-key "test-secret"})]
+    (with-redefs [s3-storage/get-base-credentials (fn [] {:access-key "test-key" :secret-key "test-secret"})]
       (let [store (s3-storage/open "test-s3" "test-bucket" "test-prefix")]
         (is (= "fluree:test-s3:s3" (storage/location store))
             "Should generate correct fluree location URI"))))
 
   (testing "S3 storage normalizes prefix to end with /"
-    (with-redefs [s3-storage/get-credentials (fn [] {:access-key "test-key" :secret-key "test-secret"})]
+    (with-redefs [s3-storage/get-base-credentials (fn [] {:access-key "test-key" :secret-key "test-secret"})]
       (let [store1 (s3-storage/open nil "bucket" "prefix")
             store2 (s3-storage/open nil "bucket" "prefix/")
             store3 (s3-storage/open nil "bucket" "")

@@ -296,7 +296,7 @@
   (delete [clg address]
     (if-let [store (locate-address clg address)]
       (delete store address)
-      (async-location-error location))))
+      (async-location-error address))))
 
 (defn content-write-catalog-json
   [clg location path data]
@@ -311,4 +311,4 @@
   (if-let [store (locate-address clg address)]
     (let [path (get-local-path address)]
       (write-bytes store path data))
-    (async-location-error location)))
+    (async-location-error address)))

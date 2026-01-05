@@ -6,40 +6,76 @@
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [go-try <?]]))
 
-;; Inline filter optimization
+(defn compare-component
+  [cmp-a cmp-b]
+  (if (where/matched-value? cmp-a)
+    (if (where/matched-value? cmp-b)
+      0
+      -1)
+    (if (where/matched-value? cmp-b)
+      1
+      0)))
 
-(defn filter-info
-  "Describe a `:filter` pattern by returning a map of useful details, or nil if the
-  pattern is not a filter.
+(def triple-pattern-types
+  #{:tuple :class})
 
-  {:pattern <original pattern entry>
-   :fn      <compiled filter fn>
-   :vars    #{sym ...} ; symbols referenced by the filter
-   :forms   [form ...] ; parsed forms used to compile the filter
-   :order   [sym ...]} ; vars in a deterministic dependency order
+(defn triple-pattern?
+  [x]
+  (contains? triple-pattern-types (where/pattern-type x)))
 
-  The values mirror what the parser stored in the filter function's metadata, but
-  packaged in a plain map so downstream optimizations can reason about them without
-  digging through metadata directly."
-  [pattern]
-  (when (= :filter (where/pattern-type pattern))
-    (let [f     (where/pattern-data pattern)
-          forms (some-> f meta :forms vec)
-          vars  (-> f meta :vars)
-          order (or (some-> f meta :dependency-order vec)
-                    (some-> vars sort vec))]
-      {:pattern pattern
-       :fn      f
-       :vars    vars
-       :forms   forms
-       :order   order})))
+(defn coerce-triple
+  [x]
+  (if (triple-pattern? x)
+    (where/pattern-data x)
+    (throw (ex-info "Optimization failed on non triple pattern type"
+                    {:status   500
+                     :error    :db/optimization-failure
+                     ::pattern x}))))
+
+(defn compare-triples
+  [a b]
+  (let [a' (coerce-triple a)
+        b' (coerce-triple b)]
+    (reduce (fn [_ nxt]
+              (if (zero? nxt)
+                nxt
+                (reduced nxt)))
+            (map compare-component a' b'))))
+
+(defprotocol Optimizable
+  "Protocol for query optimization based on database statistics."
+
+  (-reorder [db where-clause]
+    "Reorder the patterns within a parsed where clause based on database statistics.
+
+    Returns a channel that will contain the reordered where clause. If the
+    database has no statistics available, returns the clause unchanged.
+
+    Parameters:
+      db           - Database instance (FlakeDB, AsyncDB, etc.)
+      where-clause - Parsed where clause (vector of patterns)
+
+    Returns:
+      Channel containing reordered where clause")
+
+  (-explain [db parsed-query]
+    "Generate an execution plan for the query showing optimization details.
+
+    Returns a channel that will contain a query plan map.
+
+    Parameters:
+      db           - Database instance (FlakeDB, AsyncDB, etc.)
+      parsed-query - Parsed query produced by `fql/parse-query`
+
+    Returns:
+      Channel containing query plan map"))
 
 (defn collect-filters
   "Split a where clause into binding patterns and top-level filter descriptors.
 
   Returns a map with:
   - :binding-patterns — patterns excluding top-level :filter entries
-  - :filters — descriptor maps from `filter-info` for each top-level filter
+  - :filters — descriptor maps for each top-level filter (parser-emitted)
 
   Filters nested in higher‑order patterns are left in place."
   [patterns]
@@ -50,40 +86,155 @@
       (let [next-remaining (rest remaining)
             pattern-type   (where/pattern-type pattern)]
         (if (= :filter pattern-type)
-          (if-let [info (filter-info pattern)]
-            (recur next-remaining binding-patterns (conj filters info))
-            (recur next-remaining (conj binding-patterns pattern) filters))
+          (let [info (where/pattern-data pattern)]
+            (recur next-remaining binding-patterns (conj filters info)))
           (recur next-remaining (conj binding-patterns pattern) filters)))
       {:binding-patterns binding-patterns
        :filters          filters})))
 
-(defn get-filtered-variable
-  "If a :filter pattern references exactly one variable, return it; else nil."
-  [pattern]
-  (let [vars (some-> pattern filter-info :vars)]
-    (when (= 1 (count vars))
-      (first vars))))
-
 (defn matches-var?
   "Return true if the match object references `variable`."
   [match variable]
-  (= variable (where/get-variable match)))
+  (-> match where/get-variable (= variable)))
 
-(defn binds-var?
-  "Return true if match both references `variable` and is unmatched."
-  [match variable]
-  (and (where/unmatched? match)
-       (matches-var? match variable)))
+;; --- Range extraction helpers for filter pushdown ---
 
-(defn tuple-binds-var?
-  "Return true if any element of `tuple` binds `variable`."
-  [tuple variable]
-  (some #(binds-var? % variable) tuple))
+(def ^:private comparison-ops
+  "Set of comparison operators that can be used to derive range bounds."
+  #{'> '>= '< '<=})
+
+(defn- scalar-literal?
+  "Returns true if x is a scalar literal (number or string) that can be used
+  as a range bound."
+  [x]
+  (or (number? x) (string? x)))
+
+(defn- extract-comparison-forms
+  "Extract comparison forms from potentially nested (and ...) expressions.
+  Returns a sequence of comparison forms."
+  [form]
+  (cond
+    (and (seq? form) (= 'and (first form)))
+    (mapcat extract-comparison-forms (rest form))
+
+    (and (seq? form) (contains? comparison-ops (first form)))
+    [form]
+
+    :else
+    []))
+
+(defn- comparison-form->range
+  "Convert a single comparison form to a range bound map.
+  Returns nil if the form doesn't match the expected pattern.
+
+  Examples:
+    (> ?v 10)  with variable=?v -> {:lower {:value 10 :strict? true}}
+    (< 5 ?v)  with variable=?v -> {:lower {:value 5 :strict? true}}"
+  [form variable]
+  (when (and (seq? form) (= 3 (count form)))
+    (let [[op a b] form]
+      (when (contains? comparison-ops op)
+        (cond
+          ;; (< ?v 10) means ?v < 10, so upper bound
+          (and (= a variable) (scalar-literal? b))
+          (case op
+            >  {:lower {:value b :strict? true}}
+            >= {:lower {:value b :strict? false}}
+            <  {:upper {:value b :strict? true}}
+            <= {:upper {:value b :strict? false}})
+
+          ;; (< 10 ?v) means 10 < ?v, so lower bound
+          (and (scalar-literal? a) (= b variable))
+          (case op
+            >  {:upper {:value a :strict? true}}
+            >= {:upper {:value a :strict? false}}
+            <  {:lower {:value a :strict? true}}
+            <= {:lower {:value a :strict? false}})
+
+          :else
+          nil)))))
+
+(defn- tighter-bound
+  "Pick the tighter of two bounds using pick-fn to decide based on comparison.
+  pick-fn receives [bound-a bound-b comparison-result] and returns the tighter bound."
+  [a b pick-fn]
+  (cond
+    (nil? a) b
+    (nil? b) a
+    :else
+    (let [va (:value a)
+          vb (:value b)
+          c  (compare va vb)]
+      (pick-fn a b c))))
+
+(defn- merge-range-bounds
+  "Merge two range maps, keeping tighter bounds.
+  For lower bounds, picks the larger value. For upper bounds, picks the smaller value.
+  When values are equal, prefers strict bounds (> or <) over non-strict (>= or <=)."
+  [r1 r2]
+  (when (or r1 r2)
+    (let [l1 (:lower r1) l2 (:lower r2)
+          u1 (:upper r1) u2 (:upper r2)
+          ;; For lower bound, pick the larger value (tighter constraint)
+          lower (tighter-bound l1 l2 (fn [a b c]
+                                       (cond
+                                         (neg? c) b
+                                         (pos? c) a
+                                         ;; equal values - prefer strict bounds
+                                         :else (if (:strict? a) a b))))
+          ;; For upper bound, pick the smaller value (tighter constraint)
+          upper (tighter-bound u1 u2 (fn [a b c]
+                                       (cond
+                                         (pos? c) b
+                                         (neg? c) a
+                                         ;; equal values - prefer strict bounds
+                                         :else (if (:strict? a) a b))))]
+      (cond-> {}
+        lower (assoc :lower lower)
+        upper (assoc :upper upper)))))
+
+(defn- bound->scan-value
+  "Convert a bound to a scan value for index range queries.
+  For strict bounds on doubles (CLJ only), uses nextUp/nextDown to adjust the value
+  so the range scan excludes the boundary value.
+  In CLJS, returns the value as-is and relies on the filter fn to enforce strictness."
+  [{:keys [value strict?]} direction]
+  (if (and strict?
+           #?(:clj (instance? Double value) :cljs false))
+    (case direction
+      :lower #?(:clj (Math/nextUp (double value)) :cljs value)
+      :upper #?(:clj (Math/nextDown (double value)) :cljs value))
+    value))
+
+(defn- extract-range-from-codes
+  "Extract a range map from filter code forms for a given variable.
+  Returns a map with :start-o and/or :end-o keys for index scanning,
+  or nil if no range bounds could be extracted."
+  [codes variable]
+  (let [ranges (->> codes
+                    (mapcat extract-comparison-forms)
+                    (keep #(comparison-form->range % variable)))]
+    (when (seq ranges)
+      (let [r (reduce merge-range-bounds nil ranges)]
+        (when (seq r)
+          (cond-> r
+            (:lower r) (assoc :start-o (bound->scan-value (:lower r) :lower))
+            (:upper r) (assoc :end-o (bound->scan-value (:upper r) :upper))))))))
 
 (defn with-filter-code
-  "Attach parsed filter forms to a match object under ::filter-code."
+  "Attach filter code to a match object for later compilation.
+  Stores the code and variable in metadata for later compilation.
+
+  Also extracts range bounds from simple comparison filters like:
+    (< ?v n), (<= ?v n), (> ?v n), (>= ?v n)
+    (< ?v \"str\"), (<= ?v \"str\"), (> ?v \"str\"), (>= ?v \"str\")
+  and nested (and ...) combinations of those.
+
+  Stores derived range on the match object as ::where/range with :start-o / :end-o."
   [mch variable codes]
-  (assoc mch ::filter-code {:variable variable, :forms codes}))
+  (let [range-from-codes (extract-range-from-codes codes variable)]
+    (cond-> (assoc mch ::filter-code {:variable variable, :forms codes})
+      range-from-codes (assoc ::where/range range-from-codes))))
 
 (defn with-var-filter
   "Attach filter code to the match in `tuple` that binds `variable`."
@@ -94,33 +245,15 @@
             mch))
         tuple))
 
-(defn get-filter-codes
-  "Return parsed filter forms from a filter fn’s metadata."
-  [filter-fn]
-  (-> filter-fn meta :forms vec))
-
-(def binding-pattern-types
-  #{:tuple :class :id})
-
-(defn binding-pattern?
-  [pattern-type]
-  (contains? binding-pattern-types pattern-type))
-
 (defn tuple-bindings
-  [tuple]
-  (->> tuple
-       (keep (fn [m]
-               (let [var (where/get-variable m)]
-                 (when (and var (where/unmatched? m))
-                   var))))
-       set))
-
-(defn bound-vars
-  "Return vars guaranteed to be bound by a binding pattern, or nil otherwise."
   [pattern]
-  (let [pattern-type (where/pattern-type pattern)]
-    (when (binding-pattern? pattern-type)
-      (->> pattern where/pattern-data util/ensure-vector tuple-bindings))))
+  (->> pattern
+       where/pattern-data
+       util/ensure-vector
+       (keep (fn [m]
+               (when (where/unmatched? m)
+                 (where/get-variable m))))
+       set))
 
 (declare clause-bindings)
 
@@ -147,7 +280,7 @@
 
 (defmethod pattern-bindings :simple/binding
   [pattern]
-  (or (bound-vars pattern) #{}))
+  (tuple-bindings pattern))
 
 (defmethod pattern-bindings :graph
   [pattern]
@@ -225,9 +358,9 @@
    (remove #(set/subset? (:vars %) bound) filters)])
 
 (defn append-clause-filters
-  "Append `appendable` filter patterns to inner clause and return it."
+  "Append `appendable` filter descriptors to inner clause as :filter patterns and return it."
   [inner appendable]
-  (into (vec inner) (map :pattern) appendable))
+  (into (vec inner) (map #(where/->pattern :filter %)) appendable))
 
 (defn append-union-filters
   "Append filters to every union branch, returning updated branches."
@@ -358,40 +491,41 @@
           (recur (rest remaining) (conj acc p) filters bound-next)))
       {:patterns acc :filters filters})))
 
-(defn select-target-var
-  "Return the last symbol in `ordered-vars` that is contained in `likely-vars`."
-  [likely-vars ordered-vars]
-  (some likely-vars (rseq ordered-vars)))
-
 (defn advance-pending
   [pending pattern-vars]
-  (reduce-kv
-   (fn [[pending* inline] id {:keys [info remaining inlined?] :as entry}]
-     (if inlined?
-       [(assoc pending* id entry) inline]
-       (let [remaining (or remaining #{})
-             newly-bound (set/intersection remaining pattern-vars)
-             remaining*  (set/difference remaining pattern-vars)]
-         (if (and (seq newly-bound) (empty? remaining*))
-           (let [target (select-target-var newly-bound (:order info))]
-             [(assoc pending* id (assoc entry
-                                        :remaining remaining*
-                                        :inlined? true
-                                        :target target))
-              (conj inline {:id id
-                            :target target
-                            :forms  (:forms info)})])
-           [(assoc pending* id (assoc entry :remaining remaining*))
-            inline]))))
-   [pending []]
-   pending))
+  (loop [ids        (keys pending)
+         pending*   pending
+         inline     []
+         standalone []]
+    (if-let [id (first ids)]
+      (let [{:keys [info remaining inlined?] :as entry} (get pending* id)]
+        (if inlined?
+          (recur (rest ids) pending* inline standalone)
+          (let [remaining   (or remaining #{})
+                newly-bound (set/intersection remaining pattern-vars)
+                remaining*  (set/difference remaining pattern-vars)]
+            (if (and (seq newly-bound) (empty? remaining*))
+              (if (= 1 (count newly-bound))
+                (let [target   (first newly-bound)
+                      entry*   (assoc entry :remaining remaining* :inlined? true :target target)
+                      inline*  (conj inline {:id id :target target :forms (:forms info)})
+                      pending** (assoc pending* id entry*)]
+                  (recur (rest ids) pending** inline* standalone))
+                (let [entry*   (assoc entry :remaining remaining* :inlined? true :target nil)
+                      pending** (assoc pending* id entry*)
+                      stand*    (conj standalone {:id id :info info})]
+                  (recur (rest ids) pending** inline stand*)))
+              (let [entry*   (assoc entry :remaining remaining*)
+                    pending** (assoc pending* id entry*)]
+                (recur (rest ids) pending** inline standalone))))))
+      [pending* inline standalone])))
 
 (defn attach-inline-filters
   [pattern pattern-type pending pattern-vars]
   (let [tuple (if (= :tuple pattern-type)
                 (util/ensure-vector pattern)
                 (util/ensure-vector (where/pattern-data pattern)))
-        [pending* inline] (advance-pending pending pattern-vars)
+        [pending* inline standalone] (advance-pending pending pattern-vars)
         tuple* (reduce (fn [tuple {:keys [target forms]}]
                          (with-var-filter tuple target forms))
                        tuple inline)
@@ -402,7 +536,11 @@
                    pattern)]
     {:pattern pattern*
      :pending pending*
-     :inlined? (seq inline)}))
+     :inlined? (seq inline)
+     :after   (when (seq standalone)
+                (mapv (fn [{:keys [info]}]
+                        (where/->pattern :filter info))
+                      standalone))}))
 
 (def ^:private pending-filter-key ::pending-filter)
 
@@ -439,26 +577,26 @@
                     (let [id (get entry pending-filter-key)
                           {:keys [info inlined?]} (get pending id)]
                       (when-not inlined?
-                        [(:pattern info)]))
+                        [(where/->pattern :filter info)]))
                     [entry])))
         result))
 
 (defn inline-clause*
   [bound patterns]
   (loop [remaining patterns
-         result []
-         bound bound
-         pending {}]
+         result    []
+         bound     bound
+         pending   {}]
     (if-let [pattern (first remaining)]
       (let [pattern-type (where/pattern-type pattern)]
         (case pattern-type
           :filter
-          (if-let [{:keys [vars] :as info} (filter-info pattern)]
+          (let [{:keys [vars] :as info} (where/pattern-data pattern)]
             (if (seq vars)
-              (let [id (gensym "filter")
-                    pending-entry {:info info
+              (let [id            (gensym "filter")
+                    pending-entry {:info      info
                                    :remaining (set vars)
-                                   :inlined? false}]
+                                   :inlined?  false}]
                 (recur (rest remaining)
                        (conj result {pending-filter-key id})
                        bound
@@ -466,18 +604,16 @@
               (recur (rest remaining)
                      (conj result pattern)
                      bound
-                     pending))
-            (recur (rest remaining)
-                   (conj result pattern)
-                   bound
-                   pending))
+                     pending)))
 
           (:tuple :class :id)
-          (let [pattern-vars (or (bound-vars pattern) #{})
-                {:keys [pattern pending]} (attach-inline-filters pattern pattern-type pending pattern-vars)
-                bound* (into bound pattern-vars)]
+          (let [pattern-vars (tuple-bindings pattern)
+                bound*       (into bound pattern-vars)
+
+                {:keys [pattern pending after]}
+                (attach-inline-filters pattern pattern-type pending pattern-vars)]
             (recur (rest remaining)
-                   (conj result pattern)
+                   (into (conj result pattern) after)
                    bound*
                    pending))
 
@@ -492,9 +628,9 @@
                  (conj result pattern)
                  bound
                  pending)))
-      {:result result
+      {:result  result
        :pending pending
-       :bound bound})))
+       :bound   bound})))
 
 (defn inline-clause
   [bound clause]
@@ -506,9 +642,7 @@
 (defn strip-filter-code
   "Remove temporary `::filter-code` metadata from a match object, if present."
   [mch]
-  (if (::filter-code mch)
-    (dissoc mch ::filter-code)
-    mch))
+  (dissoc mch ::filter-code))
 
 (declare strip-clause-filters)
 
@@ -522,8 +656,16 @@
       ;; Tuple patterns are vectors of match objects
       (mapv strip-filter-code pattern)
 
-      (:class :id)
-      ;; Class and ID patterns have a single match object as data
+      :class
+      ;; Class patterns may carry a vector of matches after inlining
+      (let [data (where/pattern-data pattern)
+            data* (if (vector? data)
+                    (mapv strip-filter-code data)
+                    (strip-filter-code data))]
+        (where/->pattern pattern-type data*))
+
+      :id
+      ;; ID patterns always contain a single match
       (let [mch (-> pattern where/pattern-data strip-filter-code)]
         (where/->pattern pattern-type mch))
 
@@ -564,7 +706,7 @@
   assumes patterns have already been scheduled using Optimizer."
   [binding-patterns filter-descriptors]
   (let [clause (into (vec binding-patterns)
-                     (map :pattern)
+                     (map (partial where/->pattern :filter))
                      filter-descriptors)]
     (inline-clause #{} clause)))
 

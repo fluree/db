@@ -2,6 +2,7 @@
   (:require [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.core.async :as async :refer [go <!]]
             [clojure.walk :refer [postwalk]]
+            [fluree.db.api.decode :as decode]
             [fluree.db.api.transact :as transact-api]
             [fluree.db.connection :as connection :refer [connection?]]
             [fluree.db.connection.config :as config]
@@ -9,6 +10,7 @@
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.json-ld.policy :as policy]
+            [fluree.db.json-ld.policy.rules :as policy-rules]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice.query :as ns-query]
             [fluree.db.query.api :as query-api]
@@ -554,48 +556,49 @@
   Parameters:
     conn - Connection object
     ledger-id - Ledger alias (with optional :branch) or address
+    context - (optional) JSON-LD context for compacting IRIs in response
 
   Returns info map with:
-    - :address - Ledger address
-    - :alias - Ledger alias
-    - :branch - Branch name
-    - :t - Current transaction number
-    - :size - Total byte size
-    - :flakes - Total flake count
-    - :commit - Commit metadata
-    - :properties - Map of property IRI -> stats (count, NDV, selectivity, etc.)
-    - :classes - Map of class IRI -> stats
+    - :commit - Commit metadata (JSON-LD format) including:
+        - @id - Commit ID
+        - @type - Type (VerifiableCredential)
+        - alias - Ledger alias
+        - data - DB data including t (transaction number)
+        - index - Index metadata with id, t, and address
+        - ns - Namespace addresses
+        - previous - Previous commit reference
+        - time - Commit timestamp
+    - :nameservice - Nameservice record (JSON-LD format) if available, including:
+        - @id - Ledger alias with branch
+        - f:branch - Branch name
+        - f:t - Current transaction number
+        - f:commit - Commit address/reference
+        - f:index - Index address/reference
+    - :namespace-codes - Map of namespace IRIs to namespace codes
+    - :stats - Statistics map containing:
+      - :size - Total byte size
+      - :flakes - Total flake count
+      - :properties - Map of property IRI -> stats (count, NDV, selectivity, :sub-property-of)
+      - :classes - Map of class IRI -> stats (count, :subclass-of, nested property details)
 
   Property and class counts are computed from the most recent index plus
-  any novelty, providing absolutely current statistics."
-  [conn ledger-id]
-  (validate-connection conn)
-  (promise-wrap
-   (go-try
-     (let [ledger (<? (connection/load-ledger conn ledger-id))
-           info   (<? (ledger/ledger-info ledger))
-           namespace-codes (:namespace-codes info)
-           ;; Helper to decode SID keys to IRIs
-           decode-keys (fn [m]
-                         (reduce-kv (fn [acc sid stats]
-                                      (assoc acc (iri/sid->iri sid namespace-codes) stats))
-                                    {}
-                                    m))
-           ;; Decode properties and classes within stats
-           decoded-properties (decode-keys (get-in info [:stats :properties]))
-           decoded-classes (decode-keys (get-in info [:stats :classes]))
-           ;; Invert namespace-codes to be {namespace -> code} for API consumers
-           inverted-ns-codes (reduce-kv (fn [acc code ns]
-                                          (assoc acc ns code))
-                                        {}
-                                        namespace-codes)]
-       ;; Return result with IRIs instead of SIDs, with inverted namespace-codes
-       ;; Remove internal fields like novelty-post
-       (-> info
-           (assoc-in [:stats :properties] decoded-properties)
-           (assoc-in [:stats :classes] decoded-classes)
-           (assoc :namespace-codes inverted-ns-codes)
-           (dissoc :novelty-post))))))
+  any novelty, providing absolutely current statistics.
+
+  Hierarchy information (:sub-property-of, :subclass-of) shows direct parent relationships
+  for properties and classes that have them.
+
+  When context is provided, all IRIs in the stats maps will be compacted using
+  the context prefixes (e.g., \"http://example.org/name\" -> \"ex:name\")."
+  ([conn ledger-id] (ledger-info conn ledger-id nil))
+  ([conn ledger-id context]
+   (validate-connection conn)
+   (promise-wrap
+    (go-try
+      (let [ledger     (<? (connection/load-ledger conn ledger-id))
+            info       (<? (ledger/ledger-info ledger))
+            compact-fn (when context
+                         (json-ld/compact-fn (json-ld/parse-context context)))]
+        (decode/ledger-info info compact-fn))))))
 
 ;; db operations
 
@@ -621,15 +624,18 @@
     db - Database value
     policy - JSON-LD policy document
     policy-values - (optional) Values for policy variables
+    default-allow? - (optional) If truthy, allow access when no policies apply (default false)
 
   Returns promise resolving to policy-wrapped database."
   ([db policy]
    (wrap-policy db policy nil))
   ([db policy policy-values]
+   (wrap-policy db policy policy-values nil))
+  ([db policy policy-values default-allow?]
    (promise-wrap
-    (let [policy* (json-ld/expand policy)
+    (let [policy*        (json-ld/expand policy)
           policy-values* (util.parse/normalize-values policy-values)]
-      (policy/wrap-policy db policy* policy-values*)))))
+      (policy-rules/wrap-policy db nil policy* policy-values* default-allow?)))))
 
 (defn wrap-class-policy
   "Applies policy restrictions based on policy classes in the database.
@@ -638,15 +644,18 @@
     db - Database value
     policy-classes - IRI or vector of IRIs of policy classes
     policy-values - (optional) Values for policy variables
+    default-allow? - (optional) If truthy, allow access when no policies apply (default false)
 
   Finds and applies all policies with matching @type.
   Returns promise resolving to policy-wrapped database."
   ([db policy-classes]
    (wrap-class-policy db policy-classes nil))
   ([db policy-classes policy-values]
+   (wrap-class-policy db policy-classes policy-values nil))
+  ([db policy-classes policy-values default-allow?]
    (promise-wrap
     (let [policy-values* (util.parse/normalize-values policy-values)]
-      (policy/wrap-class-policy db nil policy-classes policy-values*)))))
+      (policy/wrap-class-policy db nil policy-classes policy-values* default-allow?)))))
 
 (defn wrap-identity-policy
   "Applies policy restrictions based on an identity's policy classes.
@@ -655,6 +664,7 @@
     db - Database value
     identity - IRI of the identity
     policy-values - (optional) Values for policy variables
+    default-allow? - (optional) If truthy, allow access when no policies apply (default false)
 
   Looks up the identity's f:policyClass property and applies
   all policies with those class IRIs.
@@ -663,9 +673,11 @@
   ([db identity]
    (wrap-identity-policy db identity nil))
   ([db identity policy-values]
+   (wrap-identity-policy db identity policy-values nil))
+  ([db identity policy-values default-allow?]
    (promise-wrap
     (let [policy-values* (util.parse/normalize-values policy-values)]
-      (policy/wrap-identity-policy db nil identity policy-values*)))))
+      (policy/wrap-identity-policy db nil identity policy-values* default-allow?)))))
 
 (defn dataset
   "Creates a composed dataset from multiple resolved graph databases.
