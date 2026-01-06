@@ -522,3 +522,261 @@
       ;; This test verifies the structure is correct
       (is (some? (plan/estimated-rows union))
           "UnionOp should have estimated-rows"))))
+
+;;; ---------------------------------------------------------------------------
+;;; HashAggOp Tests (SPARQL GROUP BY + Aggregations)
+;;; ---------------------------------------------------------------------------
+
+;; Extended test data for aggregation tests
+(def aggregation-test-data
+  [{:category "electronics" :amount 100 :quantity 2}
+   {:category "electronics" :amount 200 :quantity 1}
+   {:category "electronics" :amount 150 :quantity 3}
+   {:category "clothing" :amount 50 :quantity 5}
+   {:category "clothing" :amount 75 :quantity 2}
+   {:category "food" :amount 25 :quantity 10}])
+
+(def agg-test-source
+  (create-mock-source {"sales" aggregation-test-data
+                       "airlines" airlines-data}))
+
+(deftest hash-agg-op-protocol-test
+  (testing "HashAggOp satisfies ITabularPlan protocol"
+    (let [scan (plan/create-scan-op agg-test-source "sales" ["category" "amount"] [])
+          agg (plan/create-hash-agg-op scan ["category"]
+                                       [{:fn :count :column nil :alias "cnt"}])]
+      (is (satisfies? plan/ITabularPlan agg)))))
+
+(deftest hash-agg-op-count-star-test
+  (testing "HashAggOp COUNT(*) with no GROUP BY"
+    (let [scan (plan/create-scan-op agg-test-source "sales" ["category" "amount"] [])
+          agg (plan/create-hash-agg-op scan []
+                                       [{:fn :count :column nil :alias "total"}])]
+      (plan/open! agg)
+      (try
+        (let [batch (plan/next-batch! agg)]
+          (is (some? batch) "Should emit aggregated results")
+          (is (vector? batch) "Results should be a vector")
+          (is (= 1 (count batch)) "COUNT(*) without GROUP BY produces 1 row")
+          (is (= 6 (get (first batch) "total")) "Should count all 6 rows"))
+        (finally
+          (plan/close! agg)))))
+
+  (testing "HashAggOp COUNT(?var) counts non-nulls"
+    (let [;; Use airlines data - all have non-null name
+          scan (plan/create-scan-op agg-test-source "airlines" ["id" "name" "country"] [])
+          agg (plan/create-hash-agg-op scan []
+                                       [{:fn :count :column "name" :alias "name_cnt"}])]
+      (plan/open! agg)
+      (try
+        (let [batch (plan/next-batch! agg)]
+          (is (= 1 (count batch)))
+          (is (= 4 (get (first batch) "name_cnt")) "Should count 4 non-null names"))
+        (finally
+          (plan/close! agg))))))
+
+(deftest hash-agg-op-group-by-test
+  (testing "HashAggOp with GROUP BY produces groups"
+    (let [scan (plan/create-scan-op agg-test-source "sales" ["category" "amount" "quantity"] [])
+          agg (plan/create-hash-agg-op scan ["category"]
+                                       [{:fn :count :column nil :alias "cnt"}])]
+      (plan/open! agg)
+      (try
+        (let [batch (plan/next-batch! agg)
+              by-category (zipmap (map #(get % "category") batch)
+                                  (map #(get % "cnt") batch))]
+          (is (= 3 (count batch)) "Should have 3 category groups")
+          (is (= 3 (get by-category "electronics")) "Electronics has 3 rows")
+          (is (= 2 (get by-category "clothing")) "Clothing has 2 rows")
+          (is (= 1 (get by-category "food")) "Food has 1 row"))
+        (finally
+          (plan/close! agg)))))
+
+  (testing "HashAggOp GROUP BY with multiple group keys"
+    (let [;; Group by both country (group key) - US has 2 airlines
+          scan (plan/create-scan-op agg-test-source "airlines" ["id" "name" "country"] [])
+          agg (plan/create-hash-agg-op scan ["country"]
+                                       [{:fn :count :column nil :alias "airline_cnt"}])]
+      (plan/open! agg)
+      (try
+        (let [batch (plan/next-batch! agg)
+              by-country (zipmap (map #(get % "country") batch)
+                                 (map #(get % "airline_cnt") batch))]
+          (is (= 3 (count batch)) "Should have 3 country groups")
+          (is (= 2 (get by-country "US")) "US has 2 airlines")
+          (is (= 1 (get by-country "DE")) "DE has 1 airline")
+          (is (= 1 (get by-country "FR")) "FR has 1 airline"))
+        (finally
+          (plan/close! agg))))))
+
+(deftest hash-agg-op-sum-test
+  (testing "HashAggOp SUM aggregation"
+    (let [scan (plan/create-scan-op agg-test-source "sales" ["category" "amount"] [])
+          agg (plan/create-hash-agg-op scan ["category"]
+                                       [{:fn :sum :column "amount" :alias "total_amount"}])]
+      (plan/open! agg)
+      (try
+        (let [batch (plan/next-batch! agg)
+              by-category (zipmap (map #(get % "category") batch)
+                                  (map #(get % "total_amount") batch))]
+          (is (= 450 (get by-category "electronics")) "Electronics: 100+200+150=450")
+          (is (= 125 (get by-category "clothing")) "Clothing: 50+75=125")
+          (is (= 25 (get by-category "food")) "Food: 25"))
+        (finally
+          (plan/close! agg)))))
+
+  (testing "HashAggOp SUM without GROUP BY"
+    (let [scan (plan/create-scan-op agg-test-source "sales" ["amount"] [])
+          agg (plan/create-hash-agg-op scan []
+                                       [{:fn :sum :column "amount" :alias "grand_total"}])]
+      (plan/open! agg)
+      (try
+        (let [batch (plan/next-batch! agg)]
+          (is (= 1 (count batch)))
+          (is (= 600 (get (first batch) "grand_total")) "Grand total: 100+200+150+50+75+25=600"))
+        (finally
+          (plan/close! agg))))))
+
+(deftest hash-agg-op-avg-test
+  (testing "HashAggOp AVG aggregation"
+    (let [scan (plan/create-scan-op agg-test-source "sales" ["category" "amount"] [])
+          agg (plan/create-hash-agg-op scan ["category"]
+                                       [{:fn :avg :column "amount" :alias "avg_amount"}])]
+      (plan/open! agg)
+      (try
+        (let [batch (plan/next-batch! agg)
+              by-category (zipmap (map #(get % "category") batch)
+                                  (map #(get % "avg_amount") batch))]
+          (is (= 150 (get by-category "electronics")) "Electronics avg: 450/3=150")
+          (is (= 125/2 (get by-category "clothing")) "Clothing avg: 125/2")
+          (is (= 25 (get by-category "food")) "Food avg: 25/1=25"))
+        (finally
+          (plan/close! agg))))))
+
+(deftest hash-agg-op-min-max-test
+  (testing "HashAggOp MIN aggregation"
+    (let [scan (plan/create-scan-op agg-test-source "sales" ["category" "amount"] [])
+          agg (plan/create-hash-agg-op scan ["category"]
+                                       [{:fn :min :column "amount" :alias "min_amount"}])]
+      (plan/open! agg)
+      (try
+        (let [batch (plan/next-batch! agg)
+              by-category (zipmap (map #(get % "category") batch)
+                                  (map #(get % "min_amount") batch))]
+          (is (= 100 (get by-category "electronics")) "Electronics min: 100")
+          (is (= 50 (get by-category "clothing")) "Clothing min: 50")
+          (is (= 25 (get by-category "food")) "Food min: 25"))
+        (finally
+          (plan/close! agg)))))
+
+  (testing "HashAggOp MAX aggregation"
+    (let [scan (plan/create-scan-op agg-test-source "sales" ["category" "amount"] [])
+          agg (plan/create-hash-agg-op scan ["category"]
+                                       [{:fn :max :column "amount" :alias "max_amount"}])]
+      (plan/open! agg)
+      (try
+        (let [batch (plan/next-batch! agg)
+              by-category (zipmap (map #(get % "category") batch)
+                                  (map #(get % "max_amount") batch))]
+          (is (= 200 (get by-category "electronics")) "Electronics max: 200")
+          (is (= 75 (get by-category "clothing")) "Clothing max: 75")
+          (is (= 25 (get by-category "food")) "Food max: 25"))
+        (finally
+          (plan/close! agg))))))
+
+(deftest hash-agg-op-count-distinct-test
+  (testing "HashAggOp COUNT(DISTINCT) aggregation"
+    (let [;; Add test data with duplicates
+          dup-data [{:category "A" :value "x"}
+                    {:category "A" :value "y"}
+                    {:category "A" :value "x"}  ;; Duplicate
+                    {:category "B" :value "z"}
+                    {:category "B" :value "z"}] ;; Duplicate
+          dup-source (create-mock-source {"items" dup-data})
+          scan (plan/create-scan-op dup-source "items" ["category" "value"] [])
+          agg (plan/create-hash-agg-op scan ["category"]
+                                       [{:fn :count-distinct :column "value" :alias "unique_values"}])]
+      (plan/open! agg)
+      (try
+        (let [batch (plan/next-batch! agg)
+              by-category (zipmap (map #(get % "category") batch)
+                                  (map #(get % "unique_values") batch))]
+          (is (= 2 (get by-category "A")) "Category A has 2 unique values (x, y)")
+          (is (= 1 (get by-category "B")) "Category B has 1 unique value (z)"))
+        (finally
+          (plan/close! agg))))))
+
+(deftest hash-agg-op-multiple-aggregates-test
+  (testing "HashAggOp with multiple aggregate functions"
+    (let [scan (plan/create-scan-op agg-test-source "sales" ["category" "amount" "quantity"] [])
+          agg (plan/create-hash-agg-op scan ["category"]
+                                       [{:fn :count :column nil :alias "row_cnt"}
+                                        {:fn :sum :column "amount" :alias "total_amount"}
+                                        {:fn :avg :column "quantity" :alias "avg_qty"}
+                                        {:fn :min :column "amount" :alias "min_amt"}
+                                        {:fn :max :column "amount" :alias "max_amt"}])]
+      (plan/open! agg)
+      (try
+        (let [batch (plan/next-batch! agg)
+              electronics (first (filter #(= "electronics" (get % "category")) batch))]
+          (is (= 3 (count batch)) "Should have 3 groups")
+          ;; Check electronics group has all aggregates
+          (is (= 3 (get electronics "row_cnt")) "Electronics COUNT(*) = 3")
+          (is (= 450 (get electronics "total_amount")) "Electronics SUM(amount) = 450")
+          (is (= 2 (get electronics "avg_qty")) "Electronics AVG(quantity) = 6/3 = 2")
+          (is (= 100 (get electronics "min_amt")) "Electronics MIN(amount) = 100")
+          (is (= 200 (get electronics "max_amt")) "Electronics MAX(amount) = 200"))
+        (finally
+          (plan/close! agg))))))
+
+(deftest hash-agg-op-empty-input-test
+  (testing "HashAggOp with empty input produces empty output"
+    (let [;; Create source with no data matching predicate
+          scan (plan/create-scan-op agg-test-source "sales" ["category" "amount"]
+                                    [{:column "category" :op :eq :value "nonexistent"}])
+          agg (plan/create-hash-agg-op scan ["category"]
+                                       [{:fn :count :column nil :alias "cnt"}])]
+      (plan/open! agg)
+      (try
+        (let [batch (plan/next-batch! agg)]
+          ;; Empty input should produce no output rows
+          (is (or (nil? batch) (empty? batch))
+              "Empty input should produce no aggregated rows"))
+        (finally
+          (plan/close! agg))))))
+
+(deftest hash-agg-op-implicit-grouping-empty-input-test
+  (testing "SPARQL semantics: implicit grouping with empty input returns 1 row"
+    ;; Per SPARQL spec, COUNT(*) with no GROUP BY over 0 rows must return
+    ;; exactly 1 row with count=0 (not 0 rows)
+    (let [scan (plan/create-scan-op agg-test-source "sales" ["category" "amount"]
+                                    [{:column "category" :op :eq :value "nonexistent"}])
+          ;; No GROUP BY = implicit grouping
+          agg (plan/create-hash-agg-op scan []
+                                       [{:fn :count :column nil :alias "cnt"}])]
+      (plan/open! agg)
+      (try
+        (let [batch (plan/next-batch! agg)]
+          ;; Must return exactly 1 row with count=0
+          (is (= 1 (count batch))
+              "Implicit grouping with empty input must return 1 row")
+          (is (= 0 (get (first batch) "cnt"))
+              "COUNT(*) over 0 rows must equal 0"))
+        (finally
+          (plan/close! agg))))))
+
+(deftest hash-agg-op-estimated-rows-test
+  (testing "HashAggOp estimated-rows returns reasonable estimate"
+    (let [scan (plan/create-scan-op agg-test-source "sales" ["category"] [])
+          ;; No GROUP BY = implicit grouping = 1 row
+          agg-implicit (plan/create-hash-agg-op scan []
+                                                [{:fn :count :column nil :alias "cnt"}])
+          ;; With GROUP BY = estimate based on child
+          agg-grouped (plan/create-hash-agg-op scan ["category"]
+                                               [{:fn :count :column nil :alias "cnt"}])]
+      ;; Implicit grouping always returns 1
+      (is (= 1 (plan/estimated-rows agg-implicit))
+          "Implicit grouping should estimate 1 row")
+      ;; Grouped estimate should be positive
+      (is (pos? (plan/estimated-rows agg-grouped))
+          "Grouped aggregation should have positive estimate"))))

@@ -1047,6 +1047,291 @@
                                :current-child-idx 0})}))
 
 ;;; ---------------------------------------------------------------------------
+;;; HashAggOp - SPARQL GROUP BY + Aggregations
+;;; ---------------------------------------------------------------------------
+
+;; Forward declaration for batch->row-maps used in HashAggOp
+(declare batch->row-maps)
+
+(defn- get-row-value
+  "Get a value from a row map, handling both string and keyword keys.
+
+   Arrow batches produce string keys, while mock sources may use keywords.
+   This function tries both to ensure compatibility."
+  [row col]
+  (or (get row col)
+      (get row (keyword col))
+      (get row (name col))))
+
+(defn- create-aggregator
+  "Create an accumulator state for an aggregate function.
+
+   Returns initial state map for the aggregator. State is updated incrementally
+   as values are processed.
+
+   Aggregate function types:
+     :count       - COUNT(*) or COUNT(?var) - counts rows/non-null values
+     :count-distinct - COUNT(DISTINCT ?var) - counts unique non-null values
+     :sum         - SUM(?var) - sum of numeric values
+     :avg         - AVG(?var) - average (tracks sum and count)
+     :min         - MIN(?var) - minimum value
+     :max         - MAX(?var) - maximum value"
+  [agg-type]
+  (case agg-type
+    :count {:type :count :count 0}
+    :count-distinct {:type :count-distinct :values #{}}
+    :sum {:type :sum :sum 0}
+    :avg {:type :avg :sum 0 :count 0}
+    :min {:type :min :value nil}
+    :max {:type :max :value nil}
+    (throw (ex-info "Unsupported aggregate function" {:type agg-type}))))
+
+(defn- update-aggregator
+  "Update aggregator state with a new value.
+
+   Args:
+     state - Current aggregator state map
+     value - Value to accumulate (may be nil)
+
+   Returns updated state map."
+  [state value]
+  (case (:type state)
+    :count
+    ;; COUNT(*) counts all rows, COUNT(?var) counts non-null
+    ;; The caller decides whether to pass nil or skip
+    (if (some? value)
+      (update state :count inc)
+      state)
+
+    :count-distinct
+    (if (some? value)
+      (update state :values conj value)
+      state)
+
+    :sum
+    (if (and (some? value) (number? value))
+      (update state :sum + value)
+      state)
+
+    :avg
+    (if (and (some? value) (number? value))
+      (-> state
+          (update :sum + value)
+          (update :count inc))
+      state)
+
+    :min
+    (if (some? value)
+      (let [current (:value state)]
+        (if (or (nil? current)
+                (and (number? value) (number? current) (< value current))
+                (and (string? value) (string? current) (neg? (compare value current))))
+          (assoc state :value value)
+          state))
+      state)
+
+    :max
+    (if (some? value)
+      (let [current (:value state)]
+        (if (or (nil? current)
+                (and (number? value) (number? current) (> value current))
+                (and (string? value) (string? current) (pos? (compare value current))))
+          (assoc state :value value)
+          state))
+      state)
+
+    state))
+
+(defn- finalize-aggregator
+  "Compute final aggregate value from accumulator state.
+
+   Args:
+     state - Final aggregator state map
+
+   Returns the computed aggregate value."
+  [state]
+  (case (:type state)
+    :count (:count state)
+    :count-distinct (count (:values state))
+    :sum (:sum state)
+    :avg (let [{:keys [sum count]} state]
+           (if (pos? count)
+             (/ sum count)
+             0))
+    :min (:value state)
+    :max (:value state)
+    nil))
+
+(defrecord HashAggOp [child group-keys aggregates state]
+  ;; group-keys: Vector of column names to group by (may be empty for implicit grouping)
+  ;; aggregates: Vector of {:fn :count/:sum/:avg/:min/:max/:count-distinct
+  ;;                        :column column-name (nil for count(*))
+  ;;                        :alias output-column-name}
+  ;; state is an atom containing:
+  ;; {:opened? bool
+  ;;  :groups HashMap (group-key -> {:aggs [accumulator-states...]})
+  ;;  :result-emitted? bool
+  ;;  :result-batch [row-maps...]}
+  ITabularPlan
+  (open! [this]
+    (when-not (:opened? @state)
+      (log/debug "HashAggOp opening:" {:group-keys group-keys
+                                       :aggregates (count aggregates)})
+      (open! child)
+      (reset! state {:opened? true
+                     :groups (HashMap.)
+                     :result-emitted? false
+                     :result-batch nil}))
+    this)
+
+  (next-batch! [_this]
+    (let [{:keys [opened? result-emitted?]} @state]
+      (when (and opened? (not result-emitted?))
+        ;; Phase 1: Consume all child batches and build groups
+        (let [^HashMap groups (:groups @state)]
+          (loop []
+            (when-let [batch (next-batch! child)]
+              ;; Process each row in the batch
+              (let [rows (cond
+                           (arrow-batch? batch)
+                           (let [row-maps (batch->row-maps batch)]
+                             ;; Close Arrow batch to free memory
+                             (.close ^org.apache.arrow.vector.VectorSchemaRoot batch)
+                             row-maps)
+                           (map? batch) [batch]
+                           (vector? batch) batch
+                           (sequential? batch) (vec batch)
+                           :else [])]
+                (doseq [row rows]
+                  ;; Extract group key
+                  (let [group-key (if (seq group-keys)
+                                    (mapv #(get-row-value row %) group-keys)
+                                    [::all-rows])  ;; Implicit grouping
+                        ;; Get or create group state
+                        group-state (or (.get groups group-key)
+                                        (let [initial {:aggs (mapv #(create-aggregator (:fn %)) aggregates)
+                                                       :group-values (when (seq group-keys)
+                                                                       (zipmap group-keys group-key))}]
+                                          (.put groups group-key initial)
+                                          initial))]
+                    ;; Update each aggregator
+                    (let [updated-aggs
+                          (mapv (fn [agg-state agg-spec]
+                                  (let [col (:column agg-spec)
+                                        ;; For COUNT(*), always pass a non-nil value
+                                        ;; For other aggs, get the column value
+                                        value (if (nil? col)
+                                                ::count-star  ;; Sentinel for COUNT(*)
+                                                (get-row-value row col))]
+                                    (update-aggregator agg-state value)))
+                                (:aggs group-state)
+                                aggregates)]
+                      (.put groups group-key (assoc group-state :aggs updated-aggs))))))
+              (recur)))
+
+          ;; SPARQL semantics: implicit grouping (no GROUP BY) with 0 input rows
+          ;; must still return 1 row with COUNT()=0, SUM()=0, AVG()=null, etc.
+          (when (and (empty? group-keys) (.isEmpty groups))
+            (let [implicit-key [::all-rows]
+                  initial-aggs (mapv #(create-aggregator (:fn %)) aggregates)]
+              (.put groups implicit-key {:aggs initial-aggs :group-values nil})))
+
+          ;; Phase 2: Emit aggregated results as a single batch
+          (let [result-rows
+                (vec
+                 (for [group-key (keys groups)
+                       :let [group-state (.get groups group-key)]]
+                   ;; Build output row with group keys + aggregate results
+                   (let [group-vals (or (:group-values group-state) {})
+                         agg-vals (into {}
+                                        (map (fn [agg-state agg-spec]
+                                               [(:alias agg-spec) (finalize-aggregator agg-state)])
+                                             (:aggs group-state)
+                                             aggregates))]
+                     (merge group-vals agg-vals))))]
+            (swap! state assoc :result-emitted? true :result-batch result-rows)
+            (log/debug "HashAggOp emitting results:" {:groups (count result-rows)})
+            ;; Return result rows (may be single row for implicit grouping with 0 input)
+            result-rows)))))
+
+  (close! [this]
+    (when (:opened? @state)
+      (log/debug "HashAggOp closing")
+      (close! child)
+      (when-let [^HashMap groups (:groups @state)]
+        (.clear groups))
+      (reset! state {:opened? false
+                     :groups nil
+                     :result-emitted? false
+                     :result-batch nil}))
+    this)
+
+  (estimated-rows [_this]
+    ;; Estimate output rows as min(child-rows, distinct-groups-estimate)
+    ;; If no group keys, always 1 row (implicit grouping)
+    (if (empty? group-keys)
+      1
+      ;; Estimate number of groups as sqrt of input (rough heuristic)
+      (let [child-rows (estimated-rows child)]
+        (max 1 (long (Math/sqrt child-rows)))))))
+
+(defn create-hash-agg-op
+  "Create a hash aggregation operator for GROUP BY with aggregate functions.
+
+   The HashAggOp accumulates input rows into groups based on group-keys,
+   computing aggregate functions over each group. After all input is consumed,
+   it emits one row per group containing group key values and aggregate results.
+
+   Args:
+     child      - Child ITabularPlan to aggregate
+     group-keys - Vector of column names to GROUP BY (empty for implicit grouping)
+     aggregates - Vector of aggregate specifications, each a map:
+                  {:fn     - Aggregate function keyword (:count, :count-distinct,
+                             :sum, :avg, :min, :max)
+                   :column - Column name to aggregate (nil for COUNT(*))
+                   :alias  - Output column name for this aggregate}
+
+   Aggregate Functions:
+     :count         - COUNT(*) when :column is nil, else COUNT(?var) (non-nulls)
+     :count-distinct - COUNT(DISTINCT ?var) - unique non-null values
+     :sum           - SUM(?var) - sum of numeric values
+     :avg           - AVG(?var) - average (sum / count)
+     :min           - MIN(?var) - minimum value
+     :max           - MAX(?var) - maximum value
+
+   Examples:
+     ;; SELECT (COUNT(*) AS ?total) WHERE { ?s ?p ?o }
+     (create-hash-agg-op scan-op [] [{:fn :count :column nil :alias \"total\"}])
+
+     ;; SELECT ?category (SUM(?amount) AS ?sum) WHERE {...} GROUP BY ?category
+     (create-hash-agg-op scan-op [\"category\"]
+                         [{:fn :sum :column \"amount\" :alias \"sum\"}])
+
+     ;; SELECT ?dept (COUNT(?emp) AS ?cnt) (AVG(?salary) AS ?avg_sal)
+     ;;        WHERE {...} GROUP BY ?dept
+     (create-hash-agg-op scan-op [\"dept\"]
+                         [{:fn :count :column \"emp\" :alias \"cnt\"}
+                          {:fn :avg :column \"salary\" :alias \"avg_sal\"}])
+
+   Notes:
+     - All child rows must be consumed before results are emitted (blocking)
+     - Memory usage is proportional to number of distinct groups
+     - For very high cardinality GROUP BY, consider approximate aggregations
+     - Empty input produces empty output (no rows, not row with nulls)"
+  [child group-keys aggregates]
+  {:pre [(satisfies? ITabularPlan child)
+         (vector? group-keys)
+         (vector? aggregates)
+         (every? #(and (:fn %) (:alias %)) aggregates)]}
+  (map->HashAggOp {:child child
+                   :group-keys group-keys
+                   :aggregates aggregates
+                   :state (atom {:opened? false
+                                 :groups nil
+                                 :result-emitted? false
+                                 :result-batch nil})}))
+
+;;; ---------------------------------------------------------------------------
 ;;; Batch to Solution Conversion
 ;;; ---------------------------------------------------------------------------
 

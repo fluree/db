@@ -751,6 +751,196 @@
       combined-branches))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Aggregation Execution
+;;; ---------------------------------------------------------------------------
+
+(defn- create-aggregator
+  "Create initial accumulator state for an aggregate function."
+  [agg-type]
+  (case agg-type
+    :count {:type :count :count 0}
+    :count-distinct {:type :count-distinct :values #{}}
+    :sum {:type :sum :sum 0}
+    :avg {:type :avg :sum 0 :count 0}
+    :min {:type :min :value nil}
+    :max {:type :max :value nil}
+    {:type :count :count 0}))
+
+(defn- update-aggregator
+  "Update aggregator state with a new value."
+  [state value]
+  (case (:type state)
+    :count
+    (if (some? value)
+      (update state :count inc)
+      state)
+
+    :count-distinct
+    (if (some? value)
+      (update state :values conj value)
+      state)
+
+    :sum
+    (if (and (some? value) (number? value))
+      (update state :sum + value)
+      state)
+
+    :avg
+    (if (and (some? value) (number? value))
+      (-> state
+          (update :sum + value)
+          (update :count inc))
+      state)
+
+    :min
+    (if (some? value)
+      (let [current (:value state)]
+        (if (or (nil? current)
+                (and (number? value) (number? current) (< value current))
+                (and (string? value) (string? current) (neg? (compare value current))))
+          (assoc state :value value)
+          state))
+      state)
+
+    :max
+    (if (some? value)
+      (let [current (:value state)]
+        (if (or (nil? current)
+                (and (number? value) (number? current) (> value current))
+                (and (string? value) (string? current) (pos? (compare value current))))
+          (assoc state :value value)
+          state))
+      state)
+
+    state))
+
+(defn- finalize-aggregator
+  "Compute final aggregate value from accumulator state."
+  [state]
+  (case (:type state)
+    :count (:count state)
+    :count-distinct (count (:values state))
+    :sum (:sum state)
+    :avg (let [{:keys [sum count]} state]
+           (if (pos? count)
+             (/ sum count)
+             0))
+    :min (:value state)
+    :max (:value state)
+    nil))
+
+(defn- unwrap-match-value
+  "Extract scalar value from a Fluree match object or return raw value.
+
+   SPARQL solutions in Fluree contain match objects with metadata.
+   This function extracts the raw value for aggregation purposes."
+  [v]
+  (cond
+    ;; Already a scalar (from row-based execution)
+    (or (number? v) (string? v) (boolean? v) (nil? v))
+    v
+
+    ;; Fluree match object - use where/get-value
+    (map? v)
+    (where/get-value v)
+
+    ;; Other (keywords, etc.)
+    :else v))
+
+(defn- solution-get-column-value
+  "Extract a column value from a solution map.
+
+   Solutions have SPARQL variable bindings as symbols, but columns are strings.
+   This function handles the translation, looking for both the column name
+   directly and as a SPARQL variable (with ? prefix).
+
+   Also unwraps Fluree match objects to get scalar values for aggregation."
+  [solution column]
+  (-> (or
+       ;; Direct column name lookup (from row maps)
+       (get solution column)
+       ;; SPARQL variable lookup (symbol with ?)
+       (get solution (symbol (str "?" column)))
+       ;; Symbol without ?
+       (get solution (symbol column))
+       ;; Keyword lookup
+       (get solution (keyword column)))
+      unwrap-match-value))
+
+(defn apply-aggregation
+  "Apply GROUP BY and aggregation to a vector of solutions.
+
+   This function implements SPARQL aggregation semantics, grouping solutions
+   by the specified keys and computing aggregate functions over each group.
+
+   Args:
+     solutions  - Vector of solution maps (from Iceberg query execution)
+     group-keys - Vector of column names to GROUP BY (empty for implicit grouping)
+     aggregates - Vector of aggregate specifications:
+                  [{:fn :count/:sum/:avg/:min/:max/:count-distinct
+                    :column column-name (nil for COUNT(*))
+                    :alias output-column-name}]
+
+   Returns vector of aggregated solution maps, one per group.
+
+   Examples:
+     ;; COUNT(*) with no grouping
+     (apply-aggregation solutions [] [{:fn :count :column nil :alias \"total\"}])
+     ;; => [{\"total\" 42}]
+
+     ;; GROUP BY country with COUNT
+     (apply-aggregation solutions [\"country\"]
+                        [{:fn :count :column nil :alias \"cnt\"}])
+     ;; => [{\"country\" \"US\" \"cnt\" 10} {\"country\" \"UK\" \"cnt\" 5}]"
+  [solutions group-keys aggregates]
+  (when (seq aggregates)
+    (let [^java.util.HashMap groups (java.util.HashMap.)]
+      ;; Process each solution
+      (doseq [solution solutions]
+        (let [;; Extract group key
+              group-key (if (seq group-keys)
+                          (mapv #(solution-get-column-value solution %) group-keys)
+                          [::all-rows])
+              ;; Get or create group state
+              group-state (or (.get groups group-key)
+                              (let [initial {:aggs (mapv #(create-aggregator (:fn %)) aggregates)
+                                             :group-values (when (seq group-keys)
+                                                             (zipmap group-keys group-key))}]
+                                (.put groups group-key initial)
+                                initial))
+              ;; Update aggregators
+              updated-aggs
+              (mapv (fn [agg-state agg-spec]
+                      (let [col (:column agg-spec)
+                            ;; For COUNT(*), always pass a non-nil sentinel
+                            value (if (nil? col)
+                                    ::count-star
+                                    (solution-get-column-value solution col))]
+                        (update-aggregator agg-state value)))
+                    (:aggs group-state)
+                    aggregates)]
+          (.put groups group-key (assoc group-state :aggs updated-aggs))))
+
+      ;; SPARQL semantics: implicit grouping (no GROUP BY) with 0 input rows
+      ;; must still return 1 row with COUNT()=0, SUM()=0, AVG()=null, etc.
+      (when (and (empty? group-keys) (.isEmpty groups))
+        (let [implicit-key [::all-rows]
+              initial-aggs (mapv #(create-aggregator (:fn %)) aggregates)]
+          (.put groups implicit-key {:aggs initial-aggs :group-values nil})))
+
+      ;; Build result rows
+      (vec
+       (for [group-key (keys groups)
+             :let [group-state (.get groups group-key)
+                   group-vals (or (:group-values group-state) {})
+                   agg-vals (into {}
+                                  (map (fn [agg-state agg-spec]
+                                         [(:alias agg-spec) (finalize-aggregator agg-state)])
+                                       (:aggs group-state)
+                                       aggregates))]]
+         (merge group-vals agg-vals))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; IcebergDatabase Record (Multi-Table Support)
 ;;; ---------------------------------------------------------------------------
 

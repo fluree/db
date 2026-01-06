@@ -381,6 +381,185 @@
 ;;; Query Execution
 ;;; ---------------------------------------------------------------------------
 
+;;; ---------------------------------------------------------------------------
+;;; Aggregation Detection
+;;; ---------------------------------------------------------------------------
+
+(def ^:private aggregate-fn-names
+  "Set of aggregate function names (as symbols or strings)."
+  #{'count 'count-distinct 'sum 'avg 'min 'max 'sample 'sample1 'groupconcat
+    "count" "count-distinct" "sum" "avg" "min" "max" "sample" "sample1" "groupconcat"})
+
+(defn- parse-aggregate-expr
+  "Parse an aggregate expression from SELECT clause.
+
+   Handles formats:
+   - \"(count ?var)\" - direct aggregate
+   - \"(as (count ?var) ?alias)\" - aggregate with alias
+   - (count ?var) - list form
+
+   Returns nil if not an aggregate, or a map:
+   {:fn :count/:sum/:avg/:min/:max/:count-distinct
+    :column column-name (nil for COUNT(*))
+    :alias output-column-name (string)
+    :var original-variable-symbol}"
+  [expr mapping]
+  (let [;; Parse string expressions into list form
+        parsed (cond
+                 (string? expr)
+                 (try
+                   (read-string expr)
+                   (catch Exception _ nil))
+
+                 (list? expr)
+                 expr
+
+                 (seq? expr)
+                 expr
+
+                 :else nil)]
+    (when (and parsed (seq? parsed))
+      (let [[fn-name & args] parsed]
+        (cond
+          ;; (as (aggregate-fn ...) ?alias)
+          (= fn-name 'as)
+          (let [[inner-expr alias-var] args
+                inner-parsed (parse-aggregate-expr (if (seq? inner-expr)
+                                                     inner-expr
+                                                     (str inner-expr))
+                                                   mapping)]
+            (when inner-parsed
+              (assoc inner-parsed
+                     :alias (if (symbol? alias-var)
+                              (name alias-var)
+                              (str alias-var))
+                     :var alias-var)))
+
+          ;; Direct aggregate: (count ?var), (sum ?var), etc.
+          (contains? aggregate-fn-names fn-name)
+          (let [fn-keyword (case (if (symbol? fn-name) fn-name (symbol fn-name))
+                             count :count
+                             count-distinct :count-distinct
+                             sum :sum
+                             avg :avg
+                             min :min
+                             max :max
+                             sample :sample
+                             sample1 :sample
+                             groupconcat :groupconcat
+                             :count)
+                ;; For count(*), args is typically empty or contains *
+                ;; For other aggs, first arg is the variable
+                var-arg (first args)
+                is-count-star? (or (nil? var-arg)
+                                   (= var-arg '*)
+                                   (= var-arg "*"))
+                ;; Map variable to column via R2RML mapping
+                var-name (when (and (not is-count-star?) (symbol? var-arg))
+                           (name var-arg))
+                ;; Try to find column from predicate mapping
+                column (when (and var-name mapping)
+                         (some (fn [[_pred obj-map]]
+                                 (when (and (= :column (:type obj-map))
+                                            (= var-name (:var obj-map)))
+                                   (:value obj-map)))
+                               (:predicates mapping)))]
+            {:fn fn-keyword
+             :column (if is-count-star? nil column)
+             :alias (str fn-name "_result")
+             :var var-arg
+             :var-name var-name})
+
+          :else nil)))))
+
+(defn extract-aggregates-from-select
+  "Extract aggregate specifications from a query SELECT clause.
+
+   Args:
+     select-clause - The :select value from parsed query (vector of selectors)
+     mapping       - R2RML mapping for variable->column resolution
+
+   Returns vector of aggregate specs:
+   [{:fn :count/:sum/:avg/:min/:max/:count-distinct
+     :column column-name (nil for COUNT(*))
+     :alias output-column-name
+     :var original-variable}]"
+  [select-clause mapping]
+  (when (and select-clause (or (vector? select-clause) (sequential? select-clause)))
+    (vec (keep #(parse-aggregate-expr % mapping) select-clause))))
+
+(defn extract-group-by-columns
+  "Extract GROUP BY column names from a query.
+
+   Args:
+     group-by-clause - The :group-by value from parsed query
+     mapping         - R2RML mapping for variable->column resolution
+
+   Returns vector of column names (strings)."
+  [group-by-clause mapping]
+  (when group-by-clause
+    (let [vars (if (vector? group-by-clause)
+                 group-by-clause
+                 [group-by-clause])]
+      (vec (keep (fn [var]
+                   (let [var-name (cond
+                                    (symbol? var) (name var)
+                                    (string? var) (if (str/starts-with? var "?")
+                                                    (subs var 1)
+                                                    var)
+                                    :else nil)]
+                     ;; Try to find column from predicate mapping
+                     (when (and var-name mapping)
+                       (some (fn [[_pred obj-map]]
+                               (when (and (= :column (:type obj-map))
+                                          (or (= var-name (str "?" (:var obj-map)))
+                                              (= var-name (:var obj-map))))
+                                 (:value obj-map)))
+                             (:predicates mapping)))))
+                 vars)))))
+
+(defn has-aggregations?
+  "Check if a query has any aggregate functions or GROUP BY.
+
+   Args:
+     parsed-query - The parsed query map with :select and :group-by
+
+   Returns true if the query requires aggregation."
+  [parsed-query]
+  (or (some? (:group-by parsed-query))
+      (and (:select parsed-query)
+           (some (fn [sel]
+                   (when (string? sel)
+                     (or (str/includes? sel "(count")
+                         (str/includes? sel "(sum")
+                         (str/includes? sel "(avg")
+                         (str/includes? sel "(min")
+                         (str/includes? sel "(max")
+                         (str/includes? sel "(count-distinct"))))
+                 (:select parsed-query)))))
+
+(defn build-aggregation-spec
+  "Build a complete aggregation specification from a parsed query.
+
+   This function analyzes the parsed query to extract:
+   - GROUP BY column names
+   - Aggregate function specifications
+
+   Args:
+     parsed-query - The parsed query with :select, :group-by, :where
+     mapping      - R2RML mapping for this query's tables
+
+   Returns nil if no aggregation needed, or:
+   {:group-keys [column-names...]
+    :aggregates [{:fn :count/:sum/... :column col :alias alias}...]}"
+  [parsed-query mapping]
+  (when (has-aggregations? parsed-query)
+    (let [group-keys (or (extract-group-by-columns (:group-by parsed-query) mapping) [])
+          aggregates (extract-aggregates-from-select (:select parsed-query) mapping)]
+      (when (or (seq group-keys) (seq aggregates))
+        {:group-keys group-keys
+         :aggregates (or aggregates [])}))))
+
 (defn execute-iceberg-query
   "Execute query against Iceberg source with predicate pushdown.
 

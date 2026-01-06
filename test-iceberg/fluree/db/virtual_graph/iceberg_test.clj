@@ -1244,6 +1244,112 @@
           (teardown-fluree-system))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Aggregation E2E Tests (GROUP BY + COUNT/SUM/AVG/MIN/MAX)
+;;; ---------------------------------------------------------------------------
+
+(deftest e2e-sparql-count-star-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL COUNT(*) without GROUP BY"
+      (setup-fluree-system)
+      (try
+        ;; Register the multi-table Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-count:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; COUNT(*) - count all airlines
+        (let [sparql-count "PREFIX ex: <http://example.org/>
+                           SELECT (COUNT(*) AS ?total)
+                           FROM <iceberg/openflights-count>
+                           WHERE {
+                             ?airline a ex:Airline ; ex:name ?name
+                           }"
+              res @(fluree/query-connection @e2e-conn sparql-count {:format :sparql})]
+          (is (vector? res) "Should return aggregated results")
+          (is (= 1 (count res)) "COUNT(*) without GROUP BY returns 1 row")
+          (when (seq res)
+            (let [total (get (first res) "total")]
+              (is (pos? total) "Count should be positive"))))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-sparql-group-by-count-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL GROUP BY with COUNT"
+      (setup-fluree-system)
+      (try
+        ;; Register the multi-table Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-group:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; GROUP BY country with COUNT - count airlines per country
+        (let [sparql-group "PREFIX ex: <http://example.org/>
+                           SELECT ?country (COUNT(?airline) AS ?count)
+                           FROM <iceberg/openflights-group>
+                           WHERE {
+                             ?airline a ex:Airline ;
+                                      ex:country ?country
+                           }
+                           GROUP BY ?country
+                           ORDER BY DESC(?count)
+                           LIMIT 10"
+              res @(fluree/query-connection @e2e-conn sparql-group {:format :sparql})]
+          (is (vector? res) "Should return grouped results")
+          (is (pos? (count res)) "Should have country groups")
+          ;; Each result should have country and count
+          (when (seq res)
+            (let [first-row (first res)]
+              (is (some? (get first-row "country")) "Results should include country")
+              (is (some? (get first-row "count")) "Results should include count"))))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-sparql-multiple-aggregates-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL GROUP BY with multiple aggregates"
+      (setup-fluree-system)
+      (try
+        ;; Register the multi-table Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-multi-agg:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; Multiple aggregates - route statistics by airline
+        (let [sparql-agg "PREFIX ex: <http://example.org/>
+                         SELECT ?airline (COUNT(?route) AS ?route_count)
+                         FROM <iceberg/openflights-multi-agg>
+                         WHERE {
+                           ?route a ex:Route ;
+                                  ex:operatedBy ?airline
+                         }
+                         GROUP BY ?airline
+                         ORDER BY DESC(?route_count)
+                         LIMIT 10"
+              res @(fluree/query-connection @e2e-conn sparql-agg {:format :sparql})]
+          (is (vector? res) "Should return aggregated results")
+          (is (pos? (count res)) "Should have airline groups")
+          ;; Results should have both the group key and aggregate
+          (when (seq res)
+            (let [first-row (first res)]
+              (is (some? (get first-row "airline")) "Results should include airline")
+              (is (some? (get first-row "route_count")) "Results should include route count"))))
+
+        (finally
+          (teardown-fluree-system))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Run from REPL
 ;;; ---------------------------------------------------------------------------
 
