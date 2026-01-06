@@ -223,7 +223,13 @@ Executes a query against a database.
 const results = await fluree.query(db, {
   '@context': { /* ... */ },
   'select': { '?s': ['*'] },
-  'where': { /* ... */ }
+  'where': { /* ... */ },
+  // Optional execution opts for this query
+  'opts': {
+    // Controls batched subject-join optimization. Default is 10000.
+    // Set to 0 to disable batching for this query.
+    'subjectJoinBatchSize': 0
+  }
 });
 ```
 

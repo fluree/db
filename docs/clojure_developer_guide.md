@@ -596,7 +596,19 @@ When using query/transact options, use `:default-allow true`:
                             schema:name ?name ;
                             ex:role ex:developer .
                   }"
-                 {:format :sparql}))
+                 {:format :sparql
+                  ;; Query execution opts (applies to SPARQL and JSON-LD queries):
+                  ;; - Default batching is enabled with a default batch size of 10000
+                  ;; - Set to 0 to disable for this query
+                  :opts {:subject-join-batch-size 0}}))
+
+;; Same option on a JSON-LD / analytical query:
+@(fluree/query (fluree/db ledger)
+               {:context default-context
+                :select ["?s" "?o"]
+                :where [{"@id" "?s"
+                         "http://www.mondeca.com/scoring#refersInstance" "?o"}]
+                :opts {:subject-join-batch-size 20000}})
 
 ;; Insert data as Turtle
 @(fluree/insert! ledger (fluree/db ledger)

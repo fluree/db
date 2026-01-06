@@ -499,6 +499,10 @@ Query execution options.
 - `identity` - Identity for policy evaluation
 - `format` - Output format (`:fql` or `:sparql`)
 - `meta` - Include metadata in results
+- `subjectJoinBatchSize` - Controls the **batched subject-join** optimization for eligible patterns (fixed predicate joins where the subject is already bound).
+  - Default: `10000`
+  - Set to `0` to disable batching for a specific query
+  - Key normalization: `subjectJoinBatchSize` (camelCase) and `subject-join-batch-size` (kebab-case) both normalize to `:subject-join-batch-size`
 - `policy` - Policy restrictions
 - `policy-class` - Policy class restrictions
 - `policy-values` - Values passed to policy queries

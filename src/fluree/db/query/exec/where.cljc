@@ -28,8 +28,8 @@
   "When true, allows execution-time batching for joins of the form:
   (?s fixed-p ?o) applied to a large stream of solutions where ?s is already bound.
 
-  Disabled by default; enable via query opts (plumbed from query API)."
-  false)
+  Enabled by default; may be disabled via query opts (plumbed from query API)."
+  true)
 
 (def ^:dynamic *subject-join-use-psot?*
   "When true and :psot is available, prefer :psot for batched subject-join lookups.
@@ -38,16 +38,29 @@
 
 (def ^:dynamic *subject-join-range-mode*
   "Lookup mode for batched subject-join range scans: :seek (fast) or :scan (robust)."
-  :scan)
+  :seek)
 
 (def ^:dynamic *batched-subject-join-log?*
   "When true, logs when the batched subject join optimization is applied."
-  true)
+  false)
 
 (def ^:dynamic *batched-subject-join-trace?*
   "Debug-only. When true, emits additional batching diagnostics.
   Keep false in normal operation."
   false)
+
+(def ^:dynamic *batched-subject-join-trace-fn*
+  "Optional debug hook. When non-nil and `*batched-subject-join-trace?*` is true,
+  called with small event maps describing batching behavior."
+  nil)
+
+(defn- trace-batched-subject-join!
+  [event]
+  (when *batched-subject-join-trace?*
+    (if (fn? *batched-subject-join-trace-fn*)
+      (try* (*batched-subject-join-trace-fn* event)
+            (catch* _e nil))
+      (log/debug "Batched subject-join timing" event))))
 
 (defn- dataset-like?
   "Heuristic check for `fluree.db.dataset/DataSet` without requiring the ns.
@@ -862,18 +875,33 @@
                   (async/close! out-ch)))
               ;; Batch over incoming solutions. Solutions without a bound subject SID
               ;; are handled by the fallback path inside `process-batched-subject-join-batch!`.
-              (loop [batch []]
-                (if-let [sol (async/<! solution-ch)]
-                  (let [batch* (conj batch sol)]
-                    (if (< (count batch*) (long *subject-join-batch-size*))
-                      (recur batch*)
-                      (do
-                        (<? (process-batched-subject-join-batch! ds batch-db tracker pattern error-ch batch* out-ch))
-                        (recur []))))
-                  (do
-                    (when (seq batch)
-                      (<? (process-batched-subject-join-batch! ds batch-db tracker pattern error-ch batch out-ch)))
-                    (async/close! out-ch)))))))
+              (let [trace? *batched-subject-join-trace?*]
+                (loop [batch          []
+                       batch-start-ms nil]
+                  (if-let [sol (async/<! solution-ch)]
+                    (let [batch-start-ns* (if (and trace? (empty? batch))
+                                            (util/current-time-millis)
+                                            batch-start-ms)
+                          batch*          (conj batch sol)]
+                      (if (< (count batch*) (long *subject-join-batch-size*))
+                        (recur batch* batch-start-ns*)
+                        (do
+                          (when (and trace? batch-start-ns*)
+                            (trace-batched-subject-join!
+                             {:event      :subject-join-batch/filled
+                              :batch-size (count batch*)
+                              :elapsed-ms (- (util/current-time-millis) batch-start-ns*)}))
+                          (<? (process-batched-subject-join-batch! ds batch-db tracker pattern error-ch batch* out-ch))
+                          (recur [] nil))))
+                    (do
+                      (when (seq batch)
+                        (when (and trace? batch-start-ms)
+                          (trace-batched-subject-join!
+                           {:event      :subject-join-batch/eof
+                            :batch-size (count batch)
+                            :elapsed-ms (- (util/current-time-millis) batch-start-ms)}))
+                        (<? (process-batched-subject-join-batch! ds batch-db tracker pattern error-ch batch out-ch)))
+                      (async/close! out-ch))))))))
         out-ch)
       (do
         (async/pipeline-async

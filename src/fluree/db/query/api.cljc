@@ -128,22 +128,17 @@
                        (update :opts dissoc :meta :max-fuel)
                        (cond-> (not (dataset? ds*)) (dissoc :from :from-named)))
            batch-size      (:subject-join-batch-size opts)
-           use-psot?       (:subject-join-use-psot? opts)
-           range-mode      (:subject-join-range-mode opts)
-           join-log?       (:subject-join-log? opts)
-           join-trace?     (:subject-join-trace? opts)
-           enable-batched? (pos-int? batch-size)
-           batch-size*     (if enable-batched? batch-size where/*subject-join-batch-size*)
-           use-psot?*      (if (some? use-psot?) use-psot? where/*subject-join-use-psot?*)
-           range-mode*     (if (some? range-mode) range-mode where/*subject-join-range-mode*)
-           join-log?*      (if (some? join-log?) join-log? where/*batched-subject-join-log?*)
-           join-trace?*    (if (some? join-trace?) join-trace? where/*batched-subject-join-trace?*)]
+           enable-batched? (if (contains? opts :subject-join-batch-size)
+                             (pos-int? batch-size) ; explicit 0/nil disables
+                             where/*enable-batched-subject-joins?*)
+           ;; All other batched subject-join tuning knobs are intentionally internal.
+           ;; Keep end-user surface area to a single control: :subject-join-batch-size.
+           ]
        (binding [where/*enable-batched-subject-joins?* enable-batched?
-                 where/*subject-join-batch-size*       batch-size*
-                 where/*subject-join-use-psot?*        use-psot?*
-                 where/*subject-join-range-mode*       range-mode*
-                 where/*batched-subject-join-log?*     join-log?*
-                 where/*batched-subject-join-trace?*   join-trace?*]
+                 where/*subject-join-batch-size*       (if (pos-int? batch-size) batch-size where/*subject-join-batch-size*)
+                 ;; other tuning knobs remain at their defaults unless changed via
+                 ;; dynamic var binding (intended for dev/diagnostics only).
+                 ]
          (if (track/track-query? opts)
            (<? (track-execution ds* tracker #(fql/query ds* tracker query**)))
            (<? (fql/query ds* query**))))))))
