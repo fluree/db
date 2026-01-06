@@ -181,7 +181,11 @@
 
 (defn resolve-subject-slices
   "Returns a channel of [sid flakes] pairs by fetching all :spot flakes for each
-  subject SID in `sids` (which must be sorted ascending).
+  subject SID in `sids`.
+
+  Ordering contract:
+  - `sids` must be ordered by the :spot index comparator applied to each lookup's
+    *start flake* (i.e. by `(first (subject->spot-range sid))` using `(:comparator (:spot db))`).
 
   Intended for subject-star joins: first produce a selective subject SID list,
   then fetch all predicate/object flakes for those subjects from :spot and
@@ -202,6 +206,7 @@
       (let [novelty   (get-in db [:novelty :spot])
             novelty-t (get-in db [:novelty :t])
             resolver  (index/index-catalog->t-range-resolver (:index-catalog db) novelty-t novelty to-t)
+            ;; `batched-prefix-range-lookup` expects ordered lookups (see docstring).
             raw-ch    (index/batched-prefix-range-lookup resolver root sids subject->spot-range error-ch
                                                          {:mode :seek :prefetch-n prefetch-n :buffer buffer})
             out-ch    (chan buffer)]
@@ -220,8 +225,12 @@
 
 (defn resolve-subject-predicate-slices
   "Returns a channel of [sid flakes] pairs by fetching all flakes for each
-  subject SID in `sids` (sorted ascending) restricted to the single predicate
-  `p-sid`.
+  subject SID in `sids` restricted to the single predicate `p-sid`.
+
+  Ordering contract:
+  - `sids` must be ordered by the chosen index comparator (:spot or :psot)
+    applied to each lookup's *start flake* (i.e. `(first (subject->range sid))`
+    using `(:comparator (get db idx))`).
 
   Intended for joining a large stream of already-bound subject solutions against
   a fixed predicate (e.g. ?s p ?o) without performing one index seek per
@@ -238,7 +247,7 @@
   - :mode        :seek or :scan (passed to batched-prefix-range-lookup)
   - :use-psot?   when true and :psot exists, use it; otherwise default to :spot"
   [db tracker error-ch p-sid sids {:keys [to-t prefetch-n buffer mode use-psot?]
-                                  :or {prefetch-n 3 buffer 64}}]
+                                   :or {prefetch-n 3 buffer 64}}]
   (let [mode* (or mode :seek)]
     (if (or (empty? sids) (nil? p-sid))
       empty-channel
@@ -255,6 +264,7 @@
                   ;; only bracket on meta, leave o/dt/t/op nil.
                   [(flake/create sid p-sid nil nil nil nil util/min-integer)
                    (flake/create sid p-sid nil nil nil nil util/max-integer)])
+                ;; `batched-prefix-range-lookup` expects ordered lookups (see docstring).
                 raw-ch    (index/batched-prefix-range-lookup resolver root sids subject->range error-ch
                                                              {:mode mode* :prefetch-n prefetch-n :buffer buffer})
                 out-ch    (chan buffer)]

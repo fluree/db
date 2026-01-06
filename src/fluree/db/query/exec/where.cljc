@@ -45,8 +45,8 @@
   true)
 
 (def ^:dynamic *batched-subject-join-trace?*
-  "When true, logs reasons why a candidate batched join did NOT activate.
-  Intended for debugging; keep false in normal operation."
+  "Debug-only. When true, emits additional batching diagnostics.
+  Keep false in normal operation."
   false)
 
 (defn- dataset-like?
@@ -771,28 +771,29 @@
   (go
     (let [[s p _o] (pattern-data pattern)
           s-var    (get-variable s)
+          ;; `get-sid` / `match-sid` store SIDs under `(:alias db)`. Ensure we emit bindings
+          ;; under the same alias as the incoming solution stream.
+          bind-db   (cond-> batch-db
+                      (some? (:alias ds)) (assoc :alias (:alias ds)))
           ;; IMPORTANT: predicate SIDs are not guaranteed to be precomputed at parse time.
           ;; Mirror the normal matcher path which calls `compute-sids`/`compute-sid`.
-          p*       (compute-sid p batch-db)
-          p-sid    (or (get-sid p* batch-db) (get-value p*))
-          {:keys [sid->solutions fallback]} (batch->sid->solutions batch-db s-var batch)]
+          p*       (compute-sid p bind-db)
+          p-sid    (or (get-sid p* bind-db) (get-value p*))
+          {:keys [sid->solutions fallback]} (batch->sid->solutions bind-db s-var batch)]
+
+      ;; Fallback for solutions without a bound subject SID.
       (when (seq fallback)
-        ;; Fallback path: run each solution through the normal matcher for this pattern.
         (binding [*enable-batched-subject-joins?* false]
           (loop [xs fallback]
             (when-let [sol (first xs)]
-              (let [sol-ch (match-pattern ds tracker sol pattern error-ch)]
-                (loop []
-                  (when-let [matched (async/<! sol-ch)]
-                    (>! out-ch matched)
-                    (recur))))
+              (<? (emit-solutions! (match-pattern ds tracker sol pattern error-ch) out-ch))
               (recur (rest xs))))))
 
       (when (and p-sid (seq sid->solutions))
         (let [sids     (->> (keys sid->solutions) sort vec)
               slice-ch (query-range/resolve-subject-predicate-slices
-                        batch-db tracker error-ch p-sid sids
-                        {:to-t      (:t batch-db)
+                        bind-db tracker error-ch p-sid sids
+                        {:to-t      (:t bind-db)
                          :mode      *subject-join-range-mode*
                          :use-psot? *subject-join-use-psot?*})]
           (when *batched-subject-join-log?*
@@ -801,20 +802,34 @@
                         :subjects  (count sids)
                         :mode      *subject-join-range-mode*
                         :use-psot? *subject-join-use-psot?*}))
-          (loop []
-            (when-let [[sid flakes] (async/<! slice-ch)]
-              (let [sols (get sid->solutions sid)]
+          (loop [seen (transient #{})]
+            (if-let [[sid flakes] (async/<! slice-ch)]
+              (let [seen' (conj! seen sid)
+                    sols  (get sid->solutions sid)]
                 (when (seq sols)
                   ;; Join: apply each flake to each solution for that sid.
                   ;; Important: use `assign-matched-values` so we don't re-bind already-bound vars.
-                  (let [tuple (pattern-data pattern)
-                        sol+tuple* (mapv (fn [sol] [sol (assign-matched-values tuple sol)]) sols)]
+                  (let [tuple     (pattern-data pattern)
+                        sol+tpl   (mapv (fn [sol] [sol (assign-matched-values tuple sol)]) sols)]
                     (loop [fs (seq flakes)]
                       (when-let [f (first fs)]
-                        (doseq [[sol tuple*] sol+tuple*]
-                          (>! out-ch (match-flake sol tuple* batch-db f)))
-                        (recur (rest fs)))))))
-              (recur))))))))
+                        (doseq [[sol tuple*] sol+tpl]
+                          (>! out-ch (match-flake sol tuple* bind-db f)))
+                        (recur (rest fs))))))
+                (recur seen'))
+              (let [seen*        (persistent! seen)
+                    missing-sids (seq (remove seen* sids))]
+                (when (seq missing-sids)
+                  (binding [*enable-batched-subject-joins?* false]
+                    (loop [ms missing-sids]
+                      (when-let [sid (first ms)]
+                        (when-let [sols (get sid->solutions sid)]
+                          (loop [xs sols]
+                            (when-let [sol (first xs)]
+                              (<? (emit-solutions! (match-pattern ds tracker sol pattern error-ch) out-ch))
+                              (recur (rest xs))))))
+                      (when (next ms)
+                        (recur (rest ms))))))))))))))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the
@@ -825,10 +840,10 @@
                                  (eligible-batched-subject-join? pattern)
                                  (pos-int? *subject-join-batch-size*))]
     (if batching-requested?
-      ;; NOTE: ds might be an AsyncDB wrapper or a DataSet; resolve the underlying FlakeDB
-      ;; once up-front for this constraint.
       (do
         (go
+          ;; NOTE: ds might be an AsyncDB wrapper or a DataSet; resolve the underlying FlakeDB
+          ;; once up-front for this constraint.
           (let [active-graph (dataset-active-graph ds)
                 batch-db     (cond
                                ;; dataset with a single active db
@@ -839,49 +854,29 @@
                                (some? (get ds :spot)) ds
                                :else nil)]
             (if-not (and batch-db (get batch-db :spot))
-              (do
-                (when *batched-subject-join-trace?*
-                  (log/debug "Batched subject-join NOT active for pattern"
-                             {:enabled? *enable-batched-subject-joins?*
-                              :eligible? true
-                              :batch-db? (boolean batch-db)
-                              :batch-db-has-spot? (boolean (some-> batch-db (get :spot)))
-                              :ds-type (str (type ds))
-                              :active-graph? (boolean active-graph)
-                              :active-graph-seq? (boolean (sequential? active-graph))
-                              :batch-size *subject-join-batch-size*
-                              :pattern-type (pattern-type pattern)
-                              :pattern (pr-str pattern)}))
-                ;; Fall back to normal per-solution matching for this constraint.
-                (loop []
-                  (if-let [solution (async/<! solution-ch)]
-                    (do
-                      (<? (emit-solutions! (match-pattern ds tracker solution pattern error-ch) out-ch))
-                      (recur))
-                    (async/close! out-ch))))
-            ;; Batch over incoming solutions. Solutions without a bound subject SID
-            ;; are handled by the fallback path inside `process-batched-subject-join-batch!`.
-            (loop [batch []]
-              (if-let [sol (async/<! solution-ch)]
-                (let [batch* (conj batch sol)]
-                  (if (< (count batch*) (long *subject-join-batch-size*))
-                    (recur batch*)
-                    (do
-                      (<? (process-batched-subject-join-batch! ds batch-db tracker pattern error-ch batch* out-ch))
-                      (recur []))))
-                (do
-                  (when (seq batch)
-                    (<? (process-batched-subject-join-batch! ds batch-db tracker pattern error-ch batch out-ch)))
-                  (async/close! out-ch))))))))
+              ;; Fall back to normal per-solution matching for this constraint.
+              (loop []
+                (if-let [solution (async/<! solution-ch)]
+                  (do
+                    (<? (emit-solutions! (match-pattern ds tracker solution pattern error-ch) out-ch))
+                    (recur))
+                  (async/close! out-ch)))
+              ;; Batch over incoming solutions. Solutions without a bound subject SID
+              ;; are handled by the fallback path inside `process-batched-subject-join-batch!`.
+              (loop [batch []]
+                (if-let [sol (async/<! solution-ch)]
+                  (let [batch* (conj batch sol)]
+                    (if (< (count batch*) (long *subject-join-batch-size*))
+                      (recur batch*)
+                      (do
+                        (<? (process-batched-subject-join-batch! ds batch-db tracker pattern error-ch batch* out-ch))
+                        (recur []))))
+                  (do
+                    (when (seq batch)
+                      (<? (process-batched-subject-join-batch! ds batch-db tracker pattern error-ch batch out-ch)))
+                    (async/close! out-ch)))))))
         out-ch)
       (do
-        (when *batched-subject-join-trace?*
-          (log/debug "Batched subject-join NOT active for pattern"
-                     {:enabled? *enable-batched-subject-joins?*
-                      :eligible? (boolean (eligible-batched-subject-join? pattern))
-                      :batch-size *subject-join-batch-size*
-                      :pattern-type (pattern-type pattern)
-                      :pattern (pr-str pattern)}))
         (async/pipeline-async
          2
          out-ch
@@ -889,7 +884,7 @@
            (-> (match-pattern ds tracker solution pattern error-ch)
                (async/pipe ch)))
          solution-ch)
-        out-ch)))
+        out-ch))))
 
 (defn match-patterns
   [ds tracker solution patterns error-ch]

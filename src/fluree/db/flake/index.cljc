@@ -752,7 +752,7 @@
             which can be faster when lookups are dense.
   - :prefetch-n leaf prefetch for tree-chan (default nil -> index default)"
   [r root lookups lookup->range error-ch {:keys [buffer prefetch-n mode]
-                                         :or {buffer 64 mode :seek}}]
+                                          :or {buffer 64 mode :seek}}]
   (let [cmp     (:comparator root)
         lookups (vec lookups)
         out     (chan buffer)]

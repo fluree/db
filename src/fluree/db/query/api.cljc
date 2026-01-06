@@ -32,13 +32,13 @@
                                                (-> (merge (:opts override-opts))
                                                    (dissoc :opts)))]
                         ;; ensure :max-fuel key is present
-                        (-> opts
-                            (assoc :max-fuel max-fuel)
-                            (merge override-opts*)
-                            (update :output #(or % :fql))
+                          (-> opts
+                              (assoc :max-fuel max-fuel)
+                              (merge override-opts*)
+                              (update :output #(or % :fql))
                             ;; get rid of :did, :issuer opts
-                            (update :identity #(or % (:did opts) (:issuer opts)))
-                            (dissoc :did :issuer))))))
+                              (update :identity #(or % (:did opts) (:issuer opts)))
+                              (dissoc :did :issuer))))))
 
 (defn load-aliased-rule-dbs
   [conn rule-sources]
