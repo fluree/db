@@ -454,18 +454,32 @@
                 is-count-star? (or (nil? var-arg)
                                    (= var-arg '*)
                                    (= var-arg "*"))
-                ;; Map variable to column via R2RML mapping
-                var-name (when (and (not is-count-star?) (symbol? var-arg))
-                           (name var-arg))
+                ;; Extract variable name, stripping ? prefix if present
+                ;; (name '?country) returns "?country", so we strip the leading ?
+                raw-var-name (when (and (not is-count-star?) (symbol? var-arg))
+                               (name var-arg))
+                var-name (when raw-var-name
+                           (if (str/starts-with? raw-var-name "?")
+                             (subs raw-var-name 1)
+                             raw-var-name))
                 ;; Try to find column from predicate mapping
-                column (when (and var-name mapping)
-                         (some (fn [[_pred obj-map]]
-                                 (when (and (= :column (:type obj-map))
-                                            (= var-name (:var obj-map)))
-                                   (:value obj-map)))
-                               (:predicates mapping)))]
+                ;; Compare both with and without ? prefix for robustness
+                mapped-column (when (and var-name mapping)
+                                (some (fn [[_pred obj-map]]
+                                        (when (= :column (:type obj-map))
+                                          (let [obj-var (:var obj-map)]
+                                            (when (or (= var-name obj-var)
+                                                      (= raw-var-name obj-var)
+                                                      (= var-name (str "?" obj-var)))
+                                              (:value obj-map)))))
+                                      (:predicates mapping)))
+                ;; Use mapped column if found, else use var-name directly
+                ;; solution-get-column-value handles symbol/string lookup
+                column (if is-count-star?
+                         nil  ;; Only nil for COUNT(*)
+                         (or mapped-column var-name))]
             {:fn fn-keyword
-             :column (if is-count-star? nil column)
+             :column column
              :alias (str fn-name "_result")
              :var var-arg
              :var-name var-name})

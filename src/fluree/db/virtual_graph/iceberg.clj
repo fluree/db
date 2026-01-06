@@ -940,16 +940,133 @@
                                        aggregates))]]
          (merge group-vals agg-vals))))))
 
+(defn- apply-order-by
+  "Apply ORDER BY to a sequence of aggregated solutions.
+
+   Supports both ASC (default) and DESC ordering on aggregate result columns.
+
+   Handles multiple ORDER BY formats:
+     - SPARQL translator: vector of lists like [(\"desc\" ?count) (\"asc\" ?name)]
+     - JSON-LD/map: vector of maps like [{:var ?count :order :desc}]
+     - Simple: vector of symbols like [?count ?name]"
+  [solutions order-by-clause]
+  (if (seq order-by-clause)
+    (let [;; Parse a single order-by spec into {:key string :desc? bool}
+          parse-spec (fn [spec]
+                       (cond
+                         ;; SPARQL translator format: ("desc" ?count) or ("asc" ?name)
+                         (seq? spec)
+                         (let [[direction var] spec
+                               var-name (cond
+                                          (symbol? var) (name var)
+                                          (string? var) var
+                                          :else (str var))]
+                           {:key var-name
+                            :desc? (= "desc" (str/lower-case (str direction)))})
+
+                         ;; Already a map with :var and :order
+                         (map? spec)
+                         {:key (if-let [v (:var spec)]
+                                 (if (symbol? v) (name v) (str v))
+                                 (str spec))
+                          :desc? (= :desc (:order spec))}
+
+                         ;; Symbol like ?count
+                         (symbol? spec)
+                         {:key (name spec) :desc? false}
+
+                         ;; String expression like "(desc ?count)"
+                         (string? spec)
+                         (let [desc? (str/starts-with? (str/lower-case spec) "(desc")
+                               ;; Extract variable name
+                               var-match (re-find #"\?(\w+)" spec)]
+                           {:key (or (second var-match) spec)
+                            :desc? desc?})
+
+                         :else {:key (str spec) :desc? false}))
+          ;; Parse order-by specs - handle various formats
+          order-specs (cond
+                        ;; Vector of specs
+                        (vector? order-by-clause)
+                        (mapv parse-spec order-by-clause)
+                        ;; Single spec
+                        :else [(parse-spec order-by-clause)])
+          comparator (fn [a b]
+                       (reduce (fn [result {:keys [key desc?]}]
+                                 (if (zero? result)
+                                   (let [va (or (get a key) (get a (str "?" key)))
+                                         vb (or (get b key) (get b (str "?" key)))
+                                         cmp (compare va vb)]
+                                     (if desc? (- cmp) cmp))
+                                   result))
+                               0
+                               order-specs))]
+      (sort comparator solutions))
+    solutions))
+
+(defn- apply-limit-offset
+  "Apply LIMIT and OFFSET to a sequence of solutions."
+  [solutions limit offset]
+  (cond->> solutions
+    offset (drop offset)
+    limit (take limit)))
+
+(defn- finalize-aggregation
+  "Apply aggregation, ORDER BY, and LIMIT to solutions.
+
+   This function is called when the aggregation-spec atom contains
+   aggregation info from the parsed query.
+
+   Args:
+     solutions       - Sequence of solution maps from VG execution
+     agg-info        - Map with :select, :group-by, :order-by, :limit, :offset
+     mappings        - R2RML mappings for variable->column resolution
+
+   Returns sequence of aggregated solutions."
+  [solutions agg-info mappings]
+  (let [{:keys [select group-by order-by limit offset]} agg-info
+        ;; Build a combined mapping from all available mappings
+        ;; This is needed to resolve variables to columns
+        combined-mapping (reduce
+                          (fn [acc [_ m]]
+                            (update acc :predicates merge (:predicates m)))
+                          {:predicates {}}
+                          mappings)
+        ;; Build aggregation spec using the existing function
+        parsed-query {:select select :group-by group-by}
+        agg-spec (query/build-aggregation-spec parsed-query combined-mapping)]
+
+    (if agg-spec
+      (let [{:keys [group-keys aggregates]} agg-spec
+            _ (log/debug "Applying VG-level aggregation:" {:group-keys group-keys
+                                                           :aggregates (count aggregates)
+                                                           :input-solutions (count solutions)})
+            ;; Force realization of solutions for aggregation
+            solutions-vec (vec solutions)
+            ;; Apply aggregation
+            aggregated (apply-aggregation solutions-vec group-keys aggregates)
+            ;; Apply ORDER BY
+            ordered (apply-order-by aggregated order-by)
+            ;; Apply LIMIT/OFFSET
+            limited (apply-limit-offset ordered limit offset)]
+        (log/debug "Aggregation complete:" {:output-rows (count limited)})
+        limited)
+      ;; No valid aggregation spec - just apply ORDER BY and LIMIT if present
+      (-> solutions
+          (apply-order-by order-by)
+          (apply-limit-offset limit offset)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; IcebergDatabase Record (Multi-Table Support)
 ;;; ---------------------------------------------------------------------------
 
-(defrecord IcebergDatabase [alias config sources mappings routing-indexes join-graph time-travel query-pushdown]
+(defrecord IcebergDatabase [alias config sources mappings routing-indexes join-graph time-travel query-pushdown aggregation-spec]
   ;; sources: {table-name -> IcebergSource}
   ;; mappings: {table-key -> {:table, :class, :predicates, ...}}
   ;; routing-indexes: {:class->mappings {rdf-class -> [mappings...]}, :predicate->mappings {pred -> [mappings...]}}
   ;; join-graph: {:edges [JoinEdge...], :by-table {table -> [edges]}, :tm->table {iri -> table}}
   ;; query-pushdown: atom holding query-time pushdown predicates (set in -reorder, used in -finalize)
+  ;; aggregation-spec: atom holding aggregation spec {:group-keys [...] :aggregates [...] :order-by [...] :limit n}
 
   vg/UpdatableVirtualGraph
   (upsert [this _source-db _new-flakes _remove-flakes]
@@ -992,96 +1109,167 @@
     [alias])
 
   (-finalize [_ _tracker error-ch solution-ch]
-    (let [out-ch (async/chan 1 (map #(dissoc % ::iceberg-patterns)))
-          ;; VALUES pushdown from atom - this is the primary path since pattern metadata
+    (let [;; VALUES pushdown from atom - this is the primary path since pattern metadata
           ;; doesn't survive through the WHERE executor (known limitation)
           values-pushdown (when query-pushdown @query-pushdown)
+          ;; Capture aggregation spec from atom (set in -reorder)
+          agg-info (when aggregation-spec @aggregation-spec)
           ;; Capture columnar execution flag at query start (binding may change)
-          use-columnar? *columnar-execution*]
+          use-columnar? *columnar-execution*
+          ;; If aggregation is needed, we must collect all solutions before emitting
+          ;; Otherwise, stream solutions directly
+          out-ch (async/chan 1 (map #(dissoc % ::iceberg-patterns)))]
       (when (seq values-pushdown)
         (log/debug "Iceberg -finalize using VALUES pushdown from atom:" values-pushdown))
+      (when agg-info
+        (log/debug "Iceberg -finalize will apply aggregation:" agg-info))
       (when use-columnar?
         (log/debug "Iceberg -finalize using Phase 3 columnar execution"))
+
       ;; Use pipeline-async with thread (not go) for blocking I/O operations
       ;; Iceberg queries involve lazy seq realization with actual I/O, which would
       ;; block the limited go thread pool and cause contention under load
-      (async/pipeline-async
-       2
-       out-ch
-       (fn [solution ch]
-         (async/thread
-           (try
-             (let [patterns (get solution ::iceberg-patterns)]
-               (if (seq patterns)
-                 ;; Combine: pattern metadata pushdown (FILTER) + atom pushdown (VALUES)
-                 ;; Pattern metadata may not survive WHERE executor, but atom path is reliable
-                 (let [solution-pushdown (into (or (get solution ::solution-pushdown-filters) [])
-                                               (or values-pushdown []))]
-                   (when (seq solution-pushdown)
-                     (log/debug "Iceberg -finalize combined solution pushdown:" solution-pushdown))
+      (if agg-info
+        ;; Aggregation path: collect all solutions, aggregate, then emit
+        (async/thread
+          (try
+            (let [all-solutions (atom [])]
+              ;; Process each incoming solution
+              (loop []
+                (when-let [solution (async/<!! solution-ch)]
+                  (let [patterns (get solution ::iceberg-patterns)]
+                    (if (seq patterns)
+                      (let [solution-pushdown (into (or (get solution ::solution-pushdown-filters) [])
+                                                    (or values-pushdown []))]
+                        ;; Execute query and collect results
+                        (if (query/has-union-patterns? patterns)
+                          ;; UNION path
+                          (let [{:keys [union-patterns regular-patterns]} (query/extract-union-patterns patterns)
+                                results (execute-union-patterns
+                                         sources mappings routing-indexes join-graph
+                                         union-patterns regular-patterns solution
+                                         time-travel solution-pushdown use-columnar?)]
+                            (swap! all-solutions into results))
+                          ;; Standard path
+                          (let [pattern-groups (query/group-patterns-by-table patterns mappings routing-indexes)]
+                            (if (= 1 (count pattern-groups))
+                              ;; Single table
+                              (let [{:keys [mapping patterns]} (first pattern-groups)
+                                    table-name (:table mapping)
+                                    source (get sources table-name)]
+                                (when source
+                                  (let [results (if use-columnar?
+                                                  (execute-columnar-single-table
+                                                   source mapping patterns solution
+                                                   time-travel solution-pushdown)
+                                                  (query/execute-iceberg-query
+                                                   source mapping patterns solution
+                                                   time-travel nil solution-pushdown))]
+                                    (swap! all-solutions into results))))
+                              ;; Multiple tables
+                              (let [results (if use-columnar?
+                                              (execute-columnar-multi-table
+                                               sources pattern-groups solution
+                                               time-travel solution-pushdown join-graph)
+                                              (execute-multi-table-hash-join
+                                               sources pattern-groups solution
+                                               time-travel solution-pushdown join-graph))]
+                                (swap! all-solutions into results))))))
+                      ;; No patterns - pass through
+                      (swap! all-solutions conj solution)))
+                  (recur)))
+              ;; Apply aggregation to collected solutions
+              (let [aggregated (finalize-aggregation @all-solutions agg-info mappings)]
+                (log/debug "Aggregation applied:" {:input (count @all-solutions)
+                                                   :output (count aggregated)})
+                (doseq [sol aggregated]
+                  (async/>!! out-ch sol))))
+            (catch Exception e
+              (log/error e "Error in Iceberg aggregation")
+              (async/>!! error-ch e))
+            (finally
+              (async/close! out-ch))))
 
-                   ;; Check for UNION patterns - handle them specially
-                   (if (query/has-union-patterns? patterns)
-                     ;; UNION path - extract and execute UNION branches
-                     (let [{:keys [union-patterns regular-patterns]} (query/extract-union-patterns patterns)
-                           final-solutions (execute-union-patterns
-                                            sources mappings routing-indexes join-graph
-                                            union-patterns regular-patterns solution
-                                            time-travel solution-pushdown use-columnar?)]
-                       (log/debug "UNION execution complete:" {:union-count (count union-patterns)
-                                                               :result-count (count final-solutions)})
-                       (doseq [sol final-solutions]
-                         (async/>!! ch sol))
-                       (async/close! ch))
+        ;; Non-aggregation path: stream solutions directly
+        (async/pipeline-async
+         2
+         out-ch
+         (fn [solution ch]
+           (async/thread
+             (try
+               (let [patterns (get solution ::iceberg-patterns)]
+                 (if (seq patterns)
+                   ;; Combine: pattern metadata pushdown (FILTER) + atom pushdown (VALUES)
+                   ;; Pattern metadata may not survive WHERE executor, but atom path is reliable
+                   (let [solution-pushdown (into (or (get solution ::solution-pushdown-filters) [])
+                                                 (or values-pushdown []))]
+                     (when (seq solution-pushdown)
+                       (log/debug "Iceberg -finalize combined solution pushdown:" solution-pushdown))
 
-                     ;; Standard path - no UNION patterns
-                     (let [pattern-groups (query/group-patterns-by-table patterns mappings routing-indexes)]
-                       (if (= 1 (count pattern-groups))
-                         ;; Single table - simple case
-                         (let [{:keys [mapping patterns]} (first pattern-groups)
-                               table-name (:table mapping)
-                               source (get sources table-name)]
-                           (when-not source
-                             (throw (ex-info (str "No source found for table: " table-name)
-                                             {:error :db/missing-source
-                                              :table table-name
-                                              :available-sources (keys sources)})))
-                           ;; Use columnar path when enabled
-                           (let [solutions (if use-columnar?
-                                             (execute-columnar-single-table
-                                              source mapping patterns solution
-                                              time-travel solution-pushdown)
-                                             (query/execute-iceberg-query source mapping patterns solution
-                                                                          time-travel nil solution-pushdown))]
-                             (doseq [sol solutions]
+                     ;; Check for UNION patterns - handle them specially
+                     (if (query/has-union-patterns? patterns)
+                       ;; UNION path - extract and execute UNION branches
+                       (let [{:keys [union-patterns regular-patterns]} (query/extract-union-patterns patterns)
+                             final-solutions (execute-union-patterns
+                                              sources mappings routing-indexes join-graph
+                                              union-patterns regular-patterns solution
+                                              time-travel solution-pushdown use-columnar?)]
+                         (log/debug "UNION execution complete:" {:union-count (count union-patterns)
+                                                                 :result-count (count final-solutions)})
+                         (doseq [sol final-solutions]
+                           (async/>!! ch sol))
+                         (async/close! ch))
+
+                       ;; Standard path - no UNION patterns
+                       (let [pattern-groups (query/group-patterns-by-table patterns mappings routing-indexes)]
+                         (if (= 1 (count pattern-groups))
+                           ;; Single table - simple case
+                           (let [{:keys [mapping patterns]} (first pattern-groups)
+                                 table-name (:table mapping)
+                                 source (get sources table-name)]
+                             (when-not source
+                               (throw (ex-info (str "No source found for table: " table-name)
+                                               {:error :db/missing-source
+                                                :table table-name
+                                                :available-sources (keys sources)})))
+                             ;; Use columnar path when enabled
+                             (let [solutions (if use-columnar?
+                                               (execute-columnar-single-table
+                                                source mapping patterns solution
+                                                time-travel solution-pushdown)
+                                               (query/execute-iceberg-query source mapping patterns solution
+                                                                            time-travel nil solution-pushdown))]
+                               (doseq [sol solutions]
+                                 (async/>!! ch sol))
+                               (async/close! ch)))
+                           ;; Multiple tables - use hash join when join graph available
+                           (let [final-solutions (if use-columnar?
+                                                   (execute-columnar-multi-table
+                                                    sources pattern-groups solution
+                                                    time-travel solution-pushdown join-graph)
+                                                   (execute-multi-table-hash-join
+                                                    sources pattern-groups solution
+                                                    time-travel solution-pushdown join-graph))]
+                             (doseq [sol final-solutions]
                                (async/>!! ch sol))
-                             (async/close! ch)))
-                         ;; Multiple tables - use hash join when join graph available
-                         (let [final-solutions (if use-columnar?
-                                                 (execute-columnar-multi-table
-                                                  sources pattern-groups solution
-                                                  time-travel solution-pushdown join-graph)
-                                                 (execute-multi-table-hash-join
-                                                  sources pattern-groups solution
-                                                  time-travel solution-pushdown join-graph))]
-                           (doseq [sol final-solutions]
-                             (async/>!! ch sol))
-                           (async/close! ch))))))
-                 (do (async/>!! ch solution)
-                     (async/close! ch))))
-             (catch Exception e
-               (log/error e "Error in Iceberg query execution")
-               (async/>!! error-ch e)
-               (async/close! ch)))))
-       solution-ch)
+                             (async/close! ch))))))
+                   (do (async/>!! ch solution)
+                       (async/close! ch))))
+               (catch Exception e
+                 (log/error e "Error in Iceberg query execution")
+                 (async/>!! error-ch e)
+                 (async/close! ch)))))
+         solution-ch))
       out-ch))
 
   optimize/Optimizable
   (-reorder [_ parsed-query]
     (go
-      ;; Clear any stale VALUES pushdown from previous queries
+      ;; Clear any stale pushdown/aggregation specs from previous queries
       (when query-pushdown
         (reset! query-pushdown nil))
+      (when aggregation-spec
+        (reset! aggregation-spec nil))
       (let [where-patterns (:where parsed-query)]
         (if (seq where-patterns)
           ;; Separate different pattern types
@@ -1197,7 +1385,20 @@
 
                 ;; Store VALUES predicates in the atom for retrieval in -finalize
                 _ (when (and query-pushdown (seq values-pushdown-predicates))
-                    (reset! query-pushdown values-pushdown-predicates))]
+                    (reset! query-pushdown values-pushdown-predicates))
+
+                ;; Extract aggregation info from parsed query for use in -finalize
+                ;; Store the raw query parts so they can be resolved with proper mappings later
+                agg-info (when (query/has-aggregations? parsed-query)
+                           {:select (:select parsed-query)
+                            :group-by (:group-by parsed-query)
+                            ;; Handle both :orderBy (SPARQL translator) and :order-by (JSON-LD)
+                            :order-by (or (:orderBy parsed-query) (:order-by parsed-query))
+                            :limit (:limit parsed-query)
+                            :offset (:offset parsed-query)})
+                _ (when (and aggregation-spec agg-info)
+                    (log/debug "Iceberg -reorder storing aggregation spec:" agg-info)
+                    (reset! aggregation-spec agg-info))]
 
             ;; Store direct pushdown map in query opts for retrieval in -finalize
             (-> parsed-query
@@ -1445,4 +1646,5 @@
                            :routing-indexes routing-indexes
                            :join-graph join-graph
                            :time-travel nil
-                           :query-pushdown (atom nil)})))
+                           :query-pushdown (atom nil)
+                           :aggregation-spec (atom nil)})))
