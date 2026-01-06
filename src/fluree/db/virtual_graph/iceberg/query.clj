@@ -52,18 +52,36 @@
     {:class->mappings class->mappings
      :predicate->mappings predicate->mappings}))
 
+(defn- union-pattern?
+  "Check if a pattern is a UNION pattern.
+   UNION patterns are MapEntry with :union as the key."
+  [item]
+  (and (map-entry? item)
+       (= :union (key item))))
+
 (defn- extract-pattern-info
   "Extract type and predicates from a pattern item.
 
    Also detects :optional patterns and extracts the inner patterns,
-   marking them as optional."
+   marking them as optional.
+
+   Returns nil for UNION patterns (they must be handled separately at a higher level)."
   [item]
-  ;; Check if this is an :optional pattern container
-  (if (and (vector? item) (= :optional (first item)))
+  ;; UNION patterns are handled separately - return special marker
+  (cond
+    ;; UNION pattern - return special marker to be filtered out
+    (union-pattern? item)
+    {:union-pattern? true
+     :item item}
+
+    ;; Optional pattern container
+    (and (vector? item) (= :optional (first item)))
     ;; Extract inner patterns and mark as optional
     (let [inner-patterns (second item)]
       (mapv #(assoc (extract-pattern-info %) :optional? true) inner-patterns))
+
     ;; Regular pattern (triple or :class)
+    :else
     (let [triple (if (= :class (first item)) (second item) item)
           [s p o] triple
           subject-var (when (and (map? s) (get s ::where/var))
@@ -79,6 +97,25 @@
        :item item
        :optional? false})))
 
+(defn extract-union-patterns
+  "Extract UNION patterns from a list of patterns.
+
+   Returns a map with:
+     :union-patterns - vector of UNION patterns (each is a MapEntry with :union key)
+     :regular-patterns - vector of non-UNION patterns
+
+   UNION patterns are MapEntry with :union as the key and a vector of
+   where-clauses as the value. Each where-clause is itself a vector of patterns."
+  [patterns]
+  (let [grouped (group-by union-pattern? patterns)]
+    {:union-patterns (vec (get grouped true []))
+     :regular-patterns (vec (get grouped false []))}))
+
+(defn has-union-patterns?
+  "Check if pattern list contains any UNION patterns."
+  [patterns]
+  (some union-pattern? patterns))
+
 (defn group-patterns-by-table
   "Group patterns by which table they should be routed to.
 
@@ -87,6 +124,9 @@
 
    Also handles OPTIONAL patterns, marking the resulting pattern groups
    with :optional? true so joins can use left outer join semantics.
+
+   NOTE: UNION patterns are filtered out and should be handled separately
+   using extract-union-patterns before calling this function.
 
    LIMITATION: OPTIONAL block structure is not preserved for multi-table cases.
    Currently, each pattern is individually marked as optional, then grouped by
@@ -119,6 +159,8 @@
         raw-pattern-infos (map extract-pattern-info patterns)
         ;; Flatten any nested vectors from :optional expansion
         pattern-infos (mapcat #(if (sequential? (first %)) % [%]) raw-pattern-infos)
+        ;; Filter out UNION patterns (they're handled separately)
+        non-union-infos (remove :union-pattern? pattern-infos)
 
         ;; Find mapping for each pattern (takes first when multiple exist)
         find-mapping (fn [{:keys [rdf-type predicate]}]
@@ -127,11 +169,12 @@
                            (first (vals mappings))))
 
         ;; Group by subject variable first, then by mapping
-        by-subject (group-by :subject-var pattern-infos)
+        by-subject (group-by :subject-var non-union-infos)
 
         ;; For each subject group, determine the primary mapping
         ;; and whether it's optional (all patterns in group must be optional)
         groups (for [[_subj-var infos] by-subject
+                     :when (seq infos)  ;; Skip empty groups
                      :let [;; Find mappings for patterns with type info first
                            type-patterns (filter :rdf-type infos)
                            mapping (if (seq type-patterns)

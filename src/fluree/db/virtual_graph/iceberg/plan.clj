@@ -969,6 +969,84 @@
                     :state (atom {:opened? false})})))
 
 ;;; ---------------------------------------------------------------------------
+;;; UnionOp - SPARQL UNION
+;;; ---------------------------------------------------------------------------
+
+(defrecord UnionOp [children state]
+  ;; state is an atom containing {:opened? bool, :current-child-idx int}
+  ;; children is a vector of ITabularPlan operators (one per UNION branch)
+  ITabularPlan
+  (open! [this]
+    (when-not (:opened? @state)
+      (log/debug "UnionOp opening:" {:branch-count (count children)})
+      ;; Open all children upfront
+      (doseq [child children]
+        (open! child))
+      (reset! state {:opened? true
+                     :current-child-idx 0}))
+    this)
+
+  (next-batch! [_this]
+    (when (:opened? @state)
+      (let [idx (:current-child-idx @state)]
+        (when (< idx (count children))
+          ;; Try to get a batch from the current child
+          (if-let [batch (next-batch! (nth children idx))]
+            batch
+            ;; Current child exhausted, try next child
+            (do
+              (swap! state update :current-child-idx inc)
+              ;; Recursively try next child (will return nil if all exhausted)
+              (let [new-idx (:current-child-idx @state)]
+                (when (< new-idx (count children))
+                  ;; Keep trying children until we get a batch or run out
+                  (loop [child-idx new-idx]
+                    (when (< child-idx (count children))
+                      (if-let [batch (next-batch! (nth children child-idx))]
+                        (do
+                          (swap! state assoc :current-child-idx child-idx)
+                          batch)
+                        (do
+                          (swap! state assoc :current-child-idx (inc child-idx))
+                          (recur (inc child-idx))))))))))))))
+
+  (close! [this]
+    (when (:opened? @state)
+      (log/debug "UnionOp closing")
+      (doseq [child children]
+        (close! child))
+      (reset! state {:opened? false
+                     :current-child-idx 0}))
+    this)
+
+  (estimated-rows [_this]
+    ;; UNION output is sum of all branch estimates
+    (reduce + 0 (map estimated-rows children))))
+
+(defn create-union-op
+  "Create a UNION operator that concatenates results from multiple branches.
+
+   UNION returns all results from all branches sequentially. This is equivalent
+   to SPARQL UNION semantics where results from all alternatives are combined.
+
+   For streaming execution, branches are processed sequentially (not interleaved)
+   to minimize memory usage.
+
+   Args:
+     children - Vector of ITabularPlan operators, one per UNION branch
+
+   Example:
+     (create-union-op [(create-scan-op src1 \"routes\" [...] [])
+                       (create-scan-op src2 \"airlines\" [...] [])])"
+  [children]
+  {:pre [(vector? children)
+         (every? #(satisfies? ITabularPlan %) children)
+         (pos? (count children))]}
+  (map->UnionOp {:children children
+                 :state (atom {:opened? false
+                               :current-child-idx 0})}))
+
+;;; ---------------------------------------------------------------------------
 ;;; Batch to Solution Conversion
 ;;; ---------------------------------------------------------------------------
 

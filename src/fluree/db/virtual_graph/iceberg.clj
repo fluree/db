@@ -650,6 +650,107 @@
       [])))
 
 ;;; ---------------------------------------------------------------------------
+;;; UNION Pattern Execution
+;;; ---------------------------------------------------------------------------
+
+(declare execute-union-patterns)
+
+(defn- execute-union-branch
+  "Execute a single UNION branch and return solutions.
+
+   A branch is a vector of patterns (like a WHERE clause).
+   Routes patterns to tables and executes them."
+  [sources mappings routing-indexes join-graph
+   branch-patterns base-solution time-travel solution-pushdown use-columnar?]
+  ;; Support nested UNION by recursively expanding and executing.
+  ;; Without this, group-patterns-by-table would silently drop UNION patterns.
+  (if (query/has-union-patterns? branch-patterns)
+    (let [{:keys [union-patterns regular-patterns]} (query/extract-union-patterns branch-patterns)]
+      (execute-union-patterns sources mappings routing-indexes join-graph
+                              union-patterns regular-patterns base-solution
+                              time-travel solution-pushdown use-columnar?))
+    (let [pattern-groups (query/group-patterns-by-table branch-patterns mappings routing-indexes)]
+      (log/debug "UNION branch execution:" {:patterns (count branch-patterns)
+                                            :groups (count pattern-groups)})
+      (cond
+        ;; Empty branch - no results
+        (empty? pattern-groups)
+        []
+
+        ;; Single table
+        (= 1 (count pattern-groups))
+        (let [{:keys [mapping patterns]} (first pattern-groups)
+              table-name (:table mapping)
+              source (get sources table-name)]
+          (if-not source
+            (do
+              (log/warn "No source found for table in UNION branch:" table-name)
+              [])
+            (if use-columnar?
+              (execute-columnar-single-table source mapping patterns base-solution
+                                             time-travel solution-pushdown)
+              (vec (query/execute-iceberg-query source mapping patterns base-solution
+                                                time-travel nil solution-pushdown)))))
+
+        ;; Multiple tables - use hash join
+        :else
+        (if use-columnar?
+          (execute-columnar-multi-table sources pattern-groups base-solution
+                                        time-travel solution-pushdown join-graph)
+          (execute-multi-table-hash-join sources pattern-groups base-solution
+                                         time-travel solution-pushdown join-graph))))))
+
+(defn- execute-union-patterns
+  "Execute UNION patterns and return combined solutions.
+
+   UNION returns all results from all branches concatenated.
+   Each branch is executed independently and results are combined.
+
+   Args:
+     union-patterns   - Vector of UNION patterns (MapEntry with :union key)
+     regular-patterns - Vector of non-UNION patterns (executed normally)
+     ... other args passed through to branch execution
+
+   Returns vector of solutions from all UNION branches."
+  [sources mappings routing-indexes join-graph
+   union-patterns regular-patterns base-solution time-travel solution-pushdown use-columnar?]
+  (log/debug "Executing UNION patterns:" {:union-count (count union-patterns)
+                                          :regular-count (count regular-patterns)})
+  ;; SPARQL semantics:
+  ;; - UNION is evaluated as a union of graph pattern alternatives.
+  ;; - If UNION appears alongside regular patterns, the regular patterns must be
+  ;;   included in (joined with) EACH UNION branch (distribution), not cross-producted
+  ;;   after the fact.
+  ;;
+  ;; Additionally, if multiple UNION patterns appear at the same level, semantics
+  ;; are equivalent to a UNION over the cartesian product of branch choices.
+  (let [expanded-branch-patterns
+        (reduce
+         (fn [acc union-pattern]
+           (let [branches (val union-pattern)]
+             (log/debug "UNION pattern has branches:" (count branches))
+             (vec (for [prefix acc
+                        branch branches]
+                    (into (vec prefix) branch)))))
+         [[]]
+         union-patterns)
+
+        combined-branches
+        (mapv (fn [branch]
+                (if (seq regular-patterns)
+                  (into (vec regular-patterns) branch)
+                  (vec branch)))
+              expanded-branch-patterns)]
+
+    (vec
+     (mapcat
+      (fn [branch-patterns]
+        (execute-union-branch sources mappings routing-indexes join-graph
+                              branch-patterns base-solution time-travel
+                              solution-pushdown use-columnar?))
+      combined-branches))))
+
+;;; ---------------------------------------------------------------------------
 ;;; IcebergDatabase Record (Multi-Table Support)
 ;;; ---------------------------------------------------------------------------
 
@@ -722,45 +823,60 @@
            (try
              (let [patterns (get solution ::iceberg-patterns)]
                (if (seq patterns)
-                 ;; Group patterns by table and execute each group
                  ;; Combine: pattern metadata pushdown (FILTER) + atom pushdown (VALUES)
                  ;; Pattern metadata may not survive WHERE executor, but atom path is reliable
-                 (let [pattern-groups (query/group-patterns-by-table patterns mappings routing-indexes)
-                       solution-pushdown (into (or (get solution ::solution-pushdown-filters) [])
+                 (let [solution-pushdown (into (or (get solution ::solution-pushdown-filters) [])
                                                (or values-pushdown []))]
                    (when (seq solution-pushdown)
                      (log/debug "Iceberg -finalize combined solution pushdown:" solution-pushdown))
-                   (if (= 1 (count pattern-groups))
-                     ;; Single table - simple case
-                     (let [{:keys [mapping patterns]} (first pattern-groups)
-                           table-name (:table mapping)
-                           source (get sources table-name)]
-                       (when-not source
-                         (throw (ex-info (str "No source found for table: " table-name)
-                                         {:error :db/missing-source
-                                          :table table-name
-                                          :available-sources (keys sources)})))
-                       ;; Use columnar path when enabled
-                       (let [solutions (if use-columnar?
-                                         (execute-columnar-single-table
-                                          source mapping patterns solution
-                                          time-travel solution-pushdown)
-                                         (query/execute-iceberg-query source mapping patterns solution
-                                                                      time-travel nil solution-pushdown))]
-                         (doseq [sol solutions]
-                           (async/>!! ch sol))
-                         (async/close! ch)))
-                     ;; Multiple tables - use hash join when join graph available
-                     (let [final-solutions (if use-columnar?
-                                             (execute-columnar-multi-table
-                                              sources pattern-groups solution
-                                              time-travel solution-pushdown join-graph)
-                                             (execute-multi-table-hash-join
-                                              sources pattern-groups solution
-                                              time-travel solution-pushdown join-graph))]
+
+                   ;; Check for UNION patterns - handle them specially
+                   (if (query/has-union-patterns? patterns)
+                     ;; UNION path - extract and execute UNION branches
+                     (let [{:keys [union-patterns regular-patterns]} (query/extract-union-patterns patterns)
+                           final-solutions (execute-union-patterns
+                                            sources mappings routing-indexes join-graph
+                                            union-patterns regular-patterns solution
+                                            time-travel solution-pushdown use-columnar?)]
+                       (log/debug "UNION execution complete:" {:union-count (count union-patterns)
+                                                               :result-count (count final-solutions)})
                        (doseq [sol final-solutions]
                          (async/>!! ch sol))
-                       (async/close! ch))))
+                       (async/close! ch))
+
+                     ;; Standard path - no UNION patterns
+                     (let [pattern-groups (query/group-patterns-by-table patterns mappings routing-indexes)]
+                       (if (= 1 (count pattern-groups))
+                         ;; Single table - simple case
+                         (let [{:keys [mapping patterns]} (first pattern-groups)
+                               table-name (:table mapping)
+                               source (get sources table-name)]
+                           (when-not source
+                             (throw (ex-info (str "No source found for table: " table-name)
+                                             {:error :db/missing-source
+                                              :table table-name
+                                              :available-sources (keys sources)})))
+                           ;; Use columnar path when enabled
+                           (let [solutions (if use-columnar?
+                                             (execute-columnar-single-table
+                                              source mapping patterns solution
+                                              time-travel solution-pushdown)
+                                             (query/execute-iceberg-query source mapping patterns solution
+                                                                          time-travel nil solution-pushdown))]
+                             (doseq [sol solutions]
+                               (async/>!! ch sol))
+                             (async/close! ch)))
+                         ;; Multiple tables - use hash join when join graph available
+                         (let [final-solutions (if use-columnar?
+                                                 (execute-columnar-multi-table
+                                                  sources pattern-groups solution
+                                                  time-travel solution-pushdown join-graph)
+                                                 (execute-multi-table-hash-join
+                                                  sources pattern-groups solution
+                                                  time-travel solution-pushdown join-graph))]
+                           (doseq [sol final-solutions]
+                             (async/>!! ch sol))
+                           (async/close! ch))))))
                  (do (async/>!! ch solution)
                      (async/close! ch))))
              (catch Exception e

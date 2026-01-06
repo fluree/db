@@ -434,3 +434,91 @@
       (is (true? (:vectorized? plan)) "Vectorized should be enabled")
       ;; The join should be configured as left-outer for OPTIONAL patterns
       (is (true? (:left-outer? plan)) "Left-outer should be set for OPTIONAL patterns"))))
+
+;;; ---------------------------------------------------------------------------
+;;; UnionOp Tests (SPARQL UNION)
+;;; ---------------------------------------------------------------------------
+
+(deftest union-op-test
+  (testing "UnionOp satisfies ITabularPlan protocol"
+    (let [scan1 (plan/create-scan-op test-source "airlines" ["id" "name"] [])
+          scan2 (plan/create-scan-op test-source "routes" ["route_id" "src"] [])
+          union (plan/create-union-op [scan1 scan2])]
+      (is (satisfies? plan/ITabularPlan union))))
+
+  (testing "UnionOp concatenates results from all branches"
+    (let [;; Branch 1: US airlines only
+          scan1 (plan/create-scan-op test-source "airlines" ["id" "name" "country"]
+                                     [{:column "country" :op :eq :value "US"}])
+          ;; Branch 2: All routes
+          scan2 (plan/create-scan-op test-source "routes" ["route_id" "airline_id" "src" "dst"] [])
+          union (plan/create-union-op [scan1 scan2])]
+      (plan/open! union)
+      (try
+        (let [batches (loop [result []]
+                        (if-let [batch (plan/next-batch! union)]
+                          (recur (conj result batch))
+                          result))
+              ;; Count total rows from all batches
+              total-rows (reduce + 0 (map (fn [b]
+                                            (if (map? b) 1
+                                                (if (vector? b) (count b)
+                                                    (count (:rows b)))))
+                                          batches))]
+          ;; Should have 2 US airlines + 4 routes = 6 total results
+          (is (= 6 total-rows)
+              "UNION should return results from both branches"))
+        (finally
+          (plan/close! union)))))
+
+  (testing "UnionOp handles empty branches"
+    (let [;; Branch 1: No airlines from Antarctica (empty result)
+          scan1 (plan/create-scan-op test-source "airlines" ["id" "name"]
+                                     [{:column "country" :op :eq :value "AQ"}])
+          ;; Branch 2: All airlines
+          scan2 (plan/create-scan-op test-source "airlines" ["id" "name"] [])
+          union (plan/create-union-op [scan1 scan2])]
+      (plan/open! union)
+      (try
+        (let [batches (loop [result []]
+                        (if-let [batch (plan/next-batch! union)]
+                          (recur (conj result batch))
+                          result))
+              total-rows (reduce + 0 (map (fn [b]
+                                            (if (map? b) 1
+                                                (if (vector? b) (count b)
+                                                    (count (:rows b)))))
+                                          batches))]
+          ;; First branch is empty, second has 4 airlines
+          (is (= 4 total-rows)
+              "UNION with empty branch should only return non-empty branch results"))
+        (finally
+          (plan/close! union)))))
+
+  (testing "UnionOp with single branch returns that branch's results"
+    (let [scan (plan/create-scan-op test-source "airlines" ["id" "name"] [])
+          union (plan/create-union-op [scan])]
+      (plan/open! union)
+      (try
+        (let [batches (loop [result []]
+                        (if-let [batch (plan/next-batch! union)]
+                          (recur (conj result batch))
+                          result))
+              total-rows (reduce + 0 (map (fn [b]
+                                            (if (map? b) 1
+                                                (if (vector? b) (count b)
+                                                    (count (:rows b)))))
+                                          batches))]
+          (is (= 4 total-rows)
+              "UNION with single branch should return all results from that branch"))
+        (finally
+          (plan/close! union)))))
+
+  (testing "UnionOp estimated-rows is sum of children"
+    (let [scan1 (plan/create-scan-op test-source "airlines" ["id"] [])
+          scan2 (plan/create-scan-op test-source "routes" ["route_id"] [])
+          union (plan/create-union-op [scan1 scan2])]
+      ;; Note: Without proper stats, estimated-rows may be nil or 0
+      ;; This test verifies the structure is correct
+      (is (some? (plan/estimated-rows union))
+          "UnionOp should have estimated-rows"))))

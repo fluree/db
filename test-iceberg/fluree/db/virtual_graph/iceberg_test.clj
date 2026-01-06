@@ -1174,6 +1174,76 @@
 ;; verify the complete integration works correctly.
 
 ;;; ---------------------------------------------------------------------------
+;;; UNION Tests
+;;; ---------------------------------------------------------------------------
+
+(deftest e2e-sparql-union-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL UNION returns results from both branches"
+      (setup-fluree-system)
+      (try
+        ;; Register the multi-table Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-union:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; UNION query - get names from both airlines and airports (if airport table exists)
+        ;; Using same table for both branches to test UNION mechanics
+        (let [sparql-union "PREFIX ex: <http://example.org/>
+                            SELECT ?name
+                            FROM <iceberg/openflights-union>
+                            WHERE {
+                              { ?airline a ex:Airline ; ex:name ?name }
+                              UNION
+                              { ?airline a ex:Airline ; ex:name ?name ; ex:country \"US\" }
+                            }
+                            LIMIT 20"
+              res @(fluree/query-connection @e2e-conn sparql-union {:format :sparql})]
+          (is (vector? res) "Should return results from UNION query")
+          (is (pos? (count res)) "Should have results from at least one branch")
+          ;; First branch: all airlines, Second branch: US airlines only
+          ;; Results should contain airlines from both (with possible duplicates)
+          (is (<= (count res) 20) "Should respect limit"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-sparql-union-different-vars-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL UNION with different variables in branches"
+      (setup-fluree-system)
+      (try
+        ;; Register the multi-table Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-union-vars:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; UNION with different variables - one branch has ?country, other doesn't
+        (let [sparql-union "PREFIX ex: <http://example.org/>
+                            SELECT ?name ?country
+                            FROM <iceberg/openflights-union-vars>
+                            WHERE {
+                              { ?airline a ex:Airline ; ex:name ?name ; ex:country ?country }
+                              UNION
+                              { ?route ex:sourceAirport ?name }
+                            }
+                            LIMIT 30"
+              res @(fluree/query-connection @e2e-conn sparql-union {:format :sparql})]
+          (is (vector? res) "Should return results from UNION query")
+          ;; Results from first branch have ?country, second branch doesn't
+          ;; SPARQL UNION semantics: unbound variables appear as unbound
+          (is (pos? (count res)) "Should have results"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Run from REPL
 ;;; ---------------------------------------------------------------------------
 
