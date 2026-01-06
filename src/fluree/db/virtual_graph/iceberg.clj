@@ -123,6 +123,48 @@
                         (join/parent-columns edge))]
               col)))))
 
+(defn- collect-all-join-columns
+  "Collect all join key columns from the join graph.
+
+   Returns a set of all column names used as join keys across all tables."
+  [join-graph]
+  (when join-graph
+    (into #{}
+          (for [edge (:edges join-graph)
+                col (concat (join/parent-columns edge)
+                            (join/child-columns edge))]
+            col))))
+
+(defn- extract-columns-from-pattern-groups
+  "Extract all column names needed by the query from pattern groups.
+
+   Looks at each pattern's predicate IRI and maps it to a column name
+   via the R2RML mapping. Also includes columns from pushdown predicates.
+
+   Returns a set of column names (strings) needed for the query."
+  [pattern-groups predicates]
+  (into #{}
+        (concat
+         ;; Columns from pushdown predicates
+         (keep :column predicates)
+         ;; Columns from pattern predicates mapped via R2RML
+         (for [{:keys [mapping patterns]} pattern-groups
+               pattern patterns
+               :let [;; Extract predicate IRI from pattern
+                     triple (if (and (vector? pattern) (= :class (first pattern)))
+                              (second pattern)
+                              pattern)
+                     [_s p _o] triple
+                     pred-iri (when (map? p) (::where/iri p))
+                     ;; Map predicate IRI to column via R2RML mapping
+                     object-map (when pred-iri
+                                  (get-in mapping [:predicates pred-iri]))
+                     column (when (and (map? object-map)
+                                       (= :column (:type object-map)))
+                              (:value object-map))]
+               :when column]
+           column))))
+
 (defn- extract-pattern-predicate
   "Extract the predicate IRI from a pattern item."
   [item]
@@ -506,10 +548,11 @@
    Uses the plan compiler to create an operator tree with ScanOps
    and HashJoinOps.
 
-   Phase 3b: Uses true columnar execution:
+   Phase 3c: True vectorized execution with automatic projection pushdown:
    1. ScanOps use filtered Arrow batches (vectorized filtering, copied data)
-   2. HashJoinOp processes Arrow batches via dual-mode methods
-   3. HashJoinOp outputs merged row maps for solution creation"
+   2. HashJoinOp uses vectorized mode (batch storage + gather output)
+   3. Automatic projection pushdown - only copy columns needed by query
+   4. HashJoinOp outputs Arrow batches converted to row maps at boundary"
   [sources pattern-groups base-solution time-travel predicates join-graph]
   (let [stats-by-table (get-table-statistics sources pattern-groups time-travel)
         ;; Add predicates to pattern groups
@@ -518,28 +561,41 @@
                 (let [table-name (:table mapping)
                       table-predicates (filter #(= table-name (:table %)) predicates)]
                   (assoc group :predicates table-predicates)))
-              pattern-groups)]
+              pattern-groups)
+
+        ;; Calculate columns needed by the query for projection pushdown
+        ;; Include: pattern columns + join keys + predicate columns
+        query-columns (extract-columns-from-pattern-groups groups-with-predicates predicates)
+        join-columns (collect-all-join-columns join-graph)
+        output-columns (into query-columns join-columns)]
 
     (log/debug "Columnar multi-table execution:" {:tables (count pattern-groups)
                                                   :stats stats-by-table
-                                                  :use-arrow-batches? true})
+                                                  :vectorized? true
+                                                  :query-columns (count query-columns)
+                                                  :join-columns (count join-columns)
+                                                  :output-columns (count output-columns)})
 
-    ;; Compile the plan - use Arrow batches for columnar execution
-    ;; scan-arrow-batches now returns filtered, copied batches (safe to hold)
+    ;; Compile the plan with vectorized mode and projection pushdown
+    ;; Phase 3c: Full columnar pipeline with automatic optimization
     (if-let [root-plan (plan/compile-plan sources groups-with-predicates
                                           join-graph stats-by-table time-travel
-                                          {:use-arrow-batches? true})]
+                                          {:use-arrow-batches? true
+                                           :copy-batches? true  ;; Required for vectorized build
+                                           :vectorized? true    ;; True vectorized hash join
+                                           :output-columns output-columns})]
       (try
         (plan/open! root-plan)
         (loop [solutions []]
           (if-let [batch (plan/next-batch! root-plan)]
-            ;; batch can be:
-            ;; 1. VectorSchemaRoot (from ScanOp in Arrow mode, single table)
-            ;; 2. A vector of row maps (from HashJoinOp after join)
-            ;; 3. A single row map (edge case)
+            ;; In vectorized mode, batch is VectorSchemaRoot from gather
+            ;; Convert to row maps at the boundary
             (let [row-maps (cond
                              (instance? org.apache.arrow.vector.VectorSchemaRoot batch)
-                             (plan/batch->row-maps batch)
+                             (let [rows (plan/batch->row-maps batch)]
+                               ;; Close the gathered batch to free Arrow memory
+                               (.close ^org.apache.arrow.vector.VectorSchemaRoot batch)
+                               rows)
                              (map? batch) [batch]
                              (vector? batch) batch
                              (sequential? batch) (vec batch)
