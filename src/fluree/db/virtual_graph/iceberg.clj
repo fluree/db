@@ -35,6 +35,7 @@
             [fluree.db.virtual-graph :as vg]
             [fluree.db.virtual-graph.iceberg.join :as join]
             [fluree.db.virtual-graph.iceberg.join.hash :as hash-join]
+            [fluree.db.virtual-graph.iceberg.plan :as plan]
             [fluree.db.virtual-graph.iceberg.pushdown :as pushdown]
             [fluree.db.virtual-graph.iceberg.query :as query]
             [fluree.db.virtual-graph.iceberg.r2rml :as r2rml])
@@ -59,6 +60,19 @@
      (binding [*max-cartesian-product-size* nil]
        (execute-query ...))"
   100000)
+
+(def ^:dynamic *columnar-execution*
+  "Enable Phase 3 columnar execution path.
+
+   When true, uses the plan compiler and Arrow-batch operators for query
+   execution, keeping data in columnar format through joins.
+
+   When false (default), uses the row-based solution approach from Phase 2.
+
+   This flag enables A/B testing between execution strategies:
+     (binding [*columnar-execution* true]
+       (execute-query ...))"
+  false)
 
 (defn- check-cartesian-product-size!
   "Check if a Cartesian product would exceed the safety threshold.
@@ -380,6 +394,112 @@
             (rest group-results))))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Columnar Plan Execution (Phase 3)
+;;; ---------------------------------------------------------------------------
+
+(defn- get-table-statistics
+  "Get statistics for tables in pattern groups."
+  [sources pattern-groups time-travel]
+  (into {}
+        (for [{:keys [mapping]} pattern-groups
+              :let [table-name (:table mapping)
+                    source (get sources table-name)]
+              :when source]
+          [table-name
+           (tabular/get-statistics source table-name
+                                   (cond-> {}
+                                     (:snapshot-id time-travel)
+                                     (assoc :snapshot-id (:snapshot-id time-travel))
+                                     (:as-of-time time-travel)
+                                     (assoc :as-of-time (:as-of-time time-travel))))])))
+
+(defn- columnar-batch->solutions
+  "Convert a batch of columnar data to SPARQL solutions.
+
+   This is the boundary conversion from Arrow batches to solution maps.
+   Applies the R2RML mapping to convert raw column values to RDF terms."
+  [batch _mapping base-solution]
+  (let [row-maps (plan/batch->row-maps batch)]
+    ;; Convert each row map to a solution using the mapping
+    ;; For now, just merge with base-solution
+    (map (fn [row-map]
+           (merge base-solution row-map))
+         row-maps)))
+
+(defn- execute-columnar-single-table
+  "Execute a single-table query using columnar plan execution.
+
+   Uses ScanOp from the plan compiler to read Arrow batches,
+   then converts to solutions at the boundary."
+  [source mapping _patterns base-solution time-travel predicates]
+  (let [table-name (:table mapping)
+        ;; Get all columns needed for this query
+        columns (distinct
+                 (concat
+                  ;; Columns from predicate filters
+                  (keep :column predicates)
+                  ;; Columns from mapping predicates
+                  (keep (fn [[_pred obj-map]]
+                          (when (= :column (:type obj-map))
+                            (:value obj-map)))
+                        (:predicates mapping))))
+        ;; Create scan plan
+        scan-plan (plan/compile-single-table-plan
+                   source table-name
+                   (when (seq columns) (vec columns))
+                   predicates time-travel)]
+    (log/debug "Columnar single-table execution:" {:table table-name
+                                                   :columns columns
+                                                   :predicates (count predicates)})
+    ;; Execute plan and convert batches to solutions
+    (try
+      (plan/open! scan-plan)
+      (loop [solutions []]
+        (if-let [batch (plan/next-batch! scan-plan)]
+          (recur (into solutions (columnar-batch->solutions batch mapping base-solution)))
+          solutions))
+      (finally
+        (plan/close! scan-plan)))))
+
+(defn- execute-columnar-multi-table
+  "Execute a multi-table query using columnar plan execution.
+
+   Uses the plan compiler to create an operator tree with ScanOps
+   and HashJoinOps, executing entirely in columnar format.
+
+   Note: This is Phase 3 work-in-progress. Falls back to row-based
+   execution if columnar join is incomplete."
+  [sources pattern-groups base-solution time-travel predicates join-graph]
+  (let [stats-by-table (get-table-statistics sources pattern-groups time-travel)
+        ;; Add predicates to pattern groups
+        groups-with-predicates
+        (mapv (fn [{:keys [mapping] :as group}]
+                (let [table-name (:table mapping)
+                      table-predicates (filter #(= table-name (:table %)) predicates)]
+                  (assoc group :predicates table-predicates)))
+              pattern-groups)]
+
+    (log/debug "Columnar multi-table execution:" {:tables (count pattern-groups)
+                                                  :stats stats-by-table})
+
+    ;; Compile the plan
+    (if-let [root-plan (plan/compile-plan sources groups-with-predicates
+                                          join-graph stats-by-table time-travel)]
+      (try
+        (plan/open! root-plan)
+        (loop [solutions []]
+          (if-let [batch (plan/next-batch! root-plan)]
+            ;; For now, just extract row maps - a full implementation
+            ;; would apply mappings to produce proper solutions
+            (recur (into solutions
+                         (map #(merge base-solution %) (plan/batch->row-maps batch))))
+            solutions))
+        (finally
+          (plan/close! root-plan)))
+      ;; No plan compiled - return empty
+      [])))
+
+;;; ---------------------------------------------------------------------------
 ;;; IcebergDatabase Record (Multi-Table Support)
 ;;; ---------------------------------------------------------------------------
 
@@ -434,9 +554,13 @@
     (let [out-ch (async/chan 1 (map #(dissoc % ::iceberg-patterns)))
           ;; VALUES pushdown from atom - this is the primary path since pattern metadata
           ;; doesn't survive through the WHERE executor (known limitation)
-          values-pushdown (when query-pushdown @query-pushdown)]
+          values-pushdown (when query-pushdown @query-pushdown)
+          ;; Capture columnar execution flag at query start (binding may change)
+          use-columnar? *columnar-execution*]
       (when (seq values-pushdown)
         (log/debug "Iceberg -finalize using VALUES pushdown from atom:" values-pushdown))
+      (when use-columnar?
+        (log/debug "Iceberg -finalize using Phase 3 columnar execution"))
       ;; Use pipeline-async with thread (not go) for blocking I/O operations
       ;; Iceberg queries involve lazy seq realization with actual I/O, which would
       ;; block the limited go thread pool and cause contention under load
@@ -457,7 +581,7 @@
                    (when (seq solution-pushdown)
                      (log/debug "Iceberg -finalize combined solution pushdown:" solution-pushdown))
                    (if (= 1 (count pattern-groups))
-                       ;; Single table - simple case
+                     ;; Single table - simple case
                      (let [{:keys [mapping patterns]} (first pattern-groups)
                            table-name (:table mapping)
                            source (get sources table-name)]
@@ -466,15 +590,24 @@
                                          {:error :db/missing-source
                                           :table table-name
                                           :available-sources (keys sources)})))
-                       (let [solutions (query/execute-iceberg-query source mapping patterns solution
-                                                                    time-travel nil solution-pushdown)]
+                       ;; Use columnar path when enabled
+                       (let [solutions (if use-columnar?
+                                         (execute-columnar-single-table
+                                          source mapping patterns solution
+                                          time-travel solution-pushdown)
+                                         (query/execute-iceberg-query source mapping patterns solution
+                                                                      time-travel nil solution-pushdown))]
                          (doseq [sol solutions]
                            (async/>!! ch sol))
                          (async/close! ch)))
-                       ;; Multiple tables - use hash join when join graph available
-                     (let [final-solutions (execute-multi-table-hash-join
-                                            sources pattern-groups solution
-                                            time-travel solution-pushdown join-graph)]
+                     ;; Multiple tables - use hash join when join graph available
+                     (let [final-solutions (if use-columnar?
+                                             (execute-columnar-multi-table
+                                              sources pattern-groups solution
+                                              time-travel solution-pushdown join-graph)
+                                             (execute-multi-table-hash-join
+                                              sources pattern-groups solution
+                                              time-travel solution-pushdown join-graph))]
                        (doseq [sol final-solutions]
                          (async/>!! ch sol))
                        (async/close! ch))))

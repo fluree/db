@@ -304,7 +304,7 @@
           response     (.send binary-http-client request
                               (java.net.http.HttpResponse$BodyHandlers/ofByteArray))
           status       (.statusCode response)
-          body         (.body response)]
+          ^bytes body  (.body response)]
       (log/trace "s3-get-binary done" {:bucket      bucket
                                        :path        encoded-path
                                        :status      status

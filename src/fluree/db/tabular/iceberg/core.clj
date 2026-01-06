@@ -821,6 +821,90 @@
 ;;; Supported Predicates
 ;;; ---------------------------------------------------------------------------
 
+;;; ---------------------------------------------------------------------------
+;;; Raw Arrow Batch Scanning (for columnar execution)
+;;; ---------------------------------------------------------------------------
+
+(defn arrow-raw-batch-lazy-seq
+  "Create lazy seq of Arrow VectorSchemaRoot from ArrowReader's CloseableIterator.
+
+   Each batch is immediately converted to VectorSchemaRoot to avoid issues with
+   ColumnarBatch buffer reuse. The returned VectorSchemaRoot owns its data and
+   is valid until the next batch is requested.
+
+   IMPORTANT: Resources are closed when:
+   - The seq is fully consumed
+   - An exception occurs
+
+   If iteration stops early, resources may leak.
+   Callers should fully consume or use with-open pattern."
+  [^java.util.Iterator iter ^java.io.Closeable closeable]
+  (let [closed? (atom false)
+        close-all! (fn []
+                     (when (compare-and-set! closed? false true)
+                       (try
+                         (.close closeable)
+                         (catch Exception e
+                           (log/debug "Error closing ArrowReader:" (.getMessage e))))))]
+    (letfn [(batch-seq []
+              (lazy-seq
+               (if (.hasNext iter)
+                 (try
+                   (let [^ColumnarBatch batch (.next iter)
+                         ;; Convert immediately to VectorSchemaRoot to avoid buffer reuse issues
+                         ^org.apache.arrow.vector.VectorSchemaRoot vsr
+                         (.createVectorSchemaRootFromVectors batch)]
+                     (cons vsr (batch-seq)))
+                   (catch Exception e
+                     (close-all!)
+                     (throw e)))
+                 (do (close-all!) nil))))]
+      (batch-seq))))
+
+(defn scan-raw-arrow-batches
+  "Execute an Iceberg table scan returning Arrow VectorSchemaRoot batches.
+
+   Unlike scan-with-arrow which converts to row maps, this returns
+   VectorSchemaRoot batches for vectorized columnar processing.
+
+   Args:
+     table      - Iceberg Table instance
+     opts       - Scan options:
+       :columns     - seq of column names to project
+       :predicates  - seq of predicate maps for pushdown
+       :snapshot-id - specific snapshot for time travel
+       :as-of-time  - Instant for time travel
+       :batch-size  - rows per Arrow batch (default 4096)
+
+   Returns: lazy seq of org.apache.arrow.vector.VectorSchemaRoot
+
+   Resource Safety:
+     If an exception occurs during scan setup, resources are cleaned up before
+     re-throwing. Once the lazy seq is returned, resource cleanup is handled
+     by arrow-raw-batch-lazy-seq (closes on exhaustion or exception).
+
+   Note: Predicate pushdown is applied at the Iceberg layer (file/row-group pruning).
+   Row-level filtering on returned batches must be done by the caller if needed."
+  [^Table table {:keys [columns predicates snapshot-id as-of-time batch-size]
+                 :or {batch-size 4096}}]
+  (let [^TableScan scan (build-table-scan table {:columns columns
+                                                 :predicates predicates
+                                                 :snapshot-id snapshot-id
+                                                 :as-of-time as-of-time})
+        ^ArrowReader reader (ArrowReader. scan (int batch-size) false)]
+    (try
+      (let [scan-tasks (.planTasks scan)
+            iter (.open reader scan-tasks)]
+        (arrow-raw-batch-lazy-seq iter reader))
+      (catch Exception e
+        ;; Clean up reader if setup fails before lazy-seq takes ownership
+        (try (.close reader) (catch Exception _ nil))
+        (throw e)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Supported Predicates
+;;; ---------------------------------------------------------------------------
+
 (def supported-predicate-ops
   "Set of predicate operations supported by Iceberg."
   #{:eq :ne :gt :gte :lt :lte :in :between :is-null :not-null :and :or})

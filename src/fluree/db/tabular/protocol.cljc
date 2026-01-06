@@ -14,7 +14,10 @@
    - Statistics for query planning"
 
   (scan-batches [this table-name opts]
-    "Scan table returning lazy seq of Arrow VectorSchemaRoot batches.
+    "Scan table returning lazy seq of row maps (with columnar filtering applied internally).
+
+     This method reads Arrow batches internally and converts them to row maps.
+     Predicate filtering is applied at the columnar level for efficiency.
 
      Options:
        :columns     - seq of column names to project (nil = all)
@@ -24,10 +27,29 @@
        :batch-size  - rows per batch (default 4096)
        :limit       - max total rows to return
 
-     Returns: lazy seq of VectorSchemaRoot batches.
+     Returns: lazy seq of row maps {\"column-name\" value ...}
+
+     IMPORTANT: Caller must fully consume the seq or the scan will leak resources.")
+
+  (scan-arrow-batches [this table-name opts]
+    "Scan table returning Arrow VectorSchemaRoot batches for columnar execution.
+
+     Unlike scan-batches which returns row maps, this method returns Arrow
+     VectorSchemaRoot batches for use in vectorized execution pipelines.
+
+     Options:
+       :columns     - seq of column names to project (nil = all)
+       :predicates  - seq of predicate maps (see Predicate Format)
+       :snapshot-id - specific snapshot ID for time travel
+       :as-of-time  - java.time.Instant for time travel
+       :batch-size  - rows per batch (default 4096)
+
+     Returns: lazy seq of org.apache.arrow.vector.VectorSchemaRoot batches.
+              Use (.getRowCount batch) to get the number of rows in each batch.
+              Use (.getFieldVectors batch) to access column vectors.
 
      IMPORTANT: Caller must fully consume the seq or the scan will leak resources.
-     Each batch should be used before requesting the next one.")
+     Resource cleanup happens when the seq is exhausted or an error occurs.")
 
   (scan-rows [this table-name opts]
     "Scan table returning lazy seq of row maps.

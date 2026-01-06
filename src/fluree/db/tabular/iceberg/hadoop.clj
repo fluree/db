@@ -49,6 +49,18 @@
                                    :batch-size batch-size
                                    :limit limit})))
 
+  (scan-arrow-batches [_ table-name {:keys [columns predicates snapshot-id as-of-time batch-size]
+                                     :or {batch-size 4096}}]
+    (let [table-path (table-id->hadoop-path warehouse-path table-name)
+          ^Table table (.load tables table-path)]
+      (log/debug "IcebergSource scan-arrow-batches (raw):" {:table table-name
+                                                            :batch-size batch-size})
+      (core/scan-raw-arrow-batches table {:columns columns
+                                          :predicates predicates
+                                          :snapshot-id snapshot-id
+                                          :as-of-time as-of-time
+                                          :batch-size batch-size})))
+
   (scan-rows [this table-name opts]
     ;; scan-batches now returns row maps directly
     (proto/scan-batches this table-name opts))

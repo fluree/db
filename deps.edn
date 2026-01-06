@@ -155,9 +155,23 @@
                  ;;       reader - WSM 2023-02-01
                  :exclude-linters    [:implicit-dependencies]
                  ;; Exclude IPFS namespace due to Clojure 1.12.1 compatibility issues
+                 ;; Exclude Iceberg/tabular namespaces - require :iceberg alias deps
                  :exclude-namespaces [fluree.db.storage.ipfs
                                       fluree.db.storage.file
-                                      fluree.db.nameservice.ipns]}]}
+                                      fluree.db.nameservice.ipns
+                                      ;; Iceberg namespaces require Arrow/Iceberg deps from :iceberg alias
+                                      fluree.db.tabular.file-io
+                                      fluree.db.tabular.iceberg
+                                      fluree.db.tabular.iceberg.core
+                                      fluree.db.tabular.iceberg.hadoop
+                                      fluree.db.tabular.iceberg.rest
+                                      fluree.db.virtual-graph.iceberg
+                                      fluree.db.virtual-graph.iceberg.join
+                                      fluree.db.virtual-graph.iceberg.join.hash
+                                      fluree.db.virtual-graph.iceberg.plan
+                                      fluree.db.virtual-graph.iceberg.pushdown
+                                      fluree.db.virtual-graph.iceberg.query
+                                      fluree.db.virtual-graph.iceberg.r2rml]}]}
 
   :ancient
   {:extra-deps {com.github.liquidz/antq {:mvn/version "RELEASE"}}

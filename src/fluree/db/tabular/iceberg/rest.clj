@@ -98,6 +98,25 @@
                                    :batch-size batch-size
                                    :limit limit})))
 
+  (scan-arrow-batches [_ table-name {:keys [columns predicates snapshot-id as-of-time batch-size]
+                                     :or {batch-size 4096}}]
+    (let [meta-loc (or (get @metadata-cache table-name)
+                       (let [loc (get-table-metadata-location uri auth-token table-name)]
+                         (when loc (swap! metadata-cache assoc table-name loc))
+                         loc))
+          _ (when-not meta-loc
+              (throw (ex-info (str "Cannot resolve metadata for table: " table-name)
+                              {:table table-name :uri uri})))
+          ^Table table (load-table-from-metadata file-io meta-loc table-name)]
+      (log/debug "FlureeRestIcebergSource scan-arrow-batches (raw):" {:table table-name
+                                                                      :metadata meta-loc
+                                                                      :batch-size batch-size})
+      (core/scan-raw-arrow-batches table {:columns columns
+                                          :predicates predicates
+                                          :snapshot-id snapshot-id
+                                          :as-of-time as-of-time
+                                          :batch-size batch-size})))
+
   (scan-rows [this table-name opts]
     (proto/scan-batches this table-name opts))
 
