@@ -266,4 +266,17 @@
           plan (plan/compile-plan sources pattern-groups join-graph sample-stats nil
                                   {:output-arrow? true})]
       (is (instance? fluree.db.virtual_graph.iceberg.plan.HashJoinOp plan))
-      (is (true? (:output-arrow? plan))))))
+      (is (true? (:output-arrow? plan)))))
+
+  (testing "compile-plan passes :output-columns to hash joins"
+    (let [join-graph (join/build-join-graph sample-mappings)
+          pattern-groups [{:mapping {:table "airlines"} :predicates []}
+                          {:mapping {:table "routes"} :predicates []}]
+          sources {"airlines" test-source "routes" test-source}
+          output-cols #{"name" "dst"}
+          ;; Compile with :output-columns for projection pushdown
+          plan (plan/compile-plan sources pattern-groups join-graph sample-stats nil
+                                  {:vectorized? true
+                                   :output-columns output-cols})]
+      (is (instance? fluree.db.virtual_graph.iceberg.plan.HashJoinOp plan))
+      (is (= output-cols (:output-columns plan))))))

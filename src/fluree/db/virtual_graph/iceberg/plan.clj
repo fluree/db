@@ -29,7 +29,8 @@
              solutions))
          (finally
            (close! plan))))"
-  (:require [fluree.db.tabular.protocol :as tabular]
+  (:require [clojure.set :as set]
+            [fluree.db.tabular.protocol :as tabular]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph.iceberg.join :as join])
   (:import [java.util HashMap ArrayList]
@@ -332,41 +333,78 @@
      build-batch-idxs - int[] of build batch indices for each output row
      build-row-idxs   - int[] of build row indices for each output row
      probe-row-idxs   - int[] of probe row indices for each output row
+     output-columns   - Optional set of column names to include in output.
+                        If nil, all columns from both sides are included.
+                        Use for projection pushdown to avoid copying unneeded columns.
+
+   NOTE: If build and probe have columns with the same name, both will be
+   included in the output. This can cause ambiguity when accessing columns.
+   Consider using :output-columns to select specific columns and avoid
+   collision, or ensure your tables don't have conflicting column names.
 
    Returns:
      New VectorSchemaRoot with gathered output, or nil if no matches."
   [build-batches ^VectorSchemaRoot probe-batch
-   ^ints build-batch-idxs ^ints build-row-idxs ^ints probe-row-idxs]
+   ^ints build-batch-idxs ^ints build-row-idxs ^ints probe-row-idxs
+   output-columns]
   (let [num-rows (alength build-batch-idxs)]
     (when (pos? num-rows)
       (let [allocator @join-allocator
             ;; Get first build batch to determine schema (all should have same schema)
             ^VectorSchemaRoot first-build (first build-batches)
-            ;; Collect all unique column names from both sides
-            build-fields (when first-build
-                           (for [^FieldVector fv (.getFieldVectors first-build)]
-                             (.getField fv)))
-            probe-fields (for [^FieldVector fv (.getFieldVectors probe-batch)]
-                           (.getField fv))
-            ;; Create output vectors for each column
-            ;; Build columns come first, then probe columns
-            build-vectors (mapv (fn [^Field field]
+            ;; Helper to check if column should be included
+            include-col? (if output-columns
+                           #(contains? output-columns %)
+                           (constantly true))
+            ;; Collect fields and source vectors, filtering by output-columns
+            ;; Returns vector of [Field source-vector-idx] pairs for included columns
+            build-col-specs (when first-build
+                              (let [field-vectors (.getFieldVectors first-build)]
+                                (into []
+                                      (keep-indexed
+                                       (fn [idx ^FieldVector fv]
+                                         (let [field (.getField fv)
+                                               col-name (.getName field)]
+                                           (when (include-col? col-name)
+                                             [field idx]))))
+                                      field-vectors)))
+            probe-col-specs (let [field-vectors (.getFieldVectors probe-batch)]
+                              (into []
+                                    (keep-indexed
+                                     (fn [idx ^FieldVector fv]
+                                       (let [field (.getField fv)
+                                             col-name (.getName field)]
+                                         (when (include-col? col-name)
+                                           [field idx]))))
+                                    field-vectors))
+            ;; Check for column name collisions (warn once per join)
+            _ (let [build-names (into #{} (map #(.getName ^Field (first %)) build-col-specs))
+                    probe-names (into #{} (map #(.getName ^Field (first %)) probe-col-specs))
+                    collisions (set/intersection build-names probe-names)]
+                (when (seq collisions)
+                  (log/warn "Column name collision in join output:" collisions
+                            "- both build and probe have columns with these names."
+                            "Use :output-columns to select specific columns.")))
+            ;; Create output vectors only for included columns
+            build-vectors (mapv (fn [[^Field field _]]
                                   (let [^FieldVector vector (.createVector field allocator)]
                                     (allocate-output-vector! vector num-rows)
                                     vector))
-                                build-fields)
-            probe-vectors (mapv (fn [^Field field]
+                                build-col-specs)
+            probe-vectors (mapv (fn [[^Field field _]]
                                   (let [^FieldVector vector (.createVector field allocator)]
                                     (allocate-output-vector! vector num-rows)
                                     vector))
-                                probe-fields)
+                                probe-col-specs)
             ;; Precompute: cache source vectors for each build batch (vector of vectors)
-            ;; This avoids calling getFieldVectors inside the per-row loop
             build-src-vectors-by-batch (mapv #(vec (.getFieldVectors ^VectorSchemaRoot %))
                                              build-batches)
             ;; Pre-fetch probe source vectors
             probe-src-vectors (vec (.getFieldVectors probe-batch))
-            ;; Precompute destination vector counts for zipping
+            ;; Source column indices for included columns
+            build-src-indices (mapv second build-col-specs)
+            probe-src-indices (mapv second probe-col-specs)
+            ;; Column counts
             num-build-cols (count build-vectors)
             num-probe-cols (count probe-vectors)]
         ;; Gather values from source batches into output vectors using primitive loop
@@ -376,14 +414,16 @@
                 probe-row-idx (aget probe-row-idxs out-idx)
                 ;; Get cached source vectors for this build batch
                 build-src-vectors (nth build-src-vectors-by-batch build-batch-idx)]
-            ;; Copy build columns
-            (dotimes [col-idx num-build-cols]
-              (copy-arrow-value! (nth build-src-vectors col-idx) build-row-idx
-                                 (nth build-vectors col-idx) out-idx))
-            ;; Copy probe columns
-            (dotimes [col-idx num-probe-cols]
-              (copy-arrow-value! (nth probe-src-vectors col-idx) probe-row-idx
-                                 (nth probe-vectors col-idx) out-idx))))
+            ;; Copy only included build columns
+            (dotimes [i num-build-cols]
+              (let [src-idx (nth build-src-indices i)]
+                (copy-arrow-value! (nth build-src-vectors src-idx) build-row-idx
+                                   (nth build-vectors i) out-idx)))
+            ;; Copy only included probe columns
+            (dotimes [i num-probe-cols]
+              (let [src-idx (nth probe-src-indices i)]
+                (copy-arrow-value! (nth probe-src-vectors src-idx) probe-row-idx
+                                   (nth probe-vectors i) out-idx)))))
         ;; Set value counts and create root
         (doseq [^FieldVector v build-vectors]
           (.setValueCount v num-rows))
@@ -525,7 +565,10 @@
 ;;; ---------------------------------------------------------------------------
 
 (defrecord HashJoinOp [build-child probe-child build-keys probe-keys
-                       output-arrow? vectorized? state]
+                       output-arrow? vectorized? output-columns state]
+  ;; output-columns: Optional set of column names to include in output.
+  ;;                 If nil, all columns from both sides are included.
+  ;;                 Use for projection pushdown to skip copying unneeded columns.
   ;; state is an atom containing:
   ;; Standard mode:
   ;;   {:hash-table HashMap (key -> [row-map...]), :build-complete? bool, :opened? bool,
@@ -680,10 +723,13 @@
                           (aset probe-row-idxs idx (int probe-row-idx))
                           (swap! write-idx inc))))))
                 (log/debug "HashJoinOp vectorized probe:" {:probe-rows row-count
-                                                           :matches total-matches})
+                                                           :matches total-matches
+                                                           :output-columns (count output-columns)})
                 ;; Gather output from source batches using primitive arrays
+                ;; Pass output-columns for projection pushdown
                 (gather-join-output-batch build-batches batch
-                                          build-batch-idxs build-row-idxs probe-row-idxs))))))
+                                          build-batch-idxs build-row-idxs probe-row-idxs
+                                          output-columns))))))
       ;; Standard mode: extract and merge row maps
       (let [^HashMap hash-table (:hash-table @state)
             row-count (batch-row-count batch)
@@ -721,13 +767,19 @@
                                     Probe gathers output directly from source vectors.
                                     Requires Arrow batch inputs. ~2x faster than standard.
                                     Default: false.
+                   :output-columns - Optional set of column names to include in output.
+                                     If nil (default), all columns from both sides
+                                     are included. Use for projection pushdown to
+                                     avoid copying unneeded columns in vectorized mode.
+                                     Only applies when :vectorized? is true.
 
    IMPORTANT: When vectorized? is true:
    - Build-side MUST use copy-batches? true (batches must outlive iteration)
    - Probe-side can use copy-batches? false (streaming mode)
    - Both sides MUST provide Arrow batches (use-arrow-batches? true)
 
-   The join produces output containing columns from both sides."
+   The join produces output containing columns from both sides (or subset if
+   :output-columns specified)."
   ([build-child probe-child build-keys probe-keys]
    (create-hash-join-op build-child probe-child build-keys probe-keys {}))
   ([build-child probe-child build-keys probe-keys opts]
@@ -742,6 +794,7 @@
                      :probe-keys probe-keys
                      :output-arrow? (get opts :output-arrow? false)
                      :vectorized? (get opts :vectorized? false)
+                     :output-columns (get opts :output-columns)
                      :state (atom {:hash-table nil
                                    :build-complete? false
                                    :opened? false
@@ -981,6 +1034,31 @@
   [join-graph table-a table-b]
   (first (join/edges-between join-graph table-a table-b)))
 
+(defn- collect-downstream-join-keys
+  "Collect all join key columns needed for joins after the current position.
+
+   For a 3-table join A → B → C, when we're creating the A-B join, we need
+   to include B's join keys for the B-C join in the output.
+
+   Args:
+     join-graph    - Join graph with edges between tables
+     join-order    - Vector of tables in join order
+     current-idx   - Current position in join order (0-indexed)
+
+   Returns:
+     Set of column names needed for downstream joins."
+  [join-graph join-order current-idx]
+  (let [remaining-tables (subvec join-order (inc current-idx))
+        joined-so-far (set (take (inc current-idx) join-order))]
+    (into #{}
+          (for [table remaining-tables
+                edge (join/edges-for-table join-graph table)
+                :when (or (contains? joined-so-far (:parent-table edge))
+                          (contains? joined-so-far (:child-table edge)))
+                col (concat (join/parent-columns edge)
+                            (join/child-columns edge))]
+            col))))
+
 (defn compile-plan
   "Compile a tabular plan from pattern groups.
 
@@ -1017,6 +1095,12 @@
                                              NOTE: For optimal performance with vectorized?,
                                              set :copy-batches? true (batches must outlive
                                              iteration for build storage). Default false.
+                      :output-columns     - Optional set of column names to include in
+                                            join output. If specified, hash joins only
+                                            copy these columns to output batches,
+                                            reducing memory bandwidth. Best for two-table
+                                            joins; for 3+ tables, ensure all downstream
+                                            join keys are included. Default nil (all cols).
 
    Returns:
      ITabularPlan root operator, or nil if no pattern groups."
@@ -1028,6 +1112,7 @@
            copy-batches? (get opts :copy-batches?)  ;; nil = default (true)
            output-arrow? (get opts :output-arrow? false)
            vectorized? (get opts :vectorized? false)
+           output-columns (get opts :output-columns)  ;; nil = all columns
            scan-opts {:use-arrow-batches? use-arrow-batches?
                       :copy-batches? copy-batches?}
            ;; Build scan ops for each table
@@ -1060,47 +1145,68 @@
          (:scan (get scans-by-table (first join-order)))
 
         ;; Multiple tables - chain with hash joins
-         (reduce
-          (fn [accumulated-plan current-table]
-            (if (nil? accumulated-plan)
-             ;; First table - start with its scan
-              (:scan (get scans-by-table current-table))
-             ;; Subsequent tables - join to accumulated plan
-              (let [current-scan (:scan (get scans-by-table current-table))
-                   ;; Find join edge between current and any accumulated table
-                   ;; This is a simplification - real impl would track accumulated tables
-                    edge (some (fn [t]
-                                 (find-join-edge join-graph t current-table))
-                               (take-while #(not= % current-table) join-order))]
-                (if edge
-                 ;; Create hash join
-                  (let [;; Determine build vs probe based on which is accumulated
-                        current-is-child? (= current-table (:child-table edge))
-                        [build-plan probe-plan build-keys probe-keys]
-                        (if current-is-child?
-                         ;; Accumulated is parent (dimension), current is child (fact)
-                          [accumulated-plan current-scan
-                           (vec (join/parent-columns edge))
-                           (vec (join/child-columns edge))]
-                         ;; Current is parent, accumulated is child
-                          [current-scan accumulated-plan
-                           (vec (join/parent-columns edge))
-                           (vec (join/child-columns edge))])]
-                    (log/debug "Creating hash join:" {:build-keys build-keys
-                                                      :probe-keys probe-keys
-                                                      :edge edge
-                                                      :output-arrow? output-arrow?
-                                                      :vectorized? vectorized?})
-                    (create-hash-join-op build-plan probe-plan build-keys probe-keys
-                                         {:output-arrow? output-arrow?
-                                          :vectorized? vectorized?}))
-                 ;; No edge found - would be Cartesian product
-                 ;; For now, just return accumulated (caller should handle)
-                  (do
-                    (log/warn "No join edge found, skipping table:" current-table)
-                    accumulated-plan)))))
-          nil
-          join-order))))))
+        ;; Use reduce with indexed join-order to track position for
+        ;; downstream join key preservation
+         (let [indexed-order (vec join-order)
+               num-tables (count indexed-order)]
+           ;; Extract final plan from [plan, table-idx] tuple returned by reduce
+           (first
+            (reduce
+             (fn [[accumulated-plan table-idx] current-table]
+               (if (nil? accumulated-plan)
+                ;; First table - start with its scan (no join created yet)
+                ;; Return 1 so next iteration can (take 1 indexed-order) to get first table
+                 [(:scan (get scans-by-table current-table)) 1]
+                ;; Subsequent tables - join to accumulated plan
+                 (let [current-scan (:scan (get scans-by-table current-table))
+                      ;; Find join edge between current and any accumulated table
+                       edge (some (fn [t]
+                                    (find-join-edge join-graph t current-table))
+                                  (take table-idx indexed-order))]
+                   (if edge
+                    ;; Create hash join
+                     (let [;; Determine build vs probe based on which is accumulated
+                           current-is-child? (= current-table (:child-table edge))
+                           [build-plan probe-plan build-keys probe-keys]
+                           (if current-is-child?
+                            ;; Accumulated is parent (dimension), current is child (fact)
+                             [accumulated-plan current-scan
+                              (vec (join/parent-columns edge))
+                              (vec (join/child-columns edge))]
+                            ;; Current is parent, accumulated is child
+                             [current-scan accumulated-plan
+                              (vec (join/parent-columns edge))
+                              (vec (join/child-columns edge))])
+                           ;; For intermediate joins, merge downstream join keys with user's output-columns
+                           ;; For final join, use user's output-columns directly
+                           ;; For n tables, final join is when table-idx = n-1 (processing last table)
+                           is-final-join? (= table-idx (dec num-tables))
+                           effective-output-columns
+                           (if (and output-columns (not is-final-join?))
+                             ;; Intermediate join: include downstream join keys
+                             (let [downstream-keys (collect-downstream-join-keys join-graph indexed-order table-idx)]
+                               (into output-columns downstream-keys))
+                             ;; Final join or no output-columns specified
+                             output-columns)]
+                       (log/debug "Creating hash join:" {:build-keys build-keys
+                                                         :probe-keys probe-keys
+                                                         :edge edge
+                                                         :output-arrow? output-arrow?
+                                                         :vectorized? vectorized?
+                                                         :is-final-join? is-final-join?
+                                                         :output-columns (count effective-output-columns)})
+                       [(create-hash-join-op build-plan probe-plan build-keys probe-keys
+                                             {:output-arrow? output-arrow?
+                                              :vectorized? vectorized?
+                                              :output-columns effective-output-columns})
+                        (inc table-idx)])
+                    ;; No edge found - would be Cartesian product
+                    ;; For now, just return accumulated (caller should handle)
+                     (do
+                       (log/warn "No join edge found, skipping table:" current-table)
+                       [accumulated-plan (inc table-idx)])))))
+             [nil 0]
+             indexed-order))))))))
 
 (defn compile-single-table-plan
   "Compile a plan for a single table query (no joins).
