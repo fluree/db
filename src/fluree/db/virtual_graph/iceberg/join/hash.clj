@@ -243,6 +243,46 @@
       (finally
         (close! join)))))
 
+(defn left-outer-hash-join
+  "Perform a left outer hash join.
+
+   Like hash-join, but preserves ALL probe-side rows. For probe rows that
+   have no matching build row, the result includes the probe row with nil
+   values for where the build-side would have contributed.
+
+   This implements SPARQL OPTIONAL semantics where the probe side is the
+   required pattern and the build side is the optional pattern.
+
+   Note: Unlike hash-join, this does NOT add nil placeholders for build-side
+   variable bindings since SPARQL solutions don't include unbound variables.
+   The result simply omits bindings from the optional (build) side.
+
+   Args:
+     build-solutions - Sequence of solutions for build side (optional pattern)
+     probe-solutions - Sequence of solutions for probe side (required pattern)
+     build-keys      - Vector of keys to extract from build solutions
+     probe-keys      - Vector of keys to extract from probe solutions
+
+   Returns sequence of joined solutions (probe rows always included)."
+  [build-solutions probe-solutions build-keys probe-keys]
+  (let [join (create-hash-join build-keys probe-keys)]
+    (try
+      (build! join build-solutions)
+      (log/debug "Left outer hash join built:" {:build-count (build-count join)})
+      ;; Custom probe that preserves unmatched probe rows
+      (doall
+       (mapcat
+        (fn [probe-sol]
+          ;; Try to find matches via probe
+          (let [matches (probe join [probe-sol])]
+            (if (seq matches)
+              matches
+              ;; No matches - return probe row alone (left outer semantics)
+              [probe-sol])))
+        probe-solutions))
+      (finally
+        (close! join)))))
+
 (defn hash-join-with-edge
   "Perform a hash join using a JoinEdge specification.
 

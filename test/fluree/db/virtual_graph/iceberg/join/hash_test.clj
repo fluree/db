@@ -446,3 +446,100 @@
           result (hash-join/hash-join build probe [:id] [:id])]
 
       (is (= 1 (count result)) "Same IRI should produce join result"))))
+
+;;; ---------------------------------------------------------------------------
+;;; Left Outer Hash Join Tests (SPARQL OPTIONAL)
+;;; ---------------------------------------------------------------------------
+
+(deftest left-outer-hash-join-test
+  (testing "Left outer join includes all probe rows"
+    (let [;; Airlines table (build side - optional dimension)
+          airlines [{:id 1 :name "United"}
+                    {:id 2 :name "Delta"}]
+          ;; Routes table (probe side - required)
+          routes [{:airline_id 1 :src "ORD" :dst "LAX"}
+                  {:airline_id 2 :src "ATL" :dst "LAX"}
+                  {:airline_id 4 :src "DEN" :dst "SEA"}  ;; No matching airline
+                  {:airline_id nil :src "JFK" :dst "LHR"}] ;; Null FK
+
+          result (hash-join/left-outer-hash-join airlines routes [:id] [:airline_id])]
+
+      ;; All 4 probe rows should appear in output
+      (is (= 4 (count result)) "Left outer join should include all probe rows")
+
+      ;; Matched rows should have airline info
+      (let [matched (filter :name result)]
+        (is (= 2 (count matched)) "Two rows should have airline names")
+        (is (some #(= "United" (:name %)) matched))
+        (is (some #(= "Delta" (:name %)) matched)))
+
+      ;; Unmatched rows should still appear (without airline info)
+      (let [unmatched (remove :name result)]
+        (is (= 2 (count unmatched)) "Two rows should be unmatched")
+        (is (some #(= "DEN" (:src %)) unmatched) "Route with airline_id=4 included")
+        (is (some #(= "JFK" (:src %)) unmatched) "Route with nil airline_id included"))))
+
+  (testing "Left outer join with empty build side returns all probe rows"
+    (let [routes [{:airline_id 1 :src "ORD"}
+                  {:airline_id 2 :src "ATL"}]
+          result (hash-join/left-outer-hash-join [] routes [:id] [:airline_id])]
+
+      (is (= 2 (count result)) "All probe rows should be preserved")
+      (is (every? #(nil? (:name %)) result) "No airline names since build is empty")))
+
+  (testing "Left outer join with empty probe side returns empty"
+    (let [airlines [{:id 1 :name "United"}]
+          result (hash-join/left-outer-hash-join airlines [] [:id] [:airline_id])]
+
+      (is (empty? result) "Empty probe side means empty result")))
+
+  (testing "Left outer join with all matching rows"
+    (let [airlines [{:id 1 :name "United"}
+                    {:id 2 :name "Delta"}]
+          routes [{:airline_id 1 :src "ORD"}
+                  {:airline_id 2 :src "ATL"}]
+          result (hash-join/left-outer-hash-join airlines routes [:id] [:airline_id])]
+
+      (is (= 2 (count result)) "All rows should match")
+      (is (every? :name result) "All rows should have airline names")))
+
+  (testing "Left outer join with duplicates in build side"
+    (let [;; Multiple airlines with same ID (edge case)
+          airlines [{:id 1 :name "United-A"}
+                    {:id 1 :name "United-B"}]
+          routes [{:airline_id 1 :src "ORD"}
+                  {:airline_id 2 :src "ATL"}]  ;; No match for 2
+          result (hash-join/left-outer-hash-join airlines routes [:id] [:airline_id])]
+
+      ;; Route with airline_id=1 matches both United-A and United-B
+      ;; Route with airline_id=2 has no match, appears once
+      (is (= 3 (count result)) "1*2 matched + 1 unmatched = 3 rows")
+      (is (= #{"United-A" "United-B"}
+             (set (keep :name result))) "Both United variants appear")))
+
+  (testing "Left outer join with SPARQL-style solutions"
+    (let [join-col-key :fluree.db.virtual-graph.iceberg.query/join-col-vals
+          ;; Airlines as optional (build side)
+          airlines [{join-col-key {:id 1}
+                     '?airline (where/match-iri {} "http://example.org/airline/1")
+                     '?name (where/match-value {} "United" const/iri-string)}]
+          ;; Routes as required (probe side) - one matches, one doesn't
+          routes [{join-col-key {:airline_id 1}
+                   '?route (where/match-iri {} "http://example.org/route/100")
+                   '?src (where/match-value {} "ORD" const/iri-string)}
+                  {join-col-key {:airline_id 999}
+                   '?route (where/match-iri {} "http://example.org/route/200")
+                   '?src (where/match-value {} "ATL" const/iri-string)}]
+          result (hash-join/left-outer-hash-join airlines routes [:id] [:airline_id])]
+
+      (is (= 2 (count result)) "Both routes should appear in result")
+
+      ;; First route should have airline variables
+      (let [matched (first (filter #(contains? % '?name) result))]
+        (is matched "One result should have ?name binding")
+        (is (= "ORD" (where/get-value (get matched '?src)))))
+
+      ;; Second route should NOT have airline variables
+      (let [unmatched (first (remove #(contains? % '?name) result))]
+        (is unmatched "One result should not have ?name binding")
+        (is (= "ATL" (where/get-value (get unmatched '?src))))))))

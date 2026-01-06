@@ -283,6 +283,7 @@
    3. Find join edges that are actually traversed by the query patterns
    4. Apply hash join only when patterns traverse the FK relationship
    5. Use SPARQL-compatible merge for overlapping variable bindings
+   6. Use left outer join for OPTIONAL pattern groups
 
    IMPORTANT: Join edges are only applied when the SPARQL query explicitly
    traverses the FK relationship via the RefObjectMap predicate. This prevents
@@ -299,14 +300,21 @@
                                      :when (seq cols)]
                                  [table cols]))
 
+        ;; Track which tables are from optional pattern groups
+        table->optional? (into {}
+                               (for [{:keys [mapping optional?]} pattern-groups]
+                                 [(:table mapping) (boolean optional?)]))
+
         _ (log/debug "Join columns by table:" table->join-cols)
+        _ (log/debug "Optional tables:" table->optional?)
 
         ;; Execute all table queries with join columns projected
-        group-results (mapv (fn [{:keys [mapping patterns]}]
+        group-results (mapv (fn [{:keys [mapping patterns optional?]}]
                               (let [table (:table mapping)
                                     join-cols (get table->join-cols table)]
                                 {:mapping mapping
                                  :patterns patterns
+                                 :optional? (boolean optional?)
                                  :solutions (vec (execute-pattern-group
                                                   sources mapping patterns solution
                                                   time-travel solution-pushdown join-cols))}))
@@ -316,8 +324,9 @@
                      {:groups (count group-results)
                       :solution-counts (mapv #(count (:solutions %)) group-results)})]
 
-    ;; Short-circuit if any group returns empty
-    (if (some #(empty? (:solutions %)) group-results)
+    ;; Short-circuit if any NON-OPTIONAL group returns empty
+    ;; Optional groups can be empty - that's the point of OPTIONAL
+    (if (some #(and (empty? (:solutions %)) (not (:optional? %))) group-results)
       []
 
       ;; Check if we have join edges to potentially use
@@ -326,7 +335,7 @@
         (:accumulated-solutions
          (reduce
           (fn [{:keys [accumulated-solutions accumulated-tables accumulated-patterns]}
-               {:keys [mapping patterns] :as current-group}]
+               {:keys [mapping patterns optional?] :as current-group}]
             (if (empty? accumulated-solutions)
               {:accumulated-solutions []
                :accumulated-tables accumulated-tables
@@ -345,33 +354,65 @@
                                     current-table)
 
                     _ (when traversed-edge
-                        (log/debug "Found traversed join edge:" traversed-edge))
+                        (log/debug "Found traversed join edge:" traversed-edge
+                                   "optional?" optional?))
 
                     new-solutions
                     (if traversed-edge
                       ;; Hash join path - edge is actually traversed by patterns
                       (let [edge (:edge traversed-edge)
-                            ;; Determine build vs probe based on child/parent relationship
+                            ;; For OPTIONAL (left outer join), we must ensure:
+                            ;; - probe side = accumulated (required) - gets preserved
+                            ;; - build side = current (optional) - allows nulls
+                            ;;
+                            ;; For inner join, use FK-based heuristic:
+                            ;; - child table (fact) usually probes into parent (dimension)
                             current-is-child? (= current-table (:child-table edge))
+
+                            ;; CRITICAL: For OPTIONAL, force correct orientation
+                            ;; Left outer join preserves ALL probe rows, so probe must be required
                             [build-solutions probe-solutions build-cols probe-cols]
-                            (if current-is-child?
-                              ;; Current is child (fact table) -> accumulated is parent
-                              [accumulated-solutions current-solutions
-                               (mapv keyword (join/parent-columns edge))
-                               (mapv keyword (join/child-columns edge))]
-                              ;; Current is parent (dimension table) -> build with current
-                              [current-solutions accumulated-solutions
-                               (mapv keyword (join/parent-columns edge))
-                               (mapv keyword (join/child-columns edge))])
+                            (if optional?
+                              ;; OPTIONAL: accumulated is required (probe), current is optional (build)
+                              ;; This ensures all required rows are preserved with nulls for optional
+                              (if current-is-child?
+                                ;; Current (optional) is child, accumulated (required) is parent
+                                ;; probe=accumulated uses parent cols, build=current uses child cols
+                                [current-solutions accumulated-solutions
+                                 (mapv keyword (join/child-columns edge))
+                                 (mapv keyword (join/parent-columns edge))]
+                                ;; Current (optional) is parent, accumulated (required) is child
+                                ;; probe=accumulated uses child cols, build=current uses parent cols
+                                [current-solutions accumulated-solutions
+                                 (mapv keyword (join/parent-columns edge))
+                                 (mapv keyword (join/child-columns edge))])
+                              ;; Inner join: use FK-based heuristic for efficiency
+                              (if current-is-child?
+                                ;; Current is child (fact table) -> accumulated is parent
+                                [accumulated-solutions current-solutions
+                                 (mapv keyword (join/parent-columns edge))
+                                 (mapv keyword (join/child-columns edge))]
+                                ;; Current is parent (dimension table) -> build with current
+                                [current-solutions accumulated-solutions
+                                 (mapv keyword (join/parent-columns edge))
+                                 (mapv keyword (join/child-columns edge))]))
 
                             _ (log/debug "Hash join execution:"
                                          {:build-count (count build-solutions)
                                           :probe-count (count probe-solutions)
                                           :build-cols build-cols
-                                          :probe-cols probe-cols})
+                                          :probe-cols probe-cols
+                                          :left-outer? optional?
+                                          :optional-orientation (when optional? "probe=required, build=optional")})
 
-                            joined (hash-join/hash-join build-solutions probe-solutions
-                                                        build-cols probe-cols)]
+                            ;; Use left outer join for optional pattern groups
+                            joined (if optional?
+                                     (hash-join/left-outer-hash-join
+                                      build-solutions probe-solutions
+                                      build-cols probe-cols)
+                                     (hash-join/hash-join
+                                      build-solutions probe-solutions
+                                      build-cols probe-cols))]
                         (log/debug "Hash join result count:" (count joined))
                         joined)
 

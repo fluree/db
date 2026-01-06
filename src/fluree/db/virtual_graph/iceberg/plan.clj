@@ -129,9 +129,15 @@
         vals))))
 
 (defn- extract-key-from-row-map
-  "Extract join key values from a row map."
+  "Extract join key values from a row map.
+   Handles both string and keyword column names for flexibility."
   [row-map key-columns]
-  (let [vals (mapv #(get row-map %) key-columns)]
+  (let [vals (mapv (fn [col]
+                     ;; Try string key first, then keyword
+                     (or (get row-map col)
+                         (get row-map (keyword col))
+                         (get row-map (name col))))
+                   key-columns)]
     (when-not (some nil? vals)
       (if (= 1 (count vals))
         (first vals)
@@ -331,11 +337,14 @@
      build-batches - Vector of VectorSchemaRoot batches from build side
      probe-batch   - Current VectorSchemaRoot batch from probe side
      build-batch-idxs - int[] of build batch indices for each output row
+                        For left outer join, -1 indicates no match (write nulls).
      build-row-idxs   - int[] of build row indices for each output row
      probe-row-idxs   - int[] of probe row indices for each output row
      output-columns   - Optional set of column names to include in output.
                         If nil, all columns from both sides are included.
                         Use for projection pushdown to avoid copying unneeded columns.
+     left-outer?      - If true, build-batch-idx = -1 means write nulls for build
+                        columns (for left outer join unmatched rows).
 
    NOTE: If build and probe have columns with the same name, both will be
    included in the output. This can cause ambiguity when accessing columns.
@@ -346,7 +355,7 @@
      New VectorSchemaRoot with gathered output, or nil if no matches."
   [build-batches ^VectorSchemaRoot probe-batch
    ^ints build-batch-idxs ^ints build-row-idxs ^ints probe-row-idxs
-   output-columns]
+   output-columns left-outer?]
   (let [num-rows (alength build-batch-idxs)]
     (when (pos? num-rows)
       (let [allocator @join-allocator
@@ -411,15 +420,20 @@
         (dotimes [out-idx num-rows]
           (let [build-batch-idx (aget build-batch-idxs out-idx)
                 build-row-idx (aget build-row-idxs out-idx)
-                probe-row-idx (aget probe-row-idxs out-idx)
-                ;; Get cached source vectors for this build batch
-                build-src-vectors (nth build-src-vectors-by-batch build-batch-idx)]
-            ;; Copy only included build columns
-            (dotimes [i num-build-cols]
-              (let [src-idx (nth build-src-indices i)]
-                (copy-arrow-value! (nth build-src-vectors src-idx) build-row-idx
-                                   (nth build-vectors i) out-idx)))
-            ;; Copy only included probe columns
+                probe-row-idx (aget probe-row-idxs out-idx)]
+            ;; Handle build columns - check for left outer join null case
+            (if (and left-outer? (neg? build-batch-idx))
+              ;; No match for this probe row - write nulls for all build columns
+              (dotimes [i num-build-cols]
+                (let [^FieldVector out-vec (nth build-vectors i)]
+                  (.setNull out-vec out-idx)))
+              ;; Normal case - copy from build batch
+              (let [build-src-vectors (nth build-src-vectors-by-batch build-batch-idx)]
+                (dotimes [i num-build-cols]
+                  (let [src-idx (nth build-src-indices i)]
+                    (copy-arrow-value! (nth build-src-vectors src-idx) build-row-idx
+                                       (nth build-vectors i) out-idx)))))
+            ;; Copy only included probe columns (always present)
             (dotimes [i num-probe-cols]
               (let [src-idx (nth probe-src-indices i)]
                 (copy-arrow-value! (nth probe-src-vectors src-idx) probe-row-idx
@@ -565,10 +579,13 @@
 ;;; ---------------------------------------------------------------------------
 
 (defrecord HashJoinOp [build-child probe-child build-keys probe-keys
-                       output-arrow? vectorized? output-columns state]
+                       output-arrow? vectorized? output-columns left-outer? state]
   ;; output-columns: Optional set of column names to include in output.
   ;;                 If nil, all columns from both sides are included.
   ;;                 Use for projection pushdown to skip copying unneeded columns.
+  ;; left-outer?:    If true, this is a left outer join. All probe rows appear in
+  ;;                 output; unmatched probe rows have nulls for build-side columns.
+  ;;                 This implements SPARQL OPTIONAL semantics.
   ;; state is an atom containing:
   ;; Standard mode:
   ;;   {:hash-table HashMap (key -> [row-map...]), :build-complete? bool, :opened? bool,
@@ -681,6 +698,11 @@
       ;; Standard mode: extract row data to maps
       (let [^HashMap hash-table (:hash-table @state)
             row-count (batch-row-count batch)]
+        ;; Capture build-side column names from first batch (for left outer join null creation)
+        (when (and left-outer? (nil? (:build-columns @state)) (pos? row-count))
+          (let [first-row (extract-row-from-batch batch 0)
+                col-names (when (map? first-row) (keys first-row))]
+            (swap! state assoc :build-columns col-names)))
         (dotimes [i row-count]
           (when-let [key (extract-key-from-batch batch build-keys i)]
             (let [^ArrayList rows (or (.get hash-table key)
@@ -698,51 +720,86 @@
         (let [^HashMap hash-table (:hash-table @state)
               build-batches (:build-batches @state)
               row-count (batch-row-count batch)
-              ;; First pass: count total matches to allocate primitive arrays
-              match-count (atom 0)]
-          ;; Count matches
+              ;; First pass: count matches and track which probe rows have matches
+              match-count (atom 0)
+              ;; For left outer: track which probe rows have matches
+              probe-has-match (when left-outer? (boolean-array row-count))]
+          ;; Count matches (and mark matched probe rows for left-outer)
           (dotimes [probe-row-idx row-count]
             (when-let [key (extract-key-from-batch batch probe-keys probe-row-idx)]
               (when-let [^ArrayList build-refs (.get hash-table key)]
-                (swap! match-count + (.size build-refs)))))
-          (let [total-matches @match-count]
-            (when (pos? total-matches)
+                (let [match-size (.size build-refs)]
+                  (when (pos? match-size)
+                    (swap! match-count + match-size)
+                    (when probe-has-match
+                      (aset probe-has-match probe-row-idx true)))))))
+          ;; For left outer: count unmatched probe rows
+          (let [unmatched-count (if left-outer?
+                                  (reduce (fn [cnt i]
+                                            (if (aget probe-has-match i) cnt (inc cnt)))
+                                          0 (range row-count))
+                                  0)
+                total-matches @match-count
+                total-output (+ total-matches unmatched-count)]
+            (when (pos? total-output)
               ;; Allocate primitive int arrays for match indices
-              (let [build-batch-idxs (int-array total-matches)
-                    build-row-idxs (int-array total-matches)
-                    probe-row-idxs (int-array total-matches)
+              (let [build-batch-idxs (int-array total-output)
+                    build-row-idxs (int-array total-output)
+                    probe-row-idxs (int-array total-output)
                     write-idx (atom 0)]
                 ;; Second pass: fill arrays with match data
                 (dotimes [probe-row-idx row-count]
-                  (when-let [key (extract-key-from-batch batch probe-keys probe-row-idx)]
-                    (when-let [^ArrayList build-refs (.get hash-table key)]
+                  (let [key (extract-key-from-batch batch probe-keys probe-row-idx)
+                        ^ArrayList build-refs (when key (.get hash-table key))]
+                    (if (and build-refs (pos? (.size build-refs)))
+                      ;; Has matches - emit all matched rows
                       (doseq [^ints ref build-refs]
                         (let [idx @write-idx]
                           (aset build-batch-idxs idx (aget ref 0))
                           (aset build-row-idxs idx (aget ref 1))
                           (aset probe-row-idxs idx (int probe-row-idx))
+                          (swap! write-idx inc)))
+                      ;; No matches - for left outer, emit with -1 sentinel
+                      (when left-outer?
+                        (let [idx @write-idx]
+                          (aset build-batch-idxs idx (int -1))
+                          (aset build-row-idxs idx (int -1))
+                          (aset probe-row-idxs idx (int probe-row-idx))
                           (swap! write-idx inc))))))
                 (log/debug "HashJoinOp vectorized probe:" {:probe-rows row-count
                                                            :matches total-matches
+                                                           :unmatched unmatched-count
+                                                           :left-outer? left-outer?
                                                            :output-columns (count output-columns)})
                 ;; Gather output from source batches using primitive arrays
                 ;; Pass output-columns for projection pushdown
                 (gather-join-output-batch build-batches batch
                                           build-batch-idxs build-row-idxs probe-row-idxs
-                                          output-columns))))))
+                                          output-columns left-outer?))))))
       ;; Standard mode: extract and merge row maps
       (let [^HashMap hash-table (:hash-table @state)
             row-count (batch-row-count batch)
-            joined-rows (java.util.ArrayList.)]
+            joined-rows (java.util.ArrayList.)
+            ;; For left outer join, we need build-side column names to create null entries
+            build-columns (:build-columns @state)]
         (dotimes [i row-count]
-          (when-let [key (extract-key-from-batch batch probe-keys i)]
-            (when-let [^ArrayList build-rows (.get hash-table key)]
-              (let [probe-row (extract-row-from-batch batch i)]
-                (doseq [build-row build-rows]
-                  (.add joined-rows (merge build-row probe-row)))))))
+          (let [key (extract-key-from-batch batch probe-keys i)
+                ^ArrayList build-rows (when key (.get hash-table key))
+                probe-row (extract-row-from-batch batch i)]
+            (if (and build-rows (pos? (.size build-rows)))
+              ;; Has matches - merge probe with each build row
+              (doseq [build-row build-rows]
+                (.add joined-rows (merge build-row probe-row)))
+              ;; No matches
+              (when left-outer?
+                ;; Left outer join: include probe row with nulls for build columns
+                (let [null-build-row (when build-columns
+                                       (zipmap build-columns (repeat nil)))]
+                  (.add joined-rows (merge null-build-row probe-row)))))))
         (log/debug "HashJoinOp probe batch:" {:probe-rows row-count
                                               :joined-rows (.size joined-rows)
-                                              :output-arrow? output-arrow?})
+                                              :output-arrow? output-arrow?
+                                              :left-outer? left-outer?})
         (if output-arrow?
           (rows->arrow-batch (vec joined-rows))
           (vec joined-rows))))))
@@ -772,6 +829,10 @@
                                      are included. Use for projection pushdown to
                                      avoid copying unneeded columns in vectorized mode.
                                      Only applies when :vectorized? is true.
+                   :left-outer?   - If true, this is a left outer join. All probe
+                                    rows appear in output; unmatched probe rows have
+                                    nulls for build-side columns. This implements
+                                    SPARQL OPTIONAL semantics. Default: false.
 
    IMPORTANT: When vectorized? is true:
    - Build-side MUST use copy-batches? true (batches must outlive iteration)
@@ -795,6 +856,7 @@
                      :output-arrow? (get opts :output-arrow? false)
                      :vectorized? (get opts :vectorized? false)
                      :output-columns (get opts :output-columns)
+                     :left-outer? (get opts :left-outer? false)
                      :state (atom {:hash-table nil
                                    :build-complete? false
                                    :opened? false
@@ -1073,7 +1135,7 @@
 
    Args:
      sources         - Map of {table-name -> ITabularSource}
-     pattern-groups  - [{:mapping m :patterns [...] :predicates [...]}]
+     pattern-groups  - [{:mapping m :patterns [...] :predicates [...] :optional? bool}]
      join-graph      - Join graph from build-join-graph
      stats-by-table  - Map of {table-name -> statistics}
      time-travel     - Optional time travel spec
@@ -1115,17 +1177,18 @@
            output-columns (get opts :output-columns)  ;; nil = all columns
            scan-opts {:use-arrow-batches? use-arrow-batches?
                       :copy-batches? copy-batches?}
-           ;; Build scan ops for each table
+           ;; Build scan ops for each table, tracking optional status
            scans-by-table
            (into {}
-                 (for [{:keys [mapping predicates]} pattern-groups
+                 (for [{:keys [mapping predicates optional?]} pattern-groups
                        :let [table-name (:table mapping)]]
                    [table-name
                     {:scan (build-scan-op-for-group sources mapping
                                                     (or predicates [])
                                                     join-graph time-travel
                                                     scan-opts)
-                     :mapping mapping}]))
+                     :mapping mapping
+                     :optional? (boolean optional?)}]))
 
            table-names (keys scans-by-table)
 
@@ -1159,24 +1222,49 @@
                  [(:scan (get scans-by-table current-table)) 1]
                 ;; Subsequent tables - join to accumulated plan
                  (let [current-scan (:scan (get scans-by-table current-table))
+                       ;; Check if current table's pattern group is optional
+                       current-optional? (get-in scans-by-table [current-table :optional?])
                       ;; Find join edge between current and any accumulated table
                        edge (some (fn [t]
                                     (find-join-edge join-graph t current-table))
                                   (take table-idx indexed-order))]
                    (if edge
                     ;; Create hash join
-                     (let [;; Determine build vs probe based on which is accumulated
+                     (let [;; For OPTIONAL (left outer join), we must ensure:
+                           ;; - probe side = accumulated (required) - gets preserved
+                           ;; - build side = current (optional) - allows nulls
+                           ;;
+                           ;; For inner join, use FK-based heuristic for efficiency
                            current-is-child? (= current-table (:child-table edge))
+
+                           ;; CRITICAL: For OPTIONAL, force correct orientation
+                           ;; Left outer join preserves ALL probe rows, so probe must be required
                            [build-plan probe-plan build-keys probe-keys]
-                           (if current-is-child?
-                            ;; Accumulated is parent (dimension), current is child (fact)
-                             [accumulated-plan current-scan
-                              (vec (join/parent-columns edge))
-                              (vec (join/child-columns edge))]
-                            ;; Current is parent, accumulated is child
-                             [current-scan accumulated-plan
-                              (vec (join/parent-columns edge))
-                              (vec (join/child-columns edge))])
+                           (if current-optional?
+                             ;; OPTIONAL: accumulated is required (probe), current is optional (build)
+                             ;; This ensures all required rows are preserved with nulls for optional
+                             (if current-is-child?
+                               ;; Current (optional) is child, accumulated (required) is parent
+                               ;; probe=accumulated uses parent cols, build=current uses child cols
+                               [current-scan accumulated-plan
+                                (vec (join/child-columns edge))
+                                (vec (join/parent-columns edge))]
+                               ;; Current (optional) is parent, accumulated (required) is child
+                               ;; probe=accumulated uses child cols, build=current uses parent cols
+                               [current-scan accumulated-plan
+                                (vec (join/parent-columns edge))
+                                (vec (join/child-columns edge))])
+                             ;; Inner join: use FK-based heuristic for efficiency
+                             (if current-is-child?
+                               ;; Accumulated is parent (dimension), current is child (fact)
+                               [accumulated-plan current-scan
+                                (vec (join/parent-columns edge))
+                                (vec (join/child-columns edge))]
+                               ;; Current is parent, accumulated is child
+                               [current-scan accumulated-plan
+                                (vec (join/parent-columns edge))
+                                (vec (join/child-columns edge))]))
+
                            ;; For intermediate joins, merge downstream join keys with user's output-columns
                            ;; For final join, use user's output-columns directly
                            ;; For n tables, final join is when table-idx = n-1 (processing last table)
@@ -1187,18 +1275,23 @@
                              (let [downstream-keys (collect-downstream-join-keys join-graph indexed-order table-idx)]
                                (into output-columns downstream-keys))
                              ;; Final join or no output-columns specified
-                             output-columns)]
+                             output-columns)
+                           ;; Use left outer join for optional pattern groups
+                           left-outer? (boolean current-optional?)]
                        (log/debug "Creating hash join:" {:build-keys build-keys
                                                          :probe-keys probe-keys
                                                          :edge edge
                                                          :output-arrow? output-arrow?
                                                          :vectorized? vectorized?
                                                          :is-final-join? is-final-join?
+                                                         :left-outer? left-outer?
+                                                         :optional-orientation (when left-outer? "probe=required, build=optional")
                                                          :output-columns (count effective-output-columns)})
                        [(create-hash-join-op build-plan probe-plan build-keys probe-keys
                                              {:output-arrow? output-arrow?
                                               :vectorized? vectorized?
-                                              :output-columns effective-output-columns})
+                                              :output-columns effective-output-columns
+                                              :left-outer? left-outer?})
                         (inc table-idx)])
                     ;; No edge found - would be Cartesian product
                     ;; For now, just return accumulated (caller should handle)

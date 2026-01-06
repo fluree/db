@@ -53,21 +53,31 @@
      :predicate->mappings predicate->mappings}))
 
 (defn- extract-pattern-info
-  "Extract type and predicates from a pattern item."
+  "Extract type and predicates from a pattern item.
+
+   Also detects :optional patterns and extracts the inner patterns,
+   marking them as optional."
   [item]
-  (let [triple (if (= :class (first item)) (second item) item)
-        [s p o] triple
-        subject-var (when (and (map? s) (get s ::where/var))
-                      (get s ::where/var))
-        pred-iri (when (map? p) (get p ::where/iri))
-        is-type? (= const/iri-rdf-type pred-iri)
-        rdf-type (when (and is-type? (or (string? o) (map? o)))
-                   (if (string? o) o (get o ::where/iri)))]
-    {:subject-var subject-var
-     :predicate pred-iri
-     :is-type? is-type?
-     :rdf-type rdf-type
-     :item item}))
+  ;; Check if this is an :optional pattern container
+  (if (and (vector? item) (= :optional (first item)))
+    ;; Extract inner patterns and mark as optional
+    (let [inner-patterns (second item)]
+      (mapv #(assoc (extract-pattern-info %) :optional? true) inner-patterns))
+    ;; Regular pattern (triple or :class)
+    (let [triple (if (= :class (first item)) (second item) item)
+          [s p o] triple
+          subject-var (when (and (map? s) (get s ::where/var))
+                        (get s ::where/var))
+          pred-iri (when (map? p) (get p ::where/iri))
+          is-type? (= const/iri-rdf-type pred-iri)
+          rdf-type (when (and is-type? (or (string? o) (map? o)))
+                     (if (string? o) o (get o ::where/iri)))]
+      {:subject-var subject-var
+       :predicate pred-iri
+       :is-type? is-type?
+       :rdf-type rdf-type
+       :item item
+       :optional? false})))
 
 (defn group-patterns-by-table
   "Group patterns by which table they should be routed to.
@@ -75,13 +85,40 @@
    Uses the routing indexes to determine which table handles each pattern.
    Patterns are grouped by subject variable to keep related patterns together.
 
+   Also handles OPTIONAL patterns, marking the resulting pattern groups
+   with :optional? true so joins can use left outer join semantics.
+
+   LIMITATION: OPTIONAL block structure is not preserved for multi-table cases.
+   Currently, each pattern is individually marked as optional, then grouped by
+   subject. This works correctly for simple two-table OPTIONAL cases like:
+
+     ?airline ex:name ?name .
+     OPTIONAL { ?route ex:operatedBy ?airline . }
+
+   But for complex multi-table OPTIONAL blocks:
+
+     ?airline ex:name ?name .
+     OPTIONAL {
+       ?route ex:operatedBy ?airline .
+       ?airport ex:city ?city .
+       ?route ex:sourceAirportRef ?airport .
+     }
+
+   The patterns within the OPTIONAL block should inner-join with each other
+   before left-outer-joining with required patterns. The current implementation
+   treats each optional group independently, which may produce incorrect results
+   for complex multi-table OPTIONAL scenarios.
+
    Note: When multiple tables map the same class/predicate, the first mapping
    is used. For multi-table joins, use find-all-mappings instead.
 
-   Returns: [{:mapping mapping :patterns [...]} ...]"
+   Returns: [{:mapping mapping :patterns [...] :optional? bool} ...]"
   [patterns mappings routing-indexes]
   (let [{:keys [class->mappings predicate->mappings]} routing-indexes
-        pattern-infos (map extract-pattern-info patterns)
+        ;; Extract pattern infos - this may return vectors for :optional patterns
+        raw-pattern-infos (map extract-pattern-info patterns)
+        ;; Flatten any nested vectors from :optional expansion
+        pattern-infos (mapcat #(if (sequential? (first %)) % [%]) raw-pattern-infos)
 
         ;; Find mapping for each pattern (takes first when multiple exist)
         find-mapping (fn [{:keys [rdf-type predicate]}]
@@ -93,14 +130,18 @@
         by-subject (group-by :subject-var pattern-infos)
 
         ;; For each subject group, determine the primary mapping
+        ;; and whether it's optional (all patterns in group must be optional)
         groups (for [[_subj-var infos] by-subject
                      :let [;; Find mappings for patterns with type info first
                            type-patterns (filter :rdf-type infos)
                            mapping (if (seq type-patterns)
                                      (find-mapping (first type-patterns))
-                                     (find-mapping (first infos)))]]
+                                     (find-mapping (first infos)))
+                           ;; Group is optional if ALL patterns in it are optional
+                           optional? (every? :optional? infos)]]
                  {:mapping mapping
-                  :patterns (mapv :item infos)})]
+                  :patterns (mapv :item infos)
+                  :optional? optional?})]
     (vec groups)))
 
 (defn analyze-clause-for-mapping

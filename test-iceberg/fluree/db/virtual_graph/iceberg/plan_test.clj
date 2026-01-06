@@ -1,6 +1,7 @@
 (ns fluree.db.virtual-graph.iceberg.plan-test
   "Tests for the ITabularPlan protocol and physical operators."
   (:require [clojure.test :refer [deftest is testing]]
+            [fluree.db.tabular.protocol :as tabular]
             [fluree.db.virtual-graph.iceberg.plan :as plan]
             [fluree.db.virtual-graph.iceberg.join :as join]))
 
@@ -17,8 +18,9 @@
 
 (defrecord MockSource [tables]
   ;; Simplified mock that returns row maps directly
-  ;; Real ITabularSource would return Arrow batches
-  fluree.db.tabular.protocol/ITabularSource
+  ;; For plan operators, each row is returned as a separate "batch"
+  ;; This matches how plan operators handle non-Arrow mode
+  tabular/ITabularSource
   (scan-batches [_ table-name opts]
     (let [data (get tables table-name [])
           columns (:columns opts)
@@ -41,12 +43,18 @@
                                        predicates))
                              projected)
                      projected)]
-      ;; Return as single "batch" for simplicity
-      [(mock-batch filtered)]))
+      ;; Return each row as a separate "batch" (row map)
+      ;; This is what plan operators expect for non-Arrow mode
+      (vec filtered)))
 
   (scan-rows [this table-name opts]
-    (let [batches (fluree.db.tabular.protocol/scan-batches this table-name opts)]
-      (mapcat :rows batches)))
+    ;; scan-batches now returns individual row maps
+    (tabular/scan-batches this table-name opts))
+
+  (scan-arrow-batches [this table-name opts]
+    ;; For mock, just return the same as scan-batches
+    ;; Real implementation would return Arrow VectorSchemaRoot batches
+    (tabular/scan-batches this table-name opts))
 
   (get-schema [_ _table-name _opts]
     {:columns []})
@@ -73,15 +81,28 @@
    {:id 3 :name "Lufthansa" :country "DE"}
    {:id 4 :name "Air France" :country "FR"}])
 
+;; Routes: note airline_id 4 (Air France) has no routes for OPTIONAL testing
 (def routes-data
   [{:route_id 100 :airline_id 1 :src "JFK" :dst "LAX"}
    {:route_id 101 :airline_id 1 :src "LAX" :dst "ORD"}
    {:route_id 102 :airline_id 2 :src "ATL" :dst "JFK"}
-   {:route_id 103 :airline_id 3 :src "FRA" :dst "JFK"}
-   {:route_id 104 :airline_id 4 :src "CDG" :dst "JFK"}])
+   {:route_id 103 :airline_id 3 :src "FRA" :dst "JFK"}])
+
+;; Extended airlines data with an airline that has no routes (for OPTIONAL tests)
+(def airlines-with-orphan
+  [{:id 1 :name "American Airlines" :country "US"}
+   {:id 2 :name "Delta" :country "US"}
+   {:id 3 :name "Lufthansa" :country "DE"}
+   {:id 4 :name "Air France" :country "FR"}   ;; No routes for this airline
+   {:id 5 :name "New Airline" :country "CA"}]) ;; Also no routes
 
 (def test-source
   (create-mock-source {"airlines" airlines-data
+                       "routes" routes-data}))
+
+;; Test source with orphan airlines (no routes for airline_id 4 and 5)
+(def test-source-with-orphans
+  (create-mock-source {"airlines" airlines-with-orphan
                        "routes" routes-data}))
 
 ;;; ---------------------------------------------------------------------------
@@ -132,9 +153,12 @@
     (let [scan (plan/create-scan-op test-source "airlines" ["id" "name"] [])]
       (plan/open! scan)
       (try
-        (let [batch (plan/next-batch! scan)]
-          (is (some? batch))
-          (is (= 4 (:row-count batch))))
+        ;; Count all batches (each row is a batch in mock mode)
+        (let [batches (loop [result []]
+                        (if-let [batch (plan/next-batch! scan)]
+                          (recur (conj result batch))
+                          result))]
+          (is (= 4 (count batches)) "Should have 4 airlines"))
         (finally
           (plan/close! scan)))))
 
@@ -143,10 +167,13 @@
                                     [{:column "country" :op :eq :value "US"}])]
       (plan/open! scan)
       (try
-        (let [batch (plan/next-batch! scan)]
-          (is (some? batch))
+        ;; Count all batches after filtering
+        (let [batches (loop [result []]
+                        (if-let [batch (plan/next-batch! scan)]
+                          (recur (conj result batch))
+                          result))]
           ;; Should filter to US airlines only (American, Delta)
-          (is (= 2 (:row-count batch))))
+          (is (= 2 (count batches)) "Should have 2 US airlines"))
         (finally
           (plan/close! scan))))))
 
@@ -280,3 +307,130 @@
                                    :output-columns output-cols})]
       (is (instance? fluree.db.virtual_graph.iceberg.plan.HashJoinOp plan))
       (is (= output-cols (:output-columns plan))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Left Outer Join Tests (OPTIONAL support)
+;;; ---------------------------------------------------------------------------
+
+(deftest left-outer-hash-join-test
+  (testing "HashJoinOp with :left-outer? creates left outer join"
+    (let [;; Airlines is build side (smaller)
+          scan1 (plan/create-scan-op test-source-with-orphans "airlines" ["id" "name"] [])
+          ;; Routes is probe side (larger, but has orphans)
+          scan2 (plan/create-scan-op test-source-with-orphans "routes" ["route_id" "airline_id" "src"] [])
+          ;; Create left outer join: probe (airlines) LEFT JOIN build (routes)
+          ;; For OPTIONAL, airlines is the "required" side (probe), routes is "optional" side (build)
+          join (plan/create-hash-join-op scan2 scan1 ["airline_id"] ["id"]
+                                         {:left-outer? true})]
+      (is (satisfies? plan/ITabularPlan join))
+      (is (true? (:left-outer? join)))))
+
+  (testing "Left outer join includes unmatched probe rows with nulls"
+    ;; This tests the core OPTIONAL semantics:
+    ;; All airlines should appear, even those without routes
+    (let [;; Build side: routes (smaller for this test)
+          routes-scan (plan/create-scan-op test-source-with-orphans "routes"
+                                           ["route_id" "airline_id" "src" "dst"] [])
+          ;; Probe side: airlines (we want ALL airlines in output)
+          airlines-scan (plan/create-scan-op test-source-with-orphans "airlines"
+                                             ["id" "name" "country"] [])
+          ;; Left outer join: airlines LEFT OUTER JOIN routes
+          ;; Probe side (airlines) drives the join - all probe rows appear
+          ;; Build side (routes) provides matches - nulls when no match
+          left-join (plan/create-hash-join-op routes-scan airlines-scan
+                                              ["airline_id"] ["id"]
+                                              {:left-outer? true})]
+      (plan/open! left-join)
+      (try
+        (let [batches (loop [result []]
+                        (if-let [batch (plan/next-batch! left-join)]
+                          (recur (conj result batch))
+                          result))
+              ;; Collect all rows from batches
+              all-rows (mapcat (fn [batch]
+                                 (if (vector? batch)
+                                   batch
+                                   (:rows batch)))
+                               batches)
+              ;; Group by airline id to analyze results
+              by-airline (group-by :id all-rows)]
+          ;; Should have 5 unique airlines (including orphans)
+          (is (= 5 (count by-airline))
+              "All 5 airlines should appear in left outer join output")
+          ;; Airlines 1, 2, 3 have routes
+          (is (= 2 (count (get by-airline 1)))  ;; American has 2 routes
+              "American Airlines should have 2 joined rows")
+          (is (= 1 (count (get by-airline 2)))  ;; Delta has 1 route
+              "Delta should have 1 joined row")
+          (is (= 1 (count (get by-airline 3)))  ;; Lufthansa has 1 route
+              "Lufthansa should have 1 joined row")
+          ;; Airlines 4 and 5 have NO routes - should appear with null route columns
+          (let [air-france-rows (get by-airline 4)]
+            (is (= 1 (count air-france-rows))
+                "Air France should have 1 row (no routes)")
+            (is (nil? (:route_id (first air-france-rows)))
+                "Air France row should have nil route_id"))
+          (let [new-airline-rows (get by-airline 5)]
+            (is (= 1 (count new-airline-rows))
+                "New Airline should have 1 row (no routes)")
+            (is (nil? (:src (first new-airline-rows)))
+                "New Airline row should have nil src")))
+        (finally
+          (plan/close! left-join)))))
+
+  (testing "Inner join (default) excludes unmatched rows"
+    ;; Verify that inner join still works correctly - orphan airlines excluded
+    (let [routes-scan (plan/create-scan-op test-source-with-orphans "routes"
+                                           ["route_id" "airline_id" "src"] [])
+          airlines-scan (plan/create-scan-op test-source-with-orphans "airlines"
+                                             ["id" "name"] [])
+          ;; Regular inner join (no :left-outer?)
+          inner-join (plan/create-hash-join-op routes-scan airlines-scan
+                                               ["airline_id"] ["id"]
+                                               {})]
+      (plan/open! inner-join)
+      (try
+        (let [batches (loop [result []]
+                        (if-let [batch (plan/next-batch! inner-join)]
+                          (recur (conj result batch))
+                          result))
+              all-rows (mapcat (fn [batch]
+                                 (if (vector? batch) batch (:rows batch)))
+                               batches)
+              by-airline (group-by :id all-rows)]
+          ;; Inner join should only have 3 airlines (those with routes)
+          (is (= 3 (count by-airline))
+              "Inner join should only include 3 airlines with routes")
+          ;; Airlines 4 and 5 should NOT appear
+          (is (nil? (get by-airline 4))
+              "Air France should NOT appear in inner join")
+          (is (nil? (get by-airline 5))
+              "New Airline should NOT appear in inner join"))
+        (finally
+          (plan/close! inner-join)))))
+
+  (testing "HashJoinOp accepts both :left-outer? and :vectorized? options"
+    ;; This verifies that both options can be combined - the vectorized path
+    ;; now supports left outer join for OPTIONAL patterns
+    (let [scan1 (plan/create-scan-op test-source-with-orphans "routes" ["airline_id"] [])
+          scan2 (plan/create-scan-op test-source-with-orphans "airlines" ["id" "name"] [])
+          join (plan/create-hash-join-op scan1 scan2 ["airline_id"] ["id"]
+                                         {:left-outer? true
+                                          :vectorized? true
+                                          :output-arrow? true})]
+      (is (true? (:left-outer? join)) "Left-outer option should be set")
+      (is (true? (:vectorized? join)) "Vectorized option should be set")
+      (is (true? (:output-arrow? join)) "Output-arrow option should be set")))
+
+  (testing "compile-plan with :left-outer? and :vectorized? creates properly configured HashJoinOp"
+    ;; Test that compile-plan passes both options through for OPTIONAL support in columnar mode
+    (let [join-graph (join/build-join-graph sample-mappings)
+          pattern-groups [{:mapping {:table "airlines"} :predicates []}
+                          {:mapping {:table "routes"} :predicates [] :optional? true}]
+          sources {"airlines" test-source "routes" test-source}
+          plan (plan/compile-plan sources pattern-groups join-graph sample-stats nil
+                                  {:vectorized? true})]
+      (is (instance? fluree.db.virtual_graph.iceberg.plan.HashJoinOp plan))
+      (is (true? (:vectorized? plan)) "Vectorized should be enabled")
+      ;; The join should be configured as left-outer for OPTIONAL patterns
+      (is (true? (:left-outer? plan)) "Left-outer should be set for OPTIONAL patterns"))))
