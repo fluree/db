@@ -741,8 +741,8 @@
            (not (unmatched-var? p))
            (unmatched-var? o)
            ;; If the object var has an extracted range constraint (from filter analysis),
-           ;; don't use the batched subject-join path yet. The batched join code path
-           ;; currently assumes an unconstrained object and relies on full slice materialization.
+           ;; fall back to the normal matcher (the batched subject-join path does not
+           ;; apply object range bounds to slice lookups).
            (nil? (::range o))
            ;; don't try to batch if the subject is optional (can be nil/unmatched)
            (nil? (get-optional s))))))
@@ -842,8 +842,6 @@
     (if batching-requested?
       (do
         (go
-          ;; NOTE: ds might be an AsyncDB wrapper or a DataSet; resolve the underlying FlakeDB
-          ;; once up-front for this constraint.
           (let [active-graph (dataset-active-graph ds)
                 batch-db     (cond
                                ;; dataset with a single active db
