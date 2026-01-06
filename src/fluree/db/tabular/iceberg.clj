@@ -115,8 +115,8 @@
                                    :batch-size batch-size
                                    :limit limit})))
 
-  (scan-arrow-batches [_ table-name {:keys [columns predicates snapshot-id as-of-time batch-size metadata-location]
-                                     :or {batch-size 4096}}]
+  (scan-arrow-batches [_ table-name {:keys [columns predicates snapshot-id as-of-time batch-size copy-batches metadata-location]
+                                     :or {batch-size 4096 copy-batches true}}]
     (let [meta-loc (or metadata-location
                        (get @metadata-cache table-name)
                        (let [loc (resolve-metadata-location file-io warehouse-path table-name nil)]
@@ -126,14 +126,20 @@
               (throw (ex-info (str "Cannot resolve metadata for table: " table-name)
                               {:table table-name :warehouse warehouse-path})))
           ^Table table (load-table-from-metadata file-io meta-loc table-name)]
-      (log/debug "FlureeIcebergSource scan-arrow-batches (raw):" {:table table-name
-                                                                  :batch-size batch-size
-                                                                  :metadata meta-loc})
-      (core/scan-raw-arrow-batches table {:columns columns
-                                          :predicates predicates
-                                          :snapshot-id snapshot-id
-                                          :as-of-time as-of-time
-                                          :batch-size batch-size})))
+      (log/debug "FlureeIcebergSource scan-arrow-batches (filtered):" {:table table-name
+                                                                       :batch-size batch-size
+                                                                       :predicates (count predicates)
+                                                                       :copy-batches copy-batches
+                                                                       :metadata meta-loc})
+      ;; Use filtered Arrow batches for correct row-level filtering
+      ;; When copy-batches is true (default), data is copied to avoid buffer reuse issues
+      ;; When false, batches share underlying buffers - use for streaming consumption
+      (core/scan-filtered-arrow-batches table {:columns columns
+                                               :predicates predicates
+                                               :snapshot-id snapshot-id
+                                               :as-of-time as-of-time
+                                               :batch-size batch-size
+                                               :copy-batches copy-batches})))
 
   (scan-rows [this table-name opts]
     ;; scan-batches now returns row maps directly
