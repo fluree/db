@@ -802,16 +802,45 @@
 
 (defn parse-ordering
   [q]
-  (some->> (:order-by q)
-           ensure-vector
-           (mapv (fn [ord]
-                   (if-let [v (parse-var-name ord)]
-                     [v :asc]
-                     (let [[dir dim] ord
-                           v (parse-var-name dim)]
-                       (if (syntax/asc? dir)
-                         [v :asc]
-                         [v :desc])))))))
+  (let [order-by (:order-by q)
+        ;; Disambiguate between:
+        ;; - a single direction tuple like ["desc" "?x"] or '(desc ?x)
+        ;; - a collection of orderings like ["?x" ["desc" "?y"]] etc
+        orderings (cond
+                    (nil? order-by) nil
+
+                    ;; Single direction tuple encoded as a vector (often from query coercion).
+                    (and (vector? order-by)
+                         (= 2 (count order-by))
+                         (or (syntax/asc? (nth order-by 0))
+                             (syntax/desc? (nth order-by 0)))
+                         (parse-var-name (nth order-by 1)))
+                    [order-by]
+
+                    ;; Single direction tuple encoded as a list/seq.
+                    (and (sequential? order-by)
+                         (= 2 (count order-by))
+                         (or (syntax/asc? (first order-by))
+                             (syntax/desc? (first order-by)))
+                         (parse-var-name (second order-by)))
+                    [order-by]
+
+                    ;; Collection of orderings (vector form).
+                    (vector? order-by)
+                    order-by
+
+                    ;; Single ordering (var, list tuple, etc).
+                    :else
+                    [order-by])]
+    (some->> orderings
+             (mapv (fn [ord]
+                     (if-let [v (parse-var-name ord)]
+                       [v :asc]
+                       (let [[dir dim] ord
+                             v (parse-var-name dim)]
+                         (if (syntax/asc? dir)
+                           [v :asc]
+                           [v :desc]))))))))
 
 (defn parse-having
   [q context]

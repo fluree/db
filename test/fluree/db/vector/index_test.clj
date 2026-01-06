@@ -104,6 +104,7 @@
         (let [query   {"@context" {"ex"   "http://example.org/ns/"
                                    "fidx" iri/f-idx-ns}
                        "select"   ["?x", "?title", "?score", "?vec"]
+                       "orderBy"  [["desc" "?score"] ["asc" "?x"]]
                        "where"    [["graph"
                                     "##FlatRank-DotProduct"
                                     {"fidx:target"   {"@value" [0.7, 0.6]

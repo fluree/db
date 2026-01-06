@@ -13,6 +13,7 @@
   @(fluree/query db {"@context" {"ex"   "http://example.org/ns/"
                                  "fidx" "https://ns.flur.ee/index#"}
                      "select"   ["?x", "?score", "?title"]
+                     "orderBy"  [["desc" "?score"] ["asc" "?x"]]
                      "where"    [["graph" "##articleSearch" {"fidx:target" search-term
                                                              "fidx:limit"  10,
                                                              "fidx:sync"   true,

@@ -791,11 +791,30 @@
 (defn- emit-joined-solutions!
   [bind-db pattern out-ch sols flakes]
   (go
-    (let [tuple   (pattern-data pattern)
-          sol+tpl (mapv (fn [sol] [sol (assign-matched-values tuple sol)]) sols)]
-      (doseq [f flakes
-              [sol tuple*] sol+tpl]
-        (>! out-ch (match-flake sol tuple* bind-db f))))
+    (let [tuple (pattern-data pattern)]
+      (doseq [sol sols
+              :let [[_s _p o] (assign-matched-values tuple sol)]]
+        (doseq [f flakes
+                :let [o-fn        (::fn o)
+                      o-mch       (match-object (unlink-vars o) bind-db f)
+                      bound-ok?   (if (unmatched-var? o)
+                                    true
+                                    (let [expected-sid (get-sid o bind-db)
+                                          actual-sid   (get-sid o-mch bind-db)
+                                          expected-b   (get-binding o)
+                                          actual-b     (get-binding o-mch)]
+                                      (and
+                                       (if (and (some? expected-sid) (some? actual-sid))
+                                         (= expected-sid actual-sid)
+                                         (= expected-b actual-b))
+                                       (= (get-datatype-iri o) (get-datatype-iri o-mch))
+                                       (= (get-lang o) (get-lang o-mch)))))
+                      filter-ok?  (or (nil? o-fn) (o-fn o-mch))]]
+          (when (and bound-ok? filter-ok?)
+            (let [sol* (cond-> sol
+                         (unmatched-var? o) (assoc (::var o) o-mch)
+                         (linked-vars? o)   (match-linked-vars o bind-db f))]
+              (>! out-ch sol*))))))
     ::done))
 
 (defn- process-batched-subject-join-batch!
@@ -831,9 +850,11 @@
           (loop [seen (transient #{})]
             (if-let [[sid flakes] (async/<! slice-ch)]
               (let [seen' (conj! seen sid)
-                    sols  (get sid->solutions sid)]
+                    sols  (get sid->solutions sid)
+                    fuel-xf (track/track-fuel! tracker error-ch)
+                    flakes* (if fuel-xf (into [] fuel-xf flakes) flakes)]
                 (when (seq sols)
-                  (<? (emit-joined-solutions! bind-db pattern out-ch sols flakes)))
+                  (<? (emit-joined-solutions! bind-db pattern out-ch sols flakes*)))
                 (recur seen'))
               (let [seen*        (persistent! seen)
                     missing-sids (seq (remove seen* sids))]

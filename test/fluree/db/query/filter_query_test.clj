@@ -148,14 +148,16 @@
                       {"@context" {"ex" "http://example.org/"}
                        "insert"   {"@id"       "ex:bob"
                                    "ex:father" [{"@id" "ex:alex-jr"}, {"@id" "ex:aj"}]}})]
-        (is (= [["ex:bob" "ex:aj" "ex:alex-jr"] ["ex:bob" "ex:alex-jr" "ex:aj"]]
-               @(fluree/query db-dads {:context {"ex" "http://example.org/"}
-                                       :select  '[?s ?f1 ?f2]
-                                       :where   '[{"@id"       ?s
-                                                   "ex:father" ?f1}
-                                                  {"@id"       ?s
-                                                   "ex:father" ?f2}
-                                                  ["filter" "(not= ?f1 ?f2)"]]})))))
+        ;; Order is not guaranteed unless explicitly ordered; compare as a set.
+        (is (= #{["ex:bob" "ex:aj" "ex:alex-jr"]
+                 ["ex:bob" "ex:alex-jr" "ex:aj"]}
+               (set @(fluree/query db-dads {:context {"ex" "http://example.org/"}
+                                            :select  '[?s ?f1 ?f2]
+                                            :where   '[{"@id"       ?s
+                                                        "ex:father" ?f1}
+                                                       {"@id"       ?s
+                                                        "ex:father" ?f2}
+                                                       ["filter" "(not= ?f1 ?f2)"]]}))))))
 
     (testing "value map filters"
       (is (= [["Brian" "Smith"]]

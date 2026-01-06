@@ -219,10 +219,10 @@
                                :decode/fql  string->ordering
                                :decode/json string->ordering}
                          [:scalar ::var]
-                         [:vector [:and list?
-                                   [:catn
-                                    [:direction ::direction]
-                                    [:dimension ::var]]]]]
+                         ;; Accept both EDN list form (e.g. '(desc ?x)) and JSON/JS array form (e.g. ["desc","?x"]).
+                         [:vector [:catn
+                                   [:direction ::direction]
+                                   [:dimension ::var]]]]
     ::order-by          [:orn {:error/message "orderBy clause must be variable or two-tuple formatted ['ASC' or 'DESC', var]"}
                          [:clause ::ordering]
                          [:collection [:sequential ::ordering]]]
