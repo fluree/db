@@ -179,6 +179,18 @@
   [(flake/create sid flake/min-p flake/min-s flake/min-dt flake/min-t flake/min-op flake/min-meta)
    (flake/create sid flake/max-p flake/max-s flake/max-dt flake/max-t flake/max-op flake/max-meta)])
 
+(defn- subject-predicate->range
+  "Returns [start-flake end-flake] for (sid, p-sid, *) lookups.
+
+  Notes:
+  - We intentionally use `nil` for o/dt/t/op to represent an unconstrained
+    dimension in the flake comparators (see `flake/cmp-obj`, `flake/cmp-tx`,
+    `flake/cmp-op`), rather than trying to guess a global min/max for the
+    heterogeneous object space."
+  [sid p-sid]
+  [(flake/create sid p-sid nil nil nil nil flake/min-meta)
+   (flake/create sid p-sid nil nil nil nil flake/max-meta)])
+
 (defn resolve-subject-slices
   "Returns a channel of [sid flakes] pairs by fetching all :spot flakes for each
   subject SID in `sids`.
@@ -258,12 +270,7 @@
           (let [novelty   (get-in db [:novelty idx])
                 novelty-t (get-in db [:novelty :t])
                 resolver  (index/index-catalog->t-range-resolver (:index-catalog db) novelty-t novelty to-t)
-                subject->range
-                (fn [sid]
-                  ;; Mirror `where/resolve-flake-range` bounds for (s p ?o):
-                  ;; only bracket on meta, leave o/dt/t/op nil.
-                  [(flake/create sid p-sid nil nil nil nil util/min-integer)
-                   (flake/create sid p-sid nil nil nil nil util/max-integer)])
+                subject->range (fn [sid] (subject-predicate->range sid p-sid))
                 ;; `batched-prefix-range-lookup` expects ordered lookups (see docstring).
                 raw-ch    (index/batched-prefix-range-lookup resolver root sids subject->range error-ch
                                                              {:mode mode* :prefetch-n prefetch-n :buffer buffer})

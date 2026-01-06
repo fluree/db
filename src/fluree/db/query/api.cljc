@@ -120,33 +120,30 @@
      (let [{:keys [opts] :as query*} (-> query
                                          syntax/coerce-query
                                          (sanitize-query-options override-opts))
-
            tracker (track/init opts)
-
-           ;; TODO - remove restrict-db from here, restriction should happen
-           ;;      - upstream if needed
-           ds*      (if (dataset? ds)
-                      ds
-                      (<? (restrict-db ds tracker query*)))
-           ;; NOTE: When querying a DB value directly (FlakeDB/AsyncDB), :from/:from-named
-           ;; are not used to select ledgers (unlike connection/dataset queries). Ignore them.
-           ;; This matches the expectation that a DB query runs only against the provided DB.
-           query**  (-> query*
-                        (update :opts dissoc :meta :max-fuel)
-                        (cond-> (not (dataset? ds*)) (dissoc :from :from-named)))
-           batch-size     (:subject-join-batch-size opts)
-           use-psot?      (:subject-join-use-psot? opts)
-           range-mode     (:subject-join-range-mode opts)
-           join-log?      (:subject-join-log? opts)
-           join-trace?    (:subject-join-trace? opts)]
-       (binding [where/*enable-batched-subject-joins?* (pos-int? batch-size)
-                 where/*subject-join-batch-size*       (if (pos-int? batch-size)
-                                                         batch-size
-                                                         where/*subject-join-batch-size*)
-                 where/*subject-join-use-psot?*         (if (some? use-psot?) use-psot? where/*subject-join-use-psot?*)
-                 where/*subject-join-range-mode*        (if (some? range-mode) range-mode where/*subject-join-range-mode*)
-                 where/*batched-subject-join-log?*      (if (some? join-log?) join-log? where/*batched-subject-join-log?*)
-                 where/*batched-subject-join-trace?*    (if (some? join-trace?) join-trace? where/*batched-subject-join-trace?*)]
+           ds*     (if (dataset? ds)
+                     ds
+                     (<? (restrict-db ds tracker query*)))
+           query** (-> query*
+                       (update :opts dissoc :meta :max-fuel)
+                       (cond-> (not (dataset? ds*)) (dissoc :from :from-named)))
+           batch-size      (:subject-join-batch-size opts)
+           use-psot?       (:subject-join-use-psot? opts)
+           range-mode      (:subject-join-range-mode opts)
+           join-log?       (:subject-join-log? opts)
+           join-trace?     (:subject-join-trace? opts)
+           enable-batched? (pos-int? batch-size)
+           batch-size*     (if enable-batched? batch-size where/*subject-join-batch-size*)
+           use-psot?*      (if (some? use-psot?) use-psot? where/*subject-join-use-psot?*)
+           range-mode*     (if (some? range-mode) range-mode where/*subject-join-range-mode*)
+           join-log?*      (if (some? join-log?) join-log? where/*batched-subject-join-log?*)
+           join-trace?*    (if (some? join-trace?) join-trace? where/*batched-subject-join-trace?*)]
+       (binding [where/*enable-batched-subject-joins?* enable-batched?
+                 where/*subject-join-batch-size*       batch-size*
+                 where/*subject-join-use-psot?*        use-psot?*
+                 where/*subject-join-range-mode*       range-mode*
+                 where/*batched-subject-join-log?*     join-log?*
+                 where/*batched-subject-join-trace?*   join-trace?*]
          (if (track/track-query? opts)
            (<? (track-execution ds* tracker #(fql/query ds* tracker query**)))
            (<? (fql/query ds* query**))))))))

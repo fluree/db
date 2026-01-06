@@ -665,8 +665,10 @@
                             ;; carry when the next lookup falls strictly beyond rhs.
                             (and rhs (pos? (cmp (lookup->start nxt) rhs))) [acc nxt]
                             :else (recur (conj acc nxt)))))]
-                  (doseq [item (leaf->results leaf batch)]
-                    (>! out item))
+                  (loop [items (leaf->results leaf batch)]
+                    (when-let [item (first items)]
+                      (>! out item)
+                      (recur (rest items))))
                   (recur carry)))
               (async/close! out))))
         (catch* e
@@ -759,108 +761,95 @@
     (when-not (fn? cmp)
       (throw (ex-info "batched-prefix-range-lookup requires root with :comparator"
                       {:status 500 :error :db/index-lookup})))
-    (let [done-ch
-          (go-try
-            (if (empty? lookups)
-              (async/close! out)
-              (if (= mode :scan)
-                (let [[first-start _] (lookup->range (first lookups))
-                      [_ last-end]    (lookup->range (peek lookups))
-                      range-set       (flake/sorted-set-by cmp first-start last-end)
-                      in-range?       (fn [node] (intersects-range? node range-set))
-                      leaf-ch         (tree-chan r root first-start last-end in-range?
-                                                 prefetch-n (filter resolved-leaf?) error-ch)]
-                  (loop [i      0
-                         active []
-                         acc    (transient {})]
-                    (if-let [leaf (<! leaf-ch)]
-                      (let [rhs           (:rhs leaf)
-                            leaf-flakes   (:flakes leaf)
-                            [i' active']  (add-starting-lookups lookups i active rhs cmp lookup->range)
-                            acc'          (reduce
-                                           (fn [a lk]
-                                             (let [matches (leaf-subrange leaf-flakes lookup->range lk)]
-                                               (if (seq matches)
-                                                 (assoc! a lk (into (get a lk []) matches))
-                                                 a)))
-                                           acc
-                                           active')
-                            [done stay]   (split-done-stay active' rhs cmp lookup->range)
-                            acc''         (loop [a   acc'
-                                                 lks done]
-                                            (if-let [lk (first lks)]
-                                              (do
-                                                (when-let [v (get a lk)]
-                                                  (>! out [lk v]))
-                                                (recur (dissoc! a lk) (rest lks)))
-                                              a))]
-                        (recur i' stay acc''))
+    (go
+      (try*
+        (when (seq lookups)
+          (if (= mode :scan)
+            (let [[first-start _] (lookup->range (first lookups))
+                  [_ last-end]    (lookup->range (peek lookups))
+                  range-set       (flake/sorted-set-by cmp first-start last-end)
+                  in-range?       (fn [node] (intersects-range? node range-set))
+                  leaf-ch         (tree-chan r root first-start last-end in-range?
+                                             prefetch-n (filter resolved-leaf?) error-ch)]
+              (loop [i      0
+                     active []
+                     acc    (transient {})]
+                (if-let [leaf (<! leaf-ch)]
+                  (let [rhs           (:rhs leaf)
+                        leaf-flakes   (:flakes leaf)
+                        [i' active']  (add-starting-lookups lookups i active rhs cmp lookup->range)
+                        acc'          (reduce
+                                       (fn [a lk]
+                                         (let [matches (leaf-subrange leaf-flakes lookup->range lk)]
+                                           (if (seq matches)
+                                             (assoc! a lk (into (get a lk []) matches))
+                                             a)))
+                                       acc
+                                       active')
+                        [done stay]   (split-done-stay active' rhs cmp lookup->range)
+                        acc''         (loop [a   acc'
+                                             lks done]
+                                        (if-let [lk (first lks)]
+                                          (do
+                                            (when-let [v (get a lk)]
+                                              (>! out [lk v]))
+                                            (recur (dissoc! a lk) (rest lks)))
+                                          a))]
+                    (recur i' stay acc''))
+                  (loop [lks active]
+                    (when-let [lk (first lks)]
+                      (when-let [v (get acc lk)]
+                        (>! out [lk v]))
+                      (recur (rest lks)))))))
+            ;; default: :seek
+            (loop [i 0]
+              (when (< i (count lookups))
+                (let [lk0    (nth lookups i)
+                      start0 (lookup-start lookup->range lk0)
+                      leaf   (<! (seek-leaf r root start0 error-ch))]
+                  (when-not leaf
+                    (throw (ex-info "Unable to resolve leaf for lookup batch"
+                                    {:status 500 :error :db/index-lookup
+                                     :target (pr-str start0)})))
+                  (let [rhs         (:rhs leaf)
+                        leaf-flakes (:flakes leaf)
+                        [j batch]   (add-starting-lookups lookups i [] rhs cmp lookup->range)]
+                    (if (empty? batch)
+                      (let [[st en]   (lookup->range lk0)
+                            range-set (flake/sorted-set-by cmp st en)
+                            in-range? (fn [node] (intersects-range? node range-set))
+                            leaf-ch   (tree-chan r root st en in-range? prefetch-n (filter resolved-leaf?) error-ch)
+                            matches   (loop [acc (transient [])]
+                                        (if-let [leaf* (<! leaf-ch)]
+                                          (let [ms (leaf-subrange (:flakes leaf*) lookup->range lk0)]
+                                            (recur (if (seq ms) (reduce conj! acc ms) acc)))
+                                          (persistent! acc)))]
+                        (when (seq matches)
+                          (>! out [lk0 matches]))
+                        (recur (inc i)))
                       (do
-                        ;; end of scan: emit any remaining active lookups
-                        (doseq [lk active]
-                          (when-let [v (get acc lk)]
-                            (>! out [lk v])))
-                        (async/close! out)))))
-                ;; default: :seek
-                (loop [i 0]
-                  (if (>= i (count lookups))
-                    (async/close! out)
-                    (let [lk0    (nth lookups i)
-                          start0 (lookup-start lookup->range lk0)
-                          leaf   (<! (seek-leaf r root start0 error-ch))]
-                      (when-not leaf
-                        (throw (ex-info "Unable to resolve leaf for lookup batch"
-                                        {:status 500 :error :db/index-lookup
-                                         :target (pr-str start0)})))
-                      (let [rhs         (:rhs leaf)
-                            leaf-flakes (:flakes leaf)
-                            [j batch]   (add-starting-lookups lookups i [] rhs cmp lookup->range)]
-                        ;; Defensive: if seek-leaf returns a leaf that doesn't actually contain
-                        ;; the lookup start (gap/edge case), `add-starting-lookups` can return
-                        ;; an empty batch which would otherwise lead to a tight loop (j == i).
-                        ;; Fall back to a direct scan for this lookup only.
-                        (if (empty? batch)
-                          (let [[st en] (lookup->range lk0)
-                                range-set (flake/sorted-set-by cmp st en)
-                                in-range? (fn [node] (intersects-range? node range-set))
-                                leaf-ch   (tree-chan r root st en in-range? prefetch-n (filter resolved-leaf?) error-ch)]
-                            (loop [acc (transient [])]
-                              (if-let [leaf* (<! leaf-ch)]
-                                (let [matches (leaf-subrange (:flakes leaf*) lookup->range lk0)]
-                                  (recur (if (seq matches)
-                                           (reduce conj! acc matches)
-                                           acc)))
-                                (let [matches (persistent! acc)]
+                        (loop [lks batch]
+                          (when-let [lk (first lks)]
+                            (let [[st en] (lookup->range lk)]
+                              (if (and rhs (pos? (cmp en rhs)))
+                                (let [range-set (flake/sorted-set-by cmp st en)
+                                      in-range? (fn [node] (intersects-range? node range-set))
+                                      leaf-ch   (tree-chan r root st en in-range? prefetch-n (filter resolved-leaf?) error-ch)
+                                      matches   (loop [acc (transient [])]
+                                                  (if-let [leaf* (<! leaf-ch)]
+                                                    (let [ms (leaf-subrange (:flakes leaf*) lookup->range lk)]
+                                                      (recur (if (seq ms) (reduce conj! acc ms) acc)))
+                                                    (persistent! acc)))]
                                   (when (seq matches)
-                                    (>! out [lk0 matches])))))
-                            (recur (inc i)))
-                          (do
-                            (doseq [lk batch]
-                              (let [[st en] (lookup->range lk)]
-                                (if (and rhs (pos? (cmp en rhs)))
-                                  ;; Range spans beyond this leaf; walk leaves in range.
-                                  (let [range-set (flake/sorted-set-by cmp st en)
-                                        in-range? (fn [node] (intersects-range? node range-set))
-                                        leaf-ch   (tree-chan r root st en in-range? prefetch-n (filter resolved-leaf?) error-ch)]
-                                    (loop [acc (transient [])]
-                                      (if-let [leaf* (<! leaf-ch)]
-                                        (let [matches (leaf-subrange (:flakes leaf*) lookup->range lk)]
-                                          (recur (if (seq matches)
-                                                   (reduce conj! acc matches)
-                                                   acc)))
-                                        (let [matches (persistent! acc)]
-                                          (when (seq matches)
-                                            (>! out [lk matches]))))))
-                                  ;; Entire range is within this leaf.
-                                  (let [matches (flake/subrange leaf-flakes >= st <= en)]
-                                    (when (seq matches)
-                                      (>! out [lk matches]))))))
-                            (recur j)))))))))
-            ::done)]
-      (go
-        (let [res (<! done-ch)]
-          (when (util/exception? res)
-            (log/error res "batched-prefix-range-lookup failed")
-            (>! error-ch res)
-            (async/close! out))))
-      out)))
+                                    (>! out [lk matches])))
+                                (let [matches (flake/subrange leaf-flakes >= st <= en)]
+                                  (when (seq matches)
+                                    (>! out [lk matches])))))
+                            (recur (rest lks))))
+                        (recur j)))))))))
+        (catch* e
+          (log/error e "batched-prefix-range-lookup failed")
+          (>! error-ch e))
+        (finally
+          (async/close! out))))
+    out))

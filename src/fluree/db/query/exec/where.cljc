@@ -75,14 +75,17 @@
   (and (map? ds)
        (contains? ds :db-chan)))
 
-(defn- emit-solutions!
-  "Drain `sol-ch` (a channel of solutions) into `out-ch`."
-  [sol-ch out-ch]
+(defn- pipe-solutions!
+  "Pipe all values from `src-ch` to `dest-ch`. Returns a channel that yields
+  ::done when `src-ch` closes."
+  [src-ch dest-ch]
   (go
     (loop []
-      (when-let [sol (async/<! sol-ch)]
-        (>! out-ch sol)
-        (recur)))))
+      (if-let [v (async/<! src-ch)]
+        (do
+          (>! dest-ch v)
+          (recur))
+        ::done))))
 
 (def unmatched
   {})
@@ -765,18 +768,31 @@
       {:sid->solutions (persistent! sid->sol)
        :fallback       (persistent! fallback)})))
 
+(defn- emit-solution-matches!
+  [ds tracker pattern error-ch out-ch solutions]
+  (go
+    (doseq [sol solutions]
+      (<? (pipe-solutions! (match-pattern ds tracker sol pattern error-ch) out-ch)))
+    ::done))
+
+(defn- emit-joined-solutions!
+  [bind-db pattern out-ch sols flakes]
+  (go
+    (let [tuple   (pattern-data pattern)
+          sol+tpl (mapv (fn [sol] [sol (assign-matched-values tuple sol)]) sols)]
+      (doseq [f flakes
+              [sol tuple*] sol+tpl]
+        (>! out-ch (match-flake sol tuple* bind-db f))))
+    ::done))
+
 (defn- process-batched-subject-join-batch!
   "Process a batch of incoming solutions and emit joined solutions to `out-ch`."
   [ds batch-db tracker pattern error-ch batch out-ch]
   (go
     (let [[s p _o] (pattern-data pattern)
           s-var    (get-variable s)
-          ;; `get-sid` / `match-sid` store SIDs under `(:alias db)`. Ensure we emit bindings
-          ;; under the same alias as the incoming solution stream.
           bind-db   (cond-> batch-db
                       (some? (:alias ds)) (assoc :alias (:alias ds)))
-          ;; IMPORTANT: predicate SIDs are not guaranteed to be precomputed at parse time.
-          ;; Mirror the normal matcher path which calls `compute-sids`/`compute-sid`.
           p*       (compute-sid p bind-db)
           p-sid    (or (get-sid p* bind-db) (get-value p*))
           {:keys [sid->solutions fallback]} (batch->sid->solutions bind-db s-var batch)]
@@ -784,10 +800,7 @@
       ;; Fallback for solutions without a bound subject SID.
       (when (seq fallback)
         (binding [*enable-batched-subject-joins?* false]
-          (loop [xs fallback]
-            (when-let [sol (first xs)]
-              (<? (emit-solutions! (match-pattern ds tracker sol pattern error-ch) out-ch))
-              (recur (rest xs))))))
+          (<? (emit-solution-matches! ds tracker pattern error-ch out-ch fallback))))
 
       (when (and p-sid (seq sid->solutions))
         (let [sids     (->> (keys sid->solutions) sort vec)
@@ -807,15 +820,7 @@
               (let [seen' (conj! seen sid)
                     sols  (get sid->solutions sid)]
                 (when (seq sols)
-                  ;; Join: apply each flake to each solution for that sid.
-                  ;; Important: use `assign-matched-values` so we don't re-bind already-bound vars.
-                  (let [tuple     (pattern-data pattern)
-                        sol+tpl   (mapv (fn [sol] [sol (assign-matched-values tuple sol)]) sols)]
-                    (loop [fs (seq flakes)]
-                      (when-let [f (first fs)]
-                        (doseq [[sol tuple*] sol+tpl]
-                          (>! out-ch (match-flake sol tuple* bind-db f)))
-                        (recur (rest fs))))))
+                  (<? (emit-joined-solutions! bind-db pattern out-ch sols flakes)))
                 (recur seen'))
               (let [seen*        (persistent! seen)
                     missing-sids (seq (remove seen* sids))]
@@ -823,12 +828,8 @@
                   (binding [*enable-batched-subject-joins?* false]
                     (loop [ms missing-sids]
                       (when-let [sid (first ms)]
-                        (when-let [sols (get sid->solutions sid)]
-                          (loop [xs sols]
-                            (when-let [sol (first xs)]
-                              (<? (emit-solutions! (match-pattern ds tracker sol pattern error-ch) out-ch))
-                              (recur (rest xs))))))
-                      (when (next ms)
+                        (when-let [sols (seq (get sid->solutions sid))]
+                          (<? (emit-solution-matches! ds tracker pattern error-ch out-ch sols)))
                         (recur (rest ms))))))))))))))
 
 (defn with-constraint
@@ -856,7 +857,7 @@
               (loop []
                 (if-let [solution (async/<! solution-ch)]
                   (do
-                    (<? (emit-solutions! (match-pattern ds tracker solution pattern error-ch) out-ch))
+                    (<? (pipe-solutions! (match-pattern ds tracker solution pattern error-ch) out-ch))
                     (recur))
                   (async/close! out-ch)))
               ;; Batch over incoming solutions. Solutions without a bound subject SID
