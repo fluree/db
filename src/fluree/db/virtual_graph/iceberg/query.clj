@@ -158,7 +158,9 @@
         ;; Extract pattern infos - this may return vectors for :optional patterns
         raw-pattern-infos (map extract-pattern-info patterns)
         ;; Flatten any nested vectors from :optional expansion
-        pattern-infos (mapcat #(if (sequential? (first %)) % [%]) raw-pattern-infos)
+        ;; NOTE: :optional patterns return a vector of info maps, regular patterns return a single map
+        ;; We check if the element is a vector (from :optional) to flatten it
+        pattern-infos (mapcat #(if (vector? %) % [%]) raw-pattern-infos)
         ;; Filter out UNION patterns (they're handled separately)
         non-union-infos (remove :union-pattern? pattern-infos)
 
@@ -477,10 +479,18 @@
                 ;; solution-get-column-value handles symbol/string lookup
                 column (if is-count-star?
                          nil  ;; Only nil for COUNT(*)
-                         (or mapped-column var-name))]
+                         (or mapped-column var-name))
+                ;; Build a descriptive default alias for bare aggregates without (as ...)
+                ;; SPARQL spec requires aliases for aggregates in SELECT, so bare aggregates
+                ;; indicate the translator didn't wrap properly. Use descriptive default.
+                default-alias (if is-count-star?
+                                (str fn-name)  ;; "count" for COUNT(*)
+                                (str fn-name "_" (or var-name "val")))]  ;; "count_country" for COUNT(?country)
+            ;; Note: Bare aggregates without (as ...) are technically invalid SPARQL.
+            ;; The translator should always produce (as (count ?x) ?alias) forms.
             {:fn fn-keyword
              :column column
-             :alias (str fn-name "_result")
+             :alias default-alias
              :var var-arg
              :var-name var-name})
 
