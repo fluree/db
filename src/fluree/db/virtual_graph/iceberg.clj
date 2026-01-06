@@ -1065,7 +1065,10 @@
         rest-catalog? (= catalog-type :rest)
 
         _ (when-not (or warehouse-path store rest-catalog?)
-            (throw (ex-info "Iceberg virtual graph requires :warehouse-path, :store, or REST :catalog"
+            (throw (ex-info "Iceberg virtual graph requires :warehouse-path or :store (REST catalog mode also requires :store)"
+                            {:error :db/invalid-config :config config})))
+        _ (when (and rest-catalog? (nil? store))
+            (throw (ex-info "Iceberg virtual graph REST :catalog requires :store (S3Store, FileStore, etc.)"
                             {:error :db/invalid-config :config config})))
 
         ;; Get mapping
@@ -1097,10 +1100,8 @@
                            (= catalog-type :rest)
                            #(iceberg/create-rest-iceberg-source
                              {:uri (or (:uri catalog) (get catalog "uri"))
-                              :warehouse (or (:warehouse catalog) (get catalog "warehouse"))
-                              :auth-token (or (:auth-token catalog) (get catalog "auth-token"))
-                              :headers (or (:headers catalog) (get catalog "headers"))
-                              :properties (or (:properties catalog) (get catalog "properties"))})
+                              :store store
+                              :auth-token (or (:auth-token catalog) (get catalog "auth-token"))})
 
                            :else
                            #(iceberg/create-iceberg-source

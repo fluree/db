@@ -1,55 +1,58 @@
 # Iceberg Virtual Graph Integration
 
-Fluree supports querying Apache Iceberg tables directly via SPARQL using virtual graphs. This integration provides high-performance access to columnar data lakes with predicate pushdown, column projection, and time-travel capabilities.
+Fluree supports querying Apache Iceberg tables via SPARQL using **Iceberg virtual graphs** (VGs) plus a **subset of R2RML** for mapping Iceberg columns to RDF terms.
+
+For implementation details and roadmap, see `docs/ICEBERG_SPARQL_STRATEGY.md` and `docs/ICEBERG_R2RML_SUPPORT_GAPS.md`.
 
 ## Table of Contents
 
 - [Overview](#overview)
 - [Current Status](#current-status)
-- [Architecture](#architecture)
-- [Performance](#performance)
-- [SPARQL Query Examples](#sparql-query-examples)
+- [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [R2RML Mappings](#r2rml-mappings)
+- [SPARQL Query Examples](#sparql-query-examples)
+- [Predicate Pushdown](#predicate-pushdown)
+- [Time-Travel Queries](#time-travel-queries)
+- [Multi-Table Joins](#multi-table-joins)
+- [Performance](#performance)
 - [API Reference](#api-reference)
+- [Troubleshooting](#troubleshooting)
 
 ## Overview
 
 The Iceberg virtual graph integration allows you to:
 
 - Query Iceberg tables using standard SPARQL syntax
-- Join Iceberg data with Fluree's native graph data
 - Push predicates down to the Iceberg layer for efficient filtering
 - Project only needed columns to minimize I/O
 - Perform time-travel queries using Iceberg snapshots
+- Join multiple Iceberg tables (when your R2RML mapping defines RefObjectMap join edges and your SPARQL query traverses them)
+- Execute OPTIONAL patterns with left outer join semantics (see limitations below)
+
+### Requirements / Scope
+
+- **JVM only**: Iceberg VGs require JVM Iceberg/Arrow deps.
+- **R2RML is a mapping layer, not a SQL engine**: Iceberg VGs support `rr:tableName` logical tables; `rr:sqlQuery` is not supported.
+- **RDF term modeling is limited**: the Iceberg R2RML subset currently focuses on subject IRI templates + column-to-literal mappings + RefObjectMap joins.
 
 ## Current Status
 
-**Phase 2: Correctness-First Implementation** (Current)
-
-The columnar execution path currently uses row-maps mode for correctness:
-
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Single-table queries | ✅ Working | Predicate filtering correct |
-| Multi-table joins | ✅ Working | Hash joins with cardinality estimation |
-| Predicate pushdown | ✅ Working | File/row-group pruning + row-level filtering |
-| Column projection | ✅ Working | Only requested columns read |
-| Time travel | ✅ Working | Snapshot ID or timestamp |
-| True columnar execution | ⏳ Phase 3b | See [Development Roadmap](#development-roadmap) |
+| Single-table queries | ✅ Complete | Full predicate pushdown |
+| Multi-table joins | ✅ Complete | Hash joins when the query traverses RefObjectMap edges |
+| Predicate pushdown | ✅ Complete | File/row-group pruning + row-level filtering |
+| Column projection | ✅ Complete | Only requested columns read |
+| Time travel | ✅ Complete | Snapshot ID or timestamp |
+| VALUES clause pushdown | ✅ Complete | Converted to IN predicates |
+| FILTER comparison pushdown | ✅ Complete | `=`, `!=`, `>`, `>=`, `<`, `<=` |
+| OPTIONAL patterns | ✅ Complete | Left outer join semantics |
+| Vectorized execution | ⚠️ Experimental | Columnar plan exists, but disabled by default |
+| Aggregations (GROUP BY) | ✅ Supported (no pushdown) | Executed by the SPARQL engine after VG results are produced |
+| UNION patterns | ⚠️ Partial | UNION-only queries work; UNION mixed with other patterns is currently combined via cross product |
 
-### Why Row-Maps Mode?
-
-Arrow vectorized reads from Iceberg only perform **file/row-group level pruning** based on column statistics. They do **not** perform row-level filtering. Additionally, `VectorSchemaRoot` objects from `ColumnarBatch.createVectorSchemaRootFromVectors()` share memory with the underlying batch, which gets reused when the iterator advances.
-
-For correctness, the current implementation:
-1. Uses `scan-batches` which applies row-level filtering internally
-2. Returns row maps that are safe to hold across iterator advances
-3. Converts to SPARQL solutions at the boundary
-
-## Architecture
-
-The integration consists of several layers:
+### Architecture
 
 ```
 SPARQL Query
@@ -57,17 +60,17 @@ SPARQL Query
      ▼
 ┌─────────────────────────────────────┐
 │  Virtual Graph Query Executor       │
-│  - Pattern routing                  │
+│  - Pattern routing by predicate     │
 │  - Predicate extraction             │
 │  - Solution transformation          │
 └─────────────────────────────────────┘
      │
      ▼
 ┌─────────────────────────────────────┐
-│  Plan Compiler (Phase 3)            │
+│  Plan Compiler                      │
 │  - ScanOp (columnar or row-based)   │
 │  - HashJoinOp (multi-table joins)   │
-│  - FilterOp, ProjectOp              │
+│  - Left outer join for OPTIONAL     │
 └─────────────────────────────────────┘
      │
      ▼
@@ -88,52 +91,240 @@ SPARQL Query
 └─────────────────────────────────────┘
 ```
 
-### Execution Modes
+## Quick Start
 
-The integration supports two execution modes:
+### 1. Create an Iceberg virtual graph
 
-1. **Row Maps Mode** (default): Converts Arrow batches to Clojure maps for compatibility
-2. **Columnar Mode**: Returns raw Arrow `VectorSchemaRoot` batches for maximum performance
+Use `fluree.db.api/create-virtual-graph` to publish an Iceberg VG into the nameservice (loaded lazily on first query).
 
-## Performance
+#### Option A: Local development (HadoopTables) — simplest
 
-### Benchmark Results
+```clojure
+(require '[fluree.db.api :as fluree])
 
-Benchmarks run on the OpenFlights dataset (airlines: 6,162 rows, routes: 67,663 rows):
+(def conn @(fluree/connect-file {:storage-path "./data"}))
 
-#### Scan Method Comparison
+@(fluree/create-virtual-graph conn
+   {:name "openflights-vg"
+    :type :iceberg
+    :config {:warehouse-path "./dev-resources/iceberg/openflights"
+             :mapping "dev-resources/openflights/r2rml.ttl"}})
+```
 
-| Method | Time | Speedup |
-|--------|------|---------|
-| `scan-batches` (row maps) | 31.6 ms | baseline |
-| `scan-arrow-batches` (Arrow) | 10.5 ms | **3.02x** |
+#### Option B: REST catalog (recommended for production catalogs)
 
-#### ScanOp Execution Modes
+REST catalog mode currently requires a Fluree `store` for file reads (e.g. an `S3Store`):
 
-| Mode | Time | Speedup |
-|------|------|---------|
-| Row-maps mode | 17.6 ms | baseline |
-| Columnar mode | 9.5 ms | **1.85x** |
+```clojure
+(require '[fluree.db.api :as fluree]
+         '[fluree.db.storage.s3 :as s3])
 
-#### Column Projection
+(def conn @(fluree/connect-file {:storage-path "./data"}))
+(def store (s3/open "my-bucket" "my/prefix")) ;; uses AWS env vars for credentials
 
-| Columns | Time | Speedup |
-|---------|------|---------|
-| All 8 columns | 7.3 ms | baseline |
-| 2 columns (id, name) | 4.4 ms | **1.64x** |
+@(fluree/create-virtual-graph conn
+   {:name "analytics-vg"
+    :type :iceberg
+    :config {:store store
+             :catalog {:type :rest
+                       :uri "http://localhost:8181"
+                       :auth-token "optional-bearer-token"}
+             :mapping "path/to/mapping.ttl"}})
+```
 
-### Optimization Summary
+### (Advanced) Create an Iceberg Source directly
 
-| Optimization | Speedup | Applied When |
-|--------------|---------|--------------|
-| Raw Arrow batches | **3x** | Columnar execution enabled |
-| Column projection | **1.6x** | `SELECT ?specific ?columns` (not `SELECT *`) |
-| Predicate pushdown | **varies** | `FILTER` clauses, literal values in patterns |
-| Combined | **3-5x** | Queries using all optimizations |
+```clojure
+(require '[fluree.db.tabular.iceberg :as iceberg])
+
+;; Local development with Hadoop catalog
+(def source
+  (iceberg/create-iceberg-source
+    {:warehouse-path "/path/to/iceberg/warehouse"}))
+
+;; Production with REST catalog
+(def source
+  (iceberg/create-rest-iceberg-source
+    {:uri "http://localhost:8181"
+     :store my-s3-store
+     :auth-token "optional-bearer-token"}))
+```
+
+### 2. Define R2RML Mapping
+
+```turtle
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#AirlineMapping>
+    a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "openflights/airlines" ] ;
+    rr:subjectMap [
+        rr:template "http://example.org/airline/{id}" ;
+        rr:class ex:Airline
+    ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:name ;
+        rr:objectMap [ rr:column "name" ]
+    ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:country ;
+        rr:objectMap [ rr:column "country" ]
+    ] .
+```
+
+### 3. Query with SPARQL
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+SELECT ?name ?country
+FROM <openflights-vg>
+WHERE {
+  ?airline a ex:Airline ;
+           ex:name ?name ;
+           ex:country ?country .
+  FILTER(?country = "United States")
+}
+LIMIT 100
+```
+
+## Configuration
+
+### Factory Functions
+
+Three factory functions are available depending on your deployment:
+
+```clojure
+(require '[fluree.db.tabular.iceberg :as iceberg])
+
+;; 1. Hadoop-based (local filesystem, simple development)
+(def source
+  (iceberg/create-iceberg-source
+    {:warehouse-path "/path/to/warehouse"}))
+
+;; 2. REST catalog (cloud-agnostic, recommended for production)
+(def source
+  (iceberg/create-rest-iceberg-source
+    {:uri "http://localhost:8181"
+     :store my-s3-store
+     :auth-token "optional-bearer-token"}))
+
+;; 3. Fluree storage (uses existing Fluree store)
+(def source
+  (iceberg/create-fluree-iceberg-source
+    {:store my-fluree-store
+     :warehouse-path "s3://bucket/warehouse"}))
+```
+
+### Virtual Graph Configuration
+
+```clojure
+{:type :iceberg
+ :name "my-iceberg-vg"
+ :config {:warehouse-path "/path/to/iceberg/warehouse"
+          :mapping "path/to/mapping.ttl"}}
+```
+
+| Option | Description |
+|--------|-------------|
+| `:warehouse-path` | Path to Iceberg warehouse directory |
+| `:mapping` | Path to R2RML mapping file (TTL format) |
+| `:mappingInline` | Inline R2RML mapping (Turtle string or JSON-LD) |
+| `:store` | Fluree store for file reads (e.g., `S3Store`, `FileStore`) |
+| `:catalog` | REST catalog config, e.g. `{:type :rest :uri \"...\" :auth-token \"...\"}` |
+
+## R2RML Mappings
+
+R2RML mappings define how Iceberg table columns map to RDF predicates.
+
+### Basic Mapping
+
+```turtle
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#AirlineMapping>
+    a rr:TriplesMap ;
+
+    rr:logicalTable [
+        rr:tableName "openflights/airlines"
+    ] ;
+
+    rr:subjectMap [
+        rr:template "http://example.org/airline/{id}" ;
+        rr:class ex:Airline
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:name ;
+        rr:objectMap [ rr:column "name" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:country ;
+        rr:objectMap [ rr:column "country" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:iata ;
+        rr:objectMap [ rr:column "iata" ]
+    ] .
+```
+
+### Join Mappings (RefObjectMap)
+
+For multi-table queries, use `rr:parentTriplesMap` to define relationships:
+
+```turtle
+<#RouteMapping>
+    a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "openflights/routes" ] ;
+    rr:subjectMap [
+        rr:template "http://example.org/route/{id}" ;
+        rr:class ex:Route
+    ] ;
+
+    # Reference to airlines table via foreign key
+    rr:predicateObjectMap [
+        rr:predicate ex:operatedBy ;
+        rr:objectMap [
+            rr:parentTriplesMap <#AirlineMapping> ;
+            rr:joinCondition [
+                rr:child "airline_id" ;   # Column in routes table
+                rr:parent "id"            # Column in airlines table
+            ]
+        ]
+    ] ;
+
+    # Reference to airports table
+    rr:predicateObjectMap [
+        rr:predicate ex:sourceAirport ;
+        rr:objectMap [
+            rr:parentTriplesMap <#AirportMapping> ;
+            rr:joinCondition [
+                rr:child "src_id" ;
+                rr:parent "id"
+            ]
+        ]
+    ] .
+```
+
+### Mapping Elements Reference
+
+| Element | Description |
+|---------|-------------|
+| `rr:logicalTable` | Specifies the Iceberg table name |
+| `rr:subjectMap` | Defines how row IDs become RDF subject IRIs |
+| `rr:template` | URI template with `{column}` placeholders |
+| `rr:class` | RDF class for subjects |
+| `rr:predicateObjectMap` | Maps columns to RDF predicates |
+| `rr:parentTriplesMap` | References another mapping for joins |
+| `rr:joinCondition` | Defines join keys between tables |
 
 ## SPARQL Query Examples
 
-### Example 1: Simple Query with Column Projection
+### Basic Query with Column Projection
 
 ```sparql
 PREFIX ex: <http://example.org/>
@@ -147,10 +338,9 @@ WHERE {
 ```
 
 **Optimizations applied:**
-- Column projection: Only reads `name` and `country` columns (2 of 8)
-- Expected speedup: ~1.6x from projection alone
+- Column projection: Only reads `name` and `country` columns
 
-### Example 2: Filtered Query with Predicate Pushdown
+### Equality Filter with Predicate Pushdown
 
 ```sparql
 PREFIX ex: <http://example.org/>
@@ -166,11 +356,9 @@ WHERE {
 
 **Optimizations applied:**
 - Predicate pushdown: `country = "United States"` pushed to Iceberg
-- Column projection: Only reads `name`, `iata` columns
 - Row group pruning at Parquet level
-- Expected speedup: ~3x with columnar execution
 
-### Example 3: IN List Filter (from VALUES)
+### VALUES Clause (Recommended for IN-style queries)
 
 ```sparql
 PREFIX ex: <http://example.org/>
@@ -180,7 +368,6 @@ WHERE {
   ?airline a ex:Airline ;
            ex:name ?name ;
            ex:country ?country .
-
   VALUES ?country { "United States" "Canada" "Mexico" }
 }
 ```
@@ -188,9 +375,26 @@ WHERE {
 **Optimizations applied:**
 - VALUES clause converted to `IN` predicate
 - Pushed to Iceberg for row group pruning
-- Columnar batch processing for remaining rows
 
-### Example 4: Multi-Table Join Query
+### Range Filters
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+SELECT ?name ?altitude
+WHERE {
+  ?airport a ex:Airport ;
+           ex:name ?name ;
+           ex:altitude ?altitude .
+  FILTER (?altitude > 5000)
+}
+```
+
+**Optimizations applied:**
+- Range predicate pushed to Iceberg
+- Row group pruning based on column statistics
+
+### Multi-Table Join
 
 ```sparql
 PREFIX ex: <http://example.org/>
@@ -210,33 +414,29 @@ LIMIT 1000
 ```
 
 **Optimizations applied:**
-- Greedy join ordering based on cardinality estimation
-- Hash joins between routes → airlines → airports
+- Hash joins across tables when the query traverses RefObjectMap edges (FK predicate)
 - Column projection on all three tables
-- Arrow batch processing throughout pipeline
-- Expected speedup: ~3-5x combined
 
-### Example 5: Range Filter
+### OPTIONAL Patterns
 
 ```sparql
 PREFIX ex: <http://example.org/>
 
-SELECT ?name ?altitude
+SELECT ?name ?country
 WHERE {
-  ?airport a ex:Airport ;
-           ex:name ?name ;
-           ex:altitude ?altitude .
-
-  FILTER (?altitude > 5000)
+  ?airline a ex:Airline ;
+           ex:name ?name .
+  OPTIONAL {
+    ?airline ex:country ?country .
+  }
 }
 ```
 
 **Optimizations applied:**
-- Range predicate pushed to Iceberg
-- Row group pruning based on column statistics
-- Only matching row groups are read
+- Left outer join semantics for OPTIONAL
+- Airlines without country still returned with `?country` unbound
 
-### Example 6: Aggregate Query
+### Aggregate Query
 
 ```sparql
 PREFIX ex: <http://example.org/>
@@ -254,89 +454,163 @@ ORDER BY DESC(?count)
 **Optimizations applied:**
 - Equality predicate `active = "Y"` pushed down
 - Column projection: Only `country` and `active` columns
-- Aggregation performed on filtered results
 
-## Configuration
+## Predicate Pushdown
 
-### Creating an Iceberg Source
+The Iceberg integration automatically pushes predicates to the storage layer.
 
-Three factory functions are available:
+### What Gets Pushed Down
 
-```clojure
-(require '[fluree.db.tabular.iceberg :as iceberg])
+| Pattern Type | Pushed Down | Example |
+|--------------|-------------|---------|
+| Literal in triple | Yes | `?s ex:country "US"` |
+| VALUES clause | Yes | `VALUES ?x { "A" "B" }` |
+| FILTER equality | Yes | `FILTER(?x = "value")` |
+| FILTER comparison | Yes | `FILTER(?x > 100)` |
+| FILTER bound() | Yes | `FILTER(bound(?x))` |
 
-;; 1. Hadoop-based (local filesystem, simple)
-(def source
-  (iceberg/create-iceberg-source
-    {:warehouse-path "/path/to/warehouse"}))
+### Supported Predicate Operators
 
-;; 2. REST catalog (cloud-agnostic, recommended for production)
-(def source
-  (iceberg/create-rest-iceberg-source
-    {:uri "http://localhost:8181"
-     :store my-s3-store
-     :auth-token "optional-bearer-token"}))
+| Operation | Example | Description |
+|-----------|---------|-------------|
+| `:eq` | `{:op :eq :value 42}` | Equality |
+| `:ne` | `{:op :ne :value 42}` | Not equal |
+| `:gt` | `{:op :gt :value 0}` | Greater than |
+| `:gte` | `{:op :gte :value 0}` | Greater than or equal |
+| `:lt` | `{:op :lt :value 100}` | Less than |
+| `:lte` | `{:op :lte :value 100}` | Less than or equal |
+| `:in` | `{:op :in :value [1 2 3]}` | In list |
+| `:between` | `{:op :between :value [0 100]}` | Range (inclusive) |
+| `:is-null` | `{:op :is-null}` | Is null |
+| `:not-null` | `{:op :not-null}` | Is not null |
+| `:and` | `{:op :and :predicates [...]}` | Logical AND |
+| `:or` | `{:op :or :predicates [...]}` | Logical OR |
 
-;; 3. Fluree storage (uses existing Fluree store)
-(def source
-  (iceberg/create-fluree-iceberg-source
-    {:store my-fluree-store
-     :warehouse-path "s3://bucket/warehouse"}))
+### Verifying Pushdown
+
+Enable debug logging to see what predicates are pushed:
+
+```bash
+FLUREE_LOG_LEVEL=debug clojure -M:dev:iceberg ...
 ```
 
-### Enabling Columnar Execution
-
-```clojure
-(require '[fluree.db.virtual-graph.iceberg :as iceberg-vg])
-
-;; Enable columnar execution globally
-(binding [iceberg-vg/*columnar-execution* true]
-  ;; Queries in this scope use Arrow batches
-  (query db sparql-query))
-
-;; Or per-plan compilation
-(require '[fluree.db.virtual-graph.iceberg.plan :as plan])
-
-(plan/compile-plan sources pattern-groups join-graph stats time-travel
-                   {:use-arrow-batches? true})
+```
+DEBUG f.d.v.iceberg - Iceberg query: {:table "airlines", :predicates [{:op :eq, :column "country", :value "US"}], ...}
 ```
 
-## R2RML Mappings
+## Time-Travel Queries
 
-Virtual graphs use R2RML-style mappings to translate between RDF and tabular data:
+Iceberg's snapshot-based time-travel is supported via the virtual graph alias.
 
-```clojure
-{:table "openflights/airlines"
- :class "http://example.org/Airline"
- :subject-template "http://example.org/airline/{id}"
- :predicates
- {"http://example.org/name"
-  {:type :column :value "name" :datatype :string}
+### Query at Specific Time
 
-  "http://example.org/country"
-  {:type :column :value "country" :datatype :string}
-
-  "http://example.org/iata"
-  {:type :column :value "iata" :datatype :string}}}
+```sparql
+SELECT ?name
+FROM <openflights-vg@iso:2024-01-15T00:00:00Z>
+WHERE {
+  ?airline ex:name ?name .
+}
 ```
 
-### Join Mappings (for multi-table queries)
+### Query at Specific Snapshot
+
+```sparql
+SELECT ?name
+FROM <openflights-vg@t:12345678901234>
+WHERE {
+  ?airline ex:name ?name .
+}
+```
+
+### Alias Format
+
+```
+<name>@iso:<ISO-8601-timestamp>
+<name>@t:<snapshot-id>
+```
+
+## Multi-Table Joins
+
+A single Iceberg virtual graph can span multiple tables with different R2RML mappings.
+
+### Join Graph Construction
+
+At virtual graph creation, join relationships are extracted from R2RML RefObjectMaps:
 
 ```clojure
-{:table "openflights/routes"
- :class "http://example.org/Route"
- :subject-template "http://example.org/route/{airline_id}/{src_id}/{dst_id}"
- :predicates
- {"http://example.org/operatedBy"
-  {:type :ref
-   :parent-triples-map "<#AirlineMapping>"
-   :join-conditions [{:child "airline_id" :parent "id"}]}
-
-  "http://example.org/sourceAirport"
-  {:type :ref
-   :parent-triples-map "<#AirportMapping>"
-   :join-conditions [{:child "src_id" :parent "id"}]}}}
+;; Automatically extracted from R2RML
+{:edges [{:parent-table "airlines"
+          :child-table "routes"
+          :parent-columns ["id"]
+          :child-columns ["airline_id"]
+          :predicate-iri "http://example.org/operatedBy"}]
+ :tables #{"airlines" "routes" "airports"}}
 ```
+
+### Join Planning
+
+Queries automatically route to the correct tables and apply hash joins when the query traverses RefObjectMap edges:
+
+1. **Table Identification**: Patterns are grouped by which table they reference
+2. **Join Edge Traversal**: Joins are only applied when patterns use the FK predicate from the RefObjectMap
+3. **Hash Join Execution**: Hash joins with proper null handling for OPTIONAL
+
+### Example Multi-Table Query
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+SELECT ?airlineName ?airportName
+FROM <openflights-vg>
+WHERE {
+  ?airline a ex:Airline .
+  ?airline ex:name ?airlineName .
+  ?airport a ex:Airport .
+  ?airport ex:name ?airportName .
+}
+```
+
+## Performance
+
+### Benchmark Results
+
+Benchmarks run on the OpenFlights dataset (airlines: 6,162 rows, routes: 67,663 rows):
+
+#### Scan Method Comparison
+
+| Method | Time | Speedup |
+|--------|------|---------|
+| `scan-batches` (row maps) | 31.6 ms | baseline |
+| `scan-arrow-batches` (Arrow) | 10.5 ms | **3.02x** |
+
+#### Column Projection Impact
+
+| Columns | Time | Speedup |
+|---------|------|---------|
+| All 8 columns | 7.3 ms | baseline |
+| 2 columns (id, name) | 4.4 ms | **1.64x** |
+
+### Optimization Summary
+
+| Optimization | Speedup | Applied When |
+|--------------|---------|--------------|
+| Raw Arrow batches | **3x** | Columnar execution enabled |
+| Column projection | **1.6x** | `SELECT ?specific ?columns` (not `SELECT *`) |
+| Predicate pushdown | **varies** | `FILTER` clauses, literal values in patterns |
+| VALUES clause | **significant** | Multi-value equality filters |
+| Combined | **3-5x** | Queries using all optimizations |
+
+### Performance Tips
+
+1. **Use VALUES for multi-value filters**: VALUES clauses push predicates to Iceberg, while FILTER IN may not.
+
+2. **Filter on partition columns**: If your Iceberg table is partitioned, filtering on partition columns enables partition pruning.
+
+3. **Project only needed columns**: Only columns referenced in the query are read from Iceberg.
+
+4. **Use LIMIT**: LIMIT is applied by the SPARQL engine. Iceberg scan functions support an optional per-scan `:limit`, but the Iceberg VG does not currently push SPARQL LIMIT down to scans (and for joins, per-scan limits can be incorrect).
+
+5. **Prefer equality filters**: Equality predicates enable more aggressive row group pruning.
 
 ## API Reference
 
@@ -366,44 +640,35 @@ Virtual graphs use R2RML-style mappings to translate between RDF and tabular dat
 ### Scan Options
 
 ```clojure
-{:columns ["col1" "col2"]      ; Column projection (nil = all)
- :predicates [{:column "x"     ; Predicate pushdown
+{:columns [\"col1\" \"col2\"]      ; Column projection (nil = all)
+ :predicates [{:column \"x\"       ; Predicate pushdown
                :op :eq
                :value 42}]
- :snapshot-id 12345678         ; Time travel by snapshot
- :as-of-time #inst "2024-01-01" ; Time travel by timestamp
- :batch-size 4096              ; Rows per batch
- :limit 1000}                  ; Max rows to return
+ :snapshot-id 12345678            ; Time travel by snapshot
+ :as-of-time #inst \"2024-01-01\"  ; Time travel by timestamp
+ :batch-size 4096                 ; Rows per batch
+ :limit 1000                      ; Max rows to return
+ :copy-batches true}              ; Copy Arrow batches for safe holding
 ```
 
-### Supported Predicates
+### ITabularPlan Protocol (Plan Execution)
 
-| Operation | Example | Description |
-|-----------|---------|-------------|
-| `:eq` | `{:op :eq :value 42}` | Equality |
-| `:ne` | `{:op :ne :value 42}` | Not equal |
-| `:gt` | `{:op :gt :value 0}` | Greater than |
-| `:gte` | `{:op :gte :value 0}` | Greater than or equal |
-| `:lt` | `{:op :lt :value 100}` | Less than |
-| `:lte` | `{:op :lte :value 100}` | Less than or equal |
-| `:in` | `{:op :in :value [1 2 3]}` | In list |
-| `:between` | `{:op :between :value [0 100]}` | Range (inclusive) |
-| `:is-null` | `{:op :is-null}` | Is null |
-| `:not-null` | `{:op :not-null}` | Is not null |
-| `:and` | `{:op :and :predicates [...]}` | Logical AND |
-| `:or` | `{:op :or :predicates [...]}` | Logical OR |
-
-## Running Benchmarks
-
-```bash
-# Build OpenFlights test data
-make iceberg-openflights
-
-# Run benchmarks
-clojure -M:dev:iceberg -e \
-  "(require 'fluree.db.iceberg-columnar-benchmark) \
-   (fluree.db.iceberg-columnar-benchmark/run-benchmark)"
+```clojure
+(defprotocol ITabularPlan
+  (open! [this] "Initialize the plan operator.")
+  (next-batch! [this] "Produce the next batch of results.")
+  (close! [this] "Release all resources.")
+  (estimated-rows [this] "Return estimated output row count."))
 ```
+
+### Plan Operators
+
+| Operator | Purpose |
+|----------|---------|
+| `ScanOp` | Reads from ITabularSource with pushdown |
+| `HashJoinOp` | Columnar hash join (inner or left outer) |
+| `FilterOp` | Applies residual predicates |
+| `ProjectOp` | Column selection/renaming |
 
 ## Troubleshooting
 
@@ -422,3 +687,60 @@ Always fully consume lazy sequences from `scan-batches` and `scan-arrow-batches`
 ### GraalVM Native Image
 
 For native image builds, ensure Iceberg and Arrow classes are included in reflection config. See `graalvm/reflect-config.json`.
+
+### Common Issues
+
+| Issue | Solution |
+|-------|----------|
+| "Cannot resolve metadata for table" | Check warehouse-path and table name format |
+| Slow queries without pushdown | Verify predicates are using supported patterns |
+| Memory issues with large joins | Reduce batch-size, enable columnar execution |
+| Missing results with OPTIONAL | Check join orientation (probe=required side) |
+
+## Limitations and Future Work
+
+### Current Limitations
+
+1. **FILTER IN Pushdown**: Use VALUES clauses instead for better pushdown.
+
+2. **Multi-Variable VALUES**: VALUES clauses with multiple variables are not pushed down:
+   ```sparql
+   # Not pushed down:
+   VALUES (?country ?status) { ("US" "active") ("CA" "active") }
+   ```
+
+3. **Complex OPTIONAL Blocks**: Multi-table OPTIONAL blocks require careful handling:
+   ```sparql
+   # Simple case (works):
+   ?airline ex:name ?name .
+   OPTIONAL { ?airline ex:country ?country }
+
+   # Complex case (may need attention):
+   ?route ex:source ?src .
+   OPTIONAL {
+     ?route ex:airline ?airline .
+     ?airline ex:name ?airlineName .
+   }
+   ```
+
+4. **Aggregation Pushdown**: GROUP BY aggregations are computed client-side.
+
+### Future Work
+
+- [ ] GROUP BY aggregation pushdown
+- [ ] UNION pattern support
+- [ ] Statistics-based query planning improvements
+- [ ] Parallel execution for multi-table queries
+- [ ] Spill-to-disk for large joins
+
+## Running Benchmarks
+
+```bash
+# Build OpenFlights test data
+make iceberg-openflights
+
+# Run benchmarks
+clojure -M:dev:iceberg -e \
+  "(require 'fluree.db.iceberg-columnar-benchmark) \
+   (fluree.db.iceberg-columnar-benchmark/run-benchmark)"
+```
