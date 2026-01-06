@@ -108,14 +108,17 @@
               (throw (ex-info (str "Cannot resolve metadata for table: " table-name)
                               {:table table-name :uri uri})))
           ^Table table (load-table-from-metadata file-io meta-loc table-name)]
-      (log/debug "FlureeRestIcebergSource scan-arrow-batches (raw):" {:table table-name
-                                                                      :metadata meta-loc
-                                                                      :batch-size batch-size})
-      (core/scan-raw-arrow-batches table {:columns columns
-                                          :predicates predicates
-                                          :snapshot-id snapshot-id
-                                          :as-of-time as-of-time
-                                          :batch-size batch-size})))
+      (log/debug "FlureeRestIcebergSource scan-arrow-batches (filtered):" {:table table-name
+                                                                           :metadata meta-loc
+                                                                           :batch-size batch-size
+                                                                           :predicates (count predicates)})
+      ;; Use filtered Arrow batches for correct row-level filtering
+      ;; Data is copied to avoid buffer reuse issues
+      (core/scan-filtered-arrow-batches table {:columns columns
+                                               :predicates predicates
+                                               :snapshot-id snapshot-id
+                                               :as-of-time as-of-time
+                                               :batch-size batch-size})))
 
   (scan-rows [this table-name opts]
     (proto/scan-batches this table-name opts))

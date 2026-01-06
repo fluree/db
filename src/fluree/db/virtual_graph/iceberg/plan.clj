@@ -303,6 +303,9 @@
           (loop []
             (when-let [batch (next-batch! build-child)]
               (build-from-batch! this batch)
+              ;; Close Arrow batch to release off-heap memory after extraction
+              (when (arrow-batch? batch)
+                (.close ^org.apache.arrow.vector.VectorSchemaRoot batch))
               (recur)))
           (swap! state assoc :build-complete? true)
           (let [{:keys [hash-table build-row-count]} @state]
@@ -310,7 +313,11 @@
                                                      :unique-keys (.size ^HashMap hash-table)})))
         ;; Phase 2: Probe with batches from probe side
         (when-let [probe-b (next-batch! probe-child)]
-          (probe-batch this probe-b)))))
+          (let [result (probe-batch this probe-b)]
+            ;; Close Arrow batch after probing
+            (when (arrow-batch? probe-b)
+              (.close ^org.apache.arrow.vector.VectorSchemaRoot probe-b))
+            result)))))
 
   (close! [this]
     (when (:opened? @state)
@@ -357,7 +364,7 @@
               (doseq [build-row build-rows]
                 (.add joined-rows (merge build-row probe-row)))))))
       (log/debug "HashJoinOp probe batch:" {:probe-rows row-count
-                                             :joined-rows (.size joined-rows)})
+                                            :joined-rows (.size joined-rows)})
       ;; Return joined rows as a vector of row maps
       (vec joined-rows))))
 
@@ -530,14 +537,18 @@
 ;;; ---------------------------------------------------------------------------
 
 (defn- batch->rows
-  "Convert a batch to row maps.
+  "Convert a batch to row maps and close Arrow batches to free off-heap memory.
    Handles three cases:
-   1. Arrow VectorSchemaRoot -> extract as row maps
+   1. Arrow VectorSchemaRoot -> extract as row maps, then close batch
    2. Single row map -> wrap in vector
    3. Vector of row maps (from join) -> pass through"
   [batch]
   (cond
-    (arrow-batch? batch) (batch->row-maps batch)
+    (arrow-batch? batch)
+    (let [rows (batch->row-maps batch)]
+      ;; Close Arrow batch to release off-heap memory
+      (.close ^org.apache.arrow.vector.VectorSchemaRoot batch)
+      rows)
     (map? batch) [batch]
     (vector? batch) batch
     (sequential? batch) (vec batch)

@@ -15,11 +15,13 @@
             [fluree.db.util.log :as log])
   (:import [java.nio ByteBuffer]
            [java.time Instant]
+           [org.apache.arrow.memory BufferAllocator RootAllocator]
            [org.apache.arrow.vector VectorSchemaRoot FieldVector
             BigIntVector IntVector Float4Vector Float8Vector
             VarCharVector BitVector]
+           [org.apache.arrow.vector.types.pojo Field Schema]
            [org.apache.iceberg DataFile ManifestFile ManifestFiles PartitionField
-            PartitionSpec Schema Snapshot Table TableScan]
+            PartitionSpec Snapshot Table TableScan]
            ;; Arrow imports for vectorized reads
            [org.apache.iceberg.arrow.vectorized ArrowReader ColumnarBatch]
            [org.apache.iceberg.data IcebergGenerics Record]
@@ -378,7 +380,7 @@
           :gte     (when v (>= (compare v value) 0))
           :lt      (when v (< (compare v value) 0))
           :lte     (when v (<= (compare v value) 0))
-          :in      (contains? (if (set? value) value (set value)) v)
+          :in      (contains? value v)  ;; value should be pre-normalized to set
           :between (when v
                      (and (>= (compare v (first value)) 0)
                           (<= (compare v (second value)) 0)))
@@ -394,6 +396,27 @@
   [vectors ^long idx pred]
   (vector-matches-predicate? vectors idx pred))
 
+(defn- normalize-predicate
+  "Pre-normalize a predicate for efficient evaluation.
+   - :in values become sets (O(1) lookup vs rebuilding per row)
+   - :between values become vectors
+   - :and/:or predicates recurse to normalize children"
+  [pred]
+  (let [{:keys [op value predicates]} pred]
+    (case op
+      :in (assoc pred :value (if (set? value) value (set value)))
+      :between (assoc pred :value (vec value))
+      :and (assoc pred :predicates (mapv normalize-predicate predicates))
+      :or (assoc pred :predicates (mapv normalize-predicate predicates))
+      ;; Other ops pass through unchanged
+      pred)))
+
+(defn- normalize-predicates
+  "Normalize all predicates once before filtering.
+   This avoids repeated allocations during per-row evaluation."
+  [predicates]
+  (mapv normalize-predicate predicates))
+
 (defn- find-matching-row-indices
   "Find row indices that match all predicates using columnar evaluation.
    Returns a vector of matching indices, avoiding conversion of non-matching rows.
@@ -401,7 +424,9 @@
    This is more efficient than converting all rows to maps then filtering because:
    1. Only extracts values from columns referenced in predicates
    2. Short-circuits on first failing predicate per row
-   3. Only matching rows will be fully converted to maps later"
+   3. Only matching rows will be fully converted to maps later
+
+   Predicates are normalized once (e.g., :in values -> sets) before evaluation."
   [^VectorSchemaRoot root predicates]
   (if (empty? predicates)
     ;; No predicates - return nil to signal 'all rows match'
@@ -410,12 +435,14 @@
     (let [vectors (into {}
                         (for [^FieldVector v (.getFieldVectors root)]
                           [(.getName (.getField v)) v]))
-          row-count (.getRowCount root)]
+          row-count (.getRowCount root)
+          ;; Normalize predicates once (convert :in to sets, etc.)
+          normalized-preds (normalize-predicates predicates)]
       ;; For each row, check all predicates (AND semantics, short-circuit on failure)
       (persistent!
        (reduce
         (fn [matches ^long i]
-          (if (every? #(row-matches-predicate-columnar? vectors i %) predicates)
+          (if (every? #(row-matches-predicate-columnar? vectors i %) normalized-preds)
             (conj! matches i)
             matches))
         (transient [])
@@ -450,6 +477,207 @@
       (map #(extract-row-at-index field-vectors column-names %) matching-indices)
       ;; No predicates - convert all rows
       (batch->row-maps root))))
+
+;;; ---------------------------------------------------------------------------
+;;; Filtered Arrow Batch Creation (for true columnar execution)
+;;; ---------------------------------------------------------------------------
+;;
+;; These functions support Phase 3b columnar execution by creating new
+;; VectorSchemaRoot batches containing only filtered rows. The data is
+;; copied to avoid buffer reuse issues from the underlying ColumnarBatch.
+
+(def ^:private ^BufferAllocator shared-allocator
+  "Shared Arrow allocator for creating filtered batches.
+   Uses a RootAllocator with default settings."
+  (delay (RootAllocator.)))
+
+(defn- copy-vector-value!
+  "Copy a single value from source vector at src-idx to dest vector at dest-idx.
+   Handles null values correctly. Uses setSafe for variable-length vectors
+   to handle automatic buffer expansion."
+  [^FieldVector src ^long src-idx ^FieldVector dest ^long dest-idx]
+  (if (.isNull src (int src-idx))
+    ;; Set null in destination
+    (.setNull dest (int dest-idx))
+    ;; Copy non-null value based on vector type
+    (condp instance? src
+      BigIntVector
+      (.set ^BigIntVector dest (int dest-idx)
+            (.get ^BigIntVector src (int src-idx)))
+
+      IntVector
+      (.set ^IntVector dest (int dest-idx)
+            (.get ^IntVector src (int src-idx)))
+
+      Float4Vector
+      (.set ^Float4Vector dest (int dest-idx)
+            (.get ^Float4Vector src (int src-idx)))
+
+      Float8Vector
+      (.set ^Float8Vector dest (int dest-idx)
+            (.get ^Float8Vector src (int src-idx)))
+
+      VarCharVector
+      ;; Use setSafe for variable-length vectors to handle auto buffer expansion
+      (let [bytes (.get ^VarCharVector src (int src-idx))]
+        (.setSafe ^VarCharVector dest (int dest-idx) ^bytes bytes))
+
+      BitVector
+      (.set ^BitVector dest (int dest-idx)
+            (.get ^BitVector src (int src-idx)))
+
+      ;; Fallback: use setSafe with object (may be slower)
+      (.setSafe dest (int dest-idx) (.getObject src (int src-idx))))))
+
+(defn- allocate-vector!
+  "Allocate space in a destination vector. Uses type-specific allocation
+   to properly handle fixed-width vs variable-width vectors."
+  [^FieldVector dest num-rows]
+  (condp instance? dest
+    ;; Fixed-width vectors use allocateNew(valueCount)
+    BigIntVector (.allocateNew ^BigIntVector dest (int num-rows))
+    IntVector (.allocateNew ^IntVector dest (int num-rows))
+    Float4Vector (.allocateNew ^Float4Vector dest (int num-rows))
+    Float8Vector (.allocateNew ^Float8Vector dest (int num-rows))
+    BitVector (.allocateNew ^BitVector dest (int num-rows))
+    ;; Variable-width: estimate 32 bytes average per string, let setSafe grow if needed
+    VarCharVector (.allocateNew ^VarCharVector dest (* 32 num-rows) (int num-rows))
+    ;; Fallback: use setInitialCapacity and allocateNew
+    (do
+      (.setInitialCapacity dest (int num-rows))
+      (.allocateNew dest))))
+
+(defn- create-vector-copy
+  "Create a new vector of the same type with values at specified indices copied.
+   Uses the shared allocator for memory allocation."
+  [^FieldVector src-vector indices ^BufferAllocator allocator]
+  (let [^Field field (.getField src-vector)
+        ^FieldVector dest-vector (.createVector field allocator)
+        num-rows (count indices)]
+    ;; Use type-specific allocation
+    (allocate-vector! dest-vector num-rows)
+    ;; Copy values at specified indices
+    (doseq [[dest-idx src-idx] (map-indexed vector indices)]
+      (copy-vector-value! src-vector src-idx dest-vector dest-idx))
+    ;; Set the value count
+    (.setValueCount dest-vector num-rows)
+    dest-vector))
+
+(defn create-filtered-arrow-batch
+  "Create a new VectorSchemaRoot containing only rows at specified indices.
+
+   This function copies data from the source batch to a new batch, avoiding
+   buffer reuse issues. The returned batch owns its data and is safe to hold
+   beyond the lifetime of the source batch.
+
+   Args:
+     source-batch - VectorSchemaRoot to filter
+     indices      - Vector of row indices to include (nil = all rows)
+
+   Returns:
+     New VectorSchemaRoot with copied data for specified rows.
+     Caller is responsible for closing this batch when done."
+  [^VectorSchemaRoot source-batch indices]
+  (if (nil? indices)
+    ;; No filtering - copy all rows
+    (let [allocator @shared-allocator
+          field-vectors (.getFieldVectors source-batch)
+          all-indices (vec (range (.getRowCount source-batch)))
+          new-vectors (mapv #(create-vector-copy % all-indices allocator) field-vectors)
+          ^VectorSchemaRoot root (VectorSchemaRoot. ^java.util.List new-vectors)]
+      ;; Explicitly set row count to ensure it's correct
+      (.setRowCount root (count all-indices))
+      root)
+    ;; Copy only specified indices
+    (let [allocator @shared-allocator
+          field-vectors (.getFieldVectors source-batch)
+          new-vectors (mapv #(create-vector-copy % indices allocator) field-vectors)
+          ^VectorSchemaRoot root (VectorSchemaRoot. ^java.util.List new-vectors)]
+      ;; Explicitly set row count to ensure it's correct
+      (.setRowCount root (count indices))
+      root)))
+
+(defn filter-arrow-batch
+  "Apply predicates to an Arrow batch and return a filtered copy.
+
+   Uses vectorized predicate evaluation to find matching rows, then
+   copies only those rows to a new batch.
+
+   Args:
+     batch       - VectorSchemaRoot to filter
+     predicates  - Seq of predicate maps for filtering
+     copy-batch? - If true (default), copy data to new batch.
+                   If false and no predicates, return original batch.
+                   WARNING: When false, batch is only valid until iterator advances.
+
+   Returns:
+     VectorSchemaRoot with matching rows.
+     Returns nil if no rows match.
+     Caller is responsible for closing the returned batch (if copied)."
+  ([^VectorSchemaRoot batch predicates]
+   (filter-arrow-batch batch predicates true))
+  ([^VectorSchemaRoot batch predicates copy-batch?]
+   (let [matching-indices (find-matching-row-indices batch predicates)]
+     (cond
+       ;; No predicates - return all rows
+       (nil? matching-indices)
+       (if copy-batch?
+         (create-filtered-arrow-batch batch nil)
+         batch)  ;; Return original (caller must consume before next iteration)
+
+       ;; No matching rows
+       (empty? matching-indices)
+       nil
+
+       ;; Create filtered batch with matching rows (always copy when filtering)
+       :else
+       (create-filtered-arrow-batch batch matching-indices)))))
+
+(defn arrow-filtered-batch-lazy-seq
+  "Create lazy seq of filtered Arrow VectorSchemaRoot from ArrowReader iterator.
+
+   Each batch has predicates applied via vectorized evaluation, and only
+   matching rows are copied to a new batch. The returned batches own their
+   data and are safe to hold.
+
+   Args:
+     iter        - CloseableIterator of ColumnarBatch
+     closeable   - Resource to close when done
+     predicates  - Predicates for filtering
+     copy-batch? - If true, copy batches for safety. If false and no predicates,
+                   return raw batches (only valid until next iteration).
+
+   IMPORTANT: Resources are closed when:
+   - The seq is fully consumed
+   - An exception occurs
+
+   Callers should fully consume or use doall to realize."
+  ([^java.util.Iterator iter ^java.io.Closeable closeable predicates]
+   (arrow-filtered-batch-lazy-seq iter closeable predicates true))
+  ([^java.util.Iterator iter ^java.io.Closeable closeable predicates copy-batch?]
+   (let [closed? (atom false)
+         close-all! (fn []
+                      (when (compare-and-set! closed? false true)
+                        (try
+                          (.close closeable)
+                          (catch Exception e
+                            (log/debug "Error closing ArrowReader:" (.getMessage e))))))]
+     (letfn [(batch-seq []
+               (lazy-seq
+                (if (.hasNext iter)
+                  (try
+                    (let [^ColumnarBatch batch (.next iter)
+                          ^VectorSchemaRoot root (.createVectorSchemaRootFromVectors batch)
+                          filtered-batch (filter-arrow-batch root predicates copy-batch?)]
+                      (if filtered-batch
+                        (cons filtered-batch (batch-seq))
+                        ;; No matching rows in this batch, continue to next
+                        (batch-seq)))
+                    (catch Exception e
+                      (close-all!)
+                      (throw e)))
+                  (do (close-all!) nil))))]
+       (batch-seq)))))
 
 (defn arrow-batch-lazy-seq
   "Create lazy seq of row maps from ArrowReader's CloseableIterator.
@@ -896,6 +1124,52 @@
       (let [scan-tasks (.planTasks scan)
             iter (.open reader scan-tasks)]
         (arrow-raw-batch-lazy-seq iter reader))
+      (catch Exception e
+        ;; Clean up reader if setup fails before lazy-seq takes ownership
+        (try (.close reader) (catch Exception _ nil))
+        (throw e)))))
+
+(defn scan-filtered-arrow-batches
+  "Execute an Iceberg table scan returning filtered Arrow VectorSchemaRoot batches.
+
+   Unlike scan-raw-arrow-batches, this applies row-level filtering using
+   vectorized predicate evaluation. The returned batches contain only matching
+   rows, with data copied to avoid buffer reuse issues.
+
+   This provides the best of both worlds:
+   - Vectorized predicate evaluation (fast filtering)
+   - Arrow batch output (no per-row map allocation)
+   - Safe batch lifetime (copied data, no buffer reuse issues)
+
+   Args:
+     table      - Iceberg Table instance
+     opts       - Scan options:
+       :columns      - seq of column names to project
+       :predicates   - seq of predicate maps for filtering
+       :snapshot-id  - specific snapshot for time travel
+       :as-of-time   - Instant for time travel
+       :batch-size   - rows per Arrow batch (default 4096)
+       :copy-batches - if true (default), copy batches for safety.
+                       If false and no predicates, return raw batches
+                       (only valid until next iteration - use for streaming).
+
+   Returns: lazy seq of org.apache.arrow.vector.VectorSchemaRoot (filtered)
+
+   Resource Safety:
+     When copy-batches is true (default), returned batches own their data
+     and are safe to hold beyond iteration.
+     The ArrowReader is closed when the seq is exhausted or on exception."
+  [^Table table {:keys [columns predicates snapshot-id as-of-time batch-size copy-batches]
+                 :or {batch-size 4096 copy-batches true}}]
+  (let [^TableScan scan (build-table-scan table {:columns columns
+                                                 :predicates predicates
+                                                 :snapshot-id snapshot-id
+                                                 :as-of-time as-of-time})
+        ^ArrowReader reader (ArrowReader. scan (int batch-size) false)]
+    (try
+      (let [scan-tasks (.planTasks scan)
+            iter (.open reader scan-tasks)]
+        (arrow-filtered-batch-lazy-seq iter reader predicates copy-batches))
       (catch Exception e
         ;; Clean up reader if setup fails before lazy-seq takes ownership
         (try (.close reader) (catch Exception _ nil))

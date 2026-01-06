@@ -462,10 +462,10 @@
    Uses ScanOp from the plan compiler to read batches, then converts to
    solutions at the boundary using R2RML mapping.
 
-   Note: Uses row-maps mode (not raw Arrow batches) because:
-   1. Arrow vectorized reads only do file/row-group pruning, not row filtering
-   2. Arrow VectorSchemaRoot from ColumnarBatch shares memory that gets reused
-   3. Row maps from scan-batches are safe to hold and already filtered"
+   Phase 3b: Uses true columnar execution with filtered Arrow batches:
+   1. Vectorized row-level filtering on Arrow vectors
+   2. Data copied to avoid buffer reuse issues
+   3. Arrow batches converted to solutions at boundary"
   [source mapping patterns base-solution time-travel predicates]
   (let [table-name (:table mapping)
         ;; Get all columns needed for this query
@@ -478,23 +478,23 @@
                           (when (= :column (:type obj-map))
                             (:value obj-map)))
                         (:predicates mapping))))
-        ;; Create scan plan - use row-maps mode for correctness
-        ;; Arrow batches have buffer reuse issues and no row-level filtering
+        ;; Create scan plan - use Arrow batches for columnar execution
+        ;; scan-arrow-batches now returns filtered, copied batches (safe to hold)
         scan-plan (plan/compile-single-table-plan
                    source table-name
                    (when (seq columns) (vec columns))
                    predicates time-travel
-                   {:use-arrow-batches? false})]  ;; Use row maps for correct filtering
+                   {:use-arrow-batches? true})]  ;; Phase 3b: true columnar execution
     (log/debug "Columnar single-table execution:" {:table table-name
                                                    :columns columns
                                                    :predicates (count predicates)
-                                                   :use-arrow-batches? false})
+                                                   :use-arrow-batches? true})
     ;; Execute plan and convert batches to solutions
     (try
       (plan/open! scan-plan)
       (loop [solutions []]
         (if-let [batch (plan/next-batch! scan-plan)]
-          ;; batch is a row map when use-arrow-batches? is false
+          ;; batch is VectorSchemaRoot when use-arrow-batches? is true
           (recur (into solutions (columnar-batch->solutions batch mapping patterns base-solution)))
           solutions))
       (finally
@@ -506,10 +506,10 @@
    Uses the plan compiler to create an operator tree with ScanOps
    and HashJoinOps.
 
-   Note: Uses row-maps mode (not raw Arrow batches) because:
-   1. Arrow vectorized reads only do file/row-group pruning, not row filtering
-   2. Arrow VectorSchemaRoot from ColumnarBatch shares memory that gets reused
-   3. Row maps from scan-batches are safe to hold and already filtered"
+   Phase 3b: Uses true columnar execution:
+   1. ScanOps use filtered Arrow batches (vectorized filtering, copied data)
+   2. HashJoinOp processes Arrow batches via dual-mode methods
+   3. HashJoinOp outputs merged row maps for solution creation"
   [sources pattern-groups base-solution time-travel predicates join-graph]
   (let [stats-by-table (get-table-statistics sources pattern-groups time-travel)
         ;; Add predicates to pattern groups
@@ -522,24 +522,28 @@
 
     (log/debug "Columnar multi-table execution:" {:tables (count pattern-groups)
                                                   :stats stats-by-table
-                                                  :use-arrow-batches? false})
+                                                  :use-arrow-batches? true})
 
-    ;; Compile the plan - use row-maps mode for correct filtering
+    ;; Compile the plan - use Arrow batches for columnar execution
+    ;; scan-arrow-batches now returns filtered, copied batches (safe to hold)
     (if-let [root-plan (plan/compile-plan sources groups-with-predicates
                                           join-graph stats-by-table time-travel
-                                          {:use-arrow-batches? false})]
+                                          {:use-arrow-batches? true})]
       (try
         (plan/open! root-plan)
         (loop [solutions []]
           (if-let [batch (plan/next-batch! root-plan)]
             ;; batch can be:
-            ;; 1. A single row map (from ScanOp in row-maps mode)
+            ;; 1. VectorSchemaRoot (from ScanOp in Arrow mode, single table)
             ;; 2. A vector of row maps (from HashJoinOp after join)
+            ;; 3. A single row map (edge case)
             (let [row-maps (cond
-                            (map? batch) [batch]
-                            (vector? batch) batch
-                            (sequential? batch) (vec batch)
-                            :else [])]
+                             (instance? org.apache.arrow.vector.VectorSchemaRoot batch)
+                             (plan/batch->row-maps batch)
+                             (map? batch) [batch]
+                             (vector? batch) batch
+                             (sequential? batch) (vec batch)
+                             :else [])]
               (recur (into solutions
                            (map #(merge base-solution %) row-maps))))
             solutions))
