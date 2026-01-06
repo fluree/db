@@ -28,6 +28,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.optimize :as optimize]
             [fluree.db.tabular.iceberg :as iceberg]
+            [fluree.db.tabular.iceberg.core :as iceberg-core]
             [fluree.db.tabular.protocol :as tabular]
             [fluree.db.util.async :refer [empty-channel]]
             [fluree.db.util.ledger :as util.ledger]
@@ -417,21 +418,55 @@
   "Convert a batch of columnar data to SPARQL solutions.
 
    This is the boundary conversion from Arrow batches to solution maps.
-   Applies the R2RML mapping to convert raw column values to RDF terms."
-  [batch _mapping base-solution]
-  (let [row-maps (plan/batch->row-maps batch)]
-    ;; Convert each row map to a solution using the mapping
-    ;; For now, just merge with base-solution
-    (map (fn [row-map]
-           (merge base-solution row-map))
-         row-maps)))
+   Handles both Arrow VectorSchemaRoot batches (columnar mode) and
+   individual row maps (row-maps mode for backward compatibility).
+
+   When predicates are provided, applies row-level filtering after converting
+   from Arrow batches to row maps. This is necessary because Arrow vectorized
+   reads only perform file/row-group pruning based on statistics, not row-level
+   filtering.
+
+   Uses R2RML mapping to transform column values to proper RDF terms."
+  ([batch mapping patterns base-solution]
+   (columnar-batch->solutions batch mapping patterns base-solution nil))
+  ([batch mapping patterns base-solution predicates]
+   (let [pred->var (query/extract-predicate-bindings patterns)
+         subject-var (some query/extract-subject-variable patterns)
+         ;; Helper to filter row maps based on predicates
+         filter-rows (fn [rows]
+                       (if (seq predicates)
+                         (filter #(iceberg-core/row-matches-predicates? predicates %) rows)
+                         rows))]
+     (cond
+       ;; Arrow VectorSchemaRoot - convert to row maps, filter, then to solutions
+       (instance? org.apache.arrow.vector.VectorSchemaRoot batch)
+       (let [row-maps (plan/batch->row-maps batch)
+             filtered-rows (filter-rows row-maps)]
+         (map (fn [row-map]
+                (query/row->solution row-map mapping pred->var subject-var base-solution))
+              filtered-rows))
+
+       ;; Already a row map (from row-maps mode or legacy path)
+       (map? batch)
+       (let [rows (filter-rows [batch])]
+         (map #(query/row->solution % mapping pred->var subject-var base-solution) rows))
+
+       :else
+       (do
+         (log/warn "Unexpected batch type in columnar-batch->solutions:" (type batch))
+         [])))))
 
 (defn- execute-columnar-single-table
   "Execute a single-table query using columnar plan execution.
 
-   Uses ScanOp from the plan compiler to read Arrow batches,
-   then converts to solutions at the boundary."
-  [source mapping _patterns base-solution time-travel predicates]
+   Uses ScanOp from the plan compiler to read batches, then converts to
+   solutions at the boundary using R2RML mapping.
+
+   Note: Uses row-maps mode (not raw Arrow batches) because:
+   1. Arrow vectorized reads only do file/row-group pruning, not row filtering
+   2. Arrow VectorSchemaRoot from ColumnarBatch shares memory that gets reused
+   3. Row maps from scan-batches are safe to hold and already filtered"
+  [source mapping patterns base-solution time-travel predicates]
   (let [table-name (:table mapping)
         ;; Get all columns needed for this query
         columns (distinct
@@ -443,20 +478,24 @@
                           (when (= :column (:type obj-map))
                             (:value obj-map)))
                         (:predicates mapping))))
-        ;; Create scan plan
+        ;; Create scan plan - use row-maps mode for correctness
+        ;; Arrow batches have buffer reuse issues and no row-level filtering
         scan-plan (plan/compile-single-table-plan
                    source table-name
                    (when (seq columns) (vec columns))
-                   predicates time-travel)]
+                   predicates time-travel
+                   {:use-arrow-batches? false})]  ;; Use row maps for correct filtering
     (log/debug "Columnar single-table execution:" {:table table-name
                                                    :columns columns
-                                                   :predicates (count predicates)})
+                                                   :predicates (count predicates)
+                                                   :use-arrow-batches? false})
     ;; Execute plan and convert batches to solutions
     (try
       (plan/open! scan-plan)
       (loop [solutions []]
         (if-let [batch (plan/next-batch! scan-plan)]
-          (recur (into solutions (columnar-batch->solutions batch mapping base-solution)))
+          ;; batch is a row map when use-arrow-batches? is false
+          (recur (into solutions (columnar-batch->solutions batch mapping patterns base-solution)))
           solutions))
       (finally
         (plan/close! scan-plan)))))
@@ -465,10 +504,12 @@
   "Execute a multi-table query using columnar plan execution.
 
    Uses the plan compiler to create an operator tree with ScanOps
-   and HashJoinOps, executing entirely in columnar format.
+   and HashJoinOps.
 
-   Note: This is Phase 3 work-in-progress. Falls back to row-based
-   execution if columnar join is incomplete."
+   Note: Uses row-maps mode (not raw Arrow batches) because:
+   1. Arrow vectorized reads only do file/row-group pruning, not row filtering
+   2. Arrow VectorSchemaRoot from ColumnarBatch shares memory that gets reused
+   3. Row maps from scan-batches are safe to hold and already filtered"
   [sources pattern-groups base-solution time-travel predicates join-graph]
   (let [stats-by-table (get-table-statistics sources pattern-groups time-travel)
         ;; Add predicates to pattern groups
@@ -480,19 +521,21 @@
               pattern-groups)]
 
     (log/debug "Columnar multi-table execution:" {:tables (count pattern-groups)
-                                                  :stats stats-by-table})
+                                                  :stats stats-by-table
+                                                  :use-arrow-batches? false})
 
-    ;; Compile the plan
+    ;; Compile the plan - use row-maps mode for correct filtering
     (if-let [root-plan (plan/compile-plan sources groups-with-predicates
-                                          join-graph stats-by-table time-travel)]
+                                          join-graph stats-by-table time-travel
+                                          {:use-arrow-batches? false})]
       (try
         (plan/open! root-plan)
         (loop [solutions []]
           (if-let [batch (plan/next-batch! root-plan)]
-            ;; For now, just extract row maps - a full implementation
-            ;; would apply mappings to produce proper solutions
-            (recur (into solutions
-                         (map #(merge base-solution %) (plan/batch->row-maps batch))))
+            ;; batch is a row map when use-arrow-batches? is false
+            (let [row-maps (if (map? batch) [batch] [])]
+              (recur (into solutions
+                           (map #(merge base-solution %) row-maps))))
             solutions))
         (finally
           (plan/close! root-plan)))

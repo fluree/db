@@ -447,22 +447,30 @@
 ;;; ---------------------------------------------------------------------------
 
 (defn batch->row-maps
-  "Convert an Arrow batch to a lazy seq of row maps.
+  "Convert an Arrow batch to a vector of row maps.
+
+   IMPORTANT: This function is EAGER (not lazy) because Arrow buffers may be
+   reused after the batch is consumed. The data must be extracted immediately
+   while the batch is still valid.
 
    Args:
      batch - Arrow VectorSchemaRoot
 
-   Returns lazy seq of {column-name -> value} maps."
+   Returns vector of {column-name -> value} maps."
   [^org.apache.arrow.vector.VectorSchemaRoot batch]
   (let [row-count (.getRowCount batch)
-        field-vectors (.getFieldVectors batch)]
-    (for [i (range row-count)]
-      (into {}
-            (for [^org.apache.arrow.vector.FieldVector fv field-vectors
-                  :let [col-name (.getName (.getField fv))
-                        value (get-vector-value fv i)]
-                  :when (some? value)]
-              [col-name value])))))
+        field-vectors (.getFieldVectors batch)
+        col-names (mapv #(.getName (.getField ^org.apache.arrow.vector.FieldVector %)) field-vectors)]
+    ;; Use mapv to eagerly realize all rows while the batch is still valid
+    (mapv (fn [i]
+            (into {}
+                  (keep-indexed
+                   (fn [col-idx ^org.apache.arrow.vector.FieldVector fv]
+                     (let [value (get-vector-value fv i)]
+                       (when (some? value)
+                         [(nth col-names col-idx) value])))
+                   field-vectors)))
+          (range row-count))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Plan Execution Helper
