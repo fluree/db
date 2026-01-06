@@ -237,3 +237,33 @@
       ;; Our mock uses :rows directly
       (is (= 2 (count (:rows batch))))
       (is (= {:id 1 :name "Test"} (first (:rows batch)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; HashJoinOp Arrow Output Tests
+;;; ---------------------------------------------------------------------------
+
+(deftest hash-join-output-arrow-option-test
+  (testing "HashJoinOp accepts :output-arrow? option"
+    (let [scan1 (plan/create-scan-op test-source "airlines" ["id" "name" "country"] [])
+          scan2 (plan/create-scan-op test-source "routes" ["route_id" "airline_id" "src" "dst"] [])
+          ;; Create join with :output-arrow? false (row maps output)
+          join-row-maps (plan/create-hash-join-op scan1 scan2 ["id"] ["airline_id"] {})
+          ;; Create join with :output-arrow? true (Arrow batch output)
+          join-arrow (plan/create-hash-join-op scan1 scan2 ["id"] ["airline_id"]
+                                               {:output-arrow? true})]
+      (is (satisfies? plan/ITabularPlan join-row-maps))
+      (is (satisfies? plan/ITabularPlan join-arrow))
+      ;; Both should have the output-arrow? field set correctly
+      (is (false? (:output-arrow? join-row-maps)))
+      (is (true? (:output-arrow? join-arrow)))))
+
+  (testing "compile-plan passes :output-arrow? to hash joins"
+    (let [join-graph (join/build-join-graph sample-mappings)
+          pattern-groups [{:mapping {:table "airlines"} :predicates []}
+                          {:mapping {:table "routes"} :predicates []}]
+          sources {"airlines" test-source "routes" test-source}
+          ;; Compile with :output-arrow? true
+          plan (plan/compile-plan sources pattern-groups join-graph sample-stats nil
+                                  {:output-arrow? true})]
+      (is (instance? fluree.db.virtual_graph.iceberg.plan.HashJoinOp plan))
+      (is (true? (:output-arrow? plan))))))
