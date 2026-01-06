@@ -532,8 +532,14 @@
         (plan/open! root-plan)
         (loop [solutions []]
           (if-let [batch (plan/next-batch! root-plan)]
-            ;; batch is a row map when use-arrow-batches? is false
-            (let [row-maps (if (map? batch) [batch] [])]
+            ;; batch can be:
+            ;; 1. A single row map (from ScanOp in row-maps mode)
+            ;; 2. A vector of row maps (from HashJoinOp after join)
+            (let [row-maps (cond
+                            (map? batch) [batch]
+                            (vector? batch) batch
+                            (sequential? batch) (vec batch)
+                            :else [])]
               (recur (into solutions
                            (map #(merge base-solution %) row-maps))))
             solutions))

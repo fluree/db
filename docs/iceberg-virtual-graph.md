@@ -5,6 +5,7 @@ Fluree supports querying Apache Iceberg tables directly via SPARQL using virtual
 ## Table of Contents
 
 - [Overview](#overview)
+- [Current Status](#current-status)
 - [Architecture](#architecture)
 - [Performance](#performance)
 - [SPARQL Query Examples](#sparql-query-examples)
@@ -21,6 +22,30 @@ The Iceberg virtual graph integration allows you to:
 - Push predicates down to the Iceberg layer for efficient filtering
 - Project only needed columns to minimize I/O
 - Perform time-travel queries using Iceberg snapshots
+
+## Current Status
+
+**Phase 2: Correctness-First Implementation** (Current)
+
+The columnar execution path currently uses row-maps mode for correctness:
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Single-table queries | ✅ Working | Predicate filtering correct |
+| Multi-table joins | ✅ Working | Hash joins with cardinality estimation |
+| Predicate pushdown | ✅ Working | File/row-group pruning + row-level filtering |
+| Column projection | ✅ Working | Only requested columns read |
+| Time travel | ✅ Working | Snapshot ID or timestamp |
+| True columnar execution | ⏳ Phase 3b | See [Development Roadmap](#development-roadmap) |
+
+### Why Row-Maps Mode?
+
+Arrow vectorized reads from Iceberg only perform **file/row-group level pruning** based on column statistics. They do **not** perform row-level filtering. Additionally, `VectorSchemaRoot` objects from `ColumnarBatch.createVectorSchemaRootFromVectors()` share memory with the underlying batch, which gets reused when the iterator advances.
+
+For correctness, the current implementation:
+1. Uses `scan-batches` which applies row-level filtering internally
+2. Returns row maps that are safe to hold across iterator advances
+3. Converts to SPARQL solutions at the boundary
 
 ## Architecture
 

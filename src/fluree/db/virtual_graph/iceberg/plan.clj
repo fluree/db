@@ -103,11 +103,13 @@
         ;; Default: try getObject
         (.getObject vector (int idx))))))
 
-(defn- extract-key-from-batch
-  "Extract join key values from a batch at the given row index.
-   For single-column keys, returns the value directly.
-   For composite keys, returns a vector of values.
-   Returns nil if any key column is null (null never matches)."
+(defn- arrow-batch?
+  "Check if batch is an Arrow VectorSchemaRoot (vs a row map)."
+  [batch]
+  (instance? org.apache.arrow.vector.VectorSchemaRoot batch))
+
+(defn- extract-key-from-arrow-batch
+  "Extract join key values from an Arrow batch at the given row index."
   [^org.apache.arrow.vector.VectorSchemaRoot batch key-columns ^long row-idx]
   (let [vals (mapv (fn [col-name]
                      (when-let [vector (.getVector batch ^String col-name)]
@@ -118,10 +120,62 @@
         (first vals)
         vals))))
 
+(defn- extract-key-from-row-map
+  "Extract join key values from a row map."
+  [row-map key-columns]
+  (let [vals (mapv #(get row-map %) key-columns)]
+    (when-not (some nil? vals)
+      (if (= 1 (count vals))
+        (first vals)
+        vals))))
+
+(defn- extract-key-from-batch
+  "Extract join key values from a batch at the given row index.
+   Handles both Arrow VectorSchemaRoot and row maps (dual-mode).
+   For single-column keys, returns the value directly.
+   For composite keys, returns a vector of values.
+   Returns nil if any key column is null (null never matches)."
+  ([batch key-columns]
+   ;; For row maps, no row-idx needed
+   (if (arrow-batch? batch)
+     (extract-key-from-arrow-batch batch key-columns 0)
+     (extract-key-from-row-map batch key-columns)))
+  ([batch key-columns row-idx]
+   (if (arrow-batch? batch)
+     (extract-key-from-arrow-batch batch key-columns row-idx)
+     ;; Row maps ignore row-idx (single row per "batch")
+     (extract-key-from-row-map batch key-columns))))
+
 (defn- batch-row-count
-  "Get the number of rows in a batch."
-  [^org.apache.arrow.vector.VectorSchemaRoot batch]
-  (.getRowCount batch))
+  "Get the number of rows in a batch.
+   Handles both Arrow VectorSchemaRoot and row maps (dual-mode)."
+  [batch]
+  (if (arrow-batch? batch)
+    (.getRowCount ^org.apache.arrow.vector.VectorSchemaRoot batch)
+    ;; Row map is a single row
+    1))
+
+(defn- extract-row-from-arrow-batch
+  "Extract a single row from an Arrow batch as a map."
+  [^org.apache.arrow.vector.VectorSchemaRoot batch ^long row-idx]
+  (into {}
+        (for [^org.apache.arrow.vector.FieldVector fv (.getFieldVectors batch)
+              :let [col-name (.getName (.getField fv))]]
+          [col-name (get-vector-value fv row-idx)])))
+
+(defn- extract-row-from-batch
+  "Extract a row from a batch as a map.
+   Handles both Arrow VectorSchemaRoot and row maps (dual-mode)."
+  ([batch]
+   (if (arrow-batch? batch)
+     (extract-row-from-arrow-batch batch 0)
+     ;; Row map is already a map
+     batch))
+  ([batch row-idx]
+   (if (arrow-batch? batch)
+     (extract-row-from-arrow-batch batch row-idx)
+     ;; Row map ignores row-idx
+     batch)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; ScanOp - Leaf Operator
@@ -274,39 +328,38 @@
 
   IColumnarHashJoin
   (build-from-batch! [_this batch]
+    ;; Dual-mode: handles both Arrow VectorSchemaRoot and row maps
     (let [^HashMap hash-table (:hash-table @state)
-          ^org.apache.arrow.vector.VectorSchemaRoot vsr batch
-          row-count (batch-row-count vsr)]
+          row-count (batch-row-count batch)]
       (dotimes [i row-count]
-        (when-let [key (extract-key-from-batch vsr build-keys i)]
-          ;; Store row index + batch reference (simplified - real impl would copy values)
+        (when-let [key (extract-key-from-batch batch build-keys i)]
+          ;; Store row data in hash table
           (let [^ArrayList rows (or (.get hash-table key)
                                     (let [al (ArrayList.)]
                                       (.put hash-table key al)
                                       al))
-                ;; Extract row data from batch columns
-                row-data (into {}
-                               (for [^org.apache.arrow.vector.FieldVector fv (.getFieldVectors vsr)
-                                     :let [col-name (.getName (.getField fv))]]
-                                 [col-name (get-vector-value fv i)]))]
+                ;; Extract row data - dual-mode handles both Arrow and row maps
+                row-data (extract-row-from-batch batch i)]
             (.add rows row-data)
             (swap! state update :build-row-count inc))))))
 
   (probe-batch [_this batch]
-    ;; For now, return the probe batch with matches
-    ;; A full implementation would produce a new batch with joined columns
-    ;; This is a placeholder that will be enhanced
+    ;; Dual-mode: handles both Arrow VectorSchemaRoot and row maps
+    ;; Returns joined rows as a seq of merged row maps
     (let [^HashMap hash-table (:hash-table @state)
           row-count (batch-row-count batch)
-          matches (atom 0)]
+          joined-rows (java.util.ArrayList.)]
       (dotimes [i row-count]
         (when-let [key (extract-key-from-batch batch probe-keys i)]
           (when-let [^ArrayList build-rows (.get hash-table key)]
-            (swap! matches + (.size build-rows)))))
-      (log/debug "HashJoinOp probe batch:" {:probe-rows row-count :matches @matches})
-      ;; TODO: Build proper output batch with joined columns
-      ;; For now, return probe batch as placeholder
-      batch)))
+            ;; For each matching build row, merge with probe row
+            (let [probe-row (extract-row-from-batch batch i)]
+              (doseq [build-row build-rows]
+                (.add joined-rows (merge build-row probe-row)))))))
+      (log/debug "HashJoinOp probe batch:" {:probe-rows row-count
+                                             :joined-rows (.size joined-rows)})
+      ;; Return joined rows as a vector of row maps
+      (vec joined-rows))))
 
 (defn create-hash-join-op
   "Create a hash join operator for joining two tabular plans.
@@ -476,6 +529,20 @@
 ;;; Plan Execution Helper
 ;;; ---------------------------------------------------------------------------
 
+(defn- batch->rows
+  "Convert a batch to row maps.
+   Handles three cases:
+   1. Arrow VectorSchemaRoot -> extract as row maps
+   2. Single row map -> wrap in vector
+   3. Vector of row maps (from join) -> pass through"
+  [batch]
+  (cond
+    (arrow-batch? batch) (batch->row-maps batch)
+    (map? batch) [batch]
+    (vector? batch) batch
+    (sequential? batch) (vec batch)
+    :else [batch]))
+
 (defn execute-plan
   "Execute a tabular plan, returning all row maps.
 
@@ -491,7 +558,7 @@
   (try
     (loop [rows []]
       (if-let [batch (next-batch! plan)]
-        (recur (into rows (batch->row-maps batch)))
+        (recur (into rows (batch->rows batch)))
         rows))
     (finally
       (close! plan))))
