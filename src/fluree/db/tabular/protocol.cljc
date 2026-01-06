@@ -38,11 +38,16 @@
      VectorSchemaRoot batches for use in vectorized execution pipelines.
 
      Options:
-       :columns     - seq of column names to project (nil = all)
-       :predicates  - seq of predicate maps (see Predicate Format)
-       :snapshot-id - specific snapshot ID for time travel
-       :as-of-time  - java.time.Instant for time travel
-       :batch-size  - rows per batch (default 4096)
+       :columns      - seq of column names to project (nil = all)
+       :predicates   - seq of predicate maps (see Predicate Format)
+       :snapshot-id  - specific snapshot ID for time travel
+       :as-of-time   - java.time.Instant for time travel
+       :batch-size   - rows per batch (default 4096)
+       :copy-batches - if true (default), copy data to ensure batches are safe
+                       to hold beyond iterator advancement. If false, batches
+                       share underlying buffers and are only valid until the
+                       next batch is requested. Use false for streaming where
+                       each batch is immediately consumed and discarded.
 
      Returns: lazy seq of org.apache.arrow.vector.VectorSchemaRoot batches.
               Use (.getRowCount batch) to get the number of rows in each batch.

@@ -182,7 +182,7 @@
 ;;; ---------------------------------------------------------------------------
 
 (defrecord ScanOp [source table-name columns predicates time-travel
-                   batch-size use-arrow-batches? state]
+                   batch-size use-arrow-batches? copy-batches? state]
   ;; state is an atom containing:
   ;; {:batch-iter nil :opened? false :row-count-estimate nil :mode :row-maps|:arrow}
   ITabularPlan
@@ -206,17 +206,31 @@
                         (:snapshot-id time-travel)
                         (assoc :snapshot-id (:snapshot-id time-travel))
                         (:as-of-time time-travel)
-                        (assoc :as-of-time (:as-of-time time-travel)))
+                        (assoc :as-of-time (:as-of-time time-travel))
+                        ;; Pass through copy-batches option (nil = default true)
+                        (some? copy-batches?)
+                        (assoc :copy-batches copy-batches?))
             batches (if use-arrow-batches?
                       ;; Use raw Arrow batches for columnar execution
                       ;; scan-arrow-batches returns VectorSchemaRoot directly
                       (tabular/scan-arrow-batches source table-name scan-opts)
                       ;; Use row maps (legacy behavior)
                       (tabular/scan-batches source table-name scan-opts))]
+        ;; Determine if batches are actually copied:
+        ;; - If not using Arrow batches, doesn't matter (row maps)
+        ;; - If copy-batches? is true (or nil/default), always copied
+        ;; - If copy-batches? is false AND no predicates, raw batches returned
+        ;; - If copy-batches? is false BUT predicates exist, filtering copies data
+        ;; CRITICAL: filter-arrow-batch always copies when predicates match rows,
+        ;; even when copy-batch? is false. Only when no predicates is original returned.
         (reset! state {:batch-iter (seq batches)
                        :opened? true
                        :row-count-estimate row-count-estimate
-                       :mode (if use-arrow-batches? :arrow :row-maps)})))
+                       :mode (if use-arrow-batches? :arrow :row-maps)
+                       ;; Track whether batches are copied (affects close behavior)
+                       :batches-copied? (or (not use-arrow-batches?)
+                                            (not (false? copy-batches?))
+                                            (seq predicates))})))
     this)
 
   (next-batch! [_this]
@@ -250,7 +264,12 @@
      :batch-size        - Rows per batch (default 4096)
      :use-arrow-batches? - If true, return raw Arrow VectorSchemaRoot batches.
                            If false (default), return row maps for backward
-                           compatibility. Set to true for columnar execution."
+                           compatibility. Set to true for columnar execution.
+     :copy-batches?     - If true (default), copy Arrow batches for safe holding.
+                          If false, batches share underlying buffers and are only
+                          valid until the next batch is requested. Use false for
+                          streaming consumption where batches are immediately
+                          processed and discarded."
   ([source table-name columns predicates]
    (create-scan-op source table-name columns predicates nil {}))
   ([source table-name columns predicates time-travel]
@@ -263,10 +282,26 @@
                  :time-travel time-travel
                  :batch-size (get opts :batch-size 4096)
                  :use-arrow-batches? (get opts :use-arrow-batches? false)
+                 :copy-batches? (get opts :copy-batches?)  ;; nil = use default (true)
                  :state (atom {:batch-iter nil
                                :opened? false
                                :row-count-estimate nil
                                :mode nil})})))
+
+(defn batches-copied?
+  "Check whether a plan's Arrow batches are safe to close.
+
+   For ScanOp: returns the :batches-copied? state (true if copy-batches? was true)
+   For other plans: returns true (default safe assumption)
+
+   Use this to decide whether to call .close on Arrow batches from this plan.
+   Non-copied batches share underlying buffers with the iterator and should
+   NOT be closed by the caller - the iterator manages their lifecycle."
+  [plan]
+  (if (instance? ScanOp plan)
+    (get @(:state plan) :batches-copied? true)
+    ;; Default: assume batches are copied and safe to close
+    true))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HashJoinOp - Columnar Hash Join
@@ -286,16 +321,22 @@
       ;; Estimate output rows using join cardinality estimation
       (let [build-rows (estimated-rows build-child)
             probe-rows (estimated-rows probe-child)
-            est-output (min (* build-rows probe-rows) (max build-rows probe-rows))]
+            est-output (min (* build-rows probe-rows) (max build-rows probe-rows))
+            ;; Check if batches are copied (determines if we should close them)
+            ;; Non-copied batches share buffers with iterator - don't close
+            close-build-batches? (batches-copied? build-child)
+            close-probe-batches? (batches-copied? probe-child)]
         (reset! state {:hash-table (HashMap.)
                        :build-complete? false
                        :opened? true
                        :build-row-count 0
-                       :estimated-output-rows est-output})))
+                       :estimated-output-rows est-output
+                       :close-build-batches? close-build-batches?
+                       :close-probe-batches? close-probe-batches?})))
     this)
 
   (next-batch! [this]
-    (let [{:keys [opened? build-complete?]} @state]
+    (let [{:keys [opened? build-complete? close-build-batches? close-probe-batches?]} @state]
       (when opened?
         ;; Phase 1: Build hash table from build side (if not done)
         (when-not build-complete?
@@ -303,8 +344,9 @@
           (loop []
             (when-let [batch (next-batch! build-child)]
               (build-from-batch! this batch)
-              ;; Close Arrow batch to release off-heap memory after extraction
-              (when (arrow-batch? batch)
+              ;; Only close build batch if it was copied (owns its memory)
+              ;; Non-copied batches share buffers with iterator - don't close
+              (when (and close-build-batches? (arrow-batch? batch))
                 (.close ^org.apache.arrow.vector.VectorSchemaRoot batch))
               (recur)))
           (swap! state assoc :build-complete? true)
@@ -314,8 +356,9 @@
         ;; Phase 2: Probe with batches from probe side
         (when-let [probe-b (next-batch! probe-child)]
           (let [result (probe-batch this probe-b)]
-            ;; Close Arrow batch after probing
-            (when (arrow-batch? probe-b)
+            ;; Only close probe batch if it was copied (owns its memory)
+            ;; Non-copied batches share buffers with iterator - don't close
+            (when (and close-probe-batches? (arrow-batch? probe-b))
               (.close ^org.apache.arrow.vector.VectorSchemaRoot probe-b))
             result)))))
 
@@ -610,8 +653,10 @@
      predicates        - Pushdown predicates for this table
      join-graph        - Join graph (for join column inclusion)
      time-travel       - Time travel spec
-     use-arrow-batches? - If true, use raw Arrow batches for columnar execution"
-  [sources mapping predicates join-graph time-travel use-arrow-batches?]
+     opts              - Options map:
+                         :use-arrow-batches? - If true, use raw Arrow batches
+                         :copy-batches?      - If false, don't copy batches (streaming)"
+  [sources mapping predicates join-graph time-travel opts]
   (let [table-name (:table mapping)
         source (get sources table-name)
         columns (collect-columns-for-table mapping predicates join-graph)]
@@ -620,7 +665,8 @@
                       {:table table-name
                        :available (keys sources)})))
     (create-scan-op source table-name columns predicates time-travel
-                    {:use-arrow-batches? use-arrow-batches?})))
+                    {:use-arrow-batches? (get opts :use-arrow-batches? false)
+                     :copy-batches? (get opts :copy-batches?)})))
 
 (defn- find-join-edge
   "Find the join edge connecting two tables, or nil if not connected."
@@ -648,6 +694,9 @@
      opts            - Options map:
                        :use-arrow-batches? - If true, use raw Arrow batches
                                              for columnar execution (default false)
+                       :copy-batches?      - If false, don't copy Arrow batches.
+                                             Use for streaming where batches are
+                                             immediately consumed. Default true.
 
    Returns:
      ITabularPlan root operator, or nil if no pattern groups."
@@ -656,6 +705,9 @@
   ([sources pattern-groups join-graph stats-by-table time-travel opts]
    (when (seq pattern-groups)
      (let [use-arrow-batches? (get opts :use-arrow-batches? false)
+           copy-batches? (get opts :copy-batches?)  ;; nil = default (true)
+           scan-opts {:use-arrow-batches? use-arrow-batches?
+                      :copy-batches? copy-batches?}
            ;; Build scan ops for each table
            scans-by-table
            (into {}
@@ -665,7 +717,7 @@
                     {:scan (build-scan-op-for-group sources mapping
                                                     (or predicates [])
                                                     join-graph time-travel
-                                                    use-arrow-batches?)
+                                                    scan-opts)
                      :mapping mapping}]))
 
            table-names (keys scans-by-table)
@@ -738,6 +790,8 @@
      opts        - Options map:
                    :use-arrow-batches? - If true, use raw Arrow batches
                                          for columnar execution (default false)
+                   :copy-batches?      - If false, don't copy Arrow batches.
+                                         Use for streaming. Default true.
 
    Returns:
      ScanOp for the table."

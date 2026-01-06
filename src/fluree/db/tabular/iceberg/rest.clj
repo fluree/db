@@ -98,8 +98,8 @@
                                    :batch-size batch-size
                                    :limit limit})))
 
-  (scan-arrow-batches [_ table-name {:keys [columns predicates snapshot-id as-of-time batch-size]
-                                     :or {batch-size 4096}}]
+  (scan-arrow-batches [_ table-name {:keys [columns predicates snapshot-id as-of-time batch-size copy-batches]
+                                     :or {batch-size 4096 copy-batches true}}]
     (let [meta-loc (or (get @metadata-cache table-name)
                        (let [loc (get-table-metadata-location uri auth-token table-name)]
                          (when loc (swap! metadata-cache assoc table-name loc))
@@ -111,14 +111,17 @@
       (log/debug "FlureeRestIcebergSource scan-arrow-batches (filtered):" {:table table-name
                                                                            :metadata meta-loc
                                                                            :batch-size batch-size
-                                                                           :predicates (count predicates)})
+                                                                           :predicates (count predicates)
+                                                                           :copy-batches copy-batches})
       ;; Use filtered Arrow batches for correct row-level filtering
-      ;; Data is copied to avoid buffer reuse issues
+      ;; When copy-batches is true (default), data is copied to avoid buffer reuse issues
+      ;; When false, batches share underlying buffers - use for streaming consumption
       (core/scan-filtered-arrow-batches table {:columns columns
                                                :predicates predicates
                                                :snapshot-id snapshot-id
                                                :as-of-time as-of-time
-                                               :batch-size batch-size})))
+                                               :batch-size batch-size
+                                               :copy-batches copy-batches})))
 
   (scan-rows [this table-name opts]
     (proto/scan-batches this table-name opts))
