@@ -12,7 +12,7 @@
             [clojure.string :as str]
             [fluree.db.storage :as storage]
             [fluree.db.util.log :as log])
-  (:import [java.io ByteArrayInputStream ByteArrayOutputStream InputStream OutputStream]
+  (:import [java.io ByteArrayOutputStream InputStream]
            [org.apache.iceberg.io FileIO InputFile OutputFile PositionOutputStream SeekableInputStream]))
 
 (set! *warn-on-reflection* true)
@@ -140,7 +140,7 @@
           (catch Exception _
             false)))
 
-      (getLength [this]
+      (getLength [_this]
         ;; Read and get length - cached on first access would be better
         (let [data (async/<!! (storage/read-bytes store storage-path))]
           (if data

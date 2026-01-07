@@ -469,7 +469,13 @@
       {:stats {:size 0 :flakes 0}
        :t (:t this)
        :schema {}
-       :namespace-codes (:namespace-codes this)})))
+       :namespace-codes (:namespace-codes this)}))
+
+  (-index-range [_this _idx _test _match _opts]
+    ;; BM25 indexes don't support index range queries
+    (throw (ex-info "BM25 virtual graphs do not support index range queries"
+                    {:status 400
+                     :error :db/unsupported-operation}))))
 
 ;; TODO - VG - triggering updates only works for queries for single subject, no nested nodes
 ;; TODO - VG - future feature - weighted properties

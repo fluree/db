@@ -1918,6 +1918,131 @@
           (teardown-fluree-system))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Comprehensive Pipeline Test (BIND → FILTER → GROUP BY → HAVING → ORDER BY → LIMIT)
+;;; ---------------------------------------------------------------------------
+
+(deftest e2e-sparql-comprehensive-pipeline-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: Full SPARQL pipeline with BIND, FILTER, GROUP BY, HAVING, ORDER BY, LIMIT"
+      (setup-fluree-system)
+      (try
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-pipeline:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; Comprehensive query combining all modifiers:
+        ;; 1. BIND - compute name length
+        ;; 2. FILTER with REGEX - only airlines starting with "Air" (case insensitive)
+        ;; 3. GROUP BY country
+        ;; 4. HAVING - only countries with > 5 matching airlines
+        ;; 5. ORDER BY DESC - sort by count descending
+        ;; 6. LIMIT - take top 10
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?country (COUNT(?airline) AS ?airCount)
+                      FROM <iceberg/openflights-pipeline>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:name ?name ;
+                                 ex:country ?country .
+                        BIND(STRLEN(?name) AS ?nameLen)
+                        FILTER(REGEX(?name, \"^Air\", \"i\"))
+                      }
+                      GROUP BY ?country
+                      HAVING (?airCount > 5)
+                      ORDER BY DESC(?airCount)
+                      LIMIT 10"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should have matching country groups")
+          (is (<= (count res) 10) "Should respect LIMIT 10")
+
+          ;; Verify HAVING constraint: all counts > 5
+          (when (seq res)
+            (is (every? #(let [[_country cnt] %]
+                           (> cnt 5))
+                        res)
+                "All groups should have count > 5 (HAVING constraint)"))
+
+          ;; Verify ORDER BY DESC: counts should be descending
+          (when (>= (count res) 2)
+            (let [counts (map second res)]
+              (is (= counts (reverse (sort counts)))
+                  "Results should be ordered by count descending"))))
+
+        (finally
+          (teardown-fluree-system))))))
+
+;;; ---------------------------------------------------------------------------
+;;; BOUND + OPTIONAL Pattern Test (Left Anti-Join Pattern)
+;;; ---------------------------------------------------------------------------
+
+(deftest e2e-sparql-bound-optional-pattern-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: BOUND + OPTIONAL pattern for left anti-join semantics"
+      (setup-fluree-system)
+      (try
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-bound-optional:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; This is a common LLM/SPARQL pattern to find entities WITHOUT certain relationships
+        ;; Semantically equivalent to FILTER NOT EXISTS but uses different constructs
+        ;; Pattern: OPTIONAL { ... } FILTER(!BOUND(?var)) = "left anti-join"
+        ;;
+        ;; Find airlines that have NO routes (airlines not referenced by any route)
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?airline ?name
+                      FROM <iceberg/openflights-bound-optional>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:name ?name .
+                        OPTIONAL { ?route ex:operatedBy ?airline }
+                        FILTER(!BOUND(?route))
+                      }
+                      LIMIT 100"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return results")
+          ;; OpenFlights data has many airlines without routes
+          ;; (inactive airlines, regional carriers not in routes dataset, etc.)
+          (is (pos? (count res)) "Should find some airlines without routes")
+          (is (<= (count res) 100) "Should respect LIMIT 100")
+
+          ;; Verify results have expected shape [airline-iri name]
+          (when (seq res)
+            (is (every? #(= 2 (count %)) res)
+                "Each result should have 2 values (airline, name)")
+            (is (every? #(string? (first %)) res)
+                "First value should be airline IRI string")
+            (is (every? #(string? (second %)) res)
+                "Second value should be name string")))
+
+        ;; Also test the positive case: airlines WITH routes using BOUND
+        ;; Pattern: OPTIONAL { ... } FILTER(BOUND(?var)) = "left semi-join"
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT DISTINCT ?airline ?name
+                      FROM <iceberg/openflights-bound-optional>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:name ?name .
+                        OPTIONAL { ?route ex:operatedBy ?airline }
+                        FILTER(BOUND(?route))
+                      }
+                      LIMIT 100"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should find airlines with routes")
+          (is (<= (count res) 100) "Should respect LIMIT"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Run from REPL
 ;;; ---------------------------------------------------------------------------
 

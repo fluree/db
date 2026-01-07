@@ -1,7 +1,8 @@
 (ns fluree.db.query.api
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
-  (:require #?(:clj [fluree.db.virtual-graph.nameservice-loader :as vg-loader])
+  (:require #?(:clj [fluree.db.util.json :as json])
+            #?(:clj [fluree.db.virtual-graph.nameservice-loader :as vg-loader])
             [fluree.db.connection :as connection]
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
@@ -17,7 +18,6 @@
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
-            [fluree.db.util.json :as json]
             [fluree.db.util.ledger :as ledger-util]
             [fluree.db.util.log :as log]))
 

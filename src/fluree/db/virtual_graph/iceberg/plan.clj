@@ -1213,20 +1213,20 @@
                                                        :group-values (when (seq group-keys)
                                                                        (zipmap group-keys group-key))}]
                                           (.put groups group-key initial)
-                                          initial))]
-                    ;; Update each aggregator
-                    (let [updated-aggs
-                          (mapv (fn [agg-state agg-spec]
-                                  (let [col (:column agg-spec)
-                                        ;; For COUNT(*), always pass a non-nil value
-                                        ;; For other aggs, get the column value
-                                        value (if (nil? col)
-                                                ::count-star  ;; Sentinel for COUNT(*)
-                                                (get-row-value row col))]
-                                    (update-aggregator agg-state value)))
-                                (:aggs group-state)
-                                aggregates)]
-                      (.put groups group-key (assoc group-state :aggs updated-aggs))))))
+                                          initial))
+                        ;; Update each aggregator
+                        updated-aggs
+                        (mapv (fn [agg-state agg-spec]
+                                (let [col (:column agg-spec)
+                                      ;; For COUNT(*), always pass a non-nil value
+                                      ;; For other aggs, get the column value
+                                      value (if (nil? col)
+                                              ::count-star  ;; Sentinel for COUNT(*)
+                                              (get-row-value row col))]
+                                  (update-aggregator agg-state value)))
+                              (:aggs group-state)
+                              aggregates)]
+                    (.put groups group-key (assoc group-state :aggs updated-aggs)))))
               (recur)))
 
           ;; SPARQL semantics: implicit grouping (no GROUP BY) with 0 input rows

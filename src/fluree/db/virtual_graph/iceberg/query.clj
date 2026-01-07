@@ -17,7 +17,9 @@
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph.iceberg.pushdown :as pushdown]
             [fluree.db.virtual-graph.iceberg.r2rml :as r2rml])
-  (:import [fluree.db.query.exec.select AsSelector]))
+  (:import [fluree.db.query.exec.select AsSelector]
+           [java.time Instant LocalDate LocalDateTime LocalTime
+            OffsetDateTime OffsetTime ZoneOffset]))
 
 (set! *warn-on-reflection* true)
 
@@ -334,10 +336,17 @@
    - Float types (Double, Float) → xsd:double
    - BigDecimal → xsd:decimal
    - Ratio (from AVG calculations) → xsd:decimal
-   - java.time.Instant → xsd:dateTime
+   - java.time.Instant → xsd:dateTime (converted to OffsetDateTime for eval.cljc compatibility)
+   - java.time.OffsetDateTime → xsd:dateTime
    - java.time.LocalDate → xsd:date
    - java.time.LocalDateTime → xsd:dateTime
-   - String (default) → xsd:string"
+   - java.time.LocalTime → xsd:time
+   - java.time.OffsetTime → xsd:time
+   - String (default) → xsd:string
+
+   Note: Instant values are converted to OffsetDateTime because eval.cljc date/time
+   functions (year, month, day, hours, minutes, seconds) use ->offset-date-time
+   which doesn't handle Instant directly."
   [value var-sym]
   (cond
     (nil? value)
@@ -366,14 +375,26 @@
     (where/match-value {} (double value) const/iri-xsd-decimal)
 
     ;; Date/time types from Arrow
-    (instance? java.time.Instant value)
+    ;; Instant: Convert to OffsetDateTime for compatibility with eval.cljc date functions
+    (instance? Instant value)
+    (where/match-value {} (.atOffset ^Instant value ZoneOffset/UTC) const/iri-xsd-dateTime)
+
+    ;; OffsetDateTime: Pass through directly
+    (instance? OffsetDateTime value)
     (where/match-value {} value const/iri-xsd-dateTime)
 
-    (instance? java.time.LocalDate value)
+    (instance? LocalDate value)
     (where/match-value {} value const/iri-xsd-date)
 
-    (instance? java.time.LocalDateTime value)
+    (instance? LocalDateTime value)
     (where/match-value {} value const/iri-xsd-dateTime)
+
+    ;; Time types (for time-only columns)
+    (instance? LocalTime value)
+    (where/match-value {} value const/iri-xsd-time)
+
+    (instance? OffsetTime value)
+    (where/match-value {} value const/iri-xsd-time)
 
     ;; Default: treat as string
     :else

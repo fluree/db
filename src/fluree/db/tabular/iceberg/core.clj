@@ -1023,22 +1023,22 @@
             (.hasNext iter)
             (let [^ColumnarBatch batch (.next iter)
                   filtered-rows (columnar-batch->filtered-rows batch predicates)
-                  limit-remaining @remaining]
-              (let [result (reduce
-                            (fn [acc' row]
-                              (if (<= @remaining 0)
-                                (reduced acc')
-                                (do
-                                  (swap! remaining dec)
-                                  (let [res (f acc' row)]
-                                    (if (reduced? res)
-                                      res
-                                      res)))))
-                            acc
-                            (take limit-remaining filtered-rows))]
-                (if (reduced? result)
-                  @result
-                  (recur result))))
+                  limit-remaining @remaining
+                  result (reduce
+                          (fn [acc' row]
+                            (if (<= @remaining 0)
+                              (reduced acc')
+                              (do
+                                (swap! remaining dec)
+                                (let [res (f acc' row)]
+                                  (if (reduced? res)
+                                    res
+                                    res)))))
+                          acc
+                          (take limit-remaining filtered-rows))]
+              (if (reduced? result)
+                @result
+                (recur result)))
 
             ;; No more batches
             :else acc)))
