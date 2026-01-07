@@ -18,6 +18,7 @@
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.parse :as util.parse]
+            [fluree.db.util.trace :as trace]
             [fluree.db.validation :as v]
             [fluree.json-ld :as json-ld]))
 
@@ -987,45 +988,47 @@
 
    Variable parsing is constrained by the var config allows (see `var-parsing-config`)."
   [jld var-config parsed-context]
-  (-> jld
-      (json-ld/expand parsed-context)
-      util/get-graph
-      util/sequential
-      (parse-triples var-config parsed-context)))
+  (trace/form ::jld->parsed-triples {}
+    (-> jld
+        (json-ld/expand parsed-context)
+        util/get-graph
+        util/sequential
+        (parse-triples var-config parsed-context))))
 
 (defn parse-update-txn
   ([txn]
    (parse-update-txn txn {}))
   ([txn override-opts]
-   (let [context       (or (ctx-util/txn-context txn)
-                           (:context override-opts))
-         [vars values] (-> (get-named txn "values")
-                           (parse-values context))
-         var-config    (var-parsing-config vars override-opts)
-         where         (-> (get-named txn "where")
-                           (parse-where var-config context))
-         var-config*   (cond-> (update var-config :bound-vars into (where/clause-variables where))
+   (trace/form ::parse-update-txn {}
+     (let [context (or (ctx-util/txn-context txn)
+                       (:context override-opts))
+           [vars values] (-> (get-named txn "values")
+                             (parse-values context))
+           var-config (var-parsing-config vars override-opts)
+           where (-> (get-named txn "where")
+                     (parse-where var-config context))
+           var-config* (cond-> (update var-config :bound-vars into (where/clause-variables where))
                          ;; don't attempt variable parsing if there are no unified vars
-                         (not (or where vars))  (assoc :parse-object-vars? false))
-         delete        (when-let [dlt (get-named txn "delete")]
-                         (jld->parsed-triples dlt var-config* context))
-         insert        (when-let [ins (get-named txn "insert")]
-                         (jld->parsed-triples ins var-config* context))
-         annotation    (util/get-first-value txn const/iri-annotation)
-         opts          (-> (get-named txn "opts")
-                           (parse-txn-opts override-opts context))
-         ledger-id     (get-named txn "ledger")]
-     (when (and (empty? insert) (empty? delete))
-       (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
-                       {:status 400 :error :db/invalid-transaction})))
-     (cond-> {:opts opts}
-       ledger-id    (assoc :ledger-id ledger-id)
-       context      (assoc :context context)
-       where        (assoc :where where)
-       annotation   (assoc :annotation annotation)
-       (seq values) (assoc :values values)
-       (seq delete) (assoc :delete delete)
-       (seq insert) (assoc :insert insert)))))
+                         (not (or where vars)) (assoc :parse-object-vars? false))
+           delete (when-let [dlt (get-named txn "delete")]
+                    (jld->parsed-triples dlt var-config* context))
+           insert (when-let [ins (get-named txn "insert")]
+                    (jld->parsed-triples ins var-config* context))
+           annotation (util/get-first-value txn const/iri-annotation)
+           opts (-> (get-named txn "opts")
+                    (parse-txn-opts override-opts context))
+           ledger-id (get-named txn "ledger")]
+       (when (and (empty? insert) (empty? delete))
+         (throw (ex-info "Invalid transaction, insert or delete clause must contain nodes with objects."
+                         {:status 400 :error :db/invalid-transaction})))
+       (cond-> {:opts opts}
+         ledger-id (assoc :ledger-id ledger-id)
+         context (assoc :context context)
+         where (assoc :where where)
+         annotation (assoc :annotation annotation)
+         (seq values) (assoc :values values)
+         (seq delete) (assoc :delete delete)
+         (seq insert) (assoc :insert insert))))))
 
 (defn blank-node-subject?
   [parsed-triple]

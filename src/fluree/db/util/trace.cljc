@@ -1,6 +1,18 @@
 (ns fluree.db.util.trace
   #?(:clj (:require [fluree.db.util :refer [if-cljs]]
-                    [steffan-westcott.clj-otel.api.trace.span :as span])))
+                    [steffan-westcott.clj-otel.api.trace.span :as span]
+                    [steffan-westcott.clj-otel.context :as otel-context])))
+
+(defn get-context
+  []
+  #?(:clj (otel-context/dyn)
+     :cljs {}))
+
+#?(:clj
+   (defmacro with-context
+     [id trace-ctx & body]
+     `(span/with-span! {:name ~id :parent ~trace-ctx}
+        ~@body)))
 
 #?(:clj
    (defmacro form

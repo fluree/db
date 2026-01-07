@@ -11,7 +11,8 @@
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.ledger :as util.ledger]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.trace :as trace]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -538,72 +539,73 @@
 
 (defn refresh
   [{:keys [novelty t alias] :as db} changes-ch max-old-indexes]
-  (go-try
-    (if (dirty? db)
-      (let [start-time-ms (util/current-time-millis)
-            novelty-size  (:size novelty)
-            init-stats    {:ledger-alias alias
-                           :t            t
-                           :novelty-size novelty-size
-                           :start-time   (util/current-time-iso)}
-            error-ch   (async/chan)
-            refresh-ch (refresh-all db changes-ch error-ch)]
-        (log/info "Refreshing Index:" init-stats)
-        (async/alt!
-          error-ch
-          ([e]
-           (throw e))
+  (trace/form ::refresh {}
+    (go-try
+      (if (dirty? db)
+        (let [start-time-ms (util/current-time-millis)
+              novelty-size  (:size novelty)
+              init-stats    {:ledger-alias alias
+                             :t            t
+                             :novelty-size novelty-size
+                             :start-time   (util/current-time-iso)}
+              error-ch   (async/chan)
+              refresh-ch (refresh-all db changes-ch error-ch)]
+          (log/info "Refreshing Index:" init-stats)
+          (async/alt!
+            error-ch
+            ([e]
+             (throw e))
 
-          refresh-ch
-          ([{:keys [garbage properties old-sketch-paths classes], refreshed-db :db, :as _status}]
-           (let [ ;; Add computed fields to properties for O(1) optimizer lookups
-                 properties-with-computed (add-computed-fields properties)
+            refresh-ch
+            ([{:keys [garbage properties old-sketch-paths classes], refreshed-db :db, :as _status}]
+             (let [ ;; Add computed fields to properties for O(1) optimizer lookups
+                   properties-with-computed (add-computed-fields properties)
 
-                 {:keys [index-catalog alias] :as refreshed-db*}
-                 (-> refreshed-db
-                     (assoc-in [:stats :indexed] t)
-                     (assoc-in [:stats :properties] properties-with-computed)
-                     (assoc-in [:stats :classes] classes))
+                   {:keys [index-catalog alias] :as refreshed-db*}
+                   (-> refreshed-db
+                       (assoc-in [:stats :indexed] t)
+                       (assoc-in [:stats :properties] properties-with-computed)
+                       (assoc-in [:stats :classes] classes))
 
-                 garbage-with-sketches (into garbage (or old-sketch-paths #{}))
+                   garbage-with-sketches (into garbage (or old-sketch-paths #{}))
 
-                 ;; TODO - ideally issue garbage/root writes to RAFT together
-                 ;;        as a tx, currently requires waiting for both
-                 ;;        through raft sync
-                 garbage-res   (when (seq garbage-with-sketches)
-                                 (let [write-res (<? (index-storage/write-garbage index-catalog alias t garbage-with-sketches))]
-                                   (<! (notify-new-index-file write-res :garbage t changes-ch))
-                                   write-res))
+                             ;; TODO - ideally issue garbage/root writes to RAFT together
+                             ;;        as a tx, currently requires waiting for both
+                             ;;        through raft sync
+                   garbage-res   (when (seq garbage-with-sketches)
+                                   (let [write-res (<? (index-storage/write-garbage index-catalog alias t garbage-with-sketches))]
+                                     (<! (notify-new-index-file write-res :garbage t changes-ch))
+                                     write-res))
 
-                 ;; No need to update db with sketches pointer - using fixed filenames
-                 refreshed-db**  refreshed-db*
+                             ;; No need to update db with sketches pointer - using fixed filenames
+                   refreshed-db**  refreshed-db*
 
-                 db-root-res   (<? (index-storage/write-db-root index-catalog refreshed-db** (:address garbage-res)))
-                 _             (<! (notify-new-index-file db-root-res :root t changes-ch))
+                   db-root-res   (<? (index-storage/write-db-root index-catalog refreshed-db** (:address garbage-res)))
+                   _             (<! (notify-new-index-file db-root-res :root t changes-ch))
 
-                 index-address (:address db-root-res)
-                 index-id      (str "fluree:index:sha256:" (:hash db-root-res))
+                   index-address (:address db-root-res)
+                   index-id      (str "fluree:index:sha256:" (:hash db-root-res))
 
-                 prev-idx-v    (get-in refreshed-db* [:commit :index :v])
-                 index-version (if (get-in refreshed-db* [:commit :index :data :t])
-                                 (or prev-idx-v 1)
-                                 2)
+                   prev-idx-v    (get-in refreshed-db* [:commit :index :v])
+                   index-version (if (get-in refreshed-db* [:commit :index :data :t])
+                                   (or prev-idx-v 1)
+                                   2)
 
-                 commit-index  (commit-data/new-index (-> refreshed-db* :commit :data)
-                                                      index-id
-                                                      index-address
-                                                      index-version
-                                                      (select-keys refreshed-db* index/types))
-                 indexed-db    (dbproto/-index-update refreshed-db* commit-index)
-                 duration      (- (util/current-time-millis) start-time-ms)
-                 end-stats     (assoc init-stats
-                                      :end-time (util/current-time-iso)
-                                      :duration duration
-                                      :address (:address db-root-res)
-                                      :garbage (:address garbage-res))]
-             (log/info "Index refresh complete:" end-stats)
-             ;; kick off automatic garbage collection in the background
-             (garbage/clean-garbage indexed-db max-old-indexes)
+                   commit-index  (commit-data/new-index (-> refreshed-db* :commit :data)
+                                                        index-id
+                                                        index-address
+                                                        index-version
+                                                        (select-keys refreshed-db* index/types))
+                   indexed-db    (dbproto/-index-update refreshed-db* commit-index)
+                   duration      (- (util/current-time-millis) start-time-ms)
+                   end-stats     (assoc init-stats
+                                        :end-time (util/current-time-iso)
+                                        :duration duration
+                                        :address (:address db-root-res)
+                                        :garbage (:address garbage-res))]
+               (log/info "Index refresh complete:" end-stats)
+                         ;; kick off automatic garbage collection in the background
+               (garbage/clean-garbage indexed-db max-old-indexes)
 
-             indexed-db))))
-      db)))
+               indexed-db))))
+        db))))
