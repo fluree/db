@@ -333,7 +333,8 @@
 
 (defn annotate-patterns-with-pushdown
   "Attach :pushdown-filters metadata to patterns that first bind pushed-down vars.
-   Returns updated patterns vector.
+   Returns {:patterns [...] :failed [...]} where :failed contains analyses that
+   couldn't be pushed down (e.g., BIND-created variables with no column mapping).
 
    Uses routing-indexes to find the correct mapping for each predicate,
    ensuring filters are only pushed down to the table that owns that predicate.
@@ -341,7 +342,7 @@
   [patterns pushable-analyses _mappings routing-indexes]
   (let [pred->mappings (:predicate->mappings routing-indexes)]
     (reduce
-     (fn [patterns {:keys [comparisons vars]}]
+     (fn [{:keys [patterns failed]} {:keys [comparisons vars] :as analysis}]
        (let [var (first vars)
              binding-idx (find-first-binding-pattern patterns var)]
          (if binding-idx
@@ -365,18 +366,21 @@
                  (log/debug "Annotating pattern with FILTER pushdown:"
                             {:var var :column column :ops (mapv :op comparisons)
                              :datatype datatype})
-                 (update patterns binding-idx
-                         #(annotate-pattern-with-filters % pushdown-filters)))
-               ;; No routed mapping or column found - skip pushdown
+                 {:patterns (update patterns binding-idx
+                                    #(annotate-pattern-with-filters % pushdown-filters))
+                  :failed failed})
+               ;; No routed mapping or column found - add to failed list
                (do
                  (log/debug "Skipping FILTER pushdown - no column mapping:"
                             {:var var :pred-iri pred-iri
                              :has-routed-mapping? (boolean routed-mapping)})
-                 patterns)))
+                 {:patterns patterns
+                  :failed (conj failed analysis)})))
            (do
              (log/debug "Skipping FILTER pushdown - no binding pattern for var:" var)
-             patterns))))
-     (vec patterns)
+             {:patterns patterns
+              :failed (conj failed analysis)}))))
+     {:patterns (vec patterns) :failed []}
      pushable-analyses)))
 
 ;;; ---------------------------------------------------------------------------

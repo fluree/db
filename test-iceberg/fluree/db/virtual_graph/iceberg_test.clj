@@ -4,6 +4,7 @@
    Requires :iceberg alias for dependencies.
    Run with: clojure -M:dev:iceberg:cljtest -e \"(require '[fluree.db.virtual-graph.iceberg-test]) (clojure.test/run-tests 'fluree.db.virtual-graph.iceberg-test)\""
   (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [fluree.db.api :as fluree]
             [fluree.db.connection.config :as config]
@@ -1580,6 +1581,222 @@
           (is (vector? res) "Should return results")
           ;; There should be many airlines without routes in the data
           (is (pos? (count res)) "Should have airlines without routes"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Expression Function E2E Tests (FILTER + BIND)
+;;; ---------------------------------------------------------------------------
+
+(deftest e2e-sparql-strlen-filter-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL FILTER with STRLEN (non-pushable expression)"
+      (setup-fluree-system)
+      (try
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-strlen:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; STRLEN is a non-pushable function - must be evaluated after scan
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?name
+                      FROM <iceberg/openflights-strlen>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:name ?name .
+                        FILTER(STRLEN(?name) > 15)
+                      }
+                      LIMIT 20"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should have results with long names")
+          ;; All names should be longer than 15 characters
+          (when (seq res)
+            (is (every? #(> (count (if (vector? %) (first %) %)) 15) res)
+                "All airline names should be longer than 15 characters")))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-sparql-bind-ucase-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL BIND with UCASE"
+      (setup-fluree-system)
+      (try
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-bind:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; BIND computes a new variable from an expression
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?name ?upperName
+                      FROM <iceberg/openflights-bind>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:name ?name .
+                        BIND(UCASE(?name) AS ?upperName)
+                      }
+                      LIMIT 10"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should have results with computed bindings")
+          ;; Each result should have both name and uppercase version
+          (when (seq res)
+            (let [[name upper] (first res)]
+              (is (string? name) "name should be a string")
+              (is (string? upper) "upperName should be a string")
+              ;; Upper case should be all caps
+              (is (= upper (clojure.string/upper-case name))
+                  "upperName should be uppercase version of name"))))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-sparql-bind-then-filter-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL BIND creating variable used in FILTER"
+      (setup-fluree-system)
+      (try
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-bind-filter:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; BIND creates a variable that is then used in FILTER
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?name ?nameLen
+                      FROM <iceberg/openflights-bind-filter>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:name ?name .
+                        BIND(STRLEN(?name) AS ?nameLen)
+                        FILTER(?nameLen > 20)
+                      }
+                      LIMIT 20"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should have results")
+          ;; All names should have length > 20
+          (when (seq res)
+            (let [[name name-len] (first res)]
+              (is (string? name) "name should be a string")
+              (is (number? name-len) "nameLen should be a number")
+              (is (> name-len 20) "nameLen should be greater than 20"))))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-sparql-regex-filter-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL FILTER with REGEX"
+      (setup-fluree-system)
+      (try
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-regex:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; REGEX is a non-pushable function
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?name
+                      FROM <iceberg/openflights-regex>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:name ?name .
+                        FILTER(REGEX(?name, \"^Air\", \"i\"))
+                      }
+                      LIMIT 20"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should have airlines starting with 'Air'")
+          ;; All names should start with 'Air' (case insensitive)
+          (when (seq res)
+            (is (every? #(re-find #"(?i)^Air" (if (vector? %) (first %) %)) res)
+                "All airline names should start with 'Air'")))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-sparql-coalesce-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL COALESCE for null handling"
+      (setup-fluree-system)
+      (try
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-coalesce:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; COALESCE returns first non-null value
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?name ?displayName
+                      FROM <iceberg/openflights-coalesce>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:name ?name .
+                        BIND(COALESCE(?name, \"Unknown\") AS ?displayName)
+                      }
+                      LIMIT 10"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should have results")
+          ;; displayName should never be null/empty
+          (when (seq res)
+            (is (every? #(let [[_ display] %]
+                           (and (string? display)
+                                (seq display)))
+                        res)
+                "All displayNames should be non-empty strings")))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-sparql-if-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL IF conditional expression"
+      (setup-fluree-system)
+      (try
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-if:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; IF returns one of two values based on condition
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?name ?size
+                      FROM <iceberg/openflights-if>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:name ?name .
+                        BIND(IF(STRLEN(?name) > 15, \"long\", \"short\") AS ?size)
+                      }
+                      LIMIT 20"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should have results")
+          ;; size should be either "long" or "short"
+          (when (seq res)
+            (is (every? #(let [[name size] %]
+                           (and (contains? #{"long" "short"} size)
+                                ;; Verify the categorization is correct
+                                (= (if (> (count name) 15) "long" "short") size)))
+                        res)
+                "size should correctly categorize name length")))
 
         (finally
           (teardown-fluree-system))))))

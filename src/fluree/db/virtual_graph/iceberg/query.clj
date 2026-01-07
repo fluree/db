@@ -325,21 +325,57 @@
             (r2rml/extract-template-cols template))))
 
 (defn- value->rdf-match
-  "Convert an Iceberg value to an RDF match object."
+  "Convert an Iceberg value to an RDF match object.
+
+   Handles common types from Iceberg/Arrow data:
+   - nil → unmatched variable
+   - Boolean → xsd:boolean
+   - Integer types (Long, Integer, Short, Byte) → xsd:integer
+   - Float types (Double, Float) → xsd:double
+   - BigDecimal → xsd:decimal
+   - Ratio (from AVG calculations) → xsd:decimal
+   - java.time.Instant → xsd:dateTime
+   - java.time.LocalDate → xsd:date
+   - java.time.LocalDateTime → xsd:dateTime
+   - String (default) → xsd:string"
   [value var-sym]
   (cond
     (nil? value)
     (where/unmatched-var var-sym)
 
+    (instance? Boolean value)
+    (where/match-value {} value const/iri-xsd-boolean)
+
+    ;; Integer types - all map to xsd:integer
     (integer? value)
     (where/match-value {} value const/iri-xsd-integer)
 
+    ;; Floating point types - map to xsd:double
     (float? value)
     (where/match-value {} value const/iri-xsd-double)
 
     (instance? Double value)
     (where/match-value {} value const/iri-xsd-double)
 
+    ;; BigDecimal - map to xsd:decimal
+    (instance? java.math.BigDecimal value)
+    (where/match-value {} value const/iri-xsd-decimal)
+
+    ;; Ratio (from AVG calculations) - convert to double, map to xsd:decimal
+    (ratio? value)
+    (where/match-value {} (double value) const/iri-xsd-decimal)
+
+    ;; Date/time types from Arrow
+    (instance? java.time.Instant value)
+    (where/match-value {} value const/iri-xsd-dateTime)
+
+    (instance? java.time.LocalDate value)
+    (where/match-value {} value const/iri-xsd-date)
+
+    (instance? java.time.LocalDateTime value)
+    (where/match-value {} value const/iri-xsd-dateTime)
+
+    ;; Default: treat as string
     :else
     (where/match-value {} value const/iri-string)))
 

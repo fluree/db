@@ -406,8 +406,16 @@
     (reduce compare-fn coll)))
 
 (defn regex
-  [{text :value} {pattern :value}]
-  (where/->typed-val (boolean (re-find (re-pattern pattern) text))))
+  "SPARQL REGEX function. Supports 2-arity (text, pattern) or 3-arity (text, pattern, flags).
+   Flags: 'i' = case-insensitive, 's' = dotall, 'm' = multiline, 'x' = extended."
+  ([{text :value} {pattern :value}]
+   (where/->typed-val (boolean (re-find (re-pattern pattern) text))))
+  ([{text :value} {pattern :value} {flags :value}]
+   ;; Prepend flags to pattern as (?flags)pattern for Java regex
+   (let [flag-prefix (when (and flags (not (str/blank? flags)))
+                       (str "(?" flags ")"))
+         full-pattern (str flag-prefix pattern)]
+     (where/->typed-val (boolean (re-find (re-pattern full-pattern) text))))))
 
 (defn replace
   [{s :value} {pattern :value} {replacement :value}]

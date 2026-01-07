@@ -1102,63 +1102,63 @@
   (if-not (sequential? patterns)
     #{}  ;; Return empty set for non-sequential inputs
     (into #{}
-      (mapcat (fn [pattern]
-                (cond
+          (mapcat (fn [pattern]
+                    (cond
                   ;; MapEntry pattern - use where accessors
-                  (map-entry? pattern)
-                  (let [ptype (where/pattern-type pattern)
-                        pdata (where/pattern-data pattern)]
-                    (case ptype
-                      :tuple
+                      (map-entry? pattern)
+                      (let [ptype (where/pattern-type pattern)
+                            pdata (where/pattern-data pattern)]
+                        (case ptype
+                          :tuple
                       ;; Extract vars from tuple pattern slots
-                      (->> pdata
-                           (keep (fn [[_slot m]]
-                                   (when (and (map? m) (:var m))
-                                     (:var m)))))
+                          (->> pdata
+                               (keep (fn [[_slot m]]
+                                       (when (and (map? m) (:var m))
+                                         (:var m)))))
                       ;; Nested patterns - recurse
-                      (:exists :not-exists :minus)
-                      (extract-pattern-vars pdata)
+                          (:exists :not-exists :minus)
+                          (extract-pattern-vars pdata)
                       ;; Other pattern types - no vars extracted
-                      nil))
+                          nil))
 
                   ;; Vector pattern - could be:
                   ;; 1. SPARQL nested like ["exists" [...]]
                   ;; 2. Tuple as [s-match p-match o-match] where matches have ::where/var
-                  (vector? pattern)
-                  (let [first-elem (first pattern)]
-                    (cond
+                      (vector? pattern)
+                      (let [first-elem (first pattern)]
+                        (cond
                       ;; Nested anti-join pattern
-                      (or (keyword? first-elem) (string? first-elem))
-                      (let [ptype (if (keyword? first-elem) first-elem (keyword first-elem))]
-                        (when (#{:exists :not-exists :minus} ptype)
-                          (extract-pattern-vars (second pattern))))
+                          (or (keyword? first-elem) (string? first-elem))
+                          (let [ptype (if (keyword? first-elem) first-elem (keyword first-elem))]
+                            (when (#{:exists :not-exists :minus} ptype)
+                              (extract-pattern-vars (second pattern))))
 
                       ;; Tuple as vector of match objects [s p o]
-                      (map? first-elem)
-                      (->> pattern
-                           (keep (fn [match-obj]
-                                   (when (map? match-obj)
+                          (map? first-elem)
+                          (->> pattern
+                               (keep (fn [match-obj]
+                                       (when (map? match-obj)
                                      ;; Check for ::where/var in the match object
-                                     (or (::where/var match-obj)
-                                         (:var match-obj)
+                                         (or (::where/var match-obj)
+                                             (:var match-obj)
                                          ;; Handle namespaced key as keyword
-                                         (get match-obj :fluree.db.query.exec.where/var))))))))
+                                             (get match-obj :fluree.db.query.exec.where/var))))))))
 
                   ;; Raw map pattern (tuple) - extract vars directly
-                  (map? pattern)
-                  (->> pattern
-                       (keep (fn [[_slot m]]
-                               (cond
+                      (map? pattern)
+                      (->> pattern
+                           (keep (fn [[_slot m]]
+                                   (cond
                                  ;; Match object with :var
-                                 (and (map? m) (:var m))
-                                 (:var m)
+                                     (and (map? m) (:var m))
+                                     (:var m)
                                  ;; Direct symbol (SPARQL raw pattern)
-                                 (symbol? m)
-                                 m
-                                 :else nil))))
+                                     (symbol? m)
+                                     m
+                                     :else nil))))
 
-                  :else nil))
-      patterns))))
+                      :else nil))
+                  patterns))))
 
 (defn- apply-exists
   "Apply EXISTS filter: keep solutions where inner pattern matches.
@@ -1200,32 +1200,32 @@
           ;; No correlation - EXISTS evaluates to same result for all outer solutions
           ;; Execute once and keep all or none
           (let [inner-results (execute-anti-join-inner
-                                sources mappings routing-indexes join-graph
-                                inner-patterns {} time-travel use-columnar?)]
+                               sources mappings routing-indexes join-graph
+                               inner-patterns {} time-travel use-columnar?)]
             (if (seq inner-results)
               solutions-vec  ;; Inner has results - keep all outer
               []))           ;; Inner empty - remove all outer
           ;; Has correlated vars - execute inner once, build index, do semi-join
           (let [;; Execute inner query once without outer bindings
                 inner-results (vec (execute-anti-join-inner
-                                     sources mappings routing-indexes join-graph
-                                     inner-patterns {} time-travel use-columnar?))
+                                    sources mappings routing-indexes join-graph
+                                    inner-patterns {} time-travel use-columnar?))
                 ;; Build index: {[correlated-var-values] -> true}
                 inner-index (into #{}
-                              (keep (fn [inner-sol]
-                                      (let [vals (mapv #(get inner-sol %) correlated-vars)]
-                                        (when (every? some? vals)
-                                          vals))))
-                              inner-results)]
+                                  (keep (fn [inner-sol]
+                                          (let [vals (mapv #(get inner-sol %) correlated-vars)]
+                                            (when (every? some? vals)
+                                              vals))))
+                                  inner-results)]
             (log/debug "EXISTS index built:" {:inner-count (count inner-results)
                                               :index-size (count inner-index)})
             ;; Filter outer solutions using index - O(1) lookup
             (filterv
-              (fn [outer-sol]
-                (let [outer-vals (mapv #(get outer-sol %) correlated-vars)]
-                  (and (every? some? outer-vals)
-                       (contains? inner-index outer-vals))))
-              solutions-vec)))))))
+             (fn [outer-sol]
+               (let [outer-vals (mapv #(get outer-sol %) correlated-vars)]
+                 (and (every? some? outer-vals)
+                      (contains? inner-index outer-vals))))
+             solutions-vec)))))))
 
 (defn- apply-not-exists
   "Apply NOT EXISTS filter: keep solutions where inner pattern does NOT match.
@@ -1262,38 +1262,38 @@
             ;; Correlated vars are those in both outer solution and inner patterns
             correlated-vars (vec (clojure.set/intersection outer-keys inner-vars))]
         (log/debug "NOT EXISTS anti-semi-join:" {:inner-var-count (count inner-vars)
-                                                  :correlated-var-count (count correlated-vars)})
+                                                 :correlated-var-count (count correlated-vars)})
         (if (empty? correlated-vars)
           ;; No correlation - NOT EXISTS evaluates to same result for all outer solutions
           ;; Execute once and keep all or none
           (let [inner-results (execute-anti-join-inner
-                                sources mappings routing-indexes join-graph
-                                inner-patterns {} time-travel use-columnar?)]
+                               sources mappings routing-indexes join-graph
+                               inner-patterns {} time-travel use-columnar?)]
             (if (seq inner-results)
               []              ;; Inner has results - remove all outer
               solutions-vec)) ;; Inner empty - keep all outer
           ;; Has correlated vars - execute inner once, build index, do anti-semi-join
           (let [;; Execute inner query once without outer bindings
                 inner-results (vec (execute-anti-join-inner
-                                     sources mappings routing-indexes join-graph
-                                     inner-patterns {} time-travel use-columnar?))
+                                    sources mappings routing-indexes join-graph
+                                    inner-patterns {} time-travel use-columnar?))
                 ;; Build index: {[correlated-var-values] -> true}
                 inner-index (into #{}
-                              (keep (fn [inner-sol]
-                                      (let [vals (mapv #(get inner-sol %) correlated-vars)]
-                                        (when (every? some? vals)
-                                          vals))))
-                              inner-results)]
+                                  (keep (fn [inner-sol]
+                                          (let [vals (mapv #(get inner-sol %) correlated-vars)]
+                                            (when (every? some? vals)
+                                              vals))))
+                                  inner-results)]
             (log/debug "NOT EXISTS index built:" {:inner-count (count inner-results)
                                                   :index-size (count inner-index)})
             ;; Filter outer solutions using index - O(1) lookup
             ;; Keep solutions NOT in the inner index
             (filterv
-              (fn [outer-sol]
-                (let [outer-vals (mapv #(get outer-sol %) correlated-vars)]
-                  (or (some nil? outer-vals)  ;; Unbound var - not a match, keep
-                      (not (contains? inner-index outer-vals)))))
-              solutions-vec)))))))
+             (fn [outer-sol]
+               (let [outer-vals (mapv #(get outer-sol %) correlated-vars)]
+                 (or (some nil? outer-vals)  ;; Unbound var - not a match, keep
+                     (not (contains? inner-index outer-vals)))))
+             solutions-vec)))))))
 
 (defn- apply-minus
   "Apply MINUS set difference: remove solutions that match inner pattern.
@@ -1325,8 +1325,8 @@
   [solutions inner-patterns sources mappings routing-indexes join-graph time-travel use-columnar?]
   ;; Execute inner pattern once (uncorrelated - no outer bindings)
   (let [inner-solutions (vec (execute-anti-join-inner
-                               sources mappings routing-indexes join-graph
-                               inner-patterns {} time-travel use-columnar?))
+                              sources mappings routing-indexes join-graph
+                              inner-patterns {} time-travel use-columnar?))
         outer-solutions (vec solutions)]
     (cond
       ;; No inner solutions - keep all outer solutions
@@ -1347,23 +1347,23 @@
           outer-solutions
           ;; Build hash index: {[shared-var-values] -> true}
           (let [inner-index (into #{}
-                              (keep (fn [inner-sol]
-                                      (let [vals (mapv #(get inner-sol %) shared-vars)]
+                                  (keep (fn [inner-sol]
+                                          (let [vals (mapv #(get inner-sol %) shared-vars)]
                                         ;; Only index if all shared vars are bound
-                                        (when (every? some? vals)
-                                          vals))))
-                              inner-solutions)]
+                                            (when (every? some? vals)
+                                              vals))))
+                                  inner-solutions)]
             (log/debug "MINUS index built:" {:shared-vars shared-vars
                                              :inner-count (count inner-solutions)
                                              :index-size (count inner-index)})
             ;; Filter outer solutions - O(1) lookup per solution
             (filterv
-              (fn [outer-sol]
-                (let [outer-vals (mapv #(get outer-sol %) shared-vars)]
+             (fn [outer-sol]
+               (let [outer-vals (mapv #(get outer-sol %) shared-vars)]
                   ;; Keep if: any shared var is unbound, OR values not in inner index
-                  (or (some nil? outer-vals)
-                      (not (contains? inner-index outer-vals)))))
-              outer-solutions)))))))
+                 (or (some nil? outer-vals)
+                     (not (contains? inner-index outer-vals)))))
+             outer-solutions)))))))
 
 (defn- apply-anti-joins
   "Apply all anti-join patterns to solutions in sequence.
@@ -1553,10 +1553,114 @@
         limited))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Expression Evaluation (Residual FILTER + BIND)
+;;; ---------------------------------------------------------------------------
+
+(defn- apply-filter-fn
+  "Apply a pre-compiled filter function to a solution.
+   Returns the solution if filter passes, nil otherwise.
+
+   Filter functions from eval.cljc expect solutions with match objects
+   (symbol keys to {::where/val, ::where/datatype-iri, ...}).
+   Iceberg solutions already have this format via row->solution."
+  [solution filter-fn]
+  (try
+    (when (filter-fn solution)
+      solution)
+    (catch Exception e
+      (log/debug "Filter evaluation error:" (ex-message e))
+      nil)))
+
+(defn- apply-filters
+  "Apply all compiled filter functions to solutions.
+   Works with both eager (vec) and lazy (seq) inputs.
+
+   Args:
+     solutions    - Sequence of solution maps
+     filter-specs - Vector of {:fn compiled-filter-fn, :meta pattern-metadata}"
+  [solutions filter-specs]
+  (if (seq filter-specs)
+    (let [filter-fns (map :fn filter-specs)]
+      (filter (fn [sol]
+                (every? #(apply-filter-fn sol %) filter-fns))
+              solutions))
+    solutions))
+
+(defn- apply-bind-spec
+  "Apply a BIND spec to a solution, adding new variable bindings.
+
+   Spec is a map {var-sym {::where/var v, ::where/fn f}} from the BIND pattern.
+   For each binding:
+   - If ::where/fn is present, evaluate the function and bind result
+   - Otherwise, it's a static binding
+
+   Args:
+     solution  - Current solution map
+     bind-spec - Map of {var-sym -> bind-info}"
+  [solution bind-spec]
+  (reduce-kv
+   (fn [sol var-sym bind-info]
+     (let [f (::where/fn bind-info)]
+       (if f
+         (try
+           (let [result (f sol)
+                 result-mch (where/typed-val->mch (where/unmatched-var var-sym) result)]
+             (or (where/update-solution-binding sol var-sym result-mch)
+                 (assoc sol ::invalidated true)))
+           (catch Exception e
+             (log/debug "BIND evaluation error for" var-sym ":" (ex-message e))
+             (assoc sol ::invalidated true)))
+         ;; Static binding - bind-info is already a match object
+         (or (where/update-solution-binding sol var-sym bind-info)
+             (assoc sol ::invalidated true)))))
+   solution
+   bind-spec))
+
+(defn- apply-binds
+  "Apply all BIND specs to solutions.
+   Solutions marked ::invalidated are removed.
+
+   Args:
+     solutions  - Sequence of solution maps
+     bind-specs - Vector of bind specs (each a map {var-sym -> bind-info})"
+  [solutions bind-specs]
+  (if (seq bind-specs)
+    (->> solutions
+         (map (fn [sol] (reduce apply-bind-spec sol bind-specs)))
+         (remove ::invalidated))
+    solutions))
+
+(defn- apply-expression-evaluators
+  "Apply residual BIND and FILTER evaluators to solutions.
+
+   This is called in -finalize after Iceberg scan but before anti-joins
+   and aggregation. Order: BIND first (to introduce variables that may
+   be needed for correlated EXISTS/NOT EXISTS), then FILTER.
+
+   Args:
+     solutions   - Sequence of solution maps from Iceberg scan
+     evaluators  - Map {:filters [...] :binds [...]}"
+  [solutions evaluators]
+  (if (or (seq (:filters evaluators)) (seq (:binds evaluators)))
+    (do
+      (log/debug "Applying expression evaluators:"
+                 {:filters (count (:filters evaluators))
+                  :binds (count (:binds evaluators))
+                  :input-count (if (counted? solutions) (count solutions) "lazy")})
+      (let [;; Apply BINDs first to introduce new variables
+            with-binds (apply-binds solutions (:binds evaluators))
+            ;; Then apply FILTERs
+            filtered (apply-filters with-binds (:filters evaluators))]
+        (log/debug "Expression evaluation complete")
+        filtered))
+    solutions))
+
+;;; ---------------------------------------------------------------------------
 ;;; IcebergDatabase Record (Multi-Table Support)
 ;;; ---------------------------------------------------------------------------
 
-(defrecord IcebergDatabase [alias config sources mappings routing-indexes join-graph time-travel query-pushdown aggregation-spec anti-join-spec]
+(defrecord IcebergDatabase [alias config sources mappings routing-indexes join-graph time-travel
+                            query-pushdown aggregation-spec anti-join-spec expression-evaluators]
   ;; sources: {table-name -> IcebergSource}
   ;; mappings: {table-key -> {:table, :class, :predicates, ...}}
   ;; routing-indexes: {:class->mappings {rdf-class -> [mappings...]}, :predicate->mappings {pred -> [mappings...]}}
@@ -1564,6 +1668,7 @@
   ;; query-pushdown: atom holding query-time pushdown predicates (set in -reorder, used in -finalize)
   ;; aggregation-spec: atom holding aggregation spec {:group-keys [...] :aggregates [...] :order-by [...] :limit n}
   ;; anti-join-spec: atom holding anti-join patterns [{:type :exists/:not-exists/:minus :patterns [...]} ...]
+  ;; expression-evaluators: atom holding residual FILTER/BIND evaluators {:filters [...] :binds [...]} (set in -reorder, used in -finalize)
 
   vg/UpdatableVirtualGraph
   (upsert [this _source-db _new-flakes _remove-flakes]
@@ -1613,12 +1718,16 @@
           agg-info (when aggregation-spec @aggregation-spec)
           ;; Capture anti-join spec from atom (set in -reorder)
           anti-joins (when anti-join-spec @anti-join-spec)
+          ;; Capture expression evaluators from atom (set in -reorder)
+          ;; These are non-pushable FILTER and BIND expressions
+          expr-evals (when expression-evaluators @expression-evaluators)
           ;; Capture columnar execution flag at query start (binding may change)
           use-columnar? *columnar-execution*
-          ;; If aggregation or anti-joins are needed, we must collect all solutions before emitting
-          ;; Anti-joins require collecting because they filter based on correlated/uncorrelated subqueries
-          ;; Otherwise, stream solutions directly
-          needs-collection? (or agg-info (seq anti-joins))
+          ;; If aggregation, anti-joins, or expression evaluators are needed, we must collect
+          ;; all solutions before emitting. Expression evaluators could be applied lazily,
+          ;; but collecting ensures consistent behavior and simplifies the logic.
+          needs-collection? (or agg-info (seq anti-joins)
+                                (seq (:filters expr-evals)) (seq (:binds expr-evals)))
           out-ch (async/chan 1 (map #(dissoc % ::iceberg-patterns)))]
       (when (seq values-pushdown)
         (log/debug "Iceberg -finalize using VALUES pushdown from atom:" values-pushdown))
@@ -1627,6 +1736,10 @@
       (when (seq anti-joins)
         (log/debug "Iceberg -finalize will apply anti-joins:" {:count (count anti-joins)
                                                                :types (mapv :type anti-joins)}))
+      (when (or (seq (:filters expr-evals)) (seq (:binds expr-evals)))
+        (log/debug "Iceberg -finalize will apply expression evaluators:"
+                   {:filters (count (:filters expr-evals))
+                    :binds (count (:binds expr-evals))}))
       (when use-columnar?
         (log/debug "Iceberg -finalize using Phase 3 columnar execution"))
 
@@ -1682,17 +1795,23 @@
                       ;; No patterns - pass through
                       (swap! all-solutions conj solution)))
                   (recur)))
-              ;; Apply anti-joins first (before query modifiers)
-              (let [after-anti-joins (if (seq anti-joins)
-                                       (apply-anti-joins @all-solutions anti-joins
+              ;; Apply expression evaluators first (BIND then FILTER)
+              ;; This happens before anti-joins so bound vars are available for EXISTS/NOT EXISTS
+              (let [after-expressions (if expr-evals
+                                        (vec (apply-expression-evaluators @all-solutions expr-evals))
+                                        @all-solutions)
+                    ;; Apply anti-joins (before query modifiers)
+                    after-anti-joins (if (seq anti-joins)
+                                       (apply-anti-joins after-expressions anti-joins
                                                          sources mappings routing-indexes
                                                          join-graph time-travel use-columnar?)
-                                       @all-solutions)
+                                       after-expressions)
                     ;; Apply query modifiers (aggregation, DISTINCT, ORDER BY, LIMIT)
                     modified (if agg-info
                                (finalize-query-modifiers after-anti-joins agg-info mappings)
                                after-anti-joins)]
                 (log/debug "Query modifiers applied:" {:input (count @all-solutions)
+                                                       :after-expressions (count after-expressions)
                                                        :after-anti-joins (count after-anti-joins)
                                                        :output (count modified)})
                 (doseq [sol modified]
@@ -1785,6 +1904,8 @@
         (reset! aggregation-spec nil))
       (when anti-join-spec
         (reset! anti-join-spec nil))
+      (when expression-evaluators
+        (reset! expression-evaluators nil))
       (let [where-patterns (:where parsed-query)
             ;; Helper to extract pattern type from both MapEntry and vector formats
             ;; SPARQL translator produces vectors like ["not-exists" [...]]
@@ -1813,11 +1934,15 @@
                 {values-patterns true, other-patterns false}
                 (group-by #(= :values (get-pattern-type %)) non-filters)
 
+                ;; Separate BIND patterns - they'll be evaluated in -finalize
+                {bind-patterns true, non-bind-patterns false}
+                (group-by #(= :bind (get-pattern-type %)) other-patterns)
+
                 ;; Extract anti-join patterns (EXISTS, NOT EXISTS, MINUS)
                 ;; These are evaluated after the main query in -finalize
                 anti-join-types #{:exists :not-exists :minus}
                 {anti-join-patterns true, regular-patterns false}
-                (group-by #(contains? anti-join-types (get-pattern-type %)) other-patterns)
+                (group-by #(contains? anti-join-types (get-pattern-type %)) non-bind-patterns)
 
                 ;; Store anti-join patterns for -finalize if present
                 _ (when (and anti-join-spec (seq anti-join-patterns))
@@ -1838,8 +1963,29 @@
 
                 ;; Analyze each filter for pushability
                 analyzed (map pushdown/analyze-filter-pattern filters)
-                {pushable true, _not-pushable false}
+                {pushable true, non-pushable false}
                 (group-by :pushable? analyzed)
+
+                ;; Store non-pushable filters and BIND patterns in expression-evaluators
+                ;; These will be evaluated in -finalize after Iceberg scan
+                ;; FILTER patterns already have compiled functions in pattern-data
+                ;; BIND patterns have {var {::where/var v, ::where/fn f}} in pattern-data
+                _ (when (and expression-evaluators (or (seq non-pushable) (seq bind-patterns)))
+                    (let [;; Extract compiled filter functions from non-pushable filters
+                          filter-fns (mapv (fn [{:keys [pattern]}]
+                                             {:fn (where/pattern-data pattern)
+                                              :meta (meta pattern)})
+                                           non-pushable)
+                          ;; Extract BIND specs (already compiled)
+                          bind-specs (mapv (fn [bp]
+                                             (where/pattern-data bp))
+                                           bind-patterns)]
+                      (log/debug "Iceberg -reorder storing expression evaluators:"
+                                 {:non-pushable-filters (count filter-fns)
+                                  :binds (count bind-specs)})
+                      (reset! expression-evaluators
+                              {:filters filter-fns
+                               :binds bind-specs})))
 
                 ;; Extract pushable VALUES patterns (single-var with literals)
                 values-predicates (keep pushdown/extract-values-in-predicate values-patterns)
@@ -1876,16 +2022,20 @@
                  values-predicates)
 
                 ;; Annotate patterns with FILTER pushdown metadata
-                annotated-patterns (if (seq pushable)
-                                     (pushdown/annotate-patterns-with-pushdown
-                                      other-patterns pushable mappings routing-indexes)
-                                     (vec other-patterns))
+                ;; Returns {:patterns [...] :failed [...]} where failed contains analyses
+                ;; that couldn't be pushed (e.g., BIND-created vars with no column mapping)
+                {:keys [patterns failed-pushable]}
+                (if (seq pushable)
+                  (let [{:keys [patterns failed]} (pushdown/annotate-patterns-with-pushdown
+                                                   other-patterns pushable mappings routing-indexes)]
+                    {:patterns patterns :failed-pushable failed})
+                  {:patterns (vec other-patterns) :failed-pushable []})
 
                 ;; Annotate patterns with VALUES/IN pushdown metadata
                 final-patterns (if (seq values-predicates)
                                  (pushdown/annotate-values-pushdown
-                                  annotated-patterns values-predicates mappings routing-indexes)
-                                 annotated-patterns)
+                                  patterns values-predicates mappings routing-indexes)
+                                 patterns)
 
                 ;; Track which vars were successfully pushed to Iceberg
                 ;; These VALUES patterns should be REMOVED from WHERE to avoid double-application
@@ -1917,10 +2067,12 @@
                                 :original-count (count values-patterns)
                                 :remaining-count (count unpushed-values-patterns)}))
 
-                ;; Reconstruct where: annotated patterns + filters + only UNPUSHED VALUES patterns
-                ;; Pushed VALUES are handled via pattern metadata, not VALUES decomposition
+                ;; Reconstruct where: annotated patterns + only UNPUSHED VALUES patterns
+                ;; - Pushable filters are handled via metadata annotation on patterns
+                ;; - Non-pushable filters are stored in expression-evaluators for -finalize
+                ;; - BIND patterns are stored in expression-evaluators for -finalize
+                ;; - Pushed VALUES are handled via pattern metadata
                 new-where (-> final-patterns
-                              (into filters)
                               (into unpushed-values-patterns))
 
                 ;; Flatten direct-pushdown-map to a vector of predicates
@@ -1934,11 +2086,25 @@
                 _ (log/debug "Iceberg filter pushdown:"
                              {:total-filters (count filters)
                               :pushable-filters (count pushable)
+                              :failed-pushable (count failed-pushable)
                               :values-patterns (count values-patterns)
                               :values-in-predicates (count values-predicates)
                               :values-pushdown-predicates values-pushdown-predicates
                               :patterns-annotated (count (filter #(::pushdown/pushdown-filters (meta %))
                                                                  final-patterns))})
+
+                ;; Add failed-pushable filters to expression-evaluators
+                ;; These are filters that were structurally pushable but couldn't be pushed
+                ;; (e.g., BIND-created vars with no column mapping)
+                _ (when (and expression-evaluators (seq failed-pushable))
+                    (let [failed-filter-fns (mapv (fn [{:keys [pattern]}]
+                                                    {:fn (where/pattern-data pattern)
+                                                     :meta (meta pattern)})
+                                                  failed-pushable)]
+                      (log/debug "Adding failed-pushable filters to expression evaluators:"
+                                 {:count (count failed-filter-fns)})
+                      (swap! expression-evaluators
+                             update :filters into failed-filter-fns)))
 
                 ;; Store VALUES predicates in the atom for retrieval in -finalize
                 _ (when (and query-pushdown (seq values-pushdown-predicates))
@@ -2248,4 +2414,5 @@
                            :time-travel nil
                            :query-pushdown (atom nil)
                            :aggregation-spec (atom nil)
-                           :anti-join-spec (atom nil)})))
+                           :anti-join-spec (atom nil)
+                           :expression-evaluators (atom nil)})))
