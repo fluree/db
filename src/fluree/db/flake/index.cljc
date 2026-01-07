@@ -505,7 +505,7 @@
 (defn- floor-child
   "Return the child whose key is the greatest <= target (or the leftmost child)."
   [children target]
-  (or (some-> (rsubseq children <= target) first val)
+  (or (some-> children (rsubseq <= target) first val)
       (some-> children first val)))
 
 (defn- resolve-node
