@@ -40,10 +40,6 @@
   "Lookup mode for batched subject-join range scans: :seek (fast) or :scan (robust)."
   :seek)
 
-(def ^:dynamic *batched-subject-join-log?*
-  "When true, logs when the batched subject join optimization is applied."
-  false)
-
 (defn- dataset-like?
   "Heuristic check for `fluree.db.dataset/DataSet` without requiring the ns.
   Avoids circular deps (dataset depends on where)."
@@ -824,12 +820,11 @@
                         {:to-t      (:t bind-db)
                          :mode      *subject-join-range-mode*
                          :use-psot? *subject-join-use-psot?*})]
-          (when *batched-subject-join-log?*
-            (log/debug "Batched subject-join"
-                       {:predicate p-sid
-                        :subjects  (count sids)
-                        :mode      *subject-join-range-mode*
-                        :use-psot? *subject-join-use-psot?*}))
+          (log/trace "Batched subject-join"
+                     {:predicate p-sid
+                      :subjects  (count sids)
+                      :mode      *subject-join-range-mode*
+                      :use-psot? *subject-join-use-psot?*})
           (loop [seen (transient #{})]
             (if-let [[sid flakes] (async/<! slice-ch)]
               (let [seen' (conj! seen sid)
