@@ -235,8 +235,7 @@
             (if (neg? (cmp x best))
               x
               best))
-          (first xs)
-          (rest xs)))
+          xs))
 
 (defn- remove-first
   "Remove the first element from vector `v` matching `pred`."
