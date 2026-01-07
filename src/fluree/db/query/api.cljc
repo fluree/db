@@ -21,24 +21,25 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn- normalize-override-opts
+  "Normalize override-opts to handle both flat and nested :opts styles."
+  [override-opts]
+  (cond-> (or override-opts {})
+    (map? (:opts override-opts))
+    (-> (merge (:opts override-opts))
+        (dissoc :opts))))
+
 (defn sanitize-query-options
   [query override-opts]
-  (update query :opts (fn [{:keys [max-fuel] :as opts}]
-                        ;; Support both call styles:
-                        ;; - (query db q {:subject-join-batch-size 10000})
-                        ;; - (query db q {:opts {:subject-join-batch-size 10000}})
-                        (let [override-opts* (cond-> (or override-opts {})
-                                               (map? (:opts override-opts))
-                                               (-> (merge (:opts override-opts))
-                                                   (dissoc :opts)))]
-                        ;; ensure :max-fuel key is present
-                          (-> opts
-                              (assoc :max-fuel max-fuel)
-                              (merge override-opts*)
-                              (update :output #(or % :fql))
-                            ;; get rid of :did, :issuer opts
-                              (update :identity #(or % (:did opts) (:issuer opts)))
-                              (dissoc :did :issuer))))))
+  (update query :opts
+          (fn [{:keys [max-fuel] :as opts}]
+            (let [override-opts* (normalize-override-opts override-opts)]
+              (-> opts
+                  (assoc :max-fuel max-fuel)
+                  (merge override-opts*)
+                  (update :output #(or % :fql))
+                  (update :identity #(or % (:did opts) (:issuer opts)))
+                  (dissoc :did :issuer))))))
 
 (defn load-aliased-rule-dbs
   [conn rule-sources]
@@ -120,25 +121,22 @@
      (let [{:keys [opts] :as query*} (-> query
                                          syntax/coerce-query
                                          (sanitize-query-options override-opts))
-           tracker (track/init opts)
-           ds*     (if (dataset? ds)
-                     ds
-                     (<? (restrict-db ds tracker query*)))
-           query** (-> query*
-                       (update :opts dissoc :meta :max-fuel)
-                       (cond-> (not (dataset? ds*)) (dissoc :from :from-named)))
+           tracker         (track/init opts)
+           ds*             (if (dataset? ds)
+                             ds
+                             (<? (restrict-db ds tracker query*)))
+           query**         (-> query*
+                               (update :opts dissoc :meta :max-fuel)
+                               (cond-> (not (dataset? ds*)) (dissoc :from :from-named)))
            batch-size      (:subject-join-batch-size opts)
            enable-batched? (if (contains? opts :subject-join-batch-size)
-                             (pos-int? batch-size) ; explicit 0/nil disables
+                             (pos-int? batch-size)
                              where/*enable-batched-subject-joins?*)
-           ;; All other batched subject-join tuning knobs are intentionally internal.
-           ;; Keep end-user surface area to a single control: :subject-join-batch-size.
-           ]
+           actual-batch    (if (pos-int? batch-size)
+                             batch-size
+                             where/*subject-join-batch-size*)]
        (binding [where/*enable-batched-subject-joins?* enable-batched?
-                 where/*subject-join-batch-size*       (if (pos-int? batch-size) batch-size where/*subject-join-batch-size*)
-                 ;; other tuning knobs remain at their defaults unless changed via
-                 ;; dynamic var binding (intended for dev/diagnostics only).
-                 ]
+                 where/*subject-join-batch-size*       actual-batch]
          (if (track/track-query? opts)
            (<? (track-execution ds* tracker #(fql/query ds* tracker query**)))
            (<? (fql/query ds* query**))))))))

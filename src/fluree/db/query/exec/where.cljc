@@ -44,24 +44,6 @@
   "When true, logs when the batched subject join optimization is applied."
   false)
 
-(def ^:dynamic *batched-subject-join-trace?*
-  "Debug-only. When true, emits additional batching diagnostics.
-  Keep false in normal operation."
-  false)
-
-(def ^:dynamic *batched-subject-join-trace-fn*
-  "Optional debug hook. When non-nil and `*batched-subject-join-trace?*` is true,
-  called with small event maps describing batching behavior."
-  nil)
-
-(defn- trace-batched-subject-join!
-  [event]
-  (when *batched-subject-join-trace?*
-    (if (fn? *batched-subject-join-trace-fn*)
-      (try* (*batched-subject-join-trace-fn* event)
-            (catch* _e nil))
-      (log/debug "Batched subject-join timing" event))))
-
 (defn- dataset-like?
   "Heuristic check for `fluree.db.dataset/DataSet` without requiring the ns.
   Avoids circular deps (dataset depends on where)."
@@ -788,33 +770,34 @@
       (<? (pipe-solutions! (match-pattern ds tracker sol pattern error-ch) out-ch)))
     ::done))
 
+(defn- object-match-compatible?
+  "Check if expected object match `o` is compatible with actual match `o-mch`."
+  [o o-mch db]
+  (let [expected-sid (get-sid o db)
+        actual-sid   (get-sid o-mch db)]
+    (and (if (and (some? expected-sid) (some? actual-sid))
+           (= expected-sid actual-sid)
+           (= (get-binding o) (get-binding o-mch)))
+         (= (get-datatype-iri o) (get-datatype-iri o-mch))
+         (= (get-lang o) (get-lang o-mch)))))
+
 (defn- emit-joined-solutions!
   [bind-db pattern out-ch sols flakes]
   (go
     (let [tuple (pattern-data pattern)]
-      (doseq [sol sols
-              :let [[_s _p o] (assign-matched-values tuple sol)]]
-        (doseq [f flakes
-                :let [o-fn        (::fn o)
-                      o-mch       (match-object (unlink-vars o) bind-db f)
-                      bound-ok?   (if (unmatched-var? o)
-                                    true
-                                    (let [expected-sid (get-sid o bind-db)
-                                          actual-sid   (get-sid o-mch bind-db)
-                                          expected-b   (get-binding o)
-                                          actual-b     (get-binding o-mch)]
-                                      (and
-                                       (if (and (some? expected-sid) (some? actual-sid))
-                                         (= expected-sid actual-sid)
-                                         (= expected-b actual-b))
-                                       (= (get-datatype-iri o) (get-datatype-iri o-mch))
-                                       (= (get-lang o) (get-lang o-mch)))))
-                      filter-ok?  (or (nil? o-fn) (o-fn o-mch))]]
-          (when (and bound-ok? filter-ok?)
-            (let [sol* (cond-> sol
-                         (unmatched-var? o) (assoc (::var o) o-mch)
-                         (linked-vars? o)   (match-linked-vars o bind-db f))]
-              (>! out-ch sol*))))))
+      (doseq [sol   sols
+              :let  [[_s _p o] (assign-matched-values tuple sol)]
+              f     flakes
+              :let  [o-mch     (match-object (unlink-vars o) bind-db f)
+                     o-fn      (::fn o)
+                     bound-ok? (or (unmatched-var? o)
+                                   (object-match-compatible? o o-mch bind-db))
+                     filter-ok? (or (nil? o-fn) (o-fn o-mch))]
+              :when (and bound-ok? filter-ok?)]
+        (let [sol* (cond-> sol
+                     (unmatched-var? o) (assoc (::var o) o-mch)
+                     (linked-vars? o)   (match-linked-vars o bind-db f))]
+          (>! out-ch sol*))))
     ::done))
 
 (defn- process-batched-subject-join-batch!
@@ -894,35 +877,18 @@
                     (<? (pipe-solutions! (match-pattern ds tracker solution pattern error-ch) out-ch))
                     (recur))
                   (async/close! out-ch)))
-              ;; Batch over incoming solutions. Solutions without a bound subject SID
-              ;; are handled by the fallback path inside `process-batched-subject-join-batch!`.
-              (let [trace? *batched-subject-join-trace?*]
-                (loop [batch          []
-                       batch-start-ms nil]
-                  (if-let [sol (async/<! solution-ch)]
-                    (let [batch-start-ns* (if (and trace? (empty? batch))
-                                            (util/current-time-millis)
-                                            batch-start-ms)
-                          batch*          (conj batch sol)]
-                      (if (< (count batch*) (long *subject-join-batch-size*))
-                        (recur batch* batch-start-ns*)
-                        (do
-                          (when (and trace? batch-start-ns*)
-                            (trace-batched-subject-join!
-                             {:event      :subject-join-batch/filled
-                              :batch-size (count batch*)
-                              :elapsed-ms (- (util/current-time-millis) batch-start-ns*)}))
-                          (<? (process-batched-subject-join-batch! ds batch-db tracker pattern error-ch batch* out-ch))
-                          (recur [] nil))))
-                    (do
-                      (when (seq batch)
-                        (when (and trace? batch-start-ms)
-                          (trace-batched-subject-join!
-                           {:event      :subject-join-batch/eof
-                            :batch-size (count batch)
-                            :elapsed-ms (- (util/current-time-millis) batch-start-ms)}))
-                        (<? (process-batched-subject-join-batch! ds batch-db tracker pattern error-ch batch out-ch)))
-                      (async/close! out-ch))))))))
+              (loop [batch []]
+                (if-let [sol (async/<! solution-ch)]
+                  (let [batch* (conj batch sol)]
+                    (if (< (count batch*) (long *subject-join-batch-size*))
+                      (recur batch*)
+                      (do
+                        (<? (process-batched-subject-join-batch! ds batch-db tracker pattern error-ch batch* out-ch))
+                        (recur []))))
+                  (do
+                    (when (seq batch)
+                      (<? (process-batched-subject-join-batch! ds batch-db tracker pattern error-ch batch out-ch)))
+                    (async/close! out-ch)))))))
         out-ch)
       (do
         (async/pipeline-async

@@ -800,47 +800,35 @@
            ensure-vector
            (mapv parse-var-name)))
 
+(defn- direction-tuple?
+  "True if `x` is a direction tuple like [\"desc\" \"?x\"] or (asc ?x)."
+  [x]
+  (and (sequential? x)
+       (= 2 (count x))
+       (let [[dir var] (if (vector? x)
+                         [(nth x 0) (nth x 1)]
+                         [(first x) (second x)])]
+         (and (or (syntax/asc? dir) (syntax/desc? dir))
+              (parse-var-name var)))))
+
+(defn- normalize-orderings
+  "Normalize order-by input to a vector of orderings."
+  [order-by]
+  (cond
+    (nil? order-by)             nil
+    (direction-tuple? order-by) [order-by]
+    (vector? order-by)          order-by
+    :else                       [order-by]))
+
 (defn parse-ordering
   [q]
-  (let [order-by (:order-by q)
-        ;; Disambiguate between:
-        ;; - a single direction tuple like ["desc" "?x"] or '(desc ?x)
-        ;; - a collection of orderings like ["?x" ["desc" "?y"]] etc
-        orderings (cond
-                    (nil? order-by) nil
-
-                    ;; Single direction tuple encoded as a vector (often from query coercion).
-                    (and (vector? order-by)
-                         (= 2 (count order-by))
-                         (or (syntax/asc? (nth order-by 0))
-                             (syntax/desc? (nth order-by 0)))
-                         (parse-var-name (nth order-by 1)))
-                    [order-by]
-
-                    ;; Single direction tuple encoded as a list/seq.
-                    (and (sequential? order-by)
-                         (= 2 (count order-by))
-                         (or (syntax/asc? (first order-by))
-                             (syntax/desc? (first order-by)))
-                         (parse-var-name (second order-by)))
-                    [order-by]
-
-                    ;; Collection of orderings (vector form).
-                    (vector? order-by)
-                    order-by
-
-                    ;; Single ordering (var, list tuple, etc).
-                    :else
-                    [order-by])]
-    (some->> orderings
-             (mapv (fn [ord]
-                     (if-let [v (parse-var-name ord)]
-                       [v :asc]
-                       (let [[dir dim] ord
-                             v (parse-var-name dim)]
-                         (if (syntax/asc? dir)
-                           [v :asc]
-                           [v :desc]))))))))
+  (some->> (normalize-orderings (:order-by q))
+           (mapv (fn [ord]
+                   (if-let [v (parse-var-name ord)]
+                     [v :asc]
+                     (let [[dir dim] ord
+                           v         (parse-var-name dim)]
+                       [v (if (syntax/asc? dir) :asc :desc)]))))))
 
 (defn parse-having
   [q context]
