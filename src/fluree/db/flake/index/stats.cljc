@@ -66,50 +66,50 @@
    (or type-flakes [])))
 
 (defn batched-get-subject-classes
-  "Returns a channel that yields {sid #{class-sids}}.
+  "Returns a channel that yields {sid #{class-sids}} for subjects with rdf:type.
 
-  Uses PSOT (when present) + PSOT novelty."
-  ([db sids]
-   (batched-get-subject-classes db sids {:sorted? false}))
-  ([db sids {:keys [sorted?] :or {sorted? false}}]
-   (if (empty? sids)
-     (go {})
-     (let [psot-root (:psot db)
-           resolver  (:index-catalog db)
-           ;; Get classes from novelty (not yet persisted)
-           psot-novelty       (get-in db [:novelty :psot])
-           novelty-by-subject (type-novelty-by-subject psot-novelty sids)]
-       (if (nil? psot-root)
-         ;; No PSOT on this db (e.g. legacy ledgers) - return novelty-only classes.
-         ;; Note: without an index to start from, retractions can't remove prior state.
-         (go (reduce-kv (fn [m sid fs]
-                          (assoc m sid (apply-type-novelty #{} fs)))
-                        {}
-                        novelty-by-subject))
-         (let [sorted-sids (if sorted? sids (sort sids))
-               input-ch    (async/to-chan! sorted-sids)
-               error-ch    (async/chan 1)
-               result-ch   (index/streaming-index-lookup
-                            resolver psot-root input-ch subject->psot-flake lookup-subject-classes-in-leaf
-                            error-ch {})]
-          ;; Collect results from index and merge with novelty (or throw on error)
-           (go-try
-             (loop [result {}]
-               (async/alt!
-                 error-ch ([e] (throw e))
-                 result-ch ([item]
-                            (if item
-                              (let [[sid classes] item
-                                    classes* (apply-type-novelty classes (get novelty-by-subject sid))]
-                                (recur (assoc result sid classes*)))
-                              ;; Ensure we include subjects that only appeared in novelty
-                              ;; (or had only retractions) and never appeared in the index.
-                              (reduce-kv (fn [m sid fs]
-                                           (if (contains? m sid)
-                                             m
-                                             (assoc m sid (apply-type-novelty #{} fs))))
-                                         result
-                                         novelty-by-subject))))))))))))
+   Subjects are looked up in a single streaming pass over the PSOT index, which
+   is more efficient than individual lookups. Input sids should be pre-sorted in
+   ascending order for efficient index traversal.
+
+   Uses PSOT (when present) + PSOT novelty."
+  [db sids]
+  (if (empty? sids)
+    (go {})
+    (let [psot-root (:psot db)
+          resolver  (:index-catalog db)
+          ;; Get classes from novelty (not yet persisted)
+          psot-novelty       (get-in db [:novelty :psot])
+          novelty-by-subject (type-novelty-by-subject psot-novelty sids)]
+      (if (nil? psot-root)
+        ;; No PSOT on this db (e.g. legacy ledgers or fresh reindex) - return novelty-only classes.
+        ;; This branch handles bootstrapping scenarios where novelty accumulates before first index.
+        (go (reduce-kv (fn [m sid fs]
+                         (assoc m sid (apply-type-novelty #{} fs)))
+                       {}
+                       novelty-by-subject))
+        (let [input-ch    (async/to-chan! sids)
+              error-ch    (async/chan 1)
+              result-ch   (index/streaming-index-lookup
+                           resolver psot-root input-ch subject->psot-flake lookup-subject-classes-in-leaf
+                           error-ch {})]
+          (go-try
+            (loop [result {}]
+              (async/alt!
+                error-ch ([e] (throw e))
+                result-ch ([item]
+                           (if item
+                             (let [[sid classes] item
+                                   classes* (apply-type-novelty classes (get novelty-by-subject sid))]
+                               (recur (assoc result sid classes*)))
+                             ;; Ensure we include subjects that only appeared in novelty
+                             ;; (or had only retractions) and never appeared in the index.
+                             (reduce-kv (fn [m sid fs]
+                                          (if (contains? m sid)
+                                            m
+                                            (assoc m sid (apply-type-novelty #{} fs))))
+                                        result
+                                        novelty-by-subject)))))))))))
 
 (defn- merge-class-maps
   "Merge {sid -> #{class-sids}} maps."
@@ -119,23 +119,23 @@
 (defn- collect-subject-and-ref-sids
   "Single pass over subject-ordered `spot-novelty` to collect:
    - distinct subject SIDs in encounter order (already sorted)
-   - distinct referenced object SIDs (dt=@id), as a set"
+   - distinct referenced object SIDs (dt=@id), as a set
+
+   Returns {:subjects [...] :refs #{...}} with persistent collections."
   [spot-novelty]
-  (reduce
-   (fn [{:keys [last-s] :as acc} f]
-     (let [s (flake/s f)
-           acc* (if (= s last-s)
-                  acc
-                  (-> acc
-                      (assoc :last-s s)
-                      (update :subjects conj! s)))]
-       (if (= const/$id (flake/dt f))
-         (update acc* :refs conj! (flake/o f))
-         acc*)))
-   {:last-s nil
-    :subjects (transient [])
-    :refs     (transient #{})}
-   spot-novelty))
+  (loop [flakes   (seq spot-novelty)
+         last-s   nil
+         subjects (transient [])
+         refs     (transient #{})]
+    (if-let [f (first flakes)]
+      (let [s        (flake/s f)
+            new-subj (if (= s last-s) subjects (conj! subjects s))
+            new-refs (if (= const/$id (flake/dt f))
+                       (conj! refs (flake/o f))
+                       refs)]
+        (recur (next flakes) s new-subj new-refs))
+      {:subjects (persistent! subjects)
+       :refs     (persistent! refs)})))
 
 (defn- get-lang-tag
   "Extracts language tag from flake's m field."
@@ -398,21 +398,21 @@
         (try*
           ;; Prefer grouping by subject using :spot novelty (already subject-ordered).
           ;; We still use post-novelty for the overall "empty?" check above.
-          (let [spot-novelty   (or (get-in db [:novelty :spot]) [])
+          (let [spot-novelty   (or (get-in db [:novelty :spot]) #{})
                 subject-groups (partition-by flake/s spot-novelty)
                 ;; Collect distinct subject SIDs (already sorted by :spot) and referenced SIDs.
-                {:keys [subjects refs] :as _sid-acc} (collect-subject-and-ref-sids spot-novelty)
-                subject-sids            (persistent! subjects)
-                ref-sids                (persistent! refs)
-                ;; If we have many ref lookups, sort them once (PSOT needs predicate then subject ordering).
-                sorted-ref-sids         (when (seq ref-sids) (sort ref-sids))
+                {:keys [subjects refs]} (collect-subject-and-ref-sids spot-novelty)
+                subject-sids            subjects
+                ref-sids                refs
+                ;; Sort refs for efficient PSOT traversal.
+                sorted-ref-sids         (sort ref-sids)
                 ;; Batched PSOT lookup for all subject classes at once
                 _ (log/debug "compute-class-property-stats-async: batched lookup for subjects"
                              {:subject-count (count subject-sids)
                               :ref-count     (count ref-sids)})
-                subject-classes-map     (<? (batched-get-subject-classes db subject-sids {:sorted? true}))
+                subject-classes-map     (<? (batched-get-subject-classes db subject-sids))
                 ref-classes-map         (if (seq sorted-ref-sids)
-                                          (<? (batched-get-subject-classes db sorted-ref-sids {:sorted? true}))
+                                          (<? (batched-get-subject-classes db sorted-ref-sids))
                                           {})
                 all-classes-map         (merge-class-maps subject-classes-map ref-classes-map)
                 _ (log/debug "compute-class-property-stats-async: batched lookup complete"

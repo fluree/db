@@ -707,9 +707,10 @@
    The db is created without a :commit key, which means refresh will assign
    v2 index version, enabling full statistics computation."
   [ledger-alias commit-catalog index-catalog indexing-opts]
-  (let [root-map (-> (genesis-root-map ledger-alias)
-                     (add-reindex-thresholds indexing-opts))]
-    (root-map->db root-map commit-catalog index-catalog ledger-alias nil)))
+  (-> ledger-alias
+      genesis-root-map
+      (add-reindex-thresholds indexing-opts)
+      (root-map->db commit-catalog index-catalog ledger-alias nil)))
 
 (defn- reindex-progress-log
   "Log progress during reindex. Called periodically."
