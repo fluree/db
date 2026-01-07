@@ -484,16 +484,16 @@
     {:type    :boundary
      :pattern (pattern->user-format (:pattern segment) compact-fn)}))
 
-(defn optimize-query
-  "Optimize a parsed query using statistics if available.
-   Returns the optimized query with patterns reordered for optimal execution.
-   Uses fast path - extracts optimized patterns without formatting."
-  [db parsed-query]
+(defn optimize-where
+  "Optimize a parsed where clause using statistics if available.
+   Returns the optimized clause in execution order, or the original clause when
+   statistics are unavailable."
+  [db where-clause]
   (let [stats (:stats db)]
-    (if (and stats (not-empty stats) (:where parsed-query))
-      (let [{:keys [optimized]} (optimize-patterns-with-metadata db (:where parsed-query))]
-        (assoc parsed-query :where optimized))
-      parsed-query)))
+    (if (and stats (not-empty stats) (seq where-clause))
+      (let [{:keys [optimized]} (optimize-patterns-with-metadata db where-clause)]
+        optimized)
+      where-clause)))
 
 (defn explain-query
   "Generate an execution plan for the query showing optimization details.

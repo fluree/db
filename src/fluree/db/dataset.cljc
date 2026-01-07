@@ -137,10 +137,11 @@
                  nil)))))
 
   optimize/Optimizable
-  (-reorder [_ds parsed-query]
-    ;; DataSets (federated queries) are not optimized
-    ;; Return query unchanged wrapped in channel
-    (async/go parsed-query))
+  (-reorder [_ds where-clause]
+    ;; DataSets (federated queries) are not optimized.
+    ;; Return the clause unchanged wrapped in a channel to maintain the
+    ;; optimizer contract without performing any work.
+    (async/go where-clause))
 
   (-explain [_ds parsed-query]
     ;; DataSets (federated queries) cannot be explained
