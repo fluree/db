@@ -1713,6 +1713,7 @@
   ;; aggregation-spec: atom holding aggregation spec {:group-keys [...] :aggregates [...] :order-by [...] :limit n}
   ;; anti-join-spec: atom holding anti-join patterns [{:type :exists/:not-exists/:minus :patterns [...]} ...]
   ;; expression-evaluators: atom holding residual FILTER/BIND evaluators {:filters [...] :binds [...]} (set in -reorder, used in -finalize)
+  ;; NOTE: Subqueries are handled by standard Fluree execution via match-pattern :query, not here.
 
   vg/UpdatableVirtualGraph
   (upsert [this _source-db _new-flakes _remove-flakes]
@@ -1754,7 +1755,7 @@
   (-aliases [_]
     [alias])
 
-  (-finalize [_ _tracker error-ch solution-ch]
+  (-finalize [_this _tracker error-ch solution-ch]
     (let [;; VALUES pushdown from atom - this is the primary path since pattern metadata
           ;; doesn't survive through the WHERE executor (known limitation)
           values-pushdown (when query-pushdown @query-pushdown)
@@ -1765,11 +1766,12 @@
           ;; Capture expression evaluators from atom (set in -reorder)
           ;; These are non-pushable FILTER and BIND expressions
           expr-evals (when expression-evaluators @expression-evaluators)
+          ;; NOTE: Subqueries are handled by standard Fluree execution via
+          ;; match-pattern :query, not here. This avoids shared-state issues.
           ;; Capture columnar execution flag at query start (binding may change)
           use-columnar? *columnar-execution*
-          ;; If aggregation, anti-joins, or expression evaluators are needed, we must collect
-          ;; all solutions before emitting. Expression evaluators could be applied lazily,
-          ;; but collecting ensures consistent behavior and simplifies the logic.
+          ;; If aggregation, anti-joins, or expression evaluators are needed,
+          ;; we must collect all solutions before emitting.
           needs-collection? (or agg-info (seq anti-joins)
                                 (seq (:filters expr-evals)) (seq (:binds expr-evals)))
           out-ch (async/chan 1 (map #(dissoc % ::iceberg-patterns)))]
@@ -1840,10 +1842,12 @@
                       (swap! all-solutions conj solution)))
                   (recur)))
               ;; Apply expression evaluators first (BIND then FILTER)
-              ;; This happens before anti-joins so bound vars are available for EXISTS/NOT EXISTS
+              ;; This happens before anti-joins so bound vars are available
               (let [after-expressions (if expr-evals
                                         (vec (apply-expression-evaluators @all-solutions expr-evals))
                                         @all-solutions)
+                    ;; NOTE: Subqueries are handled by standard Fluree execution via
+                    ;; match-pattern :query, not here.
                     ;; Apply anti-joins (before query modifiers)
                     after-anti-joins (if (seq anti-joins)
                                        (apply-anti-joins after-expressions anti-joins
@@ -2001,8 +2005,11 @@
                                   :types (mapv :type parsed-anti-joins)})
                       (reset! anti-join-spec parsed-anti-joins)))
 
-                ;; Use regular-patterns for the rest of the processing
-                ;; (anti-joins removed, they'll be applied in -finalize)
+                ;; NOTE: Subquery patterns (:query) are NOT handled specially here.
+                ;; They stay in the WHERE clause and are processed by:
+                ;; 1. exec/prep-subqueries (compiles raw subquery maps into executor functions)
+                ;; 2. match-pattern :query (calls the executor functions during WHERE processing)
+                ;; This ensures proper isolation - each subquery gets its own execution context.
                 other-patterns regular-patterns
 
                 ;; Analyze each filter for pushability

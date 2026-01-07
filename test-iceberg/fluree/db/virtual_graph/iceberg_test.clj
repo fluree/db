@@ -2043,6 +2043,76 @@
           (teardown-fluree-system))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Subquery Test
+;;; ---------------------------------------------------------------------------
+
+(deftest e2e-sparql-subquery-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL subquery with aggregation"
+      (setup-fluree-system)
+      (try
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-subquery:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; Test 1: Subquery with aggregation - get airlines with their route count
+        ;; This is a common analytics pattern: main query + aggregation subquery
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?airline ?name ?routeCount
+                      FROM <iceberg/openflights-subquery>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:name ?name .
+                        {
+                          SELECT ?airline (COUNT(?route) AS ?routeCount)
+                          WHERE {
+                            ?route ex:operatedBy ?airline
+                          }
+                          GROUP BY ?airline
+                        }
+                      }
+                      ORDER BY DESC(?routeCount)
+                      LIMIT 20"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return results")
+          ;; Should have airlines with route counts
+          (when (seq res)
+            (is (pos? (count res)) "Should find airlines with routes")
+            (is (<= (count res) 20) "Should respect LIMIT 20")
+            ;; Each result should have 3 values: airline IRI, name, routeCount
+            (is (every? #(= 3 (count %)) res)
+                "Each result should have 3 values")
+            ;; Route counts should be positive numbers
+            (is (every? #(and (number? (nth % 2)) (pos? (nth % 2))) res)
+                "Route counts should be positive numbers")))
+
+        ;; Test 2: Simple subquery without aggregation - correlated on shared variable
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?airline ?name ?country
+                      FROM <iceberg/openflights-subquery>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:name ?name .
+                        {
+                          SELECT ?airline ?country
+                          WHERE {
+                            ?airline ex:country ?country
+                          }
+                        }
+                      }
+                      LIMIT 50"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should find airlines with country from subquery")
+          (is (<= (count res) 50) "Should respect LIMIT 50"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Run from REPL
 ;;; ---------------------------------------------------------------------------
 
