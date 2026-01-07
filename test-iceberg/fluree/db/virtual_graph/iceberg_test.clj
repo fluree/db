@@ -1802,6 +1802,122 @@
           (teardown-fluree-system))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; HAVING Clause E2E Tests
+;;; ---------------------------------------------------------------------------
+
+(deftest e2e-sparql-having-count-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL HAVING with COUNT"
+      (setup-fluree-system)
+      (try
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-having:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; HAVING filters groups - only countries with > 50 airlines
+        ;; Note: Use aggregate alias (?count) in HAVING since Iceberg VG
+        ;; computes aggregates at database level (raw values not available)
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?country (COUNT(?airline) AS ?count)
+                      FROM <iceberg/openflights-having>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:country ?country
+                      }
+                      GROUP BY ?country
+                      HAVING (?count > 50)
+                      ORDER BY DESC(?count)"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return grouped results")
+          (is (pos? (count res)) "Should have country groups with > 50 airlines")
+          ;; All results should have count > 50
+          (when (seq res)
+            (is (every? #(let [[_country cnt] %]
+                           (> cnt 50))
+                        res)
+                "All groups should have count > 50")))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-sparql-having-alias-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL HAVING using aggregate alias"
+      (setup-fluree-system)
+      (try
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-having-alias:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; HAVING using the aggregate alias variable
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?country (COUNT(?airline) AS ?airlineCount)
+                      FROM <iceberg/openflights-having-alias>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:country ?country
+                      }
+                      GROUP BY ?country
+                      HAVING (?airlineCount > 100)
+                      ORDER BY DESC(?airlineCount)
+                      LIMIT 10"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return grouped results")
+          (is (pos? (count res)) "Should have country groups with > 100 airlines")
+          ;; All results should have count > 100
+          (when (seq res)
+            (is (every? #(let [[_country cnt] %]
+                           (> cnt 100))
+                        res)
+                "All groups should have airlineCount > 100")))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-sparql-having-combined-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SPARQL HAVING with multiple conditions"
+      (setup-fluree-system)
+      (try
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-having-combo:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; HAVING with a range condition using alias variable
+        ;; Note: Use aggregate alias (?count) in HAVING since Iceberg VG
+        ;; computes aggregates at database level
+        (let [sparql "PREFIX ex: <http://example.org/>
+                      SELECT ?country (COUNT(?airline) AS ?count)
+                      FROM <iceberg/openflights-having-combo>
+                      WHERE {
+                        ?airline a ex:Airline ;
+                                 ex:country ?country
+                      }
+                      GROUP BY ?country
+                      HAVING (?count >= 10 && ?count <= 50)
+                      ORDER BY ?count"
+              res @(fluree/query-connection @e2e-conn sparql {:format :sparql})]
+          (is (vector? res) "Should return grouped results")
+          ;; All results should have 10 <= count <= 50
+          (when (seq res)
+            (is (every? #(let [[_country cnt] %]
+                           (and (>= cnt 10) (<= cnt 50)))
+                        res)
+                "All groups should have count between 10 and 50 inclusive")))
+
+        (finally
+          (teardown-fluree-system))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Run from REPL
 ;;; ---------------------------------------------------------------------------
 

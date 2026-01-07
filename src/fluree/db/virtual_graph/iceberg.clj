@@ -1472,30 +1472,68 @@
                          row))
             aggregated-rows))))
 
+(defn- apply-having
+  "Apply HAVING filter to aggregated solutions.
+
+   HAVING is a pre-compiled filter function that works on aggregated results.
+   It expects solutions with symbol keys and match objects, same as FILTER.
+   Returns solutions where the HAVING condition evaluates to truthy.
+
+   Note: HAVING functions are compiled by eval/compile and return typed values
+   with a :value key (e.g., {:value true}). We extract :value to match the
+   standard having.cljc behavior.
+
+   Current limitation: Iceberg VG should use aggregate alias variables in HAVING
+   (e.g., HAVING ?count > 50) rather than re-computing aggregates
+   (e.g., HAVING COUNT(?x) > 50). This is because aggregates are computed at
+   the database level and raw values aren't available for re-computation.
+
+   Args:
+     solutions - Sequence of aggregated solution maps (already realized)
+     having-fn - Pre-compiled HAVING filter function (from eval/compile)"
+  [solutions having-fn]
+  (if having-fn
+    (let [input-count (count solutions)
+          _ (log/debug "Applying HAVING filter:" {:input-count input-count})
+          filtered (filterv (fn [solution]
+                              (try
+                                (let [result (having-fn solution)]
+                                  ;; HAVING function returns {:value true/false}
+                                  ;; per standard having.cljc behavior
+                                  (:value result))
+                                (catch Exception e
+                                  (log/debug "HAVING evaluation error:" (ex-message e))
+                                  false)))
+                            solutions)]
+      (log/debug "HAVING filter complete:" {:output-count (count filtered)})
+      filtered)
+    solutions))
+
 (defn- finalize-query-modifiers
-  "Apply query modifiers (aggregation, DISTINCT, ORDER BY, LIMIT) to solutions.
+  "Apply query modifiers (aggregation, HAVING, DISTINCT, ORDER BY, LIMIT) to solutions.
 
    This function is called when the aggregation-spec atom contains
    query modifier info from the parsed query.
 
    SPARQL modifier order (per spec section 15):
    1. GROUP BY + aggregates
-   2. HAVING (not yet implemented)
+   2. HAVING
    3. DISTINCT
    4. ORDER BY
    5. LIMIT/OFFSET
 
    Args:
      solutions  - Sequence of solution maps from VG execution
-     query-info - Map with :select, :group-by, :order-by, :distinct?, :limit, :offset
+     query-info - Map with :select, :group-by, :having, :order-by, :distinct?, :limit, :offset
      mappings   - R2RML mappings for variable->column resolution
 
    Returns modified solutions."
   [solutions query-info mappings]
-  (log/debug "finalize-query-modifiers input:" {:query-info query-info
+  (log/debug "finalize-query-modifiers input:" {:query-info (dissoc query-info :having)
+                                                :has-having? (some? (:having query-info))
                                                 :mapping-count (count mappings)
                                                 :solution-count (count solutions)})
-  (let [{:keys [select group-by order-by distinct? limit offset]} query-info
+  (let [{:keys [select group-by having order-by distinct? limit offset]} query-info
         ;; Build a combined mapping from all available mappings
         ;; This is needed to resolve variables to columns
         combined-mapping (reduce
@@ -1515,6 +1553,7 @@
             _ (log/debug "Applying VG-level aggregation:" {:group-keys group-keys
                                                            :aggregates aggregates
                                                            :distinct? distinct?
+                                                           :has-having? (some? having)
                                                            :input-solutions (count solutions)
                                                            :first-solution (first solutions)})
             ;; Force realization of solutions for aggregation
@@ -1529,23 +1568,28 @@
             _ (log/debug "Aggregation converted result:" {:output-count (count aggregated)
                                                           :first-result (first aggregated)
                                                           :first-result-keys (when (first aggregated) (keys (first aggregated)))})
-            ;; Apply DISTINCT (after aggregation, before ORDER BY per SPARQL spec)
+            ;; Apply HAVING (after aggregation, before DISTINCT per SPARQL spec)
+            after-having (apply-having aggregated having)
+            ;; Apply DISTINCT (after HAVING, before ORDER BY per SPARQL spec)
             deduped (if distinct?
-                      (apply-distinct aggregated)
-                      aggregated)
+                      (apply-distinct after-having)
+                      after-having)
             ;; Apply ORDER BY
             ordered (apply-order-by deduped order-by)
             ;; Apply LIMIT/OFFSET
             limited (apply-limit-offset ordered limit offset)]
         (log/debug "Query modifiers complete:" {:output-rows (count limited)
-                                                :distinct? distinct?})
+                                                :distinct? distinct?
+                                                :had-having? (some? having)})
         limited)
       ;; No aggregation - apply DISTINCT, ORDER BY, and LIMIT if present
-      (let [deduped (if distinct?
+      ;; Note: HAVING without aggregation is unusual but technically valid
+      (let [after-having (apply-having solutions having)
+            deduped (if distinct?
                       (do
-                        (log/debug "Applying VG-level DISTINCT:" {:input-solutions (count solutions)})
-                        (apply-distinct solutions))
-                      solutions)
+                        (log/debug "Applying VG-level DISTINCT:" {:input-solutions (count after-having)})
+                        (apply-distinct after-having))
+                      after-having)
             ordered (apply-order-by deduped order-by)
             limited (apply-limit-offset ordered limit offset)]
         (when distinct?
@@ -2111,12 +2155,13 @@
                     (reset! query-pushdown values-pushdown-predicates))
 
                 ;; Extract query modifiers for use in -finalize
-                ;; Includes aggregation, DISTINCT, ORDER BY, LIMIT/OFFSET
+                ;; Includes aggregation, DISTINCT, HAVING, ORDER BY, LIMIT/OFFSET
                 ;; Handle both :selectDistinct (SPARQL) and :select-distinct (FQL)
                 distinct? (or (some? (:selectDistinct parsed-query))
                               (some? (:select-distinct parsed-query)))
                 has-modifiers? (or (query/has-aggregations? parsed-query)
                                    distinct?
+                                   (:having parsed-query)
                                    (:orderBy parsed-query)
                                    (:order-by parsed-query)
                                    (:limit parsed-query)
@@ -2126,6 +2171,8 @@
                                           (:selectDistinct parsed-query)
                                           (:select-distinct parsed-query))
                               :group-by (:group-by parsed-query)
+                              ;; HAVING is a pre-compiled filter function (compiled in parse.cljc)
+                              :having (:having parsed-query)
                               ;; Handle both :orderBy (SPARQL translator) and :order-by (JSON-LD)
                               :order-by (or (:orderBy parsed-query) (:order-by parsed-query))
                               :distinct? distinct?
