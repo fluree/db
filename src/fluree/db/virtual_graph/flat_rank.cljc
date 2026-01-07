@@ -81,7 +81,10 @@
     (where/-activate-alias db alias'))
 
   (-aliases [_]
-    (where/-aliases db)))
+    (where/-aliases db))
+
+  (-resolve-subject-predicate-slices [_ _ _ _ _]
+    (go where/unsupported-slice-resolution)))
 
 (defn dot-product-graph
   [db]
@@ -108,7 +111,10 @@
     (where/-activate-alias db alias'))
 
   (-aliases [_]
-    (where/-aliases db)))
+    (where/-aliases db))
+
+  (-resolve-subject-predicate-slices [_ _ _ _ _]
+    (go where/unsupported-slice-resolution)))
 
 (defn cosine-graph
   [db]
@@ -135,7 +141,10 @@
     (where/-activate-alias db alias'))
 
   (-aliases [_]
-    (where/-aliases db)))
+    (where/-aliases db))
+
+  (-resolve-subject-predicate-slices [_ _ _ _ _]
+    (go where/unsupported-slice-resolution)))
 
 (defn euclidean-graph
   [db]

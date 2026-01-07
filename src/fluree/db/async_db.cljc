@@ -120,6 +120,11 @@
   (-finalize [_ _ _ solution-ch]
     solution-ch)
 
+  (-resolve-subject-predicate-slices [_ tracker error-ch p-match sids]
+    (go-try
+      (let [db (<? db-chan)]
+        (<? (where/-resolve-subject-predicate-slices db tracker error-ch p-match sids)))))
+
   subject/SubjectFormatter
   (-forward-properties [_ iri select-spec context compact-fn cache tracker error-ch]
     (let [prop-ch (async/chan)]

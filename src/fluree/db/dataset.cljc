@@ -97,6 +97,14 @@
   (-finalize [_ _ _ solution-ch]
     solution-ch)
 
+  (-resolve-subject-predicate-slices [ds tracker error-ch p-match sids]
+    (let [active-graph (get-active-graph ds)]
+      (if (and active-graph (not (sequential? active-graph)))
+        ;; Single active db - delegate
+        (where/-resolve-subject-predicate-slices active-graph tracker error-ch p-match sids)
+        ;; Federated or no active graph - not supported
+        (async/go where/unsupported-slice-resolution))))
+
   subject/SubjectFormatter
   (-forward-properties [ds iri select-spec context compact-fn cache tracker error-ch]
     (let [db-ch   (->> ds all async/to-chan!)

@@ -368,6 +368,21 @@
   (-finalize [_ _ _ solution-ch]
     solution-ch)
 
+  (-resolve-subject-predicate-slices [db tracker error-ch p-match sids]
+    (go
+      (let [p*    (where/compute-sid p-match db)
+            p-sid (or (where/get-sid p* db) (where/get-value p*))]
+        (if (seq sids)
+          {:db       db
+           :p-sid    p-sid
+           :slice-ch (query-range/resolve-subject-predicate-slices
+                      db tracker error-ch p-sid sids
+                      {:to-t      (:t db)
+                       :mode      where/*subject-join-range-mode*
+                       :use-psot? where/*subject-join-use-psot?*})}
+          ;; Probe call with empty sids - return db to indicate support
+          {:db db :p-sid p-sid}))))
+
   transact/Transactable
   (-stage-txn [db tracker context identity author annotation raw-txn parsed-txn]
     (flake.transact/stage db tracker context identity author annotation raw-txn parsed-txn))

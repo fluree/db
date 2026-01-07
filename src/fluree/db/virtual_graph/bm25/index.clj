@@ -271,7 +271,10 @@
 
   ;; return db-alias here, as it is used when encoding/decoding IRIs in the search function which is original db-dependent
   (-aliases [_]
-    [db-alias]))
+    [db-alias])
+
+  (-resolve-subject-predicate-slices [_ _ _ _ _]
+    (go where/unsupported-slice-resolution)))
 
 (defn bm25-iri?
   [idx-rdf-type]
