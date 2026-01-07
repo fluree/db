@@ -11,11 +11,13 @@
    optimized scans against the underlying Iceberg tables."
   (:require [clojure.string :as str]
             [fluree.db.constants :as const]
+            [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
             [fluree.db.tabular.protocol :as tabular]
             [fluree.db.util.log :as log]
             [fluree.db.virtual-graph.iceberg.pushdown :as pushdown]
-            [fluree.db.virtual-graph.iceberg.r2rml :as r2rml]))
+            [fluree.db.virtual-graph.iceberg.r2rml :as r2rml])
+  (:import [fluree.db.query.exec.select AsSelector]))
 
 (set! *warn-on-reflection* true)
 
@@ -345,26 +347,65 @@
   "Transform an Iceberg row to a SPARQL solution map.
 
    When join-columns are provided, stores raw column values under
-   ::join-col-vals for use by hash join operators."
+   ::join-col-vals for use by hash join operators.
+
+   When all-mappings is provided, also handles RefObjectMap predicates
+   by building parent IRIs from foreign key values."
   ([row mapping var-mappings subject-var base-solution]
-   (row->solution row mapping var-mappings subject-var base-solution nil))
+   (row->solution row mapping var-mappings subject-var base-solution nil nil))
   ([row mapping var-mappings subject-var base-solution join-columns]
+   (row->solution row mapping var-mappings subject-var base-solution join-columns nil))
+  ([row mapping var-mappings subject-var base-solution join-columns all-mappings]
    (let [subject-id (process-template-subject (:subject-template mapping) row)
          subject-binding (when subject-var
                            (let [subj-sym (if (symbol? subject-var) subject-var (symbol subject-var))]
                              [[subj-sym (where/match-iri {} (or subject-id "urn:unknown"))]]))
-         pred-bindings (for [[pred-iri var-name] var-mappings
-                             :when (and var-name
-                                        (not= pred-iri const/iri-rdf-type))
-                             :let [object-map (get-in mapping [:predicates pred-iri])
-                                   column (when (and (map? object-map) (= :column (:type object-map)))
-                                            (:value object-map))
-                                   value (when column
-                                           (or (get row column)
-                                               (get row (str/lower-case column))))
-                                   var-sym (if (symbol? var-name) var-name (symbol var-name))]
-                             :when value]
-                         [var-sym (value->rdf-match value var-sym)])
+         ;; Handle :column type predicates (simple column mappings)
+         column-bindings (for [[pred-iri var-name] var-mappings
+                               :when (and var-name
+                                          (not= pred-iri const/iri-rdf-type))
+                               :let [object-map (get-in mapping [:predicates pred-iri])
+                                     column (when (and (map? object-map) (= :column (:type object-map)))
+                                              (:value object-map))
+                                     value (when column
+                                             (or (get row column)
+                                                 (get row (str/lower-case column))))
+                                     var-sym (if (symbol? var-name) var-name (symbol var-name))]
+                               :when value]
+                           [var-sym (value->rdf-match value var-sym)])
+         ;; Handle :ref type predicates (RefObjectMap - foreign key relationships)
+         ;; Build parent IRI from FK value using parent mapping's subject template
+         ref-bindings (when all-mappings
+                        (for [[pred-iri var-name] var-mappings
+                              :when (and var-name
+                                         (not= pred-iri const/iri-rdf-type))
+                              :let [object-map (get-in mapping [:predicates pred-iri])]
+                              :when (= :ref (:type object-map))
+                              :let [;; Get the parent TriplesMap IRI and look up its mapping
+                                    parent-tm-iri (:parent-triples-map object-map)
+                                    ;; Find parent mapping by TriplesMap IRI
+                                    parent-mapping (some (fn [[_ m]]
+                                                           (when (= parent-tm-iri (:triples-map-iri m))
+                                                             m))
+                                                         all-mappings)
+                                    parent-template (when parent-mapping
+                                                      (:subject-template parent-mapping))
+                                    ;; Get FK value from child column
+                                    join-cond (first (:join-conditions object-map))
+                                    fk-col (:child join-cond)
+                                    pk-col (:parent join-cond)
+                                    fk-value (when fk-col
+                                               (or (get row fk-col)
+                                                   (get row (str/lower-case fk-col))
+                                                   (get row (str/upper-case fk-col))))
+                                    ;; Build parent IRI by substituting FK value for PK column
+                                    parent-iri (when (and parent-template fk-value pk-col)
+                                                 (str/replace parent-template
+                                                              (str "{" pk-col "}")
+                                                              (str fk-value)))
+                                    var-sym (if (symbol? var-name) var-name (symbol var-name))]
+                              :when parent-iri]
+                          [var-sym (where/match-iri {} parent-iri)]))
          ;; Store raw join column values for hash join operators
          ;; These are stored under keywords (not symbols) for efficient lookup
          join-col-vals (when (seq join-columns)
@@ -376,7 +417,7 @@
                                      :when (some? value)]
                                  [(keyword col) value])))]
      (cond-> (into (or base-solution {})
-                   (concat subject-binding pred-bindings))
+                   (concat subject-binding column-bindings ref-bindings))
        (seq join-col-vals) (assoc ::join-col-vals join-col-vals)))))
 
 ;;; ---------------------------------------------------------------------------
@@ -399,6 +440,7 @@
    - \"(count ?var)\" - direct aggregate
    - \"(as (count ?var) ?alias)\" - aggregate with alias
    - (count ?var) - list form
+   - AsSelector records with :aggregate? field
 
    Returns nil if not an aggregate, or a map:
    {:fn :count/:sum/:avg/:min/:max/:count-distinct
@@ -406,95 +448,175 @@
     :alias output-column-name (string)
     :var original-variable-symbol}"
   [expr mapping]
-  (let [;; Parse string expressions into list form
-        parsed (cond
-                 (string? expr)
-                 (try
-                   (read-string expr)
-                   (catch Exception _ nil))
+  (log/debug "parse-aggregate-expr input:" {:expr-type (type expr)
+                                            :is-as-selector? (instance? AsSelector expr)
+                                            :aggregate? (when (instance? AsSelector expr) (:aggregate? expr))})
+  (cond
+    ;; Handle AsSelector records from parsed SPARQL queries
+    (and (instance? AsSelector expr)
+         (:aggregate? expr))
+    (let [agg-fn-name (:aggregate? expr)
+          bind-var (:bind-var expr)
+          ;; Get aggregate-info from metadata if available
+          agg-info (::select/aggregate-info (meta expr))
+          _ (log/debug "parse-aggregate-expr AsSelector:" {:agg-fn-name agg-fn-name
+                                                           :bind-var bind-var
+                                                           :agg-info agg-info
+                                                           :vars (:vars agg-info)})
+          fn-name-sym (or (:fn-name agg-info) agg-fn-name)
+          all-vars (:vars agg-info)
+          ;; Filter out the bind-var from vars to get the actual aggregated variable
+          ;; The vars set includes both the output alias and the variable being aggregated
+          agg-vars (when all-vars (disj all-vars bind-var))
+          ;; Convert function name to keyword
+          fn-keyword (case (if (symbol? fn-name-sym) fn-name-sym (symbol (str fn-name-sym)))
+                       count :count
+                       count-distinct :count-distinct
+                       sum :sum
+                       avg :avg
+                       min :min
+                       max :max
+                       sample :sample
+                       sample1 :sample
+                       groupconcat :groupconcat
+                       :count)
+          ;; For COUNT(*), the actual aggregate vars (excluding bind-var) will be empty
+          is-count-star? (or (empty? agg-vars) (nil? agg-vars))
+          ;; Get the first variable from the filtered set (aggregates typically operate on one var)
+          var-sym (first agg-vars)
+          ;; Extract variable name, stripping ? prefix
+          raw-var-name (when var-sym (name var-sym))
+          var-name (when raw-var-name
+                     (if (str/starts-with? raw-var-name "?")
+                       (subs raw-var-name 1)
+                       raw-var-name))
+          ;; Try to find column from predicate mapping
+          mapped-column (when (and var-name mapping)
+                          (some (fn [[pred obj-map]]
+                                  (when (= :column (:type obj-map))
+                                    (let [obj-var (:var obj-map)
+                                          obj-value (:value obj-map)
+                                          pred-suffix (when (string? pred)
+                                                        (last (str/split pred #"[/#]")))]
+                                      (when (or (= var-name obj-var)
+                                                (= var-name obj-value)
+                                                (= var-name pred-suffix))
+                                        obj-value))))
+                                (:predicates mapping)))
+          column (if is-count-star?
+                   nil
+                   (or mapped-column var-name))
+          alias-name (if (symbol? bind-var)
+                       (let [n (name bind-var)]
+                         (if (str/starts-with? n "?")
+                           (subs n 1)
+                           n))
+                       (str bind-var))
+          result {:fn fn-keyword
+                  :column column
+                  :alias alias-name
+                  :var var-sym
+                  :var-name var-name
+                  ;; Include bind-var as the output SPARQL variable for result key conversion
+                  :bind-var bind-var}]
+      (log/debug "parse-aggregate-expr AsSelector result:" {:is-count-star? is-count-star?
+                                                            :column column
+                                                            :alias alias-name
+                                                            :bind-var bind-var
+                                                            :result result})
+      result)
 
-                 (list? expr)
-                 expr
+    ;; Handle string and list forms
+    :else
+    (let [;; Parse string expressions into list form
+          parsed (cond
+                   (string? expr)
+                   (try
+                     (read-string expr)
+                     (catch Exception _ nil))
 
-                 (seq? expr)
-                 expr
+                   (list? expr)
+                   expr
 
-                 :else nil)]
-    (when (and parsed (seq? parsed))
-      (let [[fn-name & args] parsed]
-        (cond
-          ;; (as (aggregate-fn ...) ?alias)
-          (= fn-name 'as)
-          (let [[inner-expr alias-var] args
-                inner-parsed (parse-aggregate-expr (if (seq? inner-expr)
-                                                     inner-expr
-                                                     (str inner-expr))
-                                                   mapping)]
-            (when inner-parsed
-              (assoc inner-parsed
-                     :alias (if (symbol? alias-var)
-                              (name alias-var)
-                              (str alias-var))
-                     :var alias-var)))
+                   (seq? expr)
+                   expr
 
-          ;; Direct aggregate: (count ?var), (sum ?var), etc.
-          (contains? aggregate-fn-names fn-name)
-          (let [fn-keyword (case (if (symbol? fn-name) fn-name (symbol fn-name))
-                             count :count
-                             count-distinct :count-distinct
-                             sum :sum
-                             avg :avg
-                             min :min
-                             max :max
-                             sample :sample
-                             sample1 :sample
-                             groupconcat :groupconcat
-                             :count)
-                ;; For count(*), args is typically empty or contains *
-                ;; For other aggs, first arg is the variable
-                var-arg (first args)
-                is-count-star? (or (nil? var-arg)
-                                   (= var-arg '*)
-                                   (= var-arg "*"))
-                ;; Extract variable name, stripping ? prefix if present
-                ;; (name '?country) returns "?country", so we strip the leading ?
-                raw-var-name (when (and (not is-count-star?) (symbol? var-arg))
-                               (name var-arg))
-                var-name (when raw-var-name
-                           (if (str/starts-with? raw-var-name "?")
-                             (subs raw-var-name 1)
-                             raw-var-name))
-                ;; Try to find column from predicate mapping
-                ;; Compare both with and without ? prefix for robustness
-                mapped-column (when (and var-name mapping)
-                                (some (fn [[_pred obj-map]]
-                                        (when (= :column (:type obj-map))
-                                          (let [obj-var (:var obj-map)]
-                                            (when (or (= var-name obj-var)
-                                                      (= raw-var-name obj-var)
-                                                      (= var-name (str "?" obj-var)))
-                                              (:value obj-map)))))
-                                      (:predicates mapping)))
-                ;; Use mapped column if found, else use var-name directly
-                ;; solution-get-column-value handles symbol/string lookup
-                column (if is-count-star?
-                         nil  ;; Only nil for COUNT(*)
-                         (or mapped-column var-name))
-                ;; Build a descriptive default alias for bare aggregates without (as ...)
-                ;; SPARQL spec requires aliases for aggregates in SELECT, so bare aggregates
-                ;; indicate the translator didn't wrap properly. Use descriptive default.
-                default-alias (if is-count-star?
-                                (str fn-name)  ;; "count" for COUNT(*)
-                                (str fn-name "_" (or var-name "val")))]  ;; "count_country" for COUNT(?country)
-            ;; Note: Bare aggregates without (as ...) are technically invalid SPARQL.
-            ;; The translator should always produce (as (count ?x) ?alias) forms.
-            {:fn fn-keyword
-             :column column
-             :alias default-alias
-             :var var-arg
-             :var-name var-name})
+                   :else nil)]
+      (when (and parsed (seq? parsed))
+        (let [[fn-name & args] parsed]
+          (cond
+            ;; (as (aggregate-fn ...) ?alias)
+            (= fn-name 'as)
+            (let [[inner-expr alias-var] args
+                  inner-parsed (parse-aggregate-expr (if (seq? inner-expr)
+                                                       inner-expr
+                                                       (str inner-expr))
+                                                     mapping)]
+              (when inner-parsed
+                (assoc inner-parsed
+                       :alias (if (symbol? alias-var)
+                                (name alias-var)
+                                (str alias-var))
+                       :var alias-var)))
 
-          :else nil)))))
+            ;; Direct aggregate: (count ?var), (sum ?var), etc.
+            (contains? aggregate-fn-names fn-name)
+            (let [fn-keyword (case (if (symbol? fn-name) fn-name (symbol fn-name))
+                               count :count
+                               count-distinct :count-distinct
+                               sum :sum
+                               avg :avg
+                               min :min
+                               max :max
+                               sample :sample
+                               sample1 :sample
+                               groupconcat :groupconcat
+                               :count)
+                  ;; For count(*), args is typically empty or contains *
+                  ;; For other aggs, first arg is the variable
+                  var-arg (first args)
+                  is-count-star? (or (nil? var-arg)
+                                     (= var-arg '*)
+                                     (= var-arg "*"))
+                  ;; Extract variable name, stripping ? prefix if present
+                  ;; (name '?country) returns "?country", so we strip the leading ?
+                  raw-var-name (when (and (not is-count-star?) (symbol? var-arg))
+                                 (name var-arg))
+                  var-name (when raw-var-name
+                             (if (str/starts-with? raw-var-name "?")
+                               (subs raw-var-name 1)
+                               raw-var-name))
+                  ;; Try to find column from predicate mapping
+                  ;; Compare both with and without ? prefix for robustness
+                  mapped-column (when (and var-name mapping)
+                                  (some (fn [[_pred obj-map]]
+                                          (when (= :column (:type obj-map))
+                                            (let [obj-var (:var obj-map)]
+                                              (when (or (= var-name obj-var)
+                                                        (= raw-var-name obj-var)
+                                                        (= var-name (str "?" obj-var)))
+                                                (:value obj-map)))))
+                                        (:predicates mapping)))
+                  ;; Use mapped column if found, else use var-name directly
+                  ;; solution-get-column-value handles symbol/string lookup
+                  column (if is-count-star?
+                           nil  ;; Only nil for COUNT(*)
+                           (or mapped-column var-name))
+                  ;; Build a descriptive default alias for bare aggregates without (as ...)
+                  ;; SPARQL spec requires aliases for aggregates in SELECT, so bare aggregates
+                  ;; indicate the translator didn't wrap properly. Use descriptive default.
+                  default-alias (if is-count-star?
+                                  (str fn-name)  ;; "count" for COUNT(*)
+                                  (str fn-name "_" (or var-name "val")))]  ;; "count_country" for COUNT(?country)
+              ;; Note: Bare aggregates without (as ...) are technically invalid SPARQL.
+              ;; The translator should always produce (as (count ?x) ?alias) forms.
+              {:fn fn-keyword
+               :column column
+               :alias default-alias
+               :var var-arg
+               :var-name var-name})
+
+            :else nil))))))
 
 (defn extract-aggregates-from-select
   "Extract aggregate specifications from a query SELECT clause.
@@ -526,19 +648,30 @@
                  group-by-clause
                  [group-by-clause])]
       (vec (keep (fn [var]
-                   (let [var-name (cond
-                                    (symbol? var) (name var)
-                                    (string? var) (if (str/starts-with? var "?")
-                                                    (subs var 1)
-                                                    var)
-                                    :else nil)]
+                   ;; Extract var name without ? prefix
+                   (let [var-str (cond
+                                   (symbol? var) (name var)
+                                   (string? var) var
+                                   :else nil)
+                         ;; Strip leading ? if present
+                         var-name (when var-str
+                                    (if (str/starts-with? var-str "?")
+                                      (subs var-str 1)
+                                      var-str))]
                      ;; Try to find column from predicate mapping
+                     ;; Match against: :var in obj-map, :value in obj-map, or predicate IRI suffix
                      (when (and var-name mapping)
-                       (some (fn [[_pred obj-map]]
-                               (when (and (= :column (:type obj-map))
-                                          (or (= var-name (str "?" (:var obj-map)))
-                                              (= var-name (:var obj-map))))
-                                 (:value obj-map)))
+                       (some (fn [[pred obj-map]]
+                               (when (= :column (:type obj-map))
+                                 (let [obj-var (:var obj-map)
+                                       obj-value (:value obj-map)
+                                       ;; Extract predicate suffix (last path segment)
+                                       pred-suffix (when (string? pred)
+                                                     (last (str/split pred #"[/#]")))]
+                                   (when (or (= var-name obj-var)
+                                             (= var-name obj-value)
+                                             (= var-name pred-suffix))
+                                     obj-value))))
                              (:predicates mapping)))))
                  vars)))))
 
@@ -595,28 +728,42 @@
    limit is an optional hint to limit the number of rows scanned.
    solution-pushdown is an optional vector of pushdown filters from the solution map.
    join-columns is an optional set of column names to include for join operations.
+   all-mappings is optional map of all R2RML mappings (needed for RefObjectMap resolution).
    Returns a lazy seq of solutions - limit is enforced at the scan level
    for early termination."
   ([source mapping patterns base-solution time-travel]
-   (execute-iceberg-query source mapping patterns base-solution time-travel nil nil nil))
+   (execute-iceberg-query source mapping patterns base-solution time-travel nil nil nil nil))
   ([source mapping patterns base-solution time-travel limit]
-   (execute-iceberg-query source mapping patterns base-solution time-travel limit nil nil))
+   (execute-iceberg-query source mapping patterns base-solution time-travel limit nil nil nil))
   ([source mapping patterns base-solution time-travel limit solution-pushdown]
-   (execute-iceberg-query source mapping patterns base-solution time-travel limit solution-pushdown nil))
+   (execute-iceberg-query source mapping patterns base-solution time-travel limit solution-pushdown nil nil))
   ([source mapping patterns base-solution time-travel limit solution-pushdown join-columns]
+   (execute-iceberg-query source mapping patterns base-solution time-travel limit solution-pushdown join-columns nil))
+  ([source mapping patterns base-solution time-travel limit solution-pushdown join-columns all-mappings]
    (let [table-name (:table mapping)
          pred->var (extract-predicate-bindings patterns)
          pred->literal (extract-literal-filters patterns)
          subject-var (some extract-subject-variable patterns)
 
          ;; Build columns to select (include join columns for hash join support)
-         query-columns (->> pred->var
+         ;; Also include FK columns from :ref type predicates (RefObjectMap)
+         column-type-cols (->> pred->var
+                               keys
+                               (keep (fn [pred-iri]
+                                       (let [om (get-in mapping [:predicates pred-iri])]
+                                         (when (= :column (:type om))
+                                           (:value om))))))
+         ;; FK columns from RefObjectMap predicates (child column from join condition)
+         ref-type-cols (->> pred->var
                             keys
                             (keep (fn [pred-iri]
                                     (let [om (get-in mapping [:predicates pred-iri])]
-                                      (when (= :column (:type om))
-                                        (:value om)))))
-                            (concat (r2rml/extract-template-cols (:subject-template mapping))))
+                                      (when (= :ref (:type om))
+                                        ;; Get the child column from join condition
+                                        (:child (first (:join-conditions om))))))))
+         query-columns (concat column-type-cols
+                               ref-type-cols
+                               (r2rml/extract-template-cols (:subject-template mapping)))
          columns (-> (concat query-columns (or join-columns []))
                      distinct
                      vec)
@@ -644,6 +791,7 @@
          _ (log/debug "Iceberg query:" {:table table-name
                                         :columns columns
                                         :join-columns join-columns
+                                        :ref-cols (vec ref-type-cols)
                                         :literal-predicates (count literal-predicates)
                                         :pushed-predicates (count pushed-predicates)
                                         :solution-bound-predicates (count solution-bound-predicates)
@@ -668,5 +816,5 @@
                                    (assoc :limit limit)))]
 
      ;; Transform to solutions - this is also lazy
-     ;; Pass join-columns so raw values are stored for hash join
-     (map #(row->solution % mapping pred->var subject-var base-solution join-columns) rows))))
+     ;; Pass join-columns and all-mappings for hash join and RefObjectMap support
+     (map #(row->solution % mapping pred->var subject-var base-solution join-columns all-mappings) rows))))

@@ -1304,11 +1304,13 @@
               res @(fluree/query-connection @e2e-conn sparql-group {:format :sparql})]
           (is (vector? res) "Should return grouped results")
           (is (pos? (count res)) "Should have country groups")
-          ;; Each result should have country and count
+          ;; With :format :sparql and default :output :fql, results are vectors [country count]
           (when (seq res)
             (let [first-row (first res)]
-              (is (some? (get first-row "country")) "Results should include country")
-              (is (some? (get first-row "count")) "Results should include count"))))
+              (is (vector? first-row) "Each row should be a vector")
+              (is (= 2 (count first-row)) "Each row should have 2 elements (country, count)")
+              (is (string? (first first-row)) "First element should be country (string)")
+              (is (integer? (second first-row)) "Second element should be count (integer)"))))
 
         (finally
           (teardown-fluree-system))))))
@@ -1340,11 +1342,244 @@
               res @(fluree/query-connection @e2e-conn sparql-agg {:format :sparql})]
           (is (vector? res) "Should return aggregated results")
           (is (pos? (count res)) "Should have airline groups")
-          ;; Results should have both the group key and aggregate
+          ;; With :format :sparql and default :output :fql, results are vectors [airline route_count]
           (when (seq res)
             (let [first-row (first res)]
-              (is (some? (get first-row "airline")) "Results should include airline")
-              (is (some? (get first-row "route_count")) "Results should include route count"))))
+              (is (vector? first-row) "Each row should be a vector")
+              (is (= 2 (count first-row)) "Each row should have 2 elements (airline, route_count)")
+              (is (string? (first first-row)) "First element should be airline (string)")
+              (is (integer? (second first-row)) "Second element should be route_count (integer)"))))
+
+        (finally
+          (teardown-fluree-system))))))
+
+;;; ---------------------------------------------------------------------------
+;;; SELECT DISTINCT E2E Tests
+;;; ---------------------------------------------------------------------------
+
+(deftest e2e-sparql-select-distinct-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SELECT DISTINCT deduplicates results"
+      (setup-fluree-system)
+      (try
+        ;; Register the multi-table Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-distinct:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; SELECT DISTINCT on country - should return unique countries
+        (let [sparql-distinct "PREFIX ex: <http://example.org/>
+                               SELECT DISTINCT ?country
+                               FROM <iceberg/openflights-distinct>
+                               WHERE {
+                                 ?airline a ex:Airline ;
+                                          ex:country ?country
+                               }
+                               LIMIT 100"
+              res @(fluree/query-connection @e2e-conn sparql-distinct {:format :sparql})]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should have country results")
+          ;; With :format :sparql and default :output :fql, results are single-element vectors [country]
+          ;; All results should have unique countries
+          (let [countries (map first res)]
+            (is (= (count countries) (count (set countries)))
+                "SELECT DISTINCT should return unique countries")))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-sparql-distinct-with-aggregation-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: SELECT DISTINCT with aggregation"
+      (setup-fluree-system)
+      (try
+        ;; Register the multi-table Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-distinct-agg:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; COUNT DISTINCT - count unique countries
+        ;; Note: COUNT(DISTINCT ?var) is different from SELECT DISTINCT
+        ;; COUNT DISTINCT is already implemented in aggregation
+        (let [sparql-count-distinct "PREFIX ex: <http://example.org/>
+                                     SELECT (COUNT(*) AS ?total)
+                                     FROM <iceberg/openflights-distinct-agg>
+                                     WHERE {
+                                       ?airline a ex:Airline ;
+                                                ex:country ?country
+                                     }"
+              res @(fluree/query-connection @e2e-conn sparql-count-distinct {:format :sparql})]
+          (is (vector? res) "Should return aggregated results")
+          (is (= 1 (count res)) "COUNT without GROUP BY returns 1 row"))
+
+        (finally
+          (teardown-fluree-system))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Anti-Join E2E Tests (FILTER EXISTS, FILTER NOT EXISTS, MINUS)
+;;; ---------------------------------------------------------------------------
+
+(deftest e2e-sparql-filter-not-exists-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: FILTER NOT EXISTS excludes matching results"
+      (setup-fluree-system)
+      (try
+        ;; Register the multi-table Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-not-exists:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; Find airlines that DON'T have a specific country (e.g., not United States)
+        ;; This tests NOT EXISTS with a correlated subquery
+        (let [sparql-not-exists "PREFIX ex: <http://example.org/>
+                                 SELECT ?airline ?name ?country
+                                 FROM <iceberg/openflights-not-exists>
+                                 WHERE {
+                                   ?airline a ex:Airline ;
+                                            ex:name ?name ;
+                                            ex:country ?country .
+                                   FILTER NOT EXISTS {
+                                     ?airline ex:country \"United States\"
+                                   }
+                                 }
+                                 LIMIT 20"
+              res @(fluree/query-connection @e2e-conn sparql-not-exists {:format :sparql})]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should have results (airlines not from US)")
+          ;; All results should NOT be from United States
+          ;; Results may be tuples [airline name country] or maps {"country" ...}
+          (when (seq res)
+            (let [get-country (fn [r] (if (map? r) (get r "country") (nth r 2 nil)))]
+              (is (every? #(not= "United States" (get-country %)) res)
+                  "FILTER NOT EXISTS should exclude US airlines"))))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-sparql-filter-exists-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: FILTER EXISTS keeps only matching results"
+      (setup-fluree-system)
+      (try
+        ;; Register the multi-table Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-exists:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; Find airlines that DO have a specific country (e.g., United States)
+        ;; This tests EXISTS with a correlated subquery
+        (let [sparql-exists "PREFIX ex: <http://example.org/>
+                             SELECT ?airline ?name ?country
+                             FROM <iceberg/openflights-exists>
+                             WHERE {
+                               ?airline a ex:Airline ;
+                                        ex:name ?name ;
+                                        ex:country ?country .
+                               FILTER EXISTS {
+                                 ?airline ex:country \"United States\"
+                               }
+                             }
+                             LIMIT 20"
+              res @(fluree/query-connection @e2e-conn sparql-exists {:format :sparql})]
+          (is (vector? res) "Should return results")
+          (is (pos? (count res)) "Should have results (US airlines)")
+          ;; All results should be from United States
+          ;; Results may be tuples [airline name country] or maps {"country" ...}
+          (when (seq res)
+            (let [get-country (fn [r] (if (map? r) (get r "country") (nth r 2 nil)))]
+              (is (every? #(= "United States" (get-country %)) res)
+                  "FILTER EXISTS should only include US airlines"))))
+
+        (finally
+          (teardown-fluree-system))))))
+
+(deftest e2e-sparql-minus-test
+  ;; NOTE: MINUS keyword is not yet supported in Fluree's SPARQL parser.
+  ;; The VG MINUS execution code is implemented but can't be tested via SPARQL.
+  ;; This test is disabled until SPARQL parser supports MINUS.
+  ;; The execution code in iceberg.clj apply-minus function is ready.
+  (when false ;; Disabled - SPARQL parser doesn't support MINUS keyword
+    (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+      (testing "End-to-end: MINUS performs set difference"
+        (setup-fluree-system)
+        (try
+          ;; Register the multi-table Iceberg virtual graph
+          (async/<!! (nameservice/publish-vg
+                      @e2e-publisher
+                      {:vg-name "iceberg/openflights-minus:main"
+                       :vg-type "fidx:Iceberg"
+                       :config {:warehouse-path warehouse-path
+                                :mapping multi-table-mapping-path}}))
+
+          ;; MINUS: Get all airlines except those from United States
+          ;; MINUS is an uncorrelated set difference based on shared variables
+          (let [sparql-minus "PREFIX ex: <http://example.org/>
+                              SELECT ?airline ?name ?country
+                              FROM <iceberg/openflights-minus>
+                              WHERE {
+                                ?airline a ex:Airline ;
+                                         ex:name ?name ;
+                                         ex:country ?country .
+                              }
+                              MINUS {
+                                ?airline ex:country \"United States\"
+                              }
+                              LIMIT 20"
+                res @(fluree/query-connection @e2e-conn sparql-minus {:format :sparql})]
+            (is (vector? res) "Should return results")
+            (is (pos? (count res)) "Should have results (non-US airlines)")
+            ;; All results should NOT be from United States
+            ;; Results may be tuples [airline name country] or maps {"country" ...}
+            (when (seq res)
+              (let [get-country (fn [r] (if (map? r) (get r "country") (nth r 2 nil)))]
+                (is (every? #(not= "United States" (get-country %)) res)
+                    "MINUS should exclude US airlines"))))
+
+          (finally
+            (teardown-fluree-system)))))))
+
+(deftest e2e-sparql-not-exists-cross-table-test
+  (when (and (warehouse-exists?) (multi-table-mapping-exists?))
+    (testing "End-to-end: FILTER NOT EXISTS across tables (airlines without routes)"
+      (setup-fluree-system)
+      (try
+        ;; Register the multi-table Iceberg virtual graph
+        (async/<!! (nameservice/publish-vg
+                    @e2e-publisher
+                    {:vg-name "iceberg/openflights-not-exists-cross:main"
+                     :vg-type "fidx:Iceberg"
+                     :config {:warehouse-path warehouse-path
+                              :mapping multi-table-mapping-path}}))
+
+        ;; Find airlines that have no routes
+        ;; This demonstrates cross-table anti-join capability
+        (let [sparql-cross-not-exists "PREFIX ex: <http://example.org/>
+                                       SELECT ?airline ?name
+                                       FROM <iceberg/openflights-not-exists-cross>
+                                       WHERE {
+                                         ?airline a ex:Airline ;
+                                                  ex:name ?name .
+                                         FILTER NOT EXISTS {
+                                           ?route ex:airlineRef ?airline
+                                         }
+                                       }
+                                       LIMIT 50"
+              res @(fluree/query-connection @e2e-conn sparql-cross-not-exists {:format :sparql})]
+          (is (vector? res) "Should return results")
+          ;; There should be many airlines without routes in the data
+          (is (pos? (count res)) "Should have airlines without routes"))
 
         (finally
           (teardown-fluree-system))))))

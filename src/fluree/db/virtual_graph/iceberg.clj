@@ -25,6 +25,8 @@
   (:require [clojure.core.async :as async :refer [go]]
             [clojure.set]
             [clojure.string :as str]
+            [fluree.db.datatype :as datatype]
+            [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.optimize :as optimize]
             [fluree.db.tabular.iceberg :as iceberg]
@@ -40,7 +42,8 @@
             [fluree.db.virtual-graph.iceberg.pushdown :as pushdown]
             [fluree.db.virtual-graph.iceberg.query :as query]
             [fluree.db.virtual-graph.iceberg.r2rml :as r2rml])
-  (:import [java.time Instant]))
+  (:import [fluree.db.query.exec.select AsSelector]
+           [java.time Instant]))
 
 (set! *warn-on-reflection* true)
 
@@ -262,8 +265,10 @@
    When join-columns is provided, those columns are included in the scan
    and their raw values are stored in the solution for hash join operations.
 
+   When all-mappings is provided, it's passed through for RefObjectMap resolution.
+
    Returns a lazy seq of solutions."
-  [sources mapping patterns base-solution time-travel solution-pushdown join-columns]
+  [sources mapping patterns base-solution time-travel solution-pushdown join-columns all-mappings]
   (let [table-name (:table mapping)
         source (get sources table-name)]
     (when-not source
@@ -272,7 +277,7 @@
                        :table table-name
                        :available-sources (keys sources)})))
     (query/execute-iceberg-query source mapping patterns base-solution
-                                 time-travel nil solution-pushdown join-columns)))
+                                 time-travel nil solution-pushdown join-columns all-mappings)))
 
 (defn- execute-multi-table-hash-join
   "Execute a multi-table query using hash joins.
@@ -291,7 +296,7 @@
    but the patterns don't traverse the FK, a Cartesian product is used.
 
    Falls back to Cartesian product with compatible-merge if no traversed edges exist."
-  [sources pattern-groups solution time-travel solution-pushdown join-graph]
+  [sources pattern-groups solution time-travel solution-pushdown join-graph all-mappings]
   (let [;; Collect join columns for each table so they're included in results
         table->join-cols (into {}
                                (for [{:keys [mapping]} pattern-groups
@@ -317,7 +322,7 @@
                                  :optional? (boolean optional?)
                                  :solutions (vec (execute-pattern-group
                                                   sources mapping patterns solution
-                                                  time-travel solution-pushdown join-cols))}))
+                                                  time-travel solution-pushdown join-cols all-mappings))}))
                             pattern-groups)
 
         _ (log/debug "Multi-table query executed:"
@@ -690,7 +695,7 @@
               (execute-columnar-single-table source mapping patterns base-solution
                                              time-travel solution-pushdown)
               (vec (query/execute-iceberg-query source mapping patterns base-solution
-                                                time-travel nil solution-pushdown)))))
+                                                time-travel nil solution-pushdown nil mappings)))))
 
         ;; Multiple tables - use hash join
         :else
@@ -698,7 +703,7 @@
           (execute-columnar-multi-table sources pattern-groups base-solution
                                         time-travel solution-pushdown join-graph)
           (execute-multi-table-hash-join sources pattern-groups base-solution
-                                         time-travel solution-pushdown join-graph))))))
+                                         time-travel solution-pushdown join-graph mappings))))))
 
 (defn- execute-union-patterns
   "Execute UNION patterns and return combined solutions.
@@ -833,16 +838,17 @@
   "Extract scalar value from a Fluree match object or return raw value.
 
    SPARQL solutions in Fluree contain match objects with metadata.
-   This function extracts the raw value for aggregation purposes."
+   This function extracts the raw value for aggregation purposes.
+   Handles both literal values (::val) and IRI values (::iri)."
   [v]
   (cond
     ;; Already a scalar (from row-based execution)
     (or (number? v) (string? v) (boolean? v) (nil? v))
     v
 
-    ;; Fluree match object - use where/get-value
+    ;; Fluree match object - try get-value first (for literals), then get-iri (for IRIs)
     (map? v)
-    (where/get-value v)
+    (or (where/get-value v) (where/get-iri v))
 
     ;; Other (keywords, etc.)
     :else v))
@@ -1011,20 +1017,485 @@
     offset (drop offset)
     limit (take limit)))
 
-(defn- finalize-aggregation
-  "Apply aggregation, ORDER BY, and LIMIT to solutions.
+(defn- apply-distinct
+  "Apply DISTINCT to a sequence of solutions, deduplicating by all keys.
 
-   This function is called when the aggregation-spec atom contains
-   aggregation info from the parsed query.
+   Uses a Set to track seen solutions for O(1) lookup per solution.
+   Solutions are compared by their complete map structure.
 
    Args:
-     solutions       - Sequence of solution maps from VG execution
-     agg-info        - Map with :select, :group-by, :order-by, :limit, :offset
-     mappings        - R2RML mappings for variable->column resolution
+     solutions - Sequence of solution maps
 
-   Returns sequence of aggregated solutions."
-  [solutions agg-info mappings]
-  (let [{:keys [select group-by order-by limit offset]} agg-info
+   Returns deduplicated sequence preserving first occurrence order."
+  [solutions]
+  (let [seen (java.util.HashSet.)]
+    (filter (fn [sol]
+              (let [added? (.add seen sol)]
+                added?))
+            solutions)))
+
+;;; ---------------------------------------------------------------------------
+;;; Anti-Join Execution (EXISTS, NOT EXISTS, MINUS)
+;;; ---------------------------------------------------------------------------
+
+(defn- execute-anti-join-inner
+  "Execute inner patterns of an anti-join against Iceberg tables.
+
+   This is used by EXISTS, NOT EXISTS, and MINUS to evaluate the inner pattern.
+
+   For EXISTS/NOT EXISTS (correlated), the outer solution's bindings are
+   available to the inner pattern execution.
+
+   For MINUS (uncorrelated), the inner pattern is executed independently.
+
+   Args:
+     sources         - Map of table-name -> IcebergSource
+     mappings        - R2RML mappings
+     routing-indexes - Pattern routing indexes
+     join-graph      - Join graph for multi-table queries
+     inner-patterns  - The inner WHERE patterns to execute
+     outer-solution  - Solution from outer query (for correlated subqueries)
+     time-travel     - Time travel spec (or nil)
+     use-columnar?   - Whether to use columnar execution
+
+   Returns sequence of solutions from inner pattern execution."
+  [sources mappings routing-indexes join-graph inner-patterns outer-solution time-travel use-columnar?]
+  ;; Route inner patterns to tables
+  (let [pattern-groups (query/group-patterns-by-table inner-patterns mappings routing-indexes)]
+    (cond
+      ;; Empty patterns - no results
+      (empty? pattern-groups)
+      []
+
+      ;; Single table
+      (= 1 (count pattern-groups))
+      (let [{:keys [mapping patterns]} (first pattern-groups)
+            table-name (:table mapping)
+            source (get sources table-name)]
+        (if-not source
+          []
+          (if use-columnar?
+            (execute-columnar-single-table
+             source mapping patterns outer-solution time-travel nil)
+            (query/execute-iceberg-query
+             source mapping patterns outer-solution time-travel nil nil nil mappings))))
+
+      ;; Multiple tables - use join execution
+      :else
+      (if use-columnar?
+        (execute-columnar-multi-table
+         sources pattern-groups outer-solution time-travel nil join-graph)
+        (execute-multi-table-hash-join
+         sources pattern-groups outer-solution time-travel nil join-graph mappings)))))
+
+(defn- extract-pattern-vars
+  "Extract all variable symbols from a sequence of WHERE patterns.
+
+   Used to determine which outer solution bindings are relevant for
+   correlated subquery memoization.
+
+   Handles:
+   - MapEntry patterns (from where/->pattern): [:tuple {:s {:var ?x} ...}]
+   - Raw map patterns (SPARQL): {:s ?x :p \"pred\" :o \"val\"}
+   - Vector patterns (SPARQL nested): [\"exists\" [{:s ?x ...}]]"
+  [patterns]
+  (if-not (sequential? patterns)
+    #{}  ;; Return empty set for non-sequential inputs
+    (into #{}
+      (mapcat (fn [pattern]
+                (cond
+                  ;; MapEntry pattern - use where accessors
+                  (map-entry? pattern)
+                  (let [ptype (where/pattern-type pattern)
+                        pdata (where/pattern-data pattern)]
+                    (case ptype
+                      :tuple
+                      ;; Extract vars from tuple pattern slots
+                      (->> pdata
+                           (keep (fn [[_slot m]]
+                                   (when (and (map? m) (:var m))
+                                     (:var m)))))
+                      ;; Nested patterns - recurse
+                      (:exists :not-exists :minus)
+                      (extract-pattern-vars pdata)
+                      ;; Other pattern types - no vars extracted
+                      nil))
+
+                  ;; Vector pattern - could be:
+                  ;; 1. SPARQL nested like ["exists" [...]]
+                  ;; 2. Tuple as [s-match p-match o-match] where matches have ::where/var
+                  (vector? pattern)
+                  (let [first-elem (first pattern)]
+                    (cond
+                      ;; Nested anti-join pattern
+                      (or (keyword? first-elem) (string? first-elem))
+                      (let [ptype (if (keyword? first-elem) first-elem (keyword first-elem))]
+                        (when (#{:exists :not-exists :minus} ptype)
+                          (extract-pattern-vars (second pattern))))
+
+                      ;; Tuple as vector of match objects [s p o]
+                      (map? first-elem)
+                      (->> pattern
+                           (keep (fn [match-obj]
+                                   (when (map? match-obj)
+                                     ;; Check for ::where/var in the match object
+                                     (or (::where/var match-obj)
+                                         (:var match-obj)
+                                         ;; Handle namespaced key as keyword
+                                         (get match-obj :fluree.db.query.exec.where/var))))))))
+
+                  ;; Raw map pattern (tuple) - extract vars directly
+                  (map? pattern)
+                  (->> pattern
+                       (keep (fn [[_slot m]]
+                               (cond
+                                 ;; Match object with :var
+                                 (and (map? m) (:var m))
+                                 (:var m)
+                                 ;; Direct symbol (SPARQL raw pattern)
+                                 (symbol? m)
+                                 m
+                                 :else nil))))
+
+                  :else nil))
+      patterns))))
+
+(defn- apply-exists
+  "Apply EXISTS filter: keep solutions where inner pattern matches.
+
+   EXISTS is a correlated subquery - the inner pattern uses bindings from
+   the outer solution. A solution is kept if the inner pattern produces
+   at least one result.
+
+   SPARQL semantics per spec section 8.2.
+
+   Performance optimization: Instead of executing the inner query per outer
+   solution (expensive), we execute it ONCE with no correlations to get all
+   possible matches, then use set membership tests. This converts EXISTS to
+   a semi-join operation which is much more efficient.
+
+   Args:
+     solutions       - Sequence of outer solutions
+     inner-patterns  - Patterns from the EXISTS clause
+     sources         - Map of table-name -> IcebergSource
+     mappings        - R2RML mappings
+     routing-indexes - Pattern routing indexes
+     join-graph      - Join graph
+     time-travel     - Time travel spec
+     use-columnar?   - Whether to use columnar execution
+
+   Returns filtered sequence of solutions."
+  [solutions inner-patterns sources mappings routing-indexes join-graph time-travel use-columnar?]
+  (let [solutions-vec (vec solutions)]
+    (if (empty? solutions-vec)
+      solutions-vec
+      ;; Find variables used in inner patterns
+      (let [inner-vars (extract-pattern-vars inner-patterns)
+            outer-keys (set (keys (first solutions-vec)))
+            ;; Correlated vars are those in both outer solution and inner patterns
+            correlated-vars (vec (clojure.set/intersection outer-keys inner-vars))]
+        (log/debug "EXISTS semi-join:" {:inner-var-count (count inner-vars)
+                                        :correlated-var-count (count correlated-vars)})
+        (if (empty? correlated-vars)
+          ;; No correlation - EXISTS evaluates to same result for all outer solutions
+          ;; Execute once and keep all or none
+          (let [inner-results (execute-anti-join-inner
+                                sources mappings routing-indexes join-graph
+                                inner-patterns {} time-travel use-columnar?)]
+            (if (seq inner-results)
+              solutions-vec  ;; Inner has results - keep all outer
+              []))           ;; Inner empty - remove all outer
+          ;; Has correlated vars - execute inner once, build index, do semi-join
+          (let [;; Execute inner query once without outer bindings
+                inner-results (vec (execute-anti-join-inner
+                                     sources mappings routing-indexes join-graph
+                                     inner-patterns {} time-travel use-columnar?))
+                ;; Build index: {[correlated-var-values] -> true}
+                inner-index (into #{}
+                              (keep (fn [inner-sol]
+                                      (let [vals (mapv #(get inner-sol %) correlated-vars)]
+                                        (when (every? some? vals)
+                                          vals))))
+                              inner-results)]
+            (log/debug "EXISTS index built:" {:inner-count (count inner-results)
+                                              :index-size (count inner-index)})
+            ;; Filter outer solutions using index - O(1) lookup
+            (filterv
+              (fn [outer-sol]
+                (let [outer-vals (mapv #(get outer-sol %) correlated-vars)]
+                  (and (every? some? outer-vals)
+                       (contains? inner-index outer-vals))))
+              solutions-vec)))))))
+
+(defn- apply-not-exists
+  "Apply NOT EXISTS filter: keep solutions where inner pattern does NOT match.
+
+   NOT EXISTS is a correlated subquery - the inner pattern uses bindings from
+   the outer solution. A solution is kept if the inner pattern produces
+   NO results.
+
+   SPARQL semantics per spec section 8.2.
+
+   Performance optimization: Instead of executing the inner query per outer
+   solution (expensive), we execute it ONCE with no correlations to get all
+   possible matches, then use set membership tests. This converts NOT EXISTS
+   to an anti-semi-join operation which is much more efficient.
+
+   Args:
+     solutions       - Sequence of outer solutions
+     inner-patterns  - Patterns from the NOT EXISTS clause
+     sources         - Map of table-name -> IcebergSource
+     mappings        - R2RML mappings
+     routing-indexes - Pattern routing indexes
+     join-graph      - Join graph
+     time-travel     - Time travel spec
+     use-columnar?   - Whether to use columnar execution
+
+   Returns filtered sequence of solutions."
+  [solutions inner-patterns sources mappings routing-indexes join-graph time-travel use-columnar?]
+  (let [solutions-vec (vec solutions)]
+    (if (empty? solutions-vec)
+      solutions-vec
+      ;; Find variables used in inner patterns
+      (let [inner-vars (extract-pattern-vars inner-patterns)
+            outer-keys (set (keys (first solutions-vec)))
+            ;; Correlated vars are those in both outer solution and inner patterns
+            correlated-vars (vec (clojure.set/intersection outer-keys inner-vars))]
+        (log/debug "NOT EXISTS anti-semi-join:" {:inner-var-count (count inner-vars)
+                                                  :correlated-var-count (count correlated-vars)})
+        (if (empty? correlated-vars)
+          ;; No correlation - NOT EXISTS evaluates to same result for all outer solutions
+          ;; Execute once and keep all or none
+          (let [inner-results (execute-anti-join-inner
+                                sources mappings routing-indexes join-graph
+                                inner-patterns {} time-travel use-columnar?)]
+            (if (seq inner-results)
+              []              ;; Inner has results - remove all outer
+              solutions-vec)) ;; Inner empty - keep all outer
+          ;; Has correlated vars - execute inner once, build index, do anti-semi-join
+          (let [;; Execute inner query once without outer bindings
+                inner-results (vec (execute-anti-join-inner
+                                     sources mappings routing-indexes join-graph
+                                     inner-patterns {} time-travel use-columnar?))
+                ;; Build index: {[correlated-var-values] -> true}
+                inner-index (into #{}
+                              (keep (fn [inner-sol]
+                                      (let [vals (mapv #(get inner-sol %) correlated-vars)]
+                                        (when (every? some? vals)
+                                          vals))))
+                              inner-results)]
+            (log/debug "NOT EXISTS index built:" {:inner-count (count inner-results)
+                                                  :index-size (count inner-index)})
+            ;; Filter outer solutions using index - O(1) lookup
+            ;; Keep solutions NOT in the inner index
+            (filterv
+              (fn [outer-sol]
+                (let [outer-vals (mapv #(get outer-sol %) correlated-vars)]
+                  (or (some nil? outer-vals)  ;; Unbound var - not a match, keep
+                      (not (contains? inner-index outer-vals)))))
+              solutions-vec)))))))
+
+(defn- apply-minus
+  "Apply MINUS set difference: remove solutions that match inner pattern.
+
+   MINUS is NOT a correlated subquery - the inner pattern is executed
+   independently. Then, for each outer solution, if there exists an inner
+   solution with the same values for all shared variables, the outer
+   solution is removed.
+
+   SPARQL semantics per spec section 8.3:
+   - Only shared variables are compared
+   - Unbound variables in either solution are treated as non-matching
+
+   Performance: Uses O(1) hash index lookup instead of O(inner) scan per outer.
+   Shared variables are determined once from solution structure, then inner
+   solutions are indexed by their shared-var values.
+
+   Args:
+     solutions       - Sequence of outer solutions
+     inner-patterns  - Patterns from the MINUS clause
+     sources         - Map of table-name -> IcebergSource
+     mappings        - R2RML mappings
+     routing-indexes - Pattern routing indexes
+     join-graph      - Join graph
+     time-travel     - Time travel spec
+     use-columnar?   - Whether to use columnar execution
+
+   Returns filtered sequence of solutions."
+  [solutions inner-patterns sources mappings routing-indexes join-graph time-travel use-columnar?]
+  ;; Execute inner pattern once (uncorrelated - no outer bindings)
+  (let [inner-solutions (vec (execute-anti-join-inner
+                               sources mappings routing-indexes join-graph
+                               inner-patterns {} time-travel use-columnar?))
+        outer-solutions (vec solutions)]
+    (cond
+      ;; No inner solutions - keep all outer solutions
+      (empty? inner-solutions)
+      outer-solutions
+
+      ;; No outer solutions - nothing to filter
+      (empty? outer-solutions)
+      outer-solutions
+
+      :else
+      ;; Determine shared vars from solution structure (consistent within each result set)
+      (let [inner-keys (set (keys (first inner-solutions)))
+            outer-keys (set (keys (first outer-solutions)))
+            shared-vars (vec (clojure.set/intersection outer-keys inner-keys))]
+        (if (empty? shared-vars)
+          ;; No shared variables - nothing can match, keep all
+          outer-solutions
+          ;; Build hash index: {[shared-var-values] -> true}
+          (let [inner-index (into #{}
+                              (keep (fn [inner-sol]
+                                      (let [vals (mapv #(get inner-sol %) shared-vars)]
+                                        ;; Only index if all shared vars are bound
+                                        (when (every? some? vals)
+                                          vals))))
+                              inner-solutions)]
+            (log/debug "MINUS index built:" {:shared-vars shared-vars
+                                             :inner-count (count inner-solutions)
+                                             :index-size (count inner-index)})
+            ;; Filter outer solutions - O(1) lookup per solution
+            (filterv
+              (fn [outer-sol]
+                (let [outer-vals (mapv #(get outer-sol %) shared-vars)]
+                  ;; Keep if: any shared var is unbound, OR values not in inner index
+                  (or (some nil? outer-vals)
+                      (not (contains? inner-index outer-vals)))))
+              outer-solutions)))))))
+
+(defn- apply-anti-joins
+  "Apply all anti-join patterns to solutions in sequence.
+
+   Anti-joins are applied after the main query execution and before
+   query modifiers (DISTINCT, ORDER BY, LIMIT).
+
+   Args:
+     solutions       - Sequence of solutions from main query
+     anti-joins      - Vector of {:type :exists/:not-exists/:minus :patterns [...]}
+     sources         - Map of table-name -> IcebergSource
+     mappings        - R2RML mappings
+     routing-indexes - Pattern routing indexes
+     join-graph      - Join graph
+     time-travel     - Time travel spec
+     use-columnar?   - Whether to use columnar execution
+
+   Returns solutions after applying all anti-joins."
+  [solutions anti-joins sources mappings routing-indexes join-graph time-travel use-columnar?]
+  (reduce
+   (fn [sols {:keys [type patterns]}]
+     (log/debug "Applying anti-join:" {:type type :pattern-count (count patterns)
+                                       :input-solutions (count sols)})
+     (let [result (case type
+                    :exists (apply-exists sols patterns sources mappings
+                                          routing-indexes join-graph time-travel use-columnar?)
+                    :not-exists (apply-not-exists sols patterns sources mappings
+                                                  routing-indexes join-graph time-travel use-columnar?)
+                    :minus (apply-minus sols patterns sources mappings
+                                        routing-indexes join-graph time-travel use-columnar?)
+                    ;; Unknown type - pass through
+                    (do (log/warn "Unknown anti-join type:" type)
+                        sols))
+           ;; Force realization to get accurate count for logging
+           result-vec (vec result)]
+       (log/debug "Anti-join result:" {:type type :output-solutions (count result-vec)})
+       result-vec))
+   solutions
+   anti-joins))
+
+(defn- transform-aggregates-to-variables
+  "Transform aggregate selectors to simple variable selectors.
+
+   When VG handles aggregation, we need to modify the parsed query so the
+   query executor's group/combine doesn't try to aggregate again.
+
+   Replaces AsSelector (aggregate) with VariableSelector using the bind-var.
+   For example: (COUNT ?airline AS ?count) -> ?count"
+  [selectors output-format]
+  (mapv (fn [sel]
+          (if (instance? AsSelector sel)
+            ;; Replace aggregate with simple variable selector using bind-var
+            (let [bind-var (:bind-var sel)
+                  new-sel (select/variable-selector bind-var output-format)]
+              (log/debug "transform-aggregates-to-variables: replacing AsSelector"
+                         {:bind-var bind-var
+                          :output-format output-format
+                          :new-sel-type (type new-sel)
+                          :new-sel-meta-keys (keys (meta new-sel))})
+              new-sel)
+            ;; Keep non-aggregates as-is
+            sel))
+        selectors))
+
+(defn- convert-aggregated-to-solutions
+  "Convert aggregated results to SPARQL solutions with symbol keys.
+
+   Aggregated results have keys like {'country' 'US', 'count' 10}
+   SPARQL solutions need symbol keys like {?country match-obj, ?count match-obj}
+   where match-obj wraps the value for proper SPARQL result formatting.
+
+   Uses the group-by clause and aggregate specs to build the key mapping."
+  [aggregated-rows group-by-clause group-keys aggregates]
+  (when (seq aggregated-rows)
+    ;; Build mapping from string column keys to SPARQL variable symbols
+    ;; 1. Group-by: map column name to original variable (group-by has [?country], group-keys has ['country'])
+    (let [group-key-map (when (and (seq group-by-clause) (seq group-keys))
+                          (zipmap group-keys group-by-clause))
+          ;; 2. Aggregates: map alias to bind-var (or derive symbol from alias)
+          agg-key-map (into {}
+                            (keep (fn [{:keys [alias bind-var]}]
+                                    (when alias
+                                      ;; Use bind-var if available, else create symbol from alias
+                                      (let [sym (or bind-var
+                                                    (symbol (str "?" alias)))]
+                                        [alias sym])))
+                                  aggregates))
+          key-map (merge group-key-map agg-key-map)]
+      (log/debug "convert-aggregated-to-solutions key-map:" {:group-key-map group-key-map
+                                                             :agg-key-map agg-key-map
+                                                             :key-map key-map})
+      ;; Convert each row - use symbol keys with wrapped values for SPARQL select formatters
+      (mapv (fn [row]
+              (reduce-kv (fn [acc str-key value]
+                           ;; Get the SPARQL variable symbol (like ?country)
+                           (let [var-sym (or (get key-map str-key)
+                                             ;; Fallback: create symbol from string
+                                             (symbol (str "?" str-key)))]
+                             ;; Wrap value in a match object for SPARQL select formatters
+                             ;; Use empty map {} as base (var-sym is the key, not inside match)
+                             ;; and infer datatype from value
+                             (if (nil? value)
+                               (assoc acc var-sym (where/unmatched-var var-sym))
+                               (assoc acc var-sym (where/match-value {} value (datatype/infer-iri value))))))
+                         {}
+                         row))
+            aggregated-rows))))
+
+(defn- finalize-query-modifiers
+  "Apply query modifiers (aggregation, DISTINCT, ORDER BY, LIMIT) to solutions.
+
+   This function is called when the aggregation-spec atom contains
+   query modifier info from the parsed query.
+
+   SPARQL modifier order (per spec section 15):
+   1. GROUP BY + aggregates
+   2. HAVING (not yet implemented)
+   3. DISTINCT
+   4. ORDER BY
+   5. LIMIT/OFFSET
+
+   Args:
+     solutions  - Sequence of solution maps from VG execution
+     query-info - Map with :select, :group-by, :order-by, :distinct?, :limit, :offset
+     mappings   - R2RML mappings for variable->column resolution
+
+   Returns modified solutions."
+  [solutions query-info mappings]
+  (log/debug "finalize-query-modifiers input:" {:query-info query-info
+                                                :mapping-count (count mappings)
+                                                :solution-count (count solutions)})
+  (let [{:keys [select group-by order-by distinct? limit offset]} query-info
         ;; Build a combined mapping from all available mappings
         ;; This is needed to resolve variables to columns
         combined-mapping (reduce
@@ -1032,41 +1503,67 @@
                             (update acc :predicates merge (:predicates m)))
                           {:predicates {}}
                           mappings)
+        _ (log/debug "finalize-query-modifiers combined-mapping predicates:"
+                     {:predicate-keys (keys (:predicates combined-mapping))})
         ;; Build aggregation spec using the existing function
         parsed-query {:select select :group-by group-by}
-        agg-spec (query/build-aggregation-spec parsed-query combined-mapping)]
+        agg-spec (query/build-aggregation-spec parsed-query combined-mapping)
+        _ (log/debug "finalize-query-modifiers agg-spec:" {:agg-spec agg-spec})]
 
     (if agg-spec
       (let [{:keys [group-keys aggregates]} agg-spec
             _ (log/debug "Applying VG-level aggregation:" {:group-keys group-keys
-                                                           :aggregates (count aggregates)
-                                                           :input-solutions (count solutions)})
+                                                           :aggregates aggregates
+                                                           :distinct? distinct?
+                                                           :input-solutions (count solutions)
+                                                           :first-solution (first solutions)})
             ;; Force realization of solutions for aggregation
             solutions-vec (vec solutions)
-            ;; Apply aggregation
-            aggregated (apply-aggregation solutions-vec group-keys aggregates)
+            ;; Apply aggregation (returns string-keyed result maps)
+            aggregated-raw (apply-aggregation solutions-vec group-keys aggregates)
+            _ (log/debug "Aggregation raw result:" {:output-count (count aggregated-raw)
+                                                    :first-result (first aggregated-raw)
+                                                    :first-result-keys (when (first aggregated-raw) (keys (first aggregated-raw)))})
+            ;; Convert aggregated results back to SPARQL solutions with symbol keys
+            aggregated (convert-aggregated-to-solutions aggregated-raw group-by group-keys aggregates)
+            _ (log/debug "Aggregation converted result:" {:output-count (count aggregated)
+                                                          :first-result (first aggregated)
+                                                          :first-result-keys (when (first aggregated) (keys (first aggregated)))})
+            ;; Apply DISTINCT (after aggregation, before ORDER BY per SPARQL spec)
+            deduped (if distinct?
+                      (apply-distinct aggregated)
+                      aggregated)
             ;; Apply ORDER BY
-            ordered (apply-order-by aggregated order-by)
+            ordered (apply-order-by deduped order-by)
             ;; Apply LIMIT/OFFSET
             limited (apply-limit-offset ordered limit offset)]
-        (log/debug "Aggregation complete:" {:output-rows (count limited)})
+        (log/debug "Query modifiers complete:" {:output-rows (count limited)
+                                                :distinct? distinct?})
         limited)
-      ;; No valid aggregation spec - just apply ORDER BY and LIMIT if present
-      (-> solutions
-          (apply-order-by order-by)
-          (apply-limit-offset limit offset)))))
+      ;; No aggregation - apply DISTINCT, ORDER BY, and LIMIT if present
+      (let [deduped (if distinct?
+                      (do
+                        (log/debug "Applying VG-level DISTINCT:" {:input-solutions (count solutions)})
+                        (apply-distinct solutions))
+                      solutions)
+            ordered (apply-order-by deduped order-by)
+            limited (apply-limit-offset ordered limit offset)]
+        (when distinct?
+          (log/debug "DISTINCT complete:" {:output-rows (count limited)}))
+        limited))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; IcebergDatabase Record (Multi-Table Support)
 ;;; ---------------------------------------------------------------------------
 
-(defrecord IcebergDatabase [alias config sources mappings routing-indexes join-graph time-travel query-pushdown aggregation-spec]
+(defrecord IcebergDatabase [alias config sources mappings routing-indexes join-graph time-travel query-pushdown aggregation-spec anti-join-spec]
   ;; sources: {table-name -> IcebergSource}
   ;; mappings: {table-key -> {:table, :class, :predicates, ...}}
   ;; routing-indexes: {:class->mappings {rdf-class -> [mappings...]}, :predicate->mappings {pred -> [mappings...]}}
   ;; join-graph: {:edges [JoinEdge...], :by-table {table -> [edges]}, :tm->table {iri -> table}}
   ;; query-pushdown: atom holding query-time pushdown predicates (set in -reorder, used in -finalize)
   ;; aggregation-spec: atom holding aggregation spec {:group-keys [...] :aggregates [...] :order-by [...] :limit n}
+  ;; anti-join-spec: atom holding anti-join patterns [{:type :exists/:not-exists/:minus :patterns [...]} ...]
 
   vg/UpdatableVirtualGraph
   (upsert [this _source-db _new-flakes _remove-flakes]
@@ -1114,23 +1611,30 @@
           values-pushdown (when query-pushdown @query-pushdown)
           ;; Capture aggregation spec from atom (set in -reorder)
           agg-info (when aggregation-spec @aggregation-spec)
+          ;; Capture anti-join spec from atom (set in -reorder)
+          anti-joins (when anti-join-spec @anti-join-spec)
           ;; Capture columnar execution flag at query start (binding may change)
           use-columnar? *columnar-execution*
-          ;; If aggregation is needed, we must collect all solutions before emitting
+          ;; If aggregation or anti-joins are needed, we must collect all solutions before emitting
+          ;; Anti-joins require collecting because they filter based on correlated/uncorrelated subqueries
           ;; Otherwise, stream solutions directly
+          needs-collection? (or agg-info (seq anti-joins))
           out-ch (async/chan 1 (map #(dissoc % ::iceberg-patterns)))]
       (when (seq values-pushdown)
         (log/debug "Iceberg -finalize using VALUES pushdown from atom:" values-pushdown))
       (when agg-info
         (log/debug "Iceberg -finalize will apply aggregation:" agg-info))
+      (when (seq anti-joins)
+        (log/debug "Iceberg -finalize will apply anti-joins:" {:count (count anti-joins)
+                                                               :types (mapv :type anti-joins)}))
       (when use-columnar?
         (log/debug "Iceberg -finalize using Phase 3 columnar execution"))
 
       ;; Use pipeline-async with thread (not go) for blocking I/O operations
       ;; Iceberg queries involve lazy seq realization with actual I/O, which would
       ;; block the limited go thread pool and cause contention under load
-      (if agg-info
-        ;; Aggregation path: collect all solutions, aggregate, then emit
+      (if needs-collection?
+        ;; Collection path: collect all solutions, apply anti-joins/aggregation, then emit
         (async/thread
           (try
             (let [all-solutions (atom [])]
@@ -1164,7 +1668,7 @@
                                                    time-travel solution-pushdown)
                                                   (query/execute-iceberg-query
                                                    source mapping patterns solution
-                                                   time-travel nil solution-pushdown))]
+                                                   time-travel nil solution-pushdown nil mappings))]
                                     (swap! all-solutions into results))))
                               ;; Multiple tables
                               (let [results (if use-columnar?
@@ -1173,16 +1677,25 @@
                                                time-travel solution-pushdown join-graph)
                                               (execute-multi-table-hash-join
                                                sources pattern-groups solution
-                                               time-travel solution-pushdown join-graph))]
+                                               time-travel solution-pushdown join-graph mappings))]
                                 (swap! all-solutions into results))))))
                       ;; No patterns - pass through
                       (swap! all-solutions conj solution)))
                   (recur)))
-              ;; Apply aggregation to collected solutions
-              (let [aggregated (finalize-aggregation @all-solutions agg-info mappings)]
-                (log/debug "Aggregation applied:" {:input (count @all-solutions)
-                                                   :output (count aggregated)})
-                (doseq [sol aggregated]
+              ;; Apply anti-joins first (before query modifiers)
+              (let [after-anti-joins (if (seq anti-joins)
+                                       (apply-anti-joins @all-solutions anti-joins
+                                                         sources mappings routing-indexes
+                                                         join-graph time-travel use-columnar?)
+                                       @all-solutions)
+                    ;; Apply query modifiers (aggregation, DISTINCT, ORDER BY, LIMIT)
+                    modified (if agg-info
+                               (finalize-query-modifiers after-anti-joins agg-info mappings)
+                               after-anti-joins)]
+                (log/debug "Query modifiers applied:" {:input (count @all-solutions)
+                                                       :after-anti-joins (count after-anti-joins)
+                                                       :output (count modified)})
+                (doseq [sol modified]
                   (async/>!! out-ch sol))))
             (catch Exception e
               (log/error e "Error in Iceberg aggregation")
@@ -1238,7 +1751,7 @@
                                                 source mapping patterns solution
                                                 time-travel solution-pushdown)
                                                (query/execute-iceberg-query source mapping patterns solution
-                                                                            time-travel nil solution-pushdown))]
+                                                                            time-travel nil solution-pushdown nil mappings))]
                                (doseq [sol solutions]
                                  (async/>!! ch sol))
                                (async/close! ch)))
@@ -1249,7 +1762,7 @@
                                                     time-travel solution-pushdown join-graph)
                                                    (execute-multi-table-hash-join
                                                     sources pattern-groups solution
-                                                    time-travel solution-pushdown join-graph))]
+                                                    time-travel solution-pushdown join-graph mappings))]
                              (doseq [sol final-solutions]
                                (async/>!! ch sol))
                              (async/close! ch))))))
@@ -1265,19 +1778,63 @@
   optimize/Optimizable
   (-reorder [_ parsed-query]
     (go
-      ;; Clear any stale pushdown/aggregation specs from previous queries
+      ;; Clear any stale specs from previous queries
       (when query-pushdown
         (reset! query-pushdown nil))
       (when aggregation-spec
         (reset! aggregation-spec nil))
-      (let [where-patterns (:where parsed-query)]
+      (when anti-join-spec
+        (reset! anti-join-spec nil))
+      (let [where-patterns (:where parsed-query)
+            ;; Helper to extract pattern type from both MapEntry and vector formats
+            ;; SPARQL translator produces vectors like ["not-exists" [...]]
+            ;; FQL parser produces MapEntry like [:not-exists [...]]
+            get-pattern-type (fn [pattern]
+                               (cond
+                                 (map-entry? pattern) (key pattern)
+                                 (vector? pattern) (let [first-elem (first pattern)]
+                                                     (cond
+                                                       (keyword? first-elem) first-elem
+                                                       (string? first-elem) (keyword first-elem)
+                                                       :else :tuple))
+                                 :else :tuple))
+            ;; Helper to extract pattern data
+            get-pattern-data (fn [pattern]
+                               (cond
+                                 (map-entry? pattern) (val pattern)
+                                 (vector? pattern) (second pattern)
+                                 :else pattern))]
         (if (seq where-patterns)
           ;; Separate different pattern types
+          ;; Handles both MapEntry and vector pattern formats
           (let [{filters true, non-filters false}
-                (group-by #(= :filter (first %)) where-patterns)
+                (group-by #(= :filter (get-pattern-type %)) where-patterns)
 
                 {values-patterns true, other-patterns false}
-                (group-by #(= :values (first %)) non-filters)
+                (group-by #(= :values (get-pattern-type %)) non-filters)
+
+                ;; Extract anti-join patterns (EXISTS, NOT EXISTS, MINUS)
+                ;; These are evaluated after the main query in -finalize
+                anti-join-types #{:exists :not-exists :minus}
+                {anti-join-patterns true, regular-patterns false}
+                (group-by #(contains? anti-join-types (get-pattern-type %)) other-patterns)
+
+                ;; Store anti-join patterns for -finalize if present
+                _ (when (and anti-join-spec (seq anti-join-patterns))
+                    (let [parsed-anti-joins
+                          (mapv (fn [pattern]
+                                  ;; Extract type and data, normalizing to keywords
+                                  {:type (get-pattern-type pattern)
+                                   :patterns (get-pattern-data pattern)})
+                                anti-join-patterns)]
+                      (log/debug "Iceberg -reorder storing anti-join patterns:"
+                                 {:count (count parsed-anti-joins)
+                                  :types (mapv :type parsed-anti-joins)})
+                      (reset! anti-join-spec parsed-anti-joins)))
+
+                ;; Use regular-patterns for the rest of the processing
+                ;; (anti-joins removed, they'll be applied in -finalize)
+                other-patterns regular-patterns
 
                 ;; Analyze each filter for pushability
                 analyzed (map pushdown/analyze-filter-pattern filters)
@@ -1387,23 +1944,66 @@
                 _ (when (and query-pushdown (seq values-pushdown-predicates))
                     (reset! query-pushdown values-pushdown-predicates))
 
-                ;; Extract aggregation info from parsed query for use in -finalize
-                ;; Store the raw query parts so they can be resolved with proper mappings later
-                agg-info (when (query/has-aggregations? parsed-query)
-                           {:select (:select parsed-query)
-                            :group-by (:group-by parsed-query)
-                            ;; Handle both :orderBy (SPARQL translator) and :order-by (JSON-LD)
-                            :order-by (or (:orderBy parsed-query) (:order-by parsed-query))
-                            :limit (:limit parsed-query)
-                            :offset (:offset parsed-query)})
-                _ (when (and aggregation-spec agg-info)
-                    (log/debug "Iceberg -reorder storing aggregation spec:" agg-info)
-                    (reset! aggregation-spec agg-info))]
+                ;; Extract query modifiers for use in -finalize
+                ;; Includes aggregation, DISTINCT, ORDER BY, LIMIT/OFFSET
+                ;; Handle both :selectDistinct (SPARQL) and :select-distinct (FQL)
+                distinct? (or (some? (:selectDistinct parsed-query))
+                              (some? (:select-distinct parsed-query)))
+                has-modifiers? (or (query/has-aggregations? parsed-query)
+                                   distinct?
+                                   (:orderBy parsed-query)
+                                   (:order-by parsed-query)
+                                   (:limit parsed-query)
+                                   (:offset parsed-query))
+                query-info (when has-modifiers?
+                             {:select (or (:select parsed-query)
+                                          (:selectDistinct parsed-query)
+                                          (:select-distinct parsed-query))
+                              :group-by (:group-by parsed-query)
+                              ;; Handle both :orderBy (SPARQL translator) and :order-by (JSON-LD)
+                              :order-by (or (:orderBy parsed-query) (:order-by parsed-query))
+                              :distinct? distinct?
+                              :limit (:limit parsed-query)
+                              :offset (:offset parsed-query)})
+                _ (when (and aggregation-spec query-info)
+                    (log/debug "Iceberg -reorder storing query modifiers:" query-info)
+                    (reset! aggregation-spec query-info))
+
+                ;; Check if VG is handling aggregation
+                vg-handles-aggregation? (query/has-aggregations? parsed-query)
+
+                ;; Get output format for creating new selectors
+                ;; Use :output from opts, which defaults to :fql
+                ;; (:format controls input format, :output controls output format - they are independent)
+                output-format (or (get-in parsed-query [:opts :output]) :fql)
+
+                ;; Get the current select clause
+                current-select (or (:select parsed-query)
+                                   (:selectDistinct parsed-query)
+                                   (:select-distinct parsed-query))
+
+                _ (when vg-handles-aggregation?
+                    (log/debug "Iceberg -reorder transforming aggregation:"
+                               {:vg-handles-aggregation? vg-handles-aggregation?
+                                :output-format output-format
+                                :opts-keys (keys (:opts parsed-query))
+                                :opts-output (get-in parsed-query [:opts :output])
+                                :opts-format (get-in parsed-query [:opts :format])
+                                :current-select-types (mapv type current-select)}))]
 
             ;; Store direct pushdown map in query opts for retrieval in -finalize
-            (-> parsed-query
-                (assoc :where new-where)
-                (assoc-in [:opts ::iceberg-direct-pushdown] direct-pushdown-map)))
+            ;; When VG handles aggregation, also:
+            ;; - Remove :group-by so group/combine doesn't run again
+            ;; - Transform aggregate selectors to simple variable selectors
+            (cond-> parsed-query
+              true (assoc :where new-where)
+              true (assoc-in [:opts ::iceberg-direct-pushdown] direct-pushdown-map)
+              ;; When VG handles aggregation, modify query to skip executor's aggregation
+              vg-handles-aggregation?
+              (-> (dissoc :group-by)
+                  (assoc :select (transform-aggregates-to-variables current-select output-format))
+                  ;; Remove selectDistinct/select-distinct if present (we'll apply DISTINCT in VG)
+                  (dissoc :selectDistinct :select-distinct))))
           parsed-query))))
 
   (-explain [_ parsed-query]
@@ -1647,4 +2247,5 @@
                            :join-graph join-graph
                            :time-travel nil
                            :query-pushdown (atom nil)
-                           :aggregation-spec (atom nil)})))
+                           :aggregation-spec (atom nil)
+                           :anti-join-spec (atom nil)})))
