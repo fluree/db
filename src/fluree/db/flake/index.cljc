@@ -94,13 +94,6 @@
     (leaf? node)   (dissoc node :flakes)
     (branch? node) (dissoc node :children)))
 
-(defn- same-assertion-fact?
-  [f1 f2]
-  (and (= (flake/s f1) (flake/s f2))
-       (= (flake/p f1) (flake/p f2))
-       (= (flake/o f1) (flake/o f2))
-       (= (flake/dt f1) (flake/dt f2))))
-
 (defn- redundant-same-op
   [flakes]
   (loop [prev nil
@@ -109,7 +102,7 @@
     (if xs
       (let [f (first xs)]
         (if (and prev
-                 (same-assertion-fact? prev f)
+                 (flake/equiv-flake prev f)
                  (= (flake/op prev) (flake/op f)))
           (recur prev (next xs) (conj! acc f))
           (recur f (next xs) acc)))
