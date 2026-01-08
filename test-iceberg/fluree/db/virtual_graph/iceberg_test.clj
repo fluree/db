@@ -390,18 +390,17 @@
         (finally
           (teardown-fluree-system))))))
 
-(deftest e2e-create-virtual-graph-api-test
+(deftest e2e-connect-iceberg-api-test
   (when (and (warehouse-exists?) (mapping-exists?))
-    (testing "End-to-end: Create Iceberg VG via fluree/create-virtual-graph API"
+    (testing "End-to-end: Create Iceberg VG via fluree/connect-iceberg API"
       (setup-fluree-system)
       (try
         ;; Create the Iceberg virtual graph using the public API
-        (let [vg-result @(fluree/create-virtual-graph
+        (let [vg-result @(fluree/connect-iceberg
                           @e2e-conn
-                          {:name "iceberg/airlines-api"
-                           :type :iceberg
-                           :config {:warehouse-path warehouse-path
-                                    :mapping mapping-path}})]
+                          "iceberg/airlines-api"
+                          {:warehouse-path warehouse-path
+                           :mapping mapping-path})]
           ;; Verify the VG was created with expected properties
           (is (map? vg-result) "Should return a map")
           (is (= "iceberg/airlines-api:main" (:alias vg-result)) "Should have normalized alias")
@@ -420,26 +419,24 @@
         (finally
           (teardown-fluree-system))))))
 
-(deftest e2e-create-virtual-graph-duplicate-error-test
+(deftest e2e-connect-iceberg-duplicate-error-test
   (when (and (warehouse-exists?) (mapping-exists?))
     (testing "End-to-end: Creating duplicate VG should error"
       (setup-fluree-system)
       (try
         ;; Create the first VG
-        @(fluree/create-virtual-graph
+        @(fluree/connect-iceberg
           @e2e-conn
-          {:name "iceberg/airlines-dup"
-           :type :iceberg
-           :config {:warehouse-path warehouse-path
-                    :mapping mapping-path}})
+          "iceberg/airlines-dup"
+          {:warehouse-path warehouse-path
+           :mapping mapping-path})
 
         ;; Try to create a duplicate - API returns exception as value
-        (let [result @(fluree/create-virtual-graph
+        (let [result @(fluree/connect-iceberg
                        @e2e-conn
-                       {:name "iceberg/airlines-dup"
-                        :type :iceberg
-                        :config {:warehouse-path warehouse-path
-                                 :mapping mapping-path}})]
+                       "iceberg/airlines-dup"
+                       {:warehouse-path warehouse-path
+                        :mapping mapping-path})]
           (is (instance? Exception result) "Should return an exception")
           (is (re-find #"already exists" (ex-message result))
               "Error should mention 'already exists'"))
