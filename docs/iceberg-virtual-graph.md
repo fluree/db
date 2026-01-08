@@ -12,6 +12,7 @@ For implementation details and roadmap, see `docs/ICEBERG_SPARQL_STRATEGY.md` an
 - [Configuration](#configuration)
 - [R2RML Mappings](#r2rml-mappings)
 - [SPARQL Query Examples](#sparql-query-examples)
+- [Transitive Property Paths](#transitive-property-path-queries)
 - [Predicate Pushdown](#predicate-pushdown)
 - [Time-Travel Queries](#time-travel-queries)
 - [Multi-Table Joins](#multi-table-joins)
@@ -48,6 +49,7 @@ The Iceberg virtual graph integration allows you to:
 | VALUES clause pushdown | ✅ Complete | Converted to IN predicates |
 | FILTER comparison pushdown | ✅ Complete | `=`, `!=`, `>`, `>=`, `<`, `<=` |
 | OPTIONAL patterns | ✅ Complete | Left outer join semantics |
+| Transitive property paths | ✅ Complete | `pred+` (one-or-more), `pred*` (zero-or-more) |
 | Vectorized execution | ⚠️ Experimental | Columnar plan exists, but disabled by default |
 | Aggregations (GROUP BY) | ✅ Supported (no pushdown) | Executed by the SPARQL engine after VG results are produced |
 | UNION patterns | ⚠️ Partial | UNION-only queries work; UNION mixed with other patterns is currently combined via cross product |
@@ -455,6 +457,90 @@ ORDER BY DESC(?count)
 - Equality predicate `active = "Y"` pushed down
 - Column projection: Only `country` and `active` columns
 
+### Transitive Property Path Queries
+
+Transitive property paths allow traversing relationships recursively. This is useful for hierarchical data like organizational structures, category taxonomies, or social networks.
+
+#### One-or-More (`+`) - Forward Traversal
+
+Find all people that Alice knows (transitively):
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+SELECT ?person
+WHERE {
+  ex:alice <ex:knows+> ?person .
+}
+```
+
+In FQL/JSON-LD syntax:
+```json
+{"@context": {"ex": "http://example.org/"},
+ "where": [{"@id": "ex:alice", "<ex:knows+>": "?person"}],
+ "select": "?person"}
+```
+
+#### One-or-More (`+`) - Backward Traversal
+
+Find all people who can reach Bob through the knows relationship:
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+SELECT ?person
+WHERE {
+  ?person <ex:knows+> ex:bob .
+}
+```
+
+#### Zero-or-More (`*`) - Includes Self
+
+Zero-or-more includes the starting node (reflexive):
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+SELECT ?person
+WHERE {
+  ex:alice <ex:knows*> ?person .
+}
+```
+
+Returns `ex:alice` plus all transitively reachable nodes.
+
+#### Both Variables Unbound
+
+Find all (subject, object) pairs connected by the transitive predicate:
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+SELECT ?x ?y
+WHERE {
+  ?x <ex:knows+> ?y .
+}
+LIMIT 1000
+```
+
+**Note:** This can be expensive for large graphs. Use LIMIT.
+
+#### Cycle Detection
+
+The implementation uses BFS with cycle detection, so cycles in the data don't cause infinite loops:
+
+```
+ex:a knows ex:b
+ex:b knows ex:c
+ex:c knows ex:a  ← cycle back to ex:a
+```
+
+Query: `ex:a <ex:knows+> ?who` returns `[ex:b, ex:c, ex:a]` (terminates correctly).
+
+#### Depth Limit
+
+A configurable depth limit (default: 100) prevents runaway queries on very deep hierarchies. If exceeded, a warning is logged and results up to that depth are returned.
+
 ## Predicate Pushdown
 
 The Iceberg integration automatically pushes predicates to the storage layer.
@@ -696,6 +782,9 @@ For native image builds, ensure Iceberg and Arrow classes are included in reflec
 | Slow queries without pushdown | Verify predicates are using supported patterns |
 | Memory issues with large joins | Reduce batch-size, enable columnar execution |
 | Missing results with OPTIONAL | Check join orientation (probe=required side) |
+| "Unsupported transitive path" error | Reachability check (both S and O bound) not supported; use forward/backward traversal |
+| Transitive query returns empty | Ensure predicate IRI matches R2RML mapping; check FK column exists |
+| Transitive depth limit warning | Deep hierarchy hit default 100-level limit; results truncated |
 
 ## Limitations and Future Work
 
@@ -725,10 +814,18 @@ For native image builds, ensure Iceberg and Arrow classes are included in reflec
 
 4. **Aggregation Pushdown**: GROUP BY aggregations are computed client-side.
 
+5. **Transitive Property Path Limitations**:
+   - **Reachability check not supported**: Both subject and object bound (e.g., `ex:a <ex:knows+> ex:z`) throws an error. Use forward/backward traversal with filtering instead.
+   - **Single-table only**: Transitive paths work within a single table's self-referential FK. Cross-table transitive paths are not yet supported.
+   - **Simple predicates only**: No support for inverse paths (`^ex:pred`), sequence paths (`ex:a/ex:b`), alternative paths (`ex:a|ex:b`), or depth modifiers (`ex:pred+3`).
+
 ### Future Work
 
 - [ ] GROUP BY aggregation pushdown
-- [ ] UNION pattern support
+- [x] Transitive property paths (`pred+`, `pred*`)
+- [ ] Transitive reachability check (`[:v :v :v]` pattern)
+- [ ] Cross-table transitive paths
+- [ ] UNION pattern support (complete)
 - [ ] Statistics-based query planning improvements
 - [ ] Parallel execution for multi-table queries
 - [ ] Spill-to-disk for large joins

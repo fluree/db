@@ -2113,6 +2113,141 @@
           (teardown-fluree-system))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; IRI Helper Function Tests
+;;; ---------------------------------------------------------------------------
+
+(deftest extract-id-from-iri-test
+  (testing "Extract ID from IRI with simple template"
+    (let [extract-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg.query/extract-id-from-iri)]
+      (testing "Standard template with ID at end"
+        (is (= "123" (extract-fn "http://example.org/airline/123"
+                                 "http://example.org/airline/{id}")))
+        (is (= "456" (extract-fn "http://example.org/airline/456"
+                                 "http://example.org/airline/{id}")))
+        (is (= "abc-def" (extract-fn "http://example.org/person/abc-def"
+                                     "http://example.org/person/{id}"))))
+
+      (testing "Template with suffix"
+        (is (= "123" (extract-fn "http://example.org/item/123/view"
+                                 "http://example.org/item/{id}/view"))))
+
+      (testing "Non-matching IRI returns nil"
+        (is (nil? (extract-fn "http://other.org/airline/123"
+                              "http://example.org/airline/{id}")))
+        (is (nil? (extract-fn "http://example.org/person/123"
+                              "http://example.org/airline/{id}"))))
+
+      (testing "Nil inputs return nil"
+        (is (nil? (extract-fn nil "http://example.org/{id}")))
+        (is (nil? (extract-fn "http://example.org/123" nil)))))))
+
+(deftest build-iri-from-id-test
+  (testing "Build IRI from ID and template"
+    (let [build-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg.query/build-iri-from-id)]
+      (testing "Standard template"
+        (is (= "http://example.org/airline/123"
+               (build-fn "123" "http://example.org/airline/{id}")))
+        (is (= "http://example.org/person/alice"
+               (build-fn "alice" "http://example.org/person/{name}"))))
+
+      (testing "Template with suffix"
+        (is (= "http://example.org/item/123/view"
+               (build-fn "123" "http://example.org/item/{id}/view"))))
+
+      (testing "Nil inputs return nil"
+        (is (nil? (build-fn nil "http://example.org/{id}")))
+        (is (nil? (build-fn "123" nil)))))))
+
+(deftest get-column-for-predicate-test
+  (when @vg
+    (testing "Get column for predicate from mapping"
+      (let [get-col-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg.query/get-column-for-predicate)
+            mapping (first (vals (:mappings @vg)))]
+        (testing "Valid predicate returns column name"
+          (is (= "name" (get-col-fn "http://example.org/airlines/name" mapping)))
+          (is (= "country" (get-col-fn "http://example.org/airlines/country" mapping))))
+
+        (testing "Invalid predicate returns nil"
+          (is (nil? (get-col-fn "http://example.org/nonexistent" mapping))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Transitive Pattern Detection Tests
+;;; ---------------------------------------------------------------------------
+
+(deftest transitive-pattern-detection-test
+  (testing "Transitive property path detection via where/get-transitive-property"
+    (let [;; Create predicate match objects with transitive tags
+          make-predicate (fn [iri tag]
+                           (let [base {::where/iri iri}]
+                             (if tag
+                               (assoc base ::where/recur tag)
+                               base)))]
+      (testing "one+ (one-or-more) tag detected"
+        (let [pred (make-predicate "http://example.org/knows" :one+)]
+          (is (= :one+ (where/get-transitive-property pred)))))
+
+      (testing "zero+ (zero-or-more) tag detected"
+        (let [pred (make-predicate "http://example.org/broader" :zero+)]
+          (is (= :zero+ (where/get-transitive-property pred)))))
+
+      (testing "Non-transitive predicate returns nil"
+        (let [pred (make-predicate "http://example.org/name" nil)]
+          (is (nil? (where/get-transitive-property pred))))))))
+
+(deftest transitive-pattern-removal-test
+  (testing "Transitive tag removal via where/remove-transitivity"
+    (let [make-predicate (fn [iri tag]
+                           (let [base {::where/iri iri}]
+                             (if tag
+                               (assoc base ::where/recur tag)
+                               base)))]
+      (testing "Removes one+ tag"
+        (let [pred (make-predicate "http://example.org/knows" :one+)
+              result (where/remove-transitivity pred)]
+          (is (nil? (::where/recur result)))
+          (is (= "http://example.org/knows" (::where/iri result)))))
+
+      (testing "Removes zero+ tag"
+        (let [pred (make-predicate "http://example.org/broader" :zero+)
+              result (where/remove-transitivity pred)]
+          (is (nil? (::where/recur result)))
+          (is (= "http://example.org/broader" (::where/iri result)))))
+
+      (testing "Non-transitive predicate unchanged"
+        (let [pred (make-predicate "http://example.org/name" nil)
+              result (where/remove-transitivity pred)]
+          (is (= pred result)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Transitive Path Iceberg VG Tests
+;;; ---------------------------------------------------------------------------
+;;
+;; NOTE: Full E2E transitive path tests require a dataset with self-referential
+;; relationships (e.g., employees with manager_id → employee_id, or categories
+;; with parent_id → category_id). The OpenFlights data does not have such
+;; hierarchical relationships.
+;;
+;; The transitive path implementation supports:
+;; - Forward traversal: ?s pred+ ?o (subject bound)
+;; - Backward traversal: ?s pred+ ?o (object bound)
+;; - Both unbound: ?s pred+ ?o (expensive, requires limit)
+;; - zero-or-more: pred* (includes starting node)
+;; - Cycle detection via visited set
+;; - Configurable depth limit (default 100)
+;;
+;; To test with hierarchical data, create an Iceberg table with structure like:
+;; CREATE TABLE employees (
+;;   id INT,
+;;   name STRING,
+;;   manager_id INT  -- FK to employees.id
+;; )
+;; Then create an R2RML mapping with a predicate like ex:reportsTo that maps
+;; to manager_id, and query with:
+;; SELECT ?employee ?manager WHERE { ?employee ex:reportsTo+ ?ceo }
+;;
+;;; ---------------------------------------------------------------------------
+
+;;; ---------------------------------------------------------------------------
 ;;; Run from REPL
 ;;; ---------------------------------------------------------------------------
 

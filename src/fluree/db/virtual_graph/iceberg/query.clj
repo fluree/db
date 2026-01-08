@@ -875,3 +875,73 @@
      ;; Transform to solutions - this is also lazy
      ;; Pass join-columns and all-mappings for hash join and RefObjectMap support
      (map #(row->solution % mapping pred->var subject-var base-solution join-columns all-mappings) rows))))
+
+;;; ---------------------------------------------------------------------------
+;;; IRI Helpers for Transitive Path Execution
+;;; ---------------------------------------------------------------------------
+
+(defn extract-id-from-iri
+  "Extract the ID portion from an IRI given a subject template.
+
+   E.g., 'http://example.org/airline/123' with template 'http://example.org/airline/{id}' → '123'
+   E.g., 'http://example.org/person/alice' with template 'http://example.org/person/{id}' → 'alice'
+
+   Returns nil if the IRI doesn't match the template pattern."
+  [iri subject-template]
+  (when (and (string? iri) (string? subject-template))
+    (let [;; Find the template variable position by splitting on { and }
+          ;; Template like 'http://example.org/airline/{id}' splits into
+          ;; prefix: 'http://example.org/airline/' and suffix: ''
+          prefix-end (str/index-of subject-template "{")
+          suffix-start (when prefix-end (str/index-of subject-template "}" prefix-end))]
+      (when (and prefix-end suffix-start)
+        (let [prefix (subs subject-template 0 prefix-end)
+              suffix (subs subject-template (inc suffix-start))]
+          (when (and (str/starts-with? iri prefix)
+                     (or (empty? suffix) (str/ends-with? iri suffix)))
+            (let [id-start (count prefix)
+                  id-end (if (empty? suffix)
+                           (count iri)
+                           (- (count iri) (count suffix)))]
+              (when (< id-start id-end)
+                (subs iri id-start id-end)))))))))
+
+(defn build-iri-from-id
+  "Build an IRI from an ID value and subject template.
+
+   E.g., '123' with template 'http://example.org/airline/{id}' → 'http://example.org/airline/123'
+
+   Returns nil if the template doesn't have a placeholder."
+  [id subject-template]
+  (when (and id subject-template)
+    (let [prefix-end (str/index-of subject-template "{")
+          suffix-start (when prefix-end (str/index-of subject-template "}" prefix-end))]
+      (when (and prefix-end suffix-start)
+        (let [prefix (subs subject-template 0 prefix-end)
+              suffix (subs subject-template (inc suffix-start))]
+          (str prefix id suffix))))))
+
+(defn find-mapping-for-predicate
+  "Find the R2RML mapping that handles a given predicate IRI.
+
+   Returns the first mapping that defines the predicate, or nil if not found."
+  [pred-iri _mappings routing-indexes]
+  (let [{:keys [predicate->mappings]} routing-indexes]
+    (first (get predicate->mappings pred-iri))))
+
+(defn get-column-for-predicate
+  "Get the Iceberg column name for a predicate IRI from R2RML mapping.
+
+   For :column type predicates, returns the column value.
+   For :ref type predicates (RefObjectMap / self-referential FK),
+   returns the child column from the join condition.
+
+   Returns nil if the predicate doesn't map to a column."
+  [pred-iri mapping]
+  (let [obj-map (get-in mapping [:predicates pred-iri])]
+    (case (:type obj-map)
+      :column (:value obj-map)
+      ;; For RefObjectMap (FK relationships), use the child column
+      ;; This is the FK column that points to another entity
+      :ref (:child (first (:join-conditions obj-map)))
+      nil)))
