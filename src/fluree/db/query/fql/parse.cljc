@@ -530,9 +530,18 @@
   [attrs]
   (every? v/specified-value? (keys attrs)))
 
-(defn variable-objects?
+(defn nested?
   [attrs]
-  (every? v/query-variable? (vals attrs)))
+  (boolean (some (fn [[_k v]]
+                   (map? v))
+                 attrs)))
+
+(defn simple-property-join?
+  [id attrs]
+  (and (>= (count attrs) 2)
+       (v/query-variable? id)
+       (specified-properties? attrs)
+       (not (nested? attrs))))
 
 (defn parse-id-map-pattern
   [m var-config context]
@@ -542,7 +551,9 @@
     (if (empty? attrs)
       [(where/->pattern :id s-mch)]
       (let [statements (parse-statements s-mch attrs var-config context)]
-        (sort optimize/compare-triples statements)))))
+        (if (simple-property-join? id attrs)
+          [(where/->pattern :property-join statements)]
+          (sort optimize/compare-triples statements))))))
 
 (defn parse-node-map
   [m var-config context]

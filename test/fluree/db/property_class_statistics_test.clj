@@ -249,9 +249,9 @@
      "size" 468}
     "ns" [{"id" "test/ledger-info:main"}]
     "index"
-    {"id" "fluree:index:sha256:ht4dfkq6dqy4rddqfldzkqwpx3aegjt4t4oirxgfnzlyx4k2bzy"
+    {"id" "fluree:index:sha256:bfwnwliocmd5k3gx56h2uhr5flnvwdem3kr5qx4bofrglg73wq6t"
      "type" ["Index"]
-     "address" "fluree:file://test/ledger-info/index/root/ht4dfkq6dqy4rddqfldzkqwpx3aegjt4t4oirxgfnzlyx4k2bzy.json"
+     "address" "fluree:file://test/ledger-info/index/root/bfwnwliocmd5k3gx56h2uhr5flnvwdem3kr5qx4bofrglg73wq6t.json"
      "data"
      {"id" "fluree:db:sha256:bbtvjesfhzyojnalpe5wfayrooafw7pr6cmrkyx6cfgqflbkkkcgy"
       "type" ["DB"]
@@ -271,7 +271,7 @@
     "f:ledger" {"@id" "test/ledger-info"}
     "f:branch" "main"
     "f:t" 1
-    "f:index" {"@id" "fluree:file://test/ledger-info/index/root/ht4dfkq6dqy4rddqfldzkqwpx3aegjt4t4oirxgfnzlyx4k2bzy.json"
+    "f:index" {"@id" "fluree:file://test/ledger-info/index/root/bfwnwliocmd5k3gx56h2uhr5flnvwdem3kr5qx4bofrglg73wq6t.json"
                "f:t" 1}
     "@type" ["f:Database" "f:PhysicalDatabase"]
     "f:status" "ready"}
@@ -376,9 +376,9 @@
      "size" 468}
     "ns" [{"id" "test/ledger-info:main"}]
     "index"
-    {"id" "fluree:index:sha256:ht4dfkq6dqy4rddqfldzkqwpx3aegjt4t4oirxgfnzlyx4k2bzy"
+    {"id" "fluree:index:sha256:bfwnwliocmd5k3gx56h2uhr5flnvwdem3kr5qx4bofrglg73wq6t"
      "type" ["Index"]
-     "address" "fluree:file://test/ledger-info/index/root/ht4dfkq6dqy4rddqfldzkqwpx3aegjt4t4oirxgfnzlyx4k2bzy.json"
+     "address" "fluree:file://test/ledger-info/index/root/bfwnwliocmd5k3gx56h2uhr5flnvwdem3kr5qx4bofrglg73wq6t.json"
      "data"
      {"id" "fluree:db:sha256:bbtvjesfhzyojnalpe5wfayrooafw7pr6cmrkyx6cfgqflbkkkcgy"
       "type" ["DB"]
@@ -398,7 +398,7 @@
     "f:ledger" {"@id" "test/ledger-info"}
     "f:branch" "main"
     "f:t" 1
-    "f:index" {"@id" "fluree:file://test/ledger-info/index/root/ht4dfkq6dqy4rddqfldzkqwpx3aegjt4t4oirxgfnzlyx4k2bzy.json"
+    "f:index" {"@id" "fluree:file://test/ledger-info/index/root/bfwnwliocmd5k3gx56h2uhr5flnvwdem3kr5qx4bofrglg73wq6t.json"
                "f:t" 1}
     "@type" ["f:Database" "f:PhysicalDatabase"]
     "f:status" "ready"}

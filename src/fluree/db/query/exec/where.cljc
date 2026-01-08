@@ -301,6 +301,7 @@
   (-match-id [s tracker solution s-match error-ch])
   (-match-triple [s tracker solution triple error-ch])
   (-match-class [s tracker solution triple error-ch])
+  (-match-properties [s tracker solution triples error-ch])
   (-activate-alias [s alias])
   (-aliases [s])
   (-finalize [s tracker error-ch solution-ch]))
@@ -325,6 +326,10 @@
   (if (map-entry? pattern)
     (val pattern)
     pattern))
+
+(defn class-pattern?
+  [pattern-type]
+  (= :class pattern-type))
 
 (defmulti match-pattern
   "Return a channel that will contain all pattern match solutions from flakes in
@@ -607,6 +612,11 @@
   (let [triple (pattern-data pattern)]
     (-match-class ds tracker solution triple error-ch)))
 
+(defmethod match-pattern :property-join
+  [ds tracker solution pattern error-ch]
+  (let [triples (pattern-data pattern)]
+    (-match-properties ds tracker solution triples error-ch)))
+
 (defn filter-exception
   "Reformats raw filter exception to try to provide more useful feedback."
   [e f]
@@ -669,19 +679,12 @@
                           solution-ch)
     out-ch))
 
-(defn with-constraints
-  [ds tracker patterns error-ch solution-ch]
+(defn match-patterns
+  [ds tracker solution patterns error-ch]
   (reduce (fn [solution-ch pattern]
             (with-constraint ds tracker pattern error-ch solution-ch))
-          solution-ch patterns))
-
-(defn match-triples
-  [ds tracker triples error-ch solution]
-  (let [[triple & r] triples
-        ;; get initial solution channel from first triple
-        solution-ch  (match-pattern ds tracker solution triple error-ch)]
-    ;; refine solution channel with subsequent triples
-    (with-constraints ds tracker r error-ch solution-ch)))
+          (async/to-chan! [solution])
+          patterns))
 
 (defn subquery?
   [pattern]
@@ -697,9 +700,8 @@
          other-patterns    false} (group-by subquery? clause)
 
         ;; process subqueries before other patterns
-        patterns    (into (vec subquery-patterns) other-patterns)
-        solution-ch (async/to-chan! [solution])
-        result-ch   (with-constraints ds tracker patterns error-ch solution-ch)]
+        patterns  (into (vec subquery-patterns) other-patterns)
+        result-ch (match-patterns ds tracker solution patterns error-ch)]
     (-finalize ds tracker error-ch result-ch)))
 
 (defn match-alias
