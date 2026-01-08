@@ -12,7 +12,9 @@ For implementation details and roadmap, see `docs/ICEBERG_SPARQL_STRATEGY.md` an
 - [Configuration](#configuration)
 - [R2RML Mappings](#r2rml-mappings)
 - [SPARQL Query Examples](#sparql-query-examples)
+- [OPTIONAL Patterns](#optional-patterns)
 - [Transitive Property Paths](#transitive-property-path-queries)
+- [UNION Queries](#union-queries)
 - [Predicate Pushdown](#predicate-pushdown)
 - [Time-Travel Queries](#time-travel-queries)
 - [Multi-Table Joins](#multi-table-joins)
@@ -48,11 +50,18 @@ The Iceberg virtual graph integration allows you to:
 | Time travel | ✅ Complete | Snapshot ID or timestamp |
 | VALUES clause pushdown | ✅ Complete | Converted to IN predicates |
 | FILTER comparison pushdown | ✅ Complete | `=`, `!=`, `>`, `>=`, `<`, `<=` |
+| Residual FILTER evaluation | ✅ Complete | Full SPARQL function support post-scan via Fluree eval |
+| BIND evaluation | ✅ Complete | Full SPARQL function support post-scan via Fluree eval |
 | OPTIONAL patterns | ✅ Complete | Left outer join semantics |
 | Transitive property paths | ✅ Complete | `pred+` (one-or-more), `pred*` (zero-or-more) |
+| Anti-joins | ✅ Complete | FILTER EXISTS, FILTER NOT EXISTS, MINUS |
 | Vectorized execution | ⚠️ Experimental | Columnar plan exists, but disabled by default |
-| Aggregations (GROUP BY) | ✅ Supported (no pushdown) | Executed by the SPARQL engine after VG results are produced |
-| UNION patterns | ⚠️ Partial | UNION-only queries work; UNION mixed with other patterns is currently combined via cross product |
+| Aggregations (GROUP BY) | ✅ Complete | COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT (computed in VG; not pushed to Iceberg) |
+| HAVING | ✅ Complete | Evaluated after aggregation, before DISTINCT |
+| DISTINCT | ✅ Complete | Applied in VG (correct SPARQL modifier order) |
+| ORDER BY / LIMIT / OFFSET | ✅ Complete | Applied in VG (correct SPARQL modifier order) |
+| UNION patterns | ✅ Complete | UNION-only queries and UNION with other patterns supported |
+| Subqueries | ✅ Complete | Delegated to standard Fluree execution via `:query` patterns |
 
 ### Architecture
 
@@ -419,25 +428,6 @@ LIMIT 1000
 - Hash joins across tables when the query traverses RefObjectMap edges (FK predicate)
 - Column projection on all three tables
 
-### OPTIONAL Patterns
-
-```sparql
-PREFIX ex: <http://example.org/>
-
-SELECT ?name ?country
-WHERE {
-  ?airline a ex:Airline ;
-           ex:name ?name .
-  OPTIONAL {
-    ?airline ex:country ?country .
-  }
-}
-```
-
-**Optimizations applied:**
-- Left outer join semantics for OPTIONAL
-- Airlines without country still returned with `?country` unbound
-
 ### Aggregate Query
 
 ```sparql
@@ -456,6 +446,47 @@ ORDER BY DESC(?count)
 **Optimizations applied:**
 - Equality predicate `active = "Y"` pushed down
 - Column projection: Only `country` and `active` columns
+
+**Supported aggregation functions:** COUNT, COUNT(DISTINCT), SUM, AVG, MIN, MAX
+
+### OPTIONAL Patterns
+
+OPTIONAL provides left outer join semantics - results are returned even when the optional pattern doesn't match.
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+SELECT ?name ?country
+WHERE {
+  ?airline a ex:Airline ;
+           ex:name ?name .
+  OPTIONAL {
+    ?airline ex:country ?country .
+  }
+}
+```
+
+Airlines without a country value are still returned with `?country` unbound.
+
+#### Multi-table OPTIONAL
+
+OPTIONAL works with multi-table joins:
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+SELECT ?routeId ?airlineName
+WHERE {
+  ?route a ex:Route ;
+         ex:routeId ?routeId .
+  OPTIONAL {
+    ?route ex:operatedBy ?airline .
+    ?airline ex:name ?airlineName .
+  }
+}
+```
+
+**Note:** Complex multi-table OPTIONAL blocks (patterns spanning multiple joins within the OPTIONAL) may require careful handling. See limitations.
 
 ### Transitive Property Path Queries
 
@@ -535,11 +566,45 @@ ex:b knows ex:c
 ex:c knows ex:a  ← cycle back to ex:a
 ```
 
-Query: `ex:a <ex:knows+> ?who` returns `[ex:b, ex:c, ex:a]` (terminates correctly).
+Query: `ex:a <ex:knows+> ?who` returns `[ex:b, ex:c]` (terminates correctly; does not re-emit the start node).
 
 #### Depth Limit
 
 A configurable depth limit (default: 100) prevents runaway queries on very deep hierarchies. If exceeded, a warning is logged and results up to that depth are returned.
+
+### UNION Queries
+
+UNION combines results from multiple query branches. Each branch can query different predicates or even different tables.
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+SELECT ?name
+WHERE {
+  { ?airline a ex:Airline ; ex:name ?name ; ex:country "US" }
+  UNION
+  { ?airline a ex:Airline ; ex:name ?name ; ex:country "DE" }
+}
+```
+
+UNION can also be combined with other patterns:
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+SELECT ?airlineName ?routeSource
+WHERE {
+  ?route ex:operatedBy ?airline .
+  ?airline ex:name ?airlineName .
+  {
+    ?route ex:sourceAirport "JFK"
+  }
+  UNION
+  {
+    ?route ex:sourceAirport "LAX"
+  }
+}
+```
 
 ## Predicate Pushdown
 
@@ -688,7 +753,7 @@ Benchmarks run on the OpenFlights dataset (airlines: 6,162 rows, routes: 67,663 
 
 ### Performance Tips
 
-1. **Use VALUES for multi-value filters**: VALUES clauses push predicates to Iceberg, while FILTER IN may not.
+1. **Use VALUES for large multi-value filters**: VALUES clauses are reliably converted to `IN` pushdown. Simple `FILTER (in ?x [...])` can also push down when it matches the supported single-variable comparison form, but VALUES is typically clearer and avoids edge cases.
 
 2. **Filter on partition columns**: If your Iceberg table is partitioned, filtering on partition columns enables partition pruning.
 
@@ -812,7 +877,8 @@ For native image builds, ensure Iceberg and Arrow classes are included in reflec
    }
    ```
 
-4. **Aggregation Pushdown**: GROUP BY aggregations are computed client-side.
+4. **Aggregation Pushdown**: GROUP BY aggregations are computed in the Iceberg VG (not pushed down to Iceberg itself).
+   - Note: This still requires materializing grouped rows in memory. Use selective predicates (pushdown) and LIMIT where possible.
 
 5. **Transitive Property Path Limitations**:
    - **Reachability check not supported**: Both subject and object bound (e.g., `ex:a <ex:knows+> ex:z`) throws an error. Use forward/backward traversal with filtering instead.
@@ -821,11 +887,13 @@ For native image builds, ensure Iceberg and Arrow classes are included in reflec
 
 ### Future Work
 
-- [ ] GROUP BY aggregation pushdown
+- [x] GROUP BY aggregations (COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT)
+- [ ] GROUP BY aggregation pushdown to Iceberg
 - [x] Transitive property paths (`pred+`, `pred*`)
 - [ ] Transitive reachability check (`[:v :v :v]` pattern)
 - [ ] Cross-table transitive paths
-- [ ] UNION pattern support (complete)
+- [x] UNION pattern support (basic support complete)
+- [ ] UNION schema alignment (consistent output columns across branches)
 - [ ] Statistics-based query planning improvements
 - [ ] Parallel execution for multi-table queries
 - [ ] Spill-to-disk for large joins
