@@ -1039,6 +1039,22 @@
    (promise-wrap
     (connection/trigger-ledger-index conn ledger-alias opts))))
 
+(defn reindex
+  "Offline index rebuild from commit history (regenerates stats).
+
+  Options:
+  - :from-t - Start from this transaction t (default: 1; t=0 is genesis)
+  - :batch-bytes - Novelty threshold per batch (default: reindex-max-bytes)
+  - :index-files-ch - Optional channel for index file notifications"
+  ([conn ledger-alias]
+   (reindex conn ledger-alias {}))
+  ([conn ledger-alias opts]
+   (validate-connection conn)
+   (promise-wrap
+    (go-try
+      (let [ledger (<? (connection/load-ledger-alias conn ledger-alias))]
+        (<? (ledger/reindex! ledger opts)))))))
+
 ;; Full-Text Search APIs (JVM only)
 
 #?(:clj
