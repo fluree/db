@@ -1082,3 +1082,70 @@
      (validate-connection conn)
      (promise-wrap
       (vg-drop/drop-virtual-graph conn vg-name))))
+
+;; Iceberg-specific APIs (JVM only)
+
+#?(:clj
+   (defn connect-iceberg
+     "Connects to Apache Iceberg tables, enabling them to be queried as RDF
+     using R2RML mappings to define the relational-to-RDF transformation.
+
+     Once connected, the Iceberg source can be queried using its name in the
+     'from' clause of FQL or SPARQL queries.
+
+     Parameters:
+       conn - Connection object
+       name - Name for the virtual graph. Used in query 'from' clauses to
+              reference this data source.
+       config - Configuration map:
+         :warehouse-path - Path to Iceberg warehouse directory. Required for
+                           HadoopTables catalog; not needed for REST catalog
+                           with :store.
+         :mapping - Path to R2RML mapping file (.ttl) that defines how Iceberg
+                    table columns map to RDF predicates and classes.
+         :mapping-inline - Inline R2RML mapping content as a string. Alternative
+                           to :mapping when you don't want a separate file.
+         :store - Storage backend config (S3Store, FileStore, etc.). Required
+                  for REST catalog to read table data files.
+         :catalog - Catalog configuration map:
+                      :type - Catalog type (:rest for REST catalog)
+                      :uri - Catalog URI (for REST catalog)
+                      :warehouse - Warehouse identifier (for REST catalog)
+
+     Returns promise resolving to the connected Iceberg source descriptor.
+
+     Example:
+       ;; Connect to a local Iceberg warehouse
+       @(connect-iceberg conn \"my-data-lake\"
+         {:warehouse-path \"/path/to/warehouse\"
+          :mapping \"/path/to/mapping.ttl\"})
+
+       ;; Query the connected source
+       @(fluree/query conn {\"from\" [\"my-data-lake\"]
+                            \"select\" [\"?name\"]
+                            \"where\" {\"@id\" \"?x\" \"ex:name\" \"?name\"}})"
+     [conn name {:keys [warehouse-path mapping mapping-inline store catalog]}]
+     (validate-connection conn)
+     (promise-wrap
+      (vg-create/create conn {:name name
+                              :type :iceberg
+                              :config (cond-> {}
+                                        warehouse-path (assoc :warehouse-path warehouse-path)
+                                        mapping        (assoc :mapping mapping)
+                                        mapping-inline (assoc :mappingInline mapping-inline)
+                                        store          (assoc :store store)
+                                        catalog        (assoc :catalog catalog))}))))
+
+#?(:clj
+   (defn disconnect-iceberg
+     "Disconnects an Iceberg data source and removes its virtual graph.
+
+     Parameters:
+       conn - Connection object
+       name - Name of the Iceberg virtual graph to disconnect
+
+     Returns promise resolving to :dropped when complete."
+     [conn name]
+     (validate-connection conn)
+     (promise-wrap
+      (vg-drop/drop-virtual-graph conn name))))
