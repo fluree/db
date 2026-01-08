@@ -106,7 +106,7 @@ SPARQL Query
 
 ### 1. Create an Iceberg virtual graph
 
-Use `fluree.db.api/create-virtual-graph` to publish an Iceberg VG into the nameservice (loaded lazily on first query).
+Use `fluree.db.api/connect-iceberg` to publish an Iceberg VG into the nameservice (loaded lazily on first query).
 
 #### Option A: Local development (HadoopTables) — simplest
 
@@ -115,11 +115,9 @@ Use `fluree.db.api/create-virtual-graph` to publish an Iceberg VG into the names
 
 (def conn @(fluree/connect-file {:storage-path "./data"}))
 
-@(fluree/create-virtual-graph conn
-   {:name "openflights-vg"
-    :type :iceberg
-    :config {:warehouse-path "./dev-resources/iceberg/openflights"
-             :mapping "dev-resources/openflights/r2rml.ttl"}})
+@(fluree/connect-iceberg conn "openflights-vg"
+   {:warehouse-path "./dev-resources/iceberg/openflights"
+    :mapping "dev-resources/openflights/r2rml.ttl"})
 ```
 
 #### Option B: REST catalog (recommended for production catalogs)
@@ -133,14 +131,12 @@ REST catalog mode currently requires a Fluree `store` for file reads (e.g. an `S
 (def conn @(fluree/connect-file {:storage-path "./data"}))
 (def store (s3/open "my-bucket" "my/prefix")) ;; uses AWS env vars for credentials
 
-@(fluree/create-virtual-graph conn
-   {:name "analytics-vg"
-    :type :iceberg
-    :config {:store store
-             :catalog {:type :rest
-                       :uri "http://localhost:8181"
-                       :auth-token "optional-bearer-token"}
-             :mapping "path/to/mapping.ttl"}})
+@(fluree/connect-iceberg conn "analytics-vg"
+   {:store store
+    :catalog {:type :rest
+              :uri "http://localhost:8181"
+              :auth-token "optional-bearer-token"}
+    :mapping "path/to/mapping.ttl"})
 ```
 
 ### (Advanced) Create an Iceberg Source directly
