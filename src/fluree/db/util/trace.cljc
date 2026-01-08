@@ -13,9 +13,9 @@
    (defmacro async-with-context
      [id trace-ctx & body]
      (if-cljs
-       `(do ~@body)
-       `(chan-span/chan-span-binding [_context# {:parent ~trace-ctx :name ~id}]
-          ~@body))))
+      `(do ~@body)
+      `(chan-span/chan-span-binding [_context# {:parent ~trace-ctx :name ~id}]
+                                    ~@body))))
 
 #?(:clj
    (defmacro form

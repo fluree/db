@@ -9,8 +9,8 @@
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.util.trace :as trace]))
+            [fluree.db.util.trace :as trace]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -127,9 +127,9 @@
         (let [result
               (try*
                 (let [db* (use-latest-index db last-index-commit branch-state)
-                                        ; indexer/index always returns a FlakeDB (never AsyncDB)
+                      ;; indexer/index always returns a FlakeDB (never AsyncDB)
                       indexed-db (<? (trace/async-with-context ::index trace-ctx
-                                       (indexer/index db* index-files-ch))) 
+                                       (indexer/index db* index-files-ch)))
                       [{prev-commit :commit} {indexed-commit :commit}]
                       (swap-vals! branch-state update-index indexed-db)]
                   (when-not (= prev-commit indexed-commit)
@@ -140,13 +140,14 @@
                                                          :index-address index-address
                                                          :index-t index-t})
                       (when-let [primary (nameservice/primary-publisher publishers)]
-                        (<? (nameservice/publish-index primary ledger-alias index-address index-t)))
+                        (<? (trace/async-with-context ::publish-index trace-ctx
+                              (nameservice/publish-index primary ledger-alias index-address index-t))))
                       (when-let [secondaries (seq (nameservice/secondary-publishers publishers))]
                         (nameservice/publish-index-to-all ledger-alias index-address index-t secondaries))))
                   {:status :success, :db indexed-db, :commit indexed-commit})
                 (catch* e
-                        (log/error e "Error updating index")
-                        {:status :error, :error e}))]
+                  (log/error e "Error updating index")
+                  {:status :error, :error e}))]
           (when complete-ch
             (async/put! complete-ch result))
           (if (= :success (:status result))

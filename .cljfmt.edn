@@ -7,4 +7,5 @@
   catch* [[:block 1]]
   form   [[:block 2]]
   info!  [[:block 2]]
-  debug! [[:block 2]]}}
+  debug! [[:block 2]]
+  async-with-context [[:block 2]]}}
