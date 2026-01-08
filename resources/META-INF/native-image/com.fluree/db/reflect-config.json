@@ -1,5 +1,54 @@
 [
   {
+    "name": "com.github.benmanes.caffeine.cache.SSMS",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "com.github.benmanes.caffeine.cache.SSMSA",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "com.github.benmanes.caffeine.cache.SW",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "com.github.benmanes.caffeine.cache.SS",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "com.github.benmanes.caffeine.cache.PSMS",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "com.github.benmanes.caffeine.cache.PS",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "com.github.benmanes.caffeine.cache.PSW",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
     "name": "software.amazon.awssdk.auth.credentials.AwsBasicCredentials",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
@@ -57,6 +106,224 @@
   },
   {
     "name": "software.amazon.awssdk.services.s3.model.SessionCredentials",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.iceberg.Schema",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.iceberg.BaseTable",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.iceberg.GenericPartitionFieldSummary",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.iceberg.GenericManifestEntry",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.iceberg.GenericManifestFile",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.iceberg.GenericDataFile",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.iceberg.GenericDeleteFile",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.iceberg.PartitionData",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.iceberg.types.Types$StructType",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.github.luben.zstd.ZstdInputStreamNoFinalizer",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.github.luben.zstd.ZstdInputStream",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.github.luben.zstd.ZstdOutputStreamNoFinalizer",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.github.luben.zstd.Zstd",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.parquet.hadoop.codec.ZstandardCodec",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.parquet.hadoop.codec.SnappyCodec",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.parquet.hadoop.codec.Lz4RawCodec",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.iceberg.DataTableScan",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.iceberg.StaticTableOperations",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.iceberg.io.FileIO",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.iceberg.io.SeekableInputStream",
+    "queryAllDeclaredMethods": true,
+    "queryAllPublicMethods": true,
+    "queryAllDeclaredConstructors": true
+  },
+  {
+    "name": "org.apache.iceberg.io.PositionOutputStream",
+    "queryAllDeclaredMethods": true,
+    "queryAllPublicMethods": true,
+    "queryAllDeclaredConstructors": true
+  },
+  {
+    "name": "org.apache.iceberg.InternalParquet",
+    "methods": [{"name": "register", "parameterTypes": []}]
+  },
+  {
+    "name": "org.apache.arrow.memory.RootAllocator",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.arrow.memory.BufferAllocator",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.arrow.memory.unsafe.UnsafeAllocationManager",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.arrow.memory.unsafe.DefaultAllocationManagerFactory",
+    "fields": [{"name": "FACTORY"}]
+  },
+  {
+    "name": "org.apache.arrow.vector.VectorSchemaRoot",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.arrow.vector.types.pojo.Schema",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.arrow.vector.types.pojo.Field",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.iceberg.arrow.vectorized.ArrowReader",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "org.apache.iceberg.arrow.vectorized.VectorizedTableScanIterable",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
     "allDeclaredMethods": true,

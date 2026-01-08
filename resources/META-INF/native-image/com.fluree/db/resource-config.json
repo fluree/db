@@ -1,0 +1,17 @@
+{
+  "resources": {
+    "includes": [
+      {"pattern": "logback.xml"},
+      {"pattern": ".*\\.properties"},
+      {"pattern": "contexts/.*\\.jsonld"},
+      {"pattern": "contexts/.*\\.edn"},
+      {"pattern": ".*\\.edn"},
+      {"pattern": "darwin/.*/libzstd-jni.*"},
+      {"pattern": "linux/.*/libzstd-jni.*"},
+      {"pattern": "win/.*/zstd-jni.*"},
+      {"pattern": "aix/.*/libzstd-jni.*"},
+      {"pattern": "freebsd/.*/libzstd-jni.*"}
+    ]
+  },
+  "bundles": []
+}

@@ -185,6 +185,57 @@
   {:extra-deps  {com.github.clj-easy/graal-build-time {:mvn/version "1.0.5"}}
    :extra-paths ["graalvm"]}
 
+  ;; GraalVM native-image build with Iceberg (REST catalog, minimal Hadoop for codec support)
+  ;; Usage: clojure -M:graalvm-iceberg -e "(compile 'iceberg-graalvm-test)"
+  :graalvm-iceberg
+  {:extra-paths ["graalvm"]
+   ;; Arrow requires these JVM flags for direct memory access on Java 9+
+   :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+              "--add-opens=java.base/java.lang=ALL-UNNAMED"
+              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
+   :extra-deps {;; GraalVM build-time support
+                com.github.clj-easy/graal-build-time {:mvn/version "1.0.5"}
+
+                ;; Core Iceberg 1.10.0
+                org.apache.iceberg/iceberg-core    {:mvn/version "1.10.0"}
+                org.apache.iceberg/iceberg-parquet {:mvn/version "1.10.0"}
+                org.apache.iceberg/iceberg-data    {:mvn/version "1.10.0"}
+
+                ;; Arrow integration for vectorized reads
+                ;; Exclude arrow-memory-netty which iceberg-arrow pulls in transitively
+                ;; - Netty has complex GraalVM initialization conflicts
+                ;; - Use arrow-memory-unsafe instead for native-image compatibility
+                org.apache.iceberg/iceberg-arrow   {:mvn/version "1.10.0"
+                                                    :exclusions [org.apache.arrow/arrow-memory-netty
+                                                                 io.netty/netty-buffer
+                                                                 io.netty/netty-common]}
+                org.apache.arrow/arrow-vector      {:mvn/version "17.0.0"}
+                ;; Use unsafe allocator instead of netty for GraalVM compatibility
+                org.apache.arrow/arrow-memory-unsafe {:mvn/version "17.0.0"}
+
+                ;; Guava bundled for Iceberg (no Hadoop, no AWS bundle)
+                ;; REST catalog uses Java HttpClient, data reads use Fluree's S3 store
+                org.apache.iceberg/iceberg-bundled-guava {:mvn/version "1.10.0"}
+
+                ;; Minimal Hadoop for Parquet codec support only
+                ;; parquet-hadoop requires hadoop-common for CodecFactory
+                org.apache.hadoop/hadoop-common {:mvn/version "3.3.6"
+                                                 :exclusions [org.slf4j/slf4j-log4j12
+                                                              log4j/log4j
+                                                              org.slf4j/slf4j-reload4j
+                                                              org.apache.hadoop/hadoop-auth
+                                                              org.apache.hadoop.thirdparty/hadoop-shaded-protobuf_3_21
+                                                              org.apache.curator/curator-framework
+                                                              org.apache.curator/curator-recipes
+                                                              org.apache.curator/curator-client
+                                                              org.apache.zookeeper/zookeeper
+                                                              org.apache.kerby/kerb-core
+                                                              org.apache.kerby/kerb-admin
+                                                              dnsjava/dnsjava
+                                                              com.sun.jersey/jersey-core
+                                                              com.sun.jersey/jersey-server
+                                                              com.sun.jersey/jersey-servlet]}}}
+
   ;; Iceberg integration (experimental)
   ;; Usage: clojure -M:dev:iceberg -m fluree.db.iceberg-smoke-test
   :iceberg

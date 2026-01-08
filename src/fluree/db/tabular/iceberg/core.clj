@@ -18,7 +18,8 @@
            [org.apache.arrow.memory BufferAllocator RootAllocator]
            [org.apache.arrow.vector VectorSchemaRoot FieldVector
             BigIntVector IntVector Float4Vector Float8Vector
-            VarCharVector BitVector]
+            VarCharVector VarBinaryVector BitVector DateDayVector
+            TimeStampMicroTZVector TimeStampMicroVector DecimalVector]
            [org.apache.arrow.vector.types.pojo Field Schema]
            [org.apache.iceberg DataFile ManifestFile ManifestFiles PartitionField
             PartitionSpec Snapshot Table TableScan]
@@ -27,7 +28,8 @@
            [org.apache.iceberg.data IcebergGenerics Record]
            [org.apache.iceberg.expressions Expressions Expression]
            [org.apache.iceberg.io CloseableIterable]
-           [org.apache.iceberg.types Conversions Type Types$NestedField]))
+           [org.apache.iceberg.types Conversions Type Types$NestedField]
+           [org.apache.iceberg.util SnapshotUtil]))
 
 (set! *warn-on-reflection* true)
 
@@ -246,7 +248,7 @@
 
 (defn generic-record->map
   "Convert IcebergGenerics Record to Clojure map."
-  [^Record record ^Schema schema]
+  [^Record record ^org.apache.iceberg.Schema schema]
   (let [fields (.columns schema)]
     (into {}
           (for [^Types$NestedField field fields
@@ -526,8 +528,30 @@
       (.set ^BitVector dest (int dest-idx)
             (.get ^BitVector src (int src-idx)))
 
-      ;; Fallback: use setSafe with object (may be slower)
-      (.setSafe dest (int dest-idx) (.getObject src (int src-idx))))))
+      DateDayVector
+      (.set ^DateDayVector dest (int dest-idx)
+            (.get ^DateDayVector src (int src-idx)))
+
+      TimeStampMicroTZVector
+      (.set ^TimeStampMicroTZVector dest (int dest-idx)
+            (.get ^TimeStampMicroTZVector src (int src-idx)))
+
+      TimeStampMicroVector
+      (.set ^TimeStampMicroVector dest (int dest-idx)
+            (.get ^TimeStampMicroVector src (int src-idx)))
+
+      DecimalVector
+      (.setSafe ^DecimalVector dest (int dest-idx)
+                (.getObject ^DecimalVector src (int src-idx)))
+
+      VarBinaryVector
+      (let [bytes (.get ^VarBinaryVector src (int src-idx))]
+        (.setSafe ^VarBinaryVector dest (int dest-idx) ^bytes bytes))
+
+      ;; Fallback: throw with informative message about unsupported type
+      (throw (ex-info "Unsupported Arrow vector type for copy operation"
+                      {:vector-type (type src)
+                       :field-name (.getName (.getField ^FieldVector src))})))))
 
 (defn- allocate-vector!
   "Allocate space in a destination vector. Uses type-specific allocation
@@ -540,9 +564,14 @@
     Float4Vector (.allocateNew ^Float4Vector dest (int num-rows))
     Float8Vector (.allocateNew ^Float8Vector dest (int num-rows))
     BitVector (.allocateNew ^BitVector dest (int num-rows))
-    ;; Variable-width: estimate 32 bytes average per string, let setSafe grow if needed
+    DateDayVector (.allocateNew ^DateDayVector dest (int num-rows))
+    TimeStampMicroTZVector (.allocateNew ^TimeStampMicroTZVector dest (int num-rows))
+    TimeStampMicroVector (.allocateNew ^TimeStampMicroVector dest (int num-rows))
+    DecimalVector (.allocateNew ^DecimalVector dest (int num-rows))
+    ;; Variable-width: estimate 32 bytes average per value, let setSafe grow if needed
     VarCharVector (.allocateNew ^VarCharVector dest (* 32 num-rows) (int num-rows))
-    ;; Fallback: use setInitialCapacity and allocateNew
+    VarBinaryVector (.allocateNew ^VarBinaryVector dest (* 32 num-rows) (int num-rows))
+    ;; Fallback: use setInitialCapacity and allocateNew (for any other vector types)
     (do
       (.setInitialCapacity dest (int num-rows))
       (.allocateNew dest))))
@@ -739,21 +768,20 @@
 (defn build-table-scan
   "Build Iceberg TableScan with projection and predicate pushdown."
   ^TableScan [^Table table {:keys [columns predicates snapshot-id as-of-time]}]
-  (cond-> (.newScan table)
-    ;; Time travel
-    snapshot-id
-    (.useSnapshot ^long snapshot-id)
-
-    as-of-time
-    (.asOfTime (.toEpochMilli ^Instant as-of-time))
-
-    ;; Column projection
-    (seq columns)
-    (.select ^java.util.Collection (vec columns))
-
-    ;; Predicate pushdown
-    (seq predicates)
-    (-> ^TableScan (.filter (predicates->expression predicates)))))
+  (let [scan ^TableScan (.newScan table)
+        scan (if snapshot-id
+               (.useSnapshot scan ^long snapshot-id)
+               scan)
+        scan (if as-of-time
+               (.asOfTime scan (.toEpochMilli ^Instant as-of-time))
+               scan)
+        scan (if (seq columns)
+               (.select scan ^java.util.Collection (vec columns))
+               scan)
+        scan (if (seq predicates)
+               (.filter ^TableScan scan ^Expression (predicates->expression predicates))
+               scan)]
+    scan))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Schema Extraction
@@ -770,23 +798,23 @@
      {:columns [{:name :type :nullable? :is-partition-key?}]
       :partition-spec {:fields [...]}}"
   [^Table table {:keys [snapshot-id as-of-time]}]
-  (let [^Schema schema (cond
-                         snapshot-id
-                         (if-let [^Snapshot snapshot (.snapshot table ^long snapshot-id)]
-                           (let [schema-id (.schemaId snapshot)]
-                             (.get (.schemas table) (int schema-id)))
-                           (.schema table))
+  (let [^org.apache.iceberg.Schema schema (cond
+                                            snapshot-id
+                                            (if-let [^Snapshot snapshot (.snapshot table ^long snapshot-id)]
+                                              (let [schema-id (.schemaId snapshot)]
+                                                (.get (.schemas table) (int schema-id)))
+                                              (.schema table))
 
-                         as-of-time
-                         (let [snap-id (long (.snapshotIdAsOfTime table (.toEpochMilli ^Instant as-of-time)))]
-                           (if (pos? snap-id)
-                             (let [^Snapshot snapshot (.snapshot table snap-id)
-                                   schema-id (.schemaId snapshot)]
-                               (.get (.schemas table) (int schema-id)))
-                             (.schema table)))
+                                            as-of-time
+                                            (let [snap-id (SnapshotUtil/snapshotIdAsOfTime table (.toEpochMilli ^Instant as-of-time))]
+                                              (if (pos? snap-id)
+                                                (let [^Snapshot snapshot (.snapshot table snap-id)
+                                                      schema-id (.schemaId snapshot)]
+                                                  (.get (.schemas table) (int schema-id)))
+                                                (.schema table)))
 
-                         :else
-                         (.schema table))
+                                            :else
+                                            (.schema table))
         ^PartitionSpec partition-spec (.spec table)
         partition-fields (set (for [^PartitionField field (.fields partition-spec)]
                                 (let [source-id (.sourceId field)]
@@ -819,7 +847,7 @@
 
    Returns a map of column-name -> {:min :max :null-count :value-count}"
   [^Table table ^Snapshot snapshot]
-  (let [^Schema schema (.schema table)
+  (let [^org.apache.iceberg.Schema schema (.schema table)
         file-io (.io table)
         ;; Build field-id -> field map for type lookups
         field-by-id (into {}

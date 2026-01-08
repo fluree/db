@@ -837,7 +837,7 @@ Always fully consume lazy sequences from `scan-batches` and `scan-arrow-batches`
 
 ### GraalVM Native Image
 
-For native image builds, ensure Iceberg and Arrow classes are included in reflection config. See `graalvm/reflect-config.json`.
+For native image builds, ensure Iceberg and Arrow classes are included in reflection config. See `resources/META-INF/native-image/com.fluree/db/reflect-config.json`.
 
 ### Common Issues
 

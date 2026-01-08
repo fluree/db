@@ -25,10 +25,17 @@
 ;;; HTTP Client for REST API
 ;;; ---------------------------------------------------------------------------
 
-(def ^:private ^HttpClient http-client
-  (-> (HttpClient/newBuilder)
-      (.connectTimeout (Duration/ofSeconds 30))
-      (.build)))
+;; Lazy initialization to avoid build-time creation (required for GraalVM native-image)
+(def ^:private http-client-delay
+  (delay
+    (-> (HttpClient/newBuilder)
+        (.connectTimeout (Duration/ofSeconds 30))
+        (.build))))
+
+(defn- get-http-client
+  "Get the HTTP client, creating it lazily on first use."
+  ^HttpClient []
+  @http-client-delay)
 
 (defn- rest-request
   "Make an HTTP GET request to the REST catalog API."
@@ -42,7 +49,7 @@
                   (.header builder "Authorization" (str "Bearer " auth-token))
                   builder)
         request (.build (.GET builder))
-        response (.send http-client request (HttpResponse$BodyHandlers/ofString))]
+        response (.send (get-http-client) request (HttpResponse$BodyHandlers/ofString))]
     (when (= 200 (.statusCode response))
       (json/read-value (.body response) json/keyword-keys-object-mapper))))
 

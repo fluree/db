@@ -267,10 +267,17 @@
 (declare with-retries parse-list-objects-response)
 
 ;; HTTP client for binary requests (avoids xhttp which uses String body handlers)
-(def ^:private ^java.net.http.HttpClient binary-http-client
-  (-> (java.net.http.HttpClient/newBuilder)
-      (.connectTimeout (java.time.Duration/ofSeconds 30))
-      (.build)))
+;; Lazy initialization required for GraalVM native-image compatibility
+(def ^:private binary-http-client-delay
+  (delay
+    (-> (java.net.http.HttpClient/newBuilder)
+        (.connectTimeout (java.time.Duration/ofSeconds 30))
+        (.build))))
+
+(defn- get-binary-http-client
+  "Get the binary HTTP client, creating it lazily on first use."
+  ^java.net.http.HttpClient []
+  @binary-http-client-delay)
 
 (defn s3-get-binary
   "Make an S3 GET request returning raw bytes.
@@ -301,7 +308,7 @@
                          (.header builder k v))
           request      (.build builder)
           ;; Use byte array body handler for binary data
-          response     (.send binary-http-client request
+          response     (.send (get-binary-http-client) request
                               (java.net.http.HttpResponse$BodyHandlers/ofByteArray))
           status       (.statusCode response)
           ^bytes body  (.body response)]
