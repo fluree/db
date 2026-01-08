@@ -66,7 +66,7 @@
   "Stages a new transaction that is already parsed into the
    internal Fluree triples format."
   [db parsed-txn]
-  (trace/form ::stage-triples {}
+  (trace/async-form ::stage-triples {}
     (go-try
       (let [parsed-opts    (:opts parsed-txn)
             parsed-context (:context parsed-opts)

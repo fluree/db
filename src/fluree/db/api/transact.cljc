@@ -51,8 +51,8 @@
 
 (defn transact!
   [conn ledger-id parsed-txn]
-  (trace/form ::transact! {:ledger-alias ledger-id}
-    (go-try
+  (go-try
+    (trace/form ::transact! {:ledger-alias ledger-id}
       (if ledger-id
         (let [ledger (async/<! (connection/load-ledger conn ledger-id))]
           (if (util/exception? ledger)

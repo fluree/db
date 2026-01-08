@@ -502,20 +502,20 @@
    Uses atomic publish-commit to update only commit fields, avoiding
    overwriting index data that may have been updated by a separate indexer."
   [{:keys [primary-publisher secondary-publishers] :as _ledger} commit-jsonld]
-  (trace/form ::publish-commit {}
-    (go-try
-      (let [ledger-alias   (get commit-jsonld "alias")
-            commit-address (get commit-jsonld "address")
-            commit-t       (get-in commit-jsonld ["data" "t"])
-            _              (log/debug "publish-commit using atomic update"
-                                      {:alias ledger-alias :commit-t commit-t})
-            result         (<? (nameservice/publish-commit primary-publisher
+  (go-try
+    (let [ledger-alias   (get commit-jsonld "alias")
+          commit-address (get commit-jsonld "address")
+          commit-t       (get-in commit-jsonld ["data" "t"])
+          _              (log/debug "publish-commit using atomic update"
+                                    {:alias ledger-alias :commit-t commit-t})
+          result         (<? (trace/async-form ::publish-commit {}
+                               (nameservice/publish-commit primary-publisher
                                                            ledger-alias
                                                            commit-address
-                                                           commit-t))]
-        (when-let [secondaries (seq secondary-publishers)]
-          (nameservice/publish-commit-to-all ledger-alias commit-address commit-t secondaries))
-        result))))
+                                                           commit-t)))]
+      (when-let [secondaries (seq secondary-publishers)]
+        (nameservice/publish-commit-to-all ledger-alias commit-address commit-t secondaries))
+      result)))
 
 (defn formalize-commit
   [{prev-commit :commit :as staged-db} new-commit]
@@ -541,7 +541,7 @@
     {:keys [branch t stats commit] :as staged-db}
     opts]
    (log/debug "commit!: write-transaction start" {:ledger ledger-alias})
-   (trace/form ::commit! {:t t}
+   (trace/async-form ::commit! {:t t}
      (go-try
        (let [{:keys [commit-catalog]} ledger
              ledger-name (util.ledger/ledger-base-name ledger-alias)

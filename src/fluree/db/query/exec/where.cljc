@@ -980,7 +980,7 @@
   ([ds q tracker error-ch]
    (search ds q tracker error-ch nil))
   ([ds q tracker error-ch initial-solution-ch]
-   (trace/form ::query-where {:where (:where q)}
+   (trace/form ::search {}
      (let [out-ch               (async/chan 2)
            initial-solution-ch* (or initial-solution-ch
                                     (values-initial-solution q))]

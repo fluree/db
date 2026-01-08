@@ -18,6 +18,13 @@
                                     ~@body))))
 
 #?(:clj
+   (defmacro async-form
+     [id data & forms]
+     (if-cljs
+      `(do ~@forms)
+      `(chan-span/async-bound-chan-span {:name ~id :attributes ~data}
+                                        ~@forms))))
+#?(:clj
    (defmacro form
      [id data & forms]
      (if-cljs
