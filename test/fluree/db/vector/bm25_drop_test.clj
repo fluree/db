@@ -25,16 +25,15 @@
                                    "ex:year" 2010
                                    "ex:description" "A thief who steals corporate secrets through dream-sharing technology"}]})
 
-      ;; Create a BM25 virtual graph
-      (let [vg-obj @(fluree/create-virtual-graph
+      ;; Create a BM25 full-text index
+      (let [vg-obj @(fluree/create-full-text-index
                      conn
-                     {:name "movie-search"
-                      :type :bm25
-                      :config {:ledgers ["movies"]
-                               :query {"@context" {"ex" "http://example.org/"}
-                                       "where" [{"@id" "?x"
-                                                 "@type" "ex:Movie"}]
-                                       "select" {"?x" ["@id" "ex:title" "ex:description"]}}}})]
+                     "movie-search"
+                     {:ledger "movies"
+                      :query {"@context" {"ex" "http://example.org/"}
+                              "where" [{"@id" "?x"
+                                        "@type" "ex:Movie"}]
+                              "select" {"?x" ["@id" "ex:title" "ex:description"]}}})]
 
         (testing "VG is created successfully"
           (is (some? vg-obj))
@@ -59,7 +58,7 @@
 
         ;; Drop the virtual graph
         (testing "dropping virtual graph"
-          (let [drop-result @(fluree/drop-virtual-graph conn "movie-search")]
+          (let [drop-result @(fluree/drop-full-text-index conn "movie-search")]
             (is (= :dropped drop-result))))
 
         ;; Verify we can no longer query it
@@ -78,17 +77,16 @@
                 (is (integer? (:status data)) "Error should have a numeric status")
                 (is (some? (:error data)) "Error should include a :error code")))))
 
-        ;; Verify we can recreate a VG with the same name
-        (testing "can recreate VG with same name after deletion"
-          (let [new-vg @(fluree/create-virtual-graph
+        ;; Verify we can recreate an index with the same name
+        (testing "can recreate index with same name after deletion"
+          (let [new-vg @(fluree/create-full-text-index
                          conn
-                         {:name "movie-search"
-                          :type :bm25
-                          :config {:ledgers ["movies"]
-                                   :query {"@context" {"ex" "http://example.org/"}
-                                           "where" [{"@id" "?x"
-                                                     "@type" "ex:Movie"}]
-                                           "select" {"?x" ["@id" "ex:title"]}}}})]
+                         "movie-search"
+                         {:ledger "movies"
+                          :query {"@context" {"ex" "http://example.org/"}
+                                  "where" [{"@id" "?x"
+                                            "@type" "ex:Movie"}]
+                                  "select" {"?x" ["@id" "ex:title"]}}})]
             (is (some? new-vg))
             (is (= "movie-search:main" (:vg-name new-vg)))))))))
 
@@ -107,16 +105,15 @@
                                      "ex:title" "Fluree Guide"
                                      "ex:content" "Learn about graph databases"}]})
 
-        ;; Create VG that depends on books ledger
-        (let [vg @(fluree/create-virtual-graph
+        ;; Create index that depends on books ledger
+        (let [vg @(fluree/create-full-text-index
                    conn
-                   {:name "book-index"
-                    :type :bm25
-                    :config {:ledgers ["books"]
-                             :query {"@context" {"ex" "http://example.org/"}
-                                     "where" [{"@id" "?x"
-                                               "@type" "ex:Book"}]
-                                     "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})]
+                   "book-index"
+                   {:ledger "books"
+                    :query {"@context" {"ex" "http://example.org/"}
+                            "where" [{"@id" "?x"
+                                      "@type" "ex:Book"}]
+                            "select" {"?x" ["@id" "ex:title" "ex:content"]}}})]
           ;; Wait for VG to be initialized
           (<!! (vg/sync vg nil)))
 
@@ -130,6 +127,6 @@
 
         ;; Drop the VG first
         (testing "can drop ledger after dropping VG"
-          (is (= :dropped @(fluree/drop-virtual-graph conn "book-index")))
+          (is (= :dropped @(fluree/drop-full-text-index conn "book-index")))
           ;; Now we should be able to drop the ledger
           (is (= :dropped @(fluree/drop conn "books")))))))

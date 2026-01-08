@@ -39,16 +39,15 @@
                                            "@type" "lib:Author"
                                            "lib:name" "John Doe"}]})
 
-          ;; Create BM25 virtual graph
-          vg-obj @(fluree/create-virtual-graph
+          ;; Create BM25 full-text index
+          vg-obj @(fluree/create-full-text-index
                    conn
-                   {:name "book-search"
-                    :type :bm25
-                    :config {:ledgers ["library"]
-                             :query {"@context" {"lib" "http://library.org/"}
-                                     "where" [{"@id" "?x"
-                                               "@type" "lib:Book"}]
-                                     "select" {"?x" ["@id" "lib:title" "lib:content"]}}}})
+                   "book-search"
+                   {:ledger "library"
+                    :query {"@context" {"lib" "http://library.org/"}
+                            "where" [{"@id" "?x"
+                                      "@type" "lib:Book"}]
+                            "select" {"?x" ["@id" "lib:title" "lib:content"]}}})
           vg-name (:vg-name vg-obj)]
 
       (testing "virtual graph created"

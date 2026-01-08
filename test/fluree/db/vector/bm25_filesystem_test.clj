@@ -30,16 +30,15 @@
                                              "ex:title" "Blockchain Integration"
                                              "ex:content" "How databases integrate with blockchain technology"}]})
 
-            ;; Create BM25 virtual graph
-            vg-obj @(fluree/create-virtual-graph
+            ;; Create BM25 full-text index
+            vg-obj @(fluree/create-full-text-index
                      conn
-                     {:name "article-search"
-                      :type :bm25
-                      :config {:ledgers ["articles"]
-                               :query {"@context" {"ex" "http://example.org/"}
-                                       "where" [{"@id" "?x"
-                                                 "@type" "ex:Article"}]
-                                       "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})
+                     "article-search"
+                     {:ledger "articles"
+                      :query {"@context" {"ex" "http://example.org/"}
+                              "where" [{"@id" "?x"
+                                        "@type" "ex:Article"}]
+                              "select" {"?x" ["@id" "ex:title" "ex:content"]}}})
             vg-name (:vg-name vg-obj)]
 
         (testing "virtual graph creation"
