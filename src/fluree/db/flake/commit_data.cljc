@@ -3,6 +3,7 @@
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
+            [fluree.db.flake.index :as index]
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
@@ -181,16 +182,17 @@
       issuer (assoc :issuer {:id (get-id issuer)}))))
 
 (defn update-index-roots
-  [commit-map {:keys [spot post opst tspo]}]
+  [commit-map index-map]
   (if (contains? commit-map :index)
-    (update commit-map :index assoc :spot spot, :post post, :opst opst, :tspo tspo)
+    (let [index-map* (index/select-roots index-map)]
+      (update commit-map :index merge index-map*))
     commit-map))
 
 (defn json-ld->map
-  ([commit-jsonld index-roots]
-   (json-ld->map commit-jsonld nil index-roots))
+  ([commit-jsonld index-map]
+   (json-ld->map commit-jsonld nil index-map))
 
-  ([commit-jsonld fallback-address index-roots]
+  ([commit-jsonld fallback-address index-map]
    (let [commit-map (jsonld->clj commit-jsonld)]
      (cond-> commit-map
        (and (some? fallback-address)
@@ -199,7 +201,7 @@
                                          ; IPFS, is empty string
 
        true
-       (update-index-roots index-roots)))))
+       (update-index-roots index-map)))))
 
 (defn hash->commit-id
   [hsh]
@@ -355,35 +357,50 @@
     add (+ (flake/size-bytes add))
     rem (- (flake/size-bytes rem))))
 
+(defn revise-novelty-set
+  [novelty add rem]
+  #?(:clj  (future (flake/revise novelty add rem))
+     :cljs (flake/revise novelty add rem)))
+
+(defn revise-index-novelty
+  [novelty add rem]
+  (let [index-novelty (index/select-roots novelty)]
+    (reduce-kv (fn [m idx novelty]
+                 (let [novelty* (if (= :opst idx)
+                                  (revise-novelty-set novelty (ref-flakes add) (ref-flakes rem))
+                                  (revise-novelty-set novelty add rem))]
+                   (assoc m idx novelty*)))
+               {} index-novelty)))
+
+(defn merge-index-novelty
+  [db index-novelty]
+  (reduce-kv (fn [db* idx novelty]
+               (assoc-in db* [:novelty idx] #?(:clj  @novelty
+                                               :cljs novelty)))
+             db index-novelty))
+
 (defn update-novelty
   ([db add]
    (update-novelty db add []))
 
-  ([{:keys [t] :as db} add rem]
+  ([{:keys [t novelty] :as db} add rem]
    (try*
      (let [flake-count (cond-> 0
                          add (+ (count add))
                          rem (- (count rem)))
+
            ;; launch futures for parallellism on JVM
-           flake-size  #?(:clj  (future (calc-flake-size add rem))
-                          :cljs (calc-flake-size add rem))
-           post        #?(:clj  (future (flake/revise (get-in db [:novelty :post]) add rem))
-                          :cljs (flake/revise (get-in db [:novelty :post]) add rem))
-           opst        #?(:clj  (future (flake/revise (get-in db [:novelty :opst]) (ref-flakes add) (ref-flakes rem)))
-                          :cljs (flake/revise (get-in db [:novelty :opst]) (ref-flakes add) (ref-flakes rem)))]
+           flake-size    #?(:clj  (future (calc-flake-size add rem))
+                            :cljs (calc-flake-size add rem))
+           index-novelty (revise-index-novelty novelty add rem)]
        (-> db
-           (update-in [:novelty :spot] flake/revise add rem)
-           (update-in [:novelty :tspo] flake/revise add rem)
-           (assoc-in [:novelty :post] #?(:clj  @post
-                                         :cljs post))
-           (assoc-in [:novelty :opst] #?(:clj  @opst
-                                         :cljs opst))
            (update-in [:novelty :size] + #?(:clj  @flake-size
                                             :cljs flake-size))
            (assoc-in [:novelty :t] t)
            (update-in [:stats :size] + #?(:clj  @flake-size
                                           :cljs flake-size))
-           (update-in [:stats :flakes] + flake-count)))
+           (update-in [:stats :flakes] + flake-count)
+           (merge-index-novelty index-novelty)))
      (catch* e
        (log/error (str "Update novelty unexpected error while attempting to updated db: "
                        (pr-str db) " due to exception: " (ex-message e))
@@ -391,24 +408,34 @@
                    :rem-flakes rem})
        (throw e)))))
 
+(defn add-child-tt-ids
+  [children tt-id]
+  (reduce-kv (fn [children* k child]
+               (assoc children* k (assoc child :tt-id tt-id)))
+             (empty children) children))
+
+(defn add-root-tt-id
+  [root tt-id]
+  (-> root
+      (update :children add-child-tt-ids tt-id)
+      (assoc :tt-id tt-id)))
+
+(defn add-index-tt-ids
+  [db tt-id]
+  (let [indexes (index/indexes-for db)]
+    (reduce (fn [db* idx]
+              (update db* idx add-root-tt-id tt-id))
+            db indexes)))
+
 (defn add-tt-id
   "Associates a unique tt-id for any in-memory staged db in their index roots.
   tt-id is used as part of the caching key, by having this in place it means
   that even though the 't' value hasn't changed it will cache each stage db
   data as its own entity."
   [db]
-  (let [tt-id   (random-uuid)
-        indexes [:spot :post :opst :tspo]]
-    (-> (reduce
-         (fn [db* idx]
-           (let [{:keys [children] :as node} (get db* idx)
-                 children* (reduce-kv
-                            (fn [children* k v]
-                              (assoc children* k (assoc v :tt-id tt-id)))
-                            (empty children) children)]
-             (assoc db* idx (assoc node :tt-id tt-id
-                                   :children children*))))
-         db indexes)
+  (let [tt-id (random-uuid)]
+    (-> db
+        (add-index-tt-ids tt-id)
         (assoc :tt-id tt-id))))
 
 (defn commit-metadata-flakes

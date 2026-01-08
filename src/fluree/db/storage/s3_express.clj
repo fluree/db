@@ -126,8 +126,8 @@
         (do
           (log/debug "s3-express: Cached session expired, refreshing" {:bucket bucket})
           (cache/evict session-cache key)
-          (recur bucket region base-credentials {:refresh-buffer-seconds refresh-buffer-seconds
-                                                 :force-refresh true}))
+          (recur bucket region base-credentials [{:refresh-buffer-seconds refresh-buffer-seconds
+                                                  :force-refresh true}]))
         ;; Cached and valid
         (do
           (log/trace "s3-express: Using cached session" {:bucket bucket})

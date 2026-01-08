@@ -530,9 +530,18 @@
   [attrs]
   (every? v/specified-value? (keys attrs)))
 
-(defn variable-objects?
+(defn nested?
   [attrs]
-  (every? v/query-variable? (vals attrs)))
+  (boolean (some (fn [[_k v]]
+                   (map? v))
+                 attrs)))
+
+(defn simple-property-join?
+  [id attrs]
+  (and (>= (count attrs) 2)
+       (v/query-variable? id)
+       (specified-properties? attrs)
+       (not (nested? attrs))))
 
 (defn parse-id-map-pattern
   [m var-config context]
@@ -542,7 +551,9 @@
     (if (empty? attrs)
       [(where/->pattern :id s-mch)]
       (let [statements (parse-statements s-mch attrs var-config context)]
-        (sort optimize/compare-triples statements)))))
+        (if (simple-property-join? id attrs)
+          [(where/->pattern :property-join statements)]
+          (sort optimize/compare-triples statements))))))
 
 (defn parse-node-map
   [m var-config context]
@@ -649,14 +660,25 @@
   (let [parsed-fn  (parse-code f)
         fn-name    (some-> parsed-fn second first)
         bind-var   (last parsed-fn)
-        aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
+        aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))
+        agg-vars   (variables parsed-fn)
+        agg-info   (when aggregate?
+                     {:fn-name fn-name
+                      :vars    agg-vars})]
     (-> parsed-fn
         (eval/compile context)
-        (select/as-selector output bind-var aggregate?))))
+        (select/as-selector output bind-var aggregate? agg-info))))
 
 (defn parse-select-aggregate
   [f context]
-  (-> f parse-code (eval/compile context) select/aggregate-selector))
+  (let [parsed   (parse-code f)
+        fn-name  (when (seq? parsed) (first parsed))
+        agg-vars (variables parsed)
+        agg-info {:fn-name fn-name
+                  :vars    agg-vars}]
+    (-> parsed
+        (eval/compile context)
+        (select/aggregate-selector agg-info))))
 
 (defn reverse?
   [context k]

@@ -1,5 +1,6 @@
 (ns fluree.db.flake.index.novelty
   (:require [clojure.core.async :as async :refer [<! >! go go-loop]]
+            [fluree.db.cache :as cache]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
@@ -54,7 +55,7 @@
        seq
        boolean))
   ([db]
-   (->> index/types
+   (->> (index/indexes-for db)
         (some (partial dirty? db))
         boolean)))
 
@@ -425,6 +426,27 @@
       ;; No novelty, return indexed stats as-is
       indexed-stats)))
 
+(defn cached-current-stats
+  "Returns current-stats using connection's LRU cache.
+
+   Cache key: [::ledger-stats ledger-alias t]
+   This ensures stats are computed once per ledger state and shared across:
+   - ledger-info API calls
+   - f:onClass policy optimization
+
+   Returns a channel containing the stats."
+  [db]
+  (let [lru-cache (-> db :index-catalog :cache)
+        cache-key [::ledger-stats (:alias db) (:t db)]]
+    (cache/lru-lookup
+     lru-cache
+     cache-key
+     (fn [_]
+       (async/go
+         (log/debug "Computing class->property stats"
+                    {:ledger (:alias db) :t (:t db)})
+         (current-stats db))))))
+
 (defn write-resolved-nodes
   [db idx changes-ch error-ch index-ch]
   (go-loop [stats     {:idx idx, :novel 0, :unchanged 0, :garbage #{}, :updated-ids {}}
@@ -512,7 +534,7 @@
                             (stats/compute-class-property-stats-async db))
 
            ;; Run index refresh (always required)
-           index-result (<? (->> index/types
+           index-result (<? (->> (index/indexes-for db)
                                  (map (partial extract-root db))
                                  (map (partial refresh-index db changes-ch error-ch))
                                  async/merge
@@ -594,7 +616,7 @@
                                                       index-id
                                                       index-address
                                                       index-version
-                                                      (select-keys refreshed-db* index/types))
+                                                      (index/select-roots refreshed-db*))
                  indexed-db    (dbproto/-index-update refreshed-db* commit-index)
                  duration      (- (util/current-time-millis) start-time-ms)
                  end-stats     (assoc init-stats
