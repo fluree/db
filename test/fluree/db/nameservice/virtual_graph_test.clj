@@ -21,18 +21,17 @@
                                    "ex:title" "Advanced Queries"
                                    "ex:content" "Learn about complex queries"}]})
 
-      (testing "Create BM25 virtual graph"
-        (let [vg-obj @(fluree/create-virtual-graph
+      (testing "Create BM25 full-text index"
+        (let [vg-obj @(fluree/create-full-text-index
                        conn
-                       {:name "article-search"
-                        :type :bm25
-                        :config {:stemmer "snowballStemmer-en"
-                                 :stopwords "stopwords-en"
-                                 :ledgers ["test-vg"]
-                                 :query {"@context" {"ex" "http://example.org/ns/"}
-                                         "where" [{"@id" "?x"
-                                                   "@type" "ex:Article"}]
-                                         "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})
+                       "article-search"
+                       {:stemmer "snowballStemmer-en"
+                        :stopwords "stopwords-en"
+                        :ledger "test-vg"
+                        :query {"@context" {"ex" "http://example.org/ns/"}
+                                "where" [{"@id" "?x"
+                                          "@type" "ex:Article"}]
+                                "select" {"?x" ["@id" "ex:title" "ex:content"]}}})
               vg-name (:vg-name vg-obj)]
           ;; VG names are normalized with branch (like ledgers)
           (is (= "article-search:main" vg-name))
@@ -50,12 +49,14 @@
             ;; Dependencies are stored in fidx:dependencies
             (is (= ["test-vg:main"] (get vg-record "fidx:dependencies"))))))
 
-      (testing "Cannot create duplicate virtual graph"
-        (let [result @(fluree/create-virtual-graph
+      (testing "Cannot create duplicate full-text index"
+        (let [result @(fluree/create-full-text-index
                        conn
-                       {:name "article-search"
-                        :type :bm25
-                        :config {:ledgers ["test-vg"]}})]
+                       "article-search"
+                       {:ledger "test-vg"
+                        :query {"@context" {"ex" "http://example.org/ns/"}
+                                "where" [{"@id" "?x" "@type" "ex:Article"}]
+                                "select" {"?x" ["@id"]}}})]
           (is (instance? Exception result))
           (is (re-find #"Virtual graph already exists" (.getMessage ^Exception result)))))
 
@@ -154,19 +155,18 @@
                                          "ex:title" "First Article"
                                          "ex:content" "This is the first article about databases"}]})
 
-          ;; Create BM25 virtual graph - subscriptions start automatically
-          vg @(fluree/create-virtual-graph
+          ;; Create BM25 full-text index - subscriptions start automatically
+          vg @(fluree/create-full-text-index
                conn
-               {:name "article-search"
-                :type :bm25
-                :config {:stemmer "snowballStemmer-en"
-                         :stopwords "stopwords-en"
-                         :ledgers ["articles"]
-                         :query {"@context" {"ex" "http://example.org/ns/"}
-                                 "where" [{"@id" "?x"
-                                           "ex:title" "?title"
-                                           "ex:content" "?content"}]
-                                 "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})]
+               "article-search"
+               {:stemmer "snowballStemmer-en"
+                :stopwords "stopwords-en"
+                :ledger "articles"
+                :query {"@context" {"ex" "http://example.org/ns/"}
+                        "where" [{"@id" "?x"
+                                  "ex:title" "?title"
+                                  "ex:content" "?content"}]
+                        "select" {"?x" ["@id" "ex:title" "ex:content"]}}})]
 
       ;; Verify VG was created with subscription channels
       (is (some? (:subscription-channels vg)) "VG should have subscription channels")

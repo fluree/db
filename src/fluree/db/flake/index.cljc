@@ -94,17 +94,73 @@
     (leaf? node)   (dissoc node :flakes)
     (branch? node) (dissoc node :children)))
 
+(defn- redundant-same-op
+  [flakes]
+  (loop [prev nil
+         xs   (seq flakes)
+         acc  (transient [])]
+    (if xs
+      (let [f (first xs)]
+        (if (and prev
+                 (flake/equiv-flake prev f)
+                 (= (flake/op prev) (flake/op f)))
+          (recur prev (next xs) (conj! acc f))
+          (recur f (next xs) acc)))
+      (persistent! acc))))
+
+(defn- conj-bytes
+  "Returns [ss' bytes-added]. bytes-added is an estimate based on input."
+  [ss flakes]
+  (loop [tset  (transient ss)
+         bytes 0
+         xs    (seq flakes)]
+    (if xs
+      (let [f (first xs)]
+        (recur (conj! tset f)
+               (+ bytes (flake/size-flake f))
+               (next xs)))
+      [(persistent! tset) bytes])))
+
+(defn- disj-bytes
+  "Returns [ss' bytes-removed]."
+  [ss flakes]
+  (loop [tset  (transient ss)
+         bytes 0
+         xs    (seq flakes)]
+    (if xs
+      (let [f (first xs)]
+        (recur (disj! tset f)
+               (+ bytes (flake/size-flake f))
+               (next xs)))
+      [(persistent! tset) bytes])))
+
 (defn add-flakes
+  "Adds flakes to a resolved leaf, dropping redundant same-op reassertions."
   [leaf flakes]
-  (let [new-leaf (-> leaf
-                     (update :flakes into flakes)
-                     (update :size (fn [size]
-                                     (->> flakes
-                                          (map flake/size-flake)
-                                          (reduce + size)))))
-        new-first (or (some-> new-leaf :flakes first)
-                      flake/maximum)]
-    (assoc new-leaf :first new-first)))
+  (let [[merged added-bytes] (conj-bytes (:flakes leaf) flakes)
+        redundant            (not-empty (redundant-same-op merged))
+        [deduped removed-bytes] (if redundant
+                                  (disj-bytes merged redundant)
+                                  [merged 0])
+        expected-first       (:first leaf)
+        actual-first         (first deduped)]
+    (when redundant
+      (log/info "Dropping redundant same-op reassertions in leaf"
+                {:leaf-id (:id leaf)
+                 :redundant-flakes (count redundant)}))
+    ;; For non-leftmost leaves, :first is a stable boundary and must not change.
+    ;; For the leftmost leaf, novelty may introduce smaller keys, so :first can move.
+    (when (and (not (:leftmost? leaf))
+               (not= expected-first actual-first))
+      (throw (ex-info "Leaf :first changed for non-leftmost leaf during add-flakes"
+                      {:leaf-id   (:id leaf)
+                       :expected  expected-first
+                       :actual    actual-first
+                       :error     :db/index-invariant-failure})))
+    (cond-> (assoc leaf
+                   :flakes deduped
+                   :size  (- (+ (:size leaf) added-bytes) removed-bytes))
+      (:leftmost? leaf) (assoc :first actual-first))))
 
 (defn empty-leaf
   "Returns a blank leaf node map for the provided `ledger-alias` and index
@@ -499,3 +555,97 @@
                            (recur stack**))))))))
              (async/close! out)))))
      out)))
+
+;; Batched lookups over a single index by leaf.
+
+(defn- floor-child
+  "Return the child whose key is the greatest <= target (or the leftmost child)."
+  [children target]
+  (or (some-> children (rsubseq <= target) first val)
+      (some-> children first val)))
+
+(defn- resolve-node
+  [r node error-ch]
+  (go
+    (try*
+      (<? (resolve r node))
+      (catch* e
+        (>! error-ch e)
+        nil))))
+
+(defn- seek-leaf
+  "Resolve the leaf that should contain `target` (by index key ordering)."
+  [r root target error-ch]
+  (go
+    (loop [node root]
+      (when node
+        (let [node* (if (resolved? node) node (<! (resolve-node r node error-ch)))]
+          (cond
+            (nil? node*) nil
+
+            (leaf? node*)
+            (if (resolved? node*)
+              node*
+              (<! (resolve-node r node* error-ch)))
+
+            :else
+            (recur (floor-child (:children node*) target))))))))
+
+(defn streaming-index-lookup
+  "Streams `lookup-ch` (already sorted by `lookup->start`) and emits results by
+  batching all lookups that fall within a resolved leaf.
+
+  Callers provide:
+  - lookup->start: lookup -> flake (must match index comparator ordering)
+  - leaf->results: (fn [resolved-leaf lookups] (seq results))
+
+  Parameters:
+  - r               Resolver
+  - root            Index root node (must have :comparator)
+  - lookup-ch       Channel of lookup items (sorted by lookup->start)
+  - lookup->start   lookup -> flake (ordered by root comparator)
+  - leaf->results   (fn [resolved-leaf lookups] (seq results))
+  - error-ch        Channel for errors (required)
+  - opts:
+      :buffer out buffer size (default 64)"
+  [r root lookup-ch lookup->start leaf->results error-ch {:keys [buffer] :or {buffer 64}}]
+  (let [out (chan buffer)
+        cmp (:comparator root)]
+    (when-not (fn? cmp)
+      (throw (ex-info "streaming-index-lookup requires root with :comparator"
+                      {:status 500 :error :db/index-lookup})))
+    (go
+      (try*
+        ;; Resolve the root once up-front; repeated `seek-leaf` calls then only
+        ;; resolve along the path and leaf nodes.
+        (let [root* (if (resolved? root) root (<! (resolve-node r root error-ch)))]
+          (when-not root*
+            (throw (ex-info "Unable to resolve index root for streaming-index-lookup"
+                            {:status 500 :error :db/index-lookup})))
+          (loop [cur (<! lookup-ch)]
+            (if cur
+              (let [target (lookup->start cur)
+                    leaf   (<! (seek-leaf r root* target error-ch))]
+                (when-not leaf
+                  (throw (ex-info "Unable to resolve leaf for lookup batch"
+                                  {:status 500 :error :db/index-lookup
+                                   :lookup (pr-str cur)})))
+                (let [rhs (:rhs leaf)
+                      [batch carry]
+                      (loop [acc [cur]]
+                        (let [nxt (<! lookup-ch)]
+                          (cond
+                            (nil? nxt) [acc nil]
+                            ;; rhs is an inclusive upper bound for a leaf's key-range. We only
+                            ;; carry when the next lookup falls strictly beyond rhs.
+                            (and rhs (pos? (cmp (lookup->start nxt) rhs))) [acc nxt]
+                            :else (recur (conj acc nxt)))))]
+                  (doseq [item (leaf->results leaf batch)]
+                    (>! out item))
+                  (recur carry)))
+              (async/close! out))))
+        (catch* e
+          (log/error e "streaming-index-lookup failed")
+          (>! error-ch e)
+          (async/close! out))))
+    out))

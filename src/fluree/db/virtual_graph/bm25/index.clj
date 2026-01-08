@@ -475,7 +475,7 @@
        :namespace-codes (:namespace-codes this)}))
 
   (-index-range [_this _idx _test _match _opts]
-    ;; BM25 indexes don't support index range queries
+    ;; BM25 indexes don't support direct index range queries
     (throw (ex-info "BM25 virtual graphs do not support index range queries"
                     {:status 400
                      :error :db/unsupported-operation}))))

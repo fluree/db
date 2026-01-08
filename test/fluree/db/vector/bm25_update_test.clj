@@ -24,16 +24,15 @@
                                                "ex:title" "Advanced Programming"
                                                "ex:content" "Learn advanced programming techniques"}]})
 
-          ;; Create BM25 virtual graph and get the VG object
-          vg-obj @(fluree/create-virtual-graph
+          ;; Create BM25 full-text index and get the VG object
+          vg-obj @(fluree/create-full-text-index
                    conn
-                   {:name "book-search"
-                    :type :bm25
-                    :config {:ledgers ["books"]
-                             :query {"@context" {"ex" "http://example.org/"}
-                                     "where" [{"@id" "?x"
-                                               "@type" "ex:Book"}]
-                                     "select" {"?x" ["@id" "ex:title" "ex:content"]}}}})]
+                   "book-search"
+                   {:ledger "books"
+                    :query {"@context" {"ex" "http://example.org/"}
+                            "where" [{"@id" "?x"
+                                      "@type" "ex:Book"}]
+                            "select" {"?x" ["@id" "ex:title" "ex:content"]}}})]
 
       (testing "virtual graph creation succeeds"
         (is (some? vg-obj) "Should return VG object")

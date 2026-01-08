@@ -2075,6 +2075,12 @@
             updated (conj iceberg-patterns class-triple)]
         (assoc solution ::iceberg-patterns updated))))
 
+  (-match-properties [_this _tracker solution triples _error-ch]
+    (go
+      (let [iceberg-patterns (get solution ::iceberg-patterns [])
+            updated (into iceberg-patterns triples)]
+        (assoc solution ::iceberg-patterns updated))))
+
   (-activate-alias [this _alias]
     (go this))
 

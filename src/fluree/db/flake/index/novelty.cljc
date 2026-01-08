@@ -86,6 +86,21 @@
            :first first-flake
            :rhs rhs)))
 
+(defn merge-with-unchanged-children
+  "Merges updated children (from the stack) with unchanged children from the
+   original branch.
+
+   Uses ::old-id on updated children to identify which original children have
+   been replaced."
+  [{:keys [children] :as _branch} updated-children]
+  (if (empty? children)
+    updated-children
+    (let [replaced-ids (into #{} (keep ::old-id) updated-children)]
+      (->> children
+           vals
+           (remove #(contains? replaced-ids (:id %)))
+           (into updated-children)))))
+
 (defn update-branch
   [{branch-t :t, :as branch} t child-nodes]
   (if (some-update-after? branch-t child-nodes)
@@ -102,8 +117,10 @@
 
 (defn rebalance-children
   [branch t child-nodes]
-  (let [target-count (/ *overflow-children* 2)]
+  (let [target-count (/ *overflow-children* 2)
+        cmp          (:comparator branch)]
     (->> child-nodes
+         (sort-by :first cmp)
          (partition-all target-count)
          (map (fn [kids]
                 (reconstruct-branch branch t kids)))
@@ -124,10 +141,12 @@
              leaves    []]
         (if (empty? r)
           (let [subrange  (flake/subrange flakes >= cur-first)
+                last-size (+ cur-size (if f (flake/size-flake f) 0))
                 last-leaf (-> leaf
                               (assoc :flakes subrange
                                      :first cur-first
                                      :rhs rhs
+                                     :size last-size
                                      :leftmost? (and (empty? leaves)
                                                      leftmost?))
                               (dissoc :id))]
@@ -140,6 +159,7 @@
                                  (assoc :flakes subrange
                                         :first cur-first
                                         :rhs f
+                                        :size cur-size
                                         :leftmost? (and (empty? leaves)
                                                         leftmost?))
                                  (dissoc :id))]
@@ -204,25 +224,26 @@
              (vswap! stack push-all-nodes leaves)
              (transduce-nodes xf result leaves))
 
-           (loop [child-nodes []
-                  stack*      @stack
-                  result*     result]
+           (loop [updated-children []
+                  stack*           @stack
+                  result*          result]
              (let [child (peek stack*)]
                (if (and child
                         (index/descendant? node child))     ; all of a resolved
                                                             ; branch's children
                                                             ; should be at the top
                                                             ; of the stack
-                 (recur (conj child-nodes child)
+                 (recur (conj updated-children child)
                         (vswap! stack pop)
                         result*)
-                 (if (overflow-children? child-nodes)
-                   (let [new-branches (rebalance-children node t child-nodes)]
-                     (vswap! stack push-all-nodes new-branches)
-                     (transduce-nodes xf result* new-branches))
-                   (let [branch (update-branch node t child-nodes)]
-                     (vswap! stack push-node branch)
-                     (xf result* branch))))))))
+                 (let [all-children (merge-with-unchanged-children node updated-children)]
+                   (if (overflow-children? all-children)
+                     (let [new-branches (rebalance-children node t all-children)]
+                       (vswap! stack push-all-nodes new-branches)
+                       (transduce-nodes xf result* new-branches))
+                     (let [branch (update-branch node t all-children)]
+                       (vswap! stack push-node branch)
+                       (xf result* branch)))))))))
 
         ;; Completion: If there is only one node left in the stack, then it's
         ;; the root and we're done, so we call the nested transformer's
@@ -463,7 +484,17 @@
                  written-node))
         (recur (update stats :unchanged inc)
                node))
-      (assoc stats :root (index/unresolve last-node)))))
+      (do
+        (when (or (:rhs last-node)
+                  (not (true? (:leftmost? last-node))))
+          (throw (ex-info "Index root invariant violated: root must have :rhs nil and :leftmost? true"
+                          {:idx        idx
+                           :root-id    (:id last-node)
+                           :root-first (:first last-node)
+                           :root-rhs   (:rhs last-node)
+                           :leftmost?  (:leftmost? last-node)
+                           :error      :db/index-invariant-failure})))
+        (assoc stats :root (index/unresolve last-node))))))
 
 (defn refresh-index
   [{:keys [index-catalog] :as db} changes-ch error-ch {::keys [idx t novelty root]}]
@@ -520,9 +551,18 @@
    (go-try
      ;; Check if this is a v1 index - if so, skip stats computation entirely
      ;; v1 indexes should not generate stats until fully reindexed
-     (let [prev-index-version  (get-in db [:commit :index :v])
-           is-v1-index?        (and prev-index-version (< prev-index-version 2))
-           track-class-stats?  (get db :track-class-stats true)
+     (let [prev-index-version (get-in db [:commit :index :v])
+           ;; If there's an existing index recorded on the commit, but no :v (or :v < 2),
+           ;; treat it as v1. (Nil version is assumed v1.)
+           ;;
+           ;; Note: during full reindex we replay commits but explicitly strip :index
+           ;; metadata; in that case there is no existing index to key off of and we
+           ;; should compute stats for the new v2 index.
+           has-existing-index? (some? (get-in db [:commit :index :data :t]))
+           is-v1-index?        (and has-existing-index?
+                                    (or (nil? prev-index-version)
+                                        (< prev-index-version 2)))
+           track-class-stats? (get db :track-class-stats true)
 
            ;; Kick off stats computation in parallel (v2 only)
            stats-ch (when-not is-v1-index?
