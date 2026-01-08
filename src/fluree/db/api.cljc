@@ -1039,46 +1039,64 @@
    (promise-wrap
     (connection/trigger-ledger-index conn ledger-alias opts))))
 
-;; Virtual Graph APIs (JVM only)
+;; Full-Text Search APIs (JVM only)
 
 #?(:clj
-   (defn create-virtual-graph
-     "Creates a new virtual graph.
+   (defn create-full-text-index
+     "Creates a BM25 full-text search index over ledger data.
+
+     The index is built by executing the provided query against the specified
+     ledger(s) and indexing the selected text fields. The index automatically
+     stays in sync as the underlying ledger data changes.
+
+     Once created, use the `search` function in queries to perform full-text
+     searches against this index.
 
      Parameters:
        conn - Connection object
+       name - Name for the search index. Used to reference this index in queries.
        config - Configuration map:
-         :name - Name for the virtual graph (required)
-         :type - Virtual graph type, e.g. :bm25 (required)
-         :config - Type-specific configuration map:
-           :ledgers - Vector of ledger aliases to index
-           :query - Query defining what data to index
+         :ledger - Ledger alias to index (required). Currently only single-ledger
+                   indexes are supported.
+         :query - FQL query defining what data to index (required). The query's
+                  select clause determines which fields are indexed for search.
+         :stemmer - Optional stemmer for word normalization, e.g. \"snowballStemmer-en\"
+         :stopwords - Optional stopwords list, e.g. \"stopwords-en\"
 
-     Returns promise resolving to the created virtual graph instance.
+     Returns promise resolving to the created index descriptor.
 
      Example:
-       @(create-virtual-graph conn
-         {:name \"my-search\"
-          :type :bm25
-          :config {:ledgers [\"my-ledger\"]
-                   :query {\"@context\" {\"ex\" \"http://example.org/\"}
-                           \"where\" [{\"@id\" \"?x\" \"@type\" \"ex:Document\"}]
-                           \"select\" {\"?x\" [\"@id\" \"ex:title\" \"ex:content\"]}}}})"
-     [conn config]
+       ;; Create a search index over article titles and content
+       @(create-full-text-index conn \"article-search\"
+         {:ledger \"my-ledger\"
+          :query {\"@context\" {\"ex\" \"http://example.org/\"}
+                  \"where\" [{\"@id\" \"?x\" \"@type\" \"ex:Article\"}]
+                  \"select\" {\"?x\" [\"@id\" \"ex:title\" \"ex:content\"]}}})
+
+       ;; Search the index
+       @(fluree/query conn {\"from\" \"my-ledger\"
+                            \"where\" [[\"search\" \"article-search\" \"?x\" \"climate change\"]]
+                            \"select\" [\"?x\"]})"
+     [conn name {:keys [ledger query stemmer stopwords]}]
      (validate-connection conn)
      (promise-wrap
-      (vg-create/create conn config))))
+      (vg-create/create conn {:name name
+                              :type :bm25
+                              :config (cond-> {:ledgers [ledger]
+                                               :query query}
+                                        stemmer   (assoc :stemmer stemmer)
+                                        stopwords (assoc :stopwords stopwords))}))))
 
 #?(:clj
-   (defn drop-virtual-graph
-     "Drops a virtual graph and all its associated data.
+   (defn drop-full-text-index
+     "Drops a full-text search index and all its associated data.
 
      Parameters:
        conn - Connection object
-       vg-name - Name of the virtual graph to drop
+       name - Name of the search index to drop
 
      Returns promise resolving to :dropped when complete."
-     [conn vg-name]
+     [conn name]
      (validate-connection conn)
      (promise-wrap
-      (vg-drop/drop-virtual-graph conn vg-name))))
+      (vg-drop/drop-virtual-graph conn name))))
