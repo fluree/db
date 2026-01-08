@@ -308,8 +308,11 @@
                       (.get ^BitVector src-vector (int src-idx)))
       VarCharVector (let [bytes (.get ^VarCharVector src-vector (int src-idx))]
                       (.setSafe ^VarCharVector dest-vector (int dest-idx) ^bytes bytes))
-      ;; Fallback: copy via object (slower but safe)
-      (.set dest-vector (int dest-idx) (.getObject src-vector (int src-idx))))))
+      ;; No generic fallback - FieldVector doesn't have a set(int, Object) method
+      (throw (ex-info "Unsupported Arrow vector type for copy"
+                      {:vector-type (type src-vector)
+                       :src-idx src-idx
+                       :dest-idx dest-idx})))))
 
 (defn- allocate-output-vector!
   "Allocate space in a destination vector for num-rows."
