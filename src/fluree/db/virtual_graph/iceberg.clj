@@ -2369,12 +2369,14 @@
                 ;; Detect transitive property path patterns (pred+ or pred*)
                 ;; These are tuple patterns where the predicate has ::recur tag (:one+ or :zero+)
                 ;; They need special execution in -finalize (iterative BFS traversal)
+                ;; IMPORTANT: Must return boolean (not nil) for proper group-by grouping
                 is-transitive-pattern?
                 (fn [pattern]
-                  (when (= :tuple (get-pattern-type pattern))
-                    (let [triple (if (map-entry? pattern) (val pattern) pattern)
-                          [_s p _o] triple]
-                      (where/get-transitive-property p))))
+                  (boolean
+                   (when (= :tuple (get-pattern-type pattern))
+                     (let [triple (if (map-entry? pattern) (val pattern) pattern)
+                           [_s p _o] triple]
+                       (where/get-transitive-property p)))))
 
                 {transitive-patterns true, non-transitive-patterns false}
                 (group-by is-transitive-pattern? regular-patterns)
