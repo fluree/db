@@ -27,8 +27,11 @@
     index information without contending with transactors. Only updates if index-t
     is greater than the existing value. Writes to a separate file/record to avoid
     contention with commit updates.")
+  (publish-vg [publisher vg-config]
+    "Publishes a virtual graph configuration. The vg-config map should contain
+    :vg-name, :vg-type, :config, and optionally :dependencies.")
   (retract [publisher ledger-alias]
-    "Remove the nameservice record for the ledger.")
+    "Remove the nameservice record for the ledger or virtual graph.")
   (publishing-address [publisher ledger-alias]
     "Returns the value to write into the commit's ns field for this nameservice.
     This may be a full address/IRI (e.g., fluree:ipns://...) or a resolvable

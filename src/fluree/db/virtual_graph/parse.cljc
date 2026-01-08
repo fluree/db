@@ -5,7 +5,8 @@
             [fluree.db.json-ld.iri :as iri]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.query.fql.parse :as q-parse])
+            [fluree.db.query.fql.parse :as q-parse]
+            [fluree.db.util.log :as log])
   #?(:clj (:import (fluree.db.query.exec.select SubgraphSelector))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -31,6 +32,13 @@
   [triple]
   (-> triple (nth 2) where/get-iri))
 
+(defn- obj-node-ref
+  "Returns the object as a map if it's a node reference"
+  [triple]
+  (let [obj (nth triple 2)]
+    (when (where/get-variable obj)
+      obj)))
+
 (defn match-search-triple
   [solution triple]
   (go
@@ -52,12 +60,25 @@
         (assoc-in solution [::virtual-graph ::timeout] (obj-var triple))
 
         (= const/iri-index-result p-iri)
-        (assoc-in solution [::virtual-graph ::result ::id] (obj-var triple))
+        ;; idx:result can have either a simple variable or a node reference
+        ;; Store the node var so we can match nested properties later
+        (if-let [node-ref (obj-node-ref triple)]
+          (assoc-in solution [::virtual-graph ::result-node-var] (where/get-variable node-ref))
+          (assoc-in solution [::virtual-graph ::result ::id] (obj-var triple)))
+
+        (= const/iri-index-id p-iri)
+        ;; Handle idx:id property on result nodes
+        (let [subj-var (-> triple first where/get-variable)]
+          (if (= subj-var (get-in solution [::virtual-graph ::result-node-var]))
+            (assoc-in solution [::virtual-graph ::result ::id] (obj-var triple))
+            solution))
 
         (= const/iri-index-score p-iri)
+        ;; Set score var for result (works for both direct and nested result nodes)
         (assoc-in solution [::virtual-graph ::result ::score] (obj-var triple))
 
         (= const/iri-index-vector p-iri)
+        ;; Set vector var for result (works for both direct and nested result nodes)
         (assoc-in solution [::virtual-graph ::result ::vector] (obj-var triple))
 
         :else
@@ -151,8 +172,9 @@
   Note the property dependencies cannot be turned into encoded IRIs
   (internal format) yet, because the namespaces used in the query may
   not yet exist if this index was created before data."
-  [{:keys [query] :as bm25-opts} db-vol]
-  (let [parsed-query  (-> (parse-query query)
+  [bm25-opts db-vol]
+  (let [query (or (get bm25-opts "query") (:query bm25-opts))
+        parsed-query  (-> (parse-query query)
                           (ensure-select-subgraph))
         ;; TODO - ultimately we want a property dependency chain, so when the properties change we can
         ;; TODO - trace up the chain to the node(s) that depend on them and update the index accordingly
@@ -199,14 +221,20 @@
         vector-var      (::vector result-bindings)
         db-alias        (first (where/-aliases iri-codec))]
     (map (fn [result]
-           (cond-> solution
-             id-var (assoc id-var (-> (where/unmatched-var id-var)
-                                      (where/match-iri (iri/decode-sid iri-codec (:id result)))
-                                      (where/match-sid db-alias (:id result))))
-             score-var (assoc score-var (-> (where/unmatched-var score-var)
-                                            (where/match-value (:score result) const/iri-xsd-float)))
-             vector-var (assoc vector-var (-> (where/unmatched-var vector-var)
-                                              (where/match-value (:vec result) vec-result-dt)))))
+           (let [decoded-iri (when-let [id (:id result)]
+                               (try
+                                 (iri/decode-sid iri-codec id)
+                                 (catch #?(:clj Exception :cljs js/Error) e
+                                   (log/error e "Failed to decode SID:" id)
+                                   nil)))]
+             (cond-> solution
+               id-var (assoc id-var (-> (where/unmatched-var id-var)
+                                        (where/match-iri decoded-iri)
+                                        (where/match-sid db-alias (:id result))))
+               score-var (assoc score-var (-> (where/unmatched-var score-var)
+                                              (where/match-value (:score result) const/iri-xsd-float)))
+               vector-var (assoc vector-var (-> (where/unmatched-var vector-var)
+                                                (where/match-value (:vec result) vec-result-dt))))))
          search-results)))
 
 (defn process-sparse-results

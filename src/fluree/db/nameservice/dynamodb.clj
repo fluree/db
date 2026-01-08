@@ -358,6 +358,12 @@
     (log/debug "nameservice.dynamodb/publish-index" {:ledger ledger-alias :index-t index-t})
     (update-index config ledger-alias index-address index-t))
 
+  (publish-vg [_ vg-config]
+    ;; TODO: Implement VG support for DynamoDB nameservice
+    (go-try
+      (throw (ex-info "Virtual graph publishing not yet supported for DynamoDB nameservice"
+                      {:status 501 :error :db/not-implemented :vg-config vg-config}))))
+
   (retract [_ ledger-alias]
     (log/debug "nameservice.dynamodb/retract" {:ledger ledger-alias})
     (delete-item config ledger-alias))

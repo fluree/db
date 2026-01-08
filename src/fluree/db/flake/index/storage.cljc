@@ -11,8 +11,7 @@
             [fluree.db.storage :as storage]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.ledger :as util.ledger]
-            [fluree.db.virtual-graph :as vg]))
+            [fluree.db.util.ledger :as util.ledger]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -75,21 +74,10 @@
         serialized (serde/-serialize-garbage serializer data)]
     (write-index-file storage ledger-alias :garbage serialized)))
 
-(defn write-vg-map
-  [index-catalog vg-map]
-  (go-try
-    (loop [[[vg-alias vg] & r] vg-map
-           address-map         {}]
-      (if vg-alias
-        (let [write-resp (-> (<? (vg/write-vg index-catalog vg))
-                             (select-keys [:address :size :type]))]
-          (recur r (assoc address-map vg-alias write-resp)))
-        address-map))))
-
 (defn write-db-root
-  [{:keys [storage serializer] :as index-catalog} db garbage-addr]
+  [{:keys [storage serializer] :as _index-catalog} db garbage-addr]
   (go-try
-    (let [{:keys [alias schema t stats vg commit namespace-codes
+    (let [{:keys [alias schema t stats commit namespace-codes
                   reindex-min-bytes reindex-max-bytes max-old-indexes]}
           db
           index-data    (reduce-kv (fn [m idx root]
@@ -110,13 +98,11 @@
                           ;; HLL-based stats (properties, classes) are only for v2 indexes
                           (= 2 version) (merge (select-keys stats [:properties :classes])))
 
-          vg-addresses  (<? (write-vg-map index-catalog vg))
           data          (-> {:ledger-alias    alias
                              :t               t
                              :v               version
                              :schema          (vocab/serialize-schema schema)
                              :stats           stats-data
-                             :vg              vg-addresses
                              :timestamp       (util/current-time-millis)
                              :namespace-codes namespace-codes
                              :config          {:reindex-min-bytes reindex-min-bytes
@@ -190,30 +176,17 @@
     (update root-map :preds deserialize-preds) ;; legacy, for now only v0
     (update root-map :schema vocab/deserialize-schema namespace-codes)))
 
-(defn reify-virtual-graphs
-  [index-catalog vg-address-map]
-  (go-try
-    (loop [[[vg-alias storage-meta] & r] vg-address-map
-           vg-map         {}]
-      (if vg-alias
-        (let [vg (<? (vg/read-vg index-catalog storage-meta))]
-          (recur r (assoc vg-map (:alias vg) vg)))
-        vg-map))))
-
 (defn read-db-root
   "Returns all data for a db index root of a given t."
-  [{:keys [storage serializer] :as index-catalog} idx-address]
+  [{:keys [storage serializer] :as _index-catalog} idx-address]
   (go-try
     (if-let [data (<? (storage/read-json storage idx-address true))]
-      (let [{:keys [t vg] :as root-data}
-            (serde/-deserialize-db-root serializer data)
-
-            vg-map (<? (reify-virtual-graphs index-catalog vg))]
+      (let [{:keys [t] :as root-data}
+            (serde/-deserialize-db-root serializer data)]
         (-> root-data
             reify-index-roots
             reify-namespaces
             reify-schema
-            (assoc :vg vg-map)
             (update :stats assoc :indexed t)))
       (throw (ex-info (str "Could not load index point at address: "
                            idx-address ".")

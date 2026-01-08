@@ -57,14 +57,15 @@
          (reduce
           (fn [all-text sentence]
             (cond
-              (string? sentence)
+              (and (string? sentence)
+                   (not (str/blank? sentence)))
               (str all-text " " sentence)
 
-            ;; nested map is a referred node
+               ;; nested map is a referred node
               (map? sentence)
               (str all-text " " (extract-text sentence))
 
-            ;; multiple items, can be anything
+               ;; multiple items, can be anything
               (sequential? sentence)
               (str/join " "
                         (cons all-text (map #(if (map? %)
@@ -75,10 +76,9 @@
               all-text
 
               :else ;; stringify other data types
-              (str all-text " " sentence))
-            (if (sequential? sentence)
-              (apply str all-text " " sentence)
-              (str all-text " " sentence)))))
+              (str all-text " " sentence)))
+          "")
+         str/trim)
     (catch Exception e
       (let [msg (str "Error extracting text for BM25 from item: " item
                      " - " (ex-message e))]
@@ -151,8 +151,8 @@
   "Returns updated bm25 index map after adding item to it"
   [{:keys [avg-length item-count terms dimensions vectors] :as index} stemmer stopwords id item]
   (try
-    (let [item-terms     (-> (extract-text item)
-                             (parse-sentence stemmer stopwords))
+    (let [extracted-text (extract-text item)
+          item-terms     (parse-sentence extracted-text stemmer stopwords)
           doc-len        (count item-terms)]
       (if (pos? doc-len) ;; empty strings will have no indexing data
         (let [[avg-length* item-count*] (update-avg-len avg-length item-count doc-len)
