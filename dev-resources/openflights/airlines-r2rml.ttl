@@ -1,0 +1,53 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/airlines/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# R2RML mapping for OpenFlights airlines Iceberg table
+# Maps the openflights/airlines table to RDF
+
+<#AirlineMapping>
+    a rr:TriplesMap ;
+
+    rr:logicalTable [
+        rr:tableName "openflights/airlines"
+    ] ;
+
+    rr:subjectMap [
+        rr:template "http://example.org/airlines/{id}" ;
+        rr:class ex:Airline
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:name ;
+        rr:objectMap [ rr:column "name" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:alias ;
+        rr:objectMap [ rr:column "alias" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:iata ;
+        rr:objectMap [ rr:column "iata" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:icao ;
+        rr:objectMap [ rr:column "icao" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:callsign ;
+        rr:objectMap [ rr:column "callsign" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:country ;
+        rr:objectMap [ rr:column "country" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:active ;
+        rr:objectMap [ rr:column "active" ]
+    ] .

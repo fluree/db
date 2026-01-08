@@ -1,0 +1,215 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# Multi-table R2RML mapping for OpenFlights data
+# Maps airlines, airports, and routes tables to RDF
+
+# =============================================================================
+# Airlines Mapping
+# =============================================================================
+
+<#AirlineMapping>
+    a rr:TriplesMap ;
+
+    rr:logicalTable [
+        rr:tableName "openflights/airlines"
+    ] ;
+
+    rr:subjectMap [
+        rr:template "http://example.org/airline/{id}" ;
+        rr:class ex:Airline
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:name ;
+        rr:objectMap [ rr:column "name" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:airlineAlias ;
+        rr:objectMap [ rr:column "alias" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:iata ;
+        rr:objectMap [ rr:column "iata" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:icao ;
+        rr:objectMap [ rr:column "icao" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:callsign ;
+        rr:objectMap [ rr:column "callsign" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:country ;
+        rr:objectMap [ rr:column "country" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:active ;
+        rr:objectMap [ rr:column "active" ]
+    ] .
+
+# =============================================================================
+# Airports Mapping
+# =============================================================================
+
+<#AirportMapping>
+    a rr:TriplesMap ;
+
+    rr:logicalTable [
+        rr:tableName "openflights/airports"
+    ] ;
+
+    rr:subjectMap [
+        rr:template "http://example.org/airport/{id}" ;
+        rr:class ex:Airport
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:name ;
+        rr:objectMap [ rr:column "name" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:city ;
+        rr:objectMap [ rr:column "city" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:country ;
+        rr:objectMap [ rr:column "country" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:iata ;
+        rr:objectMap [ rr:column "iata" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:icao ;
+        rr:objectMap [ rr:column "icao" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:latitude ;
+        rr:objectMap [ rr:column "lat" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:longitude ;
+        rr:objectMap [ rr:column "lon" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:altitude ;
+        rr:objectMap [ rr:column "altitude" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:timezone ;
+        rr:objectMap [ rr:column "tz" ]
+    ] .
+
+# =============================================================================
+# Routes Mapping
+# =============================================================================
+
+<#RouteMapping>
+    a rr:TriplesMap ;
+
+    rr:logicalTable [
+        rr:tableName "openflights/routes"
+    ] ;
+
+    rr:subjectMap [
+        rr:template "http://example.org/route/{airline_id}_{src_id}_{dst_id}" ;
+        rr:class ex:Route
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:airline ;
+        rr:objectMap [ rr:column "airline" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:airlineId ;
+        rr:objectMap [ rr:column "airline_id" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:sourceAirport ;
+        rr:objectMap [ rr:column "src" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:sourceAirportId ;
+        rr:objectMap [ rr:column "src_id" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:destinationAirport ;
+        rr:objectMap [ rr:column "dst" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:destinationAirportId ;
+        rr:objectMap [ rr:column "dst_id" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:codeshare ;
+        rr:objectMap [ rr:column "codeshare" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:stops ;
+        rr:objectMap [ rr:column "stops" ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:equipment ;
+        rr:objectMap [ rr:column "equipment" ]
+    ] ;
+
+    # RefObjectMap declarations for join relationships
+    # These define how routes connect to airlines and airports
+
+    rr:predicateObjectMap [
+        rr:predicate ex:operatedBy ;
+        rr:objectMap [
+            rr:parentTriplesMap <#AirlineMapping> ;
+            rr:joinCondition [
+                rr:child "airline_id" ;
+                rr:parent "id"
+            ]
+        ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:sourceAirportRef ;
+        rr:objectMap [
+            rr:parentTriplesMap <#AirportMapping> ;
+            rr:joinCondition [
+                rr:child "src_id" ;
+                rr:parent "id"
+            ]
+        ]
+    ] ;
+
+    rr:predicateObjectMap [
+        rr:predicate ex:destinationAirportRef ;
+        rr:objectMap [
+            rr:parentTriplesMap <#AirportMapping> ;
+            rr:joinCondition [
+                rr:child "dst_id" ;
+                rr:parent "id"
+            ]
+        ]
+    ] .
