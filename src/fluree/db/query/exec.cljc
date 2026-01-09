@@ -80,6 +80,19 @@
        (paginate q)
        (collect-results q)))
 
+(defn execute-stream
+  "Internal streaming execution. Skips collect-results, emits individual results.
+   CONSTRUCT emits ungrouped nodes. SELECT ONE applies async/take 1.
+   ORDER BY, GROUP BY, and aggregates require collecting all results before emitting."
+  [ds tracker q error-ch]
+  (let [result-ch (->> (execute* ds tracker q error-ch)
+                       (select/format ds q tracker error-ch)
+                       (paginate q))]
+    ;; For SELECT ONE, take only first result
+    (if (:select-one q)
+      (async/take 1 result-ch)
+      result-ch)))
+
 ;; TODO: refactor namespace heirarchy so this isn't necessary
 (defn subquery-executor
   "Closes over a subquery to allow processing the whole query pipeline from within the
@@ -115,3 +128,19 @@
        (async/alt!
          error-ch ([e] (async/close! error-ch) e)
          result-ch ([result] result))))))
+
+(defn query-stream
+  "Execute the parsed query `q` against the database value `db` and return a
+  channel that emits individual results as they are produced.
+
+  Returns an async channel which emits individual results. If an error occurs,
+  the error will be sent to a separate error channel (and the result channel
+  will be closed)."
+  ([ds q]
+   (query-stream ds nil q))
+  ([ds tracker q]
+   (let [error-ch  (async/chan)
+         prepped-q (prep-subqueries q)
+         result-ch (execute-stream ds tracker prepped-q error-ch)]
+     result-ch)))
+

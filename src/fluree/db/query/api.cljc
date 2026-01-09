@@ -1,7 +1,8 @@
 (ns fluree.db.query.api
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
-  (:require [fluree.db.connection :as connection]
+  (:require [clojure.core.async :as async]
+            [fluree.db.connection :as connection]
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.ledger :as ledger]
@@ -288,3 +289,133 @@
   (case format
     :fql (query-connection-fql conn query override-opts)
     :sparql (query-connection-sparql conn query override-opts)))
+
+(defn query-fql-stream
+  "Internal streaming query implementation. Handles db restriction, policy tracking,
+   and metadata emission. Returns channel emitting individual results + optional
+   final :_fluree-meta map."
+  ([ds query]
+   (query-fql-stream ds query nil))
+  ([ds query override-opts]
+   (let [out-ch       (async/chan)
+         track-init   track/init
+         track-query? track/track-query?
+         track-tally  track/tally]
+     (async/go
+       (try*
+         (let [{:keys [opts] :as query*} (-> query
+                                             syntax/coerce-query
+                                             (sanitize-query-options override-opts))
+               tracker      (track-init opts)
+               track-meta?  (track-query? opts)
+               ds*          (if (dataset? ds)
+                              ds
+                              (async/<! (restrict-db ds tracker query*)))
+               query**      (update query* :opts dissoc :meta :max-fuel)]
+
+           (if (util/exception? ds*)
+             (do
+               (async/>! out-ch ds*)
+               (async/close! out-ch))
+             (let [result-ch (async/<! (fql/query-stream ds* tracker query**))]
+               (if (util/exception? result-ch)
+                 (do
+                   (async/>! out-ch result-ch)
+                   (async/close! out-ch))
+                 (do
+                   (loop []
+                     (when-some [result (async/<! result-ch)]
+                       (async/>! out-ch result)
+                       (recur)))
+
+                   (when track-meta?
+                     (let [tally (track-tally tracker)]
+                       (async/>! out-ch {:_fluree-meta (assoc tally :status 200)})))
+
+                   (async/close! out-ch))))))
+         (catch* e
+           (async/>! out-ch e)
+           (async/close! out-ch))))
+     out-ch)))
+
+(defn query-sparql-stream
+  "Converts SPARQL to FQL and delegates to query-fql-stream."
+  [db query override-opts]
+  (let [fql (sparql/->fql query)]
+    (query-fql-stream db fql override-opts)))
+
+(defn query-stream
+  "Dispatches to query-fql-stream or query-sparql-stream based on :format option."
+  [db query {:keys [format] :as override-opts :or {format :fql}}]
+  (case format
+    :fql (query-fql-stream db query override-opts)
+    :sparql (query-sparql-stream db query override-opts)))
+
+(defn query-connection-fql-stream
+  "Loads ledger(s) from connection and executes streaming query. Like
+   query-connection-fql but streams individual results instead of collecting."
+  [conn query override-opts]
+  (let [out-ch       (async/chan)
+        track-init   track/init
+        track-query? track/track-query?
+        track-tally  track/tally]
+    (async/go
+      (try*
+        (let [{:keys [opts] :as sanitized-query} (-> query
+                                                     syntax/coerce-query
+                                                     (sanitize-query-options override-opts))
+              tracker         (track-init opts)
+              track-meta?     (track-query? opts)
+              default-aliases (some-> sanitized-query :from util/sequential)
+              named-aliases   (some-> sanitized-query :from-named util/sequential)]
+
+          (log/debug "query-connection-fql-stream - from:" default-aliases
+                     "from-named:" named-aliases)
+
+          (if (or (seq default-aliases) (seq named-aliases))
+            (let [ds            (async/<! (load-dataset conn tracker default-aliases
+                                                        named-aliases sanitized-query))
+                  trimmed-query (update sanitized-query :opts dissoc :meta :max-fuel)]
+              (if (util/exception? ds)
+                (do
+                  (async/>! out-ch ds)
+                  (async/close! out-ch))
+                (let [result-ch (async/<! (fql/query-stream ds tracker trimmed-query))]
+                  (if (util/exception? result-ch)
+                    (do
+                      (async/>! out-ch result-ch)
+                      (async/close! out-ch))
+                    (do
+                      (loop []
+                        (when-some [result (async/<! result-ch)]
+                          (async/>! out-ch result)
+                          (recur)))
+
+                      (when track-meta?
+                        (let [tally (track-tally tracker)]
+                          (async/>! out-ch {:_fluree-meta (assoc tally :status 200)})))
+
+                      (async/close! out-ch))))))
+
+            (throw (ex-info "Missing ledger specification in connection query"
+                            {:status 400, :error :db/invalid-query}))))
+        (catch* e
+          (async/>! out-ch e)
+          (async/close! out-ch))))
+    out-ch))
+
+(defn query-connection-sparql-stream
+  "Converts SPARQL to FQL and delegates to query-connection-fql-stream."
+  [conn query override-opts]
+  (let [fql (sparql/->fql query)]
+    (log/debug "query-connection-sparql-stream fql:" fql
+               "override-opts:" override-opts)
+    (query-connection-fql-stream conn fql override-opts)))
+
+(defn query-connection-stream
+  "Dispatches to query-connection-fql-stream or query-connection-sparql-stream
+   based on :format option."
+  [conn query {:keys [format] :as override-opts :or {format :fql}}]
+  (case format
+    :fql (query-connection-fql-stream conn query override-opts)
+    :sparql (query-connection-sparql-stream conn query override-opts)))
