@@ -103,7 +103,7 @@
    (go-try
      (let [branch-data (get-branch-meta ledger requested-branch)
            current-db  (branch/current-db branch-data)
-           {:keys [stats current-stats namespace-codes commit]} (<? (dbproto/-ledger-info current-db))
+           {:keys [stats current-stats namespace-codes commit schema index]} (<? (dbproto/-ledger-info current-db))
            commit-jsonld (commit-data/->json-ld commit)
            nameservice (when primary-publisher
                          (try*
@@ -114,7 +114,9 @@
        {:commit          commit-jsonld
         :nameservice     nameservice
         :namespace-codes namespace-codes
-        :stats           (merge stats current-stats)}))))
+        :stats           (merge stats current-stats)
+        :schema          schema
+        :index           index}))))
 
 (defn notify
   "Returns false if provided commit update did not result in an update to the ledger because
