@@ -149,7 +149,10 @@
    :main-opts  ["-m" "eastwood.lint"
                 {:source-paths       ["src" "src-docs"]
                  :test-paths         ["test"]
-                 :exclude-linters    []
+                 ;; calls trace/form expand eventually to a with-open call that trips
+                 ;; the eastwood suspicious-expression linter, even though it is a valid
+                 ;; use of with-open
+                 :exclude-linters    [:suspicious-expression]
                  ;; Exclude IPFS namespace due to Clojure 1.12.1 compatibility issues
                  :exclude-namespaces [fluree.db.storage.ipfs
                                       fluree.db.storage.file
