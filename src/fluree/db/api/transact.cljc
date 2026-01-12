@@ -14,6 +14,8 @@
             [fluree.db.util.trace :as trace]
             [fluree.json-ld :as json-ld]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn prep-opts
   ([opts]
    (prep-opts opts nil))
@@ -51,8 +53,8 @@
 
 (defn transact!
   [conn ledger-id parsed-txn]
-  (go-try
-    (trace/form ::transact! {:ledger-alias ledger-id}
+  (trace/async-form ::transact! {:ledger-alias ledger-id}
+    (go-try
       (if ledger-id
         (let [ledger (async/<! (connection/load-ledger conn ledger-id))]
           (if (util/exception? ledger)
