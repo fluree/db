@@ -149,11 +149,7 @@
    :main-opts  ["-m" "eastwood.lint"
                 {:source-paths       ["src" "src-docs"]
                  :test-paths         ["test"]
-                 ;; TODO: Un-exclude this when it stops triggering false
-                 ;;       positives on "UnsupportedOperationException empty is
-                 ;;       not supported on Flake" when using the #Flake data
-                 ;;       reader - WSM 2023-02-01
-                 :exclude-linters    [:implicit-dependencies]
+                 :exclude-linters    []
                  ;; Exclude IPFS namespace due to Clojure 1.12.1 compatibility issues
                  :exclude-namespaces [fluree.db.storage.ipfs
                                       fluree.db.storage.file
