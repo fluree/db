@@ -347,7 +347,11 @@
       {"http://example.org/name"
        {:types {"http://www.w3.org/2001/XMLSchema#string" 2}
         :ref-classes {}
-        :langs {}}}}}}})
+        :langs {}}}}}}
+   :index
+   {:id "fluree:index:sha256:ye4ixvfirnu5ouogfung3fbkwxvx2lzbf6u3imsnir7vuk4hrec"
+    :t 1
+    :address "fluree:file://test/ledger-info/index/root/ye4ixvfirnu5ouogfung3fbkwxvx2lzbf6u3imsnir7vuk4hrec.json"}})
 
 ;; Expected output with context compaction - same data but with compacted IRIs in :stats
 (def ^:private ledger-info-with-context-expected
@@ -474,7 +478,11 @@
       {"ex:name"
        {:types {"xsd:string" 2}
         :ref-classes {}
-        :langs {}}}}}}})
+        :langs {}}}}}}
+   :index
+   {:id "fluree:index:sha256:ye4ixvfirnu5ouogfung3fbkwxvx2lzbf6u3imsnir7vuk4hrec"
+    :t 1
+    :address "fluree:file://test/ledger-info/index/root/ye4ixvfirnu5ouogfung3fbkwxvx2lzbf6u3imsnir7vuk4hrec.json"}})
 
 (deftest ^:integration ledger-info-api-test
   (testing "ledger-info API returns fully deterministic response with fixed time"

@@ -309,6 +309,37 @@
   (promise-wrap
    (connection/notify conn commit-address)))
 
+(defn refresh
+  "Poll-friendly helper to refresh a cached ledger's state (commit and/or index)
+  from the connection's configured nameservices.
+
+  This is useful in environments that cannot receive publication events (e.g.
+  AWS Lambda) and need to periodically poll to keep warm caches fresh.
+
+  Behavior:
+  - Looks up the latest nameservice record for `ledger-id` (alias or fluree address)
+  - Calls `notify` internally with that record, which will:
+    - apply an index-only update when t is unchanged but index address changed
+    - apply the next commit when t advanced by exactly 1
+    - drop cached ledger state when t jumped ahead by >1 (forcing reload)
+
+  Notes:
+  - If the ledger is not currently cached in the connection, notify is a no-op.
+    Use `load`/`db` first in cold-start paths.
+
+  Returns a promise resolving to the notify result (e.g. true, ::ledger/index-current,
+  ::ledger/index-updated), or nil if no nameservice record could be found."
+  [conn ledger-id]
+  (validate-connection conn)
+  (promise-wrap
+   (go-try
+     (let [ledger-address (if (connection/fluree-address? ledger-id)
+                            ledger-id
+                            (<? (connection/primary-address conn ledger-id)))
+           ns-record      (<? (connection/lookup-commit conn ledger-address))]
+       (when ns-record
+         (<? (connection/notify conn ns-record)))))))
+
 (defn insert
   "Stages insertion of new entities into a database.
 
@@ -1036,3 +1067,19 @@
    (validate-connection conn)
    (promise-wrap
     (connection/trigger-ledger-index conn ledger-alias opts))))
+
+(defn reindex
+  "Offline index rebuild from commit history (regenerates stats).
+
+  Options:
+  - :from-t - Start from this transaction t (default: 1; t=0 is genesis)
+  - :batch-bytes - Novelty threshold per batch (default: reindex-max-bytes)
+  - :index-files-ch - Optional channel for index file notifications"
+  ([conn ledger-alias]
+   (reindex conn ledger-alias {}))
+  ([conn ledger-alias opts]
+   (validate-connection conn)
+   (promise-wrap
+    (go-try
+      (let [ledger (<? (connection/load-ledger-alias conn ledger-alias))]
+        (<? (ledger/reindex! ledger opts)))))))
