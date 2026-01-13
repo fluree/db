@@ -880,6 +880,53 @@
         (throw (ex-info "No nameservice available for querying"
                         {:status 400 :error :db/no-nameservice})))))))
 
+;; Streaming Query APIs
+
+(defn query-stream
+  "Streaming version of `query`. Returns a core.async channel that emits
+  individual results as produced, rather than collecting into a vector.
+
+  See `query` for query syntax and options. Key differences:
+    - Returns core.async channel instead of promise
+    - Emits results individually (reduces memory for large result sets)
+    - Caching not supported
+    - CONSTRUCT queries emit individual graph nodes (not grouped by subject)
+    - When :meta enabled, final item is {:_fluree-meta {...}}"
+  ([ds q]
+   (query-stream ds q {}))
+  ([ds q opts]
+   (cond
+     (util/exception? ds)
+     (async/to-chan! [ds])
+
+     (:cache opts)
+     (async/to-chan! [(ex-info "Streaming queries do not support caching"
+                               {:status 400
+                                :error :db/invalid-query
+                                :message "Remove :cache option or use non-streaming query API"})])
+
+     :else
+     (query-api/query-stream ds q opts))))
+
+(defn query-connection-stream
+  "Streaming version of `query-connection`. Returns a core.async channel that
+  emits individual results as produced.
+
+  See `query-connection` for query syntax and options. Key differences:
+    - Returns core.async channel instead of promise
+    - Emits results individually (reduces memory for large result sets)
+    - Caching not supported
+    - When :meta enabled, final item is {:_fluree-meta {...}}"
+  ([conn q] (query-connection-stream conn q {}))
+  ([conn q opts]
+   (validate-connection conn)
+   (if (:cache opts)
+     (async/to-chan! [(ex-info "Streaming queries do not support caching"
+                               {:status 400
+                                :error :db/invalid-query
+                                :message "Remove :cache option or use non-streaming query API"})])
+     (query-api/query-connection-stream conn q opts))))
+
 (defn history
   "Queries the history of entities across commits.
 
