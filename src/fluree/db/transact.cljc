@@ -4,6 +4,7 @@
             [fluree.db.track :as track]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.trace :as trace]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -65,25 +66,26 @@
   "Stages a new transaction that is already parsed into the
    internal Fluree triples format."
   [db parsed-txn]
-  (go-try
-    (let [parsed-opts    (:opts parsed-txn)
-          parsed-context (:context parsed-opts)
-          identity       (:identity parsed-opts)]
-      (if (track/track-txn? parsed-opts)
-        (let [tracker   (track/init parsed-opts)
-              policy-db (if (policy/policy-enforced-opts? parsed-opts)
-                          (<? (policy/policy-enforce-db db tracker parsed-context parsed-opts))
-                          db)]
-          (try*
-            (let [staged-db     (<? (stage policy-db tracker identity parsed-txn parsed-opts))
-                  tally         (track/tally tracker)]
-              (assoc tally :status 200, :db staged-db))
-            (catch* e
-              (throw (ex-info (ex-message e)
-                              (let [tally (track/tally tracker)]
-                                (merge (ex-data e) tally))
-                              e)))))
-        (let [policy-db (if (policy/policy-enforced-opts? parsed-opts)
-                          (<? (policy/policy-enforce-db db parsed-context parsed-opts))
-                          db)]
-          (<? (stage policy-db identity parsed-txn parsed-opts)))))))
+  (trace/async-form ::stage-triples {}
+    (go-try
+      (let [parsed-opts    (:opts parsed-txn)
+            parsed-context (:context parsed-opts)
+            identity       (:identity parsed-opts)]
+        (if (track/track-txn? parsed-opts)
+          (let [tracker   (track/init parsed-opts)
+                policy-db (if (policy/policy-enforced-opts? parsed-opts)
+                            (<? (policy/policy-enforce-db db tracker parsed-context parsed-opts))
+                            db)]
+            (try*
+              (let [staged-db     (<? (stage policy-db tracker identity parsed-txn parsed-opts))
+                    tally         (track/tally tracker)]
+                (assoc tally :status 200, :db staged-db))
+              (catch* e
+                (throw (ex-info (ex-message e)
+                                (let [tally (track/tally tracker)]
+                                  (merge (ex-data e) tally))
+                                e)))))
+          (let [policy-db (if (policy/policy-enforced-opts? parsed-opts)
+                            (<? (policy/policy-enforce-db db parsed-context parsed-opts))
+                            db)]
+            (<? (stage policy-db identity parsed-txn parsed-opts))))))))
