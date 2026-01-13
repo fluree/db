@@ -857,7 +857,9 @@
   ([conn q] (query-connection conn q {}))
   ([conn q opts]
    (validate-connection conn)
-   (promise-wrap (query-api/query-connection conn q opts))))
+   (promise-wrap
+    (trace/async-form ::query-connection {}
+      (query-api/query-connection conn q opts)))))
 
 (defn credential-query-connection
   "Executes a query via connection using a verifiable credential.

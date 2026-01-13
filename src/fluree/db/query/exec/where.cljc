@@ -666,14 +666,15 @@
   "Return a channel of all solutions from the data set `ds` that extend from the
   solutions in `solution-ch` and also match the where-clause pattern `pattern`."
   [ds tracker pattern error-ch solution-ch]
-  (let [out-ch (async/chan 2)]
-    (async/pipeline-async 2
-                          out-ch
-                          (fn [solution ch]
-                            (-> (match-pattern ds tracker solution pattern error-ch)
-                                (async/pipe ch)))
-                          solution-ch)
-    out-ch))
+  (trace/form ::pattern {:attributes {:pattern pattern}}
+    (let [out-ch (async/chan 2)]
+      (async/pipeline-async 2
+                            out-ch
+                            (fn [solution ch]
+                              (-> (match-pattern ds tracker solution pattern error-ch)
+                                  (async/pipe ch)))
+                            solution-ch)
+      out-ch)))
 
 (defn match-patterns
   [ds tracker solution patterns error-ch]
