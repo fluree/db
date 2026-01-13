@@ -360,7 +360,7 @@
                               :id         :ex/alice
                               :quux/corge "grault"}]}
             committed  @(fluree/update! conn txn {:meta true})]
-        (is (= #{:address :db :fuel :hash :ledger-id :size :status :t :time :policy
+        (is (= #{:address :db :fuel :hash :ledger-id :size :status :t :time :policy :explain
                  :index-t :indexing-enabled :indexing-needed :novelty-size}
                (set (keys committed))))))
 

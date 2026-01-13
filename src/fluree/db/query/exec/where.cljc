@@ -14,8 +14,7 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.xhttp :as xhttp]
-            [fluree.json-ld :as json-ld])
-  #?(:clj (:import (clojure.lang MapEntry))))
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -210,11 +209,16 @@
   [graph-alias]
   (str/starts-with? graph-alias "##"))
 
+(defrecord Pattern [pattern-type data])
+
+(defn pattern?
+  [x]
+  (instance? Pattern x))
+
 (defn ->pattern
   "Build a new non-tuple match pattern of type `typ`."
   [typ data]
-  #?(:clj  (MapEntry/create typ data)
-     :cljs (MapEntry. typ data nil)))
+  (->Pattern typ data))
 
 (defn ->iri-ref
   [x]
@@ -317,14 +321,14 @@
 
 (defn pattern-type
   [pattern]
-  (if (map-entry? pattern)
-    (key pattern)
+  (if (pattern? pattern)
+    (:pattern-type pattern)
     :tuple))
 
 (defn pattern-data
   [pattern]
-  (if (map-entry? pattern)
-    (val pattern)
+  (if (pattern? pattern)
+    (:data pattern)
     pattern))
 
 (defn class-pattern?
@@ -337,6 +341,16 @@
    additional where-clause pattern `pattern`."
   (fn [_ds _tracker _solution pattern _error-ch]
     (pattern-type pattern)))
+
+(defn match-and-track-pattern
+  [ds tracker solution pattern error-ch]
+  (if (:explain tracker)
+    (do (track/pattern-in! tracker pattern solution)
+        (-> (match-pattern ds tracker solution pattern error-ch)
+            (async/pipe (async/chan 2 (map (fn [solution]
+                                             (track/pattern-out! tracker pattern solution)
+                                             solution))))))
+    (match-pattern ds tracker solution pattern error-ch)))
 
 (defn assign-solution-filter
   [component solution]
@@ -674,7 +688,7 @@
     (async/pipeline-async 2
                           out-ch
                           (fn [solution ch]
-                            (-> (match-pattern ds tracker solution pattern error-ch)
+                            (-> (match-and-track-pattern ds tracker solution pattern error-ch)
                                 (async/pipe ch)))
                           solution-ch)
     out-ch))
@@ -688,8 +702,7 @@
 
 (defn subquery?
   [pattern]
-  (and (sequential? pattern)
-       (= :query (first pattern))))
+  (= :query (pattern-type pattern)))
 
 (defn match-clause
   "Returns a channel that will eventually contain all match solutions in the

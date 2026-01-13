@@ -333,6 +333,11 @@
   (fn [pattern _var-config _context]
     (v/where-pattern-type pattern)))
 
+(defn parse-pattern-with-orig
+  "Wrap each parsed pattern with its source so we can map it back for explain queries."
+  [pattern var-config context]
+  (map #(with-meta % {:orig pattern :context context}) (parse-pattern pattern var-config context)))
+
 (defn parse-bind-map
   [binds context]
   (into {}
@@ -355,8 +360,7 @@
                   [clause]
                   (util/sequential clause))]
     (->> clause*
-         (mapcat (fn [pattern]
-                   (parse-pattern pattern var-config context)))
+         (mapcat (fn [pattern] (parse-pattern-with-orig pattern var-config context)))
          where/->where-clause)))
 
 (defn parse-variable-attributes
@@ -649,11 +653,11 @@
   underlying components."
   [patterns]
   (->> patterns
-       (mapcat (fn [[pattern-type component :as pattern]]
+       (mapcat (fn [{:keys [pattern-type data] :as pattern}]
                  (case pattern-type
-                   :class         [component]
-                   :property-join component
-                   :id            [[component]]
+                   :class         [data]
+                   :property-join data
+                   :id            [[data]]
                    [pattern])))
        vec))
 
