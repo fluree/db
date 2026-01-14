@@ -152,6 +152,122 @@
       default-val
       (throw (missing-config-error env-var java-prop))))
 
+;;; ---------------------------------------------------------------------------
+;;; Iceberg Configuration Parsing
+;;; ---------------------------------------------------------------------------
+
+#?(:clj
+   (defn- parse-iceberg-auth
+     "Parse IcebergAuth node from resolved config."
+     [auth-node]
+     (when auth-node
+       {:type (keyword (or (get-first-value auth-node conn-vocab/iceberg-auth-type) "bearer"))
+        :bearer-token (config/get-first-string auth-node conn-vocab/iceberg-bearer-token)
+        :api-key (config/get-first-string auth-node conn-vocab/iceberg-api-key)})))
+
+#?(:clj
+   (defn- parse-iceberg-catalog
+     "Parse a single IcebergCatalog node from resolved config."
+     [catalog-node]
+     (when catalog-node
+       (let [name (get-first-value catalog-node conn-vocab/iceberg-catalog-name)
+             auth-node (get-first catalog-node conn-vocab/iceberg-auth)]
+         (when name
+           {:name name
+            :type (keyword (or (get-first-value catalog-node conn-vocab/iceberg-catalog-type) "rest"))
+            :uri (config/get-first-string catalog-node conn-vocab/iceberg-rest-uri)
+            :allow-vended-credentials? (let [v (get-first-value catalog-node conn-vocab/iceberg-allow-vended-credentials)]
+                                         (if (nil? v) true v))
+            :default-headers (get-first-value catalog-node conn-vocab/iceberg-default-headers)
+            :auth (parse-iceberg-auth auth-node)})))))
+
+#?(:clj
+   (defn- parse-iceberg-cache-settings
+     "Parse IcebergCache node from resolved config."
+     [cache-node]
+     (when cache-node
+       {:enabled? (let [v (get-first-value cache-node conn-vocab/iceberg-cache-enabled)]
+                    (if (nil? v) true v))
+        :cache-dir (config/get-first-string cache-node conn-vocab/iceberg-cache-dir)
+        :mem-cache-mb (or (config/get-first-integer cache-node conn-vocab/iceberg-mem-cache-mb) 256)
+        :disk-cache-mb (config/get-first-integer cache-node conn-vocab/iceberg-disk-cache-mb)
+        :block-size-mb (or (config/get-first-integer cache-node conn-vocab/iceberg-block-size-mb) 4)
+        :ttl-seconds (or (config/get-first-integer cache-node conn-vocab/iceberg-cache-ttl-seconds) 300)})))
+
+#?(:clj
+   (defn- create-iceberg-cache-instance
+     "Create a Caffeine cache instance from cache settings.
+      This cache is created ONCE at publisher init and shared across all VGs.
+      Returns nil if cache is disabled.
+      Uses requiring-resolve to avoid loading Iceberg classes at namespace load time."
+     [cache-settings]
+     (when (:enabled? cache-settings true)
+       ;; Dynamic load to avoid ClassNotFoundException when Iceberg deps not present
+       (if-let [create-cache-fn (requiring-resolve 'fluree.db.tabular.seekable-stream/create-cache)]
+         (create-cache-fn
+          {:max-bytes (* (:mem-cache-mb cache-settings 256) 1024 1024)
+           :ttl-minutes (quot (:ttl-seconds cache-settings 300) 60)})
+         (do
+           (log/warn "Iceberg cache requested but seekable-stream not available (missing Iceberg deps?)")
+           nil)))))
+
+#?(:clj
+   (defn parse-iceberg-config
+     "Parse Iceberg-related config from a publisher/nameservice config node.
+      Returns nil if no Iceberg config present.
+
+      Call this during ig/init-key where config values are already resolved."
+     [ns-config-node]
+     (let [catalog-nodes (get ns-config-node conn-vocab/iceberg-catalogs)
+           cache-node (get-first ns-config-node conn-vocab/iceberg-cache)]
+       (when (or (seq catalog-nodes) cache-node
+                 (contains? ns-config-node conn-vocab/virtual-graph-allow-publish)
+                 (contains? ns-config-node conn-vocab/iceberg-allow-dynamic-virtual-graphs)
+                 (contains? ns-config-node conn-vocab/iceberg-allow-dynamic-catalogs))
+         {:catalogs (->> catalog-nodes
+                         (map parse-iceberg-catalog)
+                         (filter :name)
+                         (into {} (map (juxt :name identity))))
+          :cache (parse-iceberg-cache-settings cache-node)
+          ;; Global gate for all VG publishing (applies to ALL VG types)
+          :allow-vg-publish? (let [v (get-first-value ns-config-node conn-vocab/virtual-graph-allow-publish)]
+                               (if (nil? v) true v))
+          ;; Iceberg-specific flags
+          :allow-dynamic-vgs? (let [v (get-first-value ns-config-node conn-vocab/iceberg-allow-dynamic-virtual-graphs)]
+                                (if (nil? v) true v))
+          :allow-dynamic-catalogs? (let [v (get-first-value ns-config-node conn-vocab/iceberg-allow-dynamic-catalogs)]
+                                     (if (nil? v) true v))
+          :persist-dynamic-secrets? (let [v (get-first-value ns-config-node conn-vocab/iceberg-persist-dynamic-catalog-secrets)]
+                                      (if (nil? v) false v))
+          :allowed-catalog-names (let [v (util/get-values ns-config-node conn-vocab/iceberg-allowed-catalog-names)]
+                                   (when (seq v) v))}))))
+
+#?(:clj
+   (defn- attach-iceberg-config
+     "Attach Iceberg config and shared cache instance to a publisher.
+      The cache is created ONCE here and shared across all VGs under this publisher.
+      Returns publisher unchanged if no iceberg config."
+     [publisher iceberg-config]
+     (if iceberg-config
+       (let [;; Create cache instance at publisher init time (shared across all VGs)
+             cache-instance (create-iceberg-cache-instance (:cache iceberg-config))]
+         (with-meta publisher {::iceberg-config iceberg-config
+                               ::iceberg-cache-instance cache-instance}))
+       publisher)))
+
+#?(:clj
+   (defn get-iceberg-config
+     "Retrieve Iceberg config from a publisher/nameservice instance."
+     [publisher]
+     (-> publisher meta ::iceberg-config)))
+
+#?(:clj
+   (defn get-iceberg-cache
+     "Retrieve the shared Iceberg cache instance from a publisher.
+      This cache is created once at publisher init and shared across all VGs."
+     [publisher]
+     (-> publisher meta ::iceberg-cache-instance)))
+
 (defmethod ig/init-key :fluree.db/config-value
   [_ config-value-node]
   (let [env-var     (get-first-value config-value-node conn-vocab/env-var)
@@ -244,14 +360,20 @@
 
 (defmethod ig/init-key :fluree.db.nameservice/storage
   [_ config]
-  (let [storage (get-first config conn-vocab/storage)]
-    (storage-nameservice/start storage)))
+  (let [storage (get-first config conn-vocab/storage)
+        ns (storage-nameservice/start storage)]
+    #?(:clj (let [iceberg-cfg (parse-iceberg-config config)]
+              (attach-iceberg-config ns iceberg-cfg))
+       :cljs ns)))
 
 (defmethod ig/init-key :fluree.db.nameservice/ipns
   [_ config]
   (let [endpoint (config/get-first-string config conn-vocab/ipfs-endpoint)
-        ipns-key (config/get-first-string config conn-vocab/ipns-key)]
-    (ipns-nameservice/initialize endpoint ipns-key)))
+        ipns-key (config/get-first-string config conn-vocab/ipns-key)
+        ns (ipns-nameservice/initialize endpoint ipns-key)]
+    #?(:clj (let [iceberg-cfg (parse-iceberg-config config)]
+              (attach-iceberg-config ns iceberg-cfg))
+       :cljs ns)))
 
 #?(:clj
    (defmethod ig/init-key :fluree.db.nameservice/dynamodb
@@ -259,11 +381,13 @@
      (let [table-name (config/get-first-string config conn-vocab/dynamodb-table)
            region     (config/get-first-string config conn-vocab/dynamodb-region)
            endpoint   (config/get-first-string config conn-vocab/dynamodb-endpoint)
-           timeout-ms (config/get-first-long config conn-vocab/dynamodb-timeout-ms)]
-       (dynamodb-nameservice/start (cond-> {:table-name table-name}
-                                     region     (assoc :region region)
-                                     endpoint   (assoc :endpoint endpoint)
-                                     timeout-ms (assoc :timeout-ms timeout-ms))))))
+           timeout-ms (config/get-first-long config conn-vocab/dynamodb-timeout-ms)
+           ns         (dynamodb-nameservice/start (cond-> {:table-name table-name}
+                                                    region     (assoc :region region)
+                                                    endpoint   (assoc :endpoint endpoint)
+                                                    timeout-ms (assoc :timeout-ms timeout-ms)))
+           iceberg-cfg (parse-iceberg-config config)]
+       (attach-iceberg-config ns iceberg-cfg))))
 
 (defmethod ig/init-key :fluree.db.serializer/json
   [_ _]

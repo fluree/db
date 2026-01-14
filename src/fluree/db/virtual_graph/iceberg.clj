@@ -29,8 +29,10 @@
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.optimize :as optimize]
+            [fluree.db.storage.vended-s3 :as vended-s3]
             [fluree.db.tabular.iceberg :as iceberg]
             [fluree.db.tabular.iceberg.core :as iceberg-core]
+            [fluree.db.tabular.iceberg.rest :as iceberg-rest]
             [fluree.db.tabular.protocol :as tabular]
             [fluree.db.util.async :refer [empty-channel]]
             [fluree.db.util.ledger :as util.ledger]
@@ -2727,6 +2729,45 @@
       (assoc iceberg-db :time-travel time-travel))
     iceberg-db))
 
+;;; ---------------------------------------------------------------------------
+;;; Catalog Resolution by Name
+;;; ---------------------------------------------------------------------------
+
+(defn- normalize-catalog-name
+  "Accept both 'catalog-name' (kebab) and 'catalogName' (camel).
+   Returns the catalog name or nil if not present."
+  [catalog]
+  (or (:catalog-name catalog)
+      (get catalog "catalog-name")
+      (get catalog "catalogName")))
+
+(defn- resolve-catalog-config
+  "Resolve catalog configuration, either from catalog-name or inline config.
+   Returns {:uri :auth-token :allow-vended-credentials? :default-headers} or nil.
+
+   If iceberg-config has a :catalogs map with pre-configured catalogs,
+   catalog-name can be used to look up the full config. Otherwise,
+   uses inline config from the catalog map directly."
+  [catalog iceberg-config]
+  (when catalog
+    (let [catalog-name (normalize-catalog-name catalog)]
+      (if catalog-name
+        ;; Resolve from pre-configured catalogs
+        (when-let [cfg (get-in iceberg-config [:catalogs catalog-name])]
+          {:uri (:uri cfg)
+           :auth-token (get-in cfg [:auth :bearer-token])
+           :allow-vended-credentials? (:allow-vended-credentials? cfg true)
+           :default-headers (:default-headers cfg)})
+        ;; Use inline config (dynamic catalog)
+        ;; Note: Use contains? for allow-vended-credentials since `or` fails on explicit false
+        {:uri (or (:uri catalog) (get catalog "uri"))
+         :auth-token (or (:auth-token catalog) (get catalog "auth-token"))
+         :allow-vended-credentials? (let [v (if (contains? catalog :allow-vended-credentials)
+                                              (:allow-vended-credentials catalog)
+                                              (get catalog "allow-vended-credentials"))]
+                                      (if (nil? v) true v))
+         :default-headers (or (:default-headers catalog) (get catalog "default-headers"))}))))
+
 (defn create
   "Create an IcebergDatabase virtual graph with multi-table support.
 
@@ -2757,9 +2798,12 @@
        :metadata-location - Direct path to metadata JSON (optional)
        :mapping         - Path to R2RML mapping file
        :mappingInline   - Inline R2RML mapping (Turtle or JSON-LD)
+       :catalog         - Optional catalog config (inline or catalog-name reference)
+     :iceberg-config - Optional publisher-level Iceberg config (catalogs, cache, etc.)
+     :cache-instance - Optional shared cache instance from publisher
 
    Either :warehouse-path or :store must be provided."
-  [{:keys [alias config]}]
+  [{:keys [alias config iceberg-config cache-instance]}]
   (let [;; Reject @ in alias - reserved character
         _ (when (str/includes? alias "@")
             (throw (ex-info (str "Virtual graph name cannot contain '@' character. Provided: " alias)
@@ -2778,16 +2822,22 @@
                               (get config "metadata-location")
                               (get config "metadataLocation"))
 
-        ;; Catalog config (REST)
+        ;; Catalog config (REST) - resolve by name or use inline
         catalog (or (:catalog config) (get config "catalog"))
+        resolved-catalog (resolve-catalog-config catalog iceberg-config)
         catalog-type (keyword (or (:type catalog) (get catalog "type")))
         rest-catalog? (= catalog-type :rest)
+        vended-enabled? (:allow-vended-credentials? resolved-catalog true)
+
+        ;; Cache settings from publisher config
+        cache-settings (:cache iceberg-config)
+        block-size (when cache-settings (* (:block-size-mb cache-settings 4) 1024 1024))
 
         _ (when-not (or warehouse-path store rest-catalog?)
             (throw (ex-info "Iceberg virtual graph requires :warehouse-path or :store (REST catalog mode also requires :store)"
                             {:error :db/invalid-config :config config})))
-        _ (when (and rest-catalog? (nil? store))
-            (throw (ex-info "Iceberg virtual graph REST :catalog requires :store (S3Store, FileStore, etc.)"
+        _ (when (and rest-catalog? (nil? store) (not vended-enabled?))
+            (throw (ex-info "Iceberg virtual graph REST :catalog requires :store (S3Store, FileStore, etc.) unless vended credentials are enabled"
                             {:error :db/invalid-config :config config})))
 
         ;; Get mapping
@@ -2809,34 +2859,63 @@
                          (remove nil?)
                          distinct)
 
+        ;; File IO options for shared cache
+        file-io-opts {:cache-instance cache-instance
+                      :block-size block-size}
+
         ;; Create source factory function
+        ;; When vended credentials are enabled for REST catalogs, create a VendedCredentialsStore
         create-source-fn (cond
+                           ;; REST catalog with vended credentials enabled (no explicit store)
+                           (and rest-catalog? vended-enabled? (nil? store))
+                           (let [;; Create credential provider once, reused for all tables
+                                 cred-provider (iceberg-rest/make-credential-provider
+                                                (:uri resolved-catalog)
+                                                (:auth-token resolved-catalog))]
+                             (fn [table-name]
+                               (let [vended-store (vended-s3/create-vended-s3-store
+                                                   cred-provider
+                                                   table-name)]
+                                 (iceberg/create-rest-iceberg-source
+                                  {:uri (:uri resolved-catalog)
+                                   :store vended-store
+                                   :auth-token (:auth-token resolved-catalog)
+                                   :file-io-opts file-io-opts}))))
+
+                           ;; Explicit store provided (with optional cache)
                            store
-                           #(iceberg/create-fluree-iceberg-source
-                             {:store store
-                              :warehouse-path (or warehouse-path "")})
+                           (fn [_table-name]
+                             (iceberg/create-fluree-iceberg-source
+                              {:store store
+                               :warehouse-path (or warehouse-path "")
+                               :file-io-opts file-io-opts}))
 
-                           (= catalog-type :rest)
-                           #(iceberg/create-rest-iceberg-source
-                             {:uri (or (:uri catalog) (get catalog "uri"))
-                              :store store
-                              :auth-token (or (:auth-token catalog) (get catalog "auth-token"))})
+                           ;; REST catalog with explicit store
+                           rest-catalog?
+                           (fn [_table-name]
+                             (iceberg/create-rest-iceberg-source
+                              {:uri (:uri resolved-catalog)
+                               :store store
+                               :auth-token (:auth-token resolved-catalog)
+                               :file-io-opts file-io-opts}))
 
+                           ;; Hadoop-based (legacy, no store)
                            :else
-                           #(iceberg/create-iceberg-source
-                             {:warehouse-path warehouse-path}))
+                           (fn [_table-name]
+                             (iceberg/create-iceberg-source
+                              {:warehouse-path warehouse-path})))
 
         backend-desc (cond
+                       (and rest-catalog? vended-enabled? (nil? store)) (str "rest+vended:" (:uri resolved-catalog))
                        store "store-backed"
-                       rest-catalog? (str "rest:" (or (:uri catalog) (get catalog "uri")))
+                       rest-catalog? (str "rest:" (:uri resolved-catalog))
                        :else (str "warehouse:" warehouse-path))
 
         ;; Create an IcebergSource for each unique table
-        ;; Note: Currently we use the same source for all tables in the same warehouse
-        ;; In the future, we could optimize by sharing the source instance
+        ;; For vended credentials, each table gets its own store with table-specific credentials
         sources (into {}
                       (for [table-name table-names]
-                        [table-name (create-source-fn)]))
+                        [table-name (create-source-fn table-name)]))
 
         ;; Build routing indexes for efficient pattern-to-table mapping
         routing-indexes (query/build-routing-indexes mappings)

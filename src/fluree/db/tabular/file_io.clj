@@ -5,12 +5,17 @@
    Fluree's existing storage infrastructure (S3, local file, etc.)
    without requiring Hadoop dependencies.
 
+   When the store implements StatStore and RangeReadableStore, this uses
+   efficient HEAD requests and byte-range reads with block caching.
+   Otherwise, falls back to reading entire files into memory.
+
    Usage:
      (create-fluree-file-io store)
      ;; Returns a FileIO that can be used with StaticTableOperations"
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.db.storage :as storage]
+            [fluree.db.tabular.seekable-stream :as seekable]
             [fluree.db.util.log :as log])
   (:import [java.io ByteArrayOutputStream InputStream]
            [org.apache.iceberg.io FileIO InputFile OutputFile PositionOutputStream SeekableInputStream]))
@@ -22,7 +27,7 @@
 ;;; ---------------------------------------------------------------------------
 
 (defn- parse-storage-path
-  "Parse an Iceberg path (which may be an S3 URL) into a path suitable for Fluree storage.
+  "Parse an Iceberg path into structured components.
 
    Iceberg provides paths like:
    - s3://bucket/path/to/file
@@ -30,27 +35,54 @@
    - file:///path/to/file
    - /path/to/file
 
-   For S3 URLs, strips the s3://bucket/ prefix since the S3Store already knows the bucket.
-   For file URLs, strips the file:// prefix.
-   For other paths, returns as-is."
+   Returns a map with:
+   - :original  - the original path as provided
+   - :scheme    - \"s3\", \"file\", or nil
+   - :bucket    - bucket name for S3, nil otherwise
+   - :path      - path without scheme/bucket prefix"
   [^String path]
   (cond
     ;; S3 URL: s3://bucket/path or s3a://bucket/path
     (or (str/starts-with? path "s3://")
         (str/starts-with? path "s3a://"))
     (let [without-scheme (str/replace-first path #"^s3a?://" "")
-          ;; Skip bucket name (everything before first /)
           slash-idx (str/index-of without-scheme "/")]
       (if slash-idx
-        (subs without-scheme (inc slash-idx))
-        ""))
+        {:original path
+         :scheme   "s3"
+         :bucket   (subs without-scheme 0 slash-idx)
+         :path     (subs without-scheme (inc slash-idx))}
+        {:original path
+         :scheme   "s3"
+         :bucket   without-scheme
+         :path     ""}))
 
     ;; File URL: file:///path
     (str/starts-with? path "file://")
-    (str/replace-first path #"^file://" "")
+    {:original path
+     :scheme   "file"
+     :bucket   nil
+     :path     (str/replace-first path #"^file://" "")}
 
     ;; Already a plain path
-    :else path))
+    :else
+    {:original path
+     :scheme   nil
+     :bucket   nil
+     :path     path}))
+
+(defn- get-effective-path
+  "Get the effective storage path for a store.
+
+   For stores that implement FullURIStore (like VendedCredentialsStore), returns the original path.
+   For single-bucket stores (like S3Store), returns just the key path."
+  [store parsed-path]
+  (if (and (satisfies? storage/FullURIStore store)
+           (storage/expects-full-uri? store))
+    ;; Store expects full URIs like s3://bucket/path
+    (:original parsed-path)
+    ;; Standard store expects just the key path (bucket configured at store level)
+    (:path parsed-path)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; SeekableInputStream Implementation
@@ -125,34 +157,95 @@
 ;;; InputFile Implementation
 ;;; ---------------------------------------------------------------------------
 
-(defn- create-input-file
-  "Creates an Iceberg InputFile backed by Fluree storage."
-  [store ^String path]
-  (let [storage-path (parse-storage-path path)]
+(defn- supports-optimized-io?
+  "Check if the store supports efficient stat and range reads."
+  [store]
+  (and (satisfies? storage/StatStore store)
+       (satisfies? storage/RangeReadableStore store)))
+
+(defn- create-input-file-optimized
+  "Creates an InputFile using efficient stat and range reads with block caching.
+
+   opts may include:
+   - :cache-instance - Shared Caffeine cache for block caching
+   - :block-size - Block size in bytes for range reads"
+  [store ^String path storage-path opts]
+  (let [;; Cache the stat result to avoid multiple HEAD requests
+        stat-cache (atom nil)
+        ;; Extract seekable stream options
+        stream-opts (cond-> {}
+                      (:cache-instance opts) (assoc :cache (:cache-instance opts))
+                      (:block-size opts) (assoc :block-size (:block-size opts)))]
     (reify InputFile
       (location [_] path)
 
       (exists [_]
-        ;; Try to read - if nil or exception, doesn't exist
         (try
-          (let [result (async/<!! (storage/read-bytes store storage-path))]
-            (some? result))
+          (let [stat-result (async/<!! (storage/stat store storage-path))]
+            (if (instance? Throwable stat-result)
+              false
+              (do
+                (when stat-result (reset! stat-cache stat-result))
+                (some? stat-result))))
           (catch Exception _
             false)))
 
-      (getLength [_this]
-        ;; Read and get length - cached on first access would be better
-        (let [data (async/<!! (storage/read-bytes store storage-path))]
-          (if data
-            (alength ^bytes data)
-            (throw (java.io.FileNotFoundException. path)))))
+      (getLength [_]
+        (if-let [cached @stat-cache]
+          (:size cached)
+          (let [stat-result (async/<!! (storage/stat store storage-path))]
+            (if (instance? Throwable stat-result)
+              (throw stat-result)
+              (if stat-result
+                (do
+                  (reset! stat-cache stat-result)
+                  (:size stat-result))
+                (throw (java.io.FileNotFoundException. path)))))))
 
-      (newStream [_]
-        (log/debug "FlureeFileIO: Reading" path "as storage path:" storage-path)
-        (let [data (async/<!! (storage/read-bytes store storage-path))]
-          (if data
-            (create-seekable-input-stream data)
-            (throw (java.io.FileNotFoundException. path))))))))
+      (newStream [this]
+        (log/debug "FlureeFileIO: Opening stream (optimized)" path "as storage path:" storage-path)
+        (let [size (.getLength this)]
+          (seekable/create-seekable-input-stream store storage-path size stream-opts))))))
+
+(defn- create-input-file-fallback
+  "Creates an InputFile using full-file reads (fallback for stores without stat/range)."
+  [store ^String path storage-path]
+  (reify InputFile
+    (location [_] path)
+
+    (exists [_]
+      (try
+        (let [result (async/<!! (storage/read-bytes store storage-path))]
+          (some? result))
+        (catch Exception _
+          false)))
+
+    (getLength [_]
+      (let [data (async/<!! (storage/read-bytes store storage-path))]
+        (if data
+          (alength ^bytes data)
+          (throw (java.io.FileNotFoundException. path)))))
+
+    (newStream [_]
+      (log/debug "FlureeFileIO: Reading (fallback)" path "as storage path:" storage-path)
+      (let [data (async/<!! (storage/read-bytes store storage-path))]
+        (if data
+          (create-seekable-input-stream data)
+          (throw (java.io.FileNotFoundException. path)))))))
+
+(defn- create-input-file
+  "Creates an Iceberg InputFile backed by Fluree storage.
+   Uses efficient stat/range reads if supported, otherwise falls back to full-file reads.
+
+   opts may include:
+   - :cache-instance - Shared Caffeine cache for block caching
+   - :block-size - Block size in bytes for range reads"
+  [store ^String path opts]
+  (let [parsed-path  (parse-storage-path path)
+        storage-path (get-effective-path store parsed-path)]
+    (if (supports-optimized-io? store)
+      (create-input-file-optimized store path storage-path opts)
+      (create-input-file-fallback store path storage-path))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; OutputFile Implementation
@@ -160,8 +253,9 @@
 
 (defn- create-output-file
   "Creates an Iceberg OutputFile backed by Fluree storage."
-  [store ^String path]
-  (let [storage-path (parse-storage-path path)]
+  [store ^String path opts]
+  (let [parsed-path  (parse-storage-path path)
+        storage-path (get-effective-path store parsed-path)]
     (reify OutputFile
       (location [_] path)
 
@@ -187,7 +281,7 @@
         (.create this))
 
       (toInputFile [_]
-        (create-input-file store path)))))
+        (create-input-file store path opts)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; FlureeFileIO - Main FileIO Implementation
@@ -199,33 +293,40 @@
    The store must implement the ByteStore protocol (read-bytes, write-bytes).
    This includes FileStore, S3Store, and MemoryStore.
 
+   opts may include:
+   - :cache-instance - Shared Caffeine cache for block caching
+   - :block-size - Block size in bytes for range reads
+
    Example:
-     (def file-io (create-fluree-file-io my-s3-store))
+     (def file-io (create-fluree-file-io my-s3-store {}))
      (def table-ops (StaticTableOperations. metadata-location file-io))
      (def table (BaseTable. table-ops table-id))"
-  ^FileIO [store]
-  (reify FileIO
-    (^InputFile newInputFile [_ ^String path]
-      (create-input-file store path))
+  (^FileIO [store]
+   (create-fluree-file-io store {}))
+  (^FileIO [store opts]
+   (reify FileIO
+     (^InputFile newInputFile [_ ^String path]
+       (create-input-file store path opts))
 
-    (^OutputFile newOutputFile [_ ^String path]
-      (create-output-file store path))
+     (^OutputFile newOutputFile [_ ^String path]
+       (create-output-file store path opts))
 
-    (^void deleteFile [_ ^String path]
-      (let [storage-path (parse-storage-path path)]
-        (log/debug "FlureeFileIO: Deleting" path "as storage path:" storage-path)
-        ;; Note: Not all stores support delete - this may be a no-op
-        (when (satisfies? storage/EraseableStore store)
-          (async/<!! (storage/delete store storage-path)))
-        nil))
+     (^void deleteFile [_ ^String path]
+       (let [parsed-path  (parse-storage-path path)
+             storage-path (get-effective-path store parsed-path)]
+         (log/debug "FlureeFileIO: Deleting" path "as storage path:" storage-path)
+         ;; Note: Not all stores support delete - this may be a no-op
+         (when (satisfies? storage/EraseableStore store)
+           (async/<!! (storage/delete store storage-path)))
+         nil))
 
-    (initialize [_ _properties]
-      ;; No-op - store is already initialized
-      nil)
+     (initialize [_ _properties]
+       ;; No-op - store is already initialized
+       nil)
 
-    (properties [_]
-      {})
+     (properties [_]
+       {})
 
-    (close [_]
-      ;; No-op - store lifecycle managed externally
-      nil)))
+     (close [_]
+       ;; No-op - store lifecycle managed externally
+       nil))))

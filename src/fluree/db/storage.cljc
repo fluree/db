@@ -148,6 +148,25 @@
   (list-paths-recursive [store prefix]
     "Recursively returns all file paths that start with the given prefix. Excludes directories."))
 
+(defprotocol StatStore
+  "Protocol for efficient file metadata retrieval without downloading content."
+  (stat [store path]
+    "Returns a map with file metadata {:size :etag :last-modified} or nil if not found.
+     Returns an async channel. Does not throw on missing files."))
+
+(defprotocol RangeReadableStore
+  "Protocol for reading byte ranges from files, enabling efficient streaming."
+  (read-bytes-range [store path offset length]
+    "Read `length` bytes starting at `offset` from the file at `path`.
+     Returns an async channel with byte[] or exception.
+     If offset+length exceeds file size, returns available bytes."))
+
+(defprotocol FullURIStore
+  "Marker protocol for stores that expect full URIs (e.g., s3://bucket/path).
+   Stores not implementing this protocol expect stripped paths (just the key)."
+  (expects-full-uri? [store]
+    "Returns true if this store expects full URIs, false otherwise."))
+
 (defn content-write-json
   [store path data]
   (go-try

@@ -21,6 +21,7 @@ For implementation details and roadmap, see `docs/ICEBERG_SPARQL_STRATEGY.md` an
 - [Performance](#performance)
 - [API Reference](#api-reference)
 - [Troubleshooting](#troubleshooting)
+- [Development Setup](#development-setup)
 
 ## Overview
 
@@ -197,6 +198,133 @@ LIMIT 100
 ```
 
 ## Configuration
+
+### Nameservice (Publisher) configuration for Iceberg catalogs + cache (recommended)
+
+Iceberg virtual graphs are **published into the nameservice** (same mechanism as other VGs). For production REST catalogs (Polaris, Snowflake, Databricks UC, etc.) it’s useful to define:
+
+- **Preconfigured REST catalogs** (URIs + auth), each with its own stable name
+- **Iceberg cache defaults** (cache dir, memory budget, block size)
+- **Governance / lockdown flags** (disallow dynamic VG creation and/or disallow dynamic catalogs)
+
+These settings belong in your **connection JSON-LD** under the **publisher (nameservice) node**, because they govern how names map to graph implementations.
+
+#### Multiple named catalogs
+
+Each configured catalog gets a stable identifier (`icebergCatalogName`) so settings stay independent across multiple catalogs.
+
+Use `ConfigurationValue` for secrets so they can be supplied via env vars / JVM props:
+
+```json
+{
+  "@context": {
+    "@base": "https://ns.flur.ee/config/connection/",
+    "@vocab": "https://ns.flur.ee/system#"
+  },
+  "@graph": [
+    {
+      "@id": "s3Storage",
+      "@type": "Storage",
+      "s3Bucket": "my-bucket",
+      "s3Endpoint": "https://s3.us-east-1.amazonaws.com",
+      "s3Prefix": "fluree/"
+    },
+    {
+      "@id": "connection",
+      "@type": "Connection",
+      "commitStorage": { "@id": "s3Storage" },
+      "indexStorage": { "@id": "s3Storage" },
+      "primaryPublisher": { "@id": "publisher" }
+    },
+    {
+      "@id": "publisher",
+      "@type": "Publisher",
+      "storage": { "@id": "s3Storage" },
+
+      "icebergAllowDynamicVirtualGraphs": true,
+      "icebergAllowDynamicCatalogs": false,
+
+      "icebergCatalogs": [
+        { "@id": "polarisProd" },
+        { "@id": "databricksUc" }
+      ],
+      "icebergCache": { "@id": "icebergCache" }
+    },
+
+    {
+      "@id": "polarisProd",
+      "@type": "IcebergCatalog",
+      "icebergCatalogName": "polaris-prod",
+      "icebergCatalogType": "rest",
+      "icebergRestUri": "https://polaris.example.com",
+      "icebergAllowVendedCredentials": true,
+      "icebergAuth": { "@id": "polarisAuth" }
+    },
+    {
+      "@id": "polarisAuth",
+      "@type": "IcebergAuth",
+      "icebergAuthType": "bearer",
+      "icebergBearerToken": {
+        "@type": "ConfigurationValue",
+        "envVar": "POLARIS_TOKEN"
+      }
+    },
+
+    {
+      "@id": "databricksUc",
+      "@type": "IcebergCatalog",
+      "icebergCatalogName": "databricks-uc",
+      "icebergCatalogType": "rest",
+      "icebergRestUri": "https://dbc-123.cloud.databricks.com/api/2.1/unity-catalog/iceberg",
+      "icebergAllowVendedCredentials": false,
+      "icebergAuth": { "@id": "databricksAuth" }
+    },
+    {
+      "@id": "databricksAuth",
+      "@type": "IcebergAuth",
+      "icebergAuthType": "bearer",
+      "icebergBearerToken": {
+        "@type": "ConfigurationValue",
+        "envVar": "DATABRICKS_TOKEN"
+      }
+    },
+
+    {
+      "@id": "icebergCache",
+      "@type": "IcebergCache",
+      "icebergCacheEnabled": true,
+      "icebergCacheDir": {
+        "@type": "ConfigurationValue",
+        "defaultVal": "/tmp/fluree/iceberg-cache"
+      },
+      "icebergMemCacheMb": 128,
+      "icebergBlockSizeMb": 4
+    }
+  ]
+}
+```
+
+#### Governance: dynamic virtual graphs vs dynamic catalogs
+
+There are two distinct knobs:
+
+- **Dynamic virtual graphs** (`icebergAllowDynamicVirtualGraphs` / `virtualGraphAllowPublish`): whether users may publish new VGs into the nameservice at runtime.
+- **Dynamic catalogs** (`icebergAllowDynamicCatalogs`): whether a new Iceberg VG may specify a REST catalog that is not preconfigured in the publisher config.
+
+In locked-down environments, set:
+
+- `icebergAllowDynamicVirtualGraphs=false` and/or `virtualGraphAllowPublish=false`
+- `icebergAllowDynamicCatalogs=false`
+
+#### Security note for dynamic catalogs
+
+If you allow dynamic catalogs, API secrets may need to be persisted alongside the VG config so the catalog can be reloaded later. Treat the nameservice storage as a sensitive asset (same class as your DB storage).
+
+Recommended operating modes:
+
+- **Locked down**: only preconfigured catalogs (secrets via env vars / config)
+- **Dynamic (no secret persistence)**: allow new catalogs but require secrets to be supplied out-of-band each time (best when tokens are short-lived)
+- **Dynamic (persist secrets)**: only if you encrypt secrets at rest with a key not stored in the nameservice
 
 ### Factory Functions
 
@@ -893,6 +1021,129 @@ For native image builds, ensure Iceberg and Arrow classes are included in reflec
 - [ ] Statistics-based query planning improvements
 - [ ] Parallel execution for multi-table queries
 - [ ] Spill-to-disk for large joins
+
+## Development Setup
+
+### Local REST Catalogs for Testing
+
+Two REST catalog options are available for local development:
+
+#### Tabular REST Catalog (Simple, No Vended Credentials)
+
+The `tabulario/iceberg-rest` image is a simple reference implementation:
+
+```bash
+make iceberg-rest-up      # Start Tabular + MinIO on port 8181
+make iceberg-rest-load    # Load OpenFlights data
+make iceberg-rest-down    # Stop
+```
+
+- REST API: `http://localhost:8181`
+- MinIO Console: `http://localhost:9001` (admin/password)
+- **Does not support vended credentials**
+
+#### Apache Polaris (Vended Credentials Support)
+
+For testing vended credentials, use Apache Polaris:
+
+```bash
+make polaris-up     # Start Polaris on port 8182
+make polaris-down   # Stop
+make polaris-clean  # Stop and remove data
+```
+
+- REST API: `http://localhost:8182`
+- Management/Health: `http://localhost:8183/q/health`
+- OAuth endpoint: `http://localhost:8182/api/catalog/v1/oauth/tokens`
+
+### Polaris Setup Notes
+
+Polaris requires specific configuration for MinIO and vended credentials:
+
+**1. Path-Style S3 Access**
+
+MinIO requires path-style URLs (`http://host/bucket/key`) instead of virtual-hosted style (`http://bucket.host/key`). This must be set in the catalog's `storageConfigInfo`:
+
+```json
+{
+  "storageConfigInfo": {
+    "storageType": "S3",
+    "endpoint": "http://localhost:9000",
+    "endpointInternal": "http://iceberg-minio:9000",
+    "pathStyleAccess": true
+  }
+}
+```
+
+The `endpointInternal` is used by Polaris server (Docker network), while `endpoint` is returned to clients.
+
+**2. Enable Credential Vending**
+
+Set the catalog property:
+
+```json
+{
+  "properties": {
+    "enable.credential.vending": "true"
+  }
+}
+```
+
+**3. Grant TABLE_READ_DATA Privilege**
+
+The `catalog_admin` role needs `TABLE_READ_DATA` for vended credentials to work:
+
+```bash
+curl -X PUT "http://localhost:8182/api/management/v1/catalogs/{catalog}/catalog-roles/catalog_admin/grants" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"grant":{"type":"catalog","privilege":"TABLE_READ_DATA"}}'
+```
+
+Without this, you'll get: `"not authorized for op LOAD_TABLE_WITH_READ_DELEGATION"`
+
+**4. Testing Vended Credentials**
+
+```bash
+# Get OAuth token
+TOKEN=$(curl -s -X POST "http://localhost:8182/api/catalog/v1/oauth/tokens" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "client_id=root" \
+  --data-urlencode "client_secret=s3cr3t" \
+  --data-urlencode "scope=PRINCIPAL_ROLE:ALL" | jq -r '.access_token')
+
+# Load table with vended credentials header
+curl -s "http://localhost:8182/api/catalog/v1/{catalog}/namespaces/{ns}/tables/{table}" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Iceberg-Access-Delegation: vended-credentials"
+```
+
+Response includes `storage-credentials` with temporary S3 credentials:
+
+```json
+{
+  "metadata-location": "s3://...",
+  "config": {
+    "s3.access-key-id": "TEMP_KEY",
+    "s3.secret-access-key": "TEMP_SECRET",
+    "s3.session-token": "JWT...",
+    "s3.endpoint": "http://localhost:9000",
+    "expiration-time": "1768358224000",
+    "client.refresh-credentials-endpoint": "v1/.../credentials"
+  },
+  "storage-credentials": [...]
+}
+```
+
+### Comparing REST Catalogs
+
+| Feature | Tabular (`tabulario/iceberg-rest`) | Apache Polaris |
+|---------|-----------------------------------|----------------|
+| Port | 8181 | 8182 |
+| Auth | None (open) | OAuth2 |
+| Vended Credentials | No | Yes |
+| Path-Style S3 | Via env vars | Via storageConfigInfo |
+| Production Ready | No (reference impl) | Yes |
 
 ## Running Benchmarks
 

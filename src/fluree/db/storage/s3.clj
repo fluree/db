@@ -331,6 +331,122 @@
          :body    body
          :headers {}}))))
 
+(defn s3-head
+  "Make an S3 HEAD request to get object metadata without downloading content.
+   Returns {:size :etag :last-modified} or nil if not found."
+  [{:keys [bucket region path credentials request-timeout endpoint]
+    :or   {request-timeout 10000}}]
+  (go-try
+    (let [start        (System/nanoTime)
+          encoded-path (encode-s3-path path)
+          url          (build-s3-url bucket region encoded-path endpoint)
+          signed-hdrs  (sign-request {:method       "HEAD"
+                                      :path         encoded-path
+                                      :headers      {}
+                                      :payload      nil
+                                      :region       region
+                                      :bucket       bucket
+                                      :credentials  credentials
+                                      :query-params nil
+                                      :endpoint     endpoint})
+          builder      (-> (java.net.http.HttpRequest/newBuilder)
+                           (.uri (java.net.URI/create url))
+                           (.timeout (java.time.Duration/ofMillis request-timeout))
+                           (.method "HEAD" (java.net.http.HttpRequest$BodyPublishers/noBody)))
+          _            (doseq [[k v] signed-hdrs]
+                         (.header builder k v))
+          request      (.build builder)
+          response     (.send (get-binary-http-client) request
+                              (java.net.http.HttpResponse$BodyHandlers/discarding))
+          status       (.statusCode response)
+          headers      (.headers response)]
+      (log/trace "s3-head done" {:bucket      bucket
+                                 :path        encoded-path
+                                 :status      status
+                                 :duration-ms (long (/ (- (System/nanoTime) start)
+                                                       1000000))})
+      (cond
+        (= status 404)
+        nil  ;; Return nil for not found, don't throw
+
+        (< 299 status)
+        (throw (ex-info (str "S3 HEAD error: " status)
+                        {:status status :path path}))
+
+        :else
+        (let [content-length (-> headers (.firstValue "content-length") (.orElse nil))
+              etag           (-> headers (.firstValue "etag") (.orElse nil))
+              last-modified  (-> headers (.firstValue "last-modified") (.orElse nil))]
+          {:size          (when content-length (Long/parseLong content-length))
+           :etag          etag
+           :last-modified last-modified})))))
+
+(defn s3-get-range
+  "Make an S3 GET request for a specific byte range.
+   Returns raw bytes for the requested range."
+  [{:keys [bucket region path credentials request-timeout endpoint offset length]
+    :or   {request-timeout 20000}}]
+  (go-try
+    ;; Validate edge cases
+    (when (neg? offset)
+      (throw (ex-info "Offset cannot be negative" {:offset offset :path path})))
+    (when-not (pos? length)
+      (throw (ex-info "Length must be positive" {:length length :path path})))
+    (let [start        (System/nanoTime)
+          encoded-path (encode-s3-path path)
+          ;; Range header: bytes=start-end (inclusive)
+          range-header (str "bytes=" offset "-" (dec (+ offset length)))
+          url          (build-s3-url bucket region encoded-path endpoint)
+          signed-hdrs  (sign-request {:method       "GET"
+                                      :path         encoded-path
+                                      :headers      {"Range" range-header}
+                                      :payload      nil
+                                      :region       region
+                                      :bucket       bucket
+                                      :credentials  credentials
+                                      :query-params nil
+                                      :endpoint     endpoint})
+          builder      (-> (java.net.http.HttpRequest/newBuilder)
+                           (.uri (java.net.URI/create url))
+                           (.timeout (java.time.Duration/ofMillis request-timeout))
+                           (.GET))
+          _            (doseq [[k v] signed-hdrs]
+                         (.header builder k v))
+          request      (.build builder)
+          response     (.send (get-binary-http-client) request
+                              (java.net.http.HttpResponse$BodyHandlers/ofByteArray))
+          status       (.statusCode response)
+          ^bytes body  (.body response)]
+      (log/trace "s3-get-range done" {:bucket      bucket
+                                      :path        encoded-path
+                                      :offset      offset
+                                      :length      length
+                                      :status      status
+                                      :actual-size (when body (alength body))
+                                      :duration-ms (long (/ (- (System/nanoTime) start)
+                                                            1000000))})
+      (cond
+        (= status 404)
+        (throw (ex-info "Not found" {:status 404 :path path}))
+
+        ;; 206 Partial Content is the expected response for range requests
+        ;; Some S3-compatible stores may return 200 OK for small files
+        (and (not= status 206) (not= status 200) (< 299 status))
+        (throw (ex-info (str "S3 range error: " status)
+                        {:status status :path path :offset offset :length length}))
+
+        :else
+        (do
+          ;; Log when we get 200 instead of 206 - server may have ignored Range header
+          ;; and returned full file instead of requested range
+          (when (and (= status 200) body (> (alength body) length))
+            (log/debug "s3-get-range received 200 with more bytes than requested"
+                       {:path        path
+                        :requested   length
+                        :received    (alength body)
+                        :hint        "Server may have ignored Range header"}))
+          body)))))
+
 (defn s3-request
   "Make an S3 REST API request"
   [{:keys [method bucket region path headers body credentials query-params request-timeout endpoint]
@@ -676,7 +792,31 @@
         ;; Filter for .json files and return relative paths
         (->> all-results
              (filter #(str/ends-with? % ".json"))
-             vec)))))
+             vec))))
+
+  storage/StatStore
+  (stat [_ path]
+    (let [credentials (get-credentials bucket region base-credentials)
+          full-path   (str prefix path)]
+      (s3-head {:bucket          bucket
+                :region          region
+                :path            full-path
+                :credentials     credentials
+                :endpoint        endpoint
+                :request-timeout read-timeout-ms})))
+
+  storage/RangeReadableStore
+  (read-bytes-range [_ path offset length]
+    (let [credentials (get-credentials bucket region base-credentials)
+          full-path   (str prefix path)]
+      (s3-get-range {:bucket          bucket
+                     :region          region
+                     :path            full-path
+                     :credentials     credentials
+                     :endpoint        endpoint
+                     :offset          offset
+                     :length          length
+                     :request-timeout read-timeout-ms}))))
 
 (defn- jitter
   "Adds +/- 50% jitter to a delay in ms."

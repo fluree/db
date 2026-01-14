@@ -16,7 +16,11 @@
    - Time-travel via snapshot-id or as-of-time
    - Schema introspection
    - Statistics from snapshot summary
-   - Arrow vectorized reads for high performance"
+   - Arrow vectorized reads for high performance
+
+   Performance optimizations:
+   - Caffeine-based metadata cache for immutable metadata files
+   - Block-caching SeekableInputStream for range reads"
   (:require [clojure.string :as str]
             [fluree.db.tabular.file-io :as file-io]
             [fluree.db.tabular.iceberg.core :as core]
@@ -24,10 +28,31 @@
             [fluree.db.tabular.iceberg.rest :as rest]
             [fluree.db.tabular.protocol :as proto]
             [fluree.db.util.log :as log])
-  (:import [org.apache.iceberg BaseTable Table StaticTableOperations]
+  (:import [com.github.benmanes.caffeine.cache Cache Caffeine]
+           [org.apache.iceberg BaseTable Table StaticTableOperations]
            [org.apache.iceberg.io FileIO]))
 
 (set! *warn-on-reflection* true)
+
+;;; ---------------------------------------------------------------------------
+;;; Table Metadata Cache
+;;; ---------------------------------------------------------------------------
+
+;; Global cache for loaded Table objects, keyed by metadata-location.
+;; Iceberg metadata files are immutable (each new version creates a new file),
+;; so we can cache Table objects indefinitely. The only mutable file is
+;; version-hint.text which should not be cached.
+;; Bounded to 100 entries to limit memory usage.
+(defonce ^:private table-cache
+  (delay
+    (-> (Caffeine/newBuilder)
+        (.maximumSize 100)
+        ^Cache (.build))))
+
+(defn- get-table-cache
+  "Get the global table cache instance."
+  ^Cache []
+  @table-cache)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Re-export Hadoop factory for backward compatibility
@@ -67,11 +92,18 @@
 
 (defn- load-table-from-metadata
   "Load an Iceberg Table from a metadata location using StaticTableOperations.
-   This avoids needing a full catalog - just point to the metadata JSON."
+   This avoids needing a full catalog - just point to the metadata JSON.
+
+   Tables are cached by metadata-location since Iceberg metadata files are immutable.
+   Each new snapshot creates a new metadata file, so caching is safe."
   ^Table [^FileIO file-io ^String metadata-location ^String table-name]
-  (let [ops (StaticTableOperations. metadata-location file-io)]
-    ;; BaseTable constructor takes (TableOperations, String name)
-    (BaseTable. ops table-name)))
+  (let [^Cache cache (get-table-cache)]
+    (or (.getIfPresent cache metadata-location)
+        (let [ops   (StaticTableOperations. metadata-location file-io)
+              table (BaseTable. ops table-name)]
+          (log/debug "Caching table metadata for:" metadata-location)
+          (.put cache metadata-location table)
+          table))))
 
 (defn- resolve-metadata-location
   "Resolve the metadata location for an Iceberg table.
@@ -181,16 +213,20 @@
    Config:
      :store          - Fluree storage store (required) - must implement ByteStore
      :warehouse-path - Root path prefix for tables (optional, for path resolution)
+     :file-io-opts   - Optional FileIO options map:
+                       - :cache-instance - Shared Caffeine cache for block caching
+                       - :block-size - Block size in bytes for range reads
 
    Example:
      (create-fluree-iceberg-source {:store my-s3-store
-                                    :warehouse-path \"s3://bucket/warehouse\"})
+                                    :warehouse-path \"s3://bucket/warehouse\"
+                                    :file-io-opts {:cache-instance my-cache}})
 
    Tables are loaded by:
    1. Direct metadata-location in scan opts
    2. Cached metadata location from previous scan
    3. Reading version-hint.text from table directory"
-  [{:keys [store warehouse-path]}]
+  [{:keys [store warehouse-path file-io-opts]}]
   {:pre [(some? store)]}
-  (let [file-io (file-io/create-fluree-file-io store)]
+  (let [file-io (file-io/create-fluree-file-io store (or file-io-opts {}))]
     (->FlureeIcebergSource file-io (or warehouse-path "") (atom {}))))

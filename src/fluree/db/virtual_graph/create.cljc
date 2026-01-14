@@ -1,6 +1,7 @@
 (ns fluree.db.virtual-graph.create
   "Handles creation of virtual graphs, delegating to type-specific implementations."
-  (:require [clojure.string :as str]
+  (:require #?(:clj [fluree.db.connection.system :as system])
+            [clojure.string :as str]
             [fluree.db.connection :as connection]
             [fluree.db.ledger :as ledger]
             [fluree.db.nameservice :as nameservice]
@@ -34,11 +35,79 @@
     (throw (ex-info (str "Virtual graph name cannot contain '@' character. Provided: " name)
                     {:error :db/invalid-config :name name}))))
 
+#?(:clj
+   (defn- enforce-vg-publish-policy
+     "Enforce global VG publishing policy.
+      Throws if virtualGraphAllowPublish=false.
+      This blocks ALL VG types (Iceberg, BM25, R2RML, etc.)."
+     [publisher]
+     (when-let [iceberg-cfg (system/get-iceberg-config publisher)]
+       (when-not (:allow-vg-publish? iceberg-cfg true)
+         (throw (ex-info "Virtual graph publishing is disabled"
+                         {:error :db/policy-violation
+                          :policy :virtualGraphAllowPublish}))))))
+
+#?(:clj
+   (defn- normalize-catalog-name
+     "Accept both 'catalog-name' (kebab) and 'catalogName' (camel).
+      Normalize at the edge."
+     [catalog-config]
+     (or (:catalog-name catalog-config)
+         (get catalog-config "catalog-name")
+         (get catalog-config "catalogName"))))
+
+#?(:clj
+   (defn- enforce-iceberg-policy
+     "Enforce Iceberg-specific governance policies.
+      Throws if policy violated."
+     [publisher config]
+     (when-let [iceberg-cfg (system/get-iceberg-config publisher)]
+       (let [{:keys [allow-dynamic-vgs? allow-dynamic-catalogs?
+                     catalogs allowed-catalog-names]} iceberg-cfg
+             catalog-config (or (:catalog config) (get config "catalog"))
+             catalog-name (normalize-catalog-name catalog-config)]
+
+         ;; Check if dynamic Iceberg VGs are allowed
+         (when-not allow-dynamic-vgs?
+           (throw (ex-info "Dynamic Iceberg virtual graph creation is disabled"
+                           {:error :db/policy-violation
+                            :policy :icebergAllowDynamicVirtualGraphs})))
+
+         ;; If specifying a catalog, check if it's allowed
+         (when catalog-config
+           (cond
+             ;; Named catalog - verify it exists in pre-configured catalogs
+             catalog-name
+             (do
+               (when-not (get catalogs catalog-name)
+                 (throw (ex-info (str "Unknown Iceberg catalog: " catalog-name
+                                      ". Configured catalogs: " (vec (keys catalogs)))
+                                 {:error :db/invalid-config
+                                  :catalog-name catalog-name
+                                  :available (vec (keys catalogs))})))
+               ;; If allowlist exists, check catalog name is in it
+               ;; NOTE: Only checked when catalog-name is present
+               (when (and (seq allowed-catalog-names)
+                          (not (contains? (set allowed-catalog-names) catalog-name)))
+                 (throw (ex-info "Iceberg catalog not in allowed list"
+                                 {:error :db/policy-violation
+                                  :catalog-name catalog-name
+                                  :allowed allowed-catalog-names}))))
+
+             ;; Inline catalog (dynamic, no catalog-name) - check if allowed
+             (not allow-dynamic-catalogs?)
+             (throw (ex-info "Dynamic Iceberg catalog configuration is disabled. Use a pre-configured catalog name."
+                             {:error :db/policy-violation
+                              :policy :icebergAllowDynamicCatalogs}))))))))
+
 (defn create
   "Main entry point for creating virtual graphs."
   [conn config]
   (go-try
     (validate-common-config config)
+    ;; Global gate - applies to ALL VG types (JVM only where Iceberg is supported)
+    #?(:clj (let [publisher (connection/primary-publisher conn)]
+              (enforce-vg-publish-policy publisher)))
     (<? (create-vg conn config))))
 
 (defn- validate-bm25-config
@@ -187,6 +256,8 @@
        (let [full-config (prepare-iceberg-config vg-config)
              {:keys [vg-name]} full-config
              publisher (connection/primary-publisher conn)]
+         ;; Iceberg-specific policy checks (global gate already passed in `create`)
+         (enforce-iceberg-policy publisher (:config vg-config))
          ;; Check if VG already exists
          (when (<? (nameservice/lookup publisher vg-name))
            (throw (ex-info (str "Virtual graph already exists: " vg-name)

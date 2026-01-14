@@ -38,20 +38,107 @@
   @http-client-delay)
 
 (defn- rest-request
-  "Make an HTTP GET request to the REST catalog API."
-  [uri path auth-token]
-  (let [url (str uri path)
-        builder (-> (HttpRequest/newBuilder)
-                    (.uri (URI/create url))
-                    (.timeout (Duration/ofSeconds 60))
-                    (.header "Accept" "application/json"))
-        builder (if auth-token
-                  (.header builder "Authorization" (str "Bearer " auth-token))
-                  builder)
-        request (.build (.GET builder))
-        response (.send (get-http-client) request (HttpResponse$BodyHandlers/ofString))]
-    (when (= 200 (.statusCode response))
-      (json/read-value (.body response) json/keyword-keys-object-mapper))))
+  "Make an HTTP GET request to the REST catalog API.
+
+   Options:
+   - :request-vended-credentials - when true, adds X-Iceberg-Access-Delegation header"
+  ([uri path auth-token]
+   (rest-request uri path auth-token {}))
+  ([uri path auth-token {:keys [request-vended-credentials]}]
+   (let [url (str uri path)
+         builder (-> (HttpRequest/newBuilder)
+                     (.uri (URI/create url))
+                     (.timeout (Duration/ofSeconds 60))
+                     (.header "Accept" "application/json"))
+         builder (if auth-token
+                   (.header builder "Authorization" (str "Bearer " auth-token))
+                   builder)
+         builder (if request-vended-credentials
+                   (.header builder "X-Iceberg-Access-Delegation" "vended-credentials")
+                   builder)
+         request (.build (.GET builder))
+         response (.send (get-http-client) request (HttpResponse$BodyHandlers/ofString))]
+     (when (= 200 (.statusCode response))
+       (json/read-value (.body response) json/keyword-keys-object-mapper)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Vended Credentials Support
+;;; ---------------------------------------------------------------------------
+
+(defn parse-storage-credentials
+  "Parse storage credentials from a REST catalog loadTable response.
+
+   REST catalogs like Polaris/Snowflake return temporary S3 credentials when
+   the X-Iceberg-Access-Delegation: vended-credentials header is sent.
+
+   Returns a map with:
+   - :access-key     - temporary AWS access key
+   - :secret-key     - temporary AWS secret key
+   - :session-token  - session token (required for STS credentials)
+   - :expiration-ms  - expiration time in epoch milliseconds (may be nil)
+   - :endpoint       - S3 endpoint URL (for MinIO, etc.)
+   - :path-style?    - true if path-style S3 access required
+   - :region         - AWS region (if specified)
+
+   Returns nil if no credentials in response."
+  [response]
+  (when-let [config (:config response)]
+    (let [access-key    (get config "s3.access-key-id")
+          secret-key    (get config "s3.secret-access-key")
+          session-token (get config "s3.session-token")]
+      (when (and access-key secret-key)
+        (cond-> {:access-key    access-key
+                 :secret-key    secret-key
+                 :session-token session-token}
+          (get config "s3.endpoint")
+          (assoc :endpoint (get config "s3.endpoint"))
+
+          (get config "s3.region")
+          (assoc :region (get config "s3.region"))
+
+          (= "true" (get config "s3.path-style-access"))
+          (assoc :path-style? true)
+
+          (get config "expiration-time")
+          (assoc :expiration-ms (parse-long (get config "expiration-time")))
+
+          (get config "s3.session-token-expires-at-ms")
+          (assoc :expiration-ms (parse-long (get config "s3.session-token-expires-at-ms"))))))))
+
+(defn get-table-with-credentials
+  "Get table metadata and vended credentials from a REST catalog.
+
+   Returns a map with:
+   - :metadata-location - S3/file path to table metadata JSON
+   - :credentials - parsed credentials map (see parse-storage-credentials)
+
+   If the catalog doesn't support vended credentials, :credentials will be nil."
+  [uri auth-token table-name]
+  (if-let [{:keys [namespace-path table]} (core/table-id->rest-path table-name)]
+    (let [path (str "/v1/namespaces/" namespace-path "/tables/" table)
+          response (rest-request uri path auth-token {:request-vended-credentials true})]
+      (when response
+        {:metadata-location (:metadata-location response)
+         :credentials       (parse-storage-credentials response)}))
+    (throw (ex-info "Table name must include namespace prefix"
+                    {:table-name table-name}))))
+
+(defn make-credential-provider
+  "Create a credential provider function for use with vended-s3 store.
+
+   The returned function (fn [table-name] -> credentials-map) fetches credentials
+   from the REST catalog API, caching them and refreshing when expired.
+
+   Parameters:
+   - uri: REST catalog endpoint
+   - auth-token: Bearer token for authentication
+
+   Returns a function suitable for fluree.db.storage.vended-s3/create-vended-s3-store."
+  [uri auth-token]
+  (let [vended-s3 (requiring-resolve 'fluree.db.storage.vended-s3/make-cached-credential-provider)]
+    (vended-s3
+     (fn [table-name]
+       (:credentials (get-table-with-credentials uri auth-token table-name))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Table Loading with Fluree FileIO
@@ -226,21 +313,25 @@
    Fluree's storage protocols for data access.
 
    Config keys:
-   - :uri        (required) REST catalog endpoint
-   - :store      (required) Fluree storage store (S3Store, FileStore, etc.)
-   - :auth-token (optional) bearer token for REST API auth
+   - :uri          (required) REST catalog endpoint
+   - :store        (required) Fluree storage store (S3Store, FileStore, etc.)
+   - :auth-token   (optional) bearer token for REST API auth
+   - :file-io-opts (optional) FileIO options map:
+                   - :cache-instance - Shared Caffeine cache for block caching
+                   - :block-size - Block size in bytes for range reads
 
    Example:
      (create-rest-iceberg-source {:uri \"http://localhost:8181\"
-                                  :store my-s3-store})
+                                  :store my-s3-store
+                                  :file-io-opts {:cache-instance my-cache}})
 
    This approach:
    - Uses REST API for catalog discovery (list namespaces, tables)
    - Uses Fluree's existing storage for all file reads
    - Eliminates duplicate S3/storage configuration"
-  [{:keys [uri store auth-token]}]
+  [{:keys [uri store auth-token file-io-opts]}]
   {:pre [(string? uri) (some? store)]}
   (log/info "Creating REST Iceberg source with Fluree storage:" {:uri uri})
-  (let [file-io (file-io/create-fluree-file-io store)]
+  (let [file-io (file-io/create-fluree-file-io store (or file-io-opts {}))]
     (->FlureeRestIcebergSource file-io uri auth-token (atom {}))))
 

@@ -11,7 +11,9 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.bytes :as bytes]
             [fluree.db.util.filesystem :as fs]
-            [fluree.db.util.json :as json]))
+            [fluree.db.util.json :as json])
+  #?(:clj (:import (java.io RandomAccessFile)
+                   (java.time Instant))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -146,7 +148,33 @@
                 ;; Filter for .json files only
                 json-files (filter #(str/ends-with? % ".json") relative-files)]
             json-files)
-          [])))))
+          []))))
+
+  #?@(:clj
+      [storage/StatStore
+       (stat [_ path]
+             (async/thread
+               (let [file (io/file (full-path root path))]
+                 (when (.exists file)
+                   {:size          (.length file)
+                    :last-modified (Instant/ofEpochMilli (.lastModified file))}))))
+
+       storage/RangeReadableStore
+       (read-bytes-range [_ path offset length]
+                         (async/thread
+                           (when (neg? offset)
+                             (throw (ex-info "Offset cannot be negative" {:offset offset :path path})))
+                           (when-not (pos? length)
+                             (throw (ex-info "Length must be positive" {:length length :path path})))
+                           (let [file (io/file (full-path root path))]
+                             (when (.exists file)
+                               (with-open [raf (RandomAccessFile. file "r")]
+                                 (.seek raf offset)
+                                 (let [available (- (.length raf) offset)
+                                       to-read   (min length available)
+                                       buf       (byte-array to-read)]
+                                   (.readFully raf buf)
+                                   buf))))))]))
 
 (defn open
   ([root-path]

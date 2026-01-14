@@ -205,3 +205,18 @@ iceberg-rest-down: ## Stop Iceberg REST catalog
 
 iceberg-rest-clean: ## Stop and remove all REST catalog data
 	cd dev-resources/iceberg-rest && docker compose down -v
+
+polaris-up: ## Start Apache Polaris catalog with vended credentials (Docker, port 8182)
+	cd dev-resources/polaris && docker compose up -d
+	@echo "Waiting for Polaris to be ready..."
+	@sleep 5
+	@./dev-resources/polaris/bootstrap.sh
+	@echo ""
+	@echo "Polaris REST catalog available at http://localhost:8182"
+	@echo "OAuth: POST http://localhost:8182/api/catalog/v1/oauth/tokens"
+
+polaris-down: ## Stop Apache Polaris catalog
+	cd dev-resources/polaris && docker compose down
+
+polaris-clean: ## Stop and remove Polaris (keeps MinIO data)
+	cd dev-resources/polaris && docker compose down -v
