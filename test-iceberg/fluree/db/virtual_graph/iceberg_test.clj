@@ -914,11 +914,9 @@
         (finally
           (teardown-fluree-system))))))
 
-;; TODO: FILTER IN pushdown is not currently working because pattern metadata
-;; attached during -reorder doesn't survive through the WHERE executor.
-;; The IN filter IS parsed and identified as pushable, but the metadata is lost
-;; when patterns flow through the matcher protocol.
-;; For now, use VALUES clauses for IN-style filtering as they work correctly.
+;; NOTE: FILTER IN pushdown now stores predicates in an atom (like VALUES pushdown)
+;; to survive through the WHERE executor. The pattern metadata path was unreliable.
+;; Test below can be uncommented once the full flow is verified end-to-end.
 ;;
 ;; (deftest e2e-filter-in-pushdown-test
 ;;   (when (and (warehouse-exists?) (mapping-exists?))

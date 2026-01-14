@@ -2090,9 +2090,10 @@
     [alias])
 
   (-finalize [_this _tracker error-ch solution-ch]
-    (let [;; VALUES pushdown from atom - this is the primary path since pattern metadata
-          ;; doesn't survive through the WHERE executor (known limitation)
-          values-pushdown (when query-pushdown @query-pushdown)
+    (let [;; Pushdown predicates from atom (includes both FILTER and VALUES predicates)
+          ;; This is the primary path since pattern metadata doesn't survive through
+          ;; the WHERE executor (known limitation)
+          atom-pushdown (when query-pushdown @query-pushdown)
           ;; Capture aggregation spec from atom (set in -reorder)
           agg-info (when aggregation-spec @aggregation-spec)
           ;; Capture anti-join spec from atom (set in -reorder)
@@ -2112,8 +2113,8 @@
           needs-collection? (or agg-info (seq anti-joins) (seq trans-paths)
                                 (seq (:filters expr-evals)) (seq (:binds expr-evals)))
           out-ch (async/chan 1 (map #(dissoc % ::iceberg-patterns)))]
-      (when (seq values-pushdown)
-        (log/debug "Iceberg -finalize using VALUES pushdown from atom:" values-pushdown))
+      (when (seq atom-pushdown)
+        (log/debug "Iceberg -finalize using VALUES pushdown from atom:" atom-pushdown))
       (when agg-info
         (log/debug "Iceberg -finalize will apply aggregation:" agg-info))
       (when (seq anti-joins)
@@ -2158,7 +2159,7 @@
                     (doseq [base-sol base-solutions]
                       (if (seq patterns)
                         (let [solution-pushdown (into (or (get solution ::solution-pushdown-filters) [])
-                                                      (or values-pushdown []))]
+                                                      (or atom-pushdown []))]
                           ;; Execute query and collect results
                           (if (query/has-union-patterns? patterns)
                             ;; UNION path
@@ -2237,7 +2238,7 @@
                    ;; Combine: pattern metadata pushdown (FILTER) + atom pushdown (VALUES)
                    ;; Pattern metadata may not survive WHERE executor, but atom path is reliable
                    (let [solution-pushdown (into (or (get solution ::solution-pushdown-filters) [])
-                                                 (or values-pushdown []))]
+                                                 (or atom-pushdown []))]
                      (when (seq solution-pushdown)
                        (log/debug "Iceberg -finalize combined solution pushdown:" solution-pushdown))
 
@@ -2450,13 +2451,14 @@
                              obj-map (get-in routed-mapping [:predicates pred-iri])
                              column (when (and obj-map (= :column (:type obj-map)))
                                       (:value obj-map))
-                             datatype (:datatype obj-map)
-                             ;; Coerce values based on column datatype
-                             coerced-values (mapv #(pushdown/coerce-value % datatype nil) values)]
-                         (if column
-                           (update m column (fnil conj []) {:op :in :value coerced-values})
+                            ;; Coerce values consistently (datatype if present; schema fallback if available)
+                             ctx (when routed-mapping (pushdown/build-coercion-ctx routed-mapping))
+                             pred (when (and ctx column)
+                                    (pushdown/coerce-predicate ctx {:op :in :column column :value values}))]
+                         (if pred
+                           (update m column (fnil conj []) {:op :in :value (:value pred)})
                            (do
-                             (log/debug "Skipping VALUES pushdown - no column mapping for var:"
+                             (log/debug "Skipping VALUES pushdown - coercion failed or no column mapping for var:"
                                         {:var var :pred-iri pred-iri
                                          :routed-mapping (boolean routed-mapping)})
                              m)))
@@ -2475,6 +2477,32 @@
                                                    other-patterns pushable mappings routing-indexes)]
                     {:patterns patterns :failed-pushable failed})
                   {:patterns (vec other-patterns) :failed-pushable []})
+
+                ;; Build explicit FILTER pushdown predicates (survives executor path)
+                ;; This duplicates the annotation logic but stores predicates in an atom
+                ;; to avoid metadata loss through the WHERE executor
+                filter-pushdown-predicates
+                (when (seq pushable)
+                  (let [pred->mappings (:predicate->mappings routing-indexes)]
+                    (->> pushable
+                         (keep (fn [{:keys [comparisons vars]}]
+                                 (let [var (first vars)
+                                       pred-iri (pushdown/var->predicate-iri other-patterns var)
+                                       routed-mapping (first (get pred->mappings pred-iri))
+                                       obj-map (get-in routed-mapping [:predicates pred-iri])
+                                       column (when (and obj-map (= :column (:type obj-map)))
+                                                (:value obj-map))
+                                       ctx (when routed-mapping (pushdown/build-coercion-ctx routed-mapping))]
+                                   (when column
+                                     ;; Coerce and build predicates for this filter
+                                     (keep (fn [comp]
+                                             (when ctx
+                                               (pushdown/coerce-predicate ctx {:op (:op comp)
+                                                                               :column column
+                                                                               :value (:value comp)})))
+                                           comparisons)))))
+                         (apply concat)
+                         vec)))
 
                 ;; Annotate patterns with VALUES/IN pushdown metadata
                 final-patterns (if (seq values-predicates)
@@ -2522,7 +2550,7 @@
 
                 ;; Flatten direct-pushdown-map to a vector of predicates
                 ;; Format: [{:op :in :column "country" :value ["US" "Canada"]} ...]
-                values-pushdown-predicates
+                atom-pushdown-predicates
                 (->> direct-pushdown-map
                      (mapcat (fn [[column preds]]
                                (map #(assoc % :column column) preds)))
@@ -2532,9 +2560,10 @@
                              {:total-filters (count filters)
                               :pushable-filters (count pushable)
                               :failed-pushable (count failed-pushable)
+                              :filter-pushdown-predicates (count filter-pushdown-predicates)
                               :values-patterns (count values-patterns)
                               :values-in-predicates (count values-predicates)
-                              :values-pushdown-predicates values-pushdown-predicates
+                              :atom-pushdown-predicates (count atom-pushdown-predicates)
                               :patterns-annotated (count (filter #(::pushdown/pushdown-filters (meta %))
                                                                  final-patterns))})
 
@@ -2551,9 +2580,18 @@
                       (swap! expression-evaluators
                              update :filters into failed-filter-fns)))
 
-                ;; Store VALUES predicates in the atom for retrieval in -finalize
-                _ (when (and query-pushdown (seq values-pushdown-predicates))
-                    (reset! query-pushdown values-pushdown-predicates))
+                ;; Combine FILTER and VALUES pushdown predicates for storage in atom
+                ;; This explicit storage survives the executor path (unlike pattern metadata)
+                all-pushdown-predicates (into (vec atom-pushdown-predicates)
+                                              filter-pushdown-predicates)
+
+                ;; Store combined pushdown predicates in the atom for retrieval in -finalize
+                _ (when (and query-pushdown (seq all-pushdown-predicates))
+                    (log/debug "Storing pushdown predicates in atom:"
+                               {:filter-count (count filter-pushdown-predicates)
+                                :values-count (count atom-pushdown-predicates)
+                                :total (count all-pushdown-predicates)})
+                    (reset! query-pushdown all-pushdown-predicates))
 
                 ;; Extract query modifiers for use in -finalize
                 ;; Includes aggregation, DISTINCT, HAVING, ORDER BY, LIMIT/OFFSET

@@ -10,7 +10,8 @@
    Predicate pushdown allows SPARQL filters to be executed directly by
    Iceberg rather than post-filtering in Clojure, significantly improving
    performance for selective queries."
-  (:require [fluree.db.query.exec.where :as where]
+  (:require [clojure.string :as str]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.util.log :as log])
   (:import [java.time Instant]))
 
@@ -30,63 +31,210 @@
 
 (def ^:const xsd-ns "http://www.w3.org/2001/XMLSchema#")
 
-(defn- coercion-failed?
+(def ^:private coercion-failed
+  "Sentinel indicating coercion was required but failed."
+  ::coercion-failed)
+
+(defn coercion-failed?
   "Check if a value represents a failed coercion attempt.
    The sentinel ::coercion-failed indicates coercion was required but failed,
    signaling that the predicate should not be pushed down."
   [v]
-  (= v ::coercion-failed))
+  (= v coercion-failed))
+
+(defn- try-coerce
+  "Apply `coercer` to `value`, returning:
+   - coerced value on success
+   - nil when coercion fails (exception or invalid lexical form)"
+  [coercer value]
+  (try
+    (coercer value)
+    (catch Exception _
+      nil)))
+
+(defn- coerce-boolean-strict
+  "Strict boolean coercion.
+
+   Accepts:
+   - boolean values
+   - strings (case-insensitive) \"true\" / \"false\" (whitespace trimmed)
+
+   Returns:
+   - true/false on success
+   - nil on failure"
+  [v]
+  (cond
+    (boolean? v) v
+    (string? v) (case (-> v str/trim str/lower-case)
+                  "true" true
+                  "false" false
+                  nil)
+    :else nil))
+
+(defn- schema->type-map
+  "Convert an Iceberg schema representation (seq of {:name :type ...}) to a
+   map of column-name -> type keyword, for O(1) lookups."
+  [col-schema]
+  (when (sequential? col-schema)
+    (persistent!
+     (reduce (fn [m {:keys [name type]}]
+               (if (and name type)
+                 (assoc! m name type)
+                 m))
+             (transient {})
+             col-schema))))
+
+(defn- lookup-col-type
+  "Lookup a column type by column name from either:
+   - a seq schema: [{:name \"id\" :type :long} ...]
+   - a precomputed map: {\"id\" :long, ...}"
+  [col-schema-or-map col-name]
+  (cond
+    (nil? col-schema-or-map) nil
+    (map? col-schema-or-map) (get col-schema-or-map col-name)
+    :else (get (schema->type-map col-schema-or-map) col-name)))
+
+(defn- coerce-long
+  [v]
+  (when (some? v)
+    (parse-long (str v))))
+
+(defn- coerce-double
+  [v]
+  (when (some? v)
+    (parse-double (str v))))
+
+(defn- coerce-bigdecimal
+  "Coerce to BigDecimal for xsd:decimal.
+   Preserves precision unlike parse-double."
+  [v]
+  (when (some? v)
+    (cond
+      (instance? BigDecimal v) v
+      (number? v) (BigDecimal/valueOf (double v))
+      :else (BigDecimal. (str v)))))
+
+(defn- coerce-instant
+  [v]
+  (when (some? v)
+    (if (instance? Instant v)
+      v
+      (Instant/parse (str v)))))
+
+(defn- coerce-local-date
+  [v]
+  (when (some? v)
+    (java.time.LocalDate/parse (str v))))
+
+(defn- coerce-number->long
+  [v]
+  (when (some? v)
+    (if (number? v)
+      (long v)
+      (parse-long (str v)))))
+
+(defn- coerce-number->int
+  [v]
+  (when (some? v)
+    (if (number? v)
+      (int v)
+      (parse-long (str v)))))
+
+(defn- coerce-number->double
+  [v]
+  (when (some? v)
+    (if (number? v)
+      (double v)
+      (parse-double (str v)))))
+
+(defn- coerce-number->float
+  [v]
+  (when (some? v)
+    (if (number? v)
+      (float v)
+      (parse-double (str v)))))
+
+(declare coerce-predicate-value)
+
+(defn build-coercion-ctx
+  "Build a coercion context for a single table mapping (and optional schema).
+
+   mapping: the per-table R2RML mapping (must include :predicates map)
+   schema:  optional schema map from ITabularSource.get-schema (expects {:columns [...]})
+
+   Returns:
+     {:col->datatype {\"col\" \"xsd-iri\"}
+      :col->type     {\"col\" :long}}
+
+   Notes:
+   - rr:datatype is optional; when absent we fall back to schema types if provided.
+   - Callers should treat this as immutable and reuse it across many predicates."
+  ([mapping] (build-coercion-ctx mapping nil))
+  ([mapping schema]
+   (let [col->datatype (reduce (fn [m [_pred-iri om]]
+                                 (if (and (map? om) (= :column (:type om)))
+                                   (update m (:value om) #(or % (:datatype om)))
+                                   m))
+                               {}
+                               (:predicates mapping))
+         col->type (some-> schema :columns schema->type-map)]
+     {:col->datatype col->datatype
+      :col->type col->type})))
+
+(defn coerce-predicate
+  "Coerce a single predicate map using a coercion ctx.
+
+   pred: {:column \"col\" :op :eq/:in/... :value ...}
+
+   Returns:
+   - coerced predicate map, or
+   - nil if coercion failed (meaning: do not push down this predicate)."
+  [{:keys [col->datatype col->type]} {:keys [column] :as pred}]
+  (let [obj-map {:datatype (get col->datatype column)
+                 :value column}
+        schema (or col->type nil)]
+    (coerce-predicate-value pred obj-map schema)))
+
+(defn coerce-predicates
+  "Coerce a seq of predicate maps using a coercion ctx.
+
+   Returns a vector of coerced predicates, dropping any that fail coercion."
+  [ctx predicates]
+  (->> predicates
+       (keep #(coerce-predicate ctx %))
+       vec))
 
 (def ^:private xsd-type->coercer
   "Map of XSD datatype IRIs to coercion functions.
    Each coercer takes a value and returns the coerced type or nil on failure."
-  {(str xsd-ns "integer")      #(when % (parse-long (str %)))
-   (str xsd-ns "long")         #(when % (parse-long (str %)))
-   (str xsd-ns "int")          #(when % (parse-long (str %)))
-   (str xsd-ns "short")        #(when % (parse-long (str %)))
-   (str xsd-ns "byte")         #(when % (parse-long (str %)))
-   (str xsd-ns "decimal")      #(when % (parse-double (str %)))
-   (str xsd-ns "double")       #(when % (parse-double (str %)))
-   (str xsd-ns "float")        #(when % (parse-double (str %)))
+  {(str xsd-ns "integer")      coerce-long
+   (str xsd-ns "long")         coerce-long
+   (str xsd-ns "int")          coerce-long
+   (str xsd-ns "short")        coerce-long
+   (str xsd-ns "byte")         coerce-long
+   ;; decimal uses BigDecimal to preserve precision (Iceberg decimals are BigDecimal)
+   (str xsd-ns "decimal")      coerce-bigdecimal
+   (str xsd-ns "double")       coerce-double
+   (str xsd-ns "float")        coerce-double
    ;; Boolean coercer is strict: only accepts actual booleans or valid boolean strings
-   (str xsd-ns "boolean")      #(cond
-                                  (boolean? %) %
-                                  (string? %) (parse-boolean %)  ; returns nil for invalid
-                                  :else nil)  ; non-string, non-boolean -> fail
-   (str xsd-ns "dateTime")     #(when %
-                                  (try
-                                    (if (instance? Instant %)
-                                      %
-                                      (Instant/parse (str %)))
-                                    (catch Exception _ nil)))
-   (str xsd-ns "date")         #(when %
-                                  (try
-                                    (java.time.LocalDate/parse (str %))
-                                    (catch Exception _ nil)))
+   (str xsd-ns "boolean")      coerce-boolean-strict
+   (str xsd-ns "dateTime")     coerce-instant
+   (str xsd-ns "date")         coerce-local-date
    (str xsd-ns "string")       str})
 
 (def ^:private iceberg-type->coercer
   "Map of Iceberg column type keywords to coercion functions.
    Used when R2RML doesn't specify rr:datatype."
-  {:long    #(when % (if (number? %) (long %) (parse-long (str %))))
-   :int     #(when % (if (number? %) (int %) (parse-long (str %))))
-   :double  #(when % (if (number? %) (double %) (parse-double (str %))))
-   :float   #(when % (if (number? %) (float %) (parse-double (str %))))
+  {:long    coerce-number->long
+   :int     coerce-number->int
+   :double  coerce-number->double
+   :float   coerce-number->float
+   ;; decimal uses BigDecimal to preserve precision
+   :decimal coerce-bigdecimal
    ;; Boolean coercer is strict: only accepts actual booleans or valid boolean strings
-   :boolean #(cond
-               (boolean? %) %
-               (string? %) (parse-boolean %)  ; returns nil for invalid
-               :else nil)  ; non-string, non-boolean -> fail
-   :timestamp #(when %
-                 (try
-                   (if (instance? Instant %)
-                     %
-                     (Instant/parse (str %)))
-                   (catch Exception _ nil)))
-   :date    #(when %
-               (try
-                 (java.time.LocalDate/parse (str %))
-                 (catch Exception _ nil)))
+   :boolean coerce-boolean-strict
+   :timestamp coerce-instant
+   :date    coerce-local-date
    :string  str})
 
 (defn coerce-value
@@ -110,25 +258,25 @@
     ;; When datatype is explicit, coercion failure is an error - return sentinel
     (and datatype (contains? xsd-type->coercer datatype))
     (let [coercer (get xsd-type->coercer datatype)
-          coerced (try (coercer value) (catch Exception _ nil))]
+          coerced (try-coerce coercer value)]
       (if (some? coerced)
         coerced
         (do
           (log/warn "Coercion failed for value" value "with datatype" datatype
                     "- predicate will not be pushed down")
-          ::coercion-failed)))
+          coercion-failed)))
 
     ;; Fall back to Iceberg schema type
     ;; Schema-based coercion failure also returns sentinel
     (and col-type (contains? iceberg-type->coercer col-type))
     (let [coercer (get iceberg-type->coercer col-type)
-          coerced (try (coercer value) (catch Exception _ nil))]
+          coerced (try-coerce coercer value)]
       (if (some? coerced)
         coerced
         (do
           (log/warn "Coercion failed for value" value "with column type" col-type
                     "- predicate will not be pushed down")
-          ::coercion-failed)))
+          coercion-failed)))
 
     ;; No coercion needed - return as-is
     :else value))
@@ -143,11 +291,7 @@
   [pred object-map col-schema]
   (let [datatype (:datatype object-map)
         col-type (when col-schema
-                   (let [col-name (:value object-map)]
-                     (->> col-schema
-                          (filter #(= col-name (:name %)))
-                          first
-                          :type)))
+                   (lookup-col-type col-schema (:value object-map)))
         value (:value pred)]
     (if (or (vector? value) (set? value) (sequential? value))
       ;; Collection value (IN, BETWEEN) - coerce each element
@@ -389,28 +533,26 @@
                  obj-map (get-in routed-mapping [:predicates pred-iri])
                  column (when (and obj-map (= :column (:type obj-map)))
                           (:value obj-map))
-                 datatype (:datatype obj-map)]
+                 ctx (when routed-mapping (build-coercion-ctx routed-mapping))]
              (if column
                ;; Attempt to coerce values, checking for failures
-               (let [coerced-comparisons (mapv (fn [comp]
-                                                 (let [coerced (coerce-value (:value comp) datatype nil)]
-                                                   (-> comp
-                                                       (assoc :column column)
-                                                       (assoc :value coerced))))
-                                               comparisons)
-                     any-failed? (some #(coercion-failed? (:value %)) coerced-comparisons)]
-                 (if any-failed?
+               (let [coerced-comparisons (vec (keep (fn [comp]
+                                                      (when ctx
+                                                        (coerce-predicate ctx (assoc comp :column column))))
+                                                    comparisons))
+                     any-failed? (not= (count coerced-comparisons) (count comparisons))]
+                 (if (or (nil? ctx) any-failed?)
                    ;; Coercion failed - add to failed list, don't push down
                    (do
                      (log/debug "Skipping FILTER pushdown - coercion failed:"
-                                {:var var :column column :datatype datatype})
+                                {:var var :column column :datatype (:datatype obj-map)})
                      {:patterns patterns
                       :failed (conj failed analysis)})
                    ;; All coercions succeeded - annotate the pattern
                    (do
                      (log/debug "Annotating pattern with FILTER pushdown:"
                                 {:var var :column column :ops (mapv :op comparisons)
-                                 :datatype datatype})
+                                 :datatype (:datatype obj-map)})
                      {:patterns (update patterns binding-idx
                                         #(annotate-pattern-with-filters % coerced-comparisons))
                       :failed failed})))
@@ -559,23 +701,21 @@
                  obj-map (get-in routed-mapping [:predicates pred-iri])
                  column (when (and obj-map (= :column (:type obj-map)))
                           (:value obj-map))
-                 datatype (:datatype obj-map)]
+                 ctx (when routed-mapping (build-coercion-ctx routed-mapping))]
              (if column
-               ;; Coerce all values based on column datatype, checking for failures
-               (let [coerced-values (mapv #(coerce-value % datatype nil) values)]
-                 (if (some coercion-failed? coerced-values)
+               ;; Coerce all values (rr:datatype if present, else schema fallback if available)
+               (if-let [pred (when ctx (coerce-predicate ctx {:op :in :column column :value values}))]
+                 (let [pushdown-filter [pred]]
+                   (log/debug "Annotating pattern with VALUES IN pushdown:"
+                              {:var var :column column :values-count (count values)
+                               :datatype (:datatype obj-map)})
+                   (update patterns binding-idx
+                           #(annotate-pattern-with-filters % pushdown-filter)))
+                 (do
                    ;; Coercion failed for at least one value - skip pushdown
-                   (do
-                     (log/debug "Skipping VALUES annotation - coercion failed:"
-                                {:var var :column column :datatype datatype})
-                     patterns)
-                   ;; All coercions succeeded - annotate the pattern
-                   (let [pushdown-filter [{:op :in :column column :value coerced-values}]]
-                     (log/debug "Annotating pattern with VALUES IN pushdown:"
-                                {:var var :column column :values-count (count values)
-                                 :datatype datatype})
-                     (update patterns binding-idx
-                             #(annotate-pattern-with-filters % pushdown-filter)))))
+                   (log/debug "Skipping VALUES annotation - coercion failed:"
+                              {:var var :column column :datatype (:datatype obj-map)})
+                   patterns))
                (do
                  (log/debug "Skipping VALUES annotation - no column mapping:"
                             {:var var :pred-iri pred-iri

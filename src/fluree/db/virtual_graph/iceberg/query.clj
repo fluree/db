@@ -274,11 +274,10 @@
                 object-map (get-in mapping [:predicates pred-iri])
                 column (when (and (map? object-map) (= :column (:type object-map)))
                          (:value object-map))
-                datatype (:datatype object-map)
-                ;; Coerce the value based on R2RML datatype
-                coerced-val (pushdown/coerce-value literal-val datatype nil)]
-          :when (and column coerced-val)]
-      {:column column :op :eq :value coerced-val})))
+                ;; NOTE: coercion is applied centrally at execution time.
+                ]
+          :when (and column (some? literal-val))]
+      {:column column :op :eq :value literal-val})))
 
 (defn extract-subject-variable
   "Extract the subject variable from a pattern item."
@@ -304,10 +303,10 @@
         :let [object-map (get-in mapping [:predicates pred-iri])
               column (when (and (map? object-map) (= :column (:type object-map)))
                        (:value object-map))
-              datatype (:datatype object-map)
-              coerced-val (pushdown/coerce-value literal-val datatype nil)]
-        :when (and column coerced-val)]
-    {:column column :op :eq :value coerced-val}))
+              ;; NOTE: coercion is applied centrally at execution time.
+              ]
+        :when (and column (some? literal-val))]
+    {:column column :op :eq :value literal-val}))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Result Transformation
@@ -801,6 +800,15 @@
    (execute-iceberg-query source mapping patterns base-solution time-travel limit solution-pushdown join-columns nil))
   ([source mapping patterns base-solution time-travel limit solution-pushdown join-columns all-mappings]
    (let [table-name (:table mapping)
+         ;; Single coercion pass: rr:datatype first (if present), else schema type.
+         ;; This keeps coercion consistent across literals/FILTER/VALUES/solution bindings.
+         schema (tabular/get-schema source table-name
+                                    (cond-> {}
+                                      (:snapshot-id time-travel)
+                                      (assoc :snapshot-id (:snapshot-id time-travel))
+                                      (:as-of-time time-travel)
+                                      (assoc :as-of-time (:as-of-time time-travel))))
+         coercion-ctx (pushdown/build-coercion-ctx mapping schema)
          pred->var (extract-predicate-bindings patterns)
          pred->literal (extract-literal-filters patterns)
          subject-var (some extract-subject-variable patterns)
@@ -847,6 +855,8 @@
                             (into solution-bound-predicates)
                             (into all-solution-pushdown)
                             pushdown/coalesce-predicates)
+         ;; Coerce once, drop predicates that fail coercion (=> not pushdownable).
+         all-predicates (pushdown/coerce-predicates coercion-ctx all-predicates)
 
          _ (log/debug "Iceberg query:" {:table table-name
                                         :columns columns

@@ -162,9 +162,10 @@
              (if (zero? to-read)
                -1
                ;; Read may span multiple blocks
+               ;; Use explicit int types to avoid primitive boxing issues
                (let [bytes-read
-                     (loop [bytes-read 0
-                            buf-offset off]
+                     (loop [bytes-read (int 0)
+                            buf-offset (int off)]
                        (if (>= bytes-read to-read)
                          bytes-read
                          (let [current      (+ current-pos bytes-read)
@@ -175,10 +176,10 @@
                              bytes-read
                              (let [block-len       (alength ^bytes block)
                                    block-remaining (- block-len block-offset)
-                                   copy-len        (min block-remaining (- to-read bytes-read))]
-                               (System/arraycopy block block-offset buf buf-offset copy-len)
-                               (recur (+ bytes-read copy-len)
-                                      (+ buf-offset copy-len)))))))]
+                                   copy-len        (int (min block-remaining (- to-read bytes-read)))]
+                               (System/arraycopy block (int block-offset) buf buf-offset copy-len)
+                               (recur (int (+ bytes-read copy-len))
+                                      (int (+ buf-offset copy-len))))))))]
                  ;; Update position after successful read
                  (if (pos? bytes-read)
                    (do (swap! pos + bytes-read)
