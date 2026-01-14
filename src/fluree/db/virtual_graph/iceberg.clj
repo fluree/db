@@ -32,6 +32,7 @@
             [fluree.db.virtual-graph.iceberg.exec :as exec]
             [fluree.db.virtual-graph.iceberg.expr :as expr]
             [fluree.db.virtual-graph.iceberg.factory :as factory]
+            [fluree.db.virtual-graph.iceberg.ledger-info :as vg-ledger-info]
             [fluree.db.virtual-graph.iceberg.modifiers :as modifiers]
             [fluree.db.virtual-graph.iceberg.pushdown :as pushdown]
             [fluree.db.virtual-graph.iceberg.query :as query]
@@ -804,3 +805,12 @@
   [{:keys [alias config iceberg-config cache-instance]}]
   (map->IcebergDatabase
    (factory/build-database-map alias config iceberg-config cache-instance)))
+
+;;; ---------------------------------------------------------------------------
+;;; ledger-info support (Iceberg virtual graph introspection)
+;;; ---------------------------------------------------------------------------
+
+(defn ledger-info
+  "Delegates to `fluree.db.virtual-graph.iceberg.ledger-info/ledger-info`."
+  ([iceberg-db] (vg-ledger-info/ledger-info iceberg-db))
+  ([iceberg-db opts] (vg-ledger-info/ledger-info iceberg-db opts)))

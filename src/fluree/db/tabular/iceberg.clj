@@ -185,13 +185,16 @@
           ^Table table (load-table-from-metadata file-io meta-loc table-name)]
       (core/extract-schema table {:snapshot-id snapshot-id :as-of-time as-of-time})))
 
-  (get-statistics [_ table-name {:keys [snapshot-id metadata-location]}]
+  (get-statistics [_ table-name {:keys [snapshot-id as-of-time columns include-column-stats? metadata-location]}]
     (let [meta-loc (or metadata-location (get @metadata-cache table-name))
           _ (when-not meta-loc
               (throw (ex-info (str "Cannot resolve metadata for table: " table-name)
                               {:table table-name})))
           ^Table table (load-table-from-metadata file-io meta-loc table-name)]
-      (core/extract-statistics table {:snapshot-id snapshot-id})))
+      (core/extract-statistics table {:snapshot-id snapshot-id
+                                      :as-of-time as-of-time
+                                      :columns columns
+                                      :include-column-stats? include-column-stats?})))
 
   (supported-predicates [_]
     core/supported-predicate-ops)

@@ -33,6 +33,7 @@
 (def ^:const r2rml-object-map (str r2rml-ns "objectMap"))
 (def ^:const r2rml-column (str r2rml-ns "column"))
 (def ^:const r2rml-datatype (str r2rml-ns "datatype"))
+(def ^:const r2rml-language (str r2rml-ns "language"))
 
 ;; RefObjectMap vocabulary (for multi-table joins)
 (def ^:const r2rml-parent-triples-map (str r2rml-ns "parentTriplesMap"))
@@ -159,6 +160,10 @@
                                                                                    (when (= r2rml-datatype (get-iri p))
                                                                                      (get-iri o)))
                                                                                  om-triples)
+                                                                  language (some (fn [[_s p o]]
+                                                                                   (when (= r2rml-language (get-iri p))
+                                                                                     (::where/val o)))
+                                                                                 om-triples)
                                                                   ;; Check for RefObjectMap (parentTriplesMap)
                                                                   parent-tm (some (fn [[_s p o]]
                                                                                     (when (= r2rml-parent-triples-map (get-iri p))
@@ -167,7 +172,7 @@
                                                               (cond
                                                                 ;; Column mapping (TermMap)
                                                                 column
-                                                                {:type :column :value column :datatype datatype}
+                                                                {:type :column :value column :datatype datatype :language language}
 
                                                                 ;; RefObjectMap with join conditions
                                                                 parent-tm

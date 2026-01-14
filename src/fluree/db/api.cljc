@@ -1,5 +1,6 @@
 (ns fluree.db.api
-  (:require #?(:clj [fluree.db.virtual-graph.create :as vg-create])
+  (:require #?(:clj [fluree.db.nameservice :as nameservice])
+            #?(:clj [fluree.db.virtual-graph.create :as vg-create])
             #?(:clj [fluree.db.virtual-graph.drop :as vg-drop])
             [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.core.async :as async :refer [go <!]]
@@ -48,6 +49,14 @@
             (if (util/exception? res)
               (reject res)
               (resolve res))))))))
+
+#?(:clj
+   (defn- iceberg-virtual-graph-record?
+     "Returns true if a nameservice record represents an Iceberg virtual graph."
+     [ns-record]
+     (when ns-record
+       (let [types (set (get ns-record "@type" []))]
+         (contains? types "fidx:Iceberg")))))
 
 (defn- validate-connection
   "Throws exception if x is not a valid connection"
@@ -596,11 +605,38 @@
    (validate-connection conn)
    (promise-wrap
     (go-try
-      (let [ledger     (<? (connection/load-ledger conn ledger-id))
-            info       (<? (ledger/ledger-info ledger))
-            compact-fn (when context
-                         (json-ld/compact-fn (json-ld/parse-context context)))]
-        (decode/ledger-info info compact-fn))))))
+      (let [compact-fn (when context
+                         (json-ld/compact-fn (json-ld/parse-context context)))
+            ;; Helper to load regular (non-VG) ledger info
+            load-regular-info
+            (fn []
+              (go-try
+                (let [ledger* (<? (connection/load-ledger conn ledger-id))
+                      info    (<? (ledger/ledger-info ledger*))]
+                  (decode/ledger-info info compact-fn))))]
+        #?(:clj
+           ;; Iceberg VGs have no FlakeDB commit/index metadata, but we can provide
+           ;; ledger-info-like schema + stats from R2RML + Iceberg metadata.
+           (if (and (string? ledger-id)
+                    (not (connection/fluree-address? ledger-id)))
+             (let [parsed      (util.ledger/parse-ledger-alias ledger-id)
+                   base-alias  (cond-> (:ledger parsed)
+                                 (:branch parsed) (str ":" (:branch parsed)))
+                   norm-alias  (util.ledger/ensure-ledger-branch base-alias)
+                   publisher   (connection/primary-publisher conn)
+                   ns-record   (when publisher
+                                 (<? (nameservice/lookup publisher norm-alias)))]
+               (if (iceberg-virtual-graph-record? ns-record)
+                 (let [vg            (<? (query-api/load-alias conn nil ledger-id {}))
+                       vg-info-fn    (requiring-resolve 'fluree.db.virtual-graph.iceberg.ledger-info/ledger-info)
+                       info          (cond-> (vg-info-fn vg)
+                                       ns-record (assoc :nameservice ns-record))]
+                   (cond-> info
+                     compact-fn (clojure.core/update :stats decode/compact-iri-stats compact-fn)))
+                 (<? (load-regular-info))))
+             (<? (load-regular-info)))
+           :cljs
+           (<? (load-regular-info))))))))
 
 ;; db operations
 

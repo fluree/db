@@ -89,8 +89,10 @@
      {}
      class-stats)))
 
-(defn- compact-stats
-  "Compacts all IRIs in stats maps using compact-fn."
+(defn compact-iri-stats
+  "Compacts all IRI keys/values in a stats map using compact-fn.
+   Works for both regular ledger stats (after SID decoding) and
+   Iceberg VG stats (which are already IRI-keyed)."
   [stats compact-fn]
   (let [compact-props (fn [props]
                         (reduce-kv
@@ -148,7 +150,7 @@
                    (assoc :classes classes-with-hierarchy))
          ;; Compact if compact-fn provided
          final-stats (if compact-fn
-                       (compact-stats stats compact-fn)
+                       (compact-iri-stats stats compact-fn)
                        stats)]
      (-> info
          (assoc :stats final-stats)

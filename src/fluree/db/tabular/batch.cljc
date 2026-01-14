@@ -82,10 +82,9 @@
   (mapcat to-row-seq batches))
 
 ;;; ---------------------------------------------------------------------------
-;;; Arrow Batch Placeholder (Phase 2)
+;;; Arrow Batch Placeholder
 ;;; ---------------------------------------------------------------------------
 
-;; Phase 2 will add:
 ;; (defrecord ArrowBatch [^VectorSchemaRoot root]
 ;;   IBatch
 ;;   ...)

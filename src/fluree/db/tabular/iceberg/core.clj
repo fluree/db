@@ -898,6 +898,7 @@
 
    Options:
      :snapshot-id - specific snapshot ID (nil = current)
+     :as-of-time  - java.time.Instant for time travel (nil = current)
      :columns     - seq of column names to include (nil = all)
      :include-column-stats? - include per-column min/max/null-count (default false)
 
@@ -908,9 +909,19 @@
       :snapshot-id long
       :timestamp-ms long
       :column-stats {col-name {:min :max :null-count :value-count}}}  ; when include-column-stats? true"
-  [^Table table {:keys [snapshot-id columns include-column-stats?]}]
-  (let [snapshot (if snapshot-id
-                   (.snapshot table ^long snapshot-id)
+  [^Table table {:keys [snapshot-id as-of-time columns include-column-stats?]}]
+  (let [snapshot-id* (cond
+                       snapshot-id
+                       snapshot-id
+
+                       as-of-time
+                       (let [sid (SnapshotUtil/snapshotIdAsOfTime table (.toEpochMilli ^Instant as-of-time))]
+                         (when (pos? sid) sid))
+
+                       :else
+                       nil)
+        snapshot (if snapshot-id*
+                   (.snapshot table ^long snapshot-id*)
                    (.currentSnapshot table))]
     (when snapshot
       (let [summary (.summary snapshot)
