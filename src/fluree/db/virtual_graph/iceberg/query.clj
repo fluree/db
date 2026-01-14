@@ -9,7 +9,8 @@
    The query executor combines predicate pushdown from multiple sources
    (triple patterns, FILTER clauses, VALUES clauses) and executes
    optimized scans against the underlying Iceberg tables."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
@@ -585,12 +586,14 @@
 
     ;; Handle string and list forms
     :else
-    (let [;; Parse string expressions into list form
-          parsed (cond
+    (let [parsed (cond
                    (string? expr)
                    (try
-                     (read-string expr)
-                     (catch Exception _ nil))
+                     (edn/read-string expr)
+                     (catch Exception e
+                       (log/warn "Failed to parse aggregate expression string:"
+                                 {:expr expr :error (ex-message e)})
+                       nil))
 
                    (list? expr)
                    expr

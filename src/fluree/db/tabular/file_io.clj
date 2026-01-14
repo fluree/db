@@ -216,22 +216,26 @@
     (exists [_]
       (try
         (let [result (async/<!! (storage/read-bytes store storage-path))]
-          (some? result))
+          (if (instance? Throwable result)
+            false
+            (some? result)))
         (catch Exception _
           false)))
 
     (getLength [_]
       (let [data (async/<!! (storage/read-bytes store storage-path))]
-        (if data
-          (alength ^bytes data)
-          (throw (java.io.FileNotFoundException. path)))))
+        (cond
+          (instance? Throwable data) (throw data)
+          (some? data)               (alength ^bytes data)
+          :else                      (throw (java.io.FileNotFoundException. path)))))
 
     (newStream [_]
       (log/debug "FlureeFileIO: Reading (fallback)" path "as storage path:" storage-path)
       (let [data (async/<!! (storage/read-bytes store storage-path))]
-        (if data
-          (create-seekable-input-stream data)
-          (throw (java.io.FileNotFoundException. path)))))))
+        (cond
+          (instance? Throwable data) (throw data)
+          (some? data)               (create-seekable-input-stream data)
+          :else                      (throw (java.io.FileNotFoundException. path)))))))
 
 (defn- create-input-file
   "Creates an Iceberg InputFile backed by Fluree storage.

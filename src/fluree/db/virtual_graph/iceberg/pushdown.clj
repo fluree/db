@@ -30,6 +30,13 @@
 
 (def ^:const xsd-ns "http://www.w3.org/2001/XMLSchema#")
 
+(defn- coercion-failed?
+  "Check if a value represents a failed coercion attempt.
+   The sentinel ::coercion-failed indicates coercion was required but failed,
+   signaling that the predicate should not be pushed down."
+  [v]
+  (= v ::coercion-failed))
+
 (def ^:private xsd-type->coercer
   "Map of XSD datatype IRIs to coercion functions.
    Each coercer takes a value and returns the coerced type or nil on failure."
@@ -41,10 +48,11 @@
    (str xsd-ns "decimal")      #(when % (parse-double (str %)))
    (str xsd-ns "double")       #(when % (parse-double (str %)))
    (str xsd-ns "float")        #(when % (parse-double (str %)))
+   ;; Boolean coercer is strict: only accepts actual booleans or valid boolean strings
    (str xsd-ns "boolean")      #(cond
                                   (boolean? %) %
-                                  (string? %) (parse-boolean %)
-                                  :else (boolean %))
+                                  (string? %) (parse-boolean %)  ; returns nil for invalid
+                                  :else nil)  ; non-string, non-boolean -> fail
    (str xsd-ns "dateTime")     #(when %
                                   (try
                                     (if (instance? Instant %)
@@ -64,10 +72,11 @@
    :int     #(when % (if (number? %) (int %) (parse-long (str %))))
    :double  #(when % (if (number? %) (double %) (parse-double (str %))))
    :float   #(when % (if (number? %) (float %) (parse-double (str %))))
+   ;; Boolean coercer is strict: only accepts actual booleans or valid boolean strings
    :boolean #(cond
                (boolean? %) %
-               (string? %) (parse-boolean %)
-               :else (boolean %))
+               (string? %) (parse-boolean %)  ; returns nil for invalid
+               :else nil)  ; non-string, non-boolean -> fail
    :timestamp #(when %
                  (try
                    (if (instance? Instant %)
@@ -88,31 +97,49 @@
      datatype - XSD datatype IRI from R2RML mapping (optional)
      col-type - Iceberg column type keyword from schema (optional)
 
-   Returns the coerced value, or original value if no coercion needed/possible."
+   Returns the coerced value, or ::coercion-failed if coercion was required but failed.
+   When a datatype is specified (via R2RML rr:datatype), coercion failure returns
+   ::coercion-failed to signal the predicate should not be pushed down.
+   This prevents silent type mismatches from masking bad metadata or data bugs."
   [value datatype col-type]
   (cond
     ;; nil stays nil
     (nil? value) nil
 
     ;; Try XSD datatype coercion first (R2RML specified)
+    ;; When datatype is explicit, coercion failure is an error - return sentinel
     (and datatype (contains? xsd-type->coercer datatype))
     (let [coercer (get xsd-type->coercer datatype)
           coerced (try (coercer value) (catch Exception _ nil))]
-      (if (some? coerced) coerced value))
+      (if (some? coerced)
+        coerced
+        (do
+          (log/warn "Coercion failed for value" value "with datatype" datatype
+                    "- predicate will not be pushed down")
+          ::coercion-failed)))
 
     ;; Fall back to Iceberg schema type
+    ;; Schema-based coercion failure also returns sentinel
     (and col-type (contains? iceberg-type->coercer col-type))
     (let [coercer (get iceberg-type->coercer col-type)
           coerced (try (coercer value) (catch Exception _ nil))]
-      (if (some? coerced) coerced value))
+      (if (some? coerced)
+        coerced
+        (do
+          (log/warn "Coercion failed for value" value "with column type" col-type
+                    "- predicate will not be pushed down")
+          ::coercion-failed)))
 
-    ;; No coercion - return as-is
+    ;; No coercion needed - return as-is
     :else value))
 
 (defn coerce-predicate-value
   "Coerce a predicate's value(s) based on column mapping and schema.
 
-   Handles both single values (:eq, :gt, etc.) and collections (:in, :between)."
+   Handles both single values (:eq, :gt, etc.) and collections (:in, :between).
+
+   Returns the predicate with coerced value(s), or nil if any coercion failed.
+   A nil return signals that this predicate should not be pushed down."
   [pred object-map col-schema]
   (let [datatype (:datatype object-map)
         col-type (when col-schema
@@ -124,9 +151,15 @@
         value (:value pred)]
     (if (or (vector? value) (set? value) (sequential? value))
       ;; Collection value (IN, BETWEEN) - coerce each element
-      (assoc pred :value (mapv #(coerce-value % datatype col-type) value))
+      (let [coerced (mapv #(coerce-value % datatype col-type) value)]
+        (if (some coercion-failed? coerced)
+          nil  ; Any failure -> predicate not pushable
+          (assoc pred :value coerced)))
       ;; Single value
-      (assoc pred :value (coerce-value value datatype col-type)))))
+      (let [coerced (coerce-value value datatype col-type)]
+        (if (coercion-failed? coerced)
+          nil  ; Failure -> predicate not pushable
+          (assoc pred :value coerced))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; FILTER Pushdown Analysis
@@ -334,7 +367,8 @@
 (defn annotate-patterns-with-pushdown
   "Attach :pushdown-filters metadata to patterns that first bind pushed-down vars.
    Returns {:patterns [...] :failed [...]} where :failed contains analyses that
-   couldn't be pushed down (e.g., BIND-created variables with no column mapping).
+   couldn't be pushed down (e.g., BIND-created variables with no column mapping,
+   or coercion failures).
 
    Uses routing-indexes to find the correct mapping for each predicate,
    ensuring filters are only pushed down to the table that owns that predicate.
@@ -357,18 +391,29 @@
                           (:value obj-map))
                  datatype (:datatype obj-map)]
              (if column
-               ;; Annotate the pattern with pushdown filters, coercing values
-               (let [pushdown-filters (mapv (fn [comp]
-                                              (-> comp
-                                                  (assoc :column column)
-                                                  (update :value #(coerce-value % datatype nil))))
-                                            comparisons)]
-                 (log/debug "Annotating pattern with FILTER pushdown:"
-                            {:var var :column column :ops (mapv :op comparisons)
-                             :datatype datatype})
-                 {:patterns (update patterns binding-idx
-                                    #(annotate-pattern-with-filters % pushdown-filters))
-                  :failed failed})
+               ;; Attempt to coerce values, checking for failures
+               (let [coerced-comparisons (mapv (fn [comp]
+                                                 (let [coerced (coerce-value (:value comp) datatype nil)]
+                                                   (-> comp
+                                                       (assoc :column column)
+                                                       (assoc :value coerced))))
+                                               comparisons)
+                     any-failed? (some #(coercion-failed? (:value %)) coerced-comparisons)]
+                 (if any-failed?
+                   ;; Coercion failed - add to failed list, don't push down
+                   (do
+                     (log/debug "Skipping FILTER pushdown - coercion failed:"
+                                {:var var :column column :datatype datatype})
+                     {:patterns patterns
+                      :failed (conj failed analysis)})
+                   ;; All coercions succeeded - annotate the pattern
+                   (do
+                     (log/debug "Annotating pattern with FILTER pushdown:"
+                                {:var var :column column :ops (mapv :op comparisons)
+                                 :datatype datatype})
+                     {:patterns (update patterns binding-idx
+                                        #(annotate-pattern-with-filters % coerced-comparisons))
+                      :failed failed})))
                ;; No routed mapping or column found - add to failed list
                (do
                  (log/debug "Skipping FILTER pushdown - no column mapping:"
@@ -500,7 +545,8 @@
      column IN ('US', 'Canada', 'Mexico')
 
    Uses routing-indexes to ensure the IN predicate is only pushed to the
-   table that owns the column. Values are coerced based on column datatype."
+   table that owns the column. Values are coerced based on column datatype.
+   If any value fails coercion, the VALUES clause is not pushed down."
   [patterns values-predicates _mappings routing-indexes]
   (let [pred->mappings (:predicate->mappings routing-indexes)]
     (reduce
@@ -515,14 +561,21 @@
                           (:value obj-map))
                  datatype (:datatype obj-map)]
              (if column
-               ;; Coerce all values based on column datatype
-               (let [coerced-values (mapv #(coerce-value % datatype nil) values)
-                     pushdown-filter [{:op :in :column column :value coerced-values}]]
-                 (log/debug "Annotating pattern with VALUES IN pushdown:"
-                            {:var var :column column :values-count (count values)
-                             :datatype datatype})
-                 (update patterns binding-idx
-                         #(annotate-pattern-with-filters % pushdown-filter)))
+               ;; Coerce all values based on column datatype, checking for failures
+               (let [coerced-values (mapv #(coerce-value % datatype nil) values)]
+                 (if (some coercion-failed? coerced-values)
+                   ;; Coercion failed for at least one value - skip pushdown
+                   (do
+                     (log/debug "Skipping VALUES annotation - coercion failed:"
+                                {:var var :column column :datatype datatype})
+                     patterns)
+                   ;; All coercions succeeded - annotate the pattern
+                   (let [pushdown-filter [{:op :in :column column :value coerced-values}]]
+                     (log/debug "Annotating pattern with VALUES IN pushdown:"
+                                {:var var :column column :values-count (count values)
+                                 :datatype datatype})
+                     (update patterns binding-idx
+                             #(annotate-pattern-with-filters % pushdown-filter)))))
                (do
                  (log/debug "Skipping VALUES annotation - no column mapping:"
                             {:var var :pred-iri pred-iri
