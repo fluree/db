@@ -25,7 +25,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.util.parse :as util.parse]
             [fluree.json-ld :as json-ld])
-  (:refer-clojure :exclude [merge load range exists? update drop]))
+  (:refer-clojure :exclude [load range exists? update drop]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

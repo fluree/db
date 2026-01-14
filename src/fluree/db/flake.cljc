@@ -1,5 +1,5 @@
 (ns fluree.db.flake
-  (:refer-clojure :exclude [partition-by remove split-at sorted-set-by sorted-map-by take last])
+  (:refer-clojure :exclude [sorted-set-by sorted-map-by last])
   (:require #?(:clj [clojure.pprint :as pprint])
             [clojure.data.avl :as avl]
             [fluree.db.constants :as const]
