@@ -303,6 +303,11 @@
                  :else                              []))
        (remove nil?)))
 
+(defn primary-publisher
+  "Returns the primary nameservice publisher for the connection"
+  [{:keys [primary-publisher] :as _conn}]
+  primary-publisher)
+
 (defn publications
   [conn]
   (:remote-systems conn))
@@ -670,6 +675,7 @@
         (catch* e (log/debug e "Failed to drop artifacts for publisher during drop" {:alias alias*}))))))
 
 (defn drop-ledger
+  "Drops a ledger and all its associated data from all publishers"
   [conn alias]
   (go
     (try*

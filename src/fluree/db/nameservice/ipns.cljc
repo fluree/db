@@ -74,6 +74,11 @@
     ;; Index updates would require reading current record, merging, and republishing
     (log/warn "publish-index not fully supported for IPNS nameservice")
     (go-try nil))
+  (publish-vg [_ vg-config]
+    ;; TODO: Implement VG support for IPNS nameservice
+    (go-try
+      (throw (ex-info "Virtual graph publishing not yet supported for IPNS nameservice"
+                      {:status 501 :error :db/not-implemented :vg-config vg-config}))))
   (retract [_ _ledger-alias]
     (ipfs/write ipfs-endpoint "null"))
   (publishing-address [_ ledger-alias]

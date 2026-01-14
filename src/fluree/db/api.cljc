@@ -1,5 +1,7 @@
 (ns fluree.db.api
-  (:require [camel-snake-kebab.core :refer [->camelCaseString]]
+  (:require #?(:clj [fluree.db.virtual-graph.create :as vg-create])
+            #?(:clj [fluree.db.virtual-graph.drop :as vg-drop])
+            [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.core.async :as async :refer [go <!]]
             [clojure.walk :refer [postwalk]]
             [fluree.db.api.decode :as decode]
@@ -1083,3 +1085,65 @@
     (go-try
       (let [ledger (<? (connection/load-ledger-alias conn ledger-alias))]
         (<? (ledger/reindex! ledger opts)))))))
+
+;; Full-Text Search APIs (JVM only)
+
+#?(:clj
+   (defn create-full-text-index
+     "Creates a BM25 full-text search index over ledger data.
+
+     The index is built by executing the provided query against the specified
+     ledger(s) and indexing the selected text fields. The index automatically
+     stays in sync as the underlying ledger data changes.
+
+     Once created, use the `search` function in queries to perform full-text
+     searches against this index.
+
+     Parameters:
+       conn - Connection object
+       name - Name for the search index. Used to reference this index in queries.
+       config - Configuration map:
+         :ledger - Ledger alias to index (required). Currently only single-ledger
+                   indexes are supported.
+         :query - FQL query defining what data to index (required). The query's
+                  select clause determines which fields are indexed for search.
+         :stemmer - Optional stemmer for word normalization, e.g. \"snowballStemmer-en\"
+         :stopwords - Optional stopwords list, e.g. \"stopwords-en\"
+
+     Returns promise resolving to the created index descriptor.
+
+     Example:
+       ;; Create a search index over article titles and content
+       @(create-full-text-index conn \"article-search\"
+         {:ledger \"my-ledger\"
+          :query {\"@context\" {\"ex\" \"http://example.org/\"}
+                  \"where\" [{\"@id\" \"?x\" \"@type\" \"ex:Article\"}]
+                  \"select\" {\"?x\" [\"@id\" \"ex:title\" \"ex:content\"]}}})
+
+       ;; Search the index
+       @(fluree/query conn {\"from\" \"my-ledger\"
+                            \"where\" [[\"search\" \"article-search\" \"?x\" \"climate change\"]]
+                            \"select\" [\"?x\"]})"
+     [conn name {:keys [ledger query stemmer stopwords]}]
+     (validate-connection conn)
+     (promise-wrap
+      (vg-create/create conn {:name name
+                              :type :bm25
+                              :config (cond-> {:ledgers [ledger]
+                                               :query query}
+                                        stemmer   (assoc :stemmer stemmer)
+                                        stopwords (assoc :stopwords stopwords))}))))
+
+#?(:clj
+   (defn drop-full-text-index
+     "Drops a full-text search index and all its associated data.
+
+     Parameters:
+       conn - Connection object
+       name - Name of the search index to drop
+
+     Returns promise resolving to :dropped when complete."
+     [conn name]
+     (validate-connection conn)
+     (promise-wrap
+      (vg-drop/drop-virtual-graph conn name))))

@@ -1,5 +1,5 @@
 (ns fluree.db.nameservice.storage
-  (:require [clojure.core.async :refer [go]]
+  (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.iri :as iri]
@@ -10,7 +10,22 @@
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]))
 
-(defn local-filename
+(defn new-vg-record
+  "Generates nameservice metadata map for a virtual graph.
+   VG names follow the same convention as ledgers - fully qualified with branch."
+  [{:keys [vg-name vg-type config dependencies]}]
+  (let [[base-name branch] (util.ledger/ledger-parts vg-name)
+        branch (or branch const/default-branch-name)]
+    {"@context"           {"f" iri/f-ns
+                           "fidx" "https://ns.flur.ee/index#"}
+     "@id"                vg-name
+     "@type"              ["f:VirtualGraphDatabase" vg-type]
+     "f:name"             base-name
+     "f:branch"           branch
+     "fidx:config"        {"@value" (json/stringify config)}
+     "fidx:dependencies"  dependencies}))
+
+(defn ledger-filename
   "Returns the local filename for a ledger's nameservice record.
    Expects ledger-alias to be in format 'ledger:branch'.
    Returns path like 'ns@v2/ledger-name/branch.json'."
@@ -29,6 +44,11 @@
   (let [[ledger-name branch] (util.ledger/ledger-parts ledger-alias)
         branch (or branch const/default-branch-name)]
     (str const/ns-version "/" ledger-name "/" branch ".index.json")))
+
+(defn local-filename
+  "Returns the local filename for a ledger's nameservice record."
+  [ledger-alias]
+  (ledger-filename ledger-alias))
 
 (defn new-ns-record
   "Generates nameservice metadata map for JSON storage using new minimal format.
@@ -120,16 +140,52 @@
     (new-ns-record ledger-alias commit-address commit-t
                    index-address index-t)))
 
-(defrecord StorageNameService [store]
+;; Subscription management functions
+(defn record-subscription
+  "Add a subscription channel for a ledger alias to the state."
+  [current-state ledger-alias sub-ch]
+  (if-not (contains? (:subscriptions current-state) ledger-alias)
+    (assoc-in current-state [:subscriptions ledger-alias] #{sub-ch})
+    (update-in current-state [:subscriptions ledger-alias] conj sub-ch)))
+
+(defn record-unsubscription
+  "Remove a subscription channel for a ledger alias from the state."
+  [current-state ledger-alias sub-ch]
+  (let [updated-subs (disj (get-in current-state [:subscriptions ledger-alias] #{}) sub-ch)]
+    (if (empty? updated-subs)
+      (update current-state :subscriptions dissoc ledger-alias)
+      (assoc-in current-state [:subscriptions ledger-alias] updated-subs))))
+
+(defn notify-subscribers
+  "Notify all subscribers for a ledger alias about a new commit."
+  [sub-state ledger-alias commit-address]
+  (when-let [subscribers (get-in @sub-state [:subscriptions ledger-alias])]
+    (let [message {"action" "new-commit"
+                   "ledger" ledger-alias
+                   "data" {"address" commit-address}}]
+      (log/debug "Notifying" (count subscribers) "subscribers for ledger:" ledger-alias)
+      (doseq [sub-ch subscribers]
+        ;; Use put! with callback - don't block the caller
+        (async/put! sub-ch message
+                    (fn [success]
+                      (when-not success
+                        (log/warn "Failed to notify subscriber for ledger:" ledger-alias))))))))
+
+(defrecord StorageNameService [store sub-state]
   nameservice/Publisher
   (publish-commit [_ ledger-alias commit-address commit-t]
-    (let [filename (local-filename ledger-alias)]
-      (log/debug "nameservice.storage/publish-commit start" {:ledger ledger-alias :filename filename})
-      (storage/swap-json store filename
-                         (fn [ns-record]
-                           (if (some? ns-record)
-                             (update-commit-address ns-record commit-address commit-t)
-                             (new-ns-record ledger-alias commit-address commit-t nil nil))))))
+    (go-try
+      (let [filename (local-filename ledger-alias)]
+        (log/debug "nameservice.storage/publish-commit start" {:ledger ledger-alias :filename filename})
+        (let [result (<? (storage/swap-json store filename
+                                            (fn [ns-record]
+                                              (if (some? ns-record)
+                                                (update-commit-address ns-record commit-address commit-t)
+                                                (new-ns-record ledger-alias commit-address commit-t nil nil)))))]
+          ;; Notify subscribers about the new commit
+          (when commit-address
+            (notify-subscribers sub-state ledger-alias commit-address))
+          result))))
 
   (publish-index [_ ledger-alias index-address index-t]
     (let [filename (index-filename ledger-alias)]
@@ -138,13 +194,23 @@
                          (fn [index-record]
                            (update-index-record index-record ledger-alias index-address index-t)))))
 
-  (retract [_ ledger-alias]
+  (publish-vg [_ vg-config]
+    ;; VGs use the same storage pattern as ledgers (name:branch -> name/branch.json)
+    (let [{:keys [vg-name]} vg-config
+          filename (local-filename vg-name)]
+      (log/debug "nameservice.storage/publish-vg start" {:vg-name vg-name :filename filename})
+      (storage/swap-json store filename
+                         (fn [_existing]
+                           (new-vg-record vg-config)))))
+
+  (retract [_ target]
+    ;; Both ledgers and VGs use the same storage pattern
     (go-try
-      (let [main-filename  (local-filename ledger-alias)
-            index-filename* (index-filename ledger-alias)
-            main-address   (-> store storage/location (storage/build-address main-filename))
-            index-address  (-> store storage/location (storage/build-address index-filename*))]
-        ;; Delete both files - index file may not exist, which is fine
+      (let [main-filename   (local-filename target)
+            index-filename* (index-filename target)
+            main-address    (-> store storage/location (storage/build-address main-filename))
+            index-address   (-> store storage/location (storage/build-address index-filename*))]
+        ;; Delete main file and index file (index may not exist for VGs, which is fine)
         (<? (storage/delete store main-address))
         (<? (storage/delete store index-address)))))
 
@@ -153,25 +219,26 @@
     (go ledger-alias))
 
   nameservice/iNameService
-  (lookup [_ ledger-address]
+  (lookup [_ target]
+    ;; Both ledgers and VGs use the same storage pattern (name:branch -> name/branch.json)
+    ;; The @type field in the record distinguishes ledgers from virtual graphs
     (go-try
-      ;; ledger-address is just the alias (potentially with :branch)
-      ;; Read both main file and index file in parallel, then merge
-      (let [main-filename  (local-filename ledger-address)
-            index-filename* (index-filename ledger-address)
-            _              (log/debug "StorageNameService lookup:" {:ledger-address ledger-address
-                                                                    :main-filename  main-filename
-                                                                    :index-filename index-filename*})
+      (let [main-filename   (local-filename target)
+            index-filename* (index-filename target)
+            _               (log/debug "StorageNameService lookup:" {:target target
+                                                                     :main-filename main-filename
+                                                                     :index-filename index-filename*})
             ;; Start both reads in parallel
-            main-ch        (storage/read-bytes store main-filename)
-            index-ch       (storage/read-bytes store index-filename*)
+            main-ch         (storage/read-bytes store main-filename)
+            index-ch        (storage/read-bytes store index-filename*)
             ;; Await both results
-            main-bytes     (<? main-ch)
-            index-bytes    (<? index-ch)]
+            main-bytes      (<? main-ch)
+            index-bytes     (<? index-ch)]
         (when main-bytes
           (let [main-record  (json/parse main-bytes false)
                 index-record (when index-bytes (json/parse index-bytes false))]
             ;; Merge index file data into main record (index file takes precedence if newer)
+            ;; VGs won't have index files, but merge-index-into-record handles nil gracefully
             (merge-index-into-record main-record index-record))))))
 
   (alias [_ ledger-address]
@@ -217,8 +284,38 @@
         ;; Fallback for stores that don't support ListableStore
         (do
           (log/warn "Storage backend does not support RecursiveListableStore protocol")
-          [])))))
+          []))))
+
+  nameservice/Publication
+  (subscribe [_ ledger-alias]
+    (let [sub-ch (async/chan)]
+      (swap! sub-state record-subscription ledger-alias sub-ch)
+      (log/debug "Created subscription channel for ledger:" ledger-alias)
+      sub-ch))
+
+  (unsubscribe [_ ledger-alias]
+    (if-let [subscribers (get-in @sub-state [:subscriptions ledger-alias])]
+      (do
+        (log/debug "Unsubscribing from updates to ledger:" ledger-alias)
+        ;; Close all subscription channels for this ledger
+        (doseq [sub-ch subscribers]
+          (async/close! sub-ch))
+        (swap! sub-state update :subscriptions dissoc ledger-alias)
+        :unsubscribed)
+      (do
+        (log/debug "Ledger" ledger-alias "not subscribed")
+        :not-subscribed)))
+
+  (known-addresses [this ledger-alias]
+    (go-try
+      ;; Return the current commit address for this ledger
+      (when-let [record (<? (nameservice/lookup this ledger-alias))]
+        [(get-in record ["f:commit" "@id"])]))))
 
 (defn start
   [store]
-  (->StorageNameService store))
+  (when-not (satisfies? storage/RecursiveListableStore store)
+    (throw (ex-info "Storage backend must support RecursiveListableStore protocol for nameservice"
+                    {:protocol storage/RecursiveListableStore
+                     :store (type store)})))
+  (->StorageNameService store (atom {})))

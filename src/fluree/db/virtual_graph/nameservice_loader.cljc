@@ -1,0 +1,87 @@
+(ns fluree.db.virtual-graph.nameservice-loader
+  (:require ;; Register VG type loaders
+   #?(:clj [fluree.db.virtual-graph.bm25.index :as bm25])
+   [fluree.db.nameservice :as nameservice]
+   [fluree.db.util.async :refer [<? go-try]]
+   [fluree.db.util.json :as json]
+   [fluree.db.util.log :as log]
+   [fluree.db.virtual-graph :as vg]
+   [fluree.db.virtual-graph.parse :as vg-parse]))
+
+#?(:clj (set! *warn-on-reflection* true))
+
+(defn load-vg-config-from-nameservice
+  "Loads a virtual graph configuration from the nameservice"
+  [nameservice-publisher vg-name]
+  (go-try
+    (let [vg-record (<? (nameservice/lookup nameservice-publisher vg-name))]
+      (when-not vg-record
+        (throw (ex-info (str "Virtual graph not found in nameservice: " vg-name)
+                        {:status 404
+                         :error :db/virtual-graph-not-found})))
+      vg-record)))
+
+(defn vg-record->config
+  "Converts a nameservice VG record to the internal configuration format"
+  [vg-record]
+  (let [vg-name (get vg-record "@id")
+        vg-type (get vg-record "@type")
+        raw-config (get-in vg-record ["fidx:config" "@value"])
+        ;; Config is stored as JSON string, need to parse it
+        config (if (string? raw-config)
+                 (json/parse raw-config false)
+                 raw-config)]
+    {:id vg-name
+     :alias vg-name
+     :type vg-type
+     :vg-name vg-name
+     :config config}))
+
+(defmulti create-vg-impl
+  "Creates a virtual graph instance based on type.
+  Implementations should be registered by the respective VG type namespaces."
+  (fn [_db _vg-opts vg-config]
+    (let [types (:type vg-config)]
+      (cond
+        (some #{"fidx:BM25"} types) :bm25
+        :else :unknown))))
+
+(defmethod create-vg-impl :unknown
+  [_db _vg-opts vg-config]
+  (throw (ex-info "Unknown virtual graph type"
+                  {:status 400
+                   :error :db/invalid-query
+                   :type (:type vg-config)})))
+
+(defn create-vg-instance
+  "Creates a virtual graph instance from configuration"
+  [db vg-config]
+  (log/debug "Creating VG instance for config:" vg-config)
+  (let [{:keys [type config alias vg-name]} vg-config
+        vg-opts (-> config
+                    (assoc :alias alias
+                           :vg-name vg-name
+                           :id (:id vg-config)
+                           :type type
+                           :genesis-t (:t db))
+                    (update "query" vg-parse/select-one->select))]
+    (log/debug "VG opts prepared:" vg-opts "Dispatching to type:" type)
+    (create-vg-impl db vg-opts vg-config)))
+
+(defn load-virtual-graph-from-nameservice
+  "Loads a virtual graph from the nameservice and creates/returns the VG instance.
+  This is called when a query references a virtual graph that isn't already loaded."
+  [db nameservice vg-name]
+  (go-try
+    (log/debug "Loading virtual graph from nameservice:" vg-name)
+    (let [vg-record (<? (load-vg-config-from-nameservice nameservice vg-name))
+          vg-config (vg-record->config vg-record)
+          vg-instance (create-vg-instance db vg-config)
+          initialized-vg (<? (vg/initialize vg-instance db))]
+      (log/debug "VG initialized successfully")
+      initialized-vg)))
+
+#?(:clj
+   (defmethod create-vg-impl :bm25
+     [db vg-opts _vg-config]
+     (bm25/new-bm25-index db [] vg-opts)))

@@ -4,9 +4,8 @@
             [fluree.db.serde :as serde]
             [fluree.db.storage :as storage]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.ledger :as util.ledger]
+            [fluree.db.util.log :as log]
             [fluree.db.virtual-graph :as vg]
-            [fluree.db.virtual-graph.bm25.index :as bm25]
             [fluree.db.virtual-graph.bm25.stemmer :as stemmer]
             [fluree.db.virtual-graph.bm25.stopwords :as stopwords]
             [fluree.db.virtual-graph.parse :as parse]))
@@ -90,9 +89,14 @@
   [vg]
   (-> vg
       (select-keys [:k1 :b :index-state :initialized :genesis-t :t :alias :db-alias
-                    :query :namespace-codes :property-deps :type :lang :id :vg-name])
+                    :query :namespace-codes :namespaces :property-deps :type :lang :id :vg-name])
       (update :index-state state-data)
-      (update :type (partial mapv iri/serialize-sid))
+      ;; Type can be either SIDs or strings, handle both
+      (update :type (fn [type-val]
+                      (if (and (vector? type-val)
+                               (string? (first type-val)))
+                        type-val  ; Already strings, keep as-is
+                        (mapv iri/serialize-sid type-val))))
       (update :property-deps (partial map iri/serialize-sid))))
 
 (defn get-property-sids
@@ -103,9 +107,10 @@
         props))
 
 (defn reify-bm25
-  [{:keys [lang query namespace-codes] :as vg-data}]
+  [{:keys [lang query namespace-codes namespaces] :as vg-data}]
   (let [parsed-query (parse/parse-query query)
-        namespaces   (map-invert namespace-codes)
+        ;; Use provided namespaces if available, otherwise invert namespace-codes
+        namespaces   (or namespaces (map-invert namespace-codes))
         query-props  (parse/get-query-props parsed-query)
         property-deps (get-property-sids namespaces query-props)]
     (-> vg-data
@@ -120,23 +125,27 @@
         (update :k1 coerce-double))))
 
 (defmethod vg/write-vg :bm25
-  [{:keys [storage serializer] :as _index-catalog} {:keys [alias db-alias] :as vg}]
+  [{:keys [storage serializer] :as _index-catalog} {:keys [vg-name] :as vg}]
   (go-try
     (let [data            (vg-data vg)
           serialized-data (serde/-serialize-bm25 serializer data)
-          ;; Extract base ledger name for content-addressed storage
-          ledger-name     (util.ledger/ledger-base-name db-alias)
-          path            (vg/storage-path :bm25 ledger-name (vg/trim-alias-ref alias))
+          path            (vg/vg-storage-path :bm25 vg-name)
           write-res       (<? (storage/content-write-json storage path serialized-data))]
+      (log/debug "BM25 write-vg - write result:" write-res)
       (assoc write-res :type "bm25"))))
 
 (defmethod vg/read-vg :bm25
   [{:keys [storage serializer] :as _index-catalog} {:keys [address] :as _vg-meta}]
   (go-try
     (if-let [serialized-data (<? (storage/read-json storage address false))]
-      (-> (serde/-deserialize-bm25 serializer serialized-data)
-          reify-bm25
-          bm25/map->BM25-VirtualGraph)
+      (let [bm25-data (-> (serde/-deserialize-bm25 serializer serialized-data)
+                          reify-bm25)
+            ;; Dynamic lookup to avoid circular dependency
+            map->BM25-VirtualGraph (ns-resolve 'fluree.db.virtual-graph.bm25.index
+                                               'map->BM25-VirtualGraph)]
+        (if map->BM25-VirtualGraph
+          (map->BM25-VirtualGraph bm25-data)
+          (throw (ex-info "BM25 index namespace not loaded" {}))))
       (throw (ex-info (str "Could not load bm25 index at address: "
                            address ".")
                       {:status 400, :error :db/unavailable})))))
