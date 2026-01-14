@@ -15,7 +15,7 @@
             [fluree.db.connection.vocab :as vocab]
             [fluree.db.util :refer [get-first get-first-value]]
             [fluree.db.virtual-graph.create :as vg-create]
-            [fluree.db.virtual-graph.iceberg :as iceberg-vg]))
+            [fluree.db.virtual-graph.iceberg.factory :as iceberg-factory]))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Test Configuration
@@ -184,7 +184,7 @@
                                                 :auth {:bearer-token "secret"}
                                                 :allow-vended-credentials? true}}}
           catalog {:catalog-name "polaris"}
-          resolved (#'iceberg-vg/resolve-catalog-config catalog iceberg-config)]
+          resolved (#'iceberg-factory/resolve-catalog-config catalog iceberg-config)]
       (is (= "http://polaris:8181" (:uri resolved)))
       (is (= "secret" (:auth-token resolved)))
       (is (true? (:allow-vended-credentials? resolved)))))
@@ -192,13 +192,13 @@
   (testing "Accepts camelCase catalogName"
     (let [iceberg-config {:catalogs {"my-cat" {:name "my-cat" :uri "http://test"}}}
           catalog {"catalogName" "my-cat"}
-          resolved (#'iceberg-vg/resolve-catalog-config catalog iceberg-config)]
+          resolved (#'iceberg-factory/resolve-catalog-config catalog iceberg-config)]
       (is (= "http://test" (:uri resolved)))))
 
   (testing "Returns nil for unknown catalog-name"
     (let [iceberg-config {:catalogs {"known" {:name "known"}}}
           catalog {:catalog-name "unknown"}
-          resolved (#'iceberg-vg/resolve-catalog-config catalog iceberg-config)]
+          resolved (#'iceberg-factory/resolve-catalog-config catalog iceberg-config)]
       (is (nil? resolved))))
 
   (testing "Uses inline config when no catalog-name"
@@ -207,14 +207,14 @@
                    :uri "http://inline-uri"
                    :auth-token "inline-token"
                    :allow-vended-credentials false}
-          resolved (#'iceberg-vg/resolve-catalog-config catalog iceberg-config)]
+          resolved (#'iceberg-factory/resolve-catalog-config catalog iceberg-config)]
       (is (= "http://inline-uri" (:uri resolved)))
       (is (= "inline-token" (:auth-token resolved)))
       (is (false? (:allow-vended-credentials? resolved)))))
 
   (testing "Defaults allow-vended-credentials to true"
     (let [catalog {:uri "http://test"}
-          resolved (#'iceberg-vg/resolve-catalog-config catalog nil)]
+          resolved (#'iceberg-factory/resolve-catalog-config catalog nil)]
       (is (true? (:allow-vended-credentials? resolved))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -252,7 +252,7 @@
                                     :mem-cache-mb 128
                                     :block-size-mb 4}}
             ;; The resolved catalog config should match
-            resolved (#'iceberg-vg/resolve-catalog-config
+            resolved (#'iceberg-factory/resolve-catalog-config
                       {:catalog-name "local-rest"}
                       iceberg-config)]
         (is (= rest-uri (:uri resolved)))

@@ -161,17 +161,24 @@
                                       fluree.db.nameservice.ipns
                                       ;; Iceberg namespaces require Arrow/Iceberg deps from :iceberg alias
                                       fluree.db.tabular.file-io
+                                      fluree.db.tabular.seekable-stream
                                       fluree.db.tabular.iceberg
                                       fluree.db.tabular.iceberg.core
                                       fluree.db.tabular.iceberg.hadoop
                                       fluree.db.tabular.iceberg.rest
                                       fluree.db.virtual-graph.iceberg
+                                      fluree.db.virtual-graph.iceberg.antijoin
+                                      fluree.db.virtual-graph.iceberg.exec
+                                      fluree.db.virtual-graph.iceberg.expr
+                                      fluree.db.virtual-graph.iceberg.factory
                                       fluree.db.virtual-graph.iceberg.join
                                       fluree.db.virtual-graph.iceberg.join.hash
+                                      fluree.db.virtual-graph.iceberg.modifiers
                                       fluree.db.virtual-graph.iceberg.plan
                                       fluree.db.virtual-graph.iceberg.pushdown
                                       fluree.db.virtual-graph.iceberg.query
-                                      fluree.db.virtual-graph.iceberg.r2rml]}]}
+                                      fluree.db.virtual-graph.iceberg.r2rml
+                                      fluree.db.virtual-graph.iceberg.transitive]}]}
 
   :ancient
   {:extra-deps {com.github.liquidz/antq {:mvn/version "RELEASE"}}
