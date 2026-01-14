@@ -221,7 +221,7 @@
 
 (defn with-filter-code
   "Attach filter code to a match object for later compilation.
-  Stores the code and variable in metadata for later compilation.
+  Stores the code and variable for later compilation.
 
   Also extracts range bounds from simple comparison filters like:
     (< ?v n), (<= ?v n), (> ?v n), (>= ?v n)
@@ -268,9 +268,9 @@
       (derive :tuple :simple/binding)
       (derive :class :simple/binding)
       (derive :id :simple/binding)
-      (derive :exists :nested/single)
-      (derive :not-exists :nested/single)
-      (derive :minus :nested/single)))
+      (derive :exists :nonbinding/filter)
+      (derive :not-exists :nonbinding/filter)
+      (derive :minus :nonbinding/filter)))
 
 (defmulti pattern-bindings
   "Return the set of variables guaranteed to be bound by a single pattern."
@@ -288,9 +288,9 @@
   [pattern]
   (->> pattern where/pattern-data union-bindings))
 
-(defmethod pattern-bindings :nested/single
-  [pattern]
-  (->> pattern where/pattern-data clause-bindings))
+(defmethod pattern-bindings :nonbinding/filter
+  [_]
+  #{})
 
 (defmethod pattern-bindings :default
   [_]
@@ -340,14 +340,7 @@
              :remaining-filters remaining})))
 
       (:exists :not-exists :minus)
-      (let [inner                (where/pattern-data pattern)
-            [appendable remaining]  (->> inner
-                                         clause-bindings
-                                         (into bound-vars)
-                                         (partition-appendable filter-descriptors))
-            inner*               (append-clause-filters inner appendable)]
-        {:pattern (where/->pattern t inner*)
-         :remaining-filters remaining})
+      {:pattern pattern :remaining-filters filter-descriptors}
 
       :union
       (let [branches            (where/pattern-data pattern)
@@ -388,18 +381,7 @@
            :filters filters'}))
 
       (:exists :not-exists :minus)
-      (let [{:keys [pattern remaining-filters]}
-            (append-pattern-filters pattern filters bound)
-
-            inner*   (where/pattern-data pattern)
-            filters* remaining-filters]
-        (if (seq filters*)
-          (let [{:keys [patterns filters]}
-                (nest-filters inner* filters* bound)]
-            {:pattern (where/->pattern t patterns)
-             :filters filters})
-          {:pattern (where/->pattern t inner*)
-           :filters filters*}))
+      {:pattern pattern :filters filters}
 
       :union
       (let [branches (where/pattern-data pattern)

@@ -17,6 +17,27 @@
   [vars order]
   (where/pattern-data (mk-filter vars order)))
 
+(deftest exists-should-not-claim-bindings-escape
+  (testing "a filter depending on a var bound later must not be pushed into :exists"
+    ;; Vars introduced inside :exists do not escape to the outer solution.
+    ;; Pushing a top-level filter into :exists can change results; keep it pending.
+    (let [inner-exists    [(vector (where/unmatched-var '?x)
+                                   (where/unmatched-var '?p)
+                                   (where/unmatched-var '?age))]
+          exists-pattern  (where/->pattern :exists inner-exists)
+          outer-binds-age (vector (where/unmatched-var '?s)
+                                  (where/unmatched-var '?p2)
+                                  (where/unmatched-var '?age))
+          filter-desc     {:fn    (constantly true)
+                           :forms ['(> ?age 45)]
+                           :vars  #{'?age}}
+          {:keys [patterns filters]}
+          (opt/nest-filters [exists-pattern outer-binds-age] [filter-desc] #{})]
+      (is (= [exists-pattern outer-binds-age] patterns)
+          "nest-filters should not rewrite by pushing the filter into :exists here")
+      (is (= [filter-desc] filters)
+          "filter should remain top-level until ?age is bound in the outer clause"))))
+
 (deftest union-pushes-when-all-branches-bind
   (testing "filters push into all union branches when all vars are bound"
     (let [branch-a-binds-a-and-b [(vector (where/unmatched-var '?a)
@@ -153,35 +174,33 @@
       (is (every? clause-contains-filter? updated-branches)
           "each outer branch contains a filter somewhere within nested unions"))))
 
-(deftest exists-pushes-when-bound
-  (testing ":exists receives pushed filters when inner binds all vars"
+(deftest exists-keeps-when-vars-not-outer-bound
+  (testing ":exists must not receive filters based on inner-only bindings"
     (let [inner-clause      [(vector (where/unmatched-var '?a)
                                      (where/unmatched-var '?p)
                                      (where/unmatched-var '?b))]
           exists-pattern    (where/->pattern :exists inner-clause)
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
-          (opt/append-pattern-filters exists-pattern [filter-descriptor] #{})
-          updated-inner     (where/pattern-data pattern)]
-      (is (empty? remaining-filters)
-          "no filters remain at top level after push into exists")
-      (is (some #(= :filter (where/pattern-type %)) updated-inner)
-          "inner clause contains the pushed filter"))))
+          (opt/append-pattern-filters exists-pattern [filter-descriptor] #{})]
+      (is (= 1 (count remaining-filters))
+          "filter remains top-level because outer scope doesn't yet bind ?a/?b")
+      (is (= exists-pattern pattern)
+          ":exists pattern unchanged when push is unsafe"))))
 
-(deftest not-exists-pushes-when-bound
-  (testing ":not-exists receives pushed filters when inner binds all vars"
-    (let [inner-clause      [(vector (where/unmatched-var '?a)
-                                     (where/unmatched-var '?p)
-                                     (where/unmatched-var '?b))]
+(deftest not-exists-keeps-when-vars-not-outer-bound
+  (testing ":not-exists must not receive filters based on inner-only bindings"
+    (let [inner-clause       [(vector (where/unmatched-var '?a)
+                                      (where/unmatched-var '?p)
+                                      (where/unmatched-var '?b))]
           not-exists-pattern (where/->pattern :not-exists inner-clause)
-          filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
+          filter-descriptor  (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
-          (opt/append-pattern-filters not-exists-pattern [filter-descriptor] #{})
-          updated-inner     (where/pattern-data pattern)]
-      (is (empty? remaining-filters)
-          "no filters remain after push into not-exists")
-      (is (some #(= :filter (where/pattern-type %)) updated-inner)
-          "inner clause contains the pushed filter"))))
+          (opt/append-pattern-filters not-exists-pattern [filter-descriptor] #{})]
+      (is (= 1 (count remaining-filters))
+          "filter remains top-level because outer scope doesn't yet bind ?a/?b")
+      (is (= not-exists-pattern pattern)
+          ":not-exists pattern unchanged when push is unsafe"))))
 
 (deftest minus-keeps-when-not-all-bind
   (testing ":minus keeps filter top-level when inner does not bind all vars"
@@ -197,17 +216,16 @@
       (is (= minus-pattern pattern)
           ":minus pattern unchanged when push is unsafe"))))
 
-(deftest minus-pushes-when-bound
-  (testing ":minus receives pushed filters when inner binds all vars"
+(deftest minus-never-pushes
+  (testing ":minus never receives pushed filters regardless of inner bindings"
     (let [inner-clause      [(vector (where/unmatched-var '?a)
                                      (where/unmatched-var '?p)
                                      (where/unmatched-var '?b))]
           minus-pattern     (where/->pattern :minus inner-clause)
           filter-descriptor (build-filter-descriptor ['?a '?b] ['?a '?b])
           {:keys [pattern remaining-filters]}
-          (opt/append-pattern-filters minus-pattern [filter-descriptor] #{})
-          updated-inner     (where/pattern-data pattern)]
-      (is (empty? remaining-filters)
-          "no filters remain after push into :minus")
-      (is (some #(= :filter (where/pattern-type %)) updated-inner)
-          ":minus inner clause contains the pushed filter"))))
+          (opt/append-pattern-filters minus-pattern [filter-descriptor] #{})]
+      (is (= 1 (count remaining-filters))
+          "filter remains top-level for :minus")
+      (is (= minus-pattern pattern)
+          ":minus pattern unchanged (no push)"))))
