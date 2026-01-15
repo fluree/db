@@ -725,10 +725,11 @@
         fn-name       (when (seq? code) (first code))
         agg-vars      (variables code)
         agg-fn        (eval/compile code context)
-        streaming-agg (build-streaming-agg code)
         agg-info      {:fn-name fn-name
                        :vars    agg-vars}]
-    (select/aggregate-selector agg-fn streaming-agg agg-info)))
+    (if-let [streaming-agg (build-streaming-agg code)]
+      (select/streaming-aggregate-selector streaming-agg agg-info)
+      (select/aggregate-selector agg-fn agg-info))))
 
 (defn reverse?
   [context k]

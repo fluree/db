@@ -11,47 +11,58 @@
 
 (defprotocol StreamingAggregator
   "Protocol for streaming/incremental aggregate computation.
-  Implementations are stateless - state is managed externally."
-  (initialize [this] "Return initial accumulator state")
-  (step [this state tv] "Update state with new typed-value, return new state")
-  (finalize [this state] "Convert final state to result typed-val"))
+  Implementations encapsulate their own state."
+  (step [this tv] "Update aggregator with new typed-value, return new aggregator")
+  (complete [this] "Convert accumulated state to result typed-val"))
 
-(defrecord CountAggregator []
+(defrecord CountAggregator [tally]
   StreamingAggregator
-  (initialize [_] 0)
-  (step [_ state tv]
+  (step [this tv]
     (if (some-> tv :value some?)
-      (inc state)
-      state))
-  (finalize [_ state]
-    (where/->typed-val state)))
+      (update this :tally inc)
+      this))
+  (complete [this]
+    (where/->typed-val (:tally this))))
 
-(defrecord CountStarAggregator []
-  StreamingAggregator
-  (initialize [_] 0)
-  (step [_ state _tv] (inc state))
-  (finalize [_ state] (where/->typed-val state)))
+(defn count-aggregator
+  []
+  (->CountAggregator 0))
 
-(defrecord CountDistinctAggregator []
+(defrecord CountStarAggregator [tally]
   StreamingAggregator
-  (initialize [_] (transient #{}))
-  (step [_ state tv]
+  (step [this _tv] (update this :tally inc))
+  (complete [this] (where/->typed-val (:tally this))))
+
+(defn count-star-aggregator
+  []
+  (->CountStarAggregator 0))
+
+(defrecord CountDistinctAggregator [seen]
+  StreamingAggregator
+  (step [this tv]
     (if (some-> tv :value some?)
-      (conj! state tv)
-      state))
-  (finalize [_ state]
-    (where/->typed-val (count (persistent! state)))))
+      (update this :seen conj tv)
+      this))
+  (complete [this]
+    (where/->typed-val (count (:seen this)))))
 
-(defrecord SumAggregator []
+(defn count-distinct-aggregator
+  []
+  (->CountDistinctAggregator #{}))
+
+(defrecord SumAggregator [total]
   StreamingAggregator
-  (initialize [_] nil)
-  (step [_ state tv]
+  (step [this tv]
     (let [v (:value tv)]
       (if (some? v)
-        (if (nil? state) v (+ state v))
-        state)))
-  (finalize [_ state]
-    (where/->typed-val (or state 0))))
+        (update this :total #(if (nil? %) v (+ % v)))
+        this)))
+  (complete [this]
+    (where/->typed-val (or (:total this) 0))))
+
+(defn sum-aggregator
+  []
+  (->SumAggregator nil))
 
 #?(:clj
    (defn ratio?
@@ -62,19 +73,25 @@
      [_]
      false))
 
-(defrecord AvgAggregator []
+(defrecord AvgAggregator [sum cnt]
   StreamingAggregator
-  (initialize [_] {:sum nil :cnt 0})
-  (step [_ {:keys [sum cnt]} tv]
+  (step [this tv]
     (let [v (:value tv)]
       (if (some? v)
-        {:sum (if (nil? sum) v (+ sum v))
-         :cnt (inc cnt)}
-        {:sum sum :cnt cnt})))
-  (finalize [_ {:keys [sum cnt]}]
-    (let [raw (if (pos? cnt) (/ sum cnt) 0)
+        (-> this
+            (update :sum #(if (nil? %) v (+ % v)))
+            (update :cnt inc))
+        this)))
+  (complete [this]
+    (let [s   (:sum this)
+          c   (:cnt this)
+          raw (if (pos? c) (/ s c) 0)
           res (if (ratio? raw) (double raw) raw)]
       (where/->typed-val res))))
+
+(defn avg-aggregator
+  []
+  (->AvgAggregator nil 0))
 
 ;; Typed value comparison (mirrors fluree.db.query.exec.eval/compare*)
 
@@ -107,40 +124,58 @@
   #{const/iri-xsd-dateTime
     const/iri-xsd-date})
 
-#?(:clj (defmulti ->offset-date-time
-          #(when-let [t (#{OffsetDateTime LocalDateTime LocalDate} (type %))]
-             t)))
-#?(:clj (defmethod ->offset-date-time OffsetDateTime
-          [^OffsetDateTime datetime]
-          datetime))
-#?(:clj (defmethod ->offset-date-time LocalDateTime
-          [^LocalDateTime datetime]
-          (.atOffset datetime ZoneOffset/UTC)))
-#?(:clj (defmethod ->offset-date-time LocalDate
-          [^LocalDate date]
-          (.atOffset (.atStartOfDay date) ZoneOffset/UTC)))
-#?(:clj (defmethod ->offset-date-time :default
-          [x]
-          (throw (ex-info "Cannot convert value to OffsetDateTime."
-                          {:value  x
-                           :status 400
-                           :error  :db/invalid-fn-call}))))
+#?(:clj
+   (defprotocol OffsetDateTimeConverter
+     (->offset-date-time [this])))
 
-#?(:clj (defmulti ->offset-time
-          #(when-let [t (#{OffsetTime LocalTime} (type %))]
-             t)))
-#?(:clj (defmethod ->offset-time OffsetTime
-          [^OffsetTime time]
-          time))
-#?(:clj (defmethod ->offset-time LocalTime
-          [^LocalTime time]
-          (.atOffset time ZoneOffset/UTC)))
-#?(:clj (defmethod ->offset-time :default
-          [x]
-          (throw (ex-info "Cannot convert value to OffsetTime."
-                          {:value  x
-                           :status 400
-                           :error  :db/invalid-fn-call}))))
+#?(:clj
+   (extend-protocol OffsetDateTimeConverter
+     OffsetDateTime
+     (->offset-date-time
+       [^OffsetDateTime this]
+       this)
+
+     LocalDateTime
+     (->offset-date-time
+       [^LocalDateTime this]
+       (.atOffset this ZoneOffset/UTC))
+
+     LocalDate
+     (->offset-date-time
+       [^LocalDate this]
+       (-> this .atStartOfDay (.atOffset ZoneOffset/UTC)))
+
+     Object
+     (->offset-date-time
+       [this]
+       (throw (ex-info "Cannot convert value to OffsetDateTime."
+                       {:value  this
+                        :status 400
+                        :error  :db/invalid-fn-call})))))
+
+#?(:clj
+   (defprotocol OffsetTimeConverter
+     (->offset-time [this])))
+
+#?(:clj
+   (extend-protocol OffsetTimeConverter
+     OffsetTime
+     (->offset-time
+       [^OffsetTime this]
+       this)
+
+     LocalTime
+     (->offset-time
+       [^LocalTime this]
+       (.atOffset this ZoneOffset/UTC))
+
+     Object
+     (->offset-time
+       [this]
+       (throw (ex-info "Cannot convert value to OffsetTime."
+                       {:value  this
+                        :status 400
+                        :error  :db/invalid-fn-call})))))
 
 (defn compare*
   [{val-a :value dt-a :datatype-iri}
@@ -172,48 +207,50 @@
                        :status 400
                        :error  :db/invalid-query})))))
 
-(defrecord MinAggregator []
+(defrecord MinAggregator [current]
   StreamingAggregator
-  (initialize [_] nil)
-  (step [_ state tv]
-    (cond
-      (nil? (some-> tv :value)) state
-      (nil? state) tv
-      (neg? (compare* tv state)) tv
-      :else state))
-  (finalize [_ state]
-    (or state (where/->typed-val nil))))
+  (step [this tv]
+    (let [cur (:current this)]
+      (cond
+        (nil? (some-> tv :value)) this
+        (nil? cur) (assoc this :current tv)
+        (neg? (compare* tv cur)) (assoc this :current tv)
+        :else this)))
+  (complete [this]
+    (or (:current this) (where/->typed-val nil))))
 
-(defrecord MaxAggregator []
+(defn min-aggregator
+  []
+  (->MinAggregator nil))
+
+(defrecord MaxAggregator [current]
   StreamingAggregator
-  (initialize [_] nil)
-  (step [_ state tv]
-    (cond
-      (nil? (some-> tv :value)) state
-      (nil? state) tv
-      (pos? (compare* tv state)) tv
-      :else state))
-  (finalize [_ state]
-    (or state (where/->typed-val nil))))
+  (step [this tv]
+    (let [cur (:current this)]
+      (cond
+        (nil? (some-> tv :value)) this
+        (nil? cur) (assoc this :current tv)
+        (pos? (compare* tv cur)) (assoc this :current tv)
+        :else this)))
+  (complete [this]
+    (or (:current this) (where/->typed-val nil))))
 
-(defn agg-step
-  "Backwards-compatible wrapper for older call sites.
-  Prefer `step`."
-  [aggregator state tv]
-  (step aggregator state tv))
+(defn max-aggregator
+  []
+  (->MaxAggregator nil))
 
 (def streaming-aggregators
-  "Map of aggregate op symbols to their aggregator instances.
-  Instances are stateless and can be shared."
-  {'count          (->CountAggregator)
-   'count-star     (->CountStarAggregator)
-   'count-distinct (->CountDistinctAggregator)
-   'sum            (->SumAggregator)
-   'avg            (->AvgAggregator)
-   'min            (->MinAggregator)
-   'max            (->MaxAggregator)})
+  "Map of aggregate op symbols to their aggregator constructor functions."
+  {'count          count-aggregator
+   'count-star     count-star-aggregator
+   'count-distinct count-distinct-aggregator
+   'sum            sum-aggregator
+   'avg            avg-aggregator
+   'min            min-aggregator
+   'max            max-aggregator})
 
 (defn streaming-aggregator
-  "Returns streaming aggregator for `op`, or nil."
+  "Returns streaming aggregator constructor for `op`, or nil.
+  Call the returned function with no args to get a fresh aggregator instance."
   [op]
   (get streaming-aggregators op))

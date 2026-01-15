@@ -5,7 +5,8 @@
             [fluree.db.query.exec.select.fql :as select.fql]
             [fluree.db.query.exec.select.sparql :as select.sparql]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util :as util]))
+            [fluree.db.util :as util])
+  (:import [fluree.db.query.exec.select AsSelector StreamingAggregateSelector VariableSelector]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -104,8 +105,8 @@
 (defn- streaming-agg-selector?
   "Returns true if selector supports streaming aggregation."
   [sel]
-  (or (instance? fluree.db.query.exec.select.StreamingAggregateSelector sel)
-      (and (instance? fluree.db.query.exec.select.AsSelector sel)
+  (or (instance? StreamingAggregateSelector sel)
+      (and (instance? AsSelector sel)
            (some? (:streaming-agg sel)))))
 
 (defn- streaming-eligible?
@@ -122,13 +123,13 @@
          (every? streaming-agg-selector? selectors)
          (and (seq group-vars)
               (every? (fn [sel]
-                        (or (and (instance? fluree.db.query.exec.select.VariableSelector sel)
+                        (or (and (instance? VariableSelector sel)
                                  (contains? group-vars-set (:var sel)))
                             (streaming-agg-selector? sel)))
                       selectors)))))
 
 (defn- update-streaming-groups
-  "Reducer function that updates streaming aggregate states for each solution.
+  "Updates streaming aggregate states for a solution.
   Returns updated groups map with accumulated aggregate states per group key."
   [group-vars streaming-aggs groups solution]
   (let [group-key (extract-group-key group-vars solution)
@@ -138,13 +139,13 @@
               :agg-states     {}})
         agg-states'
         (reduce (fn [states {:keys [arg-var result-var aggregator]}]
-                  (let [state  (get states result-var (agg/initialize aggregator))
+                  (let [agg    (get states result-var (aggregator))
                         tv     (when arg-var
                                  (some-> solution
                                          (get arg-var)
                                          where/mch->typed-val))
-                        new-st (agg/step aggregator state tv)]
-                    (assoc states result-var new-st)))
+                        agg'   (agg/step agg tv)]
+                    (assoc states result-var agg')))
                 agg-states
                 streaming-aggs)]
     (assoc groups group-key {:group-vars-map group-vars-map
@@ -157,9 +158,9 @@
   (reduce-kv
    (fn [solutions _group-key {:keys [group-vars-map agg-states]}]
      (let [solution-with-aggs
-           (reduce (fn [sol {:keys [result-var aggregator]}]
-                     (let [state    (get agg-states result-var)
-                           tv       (agg/finalize aggregator state)
+           (reduce (fn [sol {:keys [result-var]}]
+                     (let [agg      (get agg-states result-var)
+                           tv       (agg/complete agg)
                            base-mch (where/unmatched-var result-var)
                            mch      (where/typed-val->mch base-mch tv)]
                        (assoc sol result-var mch)))
@@ -180,10 +181,9 @@
                             (filter streaming-agg-selector?)
                             (mapv :streaming-agg))
         implicit?      (and (empty? group-vars)
-                            (some select/implicit-grouping? selectors))
-        streaming?     (streaming-eligible? having streaming-aggs implicit?
-                                            selectors group-vars group-vars-set)]
-    (if streaming?
+                            (some select/implicit-grouping? selectors))]
+    (if (streaming-eligible? having streaming-aggs implicit?
+                             selectors group-vars group-vars-set)
       (-> (async/transduce (map identity)
                            (completing (partial update-streaming-groups group-vars streaming-aggs)
                                        (partial finalize-streaming-groups streaming-aggs))

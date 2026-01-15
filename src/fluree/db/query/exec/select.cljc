@@ -89,23 +89,22 @@
   formats each item in the group, and processes the formatted group with the
   supplied `agg-function` to generate the final aggregated result for display.
 
-  If `streaming-agg` is provided, returns a StreamingAggregateSelector that
-  reads pre-computed results from the solution. Otherwise returns an
-  AggregateSelector that applies `agg-function` to collected groups.
-
-  Optional parameters:
-    `streaming-agg` - descriptor map for incremental aggregates
-    `agg-info` - {:fn-name sym, :vars #{?v ...}}"
+  Optional `agg-info` - {:fn-name sym, :vars #{?v ...}}"
   ([agg-function]
    (->AggregateSelector agg-function))
-  ([agg-function streaming-agg]
-   (if streaming-agg
-     (->StreamingAggregateSelector streaming-agg)
-     (->AggregateSelector agg-function)))
-  ([agg-function streaming-agg agg-info]
-   (cond-> (if streaming-agg
-             (->StreamingAggregateSelector streaming-agg)
-             (->AggregateSelector agg-function))
+  ([agg-function agg-info]
+   (cond-> (->AggregateSelector agg-function)
+     agg-info (with-meta {::aggregate-info agg-info}))))
+
+(defn streaming-aggregate-selector
+  "Returns a selector that reads pre-computed streaming aggregate results
+  from the solution.
+
+  Optional `agg-info` - {:fn-name sym, :vars #{?v ...}}"
+  ([streaming-agg]
+   (->StreamingAggregateSelector streaming-agg))
+  ([streaming-agg agg-info]
+   (cond-> (->StreamingAggregateSelector streaming-agg)
      agg-info (with-meta {::aggregate-info agg-info}))))
 
 (defrecord AsSelector [as-fn bind-var aggregate? streaming-agg]
