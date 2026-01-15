@@ -85,7 +85,7 @@
                 (and (= ns-code (.-ns_code other))
                      (= name (.-name other))))))
        (hashCode [_]
-         (clojure.lang.Util/hashCombine (int ns-code) (.hashCode name))))
+         (clojure.lang.Util/hashCombine ns-code (.hashCode name))))
 
      (def ^:private interner-cache
        "Caffeine cache with weak values for SID interning.

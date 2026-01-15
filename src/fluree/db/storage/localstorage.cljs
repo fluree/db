@@ -1,5 +1,4 @@
 (ns fluree.db.storage.localstorage
-  (:refer-clojure :exclude [read list])
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.crypto :as crypto]
             [fluree.db.platform :as platform]
