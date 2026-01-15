@@ -61,6 +61,20 @@
   [x]
   (if (string? x) x (::where/iri x)))
 
+(defn- normalize-table-name
+  "Normalize table name to dot notation (Iceberg standard).
+
+   Iceberg REST catalogs use dot notation for namespace.table identifiers.
+   This function converts slash notation to dot notation for compatibility.
+
+   Examples:
+     'openflights/airlines' -> 'openflights.airlines'
+     'openflights.airlines' -> 'openflights.airlines' (unchanged)
+     'db/schema/table'      -> 'db.schema.table'"
+  [table-name]
+  (when table-name
+    (str/replace table-name "/" ".")))
+
 (defn- parse-join-conditions
   "Parse join conditions from a RefObjectMap.
 
@@ -121,7 +135,9 @@
                                                                (::where/val o)))
                                                            lt-triples)]
                                       (when table-name
-                                        {:type :table-name :name table-name})))
+                                        ;; Normalize to dot notation (Iceberg standard)
+                                        ;; Accepts both "ns/table" and "ns.table"
+                                        {:type :table-name :name (normalize-table-name table-name)})))
                     subject-map-node (get-iri (get props r2rml-subject-map))
                     [template rdf-class] (when subject-map-node
                                            (let [sm-triples (get by-subject subject-map-node)
