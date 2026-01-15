@@ -1,5 +1,4 @@
 (ns fluree.db.connection
-  (:refer-clojure :exclude [replicate])
   (:require [clojure.core.async :as async :refer [<! go go-loop]]
             [clojure.pprint :as pprint]
             [clojure.string :as str]

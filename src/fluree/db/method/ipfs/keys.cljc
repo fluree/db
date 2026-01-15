@@ -2,7 +2,7 @@
   (:require [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.xhttp :as xhttp])
-  (:refer-clojure :exclude [list key]))
+  (:refer-clojure :exclude [list]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
