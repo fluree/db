@@ -162,12 +162,16 @@
   [x]
   (instance? Flake x))
 
-(defn- equiv-flake
+(defn equiv-flake
+  "Returns true if two flakes represent the same fact. Compares subject, predicate,
+   object, datatype, and metadata (which includes list index and language tag).
+   Intentionally ignores transaction time (t) and operation (op)."
   [f other]
   (and (= (s f) (s other))
        (= (p f) (p other))
        (= (o f) (o other))
-       (= (dt f) (dt other))))
+       (= (dt f) (dt other))
+       (= (m f) (m other))))
 
 (defn parts->Flake
   "Used primarily to generate flakes for comparator. If you wish to

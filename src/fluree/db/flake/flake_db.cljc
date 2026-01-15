@@ -297,8 +297,13 @@
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!"
                       commit-metadata))
-      (log/debug "Updating db" (str/join "@" [(:alias db) (:t db)])
-                 "to t:" t-new "with new commit:" commit-metadata)
+      (log/trace "Updating db" (str/join "@" [(:alias db) (:t db)])
+                 "to t:" t-new "with new commit:"
+                 (assoc commit-metadata
+                        :index (some-> (:index commit-metadata)
+                                       (select-keys [:id :address :v :data])
+                                       (update :data #(when (map? %)
+                                                        (select-keys % [:t :address :id :v :flakes :size]))))))
       (-> db*
           (merge-flakes t-new all-flakes)
           (assoc :commit commit-metadata)))))
@@ -652,6 +657,140 @@
   (let [indexes (index/indexes-for root-map)]
     (select-keys index/comparators indexes)))
 
+(defn root-map->db
+  "Creates a FlakeDB from a root-map (from genesis-root-map or index-storage).
+
+   This is the shared logic for creating a FlakeDB, used by both load (for
+   existing ledgers) and genesis-db (for reindexing).
+
+   Parameters:
+     root-map       - From genesis-root-map or index-storage/read-db-root
+     commit-catalog - Storage catalog for commits
+     index-catalog  - Storage catalog for indexes
+     ledger-alias   - Full ledger alias including branch
+     commit-map     - Commit map (nil for genesis reindex, commit for loading)"
+  [root-map commit-catalog index-catalog ledger-alias commit-map]
+  (let [comparators (root-comparators root-map)
+        max-ns-code  (-> root-map :namespace-codes iri/get-max-namespace-code)]
+    (-> root-map
+        (assoc :index-catalog index-catalog
+               :commit-catalog commit-catalog
+               :alias ledger-alias
+               :commit commit-map
+               :tt-id nil
+               :comparators comparators
+               :staged nil
+               :novelty (new-novelty-map comparators)
+               :max-namespace-code max-ns-code)
+        map->FlakeDB
+        policy/root)))
+;; --- Reindex API ---
+
+(defn genesis-db
+  "Creates an empty FlakeDB suitable for commit replay during reindexing.
+
+   The db is created without a :commit key, which means refresh will assign
+   v2 index version, enabling full statistics computation."
+  [ledger-alias commit-catalog index-catalog indexing-opts]
+  (-> ledger-alias
+      genesis-root-map
+      (add-reindex-thresholds indexing-opts)
+      (root-map->db commit-catalog index-catalog ledger-alias nil)))
+
+(defn- reindex-progress-log
+  "Log progress during reindex. Called periodically."
+  [ledger-alias commit-count batch-count start-time-ms]
+  (let [elapsed-ms   (- (util/current-time-millis) start-time-ms)
+        elapsed-secs (/ elapsed-ms 1000.0)
+        rate         (if (pos? elapsed-secs)
+                       (/ commit-count elapsed-secs)
+                       0.0)]
+    (log/info "Reindex progress for" ledger-alias
+              {:commits-processed commit-count
+               :batches-completed batch-count
+               :elapsed-seconds   (Math/round ^double elapsed-secs)
+               :commits-per-second (Math/round ^double rate)})))
+
+(defn- strip-replayed-index-metadata
+  "During reindex we want novelty/refresh to assign a v2 index and compute stats.
+  Commits in history may carry old :index metadata (including v1), which would
+  cause refresh to skip stats. Strip :index during replay."
+  [db]
+  (update db :commit dissoc :index))
+
+(defn- should-log-progress?
+  [commit-count last-log-count log-interval]
+  (>= (- commit-count last-log-count) log-interval))
+
+(defn- should-index-batch?
+  [novelty-size batch-bytes]
+  (>= novelty-size batch-bytes))
+
+(defn reindex-from-commits
+  "Rebuilds database by replaying commits in batches.
+
+   Processes commits from commit-ch until novelty exceeds batch-bytes, then
+   indexes. Repeats until all commits are processed.
+
+   Parameters:
+     genesis-db   - Empty FlakeDB from genesis-db fn
+     commit-ch    - Channel of [commit-jsonld commit-data] pairs
+     batch-bytes  - Novelty size threshold to trigger indexing
+     changes-ch   - Optional channel for index file notifications (or nil)
+
+   Returns channel containing final reindexed db or error."
+  [genesis-db commit-ch batch-bytes changes-ch]
+  (go-try
+    (let [max-old-indexes (:max-old-indexes genesis-db)
+          ledger-alias    (:alias genesis-db)
+          start-time-ms   (util/current-time-millis)
+          log-interval    1000] ;; Log progress every 1000 commits
+      (log/info "Starting reindex for" ledger-alias
+                {:batch-bytes batch-bytes
+                 :max-old-indexes max-old-indexes})
+      (loop [db               genesis-db
+             batch-count      0
+             commit-count     0
+             last-log-count   0]
+        (if-let [[commit-jsonld commit-data] (<! commit-ch)]
+          (let [merged-db     (<? (merge-commit db commit-jsonld commit-data))
+                db*           (strip-replayed-index-metadata merged-db)
+                novelty-size  (get-in db* [:novelty :size])
+                commit-count* (inc commit-count)
+                ;; Log progress periodically
+                last-log-count* (if (should-log-progress? commit-count* last-log-count log-interval)
+                                  (do
+                                    (reindex-progress-log ledger-alias commit-count* batch-count start-time-ms)
+                                    commit-count*)
+                                  last-log-count)]
+            (if (should-index-batch? novelty-size batch-bytes)
+              (do
+                (log/info "Reindex batch" (inc batch-count) "indexing..."
+                          {:ledger ledger-alias
+                           :commits commit-count*
+                           :novelty-bytes novelty-size})
+                (let [indexed-db (<? (novelty/refresh db* changes-ch max-old-indexes))]
+                  (recur indexed-db (inc batch-count) commit-count* last-log-count*)))
+              (recur db* batch-count commit-count* last-log-count*)))
+          ;; No more commits - final index pass
+          (let [elapsed-ms (- (util/current-time-millis) start-time-ms)]
+            (log/info "Reindex final batch for" ledger-alias
+                      {:total-commits commit-count
+                       :total-batches batch-count
+                       :novelty-bytes (get-in db [:novelty :size])
+                       :elapsed-ms elapsed-ms})
+            (if (novelty/dirty? db)
+              (let [final-db (<? (novelty/refresh db changes-ch max-old-indexes))]
+                (log/info "Reindex complete for" ledger-alias
+                          {:total-commits commit-count
+                           :total-batches (inc batch-count)
+                           :total-elapsed-ms (- (util/current-time-millis) start-time-ms)
+                           :stats-properties (count (get-in final-db [:stats :properties]))
+                           :stats-classes (count (get-in final-db [:stats :classes]))})
+                final-db)
+              (do
+                (log/info "Reindex complete for" ledger-alias "(no final indexing needed)")
+                db))))))))
 ;; TODO - VG - need to reify vg from db-root!!
 (defn load
   ([ledger-alias commit-catalog index-catalog commit-pair]
@@ -661,29 +800,17 @@
      (let [commit-t    (-> commit-jsonld
                            (get-first const/iri-data)
                            (get-first-value const/iri-fluree-t))
-           root-map    (if-let [{:keys [address]} (:index commit-map)]
-                         (<? (index-storage/read-db-root index-catalog address))
-                         (genesis-root-map ledger-alias))
-           comparators (root-comparators root-map)
+           root-map    (-> (if-let [{:keys [address]} (:index commit-map)]
+                             (<? (index-storage/read-db-root index-catalog address))
+                             (genesis-root-map ledger-alias))
+                           (add-reindex-thresholds indexing-opts))
            ;; Propagate index version from root-map into commit-map so it's available
            ;; for subsequent re-indexing operations (novelty.cljc, storage.cljc)
            commit-map* (if-let [v (:v root-map)]
                          (assoc-in commit-map [:index :v] v)
                          commit-map)
-           max-ns-code (-> root-map :namespace-codes iri/get-max-namespace-code)
-           indexed-db  (-> root-map
-                           (add-reindex-thresholds indexing-opts)
-                           (assoc :index-catalog index-catalog
-                                  :commit-catalog commit-catalog
-                                  :alias ledger-alias
-                                  :commit commit-map*
-                                  :tt-id nil
-                                  :comparators comparators
-                                  :staged nil
-                                  :novelty (new-novelty-map comparators)
-                                  :max-namespace-code max-ns-code)
-                           map->FlakeDB
-                           policy/root)
+           indexed-db  (root-map->db root-map commit-catalog index-catalog
+                                     ledger-alias commit-map*)
            indexed-db* (if (nil? (:schema root-map)) ;; needed for legacy (v0) root index map
                          (<? (vocab/load-schema indexed-db (:preds root-map)))
                          indexed-db)
