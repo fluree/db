@@ -266,10 +266,9 @@
              (let [deps          (get ns-record "fidx:dependencies")
                    source-alias  (first deps)
                    source-ledger (<? (connection/load-ledger-alias conn source-alias))
-                   source-db     (ledger/current-db source-ledger)
-                   vg            (<? (vg-loader/load-virtual-graph-from-nameservice
-                                      source-db publisher normalized-alias))]
-               vg))
+                   source-db     (ledger/current-db source-ledger)]
+               (<? (vg-loader/load-virtual-graph-from-nameservice
+                    source-db publisher normalized-alias))))
            :cljs
            (throw (ex-info "Virtual graphs are not supported in ClojureScript"
                            {:status 400 :error :db/unsupported})))

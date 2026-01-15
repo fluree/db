@@ -3,6 +3,7 @@
 
    Handles configuration parsing, catalog resolution, and VG construction."
   (:require [clojure.string :as str]
+            [fluree.db.storage.s3 :as s3]
             [fluree.db.storage.vended-s3 :as vended-s3]
             [fluree.db.tabular.iceberg :as iceberg]
             [fluree.db.tabular.iceberg.rest :as iceberg-rest]
@@ -143,6 +144,47 @@
          :default-headers (or (:default-headers catalog) (get catalog "default-headers"))}))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Store Creation from Configuration
+;;; ---------------------------------------------------------------------------
+
+(defn- normalize-store-config
+  "Normalize store configuration to a consistent format.
+   Accepts both keyword and string keys (kebab and camelCase).
+   Returns nil if store-config is nil or not a map."
+  [store-config]
+  (when (map? store-config)
+    {:type     (keyword (or (:type store-config)
+                            (get store-config "type")
+                            :s3))
+     :bucket   (or (:bucket store-config)
+                   (get store-config "bucket"))
+     :prefix   (or (:prefix store-config)
+                   (get store-config "prefix")
+                   "")
+     :endpoint (or (:endpoint store-config)
+                   (get store-config "endpoint"))}))
+
+(defn- create-store-from-config
+  "Create a storage store from configuration data.
+
+   Store config format:
+     {:type :s3
+      :bucket \"warehouse\"
+      :prefix \"\"           ; optional, defaults to \"\"
+      :endpoint \"http://localhost:9000\"}  ; optional for real S3
+
+   Currently supports :s3 type. Returns nil if config is invalid."
+  [store-config]
+  (let [{:keys [type bucket prefix endpoint]} (normalize-store-config store-config)]
+    (when (and type bucket)
+      (case type
+        :s3 (s3/open nil bucket (or prefix "") endpoint)
+        ;; Add other store types here as needed
+        (do
+          (log/warn "Unknown store type:" type)
+          nil)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; IcebergDatabase Construction
 ;;; ---------------------------------------------------------------------------
 
@@ -207,7 +249,17 @@
         warehouse-path (or (:warehouse-path config)
                            (get config "warehouse-path")
                            (get config "warehousePath"))
-        store (or (:store config) (get config "store"))
+        ;; Store can be either:
+        ;; 1. Configuration data: {:type :s3 :bucket "..." :endpoint "..."}
+        ;; 2. Already a store object (legacy/internal use)
+        ;; We detect config data by checking for :bucket or "bucket" keys
+        store-raw (or (:store config) (get config "store"))
+        store (if (and (map? store-raw)
+                       (or (:bucket store-raw) (get store-raw "bucket")))
+                ;; It's configuration data - create the store
+                (create-store-from-config store-raw)
+                ;; It's already a store object (or nil)
+                store-raw)
         metadata-location (or (:metadata-location config)
                               (get config "metadata-location")
                               (get config "metadataLocation"))
@@ -227,7 +279,7 @@
             (throw (ex-info "Iceberg virtual graph requires :warehouse-path or :store (REST catalog mode also requires :store)"
                             {:error :db/invalid-config :config config})))
         _ (when (and rest-catalog? (nil? store) (not vended-enabled?))
-            (throw (ex-info "Iceberg virtual graph REST :catalog requires :store (S3Store, FileStore, etc.) unless vended credentials are enabled"
+            (throw (ex-info "Iceberg virtual graph REST :catalog requires :store config {:type :s3 :bucket \"...\" :endpoint \"...\"} unless vended credentials are enabled"
                             {:error :db/invalid-config :config config})))
 
         ;; Get mapping
@@ -293,21 +345,21 @@
                                    :auth-token (:auth-token resolved-catalog)
                                    :file-io-opts file-io-opts}))))
 
-                           ;; Explicit store provided (with optional cache)
-                           store
-                           (fn [_table-name]
-                             (iceberg/create-fluree-iceberg-source
-                              {:store store
-                               :warehouse-path (or warehouse-path "")
-                               :file-io-opts file-io-opts}))
-
-                           ;; REST catalog with explicit store
-                           rest-catalog?
+                           ;; REST catalog with explicit store - must check before store-only!
+                           (and rest-catalog? store)
                            (fn [_table-name]
                              (iceberg/create-rest-iceberg-source
                               {:uri (:uri resolved-catalog)
                                :store store
                                :auth-token (:auth-token resolved-catalog)
+                               :file-io-opts file-io-opts}))
+
+                           ;; Explicit store provided without REST catalog (store-backed warehouse)
+                           store
+                           (fn [_table-name]
+                             (iceberg/create-fluree-iceberg-source
+                              {:store store
+                               :warehouse-path (or warehouse-path "")
                                :file-io-opts file-io-opts}))
 
                            ;; Hadoop-based (legacy, no store)

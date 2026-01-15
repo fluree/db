@@ -233,7 +233,7 @@
        ;; Note: REST catalog mode currently requires a Fluree store for reading table metadata/data files
        ;; via Fluree's FileIO abstraction (see fluree.db.tabular.iceberg.rest/create-rest-iceberg-source).
        (when (and (= catalog-type :rest) (nil? has-store))
-         (throw (ex-info "Iceberg virtual graph REST :catalog requires :store (S3Store, FileStore, etc.)"
+         (throw (ex-info "Iceberg virtual graph REST :catalog requires :store config {:type :s3 :bucket \"...\" :endpoint \"...\"}"
                          {:error :db/invalid-config :type :iceberg})))
        (when (and (nil? wh-path) (nil? has-store) (not= catalog-type :rest))
          (throw (ex-info "Iceberg virtual graph requires :warehouse-path or :store"

@@ -1175,8 +1175,12 @@
                     table columns map to RDF predicates and classes.
          :mapping-inline - Inline R2RML mapping content as a string. Alternative
                            to :mapping when you don't want a separate file.
-         :store - Storage backend config (S3Store, FileStore, etc.). Required
-                  for REST catalog to read table data files.
+         :store - Storage backend configuration map for reading table data files.
+                  Required for REST catalog. Format:
+                    {:type :s3
+                     :bucket \"bucket-name\"
+                     :prefix \"optional-prefix\"    ; defaults to \"\"
+                     :endpoint \"http://...\"}      ; optional, for S3-compatible stores
          :catalog - Catalog configuration map:
                       :type - Catalog type (:rest for REST catalog)
                       :uri - Catalog URI (for REST catalog)
@@ -1188,6 +1192,12 @@
        ;; Connect to a local Iceberg warehouse
        @(connect-iceberg conn \"my-data-lake\"
          {:warehouse-path \"/path/to/warehouse\"
+          :mapping \"/path/to/mapping.ttl\"})
+
+       ;; Connect via REST catalog with S3 storage
+       @(connect-iceberg conn \"my-lake\"
+         {:catalog {:type :rest :uri \"http://localhost:8181\"}
+          :store {:type :s3 :bucket \"warehouse\" :endpoint \"http://localhost:9000\"}
           :mapping \"/path/to/mapping.ttl\"})
 
        ;; Query the connected source

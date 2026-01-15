@@ -35,6 +35,8 @@
   (.exists (File. mapping-path)))
 
 (defn vg-fixture [f]
+  ;; Set up @vg if local warehouse exists, but always run tests.
+  ;; Tests that need local warehouse check @vg; REST catalog tests run independently.
   (if (and (warehouse-exists?) (mapping-exists?))
     (do
       (reset! vg (iceberg-vg/create {:alias "airlines"
@@ -44,7 +46,9 @@
         (f)
         (finally
           (reset! vg nil))))
-    (println "SKIP: OpenFlights warehouse or mapping not found. Run 'make iceberg-openflights' first.")))
+    (do
+      (println "NOTE: Local warehouse not found. Tests requiring @vg will be skipped.")
+      (f))))
 
 (use-fixtures :once vg-fixture)
 
@@ -441,6 +445,146 @@
           (is (re-find #"already exists" (ex-message result))
               "Error should mention 'already exists'"))
 
+        (finally
+          (teardown-fluree-system))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Ledger Info Tests
+;;; ---------------------------------------------------------------------------
+
+;; ledger-info for Iceberg VGs returns a map with:
+;;   :commit        - commit metadata (alias, timestamp, data with t)
+;;   :nameservice   - VG registration record from nameservice
+;;   :namespace-codes - empty map (VGs don't use Fluree namespace encoding)
+;;   :stats         - {:flakes, :size, :indexed, :properties, :classes}
+;;   :virtual-graph - iceberg-specific: {:type, :alias, :snapshot-id, :timestamp-ms, :tables}
+;;
+;; Unlike regular ledgers, stats come from Iceberg snapshot metadata (no full scan).
+;; Property/class counts are derived from Iceberg column statistics.
+
+(def ^:private rest-catalog-uri "http://localhost:8181")
+(def ^:private rest-s3-endpoint "http://localhost:9000")
+(def ^:private rest-s3-bucket "warehouse")
+
+(defn- rest-catalog-reachable?
+  "Check if REST catalog is reachable at localhost:8181."
+  []
+  (try
+    (let [url (java.net.URL. (str rest-catalog-uri "/v1/config"))
+          conn (.openConnection url)]
+      (.setConnectTimeout conn 2000)
+      (.setReadTimeout conn 2000)
+      (with-open [_ (.getInputStream conn)]
+        true))
+    (catch Exception _
+      false)))
+
+(deftest ^:iceberg-rest e2e-ledger-info-test
+  (when (and (rest-catalog-reachable?) (mapping-exists?))
+    (testing "ledger-info returns expected structure for Iceberg VG"
+      (setup-fluree-system)
+      (try
+        ;; Create the Iceberg virtual graph using full API with store config data
+        @(fluree/connect-iceberg
+          @e2e-conn
+          "iceberg/airlines-info"
+          {:catalog {:type :rest
+                     :uri rest-catalog-uri}
+           :store {:type :s3
+                   :bucket rest-s3-bucket
+                   :endpoint rest-s3-endpoint}
+           :mapping mapping-path})
+
+        ;; Get ledger-info via the standard API
+        (let [info       @(fluree/ledger-info @e2e-conn "iceberg/airlines-info")
+              ;; Extract dynamic values that change per Iceberg snapshot
+              snapshot-id (get-in info [:virtual-graph :snapshot-id])]
+
+          ;; Single assertion documents the expected output structure.
+          ;; Counts are from the OpenFlights airlines dataset (6162 airlines).
+          ;; Only snapshot-related values (snapshot-id, timestamp, time) are dynamic.
+          (is (= {:commit
+                  {"@context" "https://ns.flur.ee/ledger/v1"
+                   "type"     ["Commit"]
+                   "alias"    "iceberg/airlines-info:main"
+                   "time"     (get-in info [:commit "time"]) ; ISO timestamp from snapshot
+                   "data"     {"type" ["DB"]
+                               "t"    snapshot-id}}          ; Iceberg snapshot ID
+
+                  :nameservice
+                  {"@context"          {"f"    "https://ns.flur.ee/ledger#"
+                                        "fidx" "https://ns.flur.ee/index#"}
+                   "@id"               "iceberg/airlines-info:main"
+                   "@type"             ["f:VirtualGraphDatabase" "fidx:Iceberg"]
+                   "f:name"            "iceberg/airlines-info"
+                   "f:branch"          "main"
+                   "fidx:config"       {"@value" (get-in info [:nameservice "fidx:config" "@value"])}
+                   "fidx:dependencies" []}
+
+                  :namespace-codes {}
+
+                  :stats
+                  {:flakes  43623  ; 6162 airlines × 7 properties + 6162 rdf:type triples
+                   :size    0      ; VGs don't track byte size
+                   :indexed 1      ; VGs are always "indexed"
+
+                   :properties
+                   {"http://example.org/airlines/name"
+                    {:count 6162, :last-modified-t snapshot-id}
+                    "http://example.org/airlines/alias"
+                    {:count 684, :last-modified-t snapshot-id}  ; many airlines have no alias
+                    "http://example.org/airlines/iata"
+                    {:count 6161, :last-modified-t snapshot-id}
+                    "http://example.org/airlines/icao"
+                    {:count 5974, :last-modified-t snapshot-id}
+                    "http://example.org/airlines/callsign"
+                    {:count 6159, :last-modified-t snapshot-id}
+                    "http://example.org/airlines/country"
+                    {:count 6159, :last-modified-t snapshot-id}
+                    "http://example.org/airlines/active"
+                    {:count 6162, :last-modified-t snapshot-id}}
+
+                   :classes
+                   {"http://example.org/airlines/Airline"
+                    {:count 6162  ; 6162 airlines in OpenFlights dataset
+                     :properties
+                     {"http://example.org/airlines/name"
+                      {:types {"http://www.w3.org/2001/XMLSchema#string" 6162}
+                       :ref-classes {}
+                       :langs {}}
+                      "http://example.org/airlines/alias"
+                      {:types {"http://www.w3.org/2001/XMLSchema#string" 684}
+                       :ref-classes {}
+                       :langs {}}
+                      "http://example.org/airlines/iata"
+                      {:types {"http://www.w3.org/2001/XMLSchema#string" 6161}
+                       :ref-classes {}
+                       :langs {}}
+                      "http://example.org/airlines/icao"
+                      {:types {"http://www.w3.org/2001/XMLSchema#string" 5974}
+                       :ref-classes {}
+                       :langs {}}
+                      "http://example.org/airlines/callsign"
+                      {:types {"http://www.w3.org/2001/XMLSchema#string" 6159}
+                       :ref-classes {}
+                       :langs {}}
+                      "http://example.org/airlines/country"
+                      {:types {"http://www.w3.org/2001/XMLSchema#string" 6159}
+                       :ref-classes {}
+                       :langs {}}
+                      "http://example.org/airlines/active"
+                      {:types {"http://www.w3.org/2001/XMLSchema#string" 6162}
+                       :ref-classes {}
+                       :langs {}}}}}}
+
+                  :virtual-graph
+                  {:type         :iceberg
+                   :alias        "iceberg/airlines-info:main"
+                   :snapshot-id  snapshot-id
+                   :timestamp-ms (get-in info [:virtual-graph :timestamp-ms])
+                   :tables       ["openflights/airlines"]}}
+
+                 info)))
         (finally
           (teardown-fluree-system))))))
 
