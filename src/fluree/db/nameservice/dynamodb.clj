@@ -229,29 +229,49 @@
     :else v))
 
 (defn- item->ns-record
-  "Convert a DynamoDB item to a nameservice record format"
+  "Convert a DynamoDB item to a nameservice record format.
+   Handles both ledger records and virtual graph records."
   [item ledger-alias]
   (when item
     (let [[ledger-name branch] (util.ledger/ledger-parts ledger-alias)
-          commit-address (dynamo-value->clj (get item "commit_address"))
-          commit-t (dynamo-value->clj (get item "commit_t"))
-          index-address (dynamo-value->clj (get item "index_address"))
-          index-t (dynamo-value->clj (get item "index_t"))
-          _ (log/debug "item->ns-record extraction" {:ledger-alias ledger-alias
-                                                     :raw-index-address (get item "index_address")
-                                                     :parsed-index-address index-address
-                                                     :raw-commit-address (get item "commit_address")
-                                                     :parsed-commit-address commit-address})]
-      (cond-> {"@context" {"f" "https://ns.flur.ee/ledger#"}
-               "@id" ledger-alias
-               "@type" ["f:Database" "f:PhysicalDatabase"]
-               "f:ledger" {"@id" ledger-name}
-               "f:branch" (or branch const/default-branch-name)
-               "f:status" "ready"}
-        commit-address (assoc "f:commit" {"@id" commit-address})
-        commit-t (assoc "f:t" commit-t)
-        index-address (assoc "f:index" (cond-> {"@id" index-address}
-                                         index-t (assoc "f:t" index-t)))))))
+          record-type (dynamo-value->clj (get item "record_type"))]
+      (if (= "vg" record-type)
+        ;; Virtual graph record
+        (let [vg-type (dynamo-value->clj (get item "vg_type"))
+              vg-config-str (dynamo-value->clj (get item "vg_config"))
+              vg-config (when vg-config-str (json/parse vg-config-str false))
+              dependencies (dynamo-value->clj (get item "dependencies"))]
+          (log/debug "item->ns-record VG extraction" {:ledger-alias ledger-alias
+                                                      :vg-type vg-type
+                                                      :has-config? (some? vg-config)})
+          (cond-> {"@context" {"f" "https://ns.flur.ee/ledger#"
+                               "fidx" "https://ns.flur.ee/index#"}
+                   "@id" ledger-alias
+                   "@type" ["f:VirtualGraphDatabase" (or vg-type "f:IcebergVirtualGraph")]
+                   "f:name" ledger-name
+                   "f:branch" (or branch const/default-branch-name)}
+            vg-config (assoc "fidx:config" {"@value" (json/stringify vg-config)})
+            (seq dependencies) (assoc "fidx:dependencies" dependencies)))
+        ;; Regular ledger record
+        (let [commit-address (dynamo-value->clj (get item "commit_address"))
+              commit-t (dynamo-value->clj (get item "commit_t"))
+              index-address (dynamo-value->clj (get item "index_address"))
+              index-t (dynamo-value->clj (get item "index_t"))]
+          (log/debug "item->ns-record ledger extraction" {:ledger-alias ledger-alias
+                                                          :raw-index-address (get item "index_address")
+                                                          :parsed-index-address index-address
+                                                          :raw-commit-address (get item "commit_address")
+                                                          :parsed-commit-address commit-address})
+          (cond-> {"@context" {"f" "https://ns.flur.ee/ledger#"}
+                   "@id" ledger-alias
+                   "@type" ["f:Database" "f:PhysicalDatabase"]
+                   "f:ledger" {"@id" ledger-name}
+                   "f:branch" (or branch const/default-branch-name)
+                   "f:status" "ready"}
+            commit-address (assoc "f:commit" {"@id" commit-address})
+            commit-t (assoc "f:t" commit-t)
+            index-address (assoc "f:index" (cond-> {"@id" index-address}
+                                             index-t (assoc "f:t" index-t)))))))))
 
 (defn put-item
   "Put a full item to DynamoDB (used by legacy publish)"
@@ -330,6 +350,28 @@
                    :Key {"ledger_alias" {"S" ledger-alias}}}]
       (<? (dynamodb-request config "DeleteItem" payload timeout-ms)))))
 
+(defn put-vg
+  "Store a virtual graph record in DynamoDB.
+
+   VG records are stored with record_type='vg' to distinguish from ledgers.
+   The config is stored as a JSON string in the vg_config attribute."
+  [{:keys [table-name timeout-ms] :as db-config} {:keys [vg-name vg-type config dependencies]}]
+  (go-try
+    (let [[base-name branch] (util.ledger/ledger-parts vg-name)
+          branch (or branch const/default-branch-name)
+          item (cond-> {"ledger_alias" {"S" vg-name}
+                        "ledger_name" {"S" base-name}
+                        "branch" {"S" branch}
+                        "status" {"S" "ready"}
+                        "record_type" {"S" "vg"}}
+                 vg-type (assoc "vg_type" {"S" vg-type})
+                 config (assoc "vg_config" {"S" (json/stringify config)})
+                 (seq dependencies) (assoc "dependencies" {"L" (mapv #(hash-map "S" %) dependencies)}))
+          payload {:TableName table-name
+                   :Item item}]
+      (log/debug "nameservice.dynamodb/put-vg" {:vg-name vg-name :vg-type vg-type})
+      (<? (dynamodb-request db-config "PutItem" payload timeout-ms)))))
+
 (defn scan-all
   "Scan all items from the table. Use with caution on large tables."
   [{:keys [table-name timeout-ms] :as config}]
@@ -359,10 +401,8 @@
     (update-index config ledger-alias index-address index-t))
 
   (publish-vg [_ vg-config]
-    ;; TODO: Implement VG support for DynamoDB nameservice
-    (go-try
-      (throw (ex-info "Virtual graph publishing not yet supported for DynamoDB nameservice"
-                      {:status 501 :error :db/not-implemented :vg-config vg-config}))))
+    (log/debug "nameservice.dynamodb/publish-vg" {:vg-name (:vg-name vg-config)})
+    (put-vg config vg-config))
 
   (retract [_ ledger-alias]
     (log/debug "nameservice.dynamodb/retract" {:ledger ledger-alias})
