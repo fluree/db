@@ -1,0 +1,39 @@
+{:deps {com.fluree/db-iceberg {:local/root "../db-iceberg"}
+
+        ;; Arrow and Iceberg Arrow integration
+        org.apache.iceberg/iceberg-arrow {:mvn/version "1.10.0"}
+        org.apache.arrow/arrow-vector    {:mvn/version "17.0.0"}
+        org.apache.arrow/arrow-memory-netty {:mvn/version "17.0.0"}}
+
+ :paths ["src" "resources"]
+
+ ;; NOTE: Arrow requires JVM flags for direct memory access on Java 9+
+ ;; These are specified in each alias below (global :jvm-opts not supported)
+
+ :aliases
+ {:dev
+  {:extra-paths ["../db-iceberg/dev" "../dev" "../dev-resources"]
+   :jvm-opts    ["-Dlogback.configurationFile=../dev-resources/logback.xml"
+                 "--add-opens=java.base/java.nio=ALL-UNNAMED"
+                 "--add-opens=java.base/java.lang=ALL-UNNAMED"
+                 "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]}
+
+  :test
+  {:extra-paths ["test" "../db-iceberg/test" "../test" "../test-resources" "../dev-resources"]
+   :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}
+                 org.clojure/test.check {:mvn/version "1.1.1"}
+                 babashka/fs {:mvn/version "0.5.20"}}
+   :jvm-opts    ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                 "--add-opens=java.base/java.lang=ALL-UNNAMED"
+                 "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
+   :exec-fn     kaocha.runner/exec-fn
+   :exec-args   {:kaocha/tests [{:kaocha.testable/id :iceberg-arrow
+                                 :kaocha.testable/type :kaocha.type/clojure.test
+                                 :kaocha/source-paths ["src" "../db-iceberg/src" "../src"]
+                                 :kaocha/test-paths ["test"]
+                                 :kaocha/ns-patterns [".*"]}]}}
+
+  ;; GraalVM-compatible alias (uses arrow-memory-unsafe instead of netty)
+  :graalvm
+  {:override-deps {org.apache.arrow/arrow-memory-unsafe {:mvn/version "17.0.0"}}
+   :exclude-deps  [org.apache.arrow/arrow-memory-netty]}}}

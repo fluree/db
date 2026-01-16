@@ -42,25 +42,7 @@
 
         ;; AWS SDK v2 for S3 Express One Zone session management
         ;; Using minimal dependencies - only for CreateSession API
-        software.amazon.awssdk/s3 {:mvn/version "2.29.40"}
-
-        ;; Iceberg / Arrow / Parquet for virtual graph support
-        org.apache.iceberg/iceberg-core    {:mvn/version "1.10.0"}
-        org.apache.iceberg/iceberg-parquet {:mvn/version "1.10.0"}
-        org.apache.iceberg/iceberg-data    {:mvn/version "1.10.0"}
-        org.apache.iceberg/iceberg-arrow   {:mvn/version "1.10.0"}
-        org.apache.arrow/arrow-vector      {:mvn/version "17.0.0"}
-        org.apache.arrow/arrow-memory-netty {:mvn/version "17.0.0"}
-        org.apache.iceberg/iceberg-aws       {:mvn/version "1.10.0"}
-        org.apache.iceberg/iceberg-aws-bundle {:mvn/version "1.10.0"}
-        org.apache.iceberg/iceberg-bundled-guava {:mvn/version "1.10.0"}
-        org.apache.hadoop/hadoop-common    {:mvn/version "3.3.6"
-                                            :exclusions [org.slf4j/slf4j-log4j12
-                                                         log4j/log4j
-                                                         org.slf4j/slf4j-reload4j]}
-        org.apache.hadoop/hadoop-hdfs-client {:mvn/version "3.3.6"
-                                              :exclusions [org.slf4j/slf4j-log4j12
-                                                           log4j/log4j]}}
+        software.amazon.awssdk/s3 {:mvn/version "2.29.40"}}
 
  :paths ["src" "resources" "target/classes"]
 
@@ -104,16 +86,25 @@
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha.filter/focus-meta [:sci]}}
 
-  ;; Iceberg tests - separate from main test suite, requires :iceberg alias for deps
-  ;; Run with: clojure -X:dev:iceberg:cljtest-iceberg
+  ;; Iceberg tests - run from subprojects
+  ;; Run row-based tests: cd db-iceberg && clj -X:test
+  ;; Run Arrow tests: cd db-iceberg-arrow && clj -X:test
+  ;; Or run all Iceberg tests from root:
   :cljtest-iceberg
-  {:extra-paths ["test-iceberg" "dev-resources"]
-   :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}}
+  {:extra-paths ["db-iceberg/test" "db-iceberg-arrow/test" "db-iceberg/test-resources" "dev-resources"]
+   :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}
+                 org.clojure/test.check {:mvn/version "1.1.1"}
+                 babashka/fs {:mvn/version "0.5.20"}
+                 com.fluree/db-iceberg {:local/root "db-iceberg"}
+                 com.fluree/db-iceberg-arrow {:local/root "db-iceberg-arrow"}}
+   :jvm-opts    ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                 "--add-opens=java.base/java.lang=ALL-UNNAMED"
+                 "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {:kaocha/tests [{:kaocha.testable/id :iceberg
                                  :kaocha.testable/type :kaocha.type/clojure.test
-                                 :kaocha/source-paths ["src"]
-                                 :kaocha/test-paths ["test-iceberg"]
+                                 :kaocha/source-paths ["src" "db-iceberg/src" "db-iceberg-arrow/src"]
+                                 :kaocha/test-paths ["db-iceberg/test" "db-iceberg-arrow/test"]
                                  :kaocha/ns-patterns [".*"]}]}}
 
   :pending-tests
@@ -189,49 +180,12 @@
   {:extra-deps  {com.github.clj-easy/graal-build-time {:mvn/version "1.0.5"}}
    :extra-paths ["graalvm"]}
 
-  ;; GraalVM native-image build with Iceberg (REST catalog, minimal Hadoop for codec support)
-  ;; Usage: clojure -M:graalvm-iceberg -e "(compile 'iceberg-graalvm-test)"
-  ;; Note: Base Iceberg deps are now in main :deps section. This alias overrides
-  ;; arrow-memory-netty with arrow-memory-unsafe for GraalVM native-image compatibility.
+  ;; GraalVM native-image build with Iceberg (row-based only, no Arrow)
+  ;; For Iceberg GraalVM tests, run from db-iceberg: cd db-iceberg && clj -M:graalvm
+  ;; Uses db-iceberg module (row-based), not db-iceberg-arrow (Arrow columnar)
   :graalvm-iceberg
   {:extra-paths ["graalvm"]
-   ;; Arrow requires these JVM flags for direct memory access on Java 9+
-   :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
-              "--add-opens=java.base/java.lang=ALL-UNNAMED"
-              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
    :extra-deps {;; GraalVM build-time support
                 com.github.clj-easy/graal-build-time {:mvn/version "1.0.5"}
-                ;; Use unsafe allocator instead of netty for GraalVM compatibility
-                ;; This overrides the arrow-memory-netty from main deps
-                org.apache.arrow/arrow-memory-unsafe {:mvn/version "17.0.0"}}
-   ;; Override deps to exclude netty for GraalVM
-   :override-deps {org.apache.iceberg/iceberg-arrow {:mvn/version "1.10.0"
-                                                     :exclusions [org.apache.arrow/arrow-memory-netty
-                                                                  io.netty/netty-buffer
-                                                                  io.netty/netty-common]}
-                   org.apache.hadoop/hadoop-common {:mvn/version "3.3.6"
-                                                    :exclusions [org.slf4j/slf4j-log4j12
-                                                                 log4j/log4j
-                                                                 org.slf4j/slf4j-reload4j
-                                                                 org.apache.hadoop/hadoop-auth
-                                                                 org.apache.hadoop.thirdparty/hadoop-shaded-protobuf_3_21
-                                                                 org.apache.curator/curator-framework
-                                                                 org.apache.curator/curator-recipes
-                                                                 org.apache.curator/curator-client
-                                                                 org.apache.zookeeper/zookeeper
-                                                                 org.apache.kerby/kerb-core
-                                                                 org.apache.kerby/kerb-admin
-                                                                 dnsjava/dnsjava
-                                                                 com.sun.jersey/jersey-core
-                                                                 com.sun.jersey/jersey-server
-                                                                 com.sun.jersey/jersey-servlet]}}}
-
-  ;; Iceberg JVM options for Arrow direct memory access
-  ;; Usage: clojure -M:dev:iceberg -m fluree.db.iceberg-smoke-test
-  ;; Note: Iceberg deps are now in main :deps section
-  :iceberg
-  {:extra-paths ["test"]
-   ;; Arrow requires these JVM flags for direct memory access on Java 9+
-   :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
-              "--add-opens=java.base/java.lang=ALL-UNNAMED"
-              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]}}}
+                ;; Row-based Iceberg support only (no Arrow for GraalVM compatibility)
+                com.fluree/db-iceberg {:local/root "db-iceberg"}}}}}

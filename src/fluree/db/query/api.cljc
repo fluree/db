@@ -3,7 +3,6 @@
   that are directly exposed"
   (:require #?(:clj [fluree.db.connection.system :as system])
             #?(:clj [fluree.db.util.json :as json])
-            #?(:clj [fluree.db.virtual-graph.iceberg :as iceberg-vg])
             #?(:clj [fluree.db.virtual-graph.nameservice-loader :as vg-loader])
             [fluree.db.connection :as connection]
             [fluree.db.dataset :as dataset :refer [dataset?]]
@@ -242,21 +241,27 @@
 
              (iceberg-virtual-graph? ns-record)
              ;; Iceberg VGs - create directly and apply time-travel if specified
-             (let [raw-config (get-in ns-record ["fidx:config" "@value"])
-                   ;; Config is stored as JSON string, need to parse it
-                   config (if (string? raw-config)
-                            (json/parse raw-config false)
-                            raw-config)
-                   ;; Get publisher-level Iceberg config and shared cache
-                   iceberg-config (system/get-iceberg-config publisher)
-                   cache-instance (system/get-iceberg-cache publisher)
-                   vg (iceberg-vg/create {:alias normalized-alias
-                                          :config config
-                                          :iceberg-config iceberg-config
-                                          :cache-instance cache-instance})
-                   ;; Apply time-travel if specified in alias (e.g., airlines@t:12345)
-                   time-travel (when explicit-t (iceberg-vg/parse-time-travel explicit-t))]
-               (iceberg-vg/with-time-travel vg time-travel))
+             ;; Uses requiring-resolve for dynamic loading (db-iceberg module)
+             (if-let [create-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/create)]
+               (let [raw-config (get-in ns-record ["fidx:config" "@value"])
+                     ;; Config is stored as JSON string, need to parse it
+                     config (if (string? raw-config)
+                              (json/parse raw-config false)
+                              raw-config)
+                     ;; Get publisher-level Iceberg config and shared cache
+                     iceberg-config (system/get-iceberg-config publisher)
+                     cache-instance (system/get-iceberg-cache publisher)
+                     vg (create-fn {:alias normalized-alias
+                                    :config config
+                                    :iceberg-config iceberg-config
+                                    :cache-instance cache-instance})
+                     ;; Apply time-travel if specified in alias (e.g., airlines@t:12345)
+                     parse-time-travel (requiring-resolve 'fluree.db.virtual-graph.iceberg/parse-time-travel)
+                     with-time-travel (requiring-resolve 'fluree.db.virtual-graph.iceberg/with-time-travel)
+                     time-travel (when explicit-t (parse-time-travel explicit-t))]
+                 (with-time-travel vg time-travel))
+               (throw (ex-info "Iceberg support not available. Add com.fluree/db-iceberg dependency."
+                               {:status 501 :error :db/missing-iceberg-module})))
 
              :else
              ;; Other VGs (BM25, etc.) need a source ledger from dependencies
