@@ -3,6 +3,7 @@
   that are directly exposed"
   (:require #?(:clj [fluree.db.connection.system :as system])
             #?(:clj [fluree.db.util.json :as json])
+            #?(:clj [fluree.db.virtual-graph.iceberg :as iceberg-vg])
             #?(:clj [fluree.db.virtual-graph.nameservice-loader :as vg-loader])
             [fluree.db.connection :as connection]
             [fluree.db.dataset :as dataset :refer [dataset?]]
@@ -249,17 +250,13 @@
                    ;; Get publisher-level Iceberg config and shared cache
                    iceberg-config (system/get-iceberg-config publisher)
                    cache-instance (system/get-iceberg-cache publisher)
-                   ;; Dynamic loading to avoid requiring Iceberg deps at compile time
-                   create-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/create)
-                   with-time-travel-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/with-time-travel)
-                   parse-time-travel-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/parse-time-travel)
-                   vg (create-fn {:alias normalized-alias
-                                  :config config
-                                  :iceberg-config iceberg-config
-                                  :cache-instance cache-instance})
+                   vg (iceberg-vg/create {:alias normalized-alias
+                                          :config config
+                                          :iceberg-config iceberg-config
+                                          :cache-instance cache-instance})
                    ;; Apply time-travel if specified in alias (e.g., airlines@t:12345)
-                   time-travel (when explicit-t (parse-time-travel-fn explicit-t))]
-               (with-time-travel-fn vg time-travel))
+                   time-travel (when explicit-t (iceberg-vg/parse-time-travel explicit-t))]
+               (iceberg-vg/with-time-travel vg time-travel))
 
              :else
              ;; Other VGs (BM25, etc.) need a source ledger from dependencies
