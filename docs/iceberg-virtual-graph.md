@@ -766,7 +766,8 @@ The Iceberg integration automatically pushes predicates to the storage layer.
 Enable debug logging to see what predicates are pushed:
 
 ```bash
-FLUREE_LOG_LEVEL=debug clojure -M:dev:iceberg ...
+# From db-iceberg subproject
+cd db-iceberg && FLUREE_LOG_LEVEL=debug clj -M:dev ...
 ```
 
 ```
@@ -952,7 +953,8 @@ Benchmarks run on the OpenFlights dataset (airlines: 6,162 rows, routes: 67,663 
 Suppress Hadoop/Parquet debug logs:
 
 ```bash
-FLUREE_LOG_LEVEL=error clojure -M:dev:iceberg ...
+# From db-iceberg subproject
+cd db-iceberg && FLUREE_LOG_LEVEL=error clj -M:dev ...
 ```
 
 ### Resource Leaks
@@ -961,7 +963,12 @@ Always fully consume lazy sequences from `scan-batches` and `scan-arrow-batches`
 
 ### GraalVM Native Image
 
-For native image builds, ensure Iceberg and Arrow classes are included in reflection config. See `resources/META-INF/native-image/com.fluree/db/reflect-config.json`.
+For native image builds, ensure Iceberg classes are included in reflection config. The reflection configs are split across modules:
+
+- `db/resources/META-INF/native-image/com.fluree/db/reflect-config.json` - Core Fluree classes
+- `db-iceberg/resources/META-INF/native-image/com.fluree/db-iceberg/reflect-config.json` - Iceberg classes
+
+**Note:** Arrow columnar execution is not supported in GraalVM native images. Use row-based execution (default) for native builds.
 
 ### Common Issues
 
@@ -1021,6 +1028,59 @@ For native image builds, ensure Iceberg and Arrow classes are included in reflec
 - [ ] Statistics-based query planning improvements
 - [ ] Parallel execution for multi-table queries
 - [ ] Spill-to-disk for large joins
+
+## Module Structure
+
+The Iceberg integration is split into three separate Maven artifacts for modularity:
+
+| Module | Artifact | Purpose |
+|--------|----------|---------|
+| `db` | `com.fluree/db` | Core Fluree DB - loads with **zero Iceberg/Arrow deps** |
+| `db-iceberg` | `com.fluree/db-iceberg` | Iceberg row-based reads + R2RML + Virtual Graphs (no Arrow) |
+| `db-iceberg-arrow` | `com.fluree/db-iceberg-arrow` | Arrow vectorized execution (columnar) |
+
+### Directory Structure
+
+```
+fluree-db/
+├── src/                           # com.fluree/db core
+├── db-iceberg/                    # com.fluree/db-iceberg
+│   ├── deps.edn
+│   ├── src/fluree/db/
+│   │   ├── tabular/iceberg/...    # Iceberg source implementations
+│   │   └── virtual_graph/iceberg/ # VG execution (row-based)
+│   └── test/
+└── db-iceberg-arrow/              # com.fluree/db-iceberg-arrow
+    ├── deps.edn
+    ├── src/fluree/db/
+    │   └── tabular/iceberg/arrow.clj  # Arrow vectorized reads
+    └── test/
+```
+
+### Running Tests
+
+```bash
+# Run Iceberg tests from subproject
+cd db-iceberg && clj -X:test
+
+# Run Arrow tests from subproject
+cd db-iceberg-arrow && clj -X:test
+
+# Run all Iceberg tests from repository root
+clj -X:cljtest-iceberg
+```
+
+### Dependencies
+
+To use Iceberg with Fluree, add the appropriate dependency:
+
+```clojure
+;; Row-based Iceberg support (most common)
+{:deps {com.fluree/db-iceberg {:mvn/version "VERSION"}}}
+
+;; Arrow columnar support (requires db-iceberg)
+{:deps {com.fluree/db-iceberg-arrow {:mvn/version "VERSION"}}}
+```
 
 ## Development Setup
 
@@ -1147,12 +1207,31 @@ Response includes `storage-credentials` with temporary S3 credentials:
 
 ## Running Benchmarks
 
-```bash
-# Build OpenFlights test data
-make iceberg-openflights
+### Build OpenFlights Test Data
 
-# Run benchmarks
-clojure -M:dev:iceberg -e \
-  "(require 'fluree.db.iceberg-columnar-benchmark) \
-   (fluree.db.iceberg-columnar-benchmark/run-benchmark)"
+From the repository root:
+
+```bash
+make iceberg-openflights
+```
+
+Or manually from the db-iceberg subproject (see script/build_openflights_iceberg.clj for full deps):
+
+```bash
+cd db-iceberg && clojure -Sdeps '{:paths ["script"] :deps {...}}' -M -m build-openflights-iceberg
+```
+
+### Run Benchmarks
+
+Arrow vs row-based benchmarks comparing vectorized reads vs IcebergGenerics:
+
+```bash
+cd db-iceberg-arrow && clj -M:dev:test -m fluree.db.tabular.iceberg-bench
+```
+
+Or from REPL:
+
+```clojure
+(require '[fluree.db.tabular.iceberg-bench :as bench])
+(bench/run-benchmark)
 ```
