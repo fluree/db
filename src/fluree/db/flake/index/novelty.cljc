@@ -602,7 +602,7 @@
 
 (defn refresh
   [{:keys [novelty t alias] :as db} changes-ch max-old-indexes]
-  (trace/async-form ::refresh {}
+  (trace/async-form ::refresh {:ledger-alias alias :t t}
     (go-try
       (if (dirty? db)
         (let [start-time-ms (util/current-time-millis)
