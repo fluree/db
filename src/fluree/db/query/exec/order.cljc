@@ -1,6 +1,7 @@
 (ns fluree.db.query.exec.order
   (:require [clojure.core.async :as async]
-            [fluree.db.query.exec.where :as where]))
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.util.trace :as trace]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -42,7 +43,8 @@
   (if order-by
     (let [comparator (partial compare-solutions order-by)
           coll-ch    (async/into [] solution-ch)
-          ordered-ch (async/chan 2 (comp (map (partial sort comparator))
+          ordered-ch (async/chan 2 (comp (trace/xf ::order-by {})
+                                         (map (partial sort comparator))
                                          cat))]
       (async/pipe coll-ch ordered-ch))
     solution-ch))

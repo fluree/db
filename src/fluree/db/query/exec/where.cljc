@@ -13,6 +13,7 @@
             [fluree.db.util.async :refer [<? empty-channel]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.trace :as trace]
             [fluree.db.util.xhttp :as xhttp]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (clojure.lang MapEntry))))
@@ -665,14 +666,15 @@
   "Return a channel of all solutions from the data set `ds` that extend from the
   solutions in `solution-ch` and also match the where-clause pattern `pattern`."
   [ds tracker pattern error-ch solution-ch]
-  (let [out-ch (async/chan 2)]
-    (async/pipeline-async 2
-                          out-ch
-                          (fn [solution ch]
-                            (-> (match-pattern ds tracker solution pattern error-ch)
-                                (async/pipe ch)))
-                          solution-ch)
-    out-ch))
+  (trace/form ::pattern {:attributes {:pattern pattern}}
+    (let [out-ch (async/chan 2)]
+      (async/pipeline-async 2
+                            out-ch
+                            (fn [solution ch]
+                              (-> (match-pattern ds tracker solution pattern error-ch)
+                                  (async/pipe ch)))
+                            solution-ch)
+      out-ch)))
 
 (defn match-patterns
   [ds tracker solution patterns error-ch]
@@ -1008,15 +1010,16 @@
   ([ds q tracker error-ch]
    (search ds q tracker error-ch nil))
   ([ds q tracker error-ch initial-solution-ch]
-   (let [out-ch               (async/chan 2)
-         initial-solution-ch* (or initial-solution-ch
-                                  (values-initial-solution q))]
-     (if-let [where-clause (:where q)]
-       (async/pipeline-async 2
-                             out-ch
-                             (fn [initial-solution ch]
-                               (-> (match-clause ds tracker initial-solution where-clause error-ch)
-                                   (async/pipe ch)))
-                             initial-solution-ch*)
-       (async/pipe initial-solution-ch* out-ch))
-     out-ch)))
+   (trace/form ::search {}
+     (let [out-ch               (async/chan 2)
+           initial-solution-ch* (or initial-solution-ch
+                                    (values-initial-solution q))]
+       (if-let [where-clause (:where q)]
+         (async/pipeline-async 2
+                               out-ch
+                               (fn [initial-solution ch]
+                                 (-> (match-clause ds tracker initial-solution where-clause error-ch)
+                                     (async/pipe ch)))
+                               initial-solution-ch*)
+         (async/pipe initial-solution-ch* out-ch))
+       out-ch))))

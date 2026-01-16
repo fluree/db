@@ -7,7 +7,8 @@
             [fluree.db.query.exec.order :as order]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.select.subject :as subject]
-            [fluree.db.query.exec.where :as where]))
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.util.trace :as trace]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -23,7 +24,7 @@
   [{:keys [offset]} solution-ch]
   (if offset
     (async/pipe solution-ch
-                (async/chan 2 (drop offset)))
+                (async/chan 2 (comp (trace/xf ::offset {:offset offset}) (drop offset))))
     solution-ch))
 
 (defn take-limit
@@ -52,16 +53,17 @@
   containing a single result to the output channel instead of the single result
   alone. `:construct` and output-type `:sparql` need to be collected into a wrapper."
   [q result-ch]
-  (cond (:select-one q) (async/take 1 result-ch)
+  (trace/form ::collect-results {}
+    (cond (:select-one q) (async/take 1 result-ch)
 
-        (:construct q)
-        (async/transduce identity (completing conj (partial select/wrap-construct q)) [] result-ch)
+          (:construct q)
+          (async/transduce identity (completing conj (partial select/wrap-construct q)) [] result-ch)
 
-        (-> q :opts :output (= :sparql))
-        (async/transduce identity (completing conj select/wrap-sparql) [] result-ch)
+          (-> q :opts :output (= :sparql))
+          (async/transduce identity (completing conj select/wrap-sparql) [] result-ch)
 
-        :else
-        (async/into [] result-ch)))
+          :else
+          (async/into [] result-ch))))
 
 (defn execute*
   ([ds tracker q error-ch]
@@ -108,10 +110,11 @@
   ([ds q]
    (query ds nil q))
   ([ds tracker q]
-   (go
-     (let [error-ch  (async/chan)
-           prepped-q (prep-subqueries q)
-           result-ch (execute ds tracker prepped-q error-ch)]
-       (async/alt!
-         error-ch ([e] (async/close! error-ch) e)
-         result-ch ([result] result))))))
+   (trace/async-form ::query {}
+     (go
+       (let [error-ch  (async/chan)
+             prepped-q (prep-subqueries q)
+             result-ch (execute ds tracker prepped-q error-ch)]
+         (async/alt!
+           error-ch ([e] (async/close! error-ch) e)
+           result-ch ([result] result)))))))
