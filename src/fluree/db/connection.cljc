@@ -98,8 +98,8 @@
   nil)
 
 (defn all-publications
-  [{:keys [remote-systems] :as _conn}]
-  remote-systems)
+  [conn]
+  (:remote-systems conn))
 
 (defn subscribe-all
   [publications ledger-alias]
@@ -307,10 +307,6 @@
   [{:keys [primary-publisher] :as _conn}]
   primary-publisher)
 
-(defn publications
-  [conn]
-  (:remote-systems conn))
-
 (defn all-nameservices
   [{:keys [remote-systems] :as conn}]
   (concat (publishers conn) remote-systems))
@@ -413,7 +409,7 @@
 (defn known-addresses
   [conn ledger-alias]
   (go-try
-    (loop [[nsv & r] (publications conn)
+    (loop [[nsv & r] (all-publications conn)
            addrs     []]
       (if nsv
         (recur r (into addrs (<? (nameservice/known-addresses nsv ledger-alias))))

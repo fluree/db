@@ -229,16 +229,13 @@
            (throw (ex-info "Virtual graphs are not supported in ClojureScript"
                            {:status 400 :error :db/unsupported})))
         ;; Regular ledger
-        (if ns-record
-          (let [ledger (<? (connection/load-ledger-alias conn normalized-alias))
-                db     (ledger/current-db ledger)
-                t*     (or explicit-t t)
-                query* (-> sanitized-query
-                           (assoc :t t*)
-                           (ledger-opts-override db))]
-            (<? (restrict-db db tracker query* conn)))
-          (throw (ex-info (str "Load for " normalized-alias " failed due to failed address lookup.")
-                          {:status 404 :error :db/unkown-ledger})))))))
+        (let [ledger (<? (connection/load-ledger-alias conn normalized-alias))
+              db     (ledger/current-db ledger)
+              t*     (or explicit-t t)
+              query* (-> sanitized-query
+                         (assoc :t t*)
+                         (ledger-opts-override db))]
+          (<? (restrict-db db tracker query* conn)))))))
 
 (defn load-aliases
   [conn tracker aliases sanitized-query]
