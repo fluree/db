@@ -6,6 +6,7 @@
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.json-ld.iri :as iri]
+            [fluree.db.query.exec.aggregate :as agg]
             [fluree.db.query.exec.eval :as eval]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
@@ -655,30 +656,69 @@
         unwrap-tuple-patterns
         select/construct-selector)))
 
+(defn- extract-simple-agg-op
+  "Returns {:agg-op op, :arg-var ?v} for simple (op ?v)/(count *) aggregates."
+  [code]
+  (when (and (seq? code)
+             (symbol? (first code)))
+    (let [op   (first code)
+          args (rest code)]
+      (cond
+        (and (= 'count op)
+             (= 1 (count args))
+             (= '* (first args)))
+        {:agg-op 'count-star
+         :arg-var nil}
+
+        (and (= 1 (count args))
+             (symbol? (first args))
+             (v/query-variable? (first args))
+             (contains? eval/allowed-aggregate-fns op))
+        {:agg-op  op
+         :arg-var (symbol (first args))}
+
+        :else
+        nil))))
+
+(defn- build-streaming-agg
+  "Returns streaming-agg map for `code`, or nil."
+  [code]
+  (when-let [{:keys [agg-op arg-var]} (extract-simple-agg-op code)]
+    (when-let [aggregator (agg/streaming-aggregator agg-op)]
+      {:agg-op     agg-op
+       :arg-var    arg-var
+       :result-var (gensym "?agg")
+       :aggregator aggregator})))
+
 (defn parse-select-as-fn
   [f context output]
-  (let [parsed-fn  (parse-code f)
-        fn-name    (some-> parsed-fn second first)
-        bind-var   (last parsed-fn)
-        aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))
-        agg-vars   (variables parsed-fn)
-        agg-info   (when aggregate?
-                     {:fn-name fn-name
-                      :vars    agg-vars})]
+  (let [parsed-fn     (parse-code f)
+        inner-form    (second parsed-fn)
+        fn-name       (when (seq? inner-form) (first inner-form))
+        bind-var      (last parsed-fn)
+        aggregate?    (when fn-name (eval/allowed-aggregate-fns fn-name))
+        agg-vars      (variables parsed-fn)
+        streaming-agg (when aggregate?
+                        (when-let [sagg (build-streaming-agg inner-form)]
+                          (assoc sagg :result-var bind-var)))
+        agg-info      (when aggregate?
+                        {:fn-name fn-name
+                         :vars    agg-vars})]
     (-> parsed-fn
         (eval/compile context)
-        (select/as-selector output bind-var aggregate? agg-info))))
+        (select/as-selector output bind-var aggregate? streaming-agg agg-info))))
 
 (defn parse-select-aggregate
   [f context]
-  (let [parsed   (parse-code f)
-        fn-name  (when (seq? parsed) (first parsed))
-        agg-vars (variables parsed)
-        agg-info {:fn-name fn-name
-                  :vars    agg-vars}]
-    (-> parsed
-        (eval/compile context)
-        (select/aggregate-selector agg-info))))
+  (let [code          (parse-code f)
+        fn-name       (when (seq? code) (first code))
+        agg-vars      (variables code)
+        agg-fn        (eval/compile code context)
+        agg-info      {:fn-name fn-name
+                       :vars    agg-vars}]
+    (if-let [streaming-agg (build-streaming-agg code)]
+      (select/streaming-aggregate-selector streaming-agg agg-info)
+      (select/aggregate-selector agg-fn agg-info))))
 
 (defn reverse?
   [context k]

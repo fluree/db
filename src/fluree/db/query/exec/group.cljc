@@ -1,10 +1,12 @@
 (ns fluree.db.query.exec.group
   (:require [clojure.core.async :as async]
+            [fluree.db.query.exec.aggregate :as agg]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.select.fql :as select.fql]
             [fluree.db.query.exec.select.sparql :as select.sparql]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.util :as util]))
+            [fluree.db.util :as util])
+  (:import [fluree.db.query.exec.select AsSelector StreamingAggregateSelector VariableSelector]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -23,13 +25,18 @@
                 (transient {})
                 m))))
 
+(defn extract-group-key
+  "Extracts the group key from a solution."
+  [variables solution]
+  (mapv (fn [v]
+          (-> solution
+              (get v)
+              where/sanitize-match))
+        variables))
+
 (defn split-solution-by
   [variables variable-set solution]
-  (let [group-key   (mapv (fn [v]
-                            (-> solution
-                                (get v)
-                                where/sanitize-match))
-                          variables)
+  (let [group-key   (extract-group-key variables solution)
         grouped-val (dissoc-many solution variable-set)]
     [group-key grouped-val]))
 
@@ -95,17 +102,102 @@
   [match compact]
   (display-sparql-aggregate match compact))
 
+(defn- streaming-agg-selector?
+  "Returns true if selector supports streaming aggregation."
+  [sel]
+  (or (instance? StreamingAggregateSelector sel)
+      (and (instance? AsSelector sel)
+           (some? (:streaming-agg sel)))))
+
+(defn- streaming-eligible?
+  "Returns true if the query can use streaming aggregation.
+  Streaming is possible when:
+  - No HAVING clause (requires all solutions to evaluate)
+  - Has streaming aggregates
+  - Either implicit grouping with all aggregate selectors,
+    or explicit group-by with all selectors being group vars or aggregates"
+  [having streaming-aggs implicit? selectors group-vars group-vars-set]
+  (and (nil? having)
+       (seq streaming-aggs)
+       (if implicit?
+         (every? streaming-agg-selector? selectors)
+         (and (seq group-vars)
+              (every? (fn [sel]
+                        (or (and (instance? VariableSelector sel)
+                                 (contains? group-vars-set (:var sel)))
+                            (streaming-agg-selector? sel)))
+                      selectors)))))
+
+(defn- update-streaming-groups
+  "Updates streaming aggregate states for a solution.
+  Returns updated groups map with accumulated aggregate states per group key."
+  [group-vars streaming-aggs groups solution]
+  (let [group-key (extract-group-key group-vars solution)
+        {:keys [group-vars-map agg-states]}
+        (get groups group-key
+             {:group-vars-map (zipmap group-vars group-key)
+              :agg-states     {}})
+        agg-states'
+        (reduce (fn [states {:keys [arg-var result-var aggregator]}]
+                  (let [agg    (get states result-var (aggregator))
+                        tv     (when arg-var
+                                 (some-> solution
+                                         (get arg-var)
+                                         where/mch->typed-val))
+                        agg'   (agg/step agg tv)]
+                    (assoc states result-var agg')))
+                agg-states
+                streaming-aggs)]
+    (assoc groups group-key {:group-vars-map group-vars-map
+                             :agg-states     agg-states'})))
+
+(defn- finalize-streaming-groups
+  "Completion function that converts accumulated aggregate states into final solutions.
+  Called once after all solutions have been processed."
+  [streaming-aggs groups]
+  (reduce-kv
+   (fn [solutions _group-key {:keys [group-vars-map agg-states]}]
+     (let [solution-with-aggs
+           (reduce (fn [sol {:keys [result-var]}]
+                     (let [agg      (get agg-states result-var)
+                           tv       (agg/complete agg)
+                           base-mch (where/unmatched-var result-var)
+                           mch      (where/typed-val->mch base-mch tv)]
+                       (assoc sol result-var mch)))
+                   group-vars-map
+                   streaming-aggs)]
+       (conj solutions solution-with-aggs)))
+   []
+   groups))
+
 (defn combine
   "Returns a channel of solutions from `solution-ch` collected into groups defined
   by the `:group-by` clause specified in the supplied query."
-  [{:keys [group-by select]} solution-ch]
-  (if-let [grouping (or group-by
-                        (implicit-grouping select))]
-    (let [grouping-set (set grouping)]
-      (-> (async/transduce (map (partial split-solution-by grouping grouping-set))
-                           (completing group-solution
-                                       (partial unwind-groups grouping))
+  [{:keys [group-by select having]} solution-ch]
+  (let [selectors      (util/sequential select)
+        group-vars     (vec group-by)
+        group-vars-set (set group-vars)
+        streaming-aggs (->> selectors
+                            (filter streaming-agg-selector?)
+                            (mapv :streaming-agg))
+        implicit?      (and (empty? group-vars)
+                            (some select/implicit-grouping? selectors))]
+    (if (streaming-eligible? having streaming-aggs implicit?
+                             selectors group-vars group-vars-set)
+      (-> (async/transduce (map identity)
+                           (completing (partial update-streaming-groups group-vars streaming-aggs)
+                                       (partial finalize-streaming-groups streaming-aggs))
                            {}
                            solution-ch)
-          (async/pipe (async/chan 2 cat))))
-    solution-ch))
+          (async/pipe (async/chan 2 cat)))
+
+      (if-let [grouping (or group-by
+                            (implicit-grouping select))]
+        (let [grouping-set (set grouping)]
+          (-> (async/transduce (map (partial split-solution-by grouping grouping-set))
+                               (completing group-solution
+                                           (partial unwind-groups grouping))
+                               {}
+                               solution-ch)
+              (async/pipe (async/chan 2 cat))))
+        solution-ch))))

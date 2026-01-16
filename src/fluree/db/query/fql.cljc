@@ -85,7 +85,7 @@
     - FQL output: a single FQL-style result vector [[n]]
     - SPARQL output: a SPARQL JSON results map
 
-  Only used when simple-count-distinct-subject-spec has matched."
+  Only used when simple-count-distinct-spec has matched."
   [ds {:keys [pred-iri alias output]}]
   (go-try
     (let [;; unwrap dataset if present – for now we only handle a single active
