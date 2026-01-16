@@ -232,10 +232,10 @@
       root-db))
 
   optimize/Optimizable
-  (-reorder [_ parsed-query]
+  (-reorder [_ where-clause]
     (go-try
       (let [db (<? db-chan)]
-        (<? (optimize/-reorder db parsed-query)))))
+        (<? (optimize/-reorder db where-clause)))))
 
   (-explain [_ parsed-query]
     (go-try

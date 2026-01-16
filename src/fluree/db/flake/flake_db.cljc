@@ -16,7 +16,7 @@
             [fluree.db.flake.index.novelty :as novelty]
             [fluree.db.flake.index.storage :as index-storage]
             [fluree.db.flake.match :as match]
-            [fluree.db.flake.optimize :refer  [explain-query optimize-query]]
+            [fluree.db.flake.optimize :refer  [explain-query optimize-where]]
             [fluree.db.flake.reasoner :as flake.reasoner]
             [fluree.db.flake.transact :as flake.transact]
             [fluree.db.indexer :as indexer]
@@ -506,8 +506,9 @@
     (reasoner-util/reasoned-facts db))
 
   optimize/Optimizable
-  (-reorder [db parsed-query]
-    (async/go (optimize-query db parsed-query)))
+  (-reorder [db where-clause]
+    (async/go
+      (optimize-where db where-clause)))
 
   (-explain [db parsed-query]
     (async/go (explain-query db parsed-query))))
