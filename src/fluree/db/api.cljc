@@ -1,5 +1,6 @@
 (ns fluree.db.api
-  (:require #?(:clj [fluree.db.nameservice :as nameservice])
+  (:require #?(:clj [fluree.db.api.stream :as stream-api])
+            #?(:clj [fluree.db.nameservice :as nameservice])
             #?(:clj [fluree.db.virtual-graph.create :as vg-create])
             #?(:clj [fluree.db.virtual-graph.drop :as vg-drop])
             [camel-snake-kebab.core :refer [->camelCaseString]]
@@ -1145,6 +1146,98 @@
     (go-try
       (let [ledger (<? (connection/load-ledger-alias conn ledger-alias))]
         (<? (ledger/reindex! ledger opts)))))))
+
+;; Streaming Insert APIs (JVM only)
+
+#?(:clj
+   (defn stream-insert
+     "Stages NDJSON (newline-delimited JSON-LD) data into a database without committing.
+
+     This is useful for staging multiple batches before a single commit,
+     or for preview/validation scenarios.
+
+     Parameters:
+       db    - Database value to stage into
+       input - java.io.Reader, InputStream, or file path string
+       opts  - (optional) Options map:
+         :context    - Shared JSON-LD context (optional)
+         :error-mode - :fail (default), :skip, or :collect
+
+     Returns a channel resolving to:
+       {:db staged-db
+        :stats {:lines-staged n}
+        :errors [...]}  ; if error-mode is :collect
+
+     Example:
+       ;; Stage from a file
+       (with-open [rdr (clojure.java.io/reader \"data.ndjson\")]
+         @(stream-insert db rdr {:context {\"@vocab\" \"http://example.org/\"}}))"
+     ([db input] (stream-insert db input {}))
+     ([db input opts]
+      (promise-wrap
+       (trace/async-form ::stream-insert {}
+         (stream-api/stream-insert db input opts))))))
+
+#?(:clj
+   (defn stream-insert!
+     "Streams NDJSON (newline-delimited JSON-LD) data into a ledger with automatic
+     batching and backpressure handling.
+
+     Processes documents in batches, committing when:
+     - Novelty threshold is reached (default 70% of max)
+     - Line count is reached (default 10000)
+     - Time elapsed (default 5000ms)
+     - End of stream
+
+     If max novelty is exceeded, automatically waits for indexing with
+     exponential backoff before resuming.
+
+     Parameters:
+       conn      - Fluree connection
+       ledger-id - Target ledger alias or address
+       input     - java.io.Reader, InputStream, or file path string
+       opts      - (optional) Options map:
+         :context                  - Shared JSON-LD context
+         :batch-threshold          - Novelty ratio to trigger commit (default 0.7)
+         :max-batch-lines          - Max lines per batch (default 10000)
+         :max-batch-time-ms        - Time-based flush interval (default 5000)
+         :max-backpressure-wait-ms - Max wait for indexing (default 300000 / 5 min)
+         :error-mode               - :fail (default), :skip, or :collect
+         :progress-ch              - Channel for progress events
+
+     Returns channel resolving to:
+       {:status :success | :partial | :failed
+        :lines-processed n
+        :batches-committed n
+        :final-t n
+        :errors [...]}  ; if :error-mode is :collect
+
+     Progress events (emitted to :progress-ch):
+       {:type :progress, :lines-read n, :lines-staged n, :batches-committed n, :state :running}
+       {:type :batch-committed, :batch-num n, :lines-in-batch n, :t n}
+       {:type :backpressure, :action :waiting | :resumed, :novelty-ratio n, :waited-ms n}
+
+     Example:
+       ;; Basic usage
+       (with-open [rdr (clojure.java.io/reader \"data.ndjson\")]
+         @(stream-insert! conn \"my-ledger\" rdr
+            {:context {\"@vocab\" \"http://example.org/\"}}))
+
+       ;; With progress monitoring
+       (let [progress-ch (async/chan 100)]
+         (async/go-loop []
+           (when-let [event (async/<! progress-ch)]
+             (println \"Progress:\" event)
+             (recur)))
+         @(stream-insert! conn \"my-ledger\" \"large-file.ndjson\"
+            {:progress-ch progress-ch}))"
+     ([conn ledger-id input]
+      (stream-insert! conn ledger-id input {}))
+     ([conn ledger-id input opts]
+      (validate-connection conn)
+      (promise-wrap
+       (trace/async-form ::stream-insert! {:ledger-alias ledger-id}
+         (stream-api/stream-insert! conn ledger-id input opts))))))
 
 ;; Full-Text Search APIs (JVM only)
 
