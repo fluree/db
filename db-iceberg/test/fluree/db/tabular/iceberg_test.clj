@@ -1,14 +1,16 @@
 (ns ^:iceberg fluree.db.tabular.iceberg-test
   "Tests for IcebergSource using OpenFlights airline data.
 
-   Requires :iceberg alias for dependencies.
-   Run with: clojure -M:dev:iceberg:cljtest '{:kaocha.filter/focus-meta [:iceberg]}'
+   Requires :test alias for dependencies (includes Hadoop for test fixtures).
+   Run with: clj -X:test
 
    Or from REPL:
      (require '[fluree.db.tabular.iceberg-test :as t])
-     (t/run-tests)"
+     (t/run-tests)
+
+   Note: These tests use HadoopTables for loading local test warehouses.
+   Hadoop is a test-only dependency and not shipped with the main artifact."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [fluree.db.tabular.iceberg :as iceberg]
             [fluree.db.tabular.iceberg.core :as core]
             [fluree.db.tabular.protocol :as proto])
   (:import [java.io File]
@@ -17,28 +19,66 @@
            [org.apache.hadoop.conf Configuration]))
 
 ;;; ---------------------------------------------------------------------------
-;;; Test Fixtures
+;;; Test Fixtures - Hadoop-based (test-only dependency)
 ;;; ---------------------------------------------------------------------------
 
 (def ^:private warehouse-path
   "Path to OpenFlights Iceberg warehouse."
   (str (System/getProperty "user.dir") "/dev-resources/openflights/warehouse"))
 
-(def ^:private source (atom nil))
+(def ^:private hadoop-tables (atom nil))
 
 (defn- warehouse-exists? []
   (.exists (File. (str warehouse-path "/openflights/airlines"))))
 
+(defn- create-test-hadoop-tables
+  "Create HadoopTables for test fixtures. This is test-only - not shipped in main artifact."
+  ^HadoopTables []
+  (let [conf (Configuration.)]
+    (HadoopTables. conf)))
+
+;; Test source using HadoopTables directly (for tests that need ITabularSource protocol)
+(defrecord TestHadoopSource [^HadoopTables tables warehouse-path]
+  proto/ITabularSource
+  (scan-batches [_ table-name opts]
+    (let [table-path (str warehouse-path "/" table-name)
+          ^Table table (.load tables table-path)]
+      (core/scan-with-generics table opts)))
+
+  (scan-arrow-batches [_ table-name _opts]
+    (throw (ex-info "Arrow not available in test source" {:table table-name})))
+
+  (scan-rows [this table-name opts]
+    (proto/scan-batches this table-name opts))
+
+  (get-schema [_ table-name opts]
+    (let [table-path (str warehouse-path "/" table-name)
+          ^Table table (.load tables table-path)]
+      (core/extract-schema table opts)))
+
+  (get-statistics [_ table-name opts]
+    (let [table-path (str warehouse-path "/" table-name)
+          ^Table table (.load tables table-path)]
+      (core/extract-statistics table opts)))
+
+  (supported-predicates [_]
+    core/supported-predicate-ops)
+
+  proto/ICloseable
+  (close [_] nil))
+
+(def ^:private source (atom nil))
+
 (defn source-fixture [f]
   (if (warehouse-exists?)
-    (do
-      (reset! source (iceberg/create-iceberg-source {:warehouse-path warehouse-path}))
+    (let [tables (create-test-hadoop-tables)]
+      (reset! hadoop-tables tables)
+      (reset! source (->TestHadoopSource tables warehouse-path))
       (try
         (f)
         (finally
-          (when @source
-            (proto/close @source)
-            (reset! source nil)))))
+          (reset! source nil)
+          (reset! hadoop-tables nil))))
     (println "SKIP: OpenFlights warehouse not found. Run 'make iceberg-openflights' first.")))
 
 (use-fixtures :once source-fixture)

@@ -3,6 +3,7 @@
 
    Handles configuration parsing, catalog resolution, and VG construction."
   (:require [clojure.string :as str]
+            [fluree.db.storage.file :as file-store]
             [fluree.db.storage.s3 :as s3]
             [fluree.db.storage.vended-s3 :as vended-s3]
             [fluree.db.tabular.iceberg :as iceberg]
@@ -153,36 +154,55 @@
    Returns nil if store-config is nil or not a map."
   [store-config]
   (when (map? store-config)
-    {:type     (keyword (or (:type store-config)
-                            (get store-config "type")
-                            :s3))
-     :bucket   (or (:bucket store-config)
-                   (get store-config "bucket"))
-     :prefix   (or (:prefix store-config)
-                   (get store-config "prefix")
-                   "")
-     :endpoint (or (:endpoint store-config)
-                   (get store-config "endpoint"))}))
+    (let [;; Detect type from config shape if not explicitly set
+          ;; FileStore has :root, S3Store has :bucket
+          explicit-type (or (:type store-config) (get store-config "type"))
+          inferred-type (cond
+                          explicit-type (keyword explicit-type)
+                          (or (:root store-config) (get store-config "root")) :file
+                          (or (:bucket store-config) (get store-config "bucket")) :s3
+                          :else nil)]
+      {:type     inferred-type
+       ;; S3 fields
+       :bucket   (or (:bucket store-config)
+                     (get store-config "bucket"))
+       :prefix   (or (:prefix store-config)
+                     (get store-config "prefix")
+                     "")
+       :endpoint (or (:endpoint store-config)
+                     (get store-config "endpoint"))
+       ;; FileStore fields
+       :root     (or (:root store-config)
+                     (get store-config "root"))
+       :identifier (or (:identifier store-config)
+                       (get store-config "identifier"))})))
 
 (defn- create-store-from-config
   "Create a storage store from configuration data.
 
-   Store config format:
+   Store config format for S3:
      {:type :s3
       :bucket \"warehouse\"
       :prefix \"\"           ; optional, defaults to \"\"
       :endpoint \"http://localhost:9000\"}  ; optional for real S3
 
-   Currently supports :s3 type. Returns nil if config is invalid."
+   Store config format for FileStore:
+     {:type :file
+      :root \"/path/to/warehouse\"}
+
+   Type is inferred from config shape if not explicitly set.
+   Returns nil if config is invalid."
   [store-config]
-  (let [{:keys [type bucket prefix endpoint]} (normalize-store-config store-config)]
-    (when (and type bucket)
-      (case type
-        :s3 (s3/open nil bucket (or prefix "") endpoint)
-        ;; Add other store types here as needed
-        (do
-          (log/warn "Unknown store type:" type)
-          nil)))))
+  (let [{:keys [type bucket prefix endpoint root identifier]} (normalize-store-config store-config)]
+    (case type
+      :s3 (when bucket
+            (s3/open nil bucket (or prefix "") endpoint))
+      :file (when root
+              (file-store/open identifier root))
+      ;; Unknown or nil type
+      (when type
+        (log/warn "Unknown store type:" type)
+        nil))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; IcebergDatabase Construction
@@ -250,12 +270,16 @@
                            (get config "warehouse-path")
                            (get config "warehousePath"))
         ;; Store can be either:
-        ;; 1. Configuration data: {:type :s3 :bucket "..." :endpoint "..."}
-        ;; 2. Already a store object (legacy/internal use)
-        ;; We detect config data by checking for :bucket or "bucket" keys
+        ;; 1. Configuration data: {:type :s3 :bucket "..."} or {:type :file :root "..."}
+        ;; 2. Already a store object (live object passed directly)
+        ;; We detect config data by checking for :type key (only config has explicit type)
+        ;; Note: We can't just check for :bucket/:root because records have those keys too
         store-raw (or (:store config) (get config "store"))
         store (if (and (map? store-raw)
-                       (or (:bucket store-raw) (get store-raw "bucket")))
+                       (not (record? store-raw))  ; Records are live stores, not config
+                       (or (:type store-raw) (get store-raw "type")       ; Explicit type
+                           (:bucket store-raw) (get store-raw "bucket")   ; S3 config
+                           (:root store-raw) (get store-raw "root")))     ; FileStore config
                 ;; It's configuration data - create the store
                 (create-store-from-config store-raw)
                 ;; It's already a store object (or nil)
@@ -362,11 +386,13 @@
                                :warehouse-path (or warehouse-path "")
                                :file-io-opts file-io-opts}))
 
-                           ;; Hadoop-based (legacy, no store)
+                           ;; No store or REST catalog - configuration error
                            :else
-                           (fn [_table-name]
-                             (iceberg/create-iceberg-source
-                              {:warehouse-path warehouse-path})))]
+                           (throw (ex-info (str "Iceberg virtual graph requires either :store or :catalog configuration. "
+                                                "Hadoop-based sources are no longer supported.")
+                                           {:status 400
+                                            :error :db/iceberg-vg-config-required
+                                            :warehouse-path warehouse-path})))]
     ;; Create an IcebergSource for each unique table
     ;; For vended credentials, each table gets its own store with table-specific credentials
     (into {}

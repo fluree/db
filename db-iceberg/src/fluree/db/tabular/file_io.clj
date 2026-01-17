@@ -16,6 +16,7 @@
             [clojure.string :as str]
             [fluree.db.storage :as storage]
             [fluree.db.tabular.seekable-stream :as seekable]
+            [fluree.db.util.filesystem :as fs]
             [fluree.db.util.log :as log])
   (:import [java.io ByteArrayOutputStream InputStream]
            [org.apache.iceberg.io FileIO InputFile OutputFile PositionOutputStream SeekableInputStream]))
@@ -71,18 +72,53 @@
      :bucket   nil
      :path     path}))
 
+(defn- strip-prefix
+  "Strip a prefix from a path and remove any leading slash from the remainder."
+  [path prefix]
+  (let [stripped (subs path (count prefix))]
+    (if (str/starts-with? stripped "/")
+      (subs stripped 1)
+      stripped)))
+
 (defn- get-effective-path
   "Get the effective storage path for a store.
 
    For stores that implement FullURIStore (like VendedCredentialsStore), returns the original path.
-   For single-bucket stores (like S3Store), returns just the key path."
+   For single-bucket stores (like S3Store), returns just the key path.
+   For FileStore with a root, strips the root prefix from paths to avoid doubling."
   [store parsed-path]
   (if (and (satisfies? storage/FullURIStore store)
            (storage/expects-full-uri? store))
     ;; Store expects full URIs like s3://bucket/path
     (:original parsed-path)
     ;; Standard store expects just the key path (bucket configured at store level)
-    (:path parsed-path)))
+    ;; For FileStore, strip the root prefix from paths to avoid doubling
+    (let [path (:path parsed-path)
+          root (:root store)]
+      (if-not (and root (string? path))
+        path
+        ;; Check both absolute and relative root paths
+        (let [abs-root (fs/local-path root)
+              ;; Normalize root for comparison (ensure no trailing slash)
+              rel-root (if (str/ends-with? root "/")
+                         (subs root 0 (dec (count root)))
+                         root)]
+          (cond
+            ;; Path starts with absolute root
+            (str/starts-with? path abs-root)
+            (strip-prefix path abs-root)
+
+            ;; Path starts with relative root (with trailing slash)
+            (str/starts-with? path (str rel-root "/"))
+            (strip-prefix path (str rel-root "/"))
+
+            ;; Path equals relative root exactly
+            (= path rel-root)
+            ""
+
+            ;; No match - use as-is
+            :else
+            path))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; SeekableInputStream Implementation

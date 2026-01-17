@@ -109,21 +109,9 @@ SPARQL Query
 
 Use `fluree.db.api/connect-iceberg` to publish an Iceberg VG into the nameservice (loaded lazily on first query).
 
-#### Option A: Local development (HadoopTables) — simplest
-
-```clojure
-(require '[fluree.db.api :as fluree])
-
-(def conn @(fluree/connect-file {:storage-path "./data"}))
-
-@(fluree/connect-iceberg conn "openflights-vg"
-   {:warehouse-path "./dev-resources/iceberg/openflights"
-    :mapping "dev-resources/openflights/r2rml.ttl"})
-```
-
-#### Option B: REST catalog (recommended for production catalogs)
-
-REST catalog mode currently requires a Fluree `store` for file reads (e.g. an `S3Store`):
+The db-iceberg module is **Hadoop-free** and supports two catalog modes:
+- **REST catalog** (recommended) - Polaris, Snowflake, Databricks UC, etc.
+- **Fluree storage** - Direct access via Fluree's storage protocols
 
 ```clojure
 (require '[fluree.db.api :as fluree]
@@ -145,17 +133,18 @@ REST catalog mode currently requires a Fluree `store` for file reads (e.g. an `S
 ```clojure
 (require '[fluree.db.tabular.iceberg :as iceberg])
 
-;; Local development with Hadoop catalog
-(def source
-  (iceberg/create-iceberg-source
-    {:warehouse-path "/path/to/iceberg/warehouse"}))
-
-;; Production with REST catalog
+;; REST catalog with Fluree storage (recommended)
 (def source
   (iceberg/create-rest-iceberg-source
     {:uri "http://localhost:8181"
      :store my-s3-store
      :auth-token "optional-bearer-token"}))
+
+;; Direct Fluree storage (requires known metadata location)
+(def source
+  (iceberg/create-fluree-iceberg-source
+    {:store my-s3-store
+     :warehouse-path "s3://bucket/warehouse"}))
 ```
 
 ### 2. Define R2RML Mapping
@@ -328,46 +317,46 @@ Recommended operating modes:
 
 ### Factory Functions
 
-Three factory functions are available depending on your deployment:
+Two factory functions are available:
 
 ```clojure
 (require '[fluree.db.tabular.iceberg :as iceberg])
 
-;; 1. Hadoop-based (local filesystem, simple development)
-(def source
-  (iceberg/create-iceberg-source
-    {:warehouse-path "/path/to/warehouse"}))
-
-;; 2. REST catalog (cloud-agnostic, recommended for production)
+;; 1. REST catalog (recommended - Polaris, Snowflake, Databricks UC, etc.)
 (def source
   (iceberg/create-rest-iceberg-source
     {:uri "http://localhost:8181"
      :store my-s3-store
      :auth-token "optional-bearer-token"}))
 
-;; 3. Fluree storage (uses existing Fluree store)
+;; 2. Fluree storage (direct access with known metadata location)
 (def source
   (iceberg/create-fluree-iceberg-source
     {:store my-fluree-store
      :warehouse-path "s3://bucket/warehouse"}))
 ```
 
+**Note:** Hadoop-based sources (`create-iceberg-source`) are no longer supported. The `db-iceberg` module is Hadoop-free by design for smaller footprint and GraalVM compatibility.
+
 ### Virtual Graph Configuration
 
 ```clojure
 {:type :iceberg
  :name "my-iceberg-vg"
- :config {:warehouse-path "/path/to/iceberg/warehouse"
+ :config {:catalog {:type :rest
+                    :uri "http://localhost:8181"
+                    :auth-token "optional"}
+          :store my-s3-store
           :mapping "path/to/mapping.ttl"}}
 ```
 
 | Option | Description |
 |--------|-------------|
-| `:warehouse-path` | Path to Iceberg warehouse directory |
+| `:catalog` | REST catalog config: `{:type :rest :uri "..." :auth-token "..."}` (recommended) |
+| `:store` | Fluree store for file reads (e.g., `S3Store`, `FileStore`) - required |
 | `:mapping` | Path to R2RML mapping file (TTL format) |
 | `:mappingInline` | Inline R2RML mapping (Turtle string or JSON-LD) |
-| `:store` | Fluree store for file reads (e.g., `S3Store`, `FileStore`) |
-| `:catalog` | REST catalog config, e.g. `{:type :rest :uri \"...\" :auth-token \"...\"}` |
+| `:warehouse-path` | Optional path prefix for direct storage access (used with `create-fluree-iceberg-source`) |
 
 ## R2RML Mappings
 
@@ -948,9 +937,9 @@ Benchmarks run on the OpenFlights dataset (airlines: 6,162 rows, routes: 67,663 
 
 ## Troubleshooting
 
-### Verbose Hadoop Logging
+### Verbose Parquet/Iceberg Logging
 
-Suppress Hadoop/Parquet debug logs:
+Suppress Parquet/Iceberg debug logs:
 
 ```bash
 # From db-iceberg subproject
@@ -974,7 +963,7 @@ For native image builds, ensure Iceberg classes are included in reflection confi
 
 | Issue | Solution |
 |-------|----------|
-| "Cannot resolve metadata for table" | Check warehouse-path and table name format |
+| "Cannot resolve metadata for table" | Check REST catalog URI, table name format, or metadata-location |
 | Slow queries without pushdown | Verify predicates are using supported patterns |
 | Memory issues with large joins | Reduce batch-size, enable columnar execution |
 | Missing results with OPTIONAL | Check join orientation (probe=required side) |

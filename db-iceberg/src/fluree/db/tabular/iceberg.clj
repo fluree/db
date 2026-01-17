@@ -3,12 +3,14 @@
 
    This namespace provides:
    - FlureeIcebergSource: Production-ready source using Fluree's FileIO
-   - Re-exports create-iceberg-source from hadoop namespace for convenience
+   - RESTIcebergSource: REST catalog-based source (via create-rest-iceberg-source)
 
-   For local development/testing, you can use either:
-   1. create-iceberg-source (Hadoop-based, just needs a path)
-   2. create-rest-iceberg-source (REST catalog, cloud-agnostic)
-   3. create-fluree-iceberg-source (Fluree storage, needs a store)
+   Supported catalog modes (Hadoop-free):
+   1. create-rest-iceberg-source - REST catalog (Polaris, Snowflake, Databricks UC, etc.)
+   2. create-fluree-iceberg-source - Direct Fluree storage with metadata location
+
+   Note: Hadoop-based sources (HadoopTables, HadoopCatalog) are NOT supported in this module.
+   This keeps the module lightweight and GraalVM-compatible.
 
    Supports:
    - Predicate pushdown (eq, ne, gt, gte, lt, lte, in, between, is-null, not-null, and, or)
@@ -16,7 +18,7 @@
    - Time-travel via snapshot-id or as-of-time
    - Schema introspection
    - Statistics from snapshot summary
-   - Arrow vectorized reads for high performance
+   - Arrow vectorized reads for high performance (requires db-iceberg-arrow)
 
    Performance optimizations:
    - Caffeine-based metadata cache for immutable metadata files
@@ -24,7 +26,6 @@
   (:require [clojure.string :as str]
             [fluree.db.tabular.file-io :as file-io]
             [fluree.db.tabular.iceberg.core :as core]
-            [fluree.db.tabular.iceberg.hadoop :as hadoop]
             [fluree.db.tabular.iceberg.rest :as rest]
             [fluree.db.tabular.protocol :as proto]
             [fluree.db.util.log :as log])
@@ -55,20 +56,25 @@
   @table-cache)
 
 ;;; ---------------------------------------------------------------------------
-;;; Re-export Hadoop factory for backward compatibility
+;;; Factory Functions
 ;;; ---------------------------------------------------------------------------
 
-(def create-iceberg-source
-  "Create an IcebergSource for querying Iceberg tables via Hadoop.
+(defn create-iceberg-source
+  "DEPRECATED: Hadoop-based sources are no longer supported.
 
-   Config:
-     :warehouse-path - Root path to Iceberg warehouse (required)
+   Use one of these alternatives:
+   - create-rest-iceberg-source for REST catalogs (Polaris, Snowflake, etc.)
+   - create-fluree-iceberg-source for direct Fluree storage access
 
-   Example:
-     (create-iceberg-source {:warehouse-path \"/path/to/warehouse\"})
-
-   See fluree.db.tabular.iceberg.hadoop for details."
-  hadoop/create-iceberg-source)
+   This function throws an error to guide migration."
+  [_config]
+  (throw (ex-info (str "Hadoop-based Iceberg sources are no longer supported. "
+                       "Use create-rest-iceberg-source for REST catalogs or "
+                       "create-fluree-iceberg-source for direct storage access.")
+                  {:status 501
+                   :error :db/hadoop-not-supported
+                   :alternatives [:create-rest-iceberg-source
+                                  :create-fluree-iceberg-source]})))
 
 (def create-rest-iceberg-source
   "Create an IcebergSource using a REST catalog for discovery and
@@ -105,19 +111,30 @@
           (.put cache metadata-location table)
           table))))
 
+(defn- table-name->path
+  "Convert a canonical table name (namespace.table) to a file system path (namespace/table).
+   If no dot is present, returns the table name unchanged."
+  [table-name]
+  (str/replace table-name "." "/"))
+
 (defn- resolve-metadata-location
   "Resolve the metadata location for an Iceberg table.
 
    If metadata-location is provided directly, use it.
-   Otherwise, read version-hint.text from the table directory to find latest metadata."
+   Otherwise, read version-hint.text from the table directory to find latest metadata.
+
+   Note: Table names in canonical format (namespace.table) are converted to
+   file system paths (namespace/table) for directory-based warehouses."
   [^FileIO file-io warehouse-path table-name metadata-location]
   (or metadata-location
       ;; Read version-hint.text to find current metadata
-      (let [hint-path (str warehouse-path "/" table-name "/metadata/version-hint.text")]
+      ;; Convert canonical table name (dots) to file path (slashes)
+      (let [table-path (table-name->path table-name)
+            hint-path (str warehouse-path "/" table-path "/metadata/version-hint.text")]
         (try
           (with-open [stream (.newStream (.newInputFile file-io hint-path))]
             (let [version (-> (slurp stream) str/trim)]
-              (str warehouse-path "/" table-name "/metadata/v" version ".metadata.json")))
+              (str warehouse-path "/" table-path "/metadata/v" version ".metadata.json")))
           (catch Exception e
             ;; Fall back to scanning metadata directory for latest
             (log/warn "Could not read version-hint.text for" table-name ":" (.getMessage e))
@@ -179,7 +196,11 @@
     (proto/scan-batches this table-name opts))
 
   (get-schema [_ table-name {:keys [snapshot-id as-of-time metadata-location]}]
-    (let [meta-loc (or metadata-location (get @metadata-cache table-name))
+    (let [meta-loc (or metadata-location
+                       (get @metadata-cache table-name)
+                       (let [loc (resolve-metadata-location file-io warehouse-path table-name nil)]
+                         (when loc (swap! metadata-cache assoc table-name loc))
+                         loc))
           _ (when-not meta-loc
               (throw (ex-info (str "Cannot resolve metadata for table: " table-name)
                               {:table table-name})))
@@ -187,7 +208,11 @@
       (core/extract-schema table {:snapshot-id snapshot-id :as-of-time as-of-time})))
 
   (get-statistics [_ table-name {:keys [snapshot-id as-of-time columns include-column-stats? metadata-location]}]
-    (let [meta-loc (or metadata-location (get @metadata-cache table-name))
+    (let [meta-loc (or metadata-location
+                       (get @metadata-cache table-name)
+                       (let [loc (resolve-metadata-location file-io warehouse-path table-name nil)]
+                         (when loc (swap! metadata-cache assoc table-name loc))
+                         loc))
           _ (when-not meta-loc
               (throw (ex-info (str "Cannot resolve metadata for table: " table-name)
                               {:table table-name})))

@@ -1,21 +1,15 @@
 {:deps {com.fluree/db {:local/root ".."}
 
-        ;; Iceberg core libraries
+        ;; Iceberg core libraries (Hadoop-free configuration)
+        ;; REST catalog + Fluree FileIO is the supported path
         org.apache.iceberg/iceberg-core    {:mvn/version "1.10.0"}
         org.apache.iceberg/iceberg-parquet {:mvn/version "1.10.0"}
-        org.apache.iceberg/iceberg-data    {:mvn/version "1.10.0"}
+        org.apache.iceberg/iceberg-data    {:mvn/version "1.10.0"
+                                            ;; Exclude ORC which pulls in hadoop-client-api
+                                            :exclusions [org.apache.orc/orc-core$nohive]}
         org.apache.iceberg/iceberg-aws     {:mvn/version "1.10.0"}
         org.apache.iceberg/iceberg-aws-bundle {:mvn/version "1.10.0"}
-        org.apache.iceberg/iceberg-bundled-guava {:mvn/version "1.10.0"}
-
-        ;; Hadoop dependencies (required for Iceberg)
-        org.apache.hadoop/hadoop-common    {:mvn/version "3.3.6"
-                                            :exclusions [org.slf4j/slf4j-log4j12
-                                                         log4j/log4j
-                                                         org.slf4j/slf4j-reload4j]}
-        org.apache.hadoop/hadoop-hdfs-client {:mvn/version "3.3.6"
-                                              :exclusions [org.slf4j/slf4j-log4j12
-                                                           log4j/log4j]}}
+        org.apache.iceberg/iceberg-bundled-guava {:mvn/version "1.10.0"}}
 
  :paths ["src" "resources"]
 
@@ -28,9 +22,23 @@
   {:extra-paths ["test" "test-resources" "../test" "../test-resources" "../dev-resources"]
    :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}
                  org.clojure/test.check {:mvn/version "1.1.1"}
-                 babashka/fs {:mvn/version "0.5.20"}}
+                 babashka/fs {:mvn/version "0.5.20"}
+                 ;; Hadoop deps for test fixtures only (not shipped in main artifact)
+                 ;; Required by parquet-hadoop for reading Parquet files
+                 org.apache.hadoop/hadoop-common {:mvn/version "3.3.6"
+                                                  :exclusions [org.slf4j/slf4j-log4j12
+                                                               log4j/log4j
+                                                               org.slf4j/slf4j-reload4j]}
+                 org.apache.hadoop/hadoop-hdfs-client {:mvn/version "3.3.6"
+                                                       :exclusions [org.slf4j/slf4j-log4j12
+                                                                    log4j/log4j]}
+                 org.apache.hadoop/hadoop-mapreduce-client-core {:mvn/version "3.3.6"
+                                                                 :exclusions [org.slf4j/slf4j-log4j12
+                                                                              log4j/log4j
+                                                                              org.slf4j/slf4j-reload4j]}}
    :exec-fn     kaocha.runner/exec-fn
-   :exec-args   {:kaocha/tests [{:kaocha.testable/id :iceberg
+   :exec-args   {:kaocha.filter/skip-meta [:pending]
+                 :kaocha/tests [{:kaocha.testable/id :iceberg
                                  :kaocha.testable/type :kaocha.type/clojure.test
                                  :kaocha/source-paths ["src" "../src"]
                                  :kaocha/test-paths ["test"]
