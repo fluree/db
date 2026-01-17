@@ -410,7 +410,7 @@
   [db parsed-query]
   (trace/async-form ::optimize {}
     (go-try
-      (let [ ;; First apply statistical optimization (reordering patterns)
+      (let [;; First apply statistical optimization (reordering patterns)
             reordered-query (<? (-reorder db parsed-query))
             context         (:context reordered-query)
                             ;; Then apply inline filter optimization
