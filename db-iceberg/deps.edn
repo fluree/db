@@ -1,14 +1,9 @@
 {:deps {com.fluree/db {:local/root ".."}
-
-        ;; Iceberg core libraries (Hadoop-free configuration)
-        ;; REST catalog + Fluree FileIO is the supported path
         org.apache.iceberg/iceberg-core    {:mvn/version "1.10.0"}
         org.apache.iceberg/iceberg-parquet {:mvn/version "1.10.0"}
         org.apache.iceberg/iceberg-data    {:mvn/version "1.10.0"
                                             ;; Exclude ORC which pulls in hadoop-client-api
                                             :exclusions [org.apache.orc/orc-core$nohive]}
-        org.apache.iceberg/iceberg-aws     {:mvn/version "1.10.0"}
-        org.apache.iceberg/iceberg-aws-bundle {:mvn/version "1.10.0"}
         org.apache.iceberg/iceberg-bundled-guava {:mvn/version "1.10.0"}}
 
  :paths ["src" "resources"]
