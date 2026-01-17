@@ -2,7 +2,7 @@
 	cljs-browser-test cljs-node-test cljstest test graaltest ci clean			\
 	js-packages sync-package-json publish-nodejs publish-browser		\
 	publish-webworker publish-js pending-tests pt clj-kondo-lint            \
-	clj-kondo-lint-ci cljfmt-check cljfmt-fix
+	clj-kondo-lint-ci cljfmt-check cljfmt-fix iceberg-openflights iceberg-partitioned
 
 .DEFAULT_GOAL := help
 
@@ -167,3 +167,56 @@ clean: ## Remove build artifacts and caches
 	rm -rf js-packages/browser/fluree-browser-sdk.js
 	rm -rf js-packages/nodejs/fluree-node-sdk.js
 	rm -rf js-packages/webworker/fluree-webworker.js
+
+iceberg-openflights: ## Download OpenFlights CSVs and build local Iceberg warehouse (gitignored)
+	./script/fetch-openflights.sh
+	clojure -Sdeps '{:paths ["script"] :deps {org.apache.iceberg/iceberg-core {:mvn/version "1.10.0"} \
+org.apache.iceberg/iceberg-parquet {:mvn/version "1.10.0"} \
+org.apache.iceberg/iceberg-data {:mvn/version "1.10.0"} \
+org.apache.iceberg/iceberg-bundled-guava {:mvn/version "1.10.0"} \
+org.apache.parquet/parquet-hadoop {:mvn/version "1.16.0"} \
+org.apache.hadoop/hadoop-common {:mvn/version "3.3.6" :exclusions [org.slf4j/slf4j-log4j12 log4j/log4j org.slf4j/slf4j-reload4j]} \
+org.clojure/data.csv {:mvn/version "1.0.1"}}}' \
+		-M -m build-openflights-iceberg
+
+iceberg-partitioned: ## Build partitioned Iceberg table for partition pruning tests
+	clojure -Sdeps '{:paths ["script"] :deps {org.apache.iceberg/iceberg-core {:mvn/version "1.10.0"} \
+org.apache.iceberg/iceberg-parquet {:mvn/version "1.10.0"} \
+org.apache.iceberg/iceberg-data {:mvn/version "1.10.0"} \
+org.apache.iceberg/iceberg-bundled-guava {:mvn/version "1.10.0"} \
+org.apache.parquet/parquet-hadoop {:mvn/version "1.16.0"} \
+org.apache.hadoop/hadoop-common {:mvn/version "3.3.6" :exclusions [org.slf4j/slf4j-log4j12 log4j/log4j org.slf4j/slf4j-reload4j]} \
+org.clojure/data.csv {:mvn/version "1.0.1"}}}' \
+		-M -m build-partitioned-airlines
+
+iceberg-rest-up: ## Start Iceberg REST catalog with MinIO (Docker)
+	cd dev-resources/iceberg-rest && docker compose up -d
+	@echo "Waiting for REST catalog to be ready..."
+	@sleep 10
+	@echo "REST catalog available at http://localhost:8181"
+	@echo "MinIO console at http://localhost:9001 (admin/password)"
+	@echo "Run 'make iceberg-rest-load' to load OpenFlights data"
+
+iceberg-rest-load: ## Load OpenFlights data into REST catalog
+	docker exec -it iceberg-spark /scripts/load-openflights.sh
+
+iceberg-rest-down: ## Stop Iceberg REST catalog
+	cd dev-resources/iceberg-rest && docker compose down
+
+iceberg-rest-clean: ## Stop and remove all REST catalog data
+	cd dev-resources/iceberg-rest && docker compose down -v
+
+polaris-up: ## Start Apache Polaris catalog with vended credentials (Docker, port 8182)
+	cd dev-resources/polaris && docker compose up -d
+	@echo "Waiting for Polaris to be ready..."
+	@sleep 5
+	@./dev-resources/polaris/bootstrap.sh
+	@echo ""
+	@echo "Polaris REST catalog available at http://localhost:8182"
+	@echo "OAuth: POST http://localhost:8182/api/catalog/v1/oauth/tokens"
+
+polaris-down: ## Stop Apache Polaris catalog
+	cd dev-resources/polaris && docker compose down
+
+polaris-clean: ## Stop and remove Polaris (keeps MinIO data)
+	cd dev-resources/polaris && docker compose down -v

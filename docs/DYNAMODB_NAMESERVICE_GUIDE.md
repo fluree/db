@@ -3,7 +3,7 @@
 ## Overview
 
 Fluree supports Amazon DynamoDB as a nameservice backend for storing ledger
-metadata. The DynamoDB nameservice provides:
+and virtual graph metadata. The DynamoDB nameservice provides:
 
 - **Atomic conditional updates**: No contention between transactors and indexers
 - **Strong consistency reads**: Always see the latest data
@@ -12,10 +12,10 @@ metadata. The DynamoDB nameservice provides:
 
 ### Why DynamoDB for Nameservice?
 
-The nameservice stores metadata about ledgers: the latest commit address, commit
-t-value, index address, and index t-value. In high-throughput scenarios,
-transactors and indexers may update this metadata concurrently, leading to
-contention with file-based or S3 nameservices.
+The nameservice stores metadata about ledgers (commit addresses, t-values, index
+addresses) and virtual graphs (VG configuration, dependencies). In high-throughput
+scenarios, transactors and indexers may update ledger metadata concurrently,
+leading to contention with file-based or S3 nameservices.
 
 DynamoDB solves this because:
 1. **Separate attributes**: Commit data and index data are stored as separate
@@ -124,6 +124,8 @@ Resources:
 
 ### Table Attributes
 
+#### Ledger Records
+
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | `ledger_alias` | String (PK) | Ledger identifier, e.g., `my-ledger:main` |
@@ -134,6 +136,26 @@ Resources:
 | `ledger_name` | String | Ledger name without branch |
 | `branch` | String | Branch name |
 | `status` | String | Ledger status |
+
+#### Virtual Graph Records
+
+Virtual graphs (VGs) are stored in the same table as ledgers, distinguished by the
+`record_type` attribute. No schema changes are required—DynamoDB is schema-less
+for non-key attributes.
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `ledger_alias` | String (PK) | VG identifier, e.g., `my-iceberg-vg:main` |
+| `ledger_name` | String | VG name without branch |
+| `branch` | String | Branch name |
+| `status` | String | VG status (e.g., `ready`) |
+| `record_type` | String | `"vg"` to distinguish from ledger records |
+| `vg_type` | String | VG type IRI, e.g., `"f:IcebergVirtualGraph"` |
+| `vg_config` | String | JSON-stringified VG configuration |
+| `dependencies` | List\<String\> | List of dependent ledger aliases |
+
+**Note**: The `record_type` attribute is only present on VG records. Ledger records
+do not have this attribute, so absence of `record_type` indicates a ledger record.
 
 ### How Updates Work
 
@@ -300,6 +322,17 @@ This is important for nameservice lookups where stale data could cause issues.
 
 ;; Test lookup
 (<!! (fluree.db.nameservice/lookup ns "my-ledger:main"))
+
+;; Test publish-vg (virtual graph)
+(<!! (fluree.db.nameservice/publish-vg ns
+       {:vg-name "my-iceberg-vg:main"
+        :vg-type "f:IcebergVirtualGraph"
+        :config {:warehouse-path "/data/warehouse"
+                 :mapping "...r2rml..."}
+        :dependencies ["source-ledger:main"]}))
+
+;; Lookup returns VG record with :vg-type, :vg-config, :dependencies
+(<!! (fluree.db.nameservice/lookup ns "my-iceberg-vg:main"))
 ```
 
 ## Production Considerations

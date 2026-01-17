@@ -1,7 +1,9 @@
 (ns fluree.db.query.api
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
-  (:require #?(:clj [fluree.db.virtual-graph.nameservice-loader :as vg-loader])
+  (:require #?(:clj [fluree.db.connection.system :as system])
+            #?(:clj [fluree.db.util.json :as json])
+            #?(:clj [fluree.db.virtual-graph.nameservice-loader :as vg-loader])
             [fluree.db.connection :as connection]
             [fluree.db.dataset :as dataset :refer [dataset?]]
             [fluree.db.json-ld.policy :as perm]
@@ -205,6 +207,22 @@
     (let [types (get ns-record "@type")]
       (some #{"f:VirtualGraphDatabase"} types))))
 
+#?(:clj
+   (defn- r2rml-virtual-graph?
+     "Returns true if a nameservice record represents an R2RML virtual graph."
+     [ns-record]
+     (when ns-record
+       (let [types (set (get ns-record "@type" []))]
+         (contains? types "fidx:R2RML")))))
+
+#?(:clj
+   (defn- iceberg-virtual-graph?
+     "Returns true if a nameservice record represents an Iceberg virtual graph."
+     [ns-record]
+     (when ns-record
+       (let [types (set (get ns-record "@type" []))]
+         (contains? types "fidx:Iceberg")))))
+
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
   (trace/async-form ::load-alias {}
@@ -218,15 +236,43 @@
         (if (virtual-graph-record? ns-record)
           ;; Virtual graph - load via VG loader (JVM only)
           #?(:clj
-             (let [ ;; For VG queries, we need a source ledger's db to initialize the VG
-                   ;; Get it from the VG's dependencies
-                   deps          (get ns-record "fidx:dependencies")
-                   source-alias  (first deps)
-                   source-ledger (<? (connection/load-ledger-alias conn source-alias))
-                   source-db     (ledger/current-db source-ledger)
-                   vg            (<? (vg-loader/load-virtual-graph-from-nameservice
-                                      source-db publisher normalized-alias))]
-               vg)
+             (cond
+               (r2rml-virtual-graph? ns-record)
+               ;; R2RML VGs connect to external databases, don't need a source ledger
+               (<? (vg-loader/load-virtual-graph-from-nameservice nil publisher normalized-alias))
+
+               (iceberg-virtual-graph? ns-record)
+               ;; Iceberg VGs - create directly and apply time-travel if specified
+               ;; Uses requiring-resolve for dynamic loading (db-iceberg module)
+               (if-let [create-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/create)]
+                 (let [raw-config (get-in ns-record ["fidx:config" "@value"])
+                       ;; Config is stored as JSON string, need to parse it
+                       config (if (string? raw-config)
+                                (json/parse raw-config false)
+                                raw-config)
+                       ;; Get publisher-level Iceberg config and shared cache
+                       iceberg-config (system/get-iceberg-config publisher)
+                       cache-instance (system/get-iceberg-cache publisher)
+                       vg (create-fn {:alias normalized-alias
+                                      :config config
+                                      :iceberg-config iceberg-config
+                                      :cache-instance cache-instance})
+                       ;; Apply time-travel if specified in alias (e.g., airlines@t:12345)
+                       parse-time-travel (requiring-resolve 'fluree.db.virtual-graph.iceberg/parse-time-travel)
+                       with-time-travel (requiring-resolve 'fluree.db.virtual-graph.iceberg/with-time-travel)
+                       time-travel (when explicit-t (parse-time-travel explicit-t))]
+                   (with-time-travel vg time-travel))
+                 (throw (ex-info "Iceberg support not available. Add com.fluree/db-iceberg dependency."
+                                 {:status 501 :error :db/missing-iceberg-module})))
+
+               :else
+               ;; Other VGs (BM25, etc.) need a source ledger from dependencies
+               (let [deps          (get ns-record "fidx:dependencies")
+                     source-alias  (first deps)
+                     source-ledger (<? (connection/load-ledger-alias conn source-alias))
+                     source-db     (ledger/current-db source-ledger)]
+                 (<? (vg-loader/load-virtual-graph-from-nameservice
+                      source-db publisher normalized-alias))))
              :cljs
              (throw (ex-info "Virtual graphs are not supported in ClojureScript"
                              {:status 400 :error :db/unsupported})))

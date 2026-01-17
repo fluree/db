@@ -1,0 +1,59 @@
+version: '3.8'
+
+# Apache Polaris REST Catalog with vended credentials support
+# Runs alongside existing Tabular setup on different ports
+# Connects to existing MinIO instance
+
+services:
+  polaris:
+    image: apache/polaris:latest
+    platform: linux/amd64
+    container_name: polaris-catalog
+    ports:
+      - "8182:8181"  # REST API (mapped to 8182 to avoid conflict with Tabular)
+      - "8183:8182"  # Management API
+    networks:
+      - iceberg-rest_default  # Connect to existing network with MinIO
+    environment:
+      # MinIO/S3 credentials (same as existing setup)
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      # MinIO endpoints for Polaris server (internal docker network)
+      AWS_ENDPOINT_URL_S3: http://iceberg-minio:9000
+      AWS_ENDPOINT_URL_STS: http://iceberg-minio:9000
+      # Bootstrap credentials: realm,client_id,client_secret
+      POLARIS_BOOTSTRAP_CREDENTIALS: default,root,s3cr3t
+      # Polaris configuration
+      polaris.realm-context.realms: default
+      polaris.features.DROP_WITH_PURGE_ENABLED: "true"
+      # Storage configuration for vended credentials
+      polaris.storage.s3.endpoint: http://iceberg-minio:9000
+      polaris.storage.s3.path-style-access: "true"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8181/healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      polaris-bucket-init:
+        condition: service_completed_successfully
+
+  # Initialize the polaris-warehouse bucket in existing MinIO
+  polaris-bucket-init:
+    image: minio/mc:latest
+    container_name: polaris-bucket-init
+    networks:
+      - iceberg-rest_default
+    entrypoint: >
+      /bin/sh -c "
+        echo 'Waiting for MinIO...';
+        until mc alias set minio http://iceberg-minio:9000 admin password; do sleep 1; done;
+        echo 'Creating polaris-warehouse bucket...';
+        mc mb --ignore-existing minio/polaris-warehouse;
+        echo 'Bucket ready';
+      "
+
+networks:
+  iceberg-rest_default:
+    external: true

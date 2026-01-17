@@ -1,0 +1,45 @@
+[
+  {
+    "name": "com.github.luben.zstd.ZstdInputStreamNoFinalizer",
+    "allDeclaredFields": true,
+    "methods": [
+      {"name": "createDStream", "parameterTypes": []},
+      {"name": "initDStream", "parameterTypes": ["long"]},
+      {"name": "decompressStream", "parameterTypes": ["long", "java.nio.ByteBuffer", "int", "java.nio.ByteBuffer", "int"]},
+      {"name": "freeDStream", "parameterTypes": ["long"]}
+    ]
+  },
+  {
+    "name": "com.github.luben.zstd.ZstdOutputStreamNoFinalizer",
+    "allDeclaredFields": true,
+    "methods": [
+      {"name": "createCStream", "parameterTypes": []},
+      {"name": "initCStream", "parameterTypes": ["long", "int"]},
+      {"name": "compressStream", "parameterTypes": ["long", "java.nio.ByteBuffer", "int", "java.nio.ByteBuffer", "int"]},
+      {"name": "flushStream", "parameterTypes": ["long", "java.nio.ByteBuffer", "int"]},
+      {"name": "endStream", "parameterTypes": ["long", "java.nio.ByteBuffer", "int"]},
+      {"name": "freeCStream", "parameterTypes": ["long"]}
+    ]
+  },
+  {
+    "name": "com.github.luben.zstd.Zstd",
+    "allDeclaredFields": true,
+    "methods": [
+      {"name": "compressBound", "parameterTypes": ["long"]},
+      {"name": "compress", "parameterTypes": ["byte[]", "byte[]", "int"]},
+      {"name": "decompress", "parameterTypes": ["byte[]", "byte[]"]},
+      {"name": "decompressedSize", "parameterTypes": ["byte[]"]},
+      {"name": "isError", "parameterTypes": ["long"]}
+    ]
+  },
+  {
+    "name": "com.github.luben.zstd.ZstdDecompressCtx",
+    "allDeclaredFields": true,
+    "methods": [
+      {"name": "init", "parameterTypes": []},
+      {"name": "free", "parameterTypes": []},
+      {"name": "loadDict", "parameterTypes": ["byte[]"]},
+      {"name": "decompressDirectByteBuffer", "parameterTypes": ["java.nio.ByteBuffer", "int", "int", "java.nio.ByteBuffer", "int", "int"]}
+    ]
+  }
+]

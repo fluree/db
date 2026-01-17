@@ -1,5 +1,6 @@
 (ns fluree.db.api
-  (:require #?(:clj [fluree.db.virtual-graph.create :as vg-create])
+  (:require #?(:clj [fluree.db.nameservice :as nameservice])
+            #?(:clj [fluree.db.virtual-graph.create :as vg-create])
             #?(:clj [fluree.db.virtual-graph.drop :as vg-drop])
             [camel-snake-kebab.core :refer [->camelCaseString]]
             [clojure.core.async :as async :refer [go <!]]
@@ -49,6 +50,14 @@
             (if (util/exception? res)
               (reject res)
               (resolve res))))))))
+
+#?(:clj
+   (defn- iceberg-virtual-graph-record?
+     "Returns true if a nameservice record represents an Iceberg virtual graph."
+     [ns-record]
+     (when ns-record
+       (let [types (set (get ns-record "@type" []))]
+         (contains? types "fidx:Iceberg")))))
 
 (defn- validate-connection
   "Throws exception if x is not a valid connection"
@@ -649,11 +658,38 @@
    (promise-wrap
     (trace/async-form ::ledger-info {}
       (go-try
-        (let [ledger     (<? (connection/load-ledger conn ledger-id))
-              info       (<? (ledger/ledger-info ledger))
-              compact-fn (when context
-                           (json-ld/compact-fn (json-ld/parse-context context)))]
-          (decode/ledger-info info compact-fn)))))))
+        (let [compact-fn (when context
+                           (json-ld/compact-fn (json-ld/parse-context context)))
+              ;; Helper to load regular (non-VG) ledger info
+              load-regular-info
+              (fn []
+                (go-try
+                  (let [ledger* (<? (connection/load-ledger conn ledger-id))
+                        info    (<? (ledger/ledger-info ledger*))]
+                    (decode/ledger-info info compact-fn))))]
+          #?(:clj
+             ;; Iceberg VGs have no FlakeDB commit/index metadata, but we can provide
+             ;; ledger-info-like schema + stats from R2RML + Iceberg metadata.
+             (if (and (string? ledger-id)
+                      (not (connection/fluree-address? ledger-id)))
+               (let [parsed      (util.ledger/parse-ledger-alias ledger-id)
+                     base-alias  (cond-> (:ledger parsed)
+                                   (:branch parsed) (str ":" (:branch parsed)))
+                     norm-alias  (util.ledger/ensure-ledger-branch base-alias)
+                     publisher   (connection/primary-publisher conn)
+                     ns-record   (when publisher
+                                   (<? (nameservice/lookup publisher norm-alias)))]
+                 (if (iceberg-virtual-graph-record? ns-record)
+                   (let [vg            (<? (query-api/load-alias conn nil ledger-id {}))
+                         vg-info-fn    (requiring-resolve 'fluree.db.virtual-graph.iceberg.ledger-info/ledger-info)
+                         info          (cond-> (vg-info-fn vg)
+                                         ns-record (assoc :nameservice ns-record))]
+                     (cond-> info
+                       compact-fn (clojure.core/update :stats decode/compact-iri-stats compact-fn)))
+                   (<? (load-regular-info))))
+               (<? (load-regular-info)))
+             :cljs
+             (<? (load-regular-info)))))))))
 
 ;; db operations
 
@@ -1165,6 +1201,83 @@
      Parameters:
        conn - Connection object
        name - Name of the search index to drop
+
+     Returns promise resolving to :dropped when complete."
+     [conn name]
+     (validate-connection conn)
+     (promise-wrap
+      (vg-drop/drop-virtual-graph conn name))))
+
+;; Iceberg-specific APIs (JVM only)
+
+#?(:clj
+   (defn connect-iceberg
+     "Connects to Apache Iceberg tables, enabling them to be queried as RDF
+     using R2RML mappings to define the relational-to-RDF transformation.
+
+     Once connected, the Iceberg source can be queried using its name in the
+     'from' clause of FQL or SPARQL queries.
+
+     Parameters:
+       conn - Connection object
+       name - Name for the virtual graph. Used in query 'from' clauses to
+              reference this data source.
+       config - Configuration map:
+         :warehouse-path - Path to Iceberg warehouse directory. Required for
+                           HadoopTables catalog; not needed for REST catalog
+                           with :store.
+         :mapping - Path to R2RML mapping file (.ttl) that defines how Iceberg
+                    table columns map to RDF predicates and classes.
+         :mapping-inline - Inline R2RML mapping content as a string. Alternative
+                           to :mapping when you don't want a separate file.
+         :store - Storage backend configuration map for reading table data files.
+                  Required for REST catalog. Format:
+                    {:type :s3
+                     :bucket \"bucket-name\"
+                     :prefix \"optional-prefix\"    ; defaults to \"\"
+                     :endpoint \"http://...\"}      ; optional, for S3-compatible stores
+         :catalog - Catalog configuration map:
+                      :type - Catalog type (:rest for REST catalog)
+                      :uri - Catalog URI (for REST catalog)
+                      :warehouse - Warehouse identifier (for REST catalog)
+
+     Returns promise resolving to the connected Iceberg source descriptor.
+
+     Example:
+       ;; Connect to a local Iceberg warehouse
+       @(connect-iceberg conn \"my-data-lake\"
+         {:warehouse-path \"/path/to/warehouse\"
+          :mapping \"/path/to/mapping.ttl\"})
+
+       ;; Connect via REST catalog with S3 storage
+       @(connect-iceberg conn \"my-lake\"
+         {:catalog {:type :rest :uri \"http://localhost:8181\"}
+          :store {:type :s3 :bucket \"warehouse\" :endpoint \"http://localhost:9000\"}
+          :mapping \"/path/to/mapping.ttl\"})
+
+       ;; Query the connected source
+       @(fluree/query conn {\"from\" [\"my-data-lake\"]
+                            \"select\" [\"?name\"]
+                            \"where\" {\"@id\" \"?x\" \"ex:name\" \"?name\"}})"
+     [conn name {:keys [warehouse-path mapping mapping-inline store catalog]}]
+     (validate-connection conn)
+     (promise-wrap
+      (vg-create/create conn {:name name
+                              :type :iceberg
+                              :config (cond-> {}
+                                        warehouse-path (assoc :warehouse-path warehouse-path)
+                                        mapping        (assoc :mapping mapping)
+                                        mapping-inline (assoc :mappingInline mapping-inline)
+                                        store          (assoc :store store)
+                                        catalog        (assoc :catalog catalog))}))))
+
+#?(:clj
+   (defn disconnect-iceberg
+     "Disconnects an Iceberg data source and removes its virtual graph.
+
+     Parameters:
+       conn - Connection object
+       name - Name of the Iceberg virtual graph to disconnect
 
      Returns promise resolving to :dropped when complete."
      [conn name]

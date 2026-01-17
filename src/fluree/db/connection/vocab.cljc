@@ -157,3 +157,109 @@
 
 (def dynamodb-timeout-ms
   (system-iri "dynamodbTimeoutMs"))
+
+;; -----------------------------------------------------------------------------
+;; Iceberg / Virtual Graph configuration (nameservice-level)
+;; -----------------------------------------------------------------------------
+
+;; Iceberg configuration node types
+(def iceberg-catalog-class
+  (system-iri "IcebergCatalog"))
+
+(def iceberg-auth-class
+  (system-iri "IcebergAuth"))
+
+(def iceberg-cache-class
+  (system-iri "IcebergCache"))
+
+;; Publisher/Connection policy toggles
+(def virtual-graph-allow-publish
+  "If false, disallow publishing new virtual graphs into the nameservice."
+  (system-iri "virtualGraphAllowPublish"))
+
+(def iceberg-allow-dynamic-virtual-graphs
+  "If false, disallow dynamic creation of Iceberg virtual graphs."
+  (system-iri "icebergAllowDynamicVirtualGraphs"))
+
+(def iceberg-allow-dynamic-catalogs
+  "If false, only configured catalogs may be used."
+  (system-iri "icebergAllowDynamicCatalogs"))
+
+(def iceberg-persist-dynamic-catalog-secrets
+  "If true, dynamic catalog secrets may be persisted (recommended only with encryption-at-rest)."
+  (system-iri "icebergPersistDynamicCatalogSecrets"))
+
+(def iceberg-allowed-catalog-names
+  "Optional allow-list of catalog names that may be used."
+  (system-iri "icebergAllowedCatalogNames"))
+
+;; Catalog configuration
+(def iceberg-catalogs
+  "List of IcebergCatalog nodes configured for this environment."
+  (system-iri "icebergCatalogs"))
+
+(def iceberg-catalog-name
+  "A stable name/identifier for this catalog (unique within config)."
+  (system-iri "icebergCatalogName"))
+
+(def iceberg-catalog-type
+  "Catalog type, e.g. \"rest\". Reserved for future expansion."
+  (system-iri "icebergCatalogType"))
+
+(def iceberg-rest-uri
+  "REST catalog base URI."
+  (system-iri "icebergRestUri"))
+
+(def iceberg-default-headers
+  "Optional additional headers to send to the REST catalog."
+  (system-iri "icebergDefaultHeaders"))
+
+(def iceberg-allow-vended-credentials
+  "If true, allow requesting vended credentials from the catalog."
+  (system-iri "icebergAllowVendedCredentials"))
+
+;; Auth configuration
+(def iceberg-auth
+  "Reference to an IcebergAuth node."
+  (system-iri "icebergAuth"))
+
+(def iceberg-auth-type
+  "Auth type for REST catalog, e.g. \"bearer\", \"apiKey\", or \"none\"."
+  (system-iri "icebergAuthType"))
+
+(def iceberg-bearer-token
+  "Bearer token for REST catalog (use ConfigurationValue for env/java-prop)."
+  (system-iri "icebergBearerToken"))
+
+(def iceberg-api-key
+  "API key for REST catalog (use ConfigurationValue for env/java-prop)."
+  (system-iri "icebergApiKey"))
+
+;; Cache configuration
+(def iceberg-cache
+  "Reference to an IcebergCache node."
+  (system-iri "icebergCache"))
+
+(def iceberg-cache-enabled
+  "Enable/disable Iceberg caches."
+  (system-iri "icebergCacheEnabled"))
+
+(def iceberg-cache-dir
+  "Cache directory path (Lambda default should be /tmp)."
+  (system-iri "icebergCacheDir"))
+
+(def iceberg-mem-cache-mb
+  "In-memory cache budget in MB (e.g., for range-block caching)."
+  (system-iri "icebergMemCacheMb"))
+
+(def iceberg-disk-cache-mb
+  "On-disk cache budget in MB."
+  (system-iri "icebergDiskCacheMb"))
+
+(def iceberg-block-size-mb
+  "Byte-range block size in MB."
+  (system-iri "icebergBlockSizeMb"))
+
+(def iceberg-cache-ttl-seconds
+  "Optional TTL in seconds for cache entries."
+  (system-iri "icebergCacheTtlSeconds"))

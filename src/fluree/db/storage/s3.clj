@@ -265,6 +265,187 @@
 
 (declare with-retries parse-list-objects-response)
 
+;; HTTP client for binary requests (avoids xhttp which uses String body handlers)
+;; Lazy initialization required for GraalVM native-image compatibility
+(def ^:private binary-http-client-delay
+  (delay
+    (-> (java.net.http.HttpClient/newBuilder)
+        (.connectTimeout (java.time.Duration/ofSeconds 30))
+        (.build))))
+
+(defn- get-binary-http-client
+  "Get the binary HTTP client, creating it lazily on first use."
+  ^java.net.http.HttpClient []
+  @binary-http-client-delay)
+
+(defn s3-get-binary
+  "Make an S3 GET request returning raw bytes.
+   This bypasses xhttp to properly handle binary data like Parquet/Avro files."
+  [{:keys [bucket region path credentials request-timeout endpoint headers]
+    :or   {request-timeout 20000 headers {}}}]
+  (go-try
+    (let [start        (System/nanoTime)
+          encoded-path (encode-s3-path path)
+          query-string nil  ;; No query params for simple GET
+          url          (str (build-s3-url bucket region encoded-path endpoint)
+                            (when query-string (str "?" query-string)))
+          signed-hdrs  (sign-request {:method       "GET"
+                                      :path         encoded-path
+                                      :headers      headers
+                                      :payload      nil
+                                      :region       region
+                                      :bucket       bucket
+                                      :credentials  credentials
+                                      :query-params nil
+                                      :endpoint     endpoint})
+          ;; Build request with signed headers
+          builder      (-> (java.net.http.HttpRequest/newBuilder)
+                           (.uri (java.net.URI/create url))
+                           (.timeout (java.time.Duration/ofMillis request-timeout))
+                           (.GET))
+          _            (doseq [[k v] signed-hdrs]
+                         (.header builder k v))
+          request      (.build builder)
+          ;; Use byte array body handler for binary data
+          response     (.send (get-binary-http-client) request
+                              (java.net.http.HttpResponse$BodyHandlers/ofByteArray))
+          status       (.statusCode response)
+          ^bytes body  (.body response)]
+      (log/trace "s3-get-binary done" {:bucket      bucket
+                                       :path        encoded-path
+                                       :status      status
+                                       :size        (when body (alength body))
+                                       :duration-ms (long (/ (- (System/nanoTime) start)
+                                                             1000000))})
+      (cond
+        (= status 404)
+        (throw (ex-info "Not found" {:status 404 :path path}))
+
+        (< 299 status)
+        (throw (ex-info (str "S3 error: " status)
+                        {:status status :path path}))
+
+        :else
+        {:status  status
+         :body    body
+         :headers {}}))))
+
+(defn s3-head
+  "Make an S3 HEAD request to get object metadata without downloading content.
+   Returns {:size :etag :last-modified} or nil if not found."
+  [{:keys [bucket region path credentials request-timeout endpoint]
+    :or   {request-timeout 10000}}]
+  (go-try
+    (let [start        (System/nanoTime)
+          encoded-path (encode-s3-path path)
+          url          (build-s3-url bucket region encoded-path endpoint)
+          signed-hdrs  (sign-request {:method       "HEAD"
+                                      :path         encoded-path
+                                      :headers      {}
+                                      :payload      nil
+                                      :region       region
+                                      :bucket       bucket
+                                      :credentials  credentials
+                                      :query-params nil
+                                      :endpoint     endpoint})
+          builder      (-> (java.net.http.HttpRequest/newBuilder)
+                           (.uri (java.net.URI/create url))
+                           (.timeout (java.time.Duration/ofMillis request-timeout))
+                           (.method "HEAD" (java.net.http.HttpRequest$BodyPublishers/noBody)))
+          _            (doseq [[k v] signed-hdrs]
+                         (.header builder k v))
+          request      (.build builder)
+          response     (.send (get-binary-http-client) request
+                              (java.net.http.HttpResponse$BodyHandlers/discarding))
+          status       (.statusCode response)
+          headers      (.headers response)]
+      (log/trace "s3-head done" {:bucket      bucket
+                                 :path        encoded-path
+                                 :status      status
+                                 :duration-ms (long (/ (- (System/nanoTime) start)
+                                                       1000000))})
+      (cond
+        (= status 404)
+        nil  ;; Return nil for not found, don't throw
+
+        (< 299 status)
+        (throw (ex-info (str "S3 HEAD error: " status)
+                        {:status status :path path}))
+
+        :else
+        (let [content-length (-> headers (.firstValue "content-length") (.orElse nil))
+              etag           (-> headers (.firstValue "etag") (.orElse nil))
+              last-modified  (-> headers (.firstValue "last-modified") (.orElse nil))]
+          {:size          (when content-length (Long/parseLong content-length))
+           :etag          etag
+           :last-modified last-modified})))))
+
+(defn s3-get-range
+  "Make an S3 GET request for a specific byte range.
+   Returns raw bytes for the requested range."
+  [{:keys [bucket region path credentials request-timeout endpoint offset length]
+    :or   {request-timeout 20000}}]
+  (go-try
+    ;; Validate edge cases
+    (when (neg? offset)
+      (throw (ex-info "Offset cannot be negative" {:offset offset :path path})))
+    (when-not (pos? length)
+      (throw (ex-info "Length must be positive" {:length length :path path})))
+    (let [start        (System/nanoTime)
+          encoded-path (encode-s3-path path)
+          ;; Range header: bytes=start-end (inclusive)
+          range-header (str "bytes=" offset "-" (dec (+ offset length)))
+          url          (build-s3-url bucket region encoded-path endpoint)
+          signed-hdrs  (sign-request {:method       "GET"
+                                      :path         encoded-path
+                                      :headers      {"Range" range-header}
+                                      :payload      nil
+                                      :region       region
+                                      :bucket       bucket
+                                      :credentials  credentials
+                                      :query-params nil
+                                      :endpoint     endpoint})
+          builder      (-> (java.net.http.HttpRequest/newBuilder)
+                           (.uri (java.net.URI/create url))
+                           (.timeout (java.time.Duration/ofMillis request-timeout))
+                           (.GET))
+          _            (doseq [[k v] signed-hdrs]
+                         (.header builder k v))
+          request      (.build builder)
+          response     (.send (get-binary-http-client) request
+                              (java.net.http.HttpResponse$BodyHandlers/ofByteArray))
+          status       (.statusCode response)
+          ^bytes body  (.body response)]
+      (log/trace "s3-get-range done" {:bucket      bucket
+                                      :path        encoded-path
+                                      :offset      offset
+                                      :length      length
+                                      :status      status
+                                      :actual-size (when body (alength body))
+                                      :duration-ms (long (/ (- (System/nanoTime) start)
+                                                            1000000))})
+      (cond
+        (= status 404)
+        (throw (ex-info "Not found" {:status 404 :path path}))
+
+        ;; 206 Partial Content is the expected response for range requests
+        ;; Some S3-compatible stores may return 200 OK for small files
+        (and (not= status 206) (not= status 200) (< 299 status))
+        (throw (ex-info (str "S3 range error: " status)
+                        {:status status :path path :offset offset :length length}))
+
+        :else
+        (do
+          ;; Log when we get 200 instead of 206 - server may have ignored Range header
+          ;; and returned full file instead of requested range
+          (when (and (= status 200) body (> (alength body) length))
+            (log/debug "s3-get-range received 200 with more bytes than requested"
+                       {:path        path
+                        :requested   length
+                        :received    (alength body)
+                        :hint        "Server may have ignored Range header"}))
+          body)))))
+
 (defn s3-request
   "Make an S3 REST API request"
   [{:keys [method bucket region path headers body credentials query-params request-timeout endpoint]
@@ -524,11 +705,24 @@
     (write-s3-data this path bytes))
 
   (read-bytes [this path]
-    (go-try
-      (let [resp (<? (read-s3-data this path))]
-        (when-not (or (= resp ::not-found)
-                      (nil? resp))
-          (.getBytes ^String (:body resp))))))
+    ;; Use s3-get-binary for proper binary data handling (Parquet, Avro, etc.)
+    (let [{:keys [base-credentials bucket region prefix endpoint read-timeout-ms]} this
+          credentials (get-credentials bucket region base-credentials)
+          full-path   (str prefix path)]
+      (go-try
+        (try
+          (let [resp (<? (s3-get-binary {:bucket          bucket
+                                         :region          region
+                                         :path            full-path
+                                         :credentials     credentials
+                                         :endpoint        endpoint
+                                         :request-timeout read-timeout-ms}))]
+            (:body resp))
+          (catch Exception e
+            ;; Return nil for not-found to match expected behavior
+            (if (= 404 (:status (ex-data e)))
+              nil
+              (throw e)))))))
 
   (swap-bytes [this path f]
     (go-try
@@ -597,7 +791,31 @@
         ;; Filter for .json files and return relative paths
         (->> all-results
              (filter #(str/ends-with? % ".json"))
-             vec)))))
+             vec))))
+
+  storage/StatStore
+  (stat [_ path]
+    (let [credentials (get-credentials bucket region base-credentials)
+          full-path   (str prefix path)]
+      (s3-head {:bucket          bucket
+                :region          region
+                :path            full-path
+                :credentials     credentials
+                :endpoint        endpoint
+                :request-timeout read-timeout-ms})))
+
+  storage/RangeReadableStore
+  (read-bytes-range [_ path offset length]
+    (let [credentials (get-credentials bucket region base-credentials)
+          full-path   (str prefix path)]
+      (s3-get-range {:bucket          bucket
+                     :region          region
+                     :path            full-path
+                     :credentials     credentials
+                     :endpoint        endpoint
+                     :offset          offset
+                     :length          length
+                     :request-timeout read-timeout-ms}))))
 
 (defn- jitter
   "Adds +/- 50% jitter to a delay in ms."

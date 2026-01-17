@@ -14,6 +14,41 @@
     "allPublicMethods": true
   },
   {
+    "name": "com.github.benmanes.caffeine.cache.SSMWA",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "com.github.benmanes.caffeine.cache.SSMW",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "com.github.benmanes.caffeine.cache.PSAMW",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "com.github.benmanes.caffeine.cache.PSWMW",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "com.github.benmanes.caffeine.cache.PSAWMW",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
     "name": "com.github.benmanes.caffeine.cache.SW",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,

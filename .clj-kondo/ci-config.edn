@@ -1,7 +1,8 @@
 {:source-paths   #{"src"}
  :linters        {:unresolved-symbol {:exclude [(fluree.db.util/catch*)
                                                 (test-with-files.tools/with-tmp-dir)
-                                                goog.isObject]}}
+                                                goog.isObject
+                                                form#]}}
  :lint-as        {instaparse.core/defparser clojure.core/def}
  :config-in-call {cljs.core/pr-sequential-writer {:ignore [:private-call]}
                   fluree.db.query.exec.eval/parse-qualified-code {:ignore true}}

@@ -621,7 +621,7 @@
 
             refresh-ch
             ([{:keys [garbage properties old-sketch-paths classes], refreshed-db :db, :as _status}]
-             (let [ ;; Add computed fields to properties for O(1) optimizer lookups
+             (let [;; Add computed fields to properties for O(1) optimizer lookups
                    properties-with-computed (add-computed-fields properties)
 
                    {:keys [index-catalog alias] :as refreshed-db*}
