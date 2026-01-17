@@ -20,7 +20,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
             [fluree.db.util.ledger :as ledger-util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.util.trace :as trace]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -224,67 +225,65 @@
 
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
-  (go-try
-    (log/debug "load-alias called with:" alias)
-    (let [[base-alias explicit-t] (extract-query-string-t alias)
-          ;; Normalize to ensure branch (e.g., "docs" -> "docs:main")
-          normalized-alias (ledger-util/ensure-ledger-branch base-alias)
-          publisher        (connection/primary-publisher conn)
-          ns-record        (<? (nameservice/lookup publisher normalized-alias))]
-      (if (virtual-graph-record? ns-record)
-        ;; Virtual graph - load via VG loader (JVM only)
-        #?(:clj
-           (cond
-             (r2rml-virtual-graph? ns-record)
-             ;; R2RML VGs connect to external databases, don't need a source ledger
-             (<? (vg-loader/load-virtual-graph-from-nameservice nil publisher normalized-alias))
+  (trace/async-form ::load-alias {}
+    (go-try
+      (log/debug "load-alias called with:" alias)
+      (let [[base-alias explicit-t] (extract-query-string-t alias)
+            ;; Normalize to ensure branch (e.g., "docs" -> "docs:main")
+            normalized-alias (ledger-util/ensure-ledger-branch base-alias)
+            publisher        (connection/primary-publisher conn)
+            ns-record        (<? (nameservice/lookup publisher normalized-alias))]
+        (if (virtual-graph-record? ns-record)
+          ;; Virtual graph - load via VG loader (JVM only)
+          #?(:clj
+             (cond
+               (r2rml-virtual-graph? ns-record)
+               ;; R2RML VGs connect to external databases, don't need a source ledger
+               (<? (vg-loader/load-virtual-graph-from-nameservice nil publisher normalized-alias))
 
-             (iceberg-virtual-graph? ns-record)
-             ;; Iceberg VGs - create directly and apply time-travel if specified
-             ;; Uses requiring-resolve for dynamic loading (db-iceberg module)
-             (if-let [create-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/create)]
-               (let [raw-config (get-in ns-record ["fidx:config" "@value"])
-                     ;; Config is stored as JSON string, need to parse it
-                     config (if (string? raw-config)
-                              (json/parse raw-config false)
-                              raw-config)
-                     ;; Get publisher-level Iceberg config and shared cache
-                     iceberg-config (system/get-iceberg-config publisher)
-                     cache-instance (system/get-iceberg-cache publisher)
-                     vg (create-fn {:alias normalized-alias
-                                    :config config
-                                    :iceberg-config iceberg-config
-                                    :cache-instance cache-instance})
-                     ;; Apply time-travel if specified in alias (e.g., airlines@t:12345)
-                     parse-time-travel (requiring-resolve 'fluree.db.virtual-graph.iceberg/parse-time-travel)
-                     with-time-travel (requiring-resolve 'fluree.db.virtual-graph.iceberg/with-time-travel)
-                     time-travel (when explicit-t (parse-time-travel explicit-t))]
-                 (with-time-travel vg time-travel))
-               (throw (ex-info "Iceberg support not available. Add com.fluree/db-iceberg dependency."
-                               {:status 501 :error :db/missing-iceberg-module})))
+               (iceberg-virtual-graph? ns-record)
+               ;; Iceberg VGs - create directly and apply time-travel if specified
+               ;; Uses requiring-resolve for dynamic loading (db-iceberg module)
+               (if-let [create-fn (requiring-resolve 'fluree.db.virtual-graph.iceberg/create)]
+                 (let [raw-config (get-in ns-record ["fidx:config" "@value"])
+                       ;; Config is stored as JSON string, need to parse it
+                       config (if (string? raw-config)
+                                (json/parse raw-config false)
+                                raw-config)
+                       ;; Get publisher-level Iceberg config and shared cache
+                       iceberg-config (system/get-iceberg-config publisher)
+                       cache-instance (system/get-iceberg-cache publisher)
+                       vg (create-fn {:alias normalized-alias
+                                      :config config
+                                      :iceberg-config iceberg-config
+                                      :cache-instance cache-instance})
+                       ;; Apply time-travel if specified in alias (e.g., airlines@t:12345)
+                       parse-time-travel (requiring-resolve 'fluree.db.virtual-graph.iceberg/parse-time-travel)
+                       with-time-travel (requiring-resolve 'fluree.db.virtual-graph.iceberg/with-time-travel)
+                       time-travel (when explicit-t (parse-time-travel explicit-t))]
+                   (with-time-travel vg time-travel))
+                 (throw (ex-info "Iceberg support not available. Add com.fluree/db-iceberg dependency."
+                                 {:status 501 :error :db/missing-iceberg-module})))
 
-             :else
-             ;; Other VGs (BM25, etc.) need a source ledger from dependencies
-             (let [deps          (get ns-record "fidx:dependencies")
-                   source-alias  (first deps)
-                   source-ledger (<? (connection/load-ledger-alias conn source-alias))
-                   source-db     (ledger/current-db source-ledger)]
-               (<? (vg-loader/load-virtual-graph-from-nameservice
-                    source-db publisher normalized-alias))))
-           :cljs
-           (throw (ex-info "Virtual graphs are not supported in ClojureScript"
-                           {:status 400 :error :db/unsupported})))
-        ;; Regular ledger
-        (if ns-record
+               :else
+               ;; Other VGs (BM25, etc.) need a source ledger from dependencies
+               (let [deps          (get ns-record "fidx:dependencies")
+                     source-alias  (first deps)
+                     source-ledger (<? (connection/load-ledger-alias conn source-alias))
+                     source-db     (ledger/current-db source-ledger)]
+                 (<? (vg-loader/load-virtual-graph-from-nameservice
+                      source-db publisher normalized-alias))))
+             :cljs
+             (throw (ex-info "Virtual graphs are not supported in ClojureScript"
+                             {:status 400 :error :db/unsupported})))
+          ;; Regular ledger
           (let [ledger (<? (connection/load-ledger-alias conn normalized-alias))
                 db     (ledger/current-db ledger)
                 t*     (or explicit-t t)
                 query* (-> sanitized-query
                            (assoc :t t*)
                            (ledger-opts-override db))]
-            (<? (restrict-db db tracker query* conn)))
-          (throw (ex-info (str "Load for " normalized-alias " failed due to failed address lookup.")
-                          {:status 404 :error :db/unkown-ledger})))))))
+            (<? (restrict-db db tracker query* conn))))))))
 
 (defn load-aliases
   [conn tracker aliases sanitized-query]
@@ -317,15 +316,16 @@
 
 (defn load-dataset
   [conn tracker defaults named sanitized-query]
-  (go-try
-    (if (and (= (count defaults) 1)
-             (empty? named))
-      (let [alias (first defaults)]
-        ;; return an unwrapped db if the data set consists of one ledger
-        (<? (load-alias conn tracker alias sanitized-query)))
-      (let [all-aliases (->> defaults (concat named) distinct)
-            db-map      (<? (load-aliases conn tracker all-aliases sanitized-query))]
-        (dataset db-map defaults)))))
+  (trace/async-form ::load-dataset {}
+    (go-try
+      (if (and (= (count defaults) 1)
+               (empty? named))
+        (let [alias (first defaults)]
+                          ;; return an unwrapped db if the data set consists of one ledger
+          (<? (load-alias conn tracker alias sanitized-query)))
+        (let [all-aliases (->> defaults (concat named) distinct)
+              db-map      (<? (load-aliases conn tracker all-aliases sanitized-query))]
+          (dataset db-map defaults))))))
 
 (defn query-connection-fql
   [conn query override-opts]

@@ -25,8 +25,9 @@
             [fluree.db.util.ledger :as util.ledger]
             [fluree.db.util.log :as log]
             [fluree.db.util.parse :as util.parse]
+            [fluree.db.util.trace :as trace]
             [fluree.json-ld :as json-ld])
-  (:refer-clojure :exclude [merge load range exists? update drop]))
+  (:refer-clojure :exclude [load range exists? update drop]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -75,22 +76,24 @@
   [config]
   ;; TODO - do some validation
   (promise-wrap
-   (go-try
-     (let [system-map (-> config config/parse system/initialize)
-           conn       (reduce-kv (fn [x k v]
-                                   (if (isa? k :fluree.db/connection)
-                                     (reduced v)
-                                     x))
-                                 nil system-map)]
-       (assoc conn ::system-map system-map)))))
+   (trace/async-form ::connect {:config config}
+     (go-try
+       (let [system-map (-> config config/parse system/initialize)
+             conn       (reduce-kv (fn [x k v]
+                                     (if (isa? k :fluree.db/connection)
+                                       (reduced v)
+                                       x))
+                                   nil system-map)]
+         (assoc conn ::system-map system-map))))))
 
 (defn disconnect
   "Terminates a connection and releases associated resources.
   Returns a promise that resolves when disconnection is complete."
   [conn]
   (promise-wrap
-   (go-try
-     (-> conn ::system-map system/terminate))))
+   (trace/async-form ::disconnect {}
+     (go-try
+       (-> conn ::system-map system/terminate)))))
 
 (defn convert-config-key
   [[k v]]
@@ -262,10 +265,11 @@
    (validate-connection conn)
    (util.ledger/validate-ledger-name ledger-alias)
    (promise-wrap
-    (go-try
-      (log/info "Creating ledger" ledger-alias)
-      (let [ledger (<? (connection/create-ledger conn ledger-alias opts))]
-        (ledger/current-db ledger))))))
+    (trace/async-form ::create {:ledger-alias ledger-alias}
+      (go-try
+        (log/info "Creating ledger" ledger-alias)
+        (let [ledger (<? (connection/create-ledger conn ledger-alias opts))]
+          (ledger/current-db ledger)))))))
 
 (defn alias->address
   "Resolves a ledger alias to its address.
@@ -281,16 +285,18 @@
   [conn alias-or-address]
   (validate-connection conn)
   (promise-wrap
-   (go-try
-     (let [ledger (<? (connection/load-ledger conn alias-or-address))]
-       (ledger/current-db ledger)))))
+   (trace/async-form ::load {:ledger-alias alias-or-address}
+     (go-try
+       (let [ledger (<? (connection/load-ledger conn alias-or-address))]
+         (ledger/current-db ledger))))))
 
 (defn drop
   "Deletes a ledger and its associated data.
   Returns a promise that resolves when deletion is complete."
   [conn ledger-alias]
   (promise-wrap
-   (connection/drop-ledger conn ledger-alias)))
+   (trace/async-form ::drop {:ledger-alias ledger-alias}
+     (connection/drop-ledger conn ledger-alias))))
 
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
@@ -298,12 +304,13 @@
   [conn ledger-alias-or-address]
   (validate-connection conn)
   (promise-wrap
-   (go-try
-     (let [address (if (address? ledger-alias-or-address)
-                     ledger-alias-or-address
-                     (<? (alias->address conn ledger-alias-or-address)))]
-       (log/debug "exists? - ledger address:" address)
-       (<? (connection/ledger-exists? conn address))))))
+   (trace/async-form ::exists? {:ledger-alias ledger-alias-or-address}
+     (go-try
+       (let [address (if (address? ledger-alias-or-address)
+                       ledger-alias-or-address
+                       (<? (alias->address conn ledger-alias-or-address)))]
+         (log/debug "exists? - ledger address:" address)
+         (<? (connection/ledger-exists? conn address)))))))
 
 (defn notify
   "Notifies the connection of a new commit for maintaining current db state.
@@ -318,7 +325,39 @@
   [conn commit-address]
   (validate-connection conn)
   (promise-wrap
-   (connection/notify conn commit-address)))
+   (trace/async-form ::notify {:commit-address commit-address}
+     (connection/notify conn commit-address))))
+
+(defn refresh
+  "Poll-friendly helper to refresh a cached ledger's state (commit and/or index)
+  from the connection's configured nameservices.
+
+  This is useful in environments that cannot receive publication events (e.g.
+  AWS Lambda) and need to periodically poll to keep warm caches fresh.
+
+  Behavior:
+  - Looks up the latest nameservice record for `ledger-id` (alias or fluree address)
+  - Calls `notify` internally with that record, which will:
+    - apply an index-only update when t is unchanged but index address changed
+    - apply the next commit when t advanced by exactly 1
+    - drop cached ledger state when t jumped ahead by >1 (forcing reload)
+
+  Notes:
+  - If the ledger is not currently cached in the connection, notify is a no-op.
+    Use `load`/`db` first in cold-start paths.
+
+  Returns a promise resolving to the notify result (e.g. true, ::ledger/index-current,
+  ::ledger/index-updated), or nil if no nameservice record could be found."
+  [conn ledger-id]
+  (validate-connection conn)
+  (promise-wrap
+   (go-try
+     (let [ledger-address (if (connection/fluree-address? ledger-id)
+                            ledger-id
+                            (<? (connection/primary-address conn ledger-id)))
+           ns-record      (<? (connection/lookup-commit conn ledger-address))]
+       (when ns-record
+         (<? (connection/notify conn ns-record)))))))
 
 (defn insert
   "Stages insertion of new entities into a database.
@@ -337,7 +376,8 @@
   ([db rdf] (insert db rdf nil))
   ([db rdf opts]
    (promise-wrap
-    (transact-api/insert db rdf opts))))
+    (trace/async-form ::insert {}
+      (transact-api/insert db rdf opts)))))
 
 (defn upsert
   "Stages insertion or update of entities.
@@ -355,7 +395,8 @@
   ([db rdf] (upsert db rdf nil))
   ([db rdf opts]
    (promise-wrap
-    (transact-api/upsert db rdf opts))))
+    (trace/async-form ::upsert {}
+      (transact-api/upsert db rdf opts)))))
 
 (defn update
   "Stages updates to a database without committing.
@@ -371,7 +412,8 @@
   ([db json-ld] (update db json-ld nil))
   ([db json-ld opts]
    (promise-wrap
-    (transact-api/update db json-ld opts))))
+    (trace/async-form ::update {}
+      (transact-api/update db json-ld opts)))))
 
 ;; TODO - deprecate `stage` in favor of `update` eventually
 (defn ^:deprecated stage
@@ -424,7 +466,8 @@
   ([conn txn opts]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/update! conn txn opts))))
+    (trace/async-form ::transact! {}
+      (transact-api/update! conn txn opts)))))
 
 (defn update!
   "Stages updates to a database and commits in one atomic operation.
@@ -442,21 +485,24 @@
   ([conn ledger-id txn opts]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/update! conn ledger-id txn opts)))
+    (trace/async-form ::update! {}
+      (transact-api/update! conn ledger-id txn opts))))
   ;; 3-arity dispatcher to support both new and legacy usage without arity conflicts
   ([conn a b]
    (validate-connection conn)
    (promise-wrap
-    (if (map? a)
-      ;; legacy: (conn txn opts)
-      (transact-api/update! conn a b)
-      ;; new: (conn ledger-id txn)
-      (transact-api/update! conn a b nil))))
+    (trace/async-form ::update! {}
+      (if (map? a)
+        ;; legacy: (conn txn opts)
+        (transact-api/update! conn a b)
+        ;; new: (conn ledger-id txn)
+        (transact-api/update! conn a b nil)))))
   ;; Legacy: (conn txn) where txn contains "ledger"
   ([conn txn]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/update! conn txn nil))))
+    (trace/async-form ::update! {}
+      (transact-api/update! conn txn nil)))))
 
 (defn upsert!
   "Stages insertion or update of entities and commits in one atomic operation.
@@ -476,7 +522,8 @@
   ([conn ledger-id txn opts]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/upsert! conn ledger-id txn opts))))
+    (trace/async-form ::upsert! {}
+      (transact-api/upsert! conn ledger-id txn opts)))))
 
 (defn insert!
   "Stages insertion of new entities and commits in one atomic operation.
@@ -497,7 +544,8 @@
   ([conn ledger-id txn opts]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/insert! conn ledger-id txn opts))))
+    (trace/async-form ::insert! {}
+      (transact-api/insert! conn ledger-id txn opts)))))
 
 (defn credential-update!
   "Stages updates to a database and commits using a verifiable credential.
@@ -517,7 +565,8 @@
   ([conn credential opts]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/credential-transact! conn credential opts))))
+    (trace/async-form ::credential-transact!! {}
+      (transact-api/credential-transact! conn credential opts)))))
 
 (defn ^:deprecated credential-transact!
   "Deprecated: Use `credential-update!` instead.
@@ -540,11 +589,13 @@
   ([conn txn]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/create-with-txn conn txn)))
+    (trace/async-form ::create-with-txn {}
+      (transact-api/create-with-txn conn txn))))
   ([conn txn opts]
    (validate-connection conn)
    (promise-wrap
-    (transact-api/create-with-txn conn txn opts))))
+    (trace/async-form ::create-with-txn {}
+      (transact-api/create-with-txn conn txn opts)))))
 
 (defn status
   "Returns current status of a ledger.
@@ -557,9 +608,10 @@
   [conn ledger-id]
   (validate-connection conn)
   (promise-wrap
-   (go-try
-     (let [ledger (<? (connection/load-ledger conn ledger-id))]
-       (ledger/status ledger)))))
+   (trace/async-form ::status {}
+     (go-try
+       (let [ledger (<? (connection/load-ledger conn ledger-id))]
+         (ledger/status ledger))))))
 
 (defn ledger-info
   "Returns comprehensive ledger information including detailed statistics.
@@ -604,39 +656,40 @@
   ([conn ledger-id context]
    (validate-connection conn)
    (promise-wrap
-    (go-try
-      (let [compact-fn (when context
-                         (json-ld/compact-fn (json-ld/parse-context context)))
-            ;; Helper to load regular (non-VG) ledger info
-            load-regular-info
-            (fn []
-              (go-try
-                (let [ledger* (<? (connection/load-ledger conn ledger-id))
-                      info    (<? (ledger/ledger-info ledger*))]
-                  (decode/ledger-info info compact-fn))))]
-        #?(:clj
-           ;; Iceberg VGs have no FlakeDB commit/index metadata, but we can provide
-           ;; ledger-info-like schema + stats from R2RML + Iceberg metadata.
-           (if (and (string? ledger-id)
-                    (not (connection/fluree-address? ledger-id)))
-             (let [parsed      (util.ledger/parse-ledger-alias ledger-id)
-                   base-alias  (cond-> (:ledger parsed)
-                                 (:branch parsed) (str ":" (:branch parsed)))
-                   norm-alias  (util.ledger/ensure-ledger-branch base-alias)
-                   publisher   (connection/primary-publisher conn)
-                   ns-record   (when publisher
-                                 (<? (nameservice/lookup publisher norm-alias)))]
-               (if (iceberg-virtual-graph-record? ns-record)
-                 (let [vg            (<? (query-api/load-alias conn nil ledger-id {}))
-                       vg-info-fn    (requiring-resolve 'fluree.db.virtual-graph.iceberg.ledger-info/ledger-info)
-                       info          (cond-> (vg-info-fn vg)
-                                       ns-record (assoc :nameservice ns-record))]
-                   (cond-> info
-                     compact-fn (clojure.core/update :stats decode/compact-iri-stats compact-fn)))
-                 (<? (load-regular-info))))
-             (<? (load-regular-info)))
-           :cljs
-           (<? (load-regular-info))))))))
+    (trace/async-form ::ledger-info {}
+      (go-try
+        (let [compact-fn (when context
+                           (json-ld/compact-fn (json-ld/parse-context context)))
+              ;; Helper to load regular (non-VG) ledger info
+              load-regular-info
+              (fn []
+                (go-try
+                  (let [ledger* (<? (connection/load-ledger conn ledger-id))
+                        info    (<? (ledger/ledger-info ledger*))]
+                    (decode/ledger-info info compact-fn))))]
+          #?(:clj
+             ;; Iceberg VGs have no FlakeDB commit/index metadata, but we can provide
+             ;; ledger-info-like schema + stats from R2RML + Iceberg metadata.
+             (if (and (string? ledger-id)
+                      (not (connection/fluree-address? ledger-id)))
+               (let [parsed      (util.ledger/parse-ledger-alias ledger-id)
+                     base-alias  (cond-> (:ledger parsed)
+                                   (:branch parsed) (str ":" (:branch parsed)))
+                     norm-alias  (util.ledger/ensure-ledger-branch base-alias)
+                     publisher   (connection/primary-publisher conn)
+                     ns-record   (when publisher
+                                   (<? (nameservice/lookup publisher norm-alias)))]
+                 (if (iceberg-virtual-graph-record? ns-record)
+                   (let [vg            (<? (query-api/load-alias conn nil ledger-id {}))
+                         vg-info-fn    (requiring-resolve 'fluree.db.virtual-graph.iceberg.ledger-info/ledger-info)
+                         info          (cond-> (vg-info-fn vg)
+                                         ns-record (assoc :nameservice ns-record))]
+                     (cond-> info
+                       compact-fn (clojure.core/update :stats decode/compact-iri-stats compact-fn)))
+                   (<? (load-regular-info))))
+               (<? (load-regular-info)))
+             :cljs
+             (<? (load-regular-info)))))))))
 
 ;; db operations
 
@@ -840,7 +893,9 @@
   ([conn q] (query-connection conn q {}))
   ([conn q opts]
    (validate-connection conn)
-   (promise-wrap (query-api/query-connection conn q opts))))
+   (promise-wrap
+    (trace/async-form ::query-connection {}
+      (query-api/query-connection conn q opts)))))
 
 (defn credential-query-connection
   "Executes a query via connection using a verifiable credential.

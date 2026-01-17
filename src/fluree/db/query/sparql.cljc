@@ -6,7 +6,8 @@
             [clojure.string :as str]
             [fluree.db.query.sparql.translator :as sparql.translator]
             [fluree.db.util.docs :as docs]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.util.trace :as trace]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -64,8 +65,9 @@
 
 (defn ->fql
   [sparql]
-  (let [parsed (parse sparql)]
-    (sparql.translator/translate parsed)))
+  (trace/form ::translate-sparql {}
+    (let [parsed (parse sparql)]
+      (sparql.translator/translate parsed))))
 
 (defn sparql-format?
   [opts]

@@ -22,8 +22,7 @@
             [fluree.db.virtual-graph.bm25.stopwords :as stopwords]
             [fluree.db.virtual-graph.bm25.storage] ;; Load for multimethod registration
             [fluree.db.virtual-graph.bm25.update :as bm25.update]
-            [fluree.db.virtual-graph.parse :as vg-parse])
-  (:refer-clojure :exclude [assert]))
+            [fluree.db.virtual-graph.parse :as vg-parse]))
 
 (set! *warn-on-reflection* true)
 

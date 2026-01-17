@@ -4,7 +4,8 @@
             [fluree.db.json-ld.policy.enforce :as enforce]
             [fluree.db.json-ld.policy.rules :as policy.rules]
             [fluree.db.util :as util]
-            [fluree.db.util.async :refer [<? go-try]]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.trace :as trace]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -46,24 +47,25 @@
   This enables a single O(1) lookup. Class applicability and required policy selection
   are handled internally by policies-allow-modification?."
   [tracker {:keys [db-after add]}]
-  (go-try
-    (let [{:keys [policy] :as db-after*} (<? (refresh-modify-policies db-after tracker))
-          ;; Create a separate class cache for this modification batch
-          class-policy-cache (atom {})]
-      (if (enforce/unrestricted-modify? policy)
-        db-after
-        (loop [[flake & r] add]
-          (if flake
-            (let [sid (flake/s flake)
-                  pid (flake/p flake)
-                  property-policies (enforce/modify-policies-for-property policy pid)
-                  candidate-policies (concat property-policies
-                                             (enforce/modify-policies-for-subject policy sid)
-                                             (enforce/modify-policies-for-flake db-after* flake))]
-              ;; policies-allow-modification? will throw if access forbidden
-              (<? (enforce/policies-allow-modification? db-after* tracker class-policy-cache sid candidate-policies))
-              (recur r))
-            db-after))))))
+  (trace/async-form ::allowed? {}
+    (go-try
+      (let [{:keys [policy] :as db-after*} (<? (refresh-modify-policies db-after tracker))
+                            ;; Create a separate class cache for this modification batch
+            class-policy-cache (atom {})]
+        (if (enforce/unrestricted-modify? policy)
+          db-after
+          (loop [[flake & r] add]
+            (if flake
+              (let [sid (flake/s flake)
+                    pid (flake/p flake)
+                    property-policies (enforce/modify-policies-for-property policy pid)
+                    candidate-policies (concat property-policies
+                                               (enforce/modify-policies-for-subject policy sid)
+                                               (enforce/modify-policies-for-flake db-after* flake))]
+                                ;; policies-allow-modification? will throw if access forbidden
+                (<? (enforce/policies-allow-modification? db-after* tracker class-policy-cache sid candidate-policies))
+                (recur r))
+              db-after)))))))
 
 (defn deny-all?
   "Returns true if policy allows no modification."

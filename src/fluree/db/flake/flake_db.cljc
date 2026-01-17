@@ -1,5 +1,5 @@
 (ns fluree.db.flake.flake-db
-  (:refer-clojure :exclude [load vswap!])
+  (:refer-clojure :exclude [load])
   (:require [#?(:clj clojure.pprint, :cljs cljs.pprint) :as pprint :refer [pprint]]
             [clojure.core.async :as async :refer [<! >! go go-loop]]
             [clojure.set :refer [map-invert]]

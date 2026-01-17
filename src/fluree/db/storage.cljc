@@ -1,5 +1,5 @@
 (ns fluree.db.storage
-  (:refer-clojure :exclude [read list exists?])
+  (:refer-clojure :exclude [read exists?])
   (:require [clojure.core.async :as async]
             [clojure.pprint :as pprint]
             [clojure.string :as str]

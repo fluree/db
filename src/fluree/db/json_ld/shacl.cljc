@@ -8,6 +8,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.util :as util]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.trace :as trace]
             [fluree.json-ld :as json-ld])
   #?(:clj (:import (java.util.regex Pattern))))
 
@@ -1208,23 +1209,24 @@
 
   `modified-subjects` is a sequence of s-flakes of modified subjects."
   [data-db tracker new-flakes context]
-  (go-try
-    (let [shapes (if (modified-shape? new-flakes)
-                   (<? (extract-shapes data-db tracker))
-                   (cached-shapes data-db))]
-      (if (empty? shapes)
-        :valid
-        (let [modified-subjects (<? (modified-subjects data-db tracker new-flakes))
-              v-ctx {:display  (make-display data-db context)
-                     :tracker tracker
-                     :context  context
-                     :data-db  data-db}]
-          (loop [[shape & r] shapes]
-            (if shape
-              (do
-                (doseq [s-flakes modified-subjects]
-                  ;; TODO - below could be done in parallel
-                  (when-let [results (<? (validate-node-shape v-ctx shape s-flakes))]
-                    (throw-shacl-violation context results)))
-                (recur r))
-              :valid)))))))
+  (trace/async-form ::validate {}
+    (go-try
+      (let [shapes (if (modified-shape? new-flakes)
+                     (<? (extract-shapes data-db tracker))
+                     (cached-shapes data-db))]
+        (if (empty? shapes)
+          :valid
+          (let [modified-subjects (<? (modified-subjects data-db tracker new-flakes))
+                v-ctx {:display  (make-display data-db context)
+                       :tracker tracker
+                       :context  context
+                       :data-db  data-db}]
+            (loop [[shape & r] shapes]
+              (if shape
+                (do
+                  (doseq [s-flakes modified-subjects]
+                    ;; TODO - below could be done in parallel
+                    (when-let [results (<? (validate-node-shape v-ctx shape s-flakes))]
+                      (throw-shacl-violation context results)))
+                  (recur r))
+                :valid))))))))

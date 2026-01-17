@@ -6,6 +6,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
             [fluree.db.util.parse :as util.parse]
+            [fluree.db.util.trace :as trace]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -141,18 +142,19 @@
   ([db parsed-context opts]
    (policy-enforce-db db nil parsed-context opts))
   ([db tracker parsed-context opts]
-   (go-try
-     (let [{:keys [identity policy-class policy policy-values default-allow]} opts
-           policy-values* (util.parse/normalize-values policy-values)]
-       (cond
+   (trace/async-form ::policy-enforce-db {}
+     (go-try
+       (let [{:keys [identity policy-class policy policy-values default-allow]} opts
+             policy-values* (util.parse/normalize-values policy-values)]
+         (cond
 
-         identity
-         (<? (wrap-identity-policy db tracker identity policy-values* default-allow))
+           identity
+           (<? (wrap-identity-policy db tracker identity policy-values* default-allow))
 
-         policy-class
-         (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policy-class))]
-           (<? (wrap-class-policy db tracker classes policy-values* default-allow)))
+           policy-class
+           (let [classes (map #(json-ld/expand-iri % parsed-context) (util/sequential policy-class))]
+             (<? (wrap-class-policy db tracker classes policy-values* default-allow)))
 
-         policy
-         (let [expanded-policy (json-ld/expand policy parsed-context)]
-           (<? (wrap-policy db tracker expanded-policy policy-values* default-allow))))))))
+           policy
+           (let [expanded-policy (json-ld/expand policy parsed-context)]
+             (<? (wrap-policy db tracker expanded-policy policy-values* default-allow)))))))))

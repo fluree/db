@@ -11,7 +11,8 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.track :as track]
             [fluree.db.util :as util]
-            [fluree.db.util.async :refer [<? go-try]]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.trace :as trace]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -92,18 +93,19 @@
 
 (defn generate-flakes
   [db tracker parsed-txn tx-state]
-  (go
-    (let [error-ch  (async/chan)
-          db-vol    (volatile! db)
-          update-ch (->> (where/search db parsed-txn tracker error-ch)
-                         (update/modify db-vol parsed-txn tx-state tracker error-ch)
-                         (into-flakeset tracker error-ch))]
-      (async/alt!
-        error-ch ([e] e)
-        update-ch ([result]
-                   (if (util/exception? result)
-                     result
-                     [@db-vol result]))))))
+  (trace/async-form ::generate-flakes {}
+    (go
+      (let [error-ch  (async/chan)
+            db-vol    (volatile! db)
+            update-ch (->> (where/search db parsed-txn tracker error-ch)
+                           (update/modify db-vol parsed-txn tx-state tracker error-ch)
+                           (into-flakeset tracker error-ch))]
+        (async/alt!
+          error-ch ([e] e)
+          update-ch ([result]
+                     (if (util/exception? result)
+                       result
+                       [@db-vol result])))))))
 
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an

@@ -11,7 +11,6 @@
             [fluree.db.query.optimize :as optimize]
             [fluree.db.util :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [go-try <?]])
-  (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
 #?(:clj (set! *warn-on-reflection* true))
