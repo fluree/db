@@ -269,21 +269,14 @@
         warehouse-path (or (:warehouse-path config)
                            (get config "warehouse-path")
                            (get config "warehousePath"))
-        ;; Store can be either:
-        ;; 1. Configuration data: {:type :s3 :bucket "..."} or {:type :file :root "..."}
-        ;; 2. Already a store object (live object passed directly)
-        ;; We detect config data by checking for :type key (only config has explicit type)
-        ;; Note: We can't just check for :bucket/:root because records have those keys too
-        store-raw (or (:store config) (get config "store"))
-        store (if (and (map? store-raw)
-                       (not (record? store-raw))  ; Records are live stores, not config
-                       (or (:type store-raw) (get store-raw "type")       ; Explicit type
-                           (:bucket store-raw) (get store-raw "bucket")   ; S3 config
-                           (:root store-raw) (get store-raw "root")))     ; FileStore config
-                ;; It's configuration data - create the store
-                (create-store-from-config store-raw)
-                ;; It's already a store object (or nil)
-                store-raw)
+        ;; Store configuration: {:type :s3 :bucket "..."} or {:type :file :root "..."}
+        ;; External APIs always accept config maps, never live store objects
+        store-config (or (:store config) (get config "store"))
+        store (when (and (map? store-config)
+                         (or (:type store-config) (get store-config "type")       ; Explicit type
+                             (:bucket store-config) (get store-config "bucket")   ; S3 config
+                             (:root store-config) (get store-config "root")))     ; FileStore config
+                (create-store-from-config store-config))
         metadata-location (or (:metadata-location config)
                               (get config "metadata-location")
                               (get config "metadataLocation"))

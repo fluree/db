@@ -12,7 +12,6 @@
             [fluree.db.nameservice :as nameservice]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.optimize :as optimize]
-            [fluree.db.storage.file :as file-store]
             [fluree.db.virtual-graph.iceberg :as iceberg-vg]
             [fluree.db.virtual-graph.iceberg.pushdown :as pushdown])
   (:import [java.io File]))
@@ -36,11 +35,12 @@
 (def ^:private mapping-path
   (find-resource-path "openflights/airlines-r2rml.ttl"))
 
-(defn- test-store
-  "Create a FileStore for the test warehouse. Creates a new store each call."
+(defn- test-store-config
+  "Return store config for the test warehouse. Factory will create the store."
   []
   (when warehouse-path
-    (file-store/open warehouse-path)))
+    {:type :file
+     :root warehouse-path}))
 
 (def ^:private vg (atom nil))
 
@@ -58,7 +58,7 @@
   (if (and (warehouse-exists?) (mapping-exists?))
     (do
       (reset! vg (iceberg-vg/create {:alias "airlines"
-                                     :config {:store (test-store)
+                                     :config {:store (test-store-config)
                                               :mapping mapping-path}}))
       (try
         (f)
@@ -95,6 +95,21 @@
 
 (defn- val-map [v]
   {::where/val v})
+
+(defn- reset-vg-query-state!
+  "Reset the query-scoped atoms in the VG to nil.
+
+   The VG has atoms (query-pushdown, aggregation-spec, etc.) that are normally
+   cleared in -reorder and read in -finalize. Tests that call -finalize directly
+   without going through -reorder need to reset these to avoid contamination
+   from previous tests that used the full pipeline."
+  []
+  (when @vg
+    (when-let [qp (:query-pushdown @vg)] (reset! qp nil))
+    (when-let [as (:aggregation-spec @vg)] (reset! as nil))
+    (when-let [aj (:anti-join-spec @vg)] (reset! aj nil))
+    (when-let [ee (:expression-evaluators @vg)] (reset! ee nil))
+    (when-let [ts (:transitive-spec @vg)] (reset! ts nil))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Virtual Graph Creation Tests
@@ -166,6 +181,7 @@
 
 (deftest finalize-simple-query-test
   (when @vg
+    (reset-vg-query-state!)  ;; Clear stale state from previous tests
     (testing "Finalize executes query and returns solutions"
       (let [;; Build a solution with accumulated patterns
             patterns [(make-triple (var-map "?airline")
@@ -182,6 +198,7 @@
 
 (deftest finalize-with-filter-test
   (when @vg
+    (reset-vg-query-state!)  ;; Clear stale state from previous tests
     (testing "Finalize with literal filter pushes predicate to Iceberg"
       (let [;; Query: ?airline ex:country "United States"
             patterns [(make-triple (var-map "?airline")
@@ -201,6 +218,7 @@
 
 (deftest finalize-multiple-variables-test
   (when @vg
+    (reset-vg-query-state!)  ;; Clear stale state from previous tests
     (testing "Query with multiple variable bindings"
       (let [patterns [(make-triple (var-map "?airline")
                                    (iri-map "http://example.org/airlines/name")
@@ -227,14 +245,14 @@
   (when (and (warehouse-exists?) (mapping-exists?))
     (testing "Virtual graph with explicit branch in alias"
       (let [vg (iceberg-vg/create {:alias "airlines:main"
-                                   :config {:store (test-store)
+                                   :config {:store (test-store-config)
                                             :mapping mapping-path}})]
         (is (= "airlines:main" (:alias vg)))
         (is (nil? (:time-travel vg)))))
 
     (testing "Virtual graph without branch defaults correctly"
       (let [vg (iceberg-vg/create {:alias "airlines"
-                                   :config {:store (test-store)
+                                   :config {:store (test-store-config)
                                             :mapping mapping-path}})]
         (is (= "airlines" (:alias vg)))
         (is (nil? (:time-travel vg)))))))
@@ -247,7 +265,7 @@
            clojure.lang.ExceptionInfo
            #"cannot contain '@'"
            (iceberg-vg/create {:alias "airlines@t:12345"
-                               :config {:store (test-store)
+                               :config {:store (test-store-config)
                                         :mapping mapping-path}}))))))
 
 (deftest create-requires-store-or-warehouse-test
@@ -266,7 +284,7 @@
            clojure.lang.ExceptionInfo
            #"requires :mapping or :mappingInline"
            (iceberg-vg/create {:alias "test"
-                               :config {:store (test-store)}}))))))
+                               :config {:store (test-store-config)}}))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; End-to-End Integration Tests (Full Fluree API)
@@ -313,7 +331,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/airlines:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping mapping-path}}))
 
         ;; Query using FQL with FROM clause
@@ -341,7 +359,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/airlines-filter:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping mapping-path}}))
 
         ;; Query with literal filter - should push predicate to Iceberg
@@ -368,7 +386,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/airlines-sparql:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping mapping-path}}))
 
         ;; Query using SPARQL with FROM clause
@@ -398,7 +416,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/airlines-count:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping mapping-path}}))
 
         ;; Count all airlines
@@ -421,7 +439,7 @@
         (let [vg-result @(fluree/connect-iceberg
                           @e2e-conn
                           "iceberg/airlines-api"
-                          {:store (test-store)
+                          {:store (test-store-config)
                            :mapping mapping-path})]
           ;; Verify the VG was created with expected properties
           (is (map? vg-result) "Should return a map")
@@ -450,14 +468,14 @@
         @(fluree/connect-iceberg
           @e2e-conn
           "iceberg/airlines-dup"
-          {:store (test-store)
+          {:store (test-store-config)
            :mapping mapping-path})
 
         ;; Try to create a duplicate - API returns exception as value
         (let [result @(fluree/connect-iceberg
                        @e2e-conn
                        "iceberg/airlines-dup"
-                       {:store (test-store)
+                       {:store (test-store-config)
                         :mapping mapping-path})]
           (is (instance? Exception result) "Should return an exception")
           (is (re-find #"already exists" (ex-message result))
@@ -638,7 +656,7 @@
   (when (and (warehouse-exists?) (multi-table-mapping-exists?))
     (testing "Multi-table VG creation parses all tables from R2RML"
       (let [vg (iceberg-vg/create {:alias "openflights"
-                                   :config {:store (test-store)
+                                   :config {:store (test-store-config)
                                             :mapping multi-table-mapping-path}})]
         ;; Should have 3 mappings (airlines, airports, routes)
         (is (= 3 (count (:mappings vg)))
@@ -668,7 +686,7 @@
   (when (and (warehouse-exists?) (multi-table-mapping-exists?))
     (testing "Routing indexes correctly map predicates to tables"
       (let [vg (iceberg-vg/create {:alias "openflights"
-                                   :config {:store (test-store)
+                                   :config {:store (test-store-config)
                                             :mapping multi-table-mapping-path}})
             routing (:routing-indexes vg)
             ;; Multi-map structure: predicate -> [mapping1 mapping2 ...]
@@ -689,7 +707,7 @@
   (when (and (warehouse-exists?) (multi-table-mapping-exists?))
     (testing "Query against single table in multi-table VG works"
       (let [vg (iceberg-vg/create {:alias "openflights"
-                                   :config {:store (test-store)
+                                   :config {:store (test-store-config)
                                             :mapping multi-table-mapping-path}})
             ;; Query airlines table via type pattern
             patterns [(make-triple (var-map "?airline")
@@ -719,7 +737,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; Query airlines from multi-table VG (single table query)
@@ -825,7 +843,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/airlines-filter-pushdown:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping mapping-path}}))
 
         ;; Query with FILTER that should be pushed down
@@ -858,7 +876,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/airlines-us-count:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping mapping-path}}))
 
         ;; Count US airlines with literal filter pushdown
@@ -885,7 +903,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/airlines-id-filter:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping mapping-path}}))
 
         ;; Count airlines with id > 6000 using SPARQL FILTER
@@ -1039,7 +1057,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/airlines-values:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping mapping-path}}))
 
         ;; Query with VALUES clause - should push IN predicate to Iceberg
@@ -1073,7 +1091,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/airlines-values-count:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping mapping-path}}))
 
         ;; Count with VALUES for US and Canada
@@ -1107,7 +1125,7 @@
 ;;                     @e2e-publisher
 ;;                     {:vg-name "iceberg/airlines-filter-in:main"
 ;;                      :vg-type "fidx:Iceberg"
-;;                      :config {:store (test-store)
+;;                      :config {:store (test-store-config)
 ;;                               :mapping mapping-path}}))
 ;;         (let [sparql "PREFIX ex: <http://example.org/airlines/>
 ;;                       SELECT (COUNT(?airline) AS ?count)
@@ -1131,7 +1149,7 @@
   (when (and (warehouse-exists?) (multi-table-mapping-exists?))
     (testing "Multi-table VG has join graph from RefObjectMap"
       (let [vg (iceberg-vg/create {:alias "openflights-join"
-                                   :config {:store (test-store)
+                                   :config {:store (test-store-config)
                                             :mapping multi-table-mapping-path}})
             join-graph (:join-graph vg)]
         ;; Should have join graph with edges
@@ -1157,7 +1175,7 @@
   (when (and (warehouse-exists?) (multi-table-mapping-exists?))
     (testing "Multi-table query triggers hash join execution"
       (let [vg (iceberg-vg/create {:alias "openflights-hash"
-                                   :config {:store (test-store)
+                                   :config {:store (test-store-config)
                                             :mapping multi-table-mapping-path}})
             ;; Query that spans routes and airlines tables using FK predicate
             ;; The ex:operatedBy predicate is the RefObjectMap FK that links routes -> airlines
@@ -1208,7 +1226,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-join:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; Query that joins routes and airlines via ex:operatedBy FK predicate
@@ -1239,7 +1257,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-join-fql:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; Query that joins routes and airlines via ex:operatedBy FK predicate
@@ -1273,7 +1291,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-optional:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; First, verify basic multi-table query works (same as e2e-multi-table-vg-query-test)
@@ -1321,7 +1339,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-optional-count:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; Inner join query - returns joined rows from routes + airlines
@@ -1363,7 +1381,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-union:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; UNION query - get names from both airlines and airports (if airport table exists)
@@ -1397,7 +1415,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-union-vars:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; UNION with different variables - one branch has ?country, other doesn't
@@ -1433,7 +1451,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-count:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; COUNT(*) - count all airlines
@@ -1464,7 +1482,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-group:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; GROUP BY country with COUNT - count airlines per country
@@ -1502,7 +1520,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-multi-agg:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; Multiple aggregates - route statistics by airline
@@ -1544,7 +1562,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-distinct:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; SELECT DISTINCT on country - should return unique countries
@@ -1578,7 +1596,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-distinct-agg:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; COUNT DISTINCT - count unique countries
@@ -1612,7 +1630,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-not-exists:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; Find airlines that DON'T have a specific country (e.g., not United States)
@@ -1652,7 +1670,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-exists:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; Find airlines that DO have a specific country (e.g., United States)
@@ -1695,7 +1713,7 @@
                       @e2e-publisher
                       {:vg-name "iceberg/openflights-minus:main"
                        :vg-type "fidx:Iceberg"
-                       :config {:store (test-store)
+                       :config {:store (test-store-config)
                                 :mapping multi-table-mapping-path}}))
 
           ;; MINUS: Get all airlines except those from United States
@@ -1735,7 +1753,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-not-exists-cross:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; Find airlines that have no routes
@@ -1772,7 +1790,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-strlen:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; STRLEN is a non-pushable function - must be evaluated after scan
@@ -1805,7 +1823,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-bind:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; BIND computes a new variable from an expression
@@ -1842,7 +1860,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-bind-filter:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; BIND creates a variable that is then used in FILTER
@@ -1878,7 +1896,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-regex:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; REGEX is a non-pushable function
@@ -1911,7 +1929,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-coalesce:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; COALESCE returns first non-null value
@@ -1947,7 +1965,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-if:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; IF returns one of two values based on condition
@@ -1988,7 +2006,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-having:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; HAVING filters groups - only countries with > 50 airlines
@@ -2026,7 +2044,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-having-alias:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; HAVING using the aggregate alias variable
@@ -2063,7 +2081,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-having-combo:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; HAVING with a range condition using alias variable
@@ -2104,7 +2122,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-pipeline:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; Comprehensive query combining all modifiers:
@@ -2162,7 +2180,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-bound-optional:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; This is a common LLM/SPARQL pattern to find entities WITHOUT certain relationships
@@ -2229,7 +2247,7 @@
                     @e2e-publisher
                     {:vg-name "iceberg/openflights-subquery:main"
                      :vg-type "fidx:Iceberg"
-                     :config {:store (test-store)
+                     :config {:store (test-store-config)
                               :mapping multi-table-mapping-path}}))
 
         ;; Test 1: Subquery with aggregation - get airlines with their route count
