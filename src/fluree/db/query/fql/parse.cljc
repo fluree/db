@@ -18,6 +18,7 @@
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.parse :as util.parse]
+            [fluree.db.util.trace :as trace]
             [fluree.db.validation :as v]
             [fluree.json-ld :as json-ld]))
 
@@ -864,7 +865,8 @@
 (defn parse-query
   [q]
   (log/trace "parse-query" q)
-  (-> q syntax/coerce-query parse-query*))
+  (trace/form ::parse-query {}
+    (-> q syntax/coerce-query parse-query*)))
 
 (declare parse-subj-cmp)
 

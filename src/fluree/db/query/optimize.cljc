@@ -2,7 +2,8 @@
   (:require [clojure.set :as set]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util :as util]
-            [fluree.db.util.async :refer [go-try <?]]))
+            [fluree.db.util.async :refer [go-try <?]]
+            [fluree.db.util.trace :as trace]))
 
 (defn compare-component
   [cmp-a cmp-b]
@@ -732,9 +733,10 @@
   Returns:
     Channel containing optimized query with inlined filters compiled"
   [db parsed-query]
-  (go-try
-    (if-let [where-clause (-> parsed-query :where not-empty)]
-      (let [context        (:context parsed-query)
-            where-optimized (<? (optimize-where-clause db context where-clause))]
-        (assoc parsed-query :where where-optimized))
-      parsed-query)))
+  (trace/async-form ::optimize {}
+    (go-try
+      (if-let [where-clause (-> parsed-query :where not-empty)]
+        (let [context         (:context parsed-query)
+              where-optimized (<? (optimize-where-clause db context where-clause))]
+          (assoc parsed-query :where where-optimized))
+        parsed-query))))

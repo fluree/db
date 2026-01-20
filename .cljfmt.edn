@@ -4,4 +4,7 @@
  :extra-indents
  {go-try [[:block 0]]
   try*   [[:block 0]]
-  catch* [[:block 1]]}}
+  catch* [[:block 1]]
+  form   [[:block 2]]
+  async-form [[:block 2]]
+  with-parent-context [[:block 2]]}}

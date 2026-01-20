@@ -4,7 +4,8 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.iri :as iri]
-            [fluree.db.query.exec.where :as where]))
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.util.trace :as trace]))
 
 (defn assign-clause
   [clause solution]
@@ -127,13 +128,14 @@
   [db-vol parsed-txn tx-state tracker error-ch solution-ch]
   (let [solution-ch* (async/pipe solution-ch
                                  (async/chan 2 (comp (where/with-default where/blank-solution))))]
-    (cond
-      (and (insert? parsed-txn)
-           (retract? parsed-txn))
-      (insert-retract db-vol parsed-txn tx-state tracker error-ch solution-ch*)
+    (trace/form ::modify {}
+      (cond
+        (and (insert? parsed-txn)
+             (retract? parsed-txn))
+        (insert-retract db-vol parsed-txn tx-state tracker error-ch solution-ch*)
 
-      (insert? parsed-txn)
-      (insert db-vol parsed-txn tx-state solution-ch*)
+        (insert? parsed-txn)
+        (insert db-vol parsed-txn tx-state solution-ch*)
 
-      (retract? parsed-txn)
-      (retract @db-vol parsed-txn tx-state tracker error-ch solution-ch*))))
+        (retract? parsed-txn)
+        (retract @db-vol parsed-txn tx-state tracker error-ch solution-ch*)))))

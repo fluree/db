@@ -14,6 +14,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.util :as util :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.trace :as trace]
             [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -169,7 +170,7 @@
                                       (log/trace "Updating solution:" sol)
                                       (update-solution sel sol))
                                     solution modifying-selectors)))
-        modify-ch               (chan 1 mods-xf)]
+        modify-ch               (chan 1 (comp (trace/xf ::modify {}) mods-xf))]
     (async/pipe solution-ch modify-ch)))
 
 (defn format-values
@@ -211,8 +212,8 @@
                                      (not-empty)
                                      (apply comp))
         format-ch           (if format-xf
-                              (chan 1 format-xf)
-                              (chan))]
+                              (chan 1 (comp (trace/xf ::format {}) format-xf))
+                              (chan 1 (trace/xf ::format {})))]
     (async/pipeline-async 3
                           format-ch
                           (fn [solution ch]

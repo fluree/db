@@ -18,7 +18,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.context :as context]
             [fluree.db.util.ledger :as ledger-util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.util.trace :as trace]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -206,39 +207,37 @@
 
 (defn load-alias
   [conn tracker alias {:keys [t] :as sanitized-query}]
-  (go-try
-    (log/debug "load-alias called with:" alias)
-    (let [[base-alias explicit-t] (extract-query-string-t alias)
-          ;; Normalize to ensure branch (e.g., "docs" -> "docs:main")
-          normalized-alias (ledger-util/ensure-ledger-branch base-alias)
-          publisher        (connection/primary-publisher conn)
-          ns-record        (<? (nameservice/lookup publisher normalized-alias))]
-      (if (virtual-graph-record? ns-record)
-        ;; Virtual graph - load via VG loader (JVM only)
-        #?(:clj
-           (let [;; For VG queries, we need a source ledger's db to initialize the VG
-                 ;; Get it from the VG's dependencies
-                 deps          (get ns-record "fidx:dependencies")
-                 source-alias  (first deps)
-                 source-ledger (<? (connection/load-ledger-alias conn source-alias))
-                 source-db     (ledger/current-db source-ledger)
-                 vg            (<? (vg-loader/load-virtual-graph-from-nameservice
-                                    source-db publisher normalized-alias))]
-             vg)
-           :cljs
-           (throw (ex-info "Virtual graphs are not supported in ClojureScript"
-                           {:status 400 :error :db/unsupported})))
-        ;; Regular ledger
-        (if ns-record
+  (trace/async-form ::load-alias {}
+    (go-try
+      (log/debug "load-alias called with:" alias)
+      (let [[base-alias explicit-t] (extract-query-string-t alias)
+            ;; Normalize to ensure branch (e.g., "docs" -> "docs:main")
+            normalized-alias (ledger-util/ensure-ledger-branch base-alias)
+            publisher        (connection/primary-publisher conn)
+            ns-record        (<? (nameservice/lookup publisher normalized-alias))]
+        (if (virtual-graph-record? ns-record)
+          ;; Virtual graph - load via VG loader (JVM only)
+          #?(:clj
+             (let [ ;; For VG queries, we need a source ledger's db to initialize the VG
+                   ;; Get it from the VG's dependencies
+                   deps          (get ns-record "fidx:dependencies")
+                   source-alias  (first deps)
+                   source-ledger (<? (connection/load-ledger-alias conn source-alias))
+                   source-db     (ledger/current-db source-ledger)
+                   vg            (<? (vg-loader/load-virtual-graph-from-nameservice
+                                      source-db publisher normalized-alias))]
+               vg)
+             :cljs
+             (throw (ex-info "Virtual graphs are not supported in ClojureScript"
+                             {:status 400 :error :db/unsupported})))
+          ;; Regular ledger
           (let [ledger (<? (connection/load-ledger-alias conn normalized-alias))
                 db     (ledger/current-db ledger)
                 t*     (or explicit-t t)
                 query* (-> sanitized-query
                            (assoc :t t*)
                            (ledger-opts-override db))]
-            (<? (restrict-db db tracker query* conn)))
-          (throw (ex-info (str "Load for " normalized-alias " failed due to failed address lookup.")
-                          {:status 404 :error :db/unkown-ledger})))))))
+            (<? (restrict-db db tracker query* conn))))))))
 
 (defn load-aliases
   [conn tracker aliases sanitized-query]
@@ -271,15 +270,16 @@
 
 (defn load-dataset
   [conn tracker defaults named sanitized-query]
-  (go-try
-    (if (and (= (count defaults) 1)
-             (empty? named))
-      (let [alias (first defaults)]
-        ;; return an unwrapped db if the data set consists of one ledger
-        (<? (load-alias conn tracker alias sanitized-query)))
-      (let [all-aliases (->> defaults (concat named) distinct)
-            db-map      (<? (load-aliases conn tracker all-aliases sanitized-query))]
-        (dataset db-map defaults)))))
+  (trace/async-form ::load-dataset {}
+    (go-try
+      (if (and (= (count defaults) 1)
+               (empty? named))
+        (let [alias (first defaults)]
+                          ;; return an unwrapped db if the data set consists of one ledger
+          (<? (load-alias conn tracker alias sanitized-query)))
+        (let [all-aliases (->> defaults (concat named) distinct)
+              db-map      (<? (load-aliases conn tracker all-aliases sanitized-query))]
+          (dataset db-map defaults))))))
 
 (defn query-connection-fql
   [conn query override-opts]
