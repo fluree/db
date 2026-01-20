@@ -344,15 +344,15 @@
                        [var binding]))))
         binds))
 
-(defn higher-order-pattern?
-  "A non-node where pattern."
+(defn vector-pattern?
+  "True when the where clause pattern is expressed as a vector form rather than a node map."
   [pattern]
   (and (sequential? pattern) (keyword? (first pattern))))
 
 (defn parse-where-clause
   [clause var-config context]
-  ;; a single higher-order where pattern is already sequential, so we need to check if it needs wrapping
-  (let [clause* (if (higher-order-pattern? clause)
+  ;; a single vector-form where pattern is already sequential, so we need to check if it needs wrapping
+  (let [clause* (if (vector-pattern? clause)
                   [clause]
                   (util/sequential clause))]
     (->> clause*
@@ -577,10 +577,16 @@
 
 (defmethod parse-pattern :filter
   [[_ & codes] _var-config context]
-  (let [parsed-codes (map parse-code codes)
-        vars         (apply set/union (map variables parsed-codes))
-        f            (compile-filter-fn context parsed-codes)]
-    [(where/->pattern :filter (with-meta f {:forms parsed-codes, :vars vars}))]))
+  (let [parsed-codes (mapv parse-code codes)
+        vars         (->> parsed-codes
+                          (map variables)
+                          (reduce set/union #{})
+                          not-empty)
+        f            (compile-filter-fn context parsed-codes)
+        info         {:fn    f
+                      :forms parsed-codes
+                      :vars  vars}]
+    [(where/->pattern :filter info)]))
 
 (defmethod parse-pattern :union
   [[_ & unions] var-config context]
@@ -778,22 +784,16 @@
       (assoc q select-key select))
     q))
 
-(defn ensure-vector
-  [x]
-  (if (vector? x)
-    x
-    [x]))
-
 (defn parse-grouping
   [q]
   (some->> (:group-by q)
-           ensure-vector
+           util/ensure-vector
            (mapv parse-var-name)))
 
 (defn parse-ordering
   [q]
   (some->> (:order-by q)
-           ensure-vector
+           util/ensure-vector
            (mapv (fn [ord]
                    (if-let [v (parse-var-name ord)]
                      [v :asc]
