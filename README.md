@@ -18,7 +18,7 @@ brew install fluree
 cargo install fluree
 
 # Docker
-docker run -p 8090:8090 fluree/fluree-server:latest
+docker run -p 8090:8090 fluree/server:latest
 ```
 
 ## Zero to graph in 60 seconds

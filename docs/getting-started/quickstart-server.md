@@ -49,10 +49,10 @@ cargo build --release -p fluree-db-cli
 
 ```bash
 # Pull the image
-docker pull fluree/fluree:latest
+docker pull fluree/server:latest
 
 # Run the container
-docker run -p 8090:8090 fluree/fluree:latest
+docker run -p 8090:8090 fluree/server:latest
 ```
 
 ## Start the Server
@@ -223,7 +223,7 @@ fluree server run \
 docker run -d \
   --name fluree \
   -p 8090:8090 \
-  fluree/fluree:latest
+  fluree/server:latest
 ```
 
 ### With Persistent Storage
@@ -234,7 +234,7 @@ docker run -d \
   -p 8090:8090 \
   -v /path/to/data:/data \
   -e FLUREE_STORAGE_PATH=/data \
-  fluree/fluree:latest
+  fluree/server:latest
 ```
 
 ### Docker Compose
@@ -246,7 +246,7 @@ version: '3.8'
 
 services:
   fluree:
-    image: fluree/fluree:latest
+    image: fluree/server:latest
     ports:
       - "8090:8090"
     environment:

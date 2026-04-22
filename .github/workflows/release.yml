@@ -318,7 +318,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: fluree/fluree
+          images: fluree/server
           tags: |
             type=semver,pattern={{version}},value=${{ needs.plan.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.plan.outputs.tag }}
