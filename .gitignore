@@ -2,6 +2,9 @@
 /target/
 **/target/
 
+# mdBook build output
+/docs/book/
+
 # Cargo lock for libraries (keep for binaries)
 # Cargo.lock
 

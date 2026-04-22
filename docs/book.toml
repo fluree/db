@@ -1,0 +1,17 @@
+[book]
+title = "Fluree DB"
+authors = ["Fluree"]
+language = "en"
+src = "."
+
+[output.html]
+git-repository-url = "https://github.com/fluree/db"
+edit-url-template = "https://github.com/fluree/db/edit/main/docs/{path}"
+default-theme = "rust"
+preferred-dark-theme = "navy"
+site-url = "/db/"
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-boolean-and = true
