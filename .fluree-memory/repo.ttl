@@ -1,0 +1,1651 @@
+# Fluree Memory — repo-scoped
+# Auto-managed by `fluree memory`. Manual edits are supported.
+@prefix mem: <https://ns.flur.ee/memory#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+mem:constraint-01kjcyjgszs18b9h4jg7h3xpfj a mem:Constraint ;
+    mem:content "Consensus/multisig gotcha for config graph: commit validity rules (validator set/threshold) used to validate a proposed commit at t must come from already-committed state (effectively config as-of t-1), not from config mutations inside the same commit; otherwise a commit could authorize itself by changing validator set/threshold in its own payload. Config can declare consensus parameters, but validation must treat them as lagging state." ;
+    mem:tag "commit-validation" ;
+    mem:tag "config-graph" ;
+    mem:tag "consensus" ;
+    mem:tag "gotcha" ;
+    mem:tag "multisig" ;
+    mem:tag "raft" ;
+    mem:tag "tendermint" ;
+    mem:scope mem:repo ;
+    mem:createdAt "2026-02-26T12:25:27.104151+00:00"^^xsd:dateTime .
+
+mem:constraint-01km6xq65xn4dzghwnf4wc5ax6 a mem:Constraint ;
+    mem:content "Overlay ops for `BinaryCursor` overlay merge must be (1) sorted by the cursor's `RunSortOrder` and (2) deduplicated by `FactKeyV3` before merging, otherwise duplicate ops for the same fact can cause duplicate outputs or incorrect suppression. Dedup should be deterministic: if multiple ops share the same `FactKeyV3` at the same max `t`, prefer `retract` over `assert` (final state = not present) to avoid nondeterminism from `sort_unstable` tie ordering." ;
+    mem:tag "binary-cursor" ;
+    mem:tag "binary-index" ;
+    mem:tag "correctness" ;
+    mem:tag "dedup" ;
+    mem:tag "overlay" ;
+    mem:tag "sort" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_cursor.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/types.rs" ;
+    mem:createdAt "2026-03-21T00:46:28.541390+00:00"^^xsd:dateTime .
+
+mem:decision-01kjtd4ddbk45wadcafd8tfea7 a mem:Decision ;
+    mem:content "When a novelty overlay is present, the fast POST leaflet-skipping operators (`PredicateGroupCountFirstsOperator`, `PredicateObjectCountFirstsOperator`) can stay on the fast base path and apply an exact overlay delta by translating overlay flakes to `OverlayOp` IDs and simulating per-fact state transitions in time order. We infer initial presence from the first op (first retract => existed pre-overlay) and adjust counts on assert/retract transitions; this avoids falling back to `range_with_overlay` for overlays." ;
+    mem:tag "count" ;
+    mem:tag "leaflet" ;
+    mem:tag "novelty" ;
+    mem:tag "overlay" ;
+    mem:tag "performance" ;
+    mem:tag "post" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_group_count_firsts.rs" ;
+    mem:createdAt "2026-03-03T17:50:01.131764+00:00"^^xsd:dateTime ;
+    mem:rationale "Preserve the leaflet FIRST-skipping performance while still producing correct results under novelty, given the invariant that overlay retractions only target facts that existed at the time." ;
+    mem:alternatives "Always fall back when overlay/policy/history is active; use BinaryCursor merge for overlay even in fast-path; do per-assert base existence checks." .
+
+mem:decision-01kkm7rvsg9ckza0rssnhd9h7t a mem:Decision ;
+    mem:content "Implemented SPARQL DESCRIBE by lowering it to a CONSTRUCT-style graph expansion that returns outgoing triples for described resources: bind a synthetic `?__describe` (via VALUES for explicit IRIs and/or a subquery over the WHERE clause), then match `?__describe ?p ?o` and output as `QueryOutput::Construct`. This avoids full-graph scans when no targets bind (empty VALUES guard) and is benchmark-friendly (BSBM query 9). Also updated tracked query formatting (view + dataset) and CLI `fluree query` to auto-format CONSTRUCT/DESCRIBE as JSON-LD instead of SPARQL-JSON (which would error)." ;
+    mem:tag "benchmark" ;
+    mem:tag "cli" ;
+    mem:tag "construct" ;
+    mem:tag "describe" ;
+    mem:tag "formatting" ;
+    mem:tag "lowering" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/query/sparql.md" ;
+    mem:artifactRef "docs/reference/compatibility.md" ;
+    mem:artifactRef "fluree-db-api/src/view/dataset_query.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/query.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/query.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/lower/describe.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/lower/mod.rs" ;
+    mem:createdAt "2026-03-13T18:36:34.992265+00:00"^^xsd:dateTime ;
+    mem:rationale "DESCRIBE semantics are implementation-defined; outgoing-triple expansion is simple, fast, and matches BSBM usage while preserving modifier semantics via a subquery." ;
+    mem:alternatives "Per-resource secondary queries (slower), include incoming triples too (more expensive output), single-query join without subquery (LIMIT/OFFSET semantics wrong)." .
+
+mem:decision-01kkmfs0sktrfn7ny36wzmwv9n a mem:Decision ;
+    mem:content "Added RDF/XML output for SPARQL CONSTRUCT/DESCRIBE via API `FormatterConfig::rdf_xml()` + server `Accept: application/rdf+xml`. Implementation uses construct template instantiation into `fluree_graph_ir::Graph` (shared helper `instantiate_construct_graph`) and a minimal RDF/XML serializer that requires predicate IRIs to be QName-splittable (last '#' or '/' and NCName local). Server rejects RDF/XML for SELECT/ASK, tracked, proxy-mode, and identity-scoped SPARQL paths; supports it for ledger-scoped SPARQL, including dataset-clause queries." ;
+    mem:tag "accept" ;
+    mem:tag "construct" ;
+    mem:tag "describe" ;
+    mem:tag "formatting" ;
+    mem:tag "rdfxml" ;
+    mem:tag "server" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/api/headers.md" ;
+    mem:artifactRef "fluree-db-api/src/format/config.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/construct.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/rdf_xml.rs" ;
+    mem:artifactRef "fluree-db-server/src/extract/headers.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/query.rs" ;
+    mem:createdAt "2026-03-13T20:56:28.723996+00:00"^^xsd:dateTime ;
+    mem:rationale "BSBM testdriver requests RDF/XML for DESCRIBE. Implementing a full general RDF/XML QName mapping is complex; current serializer targets typical benchmark IRIs with safe local names and fails fast otherwise." .
+
+mem:decision-01kkpnby15haz8aprhpxjdz4mb a mem:Decision ;
+    mem:content "BSBM explore outliers: Q3/Q4/Q5 shapes identified. Q3 is star + OPTIONAL{ feature2 + label } with FILTER(!bound(?testVar)) which acts like an anti-join (products matching base constraints but NOT having a specific feature). Q4 is UNION of two star-shaped branches with ORDER BY + OFFSET + LIMIT and SELECT DISTINCT, which forces broader materialization/sort when duplicates can arise across branches. Q5 is a similarity query joining ProductXYZ features to other products via shared feature plus numeric range filters; naive execution can spend most time in the shared-feature join and candidate expansion before numeric filters reduce rows." ;
+    mem:tag "benchmark" ;
+    mem:tag "bsbm" ;
+    mem:tag "join" ;
+    mem:tag "performance" ;
+    mem:tag "planner" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "benchmarks/bsbm/bsbmtools-0.2/queries/explore/query3.txt" ;
+    mem:artifactRef "benchmarks/bsbm/bsbmtools-0.2/queries/explore/query4.txt" ;
+    mem:artifactRef "benchmarks/bsbm/bsbmtools-0.2/queries/explore/query5.txt" ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:createdAt "2026-03-14T17:12:40.229851+00:00"^^xsd:dateTime ;
+    mem:rationale "Provides concrete starting points for targeted generic optimizations (anti-join rewrite, UNION branch planning, semijoin/candidate generation for shared-feature joins) before deeper implementation work." .
+
+mem:decision-01kkvnqthjzjc1h40rx76gpq99 a mem:Decision ;
+    mem:content "SPARQL OPTIONAL semantics: treat `OPTIONAL { A . B }` as a single conjunctive left-join block (no partial binding when only some triples in the block match). Updated integration test accordingly by renaming `sparql_optional_multi_pattern_allows_partial_binding` to `sparql_optional_multi_pattern_requires_conjunctive_match` and changing expected results to all-unbound optional vars when either triple is missing." ;
+    mem:tag "correctness" ;
+    mem:tag "optional" ;
+    mem:tag "sparql" ;
+    mem:tag "tests" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_query_sparql.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/lower/pattern.rs" ;
+    mem:createdAt "2026-03-16T15:55:22.034971+00:00"^^xsd:dateTime ;
+    mem:rationale "Align behavior with SPARQL algebra semantics and earlier OPTIONAL lowering fix (keep multi-triple OPTIONAL as one Pattern::Optional group). Prevents incorrect partial bindings that break NOT EXISTS / !bound() patterns (e.g., BSBM Q3)." ;
+    mem:alternatives "Keep old behavior by splitting multi-triple OPTIONAL into multiple independent OPTIONALs (non-standard)" .
+
+mem:decision-01km88js2zfk0b5465psvc8c35 a mem:Decision ;
+    mem:content "Fast-path PSOT cursor builders and dependent operators now prefer correctness-preserving fallback over hard failure when novelty overlay translation to V3 IDs fails. `build_psot_cursor_for_predicate` (and the group variant) returns `Ok(None)` if overlay flakes can't be translated (e.g., missing/stale DictNovelty or unsupported value types), and callers treat `None` as \"fast path unavailable\" and run their provided fallback operators instead of returning an internal error. This keeps the hot path unchanged when translation succeeds and avoids silently wrong results under novelty edge cases." ;
+    mem:tag "binary-cursor" ;
+    mem:tag "correctness" ;
+    mem:tag "dict-novelty" ;
+    mem:tag "fallback" ;
+    mem:tag "fast-path" ;
+    mem:tag "overlay" ;
+    mem:tag "performance" ;
+    mem:tag "psot" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/fast_group_count_firsts.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_path_common.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_property_path_plus_count_all.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_transitive_path_plus_count_all.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_union_star_count_all.rs" ;
+    mem:createdAt "2026-03-21T13:15:32.831834+00:00"^^xsd:dateTime ;
+    mem:rationale "Database correctness must not depend on flawless overlay translation; when overlay cannot be mapped into binary ID space, the system should choose a slower correct path rather than erroring or producing partial results." ;
+    mem:alternatives "Hard-fail the query on translation error; always disable fast paths whenever overlay is present" .
+
+mem:decision-01kmqh7wfsc15dzw6fvkesyza8 a mem:Decision ;
+    mem:content "Untyped numeric equality on the V3 binary path now uses a loose encoded prefilter (match by o_key, omit o_type) plus decoded-value equality, instead of forcing `FlakeValue::Long` to `OType::XSD_INTEGER`. This was needed because txn-meta `db:t` values can be stored as `xsd:long`, and exact `o_type` filtering in `binary_range_eq_v3`/`BinaryScanOperator` could miss valid matches." ;
+    mem:tag "binary-range" ;
+    mem:tag "binary-scan" ;
+    mem:tag "commit-t" ;
+    mem:tag "datatype" ;
+    mem:tag "integer-family" ;
+    mem:tag "numeric" ;
+    mem:tag "query-correctness" ;
+    mem:tag "txn-meta" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-core/src/range.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_range.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:createdAt "2026-03-27T11:35:29.529039+00:00"^^xsd:dateTime ;
+    mem:rationale "Reuse the existing decoded equality semantics instead of reimplementing datatype-family fanout separately in each binary caller." ;
+    mem:alternatives "Predicate-only decode/filter in resolve_t_to_commit_id, stats-driven multi-scan per datatype" .
+
+mem:decision-01knptda6efn6yhxj44hcnvsxh a mem:Decision ;
+    mem:content "Raw nameservice commit-head publication was removed from the public `Publisher` trait and connection convenience APIs. Commit-head changes now go through `RefPublisher`: normal transaction/merge/rebase paths use `compare_and_set_ref` with the previously validated head, rebase replay uses `fast_forward_commit`, and bulk import tracks the last published `RefValue` so periodic checkpoints CAS against the last published head instead of the immediately previous commit." ;
+    mem:tag "api" ;
+    mem:tag "compare-and-set" ;
+    mem:tag "import" ;
+    mem:tag "merge" ;
+    mem:tag "nameservice" ;
+    mem:tag "rebase" ;
+    mem:tag "refpublisher" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/import.rs" ;
+    mem:artifactRef "fluree-db-api/src/merge.rs" ;
+    mem:artifactRef "fluree-db-api/src/rebase.rs" ;
+    mem:artifactRef "fluree-db-connection/src/aws.rs" ;
+    mem:artifactRef "fluree-db-nameservice/src/lib.rs" ;
+    mem:artifactRef "fluree-db-transact/src/commit.rs" ;
+    mem:createdAt "2026-04-08T15:12:11.982180+00:00"^^xsd:dateTime ;
+    mem:rationale "Avoid exposing blind monotonic head publication that can silently no-op on stale writes; require explicit CAS semantics so callers observe conflicts clearly." ;
+    mem:alternatives "Keep publish_commit and verify after write, or deprecate only wrapper APIs while leaving the raw trait public." .
+
+mem:fact-01kjjd0b982vvxq7kxvn9bs90s a mem:Fact ;
+    mem:content "Historical time-travel views must attach a BinaryRangeProvider when loading a BinaryIndexStore. `LedgerSnapshot::from_root_bytes()` produces a metadata-only snapshot with `range_provider=None`, so `Fluree::load_graph_db_at_t()` needs to set `LedgerSnapshot.range_provider = Some(BinaryRangeProvider::new(store, dict_novelty))` after loading the binary store; otherwise range-based operators can error with: \"binary-only db has no range_provider attached — load and attach BinaryIndexStore before queries\"." ;
+    mem:tag "binary-index" ;
+    mem:tag "binaryrangeprovider" ;
+    mem:tag "bugfix" ;
+    mem:tag "historical-view" ;
+    mem:tag "range-provider" ;
+    mem:tag "time-travel" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/view/fluree_ext.rs" ;
+    mem:artifactRef "fluree-db-core/src/db.rs" ;
+    mem:artifactRef "fluree-db-core/src/range.rs" ;
+    mem:createdAt "2026-02-28T15:13:52.424054+00:00"^^xsd:dateTime .
+
+mem:fact-01kjjmk1nva80w5cj3ey87asnj a mem:Fact ;
+    mem:content "Global LRU \"leaflet cache\" (single memory budget):\n- Implementation: `fluree-db-binary-index/src/read/leaflet_cache.rs` (`LeafletCache`) uses a single `moka::sync::Cache` (TinyLFU) shared across decoded entry types (R1/R2 leaflet regions + dict leaves + BM25 leaflets + vector shards). One pool = one cache budget.\n- Budget control: `FLUREE_LEAFLET_CACHE_BYTES` (default 8 GiB) sets the max bytes for the cache.\n- Wiring: enabled by default in `fluree-db-api/src/ledger_manager.rs` (`LedgerManagerConfig::default()` creates `LeafletCache::with_max_bytes(...)`), and used by `BinaryIndexStore` load paths when ledger caching is on.\n- Note: Region 3 (history journal) is intentionally never cached (cold path)." ;
+    mem:tag "binary-index" ;
+    mem:tag "cache" ;
+    mem:tag "leaflet-cache" ;
+    mem:tag "lru" ;
+    mem:tag "moka" ;
+    mem:tag "performance" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/ledger_manager.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/leaflet_cache.rs" ;
+    mem:createdAt "2026-02-28T17:26:25.211748+00:00"^^xsd:dateTime .
+
+mem:fact-01kjjn8kspr3gnkcsmq9t1fsvf a mem:Fact ;
+    mem:content "API-level ledger-info caching uses the global unified LeafletCache (TinyLFU) so it shares the single memory budget (FLUREE_LEAFLET_CACHE_BYTES, default 8 GiB).\n\nCache key: xxh3_128 of (ledger_id, commit_t, index_t, realtime_property_details, include_property_datatypes, graph selector, context JSON hash).\nValue: serialized JSON bytes (Arc<[u8]>). Cache hit returns parsed JSON without recomputing novelty-merged stats. Naturally busts when commit_t or index_t changes." ;
+    mem:tag "api" ;
+    mem:tag "cache" ;
+    mem:tag "leaflet-cache" ;
+    mem:tag "ledger-info" ;
+    mem:tag "moka" ;
+    mem:tag "performance" ;
+    mem:tag "tinylfu" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/ledger_info.rs" ;
+    mem:artifactRef "fluree-db-api/src/ledger_manager.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/leaflet_cache.rs" ;
+    mem:createdAt "2026-02-28T17:38:11.894884+00:00"^^xsd:dateTime .
+
+mem:fact-01kjjswkfg62ratezvpdchg30h a mem:Fact ;
+    mem:content "Leaflet region decode behavior (read-side): `BinaryCursor` decodes Region 1 first and only decodes Region 2 (dt/t/lang/i) when (a) the caller requested metadata via `need_region2` AND there is at least one Region-1 match in that leaflet, OR (b) overlay merge is active, OR (c) time-travel replay is active. Region 1 and Region 2 are cached independently in the unified `LeafletCache` (TinyLFU) so caching R1 does not imply caching R2. Region 3 (history journal) is decoded only for time-travel and is intentionally never cached; however leaf files are currently fetched/mmap'd as whole objects, so Region 3 bytes still contribute to leaf download size for non-history queries." ;
+    mem:tag "binary-index" ;
+    mem:tag "cache" ;
+    mem:tag "leaflet" ;
+    mem:tag "overlay" ;
+    mem:tag "performance" ;
+    mem:tag "region1" ;
+    mem:tag "region2" ;
+    mem:tag "region3" ;
+    mem:tag "time-travel" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/format/leaflet.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_cursor.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/leaflet_cache.rs" ;
+    mem:createdAt "2026-02-28T18:59:01.232091+00:00"^^xsd:dateTime .
+
+mem:fact-01kjp8g2s9pfh64sbx1crx42d8 a mem:Fact ;
+    mem:content "Query API layering in fluree-db-api:\n- query_connection() is the request-boundary entrypoint: parses dataset spec/options, chooses execution model, applies policy and config defaults. Uses GraphDb for single-ledger (including time travel) and DataSetDb for multi-ledger union.\n- query(&GraphDb, ...) is the stable single-ledger API: load a GraphDb once via db()/db_at_t()/db_at(), run many queries.\n- DataSetDb supports history/changes via history_range: Option<(from_t,to_t)>." ;
+    mem:tag "api-layering" ;
+    mem:tag "dataset" ;
+    mem:tag "fluree-db-api" ;
+    mem:tag "graphdb" ;
+    mem:tag "history" ;
+    mem:tag "query" ;
+    mem:tag "query-connection" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/query/connection.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/dataset.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/dataset_query.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/fluree_ext.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/query.rs" ;
+    mem:createdAt "2026-03-02T03:12:02.857222+00:00"^^xsd:dateTime .
+
+mem:fact-01kjt5bpzz5aqvv93syafs18m1 a mem:Fact ;
+    mem:content "Fast GROUP BY ?o COUNT(?s) top-k optimization is now generic for any bound predicate in POST: `PredicateGroupCountFirstsOperator` scans leaflets using uncompressed per-leaflet FIRST (p,o) metadata and uses boundary-equality (FIRST(i)==FIRST(i+1)) to add `row_count` without decoding. It consults `StatsView::get_graph_property(g_id,p_id)` at open-time: if exactly one datatype and it maps to a reserved dt_id (and is not langString), it avoids decoding Region2 entirely and emits `EncodedLit` with constant dt_id/lang_id=0; otherwise it falls back to decoding Region2 and groups by (o_kind,o_key,dt_id,lang_id) for correctness." ;
+    mem:tag "count" ;
+    mem:tag "datatype" ;
+    mem:tag "group-by" ;
+    mem:tag "leaflet" ;
+    mem:tag "optimization" ;
+    mem:tag "post-index" ;
+    mem:tag "region2" ;
+    mem:tag "sparql" ;
+    mem:tag "statsview" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_group_count_firsts.rs" ;
+    mem:createdAt "2026-03-03T15:34:11.711499+00:00"^^xsd:dateTime .
+
+mem:fact-01kjtbbfnpgec8tk0zqjeg7sb8 a mem:Fact ;
+    mem:content "Added POST leaflet-skipping fast path for bound-object COUNT queries: `PredicateObjectCountFirstsOperator` answers `SELECT (COUNT(?s) AS ?c) WHERE { ?s <p> <o> }` (single triple, bound predicate+object, no dt/lang constraint, no GROUP BY) by scanning POST leaflets using uncompressed FIRST (p,o) metadata and boundary-equality to add `row_count` without decoding; falls back to decoding Region1 for partial leaflets. Wired via `detect_predicate_object_count` in `execute/operator_tree.rs`, and preserves existing loose semantics when `tp.dtc` is None (ignores dt/lang)." ;
+    mem:tag "count" ;
+    mem:tag "fast-path" ;
+    mem:tag "leaflet" ;
+    mem:tag "optimization" ;
+    mem:tag "post-index" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_group_count_firsts.rs" ;
+    mem:createdAt "2026-03-03T17:18:55.670244+00:00"^^xsd:dateTime .
+
+mem:fact-01kkmfektg8ednzhkrsh09dck4 a mem:Fact ;
+    mem:content "SPARQL Results XML (`application/sparql-results+xml`) is now supported via `FormatterConfig::sparql_xml()` in fluree-db-api. Server ledger-scoped SPARQL endpoint honors `Accept: application/sparql-results+xml` for non-tracked, non-identity, non-proxy SPARQL queries by returning SPARQL Results XML (SELECT/ASK only). CONSTRUCT/DESCRIBE are rejected for this format. Implementation lives in `fluree-db-api/src/format/sparql_xml.rs` and is wired through `format_results_string(_async)`; server wiring in `fluree-db-server/src/routes/query.rs` with header helper `FlureeHeaders::wants_sparql_results_xml()`." ;
+    mem:tag "accept" ;
+    mem:tag "content-negotiation" ;
+    mem:tag "formatting" ;
+    mem:tag "server" ;
+    mem:tag "sparql" ;
+    mem:tag "xml" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/api/headers.md" ;
+    mem:artifactRef "fluree-db-api/src/format/config.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/mod.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/sparql_xml.rs" ;
+    mem:artifactRef "fluree-db-server/src/extract/headers.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/query.rs" ;
+    mem:createdAt "2026-03-13T20:50:47.760546+00:00"^^xsd:dateTime .
+
+mem:fact-01kkp0yq2pef5qjn1nt8zvb19b a mem:Fact ;
+    mem:content "Explain plans: CLI and HTTP now support SPARQL explain.\n\n- CLI: `fluree query --explain --sparql ...` (and JSON-LD) prints the plan as JSON without executing.\n- Server: added `/v1/fluree/explain/<ledger...>` supporting `application/json` (JSON-LD) and `application/sparql-query` (SPARQL). Root `/v1/fluree/explain` also accepts SPARQL when ledger can be determined via `fluree-ledger` header or a single `FROM <ledger>`.\n- Docs updated to use `/v1/fluree/explain` (no `X-Fluree-Explain` header)." ;
+    mem:tag "cli" ;
+    mem:tag "docs" ;
+    mem:tag "explain" ;
+    mem:tag "jsonld" ;
+    mem:tag "server" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/query/explain.md" ;
+    mem:artifactRef "docs/troubleshooting/debugging-queries.md" ;
+    mem:artifactRef "fluree-db-cli/src/cli.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/query.rs" ;
+    mem:artifactRef "fluree-db-cli/src/remote_client.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/mod.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/query.rs" ;
+    mem:createdAt "2026-03-14T11:15:55.606042+00:00"^^xsd:dateTime .
+
+mem:fact-01kkp1bq52zsgf347sjvah2dt3 a mem:Fact ;
+    mem:content "Query perf gotcha (fixed): in `build_where_operators_seeded_with_needed`, the join-block logic previously forced range-bounded object scans (FILTER-derived object bounds) to the front of a triple block unconditionally. For OPTIONAL blocks like BSBM Product/Offer with `?offer validTo ?date` + FILTER, this could start with a broad predicate scan and then do per-row SPOT lookups for a selective triple (e.g., `?offer bsbm:product <ProductX>`), causing ~20k * per-row open (~50s).\n\nFix: only promote a bounded triple to the front when its estimated row count (via `estimate_triple_row_count` with current bound vars + stats) is <= the current first triple's estimate." ;
+    mem:tag "bounds" ;
+    mem:tag "bsbm" ;
+    mem:tag "filter-pushdown" ;
+    mem:tag "optional" ;
+    mem:tag "performance" ;
+    mem:tag "planner" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:createdAt "2026-03-14T11:23:01.666802+00:00"^^xsd:dateTime .
+
+mem:fact-01kkpezcasam1yf0cfeh17mh1g a mem:Fact ;
+    mem:content "Perf fast-path improvement: for constant-object star-join constraints `(?s p oRef)` (e.g., BSBM ProductType/ProductFeature), avoid scanning full PSOT predicate partitions. Instead, seek OPST by fixed `(o_type=IRI_REF, o_key=o_s_id, p_id)` using a tight `RunRecordV2` min/max key range plus a `BinaryFilter`, and project `s_id` to collect subjects quickly. This roughly halved the fused star-const ORDER BY/LIMIT query time on bsbm100m (e.g., ~260ms → ~90–130ms for a query shape with real constants). See `fluree-db-query/src/fast_star_const_order_topk.rs::collect_subjects_for_predicate_object_ref_opst`." ;
+    mem:tag "binary-index" ;
+    mem:tag "bsbm" ;
+    mem:tag "fast-path" ;
+    mem:tag "opst" ;
+    mem:tag "psot" ;
+    mem:tag "query-perf" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/fast_star_const_order_topk.rs" ;
+    mem:createdAt "2026-03-14T15:20:57.433027+00:00"^^xsd:dateTime .
+
+mem:fact-01kkpffqeax5hr1we10836qtzj a mem:Fact ;
+    mem:content "Query perf optimizations in fluree-db-query:\n1) BinaryScanOperator prefers OPST index when subject unbound and object is an encodable constant (avoids pathological PSOT scans). Guard: skip for plain strings without datatype constraint.\n2) Star-join fast path for same-subject constant-object constraints + numeric filter + ORDER BY LIMIT — intersects candidates, applies threshold, fetches labels.\n3) SortOperator::new_topk uses streaming top-k heap (O(n log k), O(k) memory) instead of buffering all rows." ;
+    mem:tag "binary-scan" ;
+    mem:tag "concurrency" ;
+    mem:tag "jsonld" ;
+    mem:tag "opst" ;
+    mem:tag "planner" ;
+    mem:tag "query-perf" ;
+    mem:tag "sort" ;
+    mem:tag "sparql" ;
+    mem:tag "topk" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_star_const_order_topk.rs" ;
+    mem:artifactRef "fluree-db-query/src/sort.rs" ;
+    mem:createdAt "2026-03-14T15:29:53.098756+00:00"^^xsd:dateTime .
+
+mem:fact-01kkppv3c2rf43xyh3wnr3xnf3 a mem:Fact ;
+    mem:content "SPARQL OPTIONAL lowering bug fixed: `fluree-db-sparql/src/lower/pattern.rs` previously split multi-triple OPTIONAL blocks into multiple `Pattern::Optional(vec![...])` ('partial binding'). This is not SPARQL semantics and breaks patterns like BSBM Explore Q3 (OPTIONAL { A . B } FILTER(!bound(?v))) by making `?v` bound via an unrelated OPTIONAL, yielding 0 rows. Fix: always lower `SparqlGraphPattern::Optional` as a single `Pattern::Optional(inner)` group (conjunctive left-join). After fix, Q3 anti-join count returned expected 54 rows on bsbm100m." ;
+    mem:tag "bsbm" ;
+    mem:tag "correctness" ;
+    mem:tag "lowering" ;
+    mem:tag "optional" ;
+    mem:tag "planner" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "benchmarks/bsbm/bsbmtools-0.2/queries/explore/query3.txt" ;
+    mem:artifactRef "fluree-db-sparql/src/lower/pattern.rs" ;
+    mem:createdAt "2026-03-14T17:38:25.794429+00:00"^^xsd:dateTime .
+
+mem:fact-01kkq2x3m0g7xk0w4bsdzj2p3p a mem:Fact ;
+    mem:content "SPARQL solution modifier parsing bug fixed: `OFFSET` and `LIMIT` were only parsed in the order `LIMIT` then `OFFSET`. Queries written as `... ORDER BY ... OFFSET n LIMIT m` (BSBM Explore Q4 uses this form) would silently drop the LIMIT, causing the engine to execute and return the full ordered result set instead of slicing. Fix in `fluree-db-sparql/src/parse/query/modifier.rs`: parse LIMIT/OFFSET in a loop so either order is accepted; later clauses override earlier ones. After fix, `ORDER BY ... OFFSET 5 LIMIT 10` returns 10 rows as expected." ;
+    mem:tag "bsbm" ;
+    mem:tag "correctness" ;
+    mem:tag "limit" ;
+    mem:tag "offset" ;
+    mem:tag "parser" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-sparql/src/parse/query/modifier.rs" ;
+    mem:createdAt "2026-03-14T19:45:00.000000+00:00"^^xsd:dateTime .
+
+mem:fact-01kkq2y4nqj3b6b7v1k3m2q5y6 a mem:Fact ;
+    mem:content "Query perf micro-optimizations:\n- `DistinctOperator` avoids allocating/cloning a `Vec<Binding>` signature for every row by using hashbrown raw-entry lookups; it only materializes the signature when a row is truly new. This reduces allocation pressure in DISTINCT-heavy queries.\n- `prepare_execution` dedups exact duplicate `Pattern::Triple` entries inside conjunctive blocks (recursively, including UNION branches). This is semantics-preserving and helps with generated queries that accidentally repeat identical triple patterns (seen in BSBM Q4 runs where the same productFeature constraint appears twice).\n\nFiles: `fluree-db-query/src/distinct.rs`, `fluree-db-query/src/execute/runner.rs`." ;
+    mem:tag "distinct" ;
+    mem:tag "perf" ;
+    mem:tag "planner" ;
+    mem:tag "query-perf" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/distinct.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/runner.rs" ;
+    mem:createdAt "2026-03-14T19:45:10.000000+00:00"^^xsd:dateTime .
+
+mem:fact-01kkq57f5xpx815scy9fsb6jzr a mem:Fact ;
+    mem:content "Bulk import string IDs are lex-order-preserving: each chunk writes sorted string vocab, Phase B k-way merges to global StringId in UTF-8 byte-lex order. FIR6 IndexRoot carries `lex_sorted_string_ids: bool` flag (header bit, backward-compatible). Set true by bulk import, cleared on first post-import write (incremental dict appends break invariant).\n\nQuery impact: SortOperator skips decode/materialization for ORDER BY on xsd:string when flag is set. ORDER BY ?label LIMIT 10 improved from ~11s to ~54ms on bsbm100m (~200x).\nTemp override: FLUREE_ASSUME_LEX_STRING_IDS=1 for benchmarking older roots." ;
+    mem:tag "benchmark" ;
+    mem:tag "bsbm" ;
+    mem:tag "import" ;
+    mem:tag "index-root" ;
+    mem:tag "k-way-merge" ;
+    mem:tag "lex-order" ;
+    mem:tag "order-by" ;
+    mem:tag "query-perf" ;
+    mem:tag "sort" ;
+    mem:tag "strings" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/import.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/format/index_root.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_index_store.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/run_index/build/incremental_root.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/run_index/resolve/chunk_dict.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/run_index/runs/spool.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/run_index/vocab/vocab_merge.rs" ;
+    mem:artifactRef "fluree-db-query/src/sort.rs" ;
+    mem:createdAt "2026-03-14T21:49:51.165863+00:00"^^xsd:dateTime .
+
+mem:fact-01kkrmk7w3gpen60ayv8x2yzqk a mem:Fact ;
+    mem:content "BSBM Q5 dominant cost is batched object join for `?product bsbm:productFeature ?prodFeature`: ~2.9s matching ~38k rows before numeric filters reduce to 5.\n\nOptimizations in NestedLoopJoinOperator batched path (join.rs):\n- On leaflet-cache miss: decode only ColumnSet::CORE (s_id, o_key, p_id, o_type) instead of all columns\n- Binary-search o_key runs for accumulator object IDs instead of full row scans\nEffect on Q5: ~3.35s → ~2.43s (~27%), no regressions on Q3/Q4." ;
+    mem:tag "benchmark" ;
+    mem:tag "bsbm" ;
+    mem:tag "join" ;
+    mem:tag "opst" ;
+    mem:tag "performance" ;
+    mem:tag "query-perf" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/read/column_loader.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/column_types.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/leaflet_cache.rs" ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:createdAt "2026-03-15T11:37:39.971253+00:00"^^xsd:dateTime .
+
+mem:fact-01kkrqp33bzvzb3kw6d5cy2wzv a mem:Fact ;
+    mem:content "Dynamic FILTER-bound pushdown (arithmetic like `?sim < (?orig + k)`) was implemented as DynamicObjectBounds but caused severe BSBM Q5 regressions (minutes instead of seconds) by disabling batched subject joins and triggering per-row SPOT scans.\n\nGated behind FLUREE_ENABLE_DYNAMIC_BOUNDS=1 (default off). Revisiting requires join-aware planner changes: avoid binding multi-valued join vars early, or add semijoin/intersection operator, and/or allow batched joins with bounds safely." ;
+    mem:tag "bsbm" ;
+    mem:tag "dynamic-bounds" ;
+    mem:tag "filter-pushdown" ;
+    mem:tag "performance" ;
+    mem:tag "planner" ;
+    mem:tag "q5" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/pushdown.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:createdAt "2026-03-15T12:31:39.115875+00:00"^^xsd:dateTime .
+
+mem:fact-01kkrv61jhs9wn7aded9bm11d9 a mem:Fact ;
+    mem:content "SPARQL FILTER optimization: for 2-arg `=` / `!=` comparisons where one side is a variable bound as `Binding::EncodedSid { s_id }` and the other side evaluates to `ComparableValue::Sid` or `ComparableValue::Iri` (e.g. lowered from `<IRI>` via `IRI()`), we now avoid `resolve_subject_iri()` by looking up the constant's `s_id` via the reverse subject dict (`find_subject_id_by_parts` / `find_subject_id`) and comparing `s_id` numerically. Implemented in `fluree-db-query/src/expression/compare.rs` (`fast_eq_ne_for_encoded_sid`). This prevents early IRI materialization during filters like `FILTER(<ProductXYZ> != ?product)`." ;
+    mem:tag "compare" ;
+    mem:tag "encodedSid" ;
+    mem:tag "filter" ;
+    mem:tag "materialization" ;
+    mem:tag "performance" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/expression/compare.rs" ;
+    mem:artifactRef "fluree-db-query/src/expression/eval.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/lower/expression.rs" ;
+    mem:createdAt "2026-03-15T13:32:47.569804+00:00"^^xsd:dateTime .
+
+mem:fact-01kkrw44zc48y3jvkpefzhzenk a mem:Fact ;
+    mem:content "Verification aids for encoded-id filter fast paths: set `FLUREE_LOG_FILTER_FASTPATH_HIT=1` and run CLI with `--verbose` plus `RUST_LOG=fluree_db_query::expression::compare=debug` to see a one-time log confirming the fast path executed (e.g. \"filter encoded-id fast path hit kind=EncodedSid\"). You can also A/B compare behavior by setting `FLUREE_DISABLE_FILTER_ENCODED_ID_FASTPATH=1` to force the old path (may be noisy in timings)." ;
+    mem:tag "debugging" ;
+    mem:tag "encodedPid" ;
+    mem:tag "encodedSid" ;
+    mem:tag "filter" ;
+    mem:tag "performance" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/expression/compare.rs" ;
+    mem:artifactRef "fluree-db-query/src/expression/rdf.rs" ;
+    mem:createdAt "2026-03-15T13:49:14.092254+00:00"^^xsd:dateTime .
+
+mem:fact-01kkvp4tyedrqvbxqfnyhabav7 a mem:Fact ;
+    mem:content "Fixed ledger-info caching + named-graph fields:\n- `LedgerInfoBuilder::execute` cache key now includes the current index root CID (`indexId`) in addition to `(ledger_id, commit_t, index_t, opts, graph, ctx_hash)` so reindex allow-equal (same index_t, new root CID) busts the API-level ledger-info cache.\n- `ledger.named-graphs` entries now include per-graph `flakes` and `size` fields (default graph + named graphs) using `IndexStats.graphs` totals.\n\nThese changes make `it_ledger_info_reindex_cache` and `it_ledger_info_reindex_size` pass." ;
+    mem:tag "cache" ;
+    mem:tag "index-root" ;
+    mem:tag "ledger-info" ;
+    mem:tag "reindex" ;
+    mem:tag "tests" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/ledger_info.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_ledger_info_reindex_cache.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_ledger_info_reindex_size.rs" ;
+    mem:createdAt "2026-03-16T16:02:28.430817+00:00"^^xsd:dateTime .
+
+mem:fact-01km06cy17rja09n90v3a50fve a mem:Fact ;
+    mem:content "Default-context (and other CAS namespaced blobs) must be stored/fetched under the *canonical* ledger ID (`NsRecord.ledger_id`, e.g. `mydb:main`) because `content_store_for(storage, namespace_id)` and `disconnect_ledger()` use that canonical key. If API methods accept user-provided aliases (`mydb`), do a `nameservice.lookup()` once and use `record.ledger_id` for: content store namespace, config get/push, and cache invalidation; otherwise blobs can be written under `mydb/...` but later looked up under `mydb/main/...` and appear missing, and cache invalidation may fail.\n\nAlso: if writing a new blob *before* a CAS push loop, delete the new blob on final CAS conflict to avoid orphan/leaked objects (best-effort GC)." ;
+    mem:tag "cache" ;
+    mem:tag "cas" ;
+    mem:tag "config" ;
+    mem:tag "content-store" ;
+    mem:tag "default-context" ;
+    mem:tag "gc" ;
+    mem:tag "ledger-id" ;
+    mem:tag "nameservice" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/lib.rs" ;
+    mem:artifactRef "fluree-db-core/src/storage.rs" ;
+    mem:artifactRef "fluree-db-ledger/src/lib.rs" ;
+    mem:artifactRef "fluree-db-nameservice/src/lib.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/context.rs" ;
+    mem:createdAt "2026-03-18T10:03:28.680101+00:00"^^xsd:dateTime .
+
+mem:fact-01km33dyv5wxhrxt4gnqra4xwb a mem:Fact ;
+    mem:content "Ledger cache incremental refresh gotchas:\n- apply_loaded_db() replaces snapshot and trims novelty via clear_up_to() but does NOT reapply commit envelope deltas (namespace_codes, graph_registry) for remaining novelty commits with t > new_snapshot.t — must preserve/merge those deltas.\n- BinaryRangeProvider's DictNovelty must be the same state.dict_novelty that is reset after index application; using detached Arc breaks overlay translation for novelty-introduced IDs.\n- BinaryIndexStore::augment_namespace_codes(&snapshot.namespace_codes) needed when novelty introduces new namespace codes not in index root." ;
+    mem:tag "binary-index" ;
+    mem:tag "caching" ;
+    mem:tag "dict-novelty" ;
+    mem:tag "gotcha" ;
+    mem:tag "graph-registry" ;
+    mem:tag "indexing" ;
+    mem:tag "ledger-manager" ;
+    mem:tag "namespace" ;
+    mem:tag "range-provider" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/ledger_manager.rs" ;
+    mem:artifactRef "fluree-db-core/src/db.rs" ;
+    mem:artifactRef "fluree-db-ledger/src/lib.rs" ;
+    mem:createdAt "2026-03-19T13:09:19.845735+00:00"^^xsd:dateTime .
+
+mem:fact-01km4f8dv0jzt33vdww5k6gef0 a mem:Fact ;
+    mem:content "BinaryGraphView now carries dict_novelty and performs watermark routing internally for dict-backed types (IriRef, StringDict, JsonArena) in decode_value() and resolve_subject_iri(). Added resolve_subject_sid() returning Sid directly (avoids IRI concat + trie lookup for novelty subjects).\n\nExecutionContext::graph_view() should construct via BinaryIndexStore::graph_with_novelty(g_id, dict_novelty.clone()) so call sites are novelty-safe by default. When decoding EncodedLit, always use decode_value_from_kind(o_kind,o_key,p_id,dt_id,lang_id)." ;
+    mem:tag "binary-index" ;
+    mem:tag "binarygraphview" ;
+    mem:tag "decode" ;
+    mem:tag "dict-novelty" ;
+    mem:tag "novelty-aware" ;
+    mem:tag "performance" ;
+    mem:tag "watermark" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_index_store.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-query/src/context.rs" ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:createdAt "2026-03-20T01:55:15.936809+00:00"^^xsd:dateTime .
+
+mem:fact-01km5nyf5803na09n60d6z8j30 a mem:Fact ;
+    mem:content "Binary-scan bound-term normalization depends on BinaryIndexStore namespace codes: extract_bound_terms re-encodes Sid via store.sid_to_iri(sid) then store.encode_iri(&iri). If store lacks a namespace code (new namespace from post-index commits), sid_to_iri drops the prefix (empty fallback) and encode_iri falls back to EMPTY code 0, causing bound filters to miss.\n\nMitigation: augment BinaryIndexStore namespace table with snapshot's namespace_codes when new deltas are applied." ;
+    mem:tag "binary-scan" ;
+    mem:tag "namespace" ;
+    mem:tag "novelty" ;
+    mem:tag "overlay" ;
+    mem:tag "prefix-trie" ;
+    mem:tag "query-bug" ;
+    mem:tag "reload" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/ledger/loading.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_index_store.rs" ;
+    mem:artifactRef "fluree-db-ledger/src/lib.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:createdAt "2026-03-20T13:11:24.072938+00:00"^^xsd:dateTime .
+
+mem:fact-01km5pmwnsym5zz3vgpyz4k1rt a mem:Fact ;
+    mem:content "Fix for 'new namespace after binary index attached' bound-query bug: `BinaryScanOperator` now keeps bound pattern SIDs in *snapshot* namespace space for overlay matching, and constructs persisted binary filters by decoding those SIDs to full IRIs via `LedgerSnapshot::decode_sid` then re-encoding via `BinaryIndexStore::encode_iri`. This avoids depending on the store's namespace table being updated after commit deltas, while preserving correct filtering when store namespace codes differ from snapshot (e.g., after rebuild). Regression test: `fluree-db-api/tests/it_namespace_new_after_index.rs`." ;
+    mem:tag "binary-scan" ;
+    mem:tag "namespace" ;
+    mem:tag "novelty" ;
+    mem:tag "overlay" ;
+    mem:tag "prefix-trie" ;
+    mem:tag "regression-test" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_namespace_new_after_index.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:createdAt "2026-03-20T13:23:38.809931+00:00"^^xsd:dateTime .
+
+mem:fact-01km6e7s84vcmvhrxvtcwgfkka a mem:Fact ;
+    mem:content "`IriCompactor` only auto-derives fallback prefixes when the provided `ParsedContext` is non-empty (has terms/@vocab/@base). If you want compact display IRIs without a user-supplied @context, pass a synthetic context with well-known prefixes so fallback derivation activates for user namespaces too (e.g., `IriCompactor::with_fallback_prefixes(namespace_codes)` pattern). Also ensure any emitted `@context` matches the exact prefixes actually used for compaction (handle collisions/unique suffixes)." ;
+    mem:tag "api" ;
+    mem:tag "commit-detail" ;
+    mem:tag "context" ;
+    mem:tag "iri-compaction" ;
+    mem:tag "json-ld" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/format/iri.rs" ;
+    mem:artifactRef "fluree-db-api/src/graph_commit_builder.rs" ;
+    mem:createdAt "2026-03-20T20:15:55.140833+00:00"^^xsd:dateTime .
+
+mem:fact-01km81d85z7rfdckve3wqwtszx a mem:Fact ;
+    mem:content "Graph crawl formatting overlay gotcha: in binary_range_eq_v3, overlay flake→V3 translation can fail when DictNovelty is uninitialized (novelty-only strings/subjects unresolvable). Previously failed translations were WARN-logged and DROPPED, causing properties to disappear when a translated retract suppresses base row but asserted novelty value fails translation.\n\nFix: keep failed translations as raw Flakes, run post-pass merging raw overlay with cursor output, resolve per-fact lifecycles (latest t wins, tie prefers retract), drop retracts, then apply RangeOptions." ;
+    mem:tag "binary-range" ;
+    mem:tag "correctness" ;
+    mem:tag "dict-novelty" ;
+    mem:tag "graph-crawl" ;
+    mem:tag "jsonld" ;
+    mem:tag "overlay" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/format/graph_crawl.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_range.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:createdAt "2026-03-21T11:10:11.647303+00:00"^^xsd:dateTime .
+
+mem:fact-01km8qneeknvq50y6dvm459rne a mem:Fact ;
+    mem:content "Graph crawl formatter previously only included `@id` when `*` was used (or `@id` explicitly selected) at that crawl level, which dropped identity for nested ref sub-selects like `{ \"schema:isBasedOn\": [\"schema:name\"] }`, producing `{ \"schema:name\": ... }` without `@id`.\n\nFix: `fluree-db-api/src/format/graph_crawl.rs` now always includes `@id` for nested expansions (`current_depth > 0`), while keeping root-level behavior unchanged unless `*` or explicit `@id` is requested.\n\nRegression test: `jsonld_graph_crawl_nested_subselect_includes_id` in `fluree-db-api/tests/it_query_jsonld_basic.rs` (was failing, now passes)." ;
+    mem:tag "@id" ;
+    mem:tag "formatter" ;
+    mem:tag "graph-crawl" ;
+    mem:tag "jsonld" ;
+    mem:tag "regression-test" ;
+    mem:tag "subselect" ;
+    mem:scope mem:repo ;
+    mem:createdAt "2026-03-21T17:39:08.884534+00:00"^^xsd:dateTime .
+
+mem:fact-01kmbj3527qd54y3whzjhwc4bg a mem:Fact ;
+    mem:content "SPARQL UPDATE WHERE now supports full GraphPattern (same as SELECT): OPTIONAL, FILTER, UNION, VALUES, BIND, subselects+aggregates. In fluree-db-transact, parsed WHERE stored as Txn.sparql_where with prologue+pattern, deferred until staging where it's lowered via fluree_db_sparql::lower_sparql with LedgerSnapshot as encoder. stage::execute_where handles both JSON-LD unresolved patterns and SPARQL-lowered patterns via same query engine.\n\nTests: it_transact_conditional.rs (JSON-LD with subquery aggregate), server integration.rs (SPARQL UPDATE with subquery+MAX+BIND)." ;
+    mem:tag "aggregate" ;
+    mem:tag "bind" ;
+    mem:tag "max" ;
+    mem:tag "query-engine" ;
+    mem:tag "sparql" ;
+    mem:tag "stage" ;
+    mem:tag "subquery" ;
+    mem:tag "transact" ;
+    mem:tag "update" ;
+    mem:tag "where" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/query/sparql.md" ;
+    mem:artifactRef "fluree-db-api/tests/it_transact_conditional.rs" ;
+    mem:artifactRef "fluree-db-server/tests/integration.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/ast/update.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/parse/query/update.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/validate/mod.rs" ;
+    mem:artifactRef "fluree-db-transact/src/ir.rs" ;
+    mem:artifactRef "fluree-db-transact/src/lower_sparql_update.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:createdAt "2026-03-22T19:59:29.863846+00:00"^^xsd:dateTime .
+
+mem:fact-01kmgg192p7hnveqckgqxyakz7 a mem:Fact ;
+    mem:content "Iceberg Direct catalog flow: in server-side scan paths, create the S3 storage client once and share it (e.g., Arc<Storage>) with SendDirectCatalogClient; avoid moving the storage into the catalog client and then re-creating storage just to read metadata/manifests. Use Arc::clone(&storage) for the catalog and pass &*storage to planners/readers." ;
+    mem:tag "aws" ;
+    mem:tag "direct-catalog" ;
+    mem:tag "gotcha" ;
+    mem:tag "iceberg" ;
+    mem:tag "performance" ;
+    mem:tag "s3" ;
+    mem:tag "storage" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/graph_source/r2rml.rs" ;
+    mem:artifactRef "fluree-db-iceberg/src/catalog/direct.rs" ;
+    mem:artifactRef "fluree-db-iceberg/src/catalog/mod.rs" ;
+    mem:createdAt "2026-03-24T17:59:43.446602+00:00"^^xsd:dateTime .
+
+mem:fact-01kmqg0w83yereh4ypzr7eqv8b a mem:Fact ;
+    mem:content "FLI3 leaf files can legally contain more than 255 leaflets because the format stores `leaflet_count` as u32 and V3 leaf assembly flushes leaves by `leaf_target_rows`, not by leaflet count; POST/PSOT segmentation on `p_id` transitions and OPST segmentation on `o_type` transitions can therefore create many tiny leaflets in one leaf. Read-side cached query paths still key V3 batches by `leaflet_idx: u8`, so when a query scans a leaf whose 257th leaflet is reached it fails with `leaflet index 256 exceeds u8::MAX` (or query-side `leaflet idx exceeds u8`)." ;
+    mem:tag "binary-index" ;
+    mem:tag "bug" ;
+    mem:tag "cache" ;
+    mem:tag "leaflet" ;
+    mem:tag "query" ;
+    mem:tag "v3-cursor" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/format/leaf.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_cursor.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/leaflet_cache.rs" ;
+    mem:createdAt "2026-03-27T11:14:11.331131+00:00"^^xsd:dateTime .
+
+mem:fact-01kmqhh9n5qtsnjt3f7eq8xf3p a mem:Fact ;
+    mem:content "`fluree-db-api/src/graph_query_builder.rs` needs `graph_source_fallback` gated with `#[cfg(feature = \"iceberg\")]` on both the struct field and its constructor initialization. The field is only read inside an `iceberg`-gated fallback path, so leaving it unconditional causes a dead-code warning in default non-iceberg builds." ;
+    mem:tag "dead-code" ;
+    mem:tag "feature-gating" ;
+    mem:tag "fluree-db-api" ;
+    mem:tag "graph-query-builder" ;
+    mem:tag "iceberg" ;
+    mem:tag "r2rml" ;
+    mem:tag "warning" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/graph_query_builder.rs" ;
+    mem:createdAt "2026-03-27T11:40:37.925049+00:00"^^xsd:dateTime .
+
+mem:fact-01kmr3thfmbcbwe2fq8hh4ckc7 a mem:Fact ;
+    mem:content "Remote binary-index queries can pay repeated leaf-open metadata cost even when decoded leaflet columns are cached: `BinaryIndexStore::open_leaf_handle()` chooses `RangeReadLeafHandle` when the full leaf is not on local disk, and that path re-runs `fetch_header_and_directory()` (range-read header + directory) before `load_columns_cached_via_handle()` can hit `LeafletCache`. Investigating tiny-dataset slow queries should therefore instrument all three layers separately: leaf open, header/directory range reads, and leaflet cache hit/miss." ;
+    mem:tag "binary-index" ;
+    mem:tag "instrumentation" ;
+    mem:tag "leaflet-cache" ;
+    mem:tag "query-perf" ;
+    mem:tag "range-read" ;
+    mem:tag "remote-storage" ;
+    mem:tag "xray" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_index_store.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/column_loader.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/leaf_access.rs" ;
+    mem:createdAt "2026-03-27T17:00:15.220284+00:00"^^xsd:dateTime .
+
+mem:fact-01kmrfjybvsfcpabafvy4hecn4 a mem:Fact ;
+    mem:content "`BinaryIndexStore::open_leaf_handle()` now caches remote leaf header+directory metadata by `leaf_cid` in-memory before constructing `RangeReadLeafHandle`. This avoids repeating `fetch_header_and_directory()` range reads on repeated opens of the same remote leaf, while leaving column block reads and local full-blob paths unchanged." ;
+    mem:tag "binary-index" ;
+    mem:tag "leaf-cache" ;
+    mem:tag "query-perf" ;
+    mem:tag "range-read" ;
+    mem:tag "remote-storage" ;
+    mem:tag "s3" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/format/leaf.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_index_store.rs" ;
+    mem:createdAt "2026-03-27T20:25:49.179364+00:00"^^xsd:dateTime .
+
+mem:fact-01kmrgkcd7aa9aj55j0jseeegb a mem:Fact ;
+    mem:content "For Lambda query-perf investigations, broad `fluree_db_query=debug` logging is too noisy and the span-heavy join/optional diagnostics can overwhelm trace exports. Prefer `RUST_LOG=info,fluree_db_binary_index=debug` with explicit binary-index debug events (`binary leaf open`, `binary fetched leaf header and directory`, `binary remote range fetch`) to confirm repeated remote opens/downloads and metadata-cache hits." ;
+    mem:tag "binary-index" ;
+    mem:tag "cloudwatch" ;
+    mem:tag "lambda" ;
+    mem:tag "query-perf" ;
+    mem:tag "tracing" ;
+    mem:tag "xray" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_index_store.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/leaf_access.rs" ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:artifactRef "fluree-db-query/src/optional.rs" ;
+    mem:createdAt "2026-03-27T20:43:32.135946+00:00"^^xsd:dateTime .
+
+mem:fact-01kmrsrnfr06tvkwrwbqmt8w0z a mem:Fact ;
+    mem:content "PropertyJoinOperator now supports same-subject star blocks that mix variable objects with bound-object existence predicates (for example `?s rdf:type :Deal`, `?s :name ?name`, `?s :stage ?stage`). The operator treats bound-object patterns as existence-only constraints and now captures encoded subject IDs after the first scan so a selective exact scan can drive later batched subject probes even without filter-pushdown object bounds." ;
+    mem:tag "batched-probe" ;
+    mem:tag "performance" ;
+    mem:tag "planner" ;
+    mem:tag "property-join" ;
+    mem:tag "query" ;
+    mem:tag "rdf:type" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:artifactRef "fluree-db-query/src/planner.rs" ;
+    mem:artifactRef "fluree-db-query/src/property_join.rs" ;
+    mem:createdAt "2026-03-27T23:23:42.456970+00:00"^^xsd:dateTime .
+
+mem:fact-01kmrwc10tqgrtgqq5j90hqd8k a mem:Fact ;
+    mem:content "NestedLoopJoinOperator's batched subject-join path now remains enabled when the right pattern has static object bounds, and the batched PSOT scanner applies those bounds row-by-row before materializing bindings. PropertyJoinOperator also now ranks star drivers so bound-object predicates (especially rdf:type) are preferred ahead of range-bounded variable-object predicates when seeding the subject candidate set." ;
+    mem:tag "batched-probe" ;
+    mem:tag "join" ;
+    mem:tag "object-bounds" ;
+    mem:tag "performance" ;
+    mem:tag "property-join" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:artifactRef "fluree-db-query/src/property_join.rs" ;
+    mem:createdAt "2026-03-28T00:09:14.010238+00:00"^^xsd:dateTime .
+
+mem:fact-01kmrxf5g1myvt34wg0vf5e6nd a mem:Fact ;
+    mem:content "PropertyJoinOperator now bypasses per-chunk NestedLoopJoinOperator construction for subject-bound follow-on probes. The star path calls a reusable `batched_subject_probe_binary` helper in `fluree-db-query/src/join.rs` that scans PSOT for a fixed predicate over a bounded subject set, applies optional bound-object or object-range filtering, and returns subject/object matches directly." ;
+    mem:tag "batched-probe" ;
+    mem:tag "join" ;
+    mem:tag "performance" ;
+    mem:tag "property-join" ;
+    mem:tag "psot" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:artifactRef "fluree-db-query/src/property_join.rs" ;
+    mem:createdAt "2026-03-28T00:28:25.473585+00:00"^^xsd:dateTime .
+
+mem:fact-01kms0v33qc3xfxjgj7g8sgje8 a mem:Fact ;
+    mem:content "Query-engine cleanup: `fluree-db-query/src/join.rs` now owns shared `make_dict_overlay(ctx, store)` construction for novelty-aware batched probe paths, and `PropertyJoinOperator` factors batched probe plumbing into small helpers (`predicate_sid`, per-predicate bounds/bound-object lookup, probe-match ingestion, driver subject capture). This keeps `PropertyJoinOperator::open` focused on control flow instead of inline setup/details." ;
+    mem:tag "cleanup" ;
+    mem:tag "dict-overlay" ;
+    mem:tag "join" ;
+    mem:tag "maintainability" ;
+    mem:tag "property-join" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:artifactRef "fluree-db-query/src/property_join.rs" ;
+    mem:createdAt "2026-03-28T01:27:21.975499+00:00"^^xsd:dateTime .
+
+mem:fact-01kmt1mrbpkwzyrpfyckbkbkfx a mem:Fact ;
+    mem:content "Object-to-Binding conversion in `fluree-db-query` is centralized in `src/object_binding.rs`. Use `late_materialized_object_binding(...)` for the fast encoded-path mapping from `(o_type,o_key,p_id,t,o_i)` and `materialized_object_binding(...)` for wrapping decoded `FlakeValue`s with the correct `Binding::Sid`/`Binding::Lit` shape and datatype metadata. `binary_scan.rs` and `join.rs` both rely on this helper so blank-node, string/json/vector/NUM_BIG, and literal datatype handling stay aligned." ;
+    mem:tag "binding" ;
+    mem:tag "cleanup" ;
+    mem:tag "join" ;
+    mem:tag "maintainability" ;
+    mem:tag "object-binding" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:artifactRef "fluree-db-query/src/object_binding.rs" ;
+    mem:createdAt "2026-03-28T11:00:37.366675+00:00"^^xsd:dateTime .
+
+mem:fact-01kmt5bw0782hg138vkahvnha3 a mem:Fact ;
+    mem:content "Property-join planning now uses a weighted width gate in `fluree-db-query/src/execute/where_plan.rs`: the star path is only chosen when weighted width > 3.0. Required same-subject triples count as 1.0 each, and immediately trailing same-subject OPTIONAL triples with bound predicates count as 0.5 each. This is a planner-only heuristic; it does not fuse OPTIONAL execution into PropertyJoinOperator, it only influences whether the required block takes the property-join path." ;
+    mem:tag "optional" ;
+    mem:tag "planner" ;
+    mem:tag "property-join" ;
+    mem:tag "query" ;
+    mem:tag "star-shape" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:createdAt "2026-03-28T12:05:40.487105+00:00"^^xsd:dateTime .
+
+mem:fact-01kmt5vns3h3p0jvn7taqcfv73 a mem:Fact ;
+    mem:content "PropertyJoinOperator now has a single subject-space follow-on path for binary single-ledger stars: after the first driver predicate seeds encoded subject IDs, it can skip per-predicate PSOT probes and call `batched_subject_star_spot` to walk the SPOT branch once across the candidate subject set, matching multiple remaining predicates and applying bound-object/object-bounds filters before recording per-predicate presence and emitted values. The fast path currently requires all remaining star predicates to have no datatype constraint." ;
+    mem:tag "binary-index" ;
+    mem:tag "property-join" ;
+    mem:tag "query-perf" ;
+    mem:tag "spot" ;
+    mem:tag "star-join" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:artifactRef "fluree-db-query/src/property_join.rs" ;
+    mem:createdAt "2026-03-28T12:14:18.403921+00:00"^^xsd:dateTime .
+
+mem:fact-01kmt6z03f41ptyctmg8z6fg37 a mem:Fact ;
+    mem:content "Property-join planning/execution now supports a narrow full-star fusion step for single-ledger binary stars: `build_where_operators_seeded_with_needed` can absorb consecutive same-subject single-triple OPTIONALs plus immediately following FILTER/BIND patterns that depend only on required-side vars, and `PropertyJoinOperator` treats those OPTIONAL triples as non-required predicates. Missing fused optional values emit `Binding::Poisoned`, while inline filters/binds run inside property-join row assembly so string predicates like `!STRSTARTS(STR(?stage), \"Closed\")` can execute without leaving the star operator." ;
+    mem:tag "filter" ;
+    mem:tag "optional" ;
+    mem:tag "property-join" ;
+    mem:tag "query-perf" ;
+    mem:tag "spot" ;
+    mem:tag "strstarts" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:artifactRef "fluree-db-query/src/property_join.rs" ;
+    mem:createdAt "2026-03-28T12:33:35.855351+00:00"^^xsd:dateTime .
+
+mem:fact-01kmt8sf8e55eg6p1cwfx5tgc7 a mem:Fact ;
+    mem:content "Zoho CRM query perf snapshot after property-join/star-pass work: local perf improved dramatically on the same dataset — COUNT ~352ms→2ms (~176x), simple 4-property LIMIT query ~8400ms→9ms (~933x), and the full query with OPTIONAL + ORDER BY + FILTER now returns correct filtered results in ~10ms locally. Remote Lambda baseline remained dominated by earlier storage/tracing behavior: original ~27s, remote leaf-open caching brought warm to ~3.0s, and with tracing off current deployed warm stayed ~1.2s. This indicates the recent executor/planner work massively improved local engine cost; remote gains from the newest fused-star/filter path still need fresh Lambda benchmarking." ;
+    mem:tag "benchmark" ;
+    mem:tag "lambda" ;
+    mem:tag "local" ;
+    mem:tag "property-join" ;
+    mem:tag "query-perf" ;
+    mem:tag "zoho" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:artifactRef "fluree-db-query/src/expression/string.rs" ;
+    mem:artifactRef "fluree-db-query/src/property_join.rs" ;
+    mem:createdAt "2026-03-28T13:05:31.918535+00:00"^^xsd:dateTime .
+
+mem:fact-01kmt9rs6m9d4rxt2ges55teq1 a mem:Fact ;
+    mem:content "Explain now exposes fused star-path selection. `fluree-db-query/src/execute/where_plan.rs` centralizes property-join decisioning in `analyze_property_join_plan`, and `fluree-db-query/src/explain.rs::explain_execution_hints()` reuses that logic to report hints like `property_join` and `property_join_fused_star` with counts for required triples, fused optional triples, and inline filter/bind fusion. The API explain response includes these hints under `plan.execution-hints`, even when stats are unavailable." ;
+    mem:tag "api" ;
+    mem:tag "explain" ;
+    mem:tag "fused-star" ;
+    mem:tag "planner" ;
+    mem:tag "property-join" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/query/explain.md" ;
+    mem:artifactRef "fluree-db-api/src/explain.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:artifactRef "fluree-db-query/src/explain.rs" ;
+    mem:createdAt "2026-03-28T13:22:37.908659+00:00"^^xsd:dateTime .
+
+mem:fact-01kmtf7e63dh83atzzsr92t8bx a mem:Fact ;
+    mem:content "Boolean expression caching now has a prepared form for hot filter paths. `fluree-db-query/src/expression/helpers.rs` defines `PreparedBoolExpression`, which precomputes the optional cache spec once from an `Expression` and then reuses it across row evaluations. The main repeated filter-bearing operator paths now construct prepared expressions at build time: `FilterOperator`, `HavingOperator`, `InlineOperator::Filter`, and `BindOperator`'s fused post-bind filters. Generic `Expression::eval_to_bool()` still supports uncached ad hoc use, but hot query execution paths no longer re-run cacheability analysis on every row." ;
+    mem:tag "cache" ;
+    mem:tag "expression" ;
+    mem:tag "filter" ;
+    mem:tag "operator" ;
+    mem:tag "performance" ;
+    mem:tag "prepared" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/bind.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:artifactRef "fluree-db-query/src/expression/helpers.rs" ;
+    mem:artifactRef "fluree-db-query/src/filter.rs" ;
+    mem:artifactRef "fluree-db-query/src/having.rs" ;
+    mem:artifactRef "fluree-db-query/src/operator/inline.rs" ;
+    mem:createdAt "2026-03-28T14:58:01.027368+00:00"^^xsd:dateTime .
+
+mem:fact-01kmth3vjk05yrpfpmcjq5nfjz a mem:Fact ;
+    mem:content "LocalStack testcontainers tests in `fluree-db-connection/tests/aws_testcontainers_test.rs` can intermittently fail under `cargo nextest` with `PortNotExposed { port: Tcp(4566) }` immediately after `image.start().await`, even though plain `cargo test` passes. A reliable fix is to centralize LocalStack startup and retry `container.get_host_port_ipv4(4566)` for a short window before treating startup as failed." ;
+    mem:tag "aws-testcontainers" ;
+    mem:tag "flaky-tests" ;
+    mem:tag "localstack" ;
+    mem:tag "nextest" ;
+    mem:tag "port-mapping" ;
+    mem:tag "testcontainers" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-connection/tests/aws_testcontainers_test.rs" ;
+    mem:createdAt "2026-03-28T15:31:00.819186+00:00"^^xsd:dateTime .
+
+mem:fact-01kn6wpk6vgvv0hh2nrz9fczbt a mem:Fact ;
+    mem:content "cargo-dist 0.31.0 plan for the current release setup produces app/artifact names based on the package name `fluree-db-cli`: shell installer `fluree-db-cli-installer.sh`, PowerShell installer `fluree-db-cli-installer.ps1`, Homebrew formula/install hint `brew install fluree/tap/fluree-db-cli`, and Linux/macOS archives named `fluree-db-cli-<target>.tar.xz` (not simplified `fluree-*` names and not `.tar.gz`). Any docs or Docker extraction steps should match those exact names/extensions unless dist metadata is changed to rename the app/formula." ;
+    mem:tag "artifact-names" ;
+    mem:tag "cargo-dist" ;
+    mem:tag "docker" ;
+    mem:tag "fluree-db-cli" ;
+    mem:tag "homebrew" ;
+    mem:tag "installer" ;
+    mem:tag "release" ;
+    mem:scope mem:repo ;
+    mem:artifactRef ".github/workflows/release.yml" ;
+    mem:artifactRef "dist-workspace.toml" ;
+    mem:artifactRef "docs/getting-started/quickstart-server.md" ;
+    mem:artifactRef "fluree-db-cli/Cargo.toml" ;
+    mem:createdAt "2026-04-02T10:44:22.363912+00:00"^^xsd:dateTime .
+
+mem:fact-01kn800ps56as4xe2kycr10yq1 a mem:Fact ;
+    mem:content "AWS Lambda indexing timeout investigation (2026-04-02): 15-min timeouts were NOT in rebuild stats. Full rebuild completed quickly, but incremental runs stopped after 'V6 incremental resolve: subject reconciliation starting'. Successful runs (47-59 subjects) finished in ~174-216ms; runs with 377-1998 subjects showed no progress and timed out.\n\nRoot cause surface: reconciliation loop does per-subject DictTreeReader::reverse_lookup(); progress logs only emit every 1000/5000 items, so moderate-size hangs look silent. Most likely: incremental subject/string reconciliation or DictTreeReader reverse leaf loading." ;
+    mem:tag "aws" ;
+    mem:tag "incremental-resolve" ;
+    mem:tag "indexing" ;
+    mem:tag "lambda" ;
+    mem:tag "stats" ;
+    mem:tag "subject-reconciliation" ;
+    mem:tag "timeout" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/dict/reader.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/build/rebuild.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/run_index/build/incremental_resolve.rs" ;
+    mem:createdAt "2026-04-02T21:01:33.861145+00:00"^^xsd:dateTime .
+
+mem:fact-01knjakv2d3t3y7av973g38tm7 a mem:Fact ;
+    mem:content "Incremental indexing has two notable gotchas in `fluree-db-indexer`: 1) when incremental fulltext refresh cannot fetch/decode the prior fulltext arena, `build/incremental.rs` starts from `FulltextArena::new()` and then writes a replacement arena built from novelty only, which can drop historical `fulltext()` scoring data for that `(g_id,p_id)`; 2) incremental schema refresh carries forward the base schema if base-store load fails, which leaves `snapshot.schema` stale for reasoning until a later successful refresh/rebuild. Also, `IndexerConfig.incremental_max_commit_bytes` defaults to `None`, and only the embedded orchestrator populates it from `reindex_max_bytes`." ;
+    mem:tag "fulltext" ;
+    mem:tag "incremental-indexing" ;
+    mem:tag "indexer" ;
+    mem:tag "operational-risk" ;
+    mem:tag "reasoning" ;
+    mem:tag "review" ;
+    mem:tag "schema" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-indexer/src/build/incremental.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/config.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/orchestrator.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/reasoning_prep.rs" ;
+    mem:createdAt "2026-04-06T21:19:10.925331+00:00"^^xsd:dateTime .
+
+mem:fact-01knpbtsmpvr9e780t2s3q3rjq a mem:Fact ;
+    mem:content "JSON-LD update transactions in Fluree parse as a single top-level object with one WHERE/DELETE/INSERT set. Staging executes WHERE once against the current ledger snapshot, then instantiates all DELETE and INSERT templates from that one binding set. There is no built-in format for a request body containing multiple ordered update phases that see each other's effects within the same transaction." ;
+    mem:tag "atomicity" ;
+    mem:tag "jsonld" ;
+    mem:tag "snapshot" ;
+    mem:tag "sparql-update" ;
+    mem:tag "transaction" ;
+    mem:tag "update" ;
+    mem:tag "where-delete-insert" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/transactions/update-where-delete-insert.md" ;
+    mem:artifactRef "fluree-db-sparql/src/ast/query.rs" ;
+    mem:artifactRef "fluree-db-transact/src/parse/jsonld.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:createdAt "2026-04-08T10:57:25.142550+00:00"^^xsd:dateTime .
+
+mem:fact-01knpqrkw6e7af9svt81ajcwnf a mem:Fact ;
+    mem:content "Owned transaction writes in `fluree-db-api` cannot be made gracefully blocking by a per-ledger mutex alone. `OwnedTransactBuilder::execute()` stages from the caller-supplied `LedgerState`, while commit sequencing is verified later against the nameservice head in `fluree-db-transact::commit`. If two independently-loaded owned states race, serializing only stage/commit still leaves the later writer with a stale base and it will hit `CommitConflict`/`CommitIdMismatch` unless the implementation refreshes or restages against the current head." ;
+    mem:tag "api" ;
+    mem:tag "commit-conflict" ;
+    mem:tag "concurrency" ;
+    mem:tag "ledger-state" ;
+    mem:tag "stage-owned" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/tx_builder.rs" ;
+    mem:artifactRef "fluree-db-transact/src/commit.rs" ;
+    mem:createdAt "2026-04-08T14:25:56.614537+00:00"^^xsd:dateTime .
+
+mem:fact-01knprmysdkjpzrr21eg89zrac a mem:Fact ;
+    mem:content "Transaction commit publishing now verifies the nameservice head after `publish_commit` and returns `TransactError::PublishLostRace` if the attempted commit did not become the published head. `ApiError::status_code()` maps `CommitConflict`, `CommitIdMismatch`, and `PublishLostRace` to HTTP 409 so callers can detect retryable write races cleanly even though nameservice `publish_commit` remains monotonic/no-op on stale writes." ;
+    mem:tag "api" ;
+    mem:tag "commit" ;
+    mem:tag "concurrency" ;
+    mem:tag "http-409" ;
+    mem:tag "nameservice" ;
+    mem:tag "publish-race" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/error.rs" ;
+    mem:artifactRef "fluree-db-transact/src/commit.rs" ;
+    mem:artifactRef "fluree-db-transact/src/error.rs" ;
+    mem:createdAt "2026-04-08T14:41:25.293176+00:00"^^xsd:dateTime .
+
+mem:fact-01knpxc3aj4bm0vj0tq03jkfnc a mem:Fact ;
+    mem:content "Background indexing correlation context gap: `fluree-db-indexer` background work is queued through `IndexerHandle::trigger()` into per-ledger state and later executed by the long-lived `BackgroundIndexerWorker::process_ledger()`. The worker has no request span/correlation context by default, so logs during `build_index_for_record()` are not correlated to the originating HTTP request. Avoid storing/cloning the original request `tracing::Span` across the queue boundary because that can distort request-span lifetime; prefer storing lightweight correlation fields (e.g. request_id/trace_id) in `LedgerIndexState` and emitting them from worker logs, with optional feature-gated OTEL context/link propagation if trace parenting is needed." ;
+    mem:tag "background-worker" ;
+    mem:tag "correlation-id" ;
+    mem:tag "indexer" ;
+    mem:tag "logging" ;
+    mem:tag "otel" ;
+    mem:tag "request-id" ;
+    mem:tag "tracing" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/lib.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/orchestrator.rs" ;
+    mem:artifactRef "fluree-db-server/src/telemetry.rs" ;
+    mem:createdAt "2026-04-08T16:03:57.906921+00:00"^^xsd:dateTime .
+
+mem:fact-01knpyxmdbpkpkp812xmfdpzav a mem:Fact ;
+    mem:content "Mapped Iceberg/R2RML graph sources are supported through the lazy query builders, not the raw materialized GraphDb snapshot path. Use `fluree.graph(alias).query()` for a single target that may be either a native ledger or a mapped graph source, and use `fluree.query_from()` when the query body carries the dataset (`from`, `FROM`, `FROM NAMED`) or combines multiple sources. Avoid documenting `fluree.db(alias).await?` + `fluree.query(&view, ...)` as graph-source-capable; that path assumes a native ledger snapshot and does not perform graph-source resolution." ;
+    mem:tag "api" ;
+    mem:tag "docs" ;
+    mem:tag "graph-sources" ;
+    mem:tag "iceberg" ;
+    mem:tag "query" ;
+    mem:tag "r2rml" ;
+    mem:tag "rust-api" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/cli/server-integration.md" ;
+    mem:artifactRef "docs/getting-started/rust-api.md" ;
+    mem:artifactRef "docs/graph-sources/iceberg.md" ;
+    mem:artifactRef "docs/graph-sources/r2rml.md" ;
+    mem:artifactRef "fluree-db-api/src/graph.rs" ;
+    mem:artifactRef "fluree-db-api/src/graph_query_builder.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/fluree_ext.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/query.rs" ;
+    mem:createdAt "2026-04-08T16:31:01.035691+00:00"^^xsd:dateTime .
+
+mem:fact-01knpz8tevjwyqp67j38nqcwn7 a mem:Fact ;
+    mem:content "`fluree iceberg map` remote support uses the generic remote-server path, not tracked-ledger mode. The CLI already had `RemoteLedgerClient::iceberg_map()` and `run_iceberg_map_remote()`; the missing piece was exposing `--remote` on `IcebergMapArgs` and giving it precedence in `run_iceberg_map()`: explicit `--remote` -> `build_remote_client(...)`, else local-server auto-route, else local execution. A focused CLI regression test can prove dispatch by configuring an unreachable remote and asserting the command fails with a remote connection error instead of falling back to local mapping behavior." ;
+    mem:tag "cli" ;
+    mem:tag "graph-sources" ;
+    mem:tag "iceberg" ;
+    mem:tag "remote" ;
+    mem:tag "remote-client" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/cli/iceberg.md" ;
+    mem:artifactRef "fluree-db-cli/src/cli.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/iceberg.rs" ;
+    mem:artifactRef "fluree-db-cli/src/remote_client.rs" ;
+    mem:artifactRef "fluree-db-cli/tests/integration.rs" ;
+    mem:createdAt "2026-04-08T16:37:07.675727+00:00"^^xsd:dateTime .
+
+mem:fact-01knpzk6s59m6z41xhgtqkkw54 a mem:Fact ;
+    mem:content "Background index correlation has two paths in `fluree-db-indexer::orchestrator`: (1) preferred copied fields via `IndexRequestCorrelation` (`request_id`, `trace_id`, `operation`) when the caller uses `with_index_request_correlation`; (2) best-effort fallback span context for direct/manual `trigger_index()` callers when no explicit correlation is present. The worker enters the stored fallback span for orchestrator log events so embedded Rust API callers still see span ancestry on background indexer logs, while transaction-triggered server paths continue to rely on copied fields to avoid holding HTTP request spans open." ;
+    mem:tag "background-worker" ;
+    mem:tag "correlation-id" ;
+    mem:tag "indexer" ;
+    mem:tag "request-id" ;
+    mem:tag "span-context" ;
+    mem:tag "tracing" ;
+    mem:tag "trigger_index" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/admin.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/orchestrator.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/transact.rs" ;
+    mem:createdAt "2026-04-08T16:42:47.973885+00:00"^^xsd:dateTime .
+
+mem:fact-01knpzwv3ahtjn3xz7ksg2a8m9 a mem:Fact ;
+    mem:content "The next Iceberg CLI admin slice is implemented as Iceberg-family wrappers over existing graph-source/server functionality: `fluree iceberg list`, `fluree iceberg info`, and `fluree iceberg drop`. These commands intentionally treat both `Iceberg` and `R2RML` graph source types as part of the Iceberg family because `fluree iceberg map` may create either. `iceberg drop` verifies the target is an Iceberg-family graph source before calling the generic remote/local drop path so it will not accidentally delete a ledger of the same name. Remote execution uses `build_remote_client(...)`, and `RemoteLedgerClient` now has `drop_resource()` for POST `/drop`." ;
+    mem:tag "cli" ;
+    mem:tag "drop" ;
+    mem:tag "graph-sources" ;
+    mem:tag "iceberg" ;
+    mem:tag "info" ;
+    mem:tag "list" ;
+    mem:tag "remote" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/cli/iceberg.md" ;
+    mem:artifactRef "fluree-db-cli/src/cli.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/iceberg.rs" ;
+    mem:artifactRef "fluree-db-cli/src/lib.rs" ;
+    mem:artifactRef "fluree-db-cli/src/remote_client.rs" ;
+    mem:artifactRef "fluree-db-cli/tests/integration.rs" ;
+    mem:createdAt "2026-04-08T16:48:03.690758+00:00"^^xsd:dateTime .
+
+mem:fact-01knq1d8f8prvx6wqghrh5zz9r a mem:Fact ;
+    mem:content "Build-phase index correlation gotcha: wrapping only `fluree-db-indexer::orchestrator` log statements with the stored span is insufficient. The worker must run the entire `build_index_for_record()` future under the stored fallback span, and copied request correlation must be scoped around that future so `build_index_for_record()` can attach `request_id`/`trace_id`/`trigger_operation` to its `index_build` span. Rebuild already propagates `Span::current()` into its top-level `spawn_blocking`, but incremental branch updates needed their own `parent_span.enter()` inside `build/incremental.rs::run_update_branch()`." ;
+    mem:tag "background-worker" ;
+    mem:tag "correlation-id" ;
+    mem:tag "incremental" ;
+    mem:tag "indexer" ;
+    mem:tag "rebuild" ;
+    mem:tag "spawn_blocking" ;
+    mem:tag "tracing" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-indexer/src/build/incremental.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/lib.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/orchestrator.rs" ;
+    mem:createdAt "2026-04-08T17:14:30.248574+00:00"^^xsd:dateTime .
+
+mem:fact-01knspnjf2k7s3x6rym31exsn0 a mem:Fact ;
+    mem:content "Remote graph source gotchas: graph source records currently only recognize kind types f:IndexSource and f:MappedSource in nameservice parsing, and graph source config is exposed verbatim via nameservice JSON-LD/info output (f:graphSourceConfig). That means a new RemoteSource kind requires storage/file nameservice changes, and bearer tokens or other secrets must not be stored directly in graph source config." ;
+    mem:tag "feature-design" ;
+    mem:tag "graph-sources" ;
+    mem:tag "nameservice" ;
+    mem:tag "remote-service" ;
+    mem:tag "security" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/ledger_info.rs" ;
+    mem:artifactRef "fluree-db-nameservice/src/file.rs" ;
+    mem:artifactRef "fluree-db-nameservice/src/storage_ns.rs" ;
+    mem:createdAt "2026-04-09T18:04:31.586698+00:00"^^xsd:dateTime .
+
+mem:fact-01kntkdbj9s0akhg36brbre0wa a mem:Fact ;
+    mem:content "Server JSON-LD config support and API Connection JSON-LD are currently two different things. `fluree-db-server`/`fluree server start` only parse top-level `.fluree/config.jsonld` as a serde-friendly config file with a `server` section and ignored `@context`; they do not ingest the API's `Connection`/`Storage`/`Publisher` graph format. Full S3 + split commit/index + DynamoDB nameservice support already exists through `FlureeBuilder::from_json_ld(...).build_client()` / `ConnectionConfig::from_json_ld`, so adding AWS to the server is likely best done by wiring the server to accept a connection JSON-LD source rather than duplicating S3/DynamoDB fields in `ServerConfig`." ;
+    mem:tag "aws" ;
+    mem:tag "cli" ;
+    mem:tag "config" ;
+    mem:tag "json-ld" ;
+    mem:tag "s3" ;
+    mem:tag "server" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/operations/configuration.md" ;
+    mem:artifactRef "docs/reference/connection-config-jsonld.md" ;
+    mem:artifactRef "fluree-db-api/src/lib.rs" ;
+    mem:artifactRef "fluree-db-connection/src/config.rs" ;
+    mem:artifactRef "fluree-db-server/src/config_file.rs" ;
+    mem:artifactRef "fluree-db-server/src/state.rs" ;
+    mem:createdAt "2026-04-10T02:26:51.081621+00:00"^^xsd:dateTime .
+
+mem:fact-01kp4g1wa8yyty4sd2p03k6bg9 a mem:Fact ;
+    mem:content "Strict compact-IRI opt-out wiring has two easy-to-miss edge cases: (1) JSON-LD query `@path` alias extraction currently happens before parse-policy resolution, so `opts.strictCompactIri:false` will not relax undefined-prefix checks inside `@context` `@path` expressions; (2) JSON-LD transaction parse-time `opts` must be stripped before single-object insert/upsert expansion, otherwise `opts` can be treated as normal data because only top-level envelope `@graph` form skips extra keys before expansion." ;
+    mem:tag "jsonld" ;
+    mem:tag "opts" ;
+    mem:tag "path-alias" ;
+    mem:tag "query" ;
+    mem:tag "strict-compact-iri" ;
+    mem:tag "transaction" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/parse/mod.rs" ;
+    mem:artifactRef "fluree-db-query/src/parse/policy.rs" ;
+    mem:artifactRef "fluree-db-transact/src/parse/jsonld.rs" ;
+    mem:artifactRef "fluree-graph-json-ld/src/expand.rs" ;
+    mem:createdAt "2026-04-13T22:40:33.608461+00:00"^^xsd:dateTime .
+
+mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
+    mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
+    mem:tag "api-alignment" ;
+    mem:tag "cli" ;
+    mem:tag "insert" ;
+    mem:tag "naming" ;
+    mem:tag "taxonomy" ;
+    mem:tag "transact" ;
+    mem:tag "update" ;
+    mem:tag "upsert" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/graph_transact_builder.rs" ;
+    mem:artifactRef "fluree-db-cli/src/cli.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/update.rs" ;
+    mem:artifactRef "fluree-db-cli/src/remote_client.rs" ;
+    mem:branch "feature/cli-transact-command" ;
+    mem:createdAt "2026-03-17T19:31:31.413037+00:00"^^xsd:dateTime ;
+    mem:rationale "The original CLI command was named `transact` but this conflicted with the established API naming where \"transact\" means any write operation. Renamed to `update` to match the API layer's `.transact().update()` pattern, where update specifically means WHERE/DELETE/INSERT." ;
+    mem:alternatives "Keep `transact` as CLI command name (rejected: confuses the umbrella concept with a specific operation type); use `where-delete-insert` or `wdi` (rejected: too verbose/obscure)" .
+
+mem:decision-01kje2pt9maxrxjw49ydgejmpe a mem:Decision ;
+    mem:content "f:enforceUnique uses storage-layer value identity, NOT RDF strict equality. Key is (graph, predicate, FlakeValue) — ignores RDF datatype IRI and language tag. Same bytes = duplicate regardless of annotation. Different FlakeValue variants (String(\"42\") vs Long(42)) are naturally distinct at storage layer.\n\nUses POST index predicate_object(p, o) without .with_datatype(), matching all datatypes for that (p, o) pair." ;
+    mem:tag "FlakeValue" ;
+    mem:tag "POST-index" ;
+    mem:tag "RDF" ;
+    mem:tag "config-graph" ;
+    mem:tag "datatype" ;
+    mem:tag "enforceUnique" ;
+    mem:tag "transact" ;
+    mem:tag "uniqueness" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/tx.rs" ;
+    mem:branch "feature/config-graph" ;
+    mem:createdAt "2026-02-26T22:56:56.628412+00:00"^^xsd:dateTime ;
+    mem:rationale "RDF strict equality treats \"hello\"^^xsd:string and \"hello\"^^ex:custom as different values because their datatype IRIs differ. For a uniqueness constraint this is surprising and easily subverted — users expect \"same text = same value.\" Storage-layer identity (FlakeValue enum variant + payload) is the right granularity: it's what the index actually stores and compares, it's deterministic, and it prevents accidental or intentional duplicate sneaking via datatype annotation." ;
+    mem:alternatives "RDF strict equality (datatype-aware key including dt Sid), datatype-family matching via dt_compatible()" .
+
+mem:fact-01km06dhjzpgyvbs1yc5h0h28e a mem:Fact ;
+    mem:content "Default context: per-ledger JSON prefix map auto-applied to queries/transactions that omit @context. Stored in CAS keyed by ContentId; pointer in ConfigPayload.default_context via nameservice.\n\nPopulation: bulk import captures @prefix + builtins; API set_default_context(); HTTP PUT /v1/fluree/context/*ledger; CLI fluree context set.\n\nPrecedence: Query @context/PREFIX > ledger default > built-in (rdf, rdfs, xsd, owl, sh, geo).\n\nUpdates use CAS via ConfigPublisher::push_config() with retry; disconnect_ledger() evicts cache after update. ProxyNameService does NOT implement ConfigPublisher — context writes only on tx server." ;
+    mem:tag "api" ;
+    mem:tag "cas" ;
+    mem:tag "cli" ;
+    mem:tag "default-context" ;
+    mem:tag "http-endpoint" ;
+    mem:tag "nameservice" ;
+    mem:tag "prefix" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/api/endpoints.md" ;
+    mem:artifactRef "docs/cli/context.md" ;
+    mem:artifactRef "docs/concepts/iri-and-context.md" ;
+    mem:artifactRef "fluree-db-api/src/import.rs" ;
+    mem:artifactRef "fluree-db-api/src/ledger_manager.rs" ;
+    mem:artifactRef "fluree-db-api/src/lib.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/context_cmd.rs" ;
+    mem:artifactRef "fluree-db-nameservice/src/lib.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/context.rs" ;
+    mem:branch "feature/default-context" ;
+    mem:createdAt "2026-03-18T10:03:48.703812+00:00"^^xsd:dateTime .
+
+mem:fact-01kjg3zmevnz6mdn53wkqn08p0 a mem:Fact ;
+    mem:content "Fluree uses CIDv1 for all content-addressed blobs. Implementation in fluree-db-core/src/content_id.rs wrapping `cid` crate.\n\nFormat: CIDv1 = version(1) + multicodec + multihash(SHA2-256, 32 bytes). Multicodec values in private-use range 0x300000+: Commit(0x300001), Txn(0x300002), IndexRoot(0x300003), IndexBranch/Leaf, DictBlob, Garbage, LedgerConfig, StatsSketch, GraphSourceSnapshot, SpatialIndex.\n\nKey APIs: ContentId::new(kind, bytes) hashes with SHA-256; verify(bytes) re-hashes and compares (NOT valid for commit-v2 which excludes trailing hash+sig); digest_hex() returns 64-char hex; Display uses base32-lower multibase." ;
+    mem:tag "CIDv1" ;
+    mem:tag "SHA-256" ;
+    mem:tag "architecture" ;
+    mem:tag "content-id" ;
+    mem:tag "content-kind" ;
+    mem:tag "multicodec" ;
+    mem:tag "multihash" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-core/src/content_id.rs" ;
+    mem:artifactRef "fluree-db-core/src/content_kind.rs" ;
+    mem:branch "feature/ipfs" ;
+    mem:createdAt "2026-02-27T17:57:43.003928+00:00"^^xsd:dateTime .
+
+mem:constraint-01kj8k4mfr2w5h0k2w67w07nz8 a mem:Constraint ;
+    mem:content "Important patterns and gotchas:\n- Binary index PSOT range queries may return a SUPERSET of matching flakes — post-filtering by subject/predicate is required (see datalog_rules.rs fix)\n- `spawn_blocking` + `handle.block_on()` pattern in indexer for non-Send types across await points\n- `max_t` tracking in index_build.rs must happen BEFORE retraction skip (op=0) — otherwise retraction-only commits don't update max_t, causing waiter deadlocks" ;
+    mem:tag "deadlock" ;
+    mem:tag "gotchas" ;
+    mem:tag "max-t" ;
+    mem:tag "patterns" ;
+    mem:tag "post-filtering" ;
+    mem:tag "psot" ;
+    mem:tag "range-queries" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-indexer/src/index_build.rs" ;
+    mem:branch "feature/memory" ;
+    mem:createdAt "2026-02-24T19:48:40.056044+00:00"^^xsd:dateTime .
+
+mem:fact-01kj8k4gvpbtb4njvzqt6tdz1g a mem:Fact ;
+    mem:content "Index pipeline:\n- `build_binary_index()` in fluree-db-indexer/src/lib.rs — direct entry point (takes NsRecord, always builds)\n- `build_index_for_ledger()` — wraps above with nameservice lookup + early-return if current\n- `reindex()` in fluree-db-api/src/admin.rs uses `build_binary_index` for forced rebuilds\n- Old B-tree pipeline fully removed (BatchedRebuild, checkpoints, ReindexProgress, etc.)" ;
+    mem:tag "binary-index" ;
+    mem:tag "index-pipeline" ;
+    mem:tag "indexer" ;
+    mem:tag "reindex" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/admin.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/lib.rs" ;
+    mem:branch "feature/memory" ;
+    mem:createdAt "2026-02-24T19:48:36.342399+00:00"^^xsd:dateTime .
+
+mem:fact-01kj8k4q4rysa5ba61nxjngzmw a mem:Fact ;
+    mem:content "Commit format (commit-v2):\n- `CommitV2Header` fields: version, flags, t, op_count, envelope_len, sig_block_len\n- `CommitV2Envelope` fields include txn_signature (Option&lt;TxnSignature&gt;)\n- `Commit` struct has `txn_signature: None, commit_signatures: Vec::new()` for test construction\n- Magic bytes: `FCV2` (binary commit-v2 only; legacy JSON path fully removed)" ;
+    mem:tag "FCV2" ;
+    mem:tag "binary-format" ;
+    mem:tag "commit-format" ;
+    mem:tag "commit-v2" ;
+    mem:scope mem:repo ;
+    mem:branch "feature/memory" ;
+    mem:createdAt "2026-02-24T19:48:42.776648+00:00"^^xsd:dateTime .
+
+mem:fact-01kj8k4v897jghnsy7dtjpg475 a mem:Fact ;
+    mem:content "OPST index changes:\n- OPST now stores ALL object types (not just refs) — changed in run_writer.rs, leaflet.rs, binary_index_store.rs\n- Leaflet format: o_kind[u8], RLE(o_key:u64), p_id[pw], s_id[u64] (breaking change, requires rebuild)\n- `is_iri_ref()` on RunRecord removed (was only used for OPST filtering)\n- OPST guard in `translate_range()` removed" ;
+    mem:tag "breaking-change" ;
+    mem:tag "index-format" ;
+    mem:tag "leaflet" ;
+    mem:tag "object-types" ;
+    mem:tag "opst" ;
+    mem:scope mem:repo ;
+    mem:branch "feature/memory" ;
+    mem:createdAt "2026-02-24T19:48:46.985249+00:00"^^xsd:dateTime .
+
+mem:fact-01kj8k505wm9rz9609edzry5r8 a mem:Fact ;
+    mem:content "BinaryRangeProvider / LedgerState loading (fixed):\n- `fluree.ledger()` in loading.rs now attaches BinaryRangeProvider + binary_store from index root\n- `TypeErasedStore(Arc&lt;dyn Any + Send + Sync&gt;)` for cross-crate type erasure (fluree-db-ledger → fluree-db-indexer)\n- `execute_query_internal` uses `prepare_execution` + `execute_prepared` with `ContextConfig` containing binary_store\n- `upload_dicts_to_cas()` must strip namespace prefixes before building subject trees (matches `upload_dicts_from_disk`)\n- `resolve_subject_iri` has defensive check against double-prefixing (CAS trees may store full IRIs)\n- `cache_bytes_to_file` uses atomic counter for unique tmp names (race condition fix)" ;
+    mem:tag "binary-range-provider" ;
+    mem:tag "ledger-state" ;
+    mem:tag "loading" ;
+    mem:tag "query-execution" ;
+    mem:tag "type-erasure" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/loading.rs" ;
+    mem:branch "feature/memory" ;
+    mem:createdAt "2026-02-24T19:48:52.028106+00:00"^^xsd:dateTime .
+
+mem:fact-01kj8k54dgr5qsah3cfbbdp4xs a mem:Fact ;
+    mem:content "Namespace augmentation after indexing: BinaryIndexStore.namespace_codes only has namespaces from index root. Novelty commits can introduce new codes not in the index. DictOverlay.resolve_subject_iri() delegates to store.namespace_prefix() — fails for new codes.\n\nFix: BinaryIndexStore::augment_namespace_codes(&mut self, extra) merges novelty ns codes + rebuilds prefix_trie. Called in 4 store-loading paths before Arc::new. Note: cached path in apply_index_v2 may need store invalidation for new ns codes." ;
+    mem:tag "augmentation" ;
+    mem:tag "dict-overlay" ;
+    mem:tag "namespace" ;
+    mem:tag "namespace-codes" ;
+    mem:tag "prefix-trie" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/fluree_ext.rs" ;
+    mem:artifactRef "fluree-db-api/src/ledger_manager.rs" ;
+    mem:artifactRef "fluree-db-api/src/loading.rs" ;
+    mem:branch "feature/memory" ;
+    mem:createdAt "2026-02-24T19:48:56.368004+00:00"^^xsd:dateTime .
+
+mem:fact-01kj8k5nzpe59p5vp7zrehbrr9 a mem:Fact ;
+    mem:content "Forward dictionary packing: replaced CoW B-tree forward dicts (many ~2MB DLF1 leaves) with large FPK1 pack files (~256MB). FPK1: 40-byte header + pages + directory, O(1) lookup via offset indexing. ForwardPackReader: mmap-backed, binary search by ID range.\n\nIRB1 root bumped to v2; DictPackRefs replaces forward tree refs; reverse dicts unchanged (DLF1 tree). Clean break — no backward compatibility with v1 forward trees.\nKey files: dict_tree/forward_pack.rs, pack_reader.rs, pack_builder.rs" ;
+    mem:tag "dictionary" ;
+    mem:tag "forward-dict" ;
+    mem:tag "fpk1" ;
+    mem:tag "mmap" ;
+    mem:tag "pack-files" ;
+    mem:tag "tsv-export" ;
+    mem:scope mem:repo ;
+    mem:branch "feature/memory" ;
+    mem:createdAt "2026-02-24T19:49:14.358637+00:00"^^xsd:dateTime .
+
+mem:constraint-01kjte29y3cp8mae56xy6yfv2n a mem:Constraint ;
+    mem:content "SPARQL↔JSON-LD Parity: both compile to the same IR (fluree-db-query/src/ir.rs) and share the entire execution engine. When adding SPARQL features: (1) shared IR changes already affect JSON-LD — verify JSON-LD tests pass, (2) if expressible in JSON-LD, add parallel tests, (3) execution path missing in JSON-LD lower → track follow-up.\n\nSPARQL tests: it_query_sparql.rs | JSON-LD tests: it_query.rs, it_query_analytical.rs, it_query_grouping.rs\nValidate: `cd testsuite-sparql && make test-eval-cat CAT=<cat>` then `cargo test -p fluree-db-api --test it_query`" ;
+    mem:tag "compliance" ;
+    mem:tag "constraint" ;
+    mem:tag "jsonld" ;
+    mem:tag "must-check" ;
+    mem:tag "parity" ;
+    mem:tag "sparql" ;
+    mem:tag "testing" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-api/tests/it_query.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_sparql.rs" ;
+    mem:artifactRef "fluree-db-query/src/ir.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-03-03T18:06:20.611062+00:00"^^xsd:dateTime .
+
+mem:fact-01kjte0r70p5ppv4cjkfyyedpe a mem:Fact ;
+    mem:content "SPARQL Testsuite critical gotchas:\n- MUST `cd testsuite-sparql/` first — excluded from workspace, `cargo test -p testsuite-sparql` from root FAILS\n- Syntax tests run by default; eval tests need `--include-ignored`\n- Each test runs in subprocess with 5s/10s timeouts — panics show as \"Subprocess error\"\n- W3C data in git submodule `rdf-tests/`; URL→local: strip `https://w3c.github.io/rdf-tests/`, prepend `testsuite-sparql/rdf-tests/`\n- `make investigate` only searches syntax report — use `make investigate-eval` for eval failures\n- Key commands: `make count-eval`, `make test-eval-cat CAT=functions`, `make summary`, `make classify`" ;
+    mem:tag "commands" ;
+    mem:tag "compliance" ;
+    mem:tag "gotchas" ;
+    mem:tag "testing" ;
+    mem:tag "testsuite-sparql" ;
+    mem:tag "w3c" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "Cargo.toml" ;
+    mem:artifactRef "testsuite-sparql/Cargo.toml" ;
+    mem:artifactRef "testsuite-sparql/Makefile" ;
+    mem:artifactRef "testsuite-sparql/tests/w3c_sparql.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-03-03T18:05:29.696388+00:00"^^xsd:dateTime .
+
+mem:fact-01kjte1yw4jyrqvnpq27mr2m9v a mem:Fact ;
+    mem:content "SPARQL and JSON-LD queries compile to the same IR and execute on the same engine.\n\nCompilation: SPARQL via fluree-db-sparql/src/lower/ → IR; JSON-LD via fluree-db-query/src/parse/ → same IR. Convergence at view/query.rs → build_executable_for_view() → execute_view_internal().\n\nShared: Expression enum (66+ functions), AggregateFn enum, Pattern enum (Triple, Optional, Minus, Union, etc.), IriEncoder trait.\n\nSPARQL-only: property path lowering, RDF-star, ASK form, SPARQL Update, dataset clause validation." ;
+    mem:tag "architecture" ;
+    mem:tag "ir" ;
+    mem:tag "jsonld" ;
+    mem:tag "parity" ;
+    mem:tag "query" ;
+    mem:tag "shared-execution" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/view/query.rs" ;
+    mem:artifactRef "fluree-db-query/src/aggregate.rs" ;
+    mem:artifactRef "fluree-db-query/src/expression/" ;
+    mem:artifactRef "fluree-db-query/src/ir.rs" ;
+    mem:artifactRef "fluree-db-query/src/parse/lower.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/lower/" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-03-03T18:06:09.284115+00:00"^^xsd:dateTime .
+
+mem:constraint-01kp8yczz09ndt54ztchbheeyb a mem:Constraint ;
+    mem:content "JSON-LD transaction parsing does NOT auto-promote bare string values to IRI references. User data becomes an IRI only when wrapped in `{\"@id\": \"...\"}` or when the property has `@type: \"@id\"` in `@context`. The former `looks_like_iri` heuristic (three sites in parse/jsonld.rs) was removed — it silently promoted strings starting with `http://`/`https://`/`did:`/`fluree:`/`urn:` to IRIs, which violated the JSON-LD spec (especially for `{\"@value\": \"...\"}`, explicitly a literal)." ;
+    mem:tag "iri" ;
+    mem:tag "jsonld" ;
+    mem:tag "parsing" ;
+    mem:tag "spec-compliance" ;
+    mem:tag "transactions" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "docs/concepts/iri-and-context.md" ;
+    mem:artifactRef "fluree-db-transact/src/parse/jsonld.rs" ;
+    mem:artifactRef "fluree-graph-json-ld/src/iri.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-15T16:08:15.584179+00:00"^^xsd:dateTime ;
+    mem:rationale "Prevents silent data corruption: a literal like `{\"@value\": \"urn:isbn:123\"}` must round-trip as a string. Distinct from the strict compact-IRI GUARD (check_unresolved_iri) which stays — that runs only in IRI positions (@id, @type, predicate, datatype) and errors on unresolved prefixes rather than guessing." .
+
+mem:decision-01kp938r33m9e5fzksf47hcfgc a mem:Decision ;
+    mem:content "For a future batched query API, the primary use case is independent page-view reads, not ordered multi-step execution. Same-t guarantees should be cheap and strong for same-ledger batches by reusing one resolved view/handle; federated or multi-ledger batches may need extra per-source time resolution and should not promise the same semantics by default." ;
+    mem:tag "api" ;
+    mem:tag "batch" ;
+    mem:tag "federation" ;
+    mem:tag "query" ;
+    mem:tag "time-travel" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/query/bm25.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/dataset_query.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/query.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-15T17:33:19.331308+00:00"^^xsd:dateTime ;
+    mem:rationale "Captures the preferred semantics for batch query design so future API work does not overfit SQL-style transactions or overpromise cross-ledger consistency." .
+
+mem:decision-01kpkj2j3jyq7742agn0yfhpsy a mem:Decision ;
+    mem:content "For planned fulltext config support, unrelated traffic should stay cheap: precompute `FulltextHookConfig` once per indexing run, keep `FulltextHook::on_op` scalar-only for reject paths, and only build/attach fulltext provider/config maps for queries whose compiled IR actually contains `fulltext(...)`." ;
+    mem:tag "config" ;
+    mem:tag "fulltext" ;
+    mem:tag "indexer" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "FULLTEXT_CONFIG.md" ;
+    mem:artifactRef "fluree-db-api/src/view/dataset_query.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/query.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/fulltext_hook.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-19T19:04:29.554332+00:00"^^xsd:dateTime ;
+    mem:rationale "This isolates the feature's cost to fulltext-relevant writes and queries, avoiding accidental overhead on unrelated transactions and query setup." .
+
+mem:fact-01kp4rwg9hcyj1ypqmfmygdxym a mem:Fact ;
+    mem:content "Strict compact-IRI policy: as of commit 170bccc9, JSON-LD transactions default `strict_compact_iri=true`. Any compact IRI (e.g. `rdf:JSON`, `xsd:string`, `ex:name`) used in data/query/update must have its prefix declared in `@context`, otherwise parsing returns `UnresolvedCompactIri`. The former PR #148 \"Layer 2 fallback\" for well-known prefixes (rdf:, xsd:) is gone. When tests fail with `UnresolvedCompactIri`, fix is to add the prefix to the test's explicit `@context` (per user preference: never rely on default/implicit context in tests). Override via `opts.strict_compact_iri = false` or JSON `opts: {strictCompactIri: false}` if legacy behavior required." ;
+    mem:tag "json-ld" ;
+    mem:tag "parse" ;
+    mem:tag "strict-compact-iri" ;
+    mem:tag "testing" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/parse/policy.rs" ;
+    mem:artifactRef "fluree-db-transact/src/parse/jsonld.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-14T01:14:54.641170+00:00"^^xsd:dateTime .
+
+mem:fact-01kp4rwsy7pf6999h00kv3wdcg a mem:Fact ;
+    mem:content "Rebase: before replay, branch nameservice head must be reset to source head via nameservice.reset_head(). replay_commit uses CommitOpts with skip_sequencing → fast_forward_commit CAS path requiring strictly increasing t. Without reset, replaying at t=N+1 collides with pre-rebase head, producing PublishLostRace.\n\nMerge: fast-forward CAS rejects \"already up to date\" cases (same head_id at same t). merge_branch_inner now short-circuits when target_head == source_head_id and returns no-op MergeReport." ;
+    mem:tag "branches" ;
+    mem:tag "cas" ;
+    mem:tag "fast-forward" ;
+    mem:tag "merge" ;
+    mem:tag "nameservice" ;
+    mem:tag "rebase" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/merge.rs" ;
+    mem:artifactRef "fluree-db-api/src/rebase.rs" ;
+    mem:artifactRef "fluree-db-transact/src/commit.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-14T01:15:04.519020+00:00"^^xsd:dateTime .
+
+mem:fact-01kp4rwyr6eas353wf1fwn2431 a mem:Fact ;
+    mem:content "Nextest SIGABRTs in fluree-db-server integration/policy/proxy/oidc tests when running multiple crates in parallel on macOS are resource contention, NOT test logic bugs. Running `cargo nextest run -p fluree-db-server --all-features` alone passes all 204 tests; running alongside fluree-db-api in the same invocation causes ~37 SIGABRTs at 0.05–0.6s (pre-body). `--test-threads=4` also makes them pass. When you see SIGABRT en-masse in server tests during a workspace run, isolate to the single crate before assuming a bug." ;
+    mem:tag "ci" ;
+    mem:tag "macos" ;
+    mem:tag "nextest" ;
+    mem:tag "parallelism" ;
+    mem:tag "sigabrt" ;
+    mem:tag "testing" ;
+    mem:scope mem:repo ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-14T01:15:09.446809+00:00"^^xsd:dateTime .
+
+mem:fact-01kp8psqsjk2g8zke4trn7ryck a mem:Fact ;
+    mem:content "A duplicate-subject symptom after reindexing old commits (for example `?s rdf:type Class` returning the same subject twice after delete-then-reinsert) most plausibly comes from legacy transaction commits, not PSOT scanning itself: old wildcard-delete / upsert paths could persist ineffective retracts for indexed facts, and rebuild only dedups exact V2 identity `(s,p,o_type,o_key,o_i)`, so mismatched legacy retracts leave the original assert alive and a later reinsert adds a second live row." ;
+    mem:tag "datatype" ;
+    mem:tag "duplicates" ;
+    mem:tag "legacy-commits" ;
+    mem:tag "psot" ;
+    mem:tag "reindex" ;
+    mem:tag "upsert" ;
+    mem:tag "wildcard-delete" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_transact_update.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_update_wildcard_delete_indexed.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/run_index/build/merge.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-15T13:55:24.594356+00:00"^^xsd:dateTime ;
+    mem:rationale "This links a user-visible duplicate-query symptom to the historical write-path bugs and the rebuild identity rules, which is useful context for future investigations." .
+
+mem:fact-01kp8y8sj2452zvzzpexfrnvep a mem:Fact ;
+    mem:content "Transaction staging currently buffers WHERE results multiple times: query execution returns `Vec<Batch>`, `stage.rs` merges them into one `Batch`, then `materialize_encoded_bindings_for_txn` clones again into a fully materialized `Batch` before flake generation. Large DELETE/UPDATE WHERE operations can therefore pay ~2-3 full copies of binding memory before any cancellation/dedup happens." ;
+    mem:tag "batch" ;
+    mem:tag "memory" ;
+    mem:tag "performance" ;
+    mem:tag "sparql" ;
+    mem:tag "stage" ;
+    mem:tag "transact" ;
+    mem:tag "update" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/binding.rs" ;
+    mem:artifactRef "fluree-db-query/src/lib.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-15T16:05:57.954523+00:00"^^xsd:dateTime ;
+    mem:rationale "This is a recurring memory hotspot for large update/delete transactions and should be recalled before doing staging performance work." .
+
+mem:fact-01kpdqtnax7zn3twyyn50xxwmz a mem:Fact ;
+    mem:content "Fuel tracking gotcha: `BinaryScanOperator::batch_to_bindings` now attaches a tracker-aware `BinaryGraphView`, but dict-touch fuel exhaustion from `resolve_subject_iri` / `resolve_subject_sid` / `decode_value` is still mapped to `QueryError::Internal` instead of `FuelLimitExceeded`. Separately, `ExecutionContext::graph_view()` does not attach `ctx.tracker`, so late-materialization helpers that go through `ctx.resolve_subject_iri()` / `decode_encoded_value()` bypass the new dict-touch charging entirely." ;
+    mem:tag "binary-scan" ;
+    mem:tag "dict-touch" ;
+    mem:tag "fuel" ;
+    mem:tag "late-materialization" ;
+    mem:tag "query" ;
+    mem:tag "tracking" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_index_store.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-query/src/context.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-17T12:49:35.582316+00:00"^^xsd:dateTime ;
+    mem:rationale "Future work on fuel accounting needs to preserve proper FuelExceeded propagation and avoid underbilling in late-materialized query paths." .
+
+mem:fact-01kpehw5sdpvgc26bxg5jthh2s a mem:Fact ;
+    mem:content "Lambda/query warmup currently overpromises dict warming: `fluree-db-server` calls `BinaryIndexStore::preload_dict_leaves()` during preload, but that method is still a TODO returning `Ok(0)`. Also, duplicate remote fetch prevention is asymmetric: dict leaves use `LeafletCache::try_get_or_load_dict_leaf` single-flight, but generic artifact-cache/leaf open paths do not coalesce concurrent cold misses, so the same CID can still be fetched from remote multiple times under concurrency." ;
+    mem:tag "binary-index" ;
+    mem:tag "cache" ;
+    mem:tag "lambda" ;
+    mem:tag "performance" ;
+    mem:tag "s3" ;
+    mem:tag "warmup" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/read/artifact_cache.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_index_store.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/leaflet_cache.rs" ;
+    mem:artifactRef "fluree-db-server/src/lib.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-17T20:24:48.173473+00:00"^^xsd:dateTime ;
+    mem:rationale "This is an easy-to-miss reason warm Lambdas may not improve much and why duplicated S3 reads can still happen even though some cache layers exist." .
+
+mem:fact-01kpepmqtapmksm216fde5jv75 a mem:Fact ;
+    mem:content "The fused fast path for `COUNT(DISTINCT ?o)` with an existence-only same-subject join is intended for `?s <p_count> ?o1 . ?s <p_exists> ?o2`, and it must be order-insensitive. If detection only checks the first triple for the counted object var, queries like `?s a Person . ?s sourceLink ?link` fall back to the generic nested-loop join plan even though they match the fast-path shape." ;
+    mem:tag "count-distinct" ;
+    mem:tag "fast-path" ;
+    mem:tag "join" ;
+    mem:tag "planner" ;
+    mem:tag "query-perf" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-17T21:48:07.370571+00:00"^^xsd:dateTime ;
+    mem:rationale "This planner gotcha is subtle and directly affects Lambda perf investigations for same-subject COUNT(DISTINCT) queries." .
+
+mem:fact-01kpery4cg5x0sz1w9b3dzbdnp a mem:Fact ;
+    mem:content "`NestedLoopJoinOperator` can batch subject-bound fixed-object existence probes like `(?s, fixed_p, fixed_o)` by reusing `batched_subject_probe_binary` with `bound_object` and `emit_object=false`; the prior slowdown came from this shape missing `batched_eligible`, not from `active_graph_mode=many`." ;
+    mem:tag "batched-probe" ;
+    mem:tag "existence" ;
+    mem:tag "join" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-17T22:28:12.304782+00:00"^^xsd:dateTime ;
+    mem:rationale "This is a non-obvious planner/operator capability gap that explains repeated NLJ opens on warm runs and is worth recalling before future query-perf debugging." .
+
+mem:fact-01kpf4qqbhbwvve54zr565y379 a mem:Fact ;
+    mem:content "`fluree-db-query/src/join.rs` now keeps per-join path-selection logs (`opened nested loop join`, `nested loop join runtime path`) at `trace`, while `join batched existence flush complete` only stays at `debug` for slow flushes (>=10ms) or non-trivial batches (accum_len >= 8). This avoids CloudWatch floods during Lambda perf captures." ;
+    mem:tag "join" ;
+    mem:tag "lambda" ;
+    mem:tag "logging" ;
+    mem:tag "query-perf" ;
+    mem:tag "tracing" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-18T01:54:25.265596+00:00"^^xsd:dateTime ;
+    mem:rationale "The previous debug-level join diagnostics produced hundreds of MB of logs and obscured the useful bottleneck signals." .
+
+mem:fact-01kpg3c19kb0nmez28863spr69 a mem:Fact ;
+    mem:content "Low-noise Q2 perf diagnostics now live in `fluree-db-query/src/optional.rs` and `fluree-db-query/src/sort.rs`: `optional batch summary` logs at debug only for expensive batches (>=25ms or >=8 builds/cache hits/result batches), and `sort blocking summary` logs at debug only for non-trivial blocking sorts (>=25ms or >=1000 input rows). The old per-row correlated-OPTIONAL planning log is now trace-level." ;
+    mem:tag "logging" ;
+    mem:tag "optional" ;
+    mem:tag "query-perf" ;
+    mem:tag "sort" ;
+    mem:tag "tracing" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/optional.rs" ;
+    mem:artifactRef "fluree-db-query/src/sort.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-18T10:49:48.083428+00:00"^^xsd:dateTime ;
+    mem:rationale "This keeps CloudWatch captures small while still surfacing the likely remaining Q2 hotspots." .
+
+mem:fact-01kpg6gdmx8k7zcqyh5byw88dn a mem:Fact ;
+    mem:content "`PatternOptionalBuilder` now has a batched execution path for single-triple correlated OPTIONALs with a subject bound from the left, a fixed predicate, no datatype constraint, and single-ledger binary execution. `OptionalOperator` asks builders for a batch result first, so queries with repeated `OPTIONAL { ?s <p> ?o }` clauses can probe many left-side subjects at once instead of opening one scan per row." ;
+    mem:tag "batched-probe" ;
+    mem:tag "optional" ;
+    mem:tag "planner" ;
+    mem:tag "query-perf" ;
+    mem:tag "tracing" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:artifactRef "fluree-db-query/src/optional.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-18T11:44:37.533439+00:00"^^xsd:dateTime ;
+    mem:rationale "This is a generic executor optimization for a common OPTIONAL shape, not a dataset-specific fast path." .
+
+mem:fact-01kpg89x3hs343017xzq1cgbj0 a mem:Fact ;
+    mem:content "`build_where_operators_seeded_with_needed` can now coalesce consecutive single-triple OPTIONALs into one `GroupedPatternOptionalBuilder` when they share the same already-bound subject var, use bound predicates, have no datatype constraint, and introduce distinct optional-only object vars. The grouped builder batches all predicates for the current required batch via `batched_subject_probe_binary`, removing left-deep OPTIONAL drain without tying the optimization to any specific query or dataset." ;
+    mem:tag "batched-probe" ;
+    mem:tag "optional" ;
+    mem:tag "planner" ;
+    mem:tag "property-join" ;
+    mem:tag "query-perf" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:artifactRef "fluree-db-query/src/optional.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-18T12:16:01.137157+00:00"^^xsd:dateTime ;
+    mem:rationale "This is the generic follow-on to the batched single-triple OPTIONAL work and explains why consecutive OPTIONAL chains can speed up substantially." .
+
+mem:fact-01kpga78m373fmr7hmsy4a7a0t a mem:Fact ;
+    mem:content "`UnionOperator` preserves correlated UNION semantics by executing each branch per input row and buffering branch output batches row-by-row, so downstream operators can see severe batch fragmentation even when the union's child produced large batches. For Q2-style reasoning-expanded unions, this can starve `GroupedPatternOptionalBuilder` and make its batched path observe `rows_considered = 1` repeatedly." ;
+    mem:tag "batching" ;
+    mem:tag "optional" ;
+    mem:tag "query-perf" ;
+    mem:tag "reasoning" ;
+    mem:tag "union" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/optional.rs" ;
+    mem:artifactRef "fluree-db-query/src/union.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-18T12:49:31.779188+00:00"^^xsd:dateTime ;
+    mem:rationale "This is a non-obvious executor interaction that matters for future batching fixes upstream of grouped OPTIONALs." .
+
+mem:fact-01kpgbv82fg78tjqhhptx05tvz a mem:Fact ;
+    mem:content "`UnionOperator` now buffers correlated branch results until it can emit a full downstream batch (or true exhaustion), rather than returning after the first per-row fragment. That preserves UNION semantics but prevents reasoning-expanded unions from starving downstream operators like grouped OPTIONAL and sort with one-row batches." ;
+    mem:tag "batching" ;
+    mem:tag "optional" ;
+    mem:tag "query-perf" ;
+    mem:tag "sort" ;
+    mem:tag "union" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/union.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-18T13:17:55.151538+00:00"^^xsd:dateTime ;
+    mem:rationale "This batching invariant is non-obvious and directly explains why the generic fix speeds up UNION-heavy queries without being dataset-specific." .
+
+mem:fact-01kpkzmffzgmf6h67prn8j3hd3 a mem:Fact ;
+    mem:content "SHACL config currently parses `f:shapesSource` into `ShaclDefaults`, but transaction-time engine construction ignores it and always compiles shapes from `ledger.as_graph_db_ref(0)` / `g_id=0`. Docs that describe named-graph shapes sources are ahead of the implementation today." ;
+    mem:tag "config-graph" ;
+    mem:tag "docs-gap" ;
+    mem:tag "shacl" ;
+    mem:tag "shapessource" ;
+    mem:tag "validation" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/guides/cookbook-shacl.md" ;
+    mem:artifactRef "docs/ledger-config/setting-groups.md" ;
+    mem:artifactRef "fluree-db-api/src/config_resolver.rs" ;
+    mem:artifactRef "fluree-db-api/src/tx.rs" ;
+    mem:artifactRef "fluree-db-shacl/src/compile.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-19T23:01:28.191644+00:00"^^xsd:dateTime ;
+    mem:rationale "Future SHACL or config work needs this recalled up front because it creates a silent mismatch between documented configuration and actual validation behavior." .
+
+mem:fact-01kpkzmkq2abxas9h48h6k21p6 a mem:Fact ;
+    mem:content "Transaction-time SHACL validation only discovers applicable shapes through the cache indexes for `sh:targetNode` and `sh:targetClass`; `sh:targetSubjectsOf` and `sh:targetObjectsOf` are compiled but not indexed, so staged-subject validation can silently skip those shapes even though full `validate_all()` handles them." ;
+    mem:tag "cache" ;
+    mem:tag "correctness" ;
+    mem:tag "shacl" ;
+    mem:tag "targets" ;
+    mem:tag "transaction-validation" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-shacl/src/cache.rs" ;
+    mem:artifactRef "fluree-db-shacl/src/compile.rs" ;
+    mem:artifactRef "fluree-db-shacl/src/validate.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-19T23:01:32.514812+00:00"^^xsd:dateTime ;
+    mem:rationale "This is an easy-to-miss correctness bug because the target predicates look implemented in the compiler but do not actually fire in the main transact path." .
+
+mem:fact-01kpm204vw7pj6e9hbag009d2d a mem:Fact ;
+    mem:content "Ledger config parses `f:schemaSource` and `f:rulesSource`, but query-time reasoning currently ignores them: OWL2 RL ontology scans and `f:rule` extraction run against the queried `GraphDbRef`'s `g_id`. In `compute_derived_facts`, OWL-derived overlay flakes are also emitted only under graph id 0." ;
+    mem:tag "config-graph" ;
+    mem:tag "datalog" ;
+    mem:tag "named-graph" ;
+    mem:tag "owl2rl" ;
+    mem:tag "reasoning" ;
+    mem:tag "rulessource" ;
+    mem:tag "schemasource" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/config_resolver.rs" ;
+    mem:artifactRef "fluree-db-core/src/graph_db_ref.rs" ;
+    mem:artifactRef "fluree-db-core/src/ledger_config.rs" ;
+    mem:artifactRef "fluree-db-query/src/datalog_rules.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/reasoning_prep.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-19T23:42:47.676059+00:00"^^xsd:dateTime ;
+    mem:rationale "Future reasoning/config work could otherwise assume named-graph schema/rule sources are already honored, because docs and config structs expose those fields even though runtime still scopes to the query graph/default derived overlay." .
+
+mem:fact-01kpm3sz8pxzakzcj4r8xx687v a mem:Fact ;
+    mem:content "OWL restriction evaluation for chain-valued `owl:onProperty` must traverse the union of the current delta and accumulated derived facts. Evaluating chain hops against delta and derived separately misses mixed paths like `delta(P1)` followed by `derived(P2)` in the same fixpoint iteration." ;
+    mem:tag "fixpoint" ;
+    mem:tag "owl2rl" ;
+    mem:tag "property-chain" ;
+    mem:tag "reasoner" ;
+    mem:tag "restrictions" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-reasoner/src/execute/restriction_rules.rs" ;
+    mem:artifactRef "fluree-db-reasoner/src/execute/tests/restriction_rule_tests.rs" ;
+    mem:branch "misc/fixes" ;
+    mem:createdAt "2026-04-20T00:14:22.486023+00:00"^^xsd:dateTime ;
+    mem:rationale "This is a subtle semi-naive reasoning invariant; future restriction or chain work could easily reintroduce the bug by splitting lookups across delta and derived." .

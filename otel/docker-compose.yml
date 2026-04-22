@@ -1,0 +1,17 @@
+services:
+  jaeger:
+    # Pin version for reproducibility; update periodically.
+    image: jaegertracing/all-in-one:1.76.0
+    container_name: fluree-jaeger
+    ports:
+      - "4317:4317" # OTLP gRPC receiver
+      - "4318:4318" # OTLP HTTP receiver
+      - "16686:16686" # Jaeger UI
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - MEMORY_MAX_TRACES=5000
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:16686"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

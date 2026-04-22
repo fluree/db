@@ -1,0 +1,57 @@
+[package]
+name = "fluree-db-binary-index"
+description = "Binary columnar index formats, codecs, and read-side runtime for Fluree DB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core", features = ["native"] }
+fluree-db-spatial = { path = "../fluree-db-spatial" }
+fluree-vocab = { path = "../fluree-vocab" }
+
+# Core dependencies
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+
+# Index format dependencies
+zstd.workspace = true
+memmap2 = "0.9"
+rustc-hash = "2"
+
+# Cache
+moka.workspace = true
+fs2 = "0.4"
+
+# Concurrency
+once_cell.workspace = true
+parking_lot = "0.12"
+
+# Numeric types (for NumBig arena)
+num-bigint = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+bigdecimal = { version = "0.4", features = ["serde"] }
+
+# Hashing
+xxhash-rust = { workspace = true, features = ["xxh3"] }
+
+# Date/time
+chrono.workspace = true
+
+# Content addressing
+sha2.workspace = true
+hex.workspace = true
+
+# Text analysis (shared analyzer for fulltext indexing + query scoring)
+regex = "1"
+rust-stemmers = "1.2"
+
+[dev-dependencies]
+async-trait.workspace = true
+
+[lints]
+workspace = true

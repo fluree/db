@@ -1,0 +1,84 @@
+[package]
+name = "fluree-db-iceberg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Iceberg REST catalog support for Fluree DB graph sources"
+
+[features]
+default = []
+# AWS SDK integration (credential provider + S3 storage)
+aws = ["dep:aws-credential-types", "dep:aws-sdk-s3", "dep:aws-config"]
+# Arrow columnar output (OFF by default for Lambda size)
+arrow = ["dep:arrow", "parquet/arrow"]
+
+[dependencies]
+# Core dependencies
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-tabular = { path = "../fluree-db-tabular" }
+
+# Async runtime
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+futures.workspace = true
+
+# HTTP client for REST catalog
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Time handling (for credential expiration)
+chrono.workspace = true
+
+# Randomness (for OAuth2 jitter)
+rand.workspace = true
+
+# URL encoding for namespace paths
+urlencoding = "2"
+
+# Logging
+tracing.workspace = true
+
+# Byte handling
+bytes.workspace = true
+
+# Avro for manifest files
+apache-avro.workspace = true
+
+# Parquet for data files (metadata + range-read column access)
+parquet = { workspace = true }
+
+# LRU cache for Parquet footer caching
+lru.workspace = true
+
+# Concurrent collections (for bounded semaphore in S3 reads)
+dashmap.workspace = true
+
+# Optional: AWS SDK (credential provider + S3 storage)
+aws-credential-types = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+
+# Optional: Arrow columnar output
+arrow = { version = "54", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
+
+[[example]]
+name = "read_rest_catalog"
+required-features = ["aws"]
+
+[[example]]
+name = "read_local_iceberg"
+required-features = ["aws"]
+
+[lints]
+workspace = true

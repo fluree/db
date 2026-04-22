@@ -1,0 +1,23 @@
+[package]
+name = "fluree-db-reasoner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OWL2-RL reasoning engine for Fluree DB"
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-vocab = { path = "../fluree-vocab" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+lru = "0.12"
+parking_lot = "0.12"
+hashbrown = { workspace = true }
+smallvec = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

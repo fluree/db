@@ -1,0 +1,151 @@
+[package]
+name = "fluree-db-api"
+description = "High-level API for Fluree DB operations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["native"]
+native = ["fluree-db-nameservice/native", "fluree-db-core/native", "fluree-db-query/native", "dep:sysinfo"]
+# Enable AWS-backed storage support (S3, storage-backed nameservice).
+aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws"]
+# Iceberg / R2RML graph source support (pulls in AWS SDK + native deps)
+iceberg = ["dep:fluree-db-iceberg", "fluree-db-iceberg/aws"]
+# Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers)
+aws-testcontainers = [
+  "dep:fluree-db-storage-aws",
+  "dep:testcontainers",
+  "dep:aws-config",
+  "dep:aws-sdk-s3",
+  "dep:aws-sdk-dynamodb",
+]
+# DID/JWS/VerifiableCredential support for signed queries/transactions
+# Pulls in ed25519-dalek, bs58, etc. Default off to reduce compile times.
+credential = ["dep:fluree-db-credential"]
+# SHACL validation (requires fluree-db-transact + fluree-db-shacl)
+shacl = ["dep:fluree-db-shacl", "fluree-db-transact/shacl"]
+# Temporary benchmark examples (opt-in so `cargo test` stays fast)
+benchmarks = []
+# Remote search client (HTTP client for remote search service)
+search-remote-client = ["dep:reqwest"]
+# Embedded vector search (HNSW-based approximate nearest neighbor)
+vector = ["fluree-db-query/vector"]
+# IPFS-backed storage (via Kubo HTTP RPC)
+ipfs = ["dep:fluree-db-storage-ipfs"]
+# Convenience bundle (excludes vector, aws, and test-only features)
+full = ["native", "credential", "iceberg", "shacl", "ipfs"]
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-crypto = { path = "../fluree-db-crypto", features = ["nameservice"] }
+fluree-db-connection = { path = "../fluree-db-connection" }
+fluree-db-policy = { path = "../fluree-db-policy" }
+fluree-db-query = { path = "../fluree-db-query" }
+fluree-db-ledger = { path = "../fluree-db-ledger" }
+fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false }
+fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
+fluree-db-indexer = { path = "../fluree-db-indexer" }
+fluree-db-binary-index = { path = "../fluree-db-binary-index" }
+fluree-db-sparql = { path = "../fluree-db-sparql" }
+fluree-db-spatial = { path = "../fluree-db-spatial" }
+fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
+fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
+fluree-db-storage-aws = { path = "../fluree-db-storage-aws", optional = true }
+fluree-db-storage-ipfs = { path = "../fluree-db-storage-ipfs", optional = true }
+fluree-search-protocol = { path = "../fluree-search-protocol" }
+fluree-graph-ir = { path = "../fluree-graph-ir" }
+fluree-graph-format = { path = "../fluree-graph-format" }
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
+fluree-db-credential = { path = "../fluree-db-credential", optional = true }
+fluree-db-shacl = { path = "../fluree-db-shacl", optional = true }
+fluree-vocab = { path = "../fluree-vocab" }
+fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
+
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+moka.workspace = true
+rustc-hash = "2"
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# Used for fast xxh3_128 hashing in streaming dictionary merge.
+xxhash-rust.workspace = true
+# Base64 for encryption key decoding
+base64 = "0.22"
+hex.workspace = true
+# Fast integer/float formatting for TSV output (zero-alloc)
+itoa.workspace = true
+ryu.workspace = true
+
+# Opt-in AWS + LocalStack testing deps (feature-gated)
+testcontainers = { version = "0.23", optional = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-sdk-dynamodb = { workspace = true, optional = true }
+
+# HTTP client for remote search service (feature-gated)
+reqwest = { workspace = true, optional = true }
+
+# Platform directory resolution (XDG on Linux, Application Support on macOS)
+dirs = "5"
+
+# System memory detection for import memory budget auto-sizing (native only)
+sysinfo = { workspace = true, optional = true }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+tempfile = "3.19"
+mimalloc.workspace = true
+fs2 = "0.4"
+# Numeric types used by datatype tests
+num-bigint = "0.4"
+num-bigdecimal = { package = "bigdecimal", version = "0.4" }
+# For credential module tests (creates test JWS signatures).
+# Note: Tests are gated via required-features=["credential"], but this dev-dep
+# may still compile. The main compile-time win is avoiding fluree-db-credential
+# and its full dep tree when the feature is off.
+ed25519-dalek = "2.1"
+criterion = "0.5"
+rand = { workspace = true }
+fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
+
+[[test]]
+name = "it_graph_source_r2rml"
+path = "tests/it_graph_source_r2rml.rs"
+required-features = ["iceberg"]
+
+[[test]]
+name = "it_credential"
+path = "tests/it_credential.rs"
+required-features = ["credential"]
+
+[[test]]
+name = "it_storage_s3_testcontainers"
+path = "tests/it_storage_s3_testcontainers.rs"
+required-features = ["aws-testcontainers"]
+
+[[test]]
+name = "it_iceberg_direct"
+path = "tests/it_iceberg_direct.rs"
+required-features = ["iceberg", "aws-testcontainers"]
+
+[[bench]]
+name = "vector_query"
+harness = false
+
+[[bench]]
+name = "fulltext_query"
+harness = false
+
+[[bench]]
+name = "insert_formats"
+harness = false
+
+[lints]
+workspace = true

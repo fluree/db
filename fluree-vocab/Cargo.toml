@@ -1,0 +1,13 @@
+[package]
+name = "fluree-vocab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RDF vocabulary constants and namespace codes for Fluree"
+
+[dependencies]
+# Minimal dependencies - just core Rust types
+
+[lints]
+workspace = true

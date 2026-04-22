@@ -1,0 +1,19 @@
+[package]
+name = "fluree-graph-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Format-agnostic RDF graph intermediate representation"
+
+[dependencies]
+fluree-vocab = { path = "../fluree-vocab" }
+serde = { workspace = true, features = ["rc"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1.4"
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "fluree-db-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ledger state combining indexed Db with novelty overlay"
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
+fluree-vocab = { path = "../fluree-vocab" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

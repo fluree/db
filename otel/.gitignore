@@ -1,0 +1,5 @@
+# Fluree project directory — config, storage, PID, logs
+.fluree/
+
+# Generated test artifacts — TTL data files
+_data/

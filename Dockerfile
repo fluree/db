@@ -1,38 +1,16 @@
-FROM clojure:temurin-17-tools-deps-1.11.1.1165-bullseye-slim
+FROM debian:bookworm-slim
 
-RUN mkdir -p /usr/src/flureedb
-WORKDIR /usr/src/flureedb
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install the tools we need to install the tools we need
-RUN apt-get update && apt-get install -y wget curl gnupg2 software-properties-common chromium
-ENV CHROME_BIN=/usr/bin/chromium
+ARG TARGETARCH
+COPY docker-artifacts/${TARGETARCH}/fluree /usr/local/bin/fluree
+RUN chmod +x /usr/local/bin/fluree
 
-# Add node PPA to get newer versions
-RUN curl -sL https://deb.nodesource.com/setup_20.x | bash -
-RUN apt-get update && apt-get install -y nodejs build-essential
+RUN mkdir -p /var/lib/fluree
+VOLUME /var/lib/fluree
+WORKDIR /var/lib/fluree
 
-COPY deps.edn Makefile ./
-RUN make deps
+EXPOSE 8090
 
-COPY package.json ./
-RUN npm install && npm install -g karma-cli
-
-COPY . ./
-
-RUN make jar
-
-# Create a user to own the fluree code
-RUN groupadd fluree && useradd --no-log-init -g fluree -m fluree
-
-# move clj deps to fluree's home
-# double caching in image layers is unfortunate, but setting this user
-# earlier in the build caused its own set of issues
-RUN mv /root/.m2 /home/fluree/.m2 && chown -R fluree.fluree /home/fluree/.m2
-
-RUN chown -R fluree.fluree .
-USER fluree
-
-# Pre-build JavaScript SDKs as fluree user to ensure proper permissions
-RUN make out/fluree-node-sdk.js out/fluree-browser-sdk.js
-
-ENTRYPOINT []
+ENTRYPOINT ["fluree", "server", "run"]

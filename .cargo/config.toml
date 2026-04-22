@@ -1,0 +1,19 @@
+# Cargo configuration for the Fluree DB-R workspace.
+#
+# The settings below apply to every `cargo` invocation run from this
+# directory tree (including CI).
+
+[env]
+# Default thread stack size for std::thread and test runners.
+#
+# In dev/test builds, async state machines are unoptimized and can grow very
+# large — particularly where SHACL validation, policy enforcement, and the
+# axum HTTP handler chain compose through several nested async fns. The
+# 2 MB Rust/Tokio default overflows on first poll in the policy_integration
+# and proxy_integration suites when the transact HTTP pipeline is exercised.
+#
+# Release builds collapse these futures aggressively and do not need the
+# larger stack; this variable only affects threads that check it at startup
+# (std::thread, cargo test harness, compiler threads). Production runtime
+# stack sizing is controlled separately via tokio's runtime builder.
+RUST_MIN_STACK = "8388608"  # 8 MB

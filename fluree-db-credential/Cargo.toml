@@ -1,0 +1,44 @@
+[package]
+name = "fluree-db-credential"
+description = "Credential verification (JWS, VerifiableCredential) for Fluree DB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Ed25519 signature verification
+ed25519-dalek = { version = "2.1", features = ["pkcs8"] }
+
+# Base64 decoding for JWS
+base64 = "0.22"
+
+# Base58 encoding for did:key
+bs58 = "0.5"
+
+# JSON parsing
+serde.workspace = true
+serde_json.workspace = true
+
+# SHA-256 for commit digest computation
+sha2 = { workspace = true }
+
+# Error handling
+thiserror.workspace = true
+
+# Standard JWT verification (OIDC/JWKS path — RS256)
+jsonwebtoken = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enable VerifiableCredential support (requires JSON-LD canonization - not yet implemented)
+vc = []
+# Enable standard OIDC JWT verification (RS256 via JWKS key material)
+oidc = ["dep:jsonwebtoken"]
+
+[dev-dependencies]
+# For test vector generation
+hex.workspace = true
+
+[lints]
+workspace = true

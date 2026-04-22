@@ -1,0 +1,51 @@
+[package]
+name = "fluree-db-connection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Connection management and storage backends for Fluree DB"
+
+[features]
+default = ["native"]
+# Enable native filesystem-backed storage (FileStorage)
+native = ["fluree-db-core/native", "dep:sysinfo"]
+# Enable AWS storage backends (S3 with native Express support, DynamoDB)
+aws = ["dep:fluree-db-storage-aws", "dep:fluree-db-nameservice", "dep:once_cell", "dep:tokio", "dep:aws-config"]
+# Opt-in infra tests that start LocalStack via testcontainers
+aws-testcontainers = ["aws"]
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core", default-features = false }
+fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# System info for memory detection (optional, native only)
+sysinfo = { workspace = true, optional = true }
+
+# AWS dependencies (optional)
+fluree-db-storage-aws = { path = "../fluree-db-storage-aws", optional = true }
+fluree-db-nameservice = { path = "../fluree-db-nameservice", optional = true, default-features = false }
+once_cell = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync"], optional = true }
+aws-config = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+fluree-db-query = { path = "../fluree-db-query" }
+testcontainers = "0.23"
+aws-sdk-s3 = { workspace = true }
+aws-sdk-dynamodb = { workspace = true }
+fs2 = "0.4"
+
+[[test]]
+name = "aws_testcontainers_test"
+path = "tests/aws_testcontainers_test.rs"
+required-features = ["aws-testcontainers"]
+
+[lints]
+workspace = true

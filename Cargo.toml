@@ -1,0 +1,211 @@
+[workspace]
+resolver = "2"
+members = [
+    "fluree-vocab",
+    "fluree-graph-ir",
+    "fluree-graph-format",
+    "fluree-graph-turtle",
+    "fluree-graph-json-ld",
+    "fluree-db-core",
+    "fluree-db-crypto",
+    "fluree-db-connection",
+    "fluree-db-query",
+    "fluree-db-sparql",
+    "fluree-db-nameservice",
+    "fluree-db-novelty",
+    "fluree-db-ledger",
+    "fluree-db-transact",
+    "fluree-db-binary-index",
+    "fluree-db-indexer",
+    "fluree-db-spatial",
+    "fluree-db-policy",
+    "fluree-db-shacl",
+    "fluree-db-reasoner",
+    "fluree-db-credential",
+    "fluree-db-api",
+    "fluree-db-storage-aws",
+    "fluree-db-storage-ipfs",
+    "fluree-db-iceberg",
+    "fluree-db-tabular",
+    "fluree-db-r2rml",
+    "fluree-db-server",
+    "fluree-db-peer",
+    "fluree-sse",
+    "fluree-db-nameservice-sync",
+    "fluree-search-protocol",
+    "fluree-search-service",
+    "fluree-search-httpd",
+    "fluree-db-cli",
+    "fluree-db-memory",
+    "bench-filter-query",
+]
+exclude = ["testsuite-sparql"]
+
+[workspace.package]
+version = "4.0.0"
+edition = "2021"
+license = "BUSL-1.1"
+repository = "https://github.com/fluree/db"
+
+[workspace.dependencies]
+# Core dependencies (runtime-agnostic)
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+mimalloc = { version = "0.1", default-features = false }
+thiserror = "1.0"
+winnow = "0.7"
+
+# For content addressing and hashing
+postcard = { version = "1.0", features = ["alloc", "use-std"] }
+sha2 = "0.10"
+hex = "0.4"
+
+# Content identifiers (CIDv1 / multiformats)
+cid = { version = "0.11.2", default-features = false, features = ["std"] }
+multihash = { version = "0.19", default-features = false, features = ["std"] }
+
+# For unique ID generation
+ulid = "1.1"
+
+# For HLL statistics (property NDV estimation)
+hyperloglogplus = "0.4"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+# Observability (logging + tracing spans)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# For testing
+tokio = { version = "1", features = ["full", "test-util"] }
+
+# AWS SDK dependencies (for fluree-db-storage-aws)
+aws-config = "1.8.15"
+aws-sdk-s3 = "1.124.0"
+aws-sdk-dynamodb = "1.109.0"
+aws-credential-types = "1.2"
+aws-smithy-types = "1.4.7"
+once_cell = "1.19"
+smallvec = "1.13"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+
+# System info for memory detection (cache sizing)
+sysinfo = "0.32"
+
+# Fast hash map with raw_entry API for efficient lookups
+hashbrown = "0.16"
+
+# Fast integer/float formatting (zero-alloc)
+itoa = "1"
+ryu = "1"
+
+# HTTP server dependencies
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = [
+    "cors",
+    "trace",
+    "compression-gzip",
+] }
+
+# Concurrent collections
+dashmap = "6"
+
+# Data parallelism (used by fluree-db-indexer incremental leaf rewrites)
+rayon = "1"
+
+# API documentation
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "8", features = ["axum"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive", "env"] }
+
+# HTTP types
+http = "1.1"
+http-body-util = "0.1"
+bytes = "1.4"
+
+# HTTP client for REST catalog (Iceberg)
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
+urlencoding = "2"
+
+# JWT verification (standard OIDC JWT with JWKS support)
+jsonwebtoken = "9"
+
+# HTTP mocking for tests
+wiremock = "0.6"
+
+# Compression
+zstd = "0.13"
+
+# Iceberg format support (manifest Avro, data Parquet)
+apache-avro = "0.21.0"
+parquet = { version = "54", default-features = false, features = ["zstd"] }
+
+# LRU cache for Parquet footers
+lru = "0.12"
+
+# High-performance concurrent cache with TinyLFU eviction
+moka = { version = "0.12", features = ["sync"] }
+
+# JSON Schema generation (for MCP tool parameters)
+schemars = "1.0"
+
+# MCP (Model Context Protocol) server support
+rmcp = { git = "https://github.com/fluree/rust-sdk-fork", rev = "ed14e6d6f0e23707e5a1ebbded7245b980a5098d", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+    "transport-io",
+    "tower",
+] }
+
+[workspace.lints.clippy]
+# Mechanical pedantic cleanups — MachineApplicable autofixes, zero logic/perf impact.
+# Denied at the workspace level so CI (and contributor IDEs) enforce them going forward.
+# See https://github.com/fluree/db-r/issues/162 for the broader pedantic audit plan.
+bool_to_int_with_if = "deny"
+comparison_chain = "deny"
+elidable_lifetime_names = "deny"
+explicit_into_iter_loop = "deny"
+explicit_iter_loop = "deny"
+ignored_unit_patterns = "deny"
+inconsistent_struct_constructor = "deny"
+manual_assert = "deny"
+manual_is_variant_and = "deny"
+manual_midpoint = "deny"
+manual_string_new = "deny"
+needless_raw_string_hashes = "deny"
+option_as_ref_cloned = "deny"
+range_plus_one = "deny"
+redundant_closure_for_method_calls = "deny"
+redundant_else = "deny"
+ref_binding_to_reference = "deny"
+semicolon_if_nothing_returned = "deny"
+unnecessary_literal_bound = "deny"
+unnecessary_semicolon = "deny"
+unnested_or_patterns = "deny"
+unreadable_literal = "deny"
+uninlined_format_args = "deny"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+
+[profile.dev-fast]
+inherits = "release"
+lto = false
+strip = false
+codegen-units = 16
+opt-level = 2
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"

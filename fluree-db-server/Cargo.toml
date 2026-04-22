@@ -1,0 +1,160 @@
+[package]
+name = "fluree-db-server"
+description = "HTTP REST API server for Fluree DB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[package.metadata.dist]
+dist = false
+
+[[bin]]
+name = "fluree-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "fluree-events-token"
+path = "src/bin/fluree_events_token.rs"
+
+[lib]
+name = "fluree_db_server"
+path = "src/lib.rs"
+
+[features]
+default = ["native", "credential", "iceberg", "shacl"]
+native = ["fluree-db-api/native"]
+# AWS S3 storage + DynamoDB nameservice (via connection JSON-LD config)
+aws = ["fluree-db-api/aws"]
+# DID/JWS/VerifiableCredential support for signed requests
+# When disabled, signed requests pass through as regular JSON bodies
+credential = ["fluree-db-api/credential"]
+# SHACL constraint validation at transaction time
+shacl = ["fluree-db-api/shacl"]
+# Enable OIDC JWT verification via JWKS (RS256 tokens from external IdPs)
+oidc = ["fluree-db-credential/oidc", "dep:jsonwebtoken"]
+# Iceberg / R2RML graph source support
+iceberg = ["fluree-db-api/iceberg"]
+# Enable Swagger UI endpoint (requires network during build to download assets)
+swagger-ui = ["dep:utoipa-swagger-ui"]
+# Enable OpenTelemetry tracing (optional)
+otel = [
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+]
+
+[dependencies]
+# Fluree DB crates
+fluree-db-api = { path = "../fluree-db-api" }
+fluree-db-connection = { path = "../fluree-db-connection" }
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-credential = { path = "../fluree-db-credential" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
+fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
+fluree-db-peer = { path = "../fluree-db-peer" }
+fluree-db-query = { path = "../fluree-db-query" }
+fluree-db-sparql = { path = "../fluree-db-sparql" }
+fluree-sse = { path = "../fluree-sse" }
+fluree-vocab = { path = "../fluree-vocab" }
+
+# Async trait macros
+async-trait = { workspace = true }
+
+# HTTP framework
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = "0.7"
+
+# Error handling
+thiserror = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { version = "0.32.1", optional = true }
+opentelemetry = { version = "0.31.0", optional = true }
+opentelemetry-otlp = { version = "0.31.0", optional = true, features = [
+    "grpc-tonic",
+    "http-proto",
+] }
+opentelemetry_sdk = { version = "0.31.0", optional = true, features = [
+    "rt-tokio",
+    "experimental_trace_batch_span_processor_with_async_runtime",
+] }
+
+# Concurrent data structures
+dashmap = { workspace = true }
+parking_lot = "0.12"
+
+# CLI
+clap = { workspace = true }
+
+# Config file support
+toml = "0.8"
+
+# API documentation
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true, optional = true }
+
+# HTTP types
+http = { workspace = true }
+bytes = { workspace = true }
+
+# Time tracking
+chrono = { workspace = true }
+
+# Cryptography
+sha2 = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { version = "2.1" }
+bs58 = "0.5"
+
+# Encoding
+base64 = "0.22"
+ahash = "0.8.12"
+ciborium = "0.2" # CBOR encoding for policy-filtered flakes transport
+
+# JWT verification (OIDC/JWKS path)
+jsonwebtoken = { workspace = true, optional = true }
+
+# Shell expansion for token CLI
+shellexpand = "3"
+
+# HTTP client for peer mode (forwarding and SSE subscription)
+reqwest = { workspace = true, features = ["stream"] }
+
+# URL encoding for query params
+urlencoding = { workspace = true }
+
+# Random for jitter in backoff
+rand = { workspace = true }
+
+# MCP (Model Context Protocol) server support
+rmcp = { workspace = true }
+schemars = { workspace = true }
+
+# Async cancellation token for graceful shutdown
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+http-body-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tempfile = "3"
+wiremock = { workspace = true }
+fluree-db-binary-index = { path = "../fluree-db-binary-index" }
+fluree-db-novelty = { path = "../fluree-db-novelty" }
+
+[lints]
+workspace = true

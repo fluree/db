@@ -1,0 +1,60 @@
+[package]
+name = "fluree-db-peer"
+description = "SSE protocol types and client for Fluree DB peer mode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Library-only crate: SSE parsing types and client reused by fluree-db-server peer mode
+# The standalone binary has been removed; if needed later, it can be added back
+# or moved to examples/
+
+[lib]
+name = "fluree_db_peer"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+
+# HTTP client for SSE
+reqwest = { workspace = true, features = ["stream"] }
+
+# SSE parser (extracted to shared crate)
+fluree-sse = { path = "../fluree-sse" }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Async traits
+async-trait = { workspace = true }
+
+# Random for jitter
+rand = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Byte streams
+bytes = { workspace = true }
+
+# Hashing (for graph source config hash, matches server)
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+wiremock = { workspace = true }
+
+[lints]
+workspace = true

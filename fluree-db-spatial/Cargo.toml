@@ -1,0 +1,74 @@
+[package]
+name = "fluree-db-spatial"
+description = "S2-based spatial indexing for Fluree DB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Enable embedded orchestrator integration
+embedded = ["dep:fluree-db-ledger"]
+# Enable remote provider (gRPC client)
+remote = ["dep:tonic", "dep:prost"]
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core", features = ["native"] }
+fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-vocab = { path = "../fluree-vocab" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
+fluree-db-ledger = { path = "../fluree-db-ledger", optional = true }
+
+# Core dependencies
+futures.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+# For content addressing
+sha2.workspace = true
+hex.workspace = true
+
+# Observability
+tracing.workspace = true
+
+# Compression
+zstd.workspace = true
+
+# Memory-mapped file access
+memmap2 = "0.9"
+
+# S2 geometry library (Google's spherical geometry)
+s2 = "0.0.12"
+
+# GeoRust ecosystem for WKT parsing and exact predicates
+geo = "0.29"
+geo-types = "0.7"
+wkt = { version = "0.11", features = ["geo-types"] }
+
+# Fast hash map
+rustc-hash = "2"
+
+# CRC32 for leaflet checksums
+crc32fast = "1.4"
+
+# LRU cache for chunk caching
+moka.workspace = true
+
+# gRPC for remote provider (optional)
+tonic = { version = "0.12", optional = true }
+prost = { version = "0.13", optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+criterion = "0.5"
+
+[[bench]]
+name = "spatial_bench"
+harness = false
+
+[lints]
+workspace = true

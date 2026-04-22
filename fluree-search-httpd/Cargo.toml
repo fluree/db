@@ -1,0 +1,60 @@
+[package]
+name = "fluree-search-httpd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP server for Fluree DB search service"
+
+[package.metadata.dist]
+dist = false
+
+[[bin]]
+name = "fluree-search-httpd"
+path = "src/main.rs"
+
+[dependencies]
+fluree-search-protocol = { path = "../fluree-search-protocol" }
+fluree-search-service = { path = "../fluree-search-service" }
+fluree-db-core = { path = "../fluree-db-core", features = ["native"] }
+fluree-db-nameservice = { path = "../fluree-db-nameservice", features = ["native"] }
+fluree-db-query = { path = "../fluree-db-query", features = ["native"] }
+
+# HTTP server
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Async trait
+async-trait = { workspace = true }
+
+[features]
+default = ["vector"]
+# Enable vector similarity search backend
+vector = ["fluree-search-service/vector"]
+
+[dev-dependencies]
+fluree-db-api = { path = "../fluree-db-api", features = ["native"] }
+tempfile = "3.19"
+http = { workspace = true }
+http-body-util = { workspace = true }
+
+[lints]
+workspace = true

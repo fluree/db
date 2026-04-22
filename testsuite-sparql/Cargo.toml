@@ -1,0 +1,23 @@
+[package]
+name = "testsuite-sparql"
+version = "4.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Fluree crates (for testing)
+fluree-db-api = { path = "../fluree-db-api", features = ["native"] }
+fluree-db-sparql = { path = "../fluree-db-sparql" }
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
+fluree-graph-ir = { path = "../fluree-graph-ir" }
+
+# Test infrastructure
+anyhow = "1"
+quick-xml = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[[bin]]
+name = "run-w3c-test"
+path = "src/bin/run_w3c_test.rs"

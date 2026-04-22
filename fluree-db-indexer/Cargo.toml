@@ -1,0 +1,60 @@
+[package]
+name = "fluree-db-indexer"
+description = "Index building for Fluree DB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Enable the embedded orchestrator (post-commit indexing helpers)
+embedded-orchestrator = ["dep:fluree-db-ledger"]
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core", features = ["native"] }
+fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-vocab = { path = "../fluree-vocab" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
+fluree-db-ledger = { path = "../fluree-db-ledger", optional = true }
+fluree-db-spatial = { path = "../fluree-db-spatial" }
+fluree-db-binary-index = { path = "../fluree-db-binary-index" }
+
+# Core dependencies
+futures.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+# For content addressing
+sha2.workspace = true
+hex.workspace = true
+
+# Observability
+tracing.workspace = true
+sysinfo.workspace = true
+
+# Run-index dependencies
+rustc-hash = "2"
+xxhash-rust = { workspace = true, features = ["xxh3"] }
+zstd.workspace = true
+memmap2 = "0.9"
+chrono.workspace = true
+moka.workspace = true
+num-bigint = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+bigdecimal = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
+libc = "0.2"
+rayon.workspace = true
+
+[dev-dependencies]
+# For HLL tests (proper hash distribution)
+xxhash-rust.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true

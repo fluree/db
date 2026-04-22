@@ -1,0 +1,20 @@
+[package]
+name = "fluree-graph-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RDF graph formatters for JSON-LD, Turtle, and other formats"
+
+[dependencies]
+fluree-graph-ir = { path = "../fluree-graph-ir" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+fluree-vocab = { path = "../fluree-vocab" }
+pretty_assertions = "1.4"
+
+[lints]
+workspace = true

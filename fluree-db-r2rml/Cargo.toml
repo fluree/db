@@ -1,0 +1,49 @@
+[package]
+name = "fluree-db-r2rml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "R2RML mapping support for Fluree DB graph sources"
+
+[features]
+default = []
+# Enable Turtle format R2RML loading (requires fluree-graph-turtle parser)
+turtle = ["dep:fluree-graph-turtle"]
+
+[dependencies]
+# Graph IR for format-agnostic R2RML parsing
+fluree-graph-ir = { path = "../fluree-graph-ir" }
+
+# Turtle parser for R2RML in Turtle format (optional)
+fluree-graph-turtle = { path = "../fluree-graph-turtle", optional = true }
+
+# Tabular column batch types
+fluree-db-tabular = { path = "../fluree-db-tabular" }
+
+# Vocabulary constants
+fluree-vocab = { path = "../fluree-vocab" }
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Regex for template parsing
+regex = "1"
+
+# Lazy initialization for compiled regexes
+once_cell.workspace = true
+
+# Serialization (for config)
+serde = { workspace = true, features = ["derive"] }
+
+# Async traits
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

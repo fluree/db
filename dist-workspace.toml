@@ -1,0 +1,30 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.31.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Path that installers should place binaries in
+install-path = "~/bin"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
+# Homebrew tap for publishing
+tap = "fluree/homebrew-tap"
+# Name the formula "fluree" instead of "fluree-db-cli"
+formula = "fluree"
+# Enable Homebrew publish job
+publish-jobs = ["homebrew"]
+# Allow modifying the generated CI file (for custom Docker job)
+allow-dirty = ["ci"]
+
+[dist.github-custom-runners]
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"

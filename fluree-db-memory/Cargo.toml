@@ -1,0 +1,40 @@
+[package]
+name = "fluree-db-memory"
+description = "Developer memory layer for Fluree DB — stores facts, decisions, constraints as RDF triples"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["native"]
+native = ["fluree-db-api/native"]
+mcp = ["dep:rmcp", "dep:schemars"]
+
+[dependencies]
+fluree-db-api = { path = "../fluree-db-api", default-features = false }
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false }
+
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
+
+chrono.workspace = true
+fs2 = "0.4"
+regex = "1"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+
+# MCP support (optional)
+rmcp = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

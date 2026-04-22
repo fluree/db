@@ -1,145 +1,102 @@
 name: CI
+
 on:
   push:
-  schedule:
-    - cron: 13 01 * * *
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUSTFLAGS: "-C link-arg=-fuse-ld=bfd"
 
 jobs:
-  docker-hub-login:
-    name: login to Docker Hub
+  fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_HUB_USER }}
-          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
-          logout: false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Format
+        run: cargo fmt --all -- --check
 
-  docker-build-cache:
-    name: docker build cache
-    needs: docker-hub-login
-    runs-on: ci-cd
+  clippy:
+    runs-on: ubuntu-latest
     steps:
-      - uses: docker/setup-buildx-action@v3
-        with:
-          install: true
-      - uses: docker/build-push-action@v6
-        id: build
-        with:
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: fluree/db
-          load: true
-
-  test-browser:
-    name: test flureedb.js
-    needs: docker-build-cache
-    runs-on: ci-cd
-    steps:
-      - uses: docker/setup-buildx-action@v3
-        with:
-          install: true
-      - uses: docker/build-push-action@v6
-        with:
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: fluree/db
-          load: true
-      - name: Run tests
-        run: docker run fluree/db make browser-test
-
-  test-cljs:
-    name: run cljs tests
-    needs: docker-build-cache
-    runs-on: ci-cd
-    steps:
-      - uses: docker/setup-buildx-action@v3
-        with:
-          install: true
-      - uses: docker/build-push-action@v6
-        with:
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: fluree/db
-          load: true
-      - name: Run tests
+      - name: Free disk space
         run: |
-          # Run with --privileged to avoid runc /proc/thread-self issue
-          # This is needed for Chrome to run in the container for CLJS tests
-          docker run --privileged fluree/db make cljstest
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
 
-  test-other:
-    name: run other tests
-    needs: docker-build-cache
-    runs-on: ci-cd
-    steps:
-      - uses: docker/setup-buildx-action@v3
-        with:
-          install: true
-      - uses: docker/build-push-action@v6
-        with:
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: fluree/db
-          load: true
-      - name: Run tests
-        run: docker run fluree/db make cljtest nodejs-test
-
-  cljfmt-check:
-    name: cljfmt check
-    runs-on: ubuntu-latest
-    steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          distribution: 'temurin'
-          java-version: '21'
-      - uses: DeLaGuardo/setup-clojure@12.5
-        with:
-          cli: 'latest'
-          cljfmt: 'latest'
-      - run: make cljfmt-check
+          cache-on-failure: true
 
-  clj-kondo-lint:
-    name: clj-kondo lint
+      - name: Clippy
+        run: cargo clippy --all --all-features --all-targets
+
+  test:
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
       - uses: actions/checkout@v4
-      - uses: DeLaGuardo/setup-clojure@12.5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          cli: 'latest'
-          clj-kondo: 'latest'
-      - run: make clj-kondo-lint-ci
+          cache-on-failure: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
 
-  eastwood-lint:
-    name: eastwood lint
+      - name: Test
+        run: cargo nextest run --workspace --all-features --no-fail-fast
+
+  testsuite-sparql:
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '21'
-      - uses: DeLaGuardo/setup-clojure@12.5
-        with:
-          cli: 'latest'
-      - run: make eastwood
+          submodules: true
 
-  notifications:
-    name: send notifications
-    if: always()
-    needs: [test-browser, test-cljs, test-other]
-    runs-on: ubuntu-latest
-    steps:
-      - if: github.ref == 'refs/heads/main' && failure()
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-        uses: voxmedia/github-action-slack-notify-build@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          channel: development
-          status: FAILED
-          color: danger
+          cache-on-failure: true
+          workspaces: "testsuite-sparql -> target"
+
+      - name: Format
+        working-directory: testsuite-sparql
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: testsuite-sparql
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Check compiles (test targets)
+        working-directory: testsuite-sparql
+        run: cargo test --no-run

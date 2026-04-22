@@ -1,0 +1,85 @@
+[package]
+name = "fluree-db-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Query execution engine for Fluree DB"
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-db-tabular = { path = "../fluree-db-tabular" }
+fluree-db-policy = { path = "../fluree-db-policy" }
+fluree-db-r2rml = { path = "../fluree-db-r2rml" }
+fluree-db-reasoner = { path = "../fluree-db-reasoner" }
+fluree-search-protocol = { path = "../fluree-search-protocol" }
+fluree-vocab = { path = "../fluree-vocab" }
+fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
+fluree-db-binary-index = { path = "../fluree-db-binary-index" }
+fluree-db-spatial = { path = "../fluree-db-spatial" }
+memmap2 = "0.9"
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+regex = "1"
+chrono.workspace = true
+# Numeric types for filter comparison
+num-bigint = "0.4"
+num-traits = "0.2"
+bigdecimal = "0.4"
+once_cell = "1"
+# LRU cache for compiled regexes
+lru = "0.12"
+# TinyLFU cache for fulltext novelty deltas
+moka = { workspace = true }
+# BM25 index serialization
+postcard = { version = "1", features = ["alloc"] }
+# Compression for chunked BM25 snapshots (v4)
+zstd = { workspace = true }
+# Hash functions
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+# Random number generation
+rand = { workspace = true }
+# Fast non-cryptographic HashMap/HashSet for hot paths
+rustc-hash = "2"
+# Hashing for leaflet cache keys (matches indexer)
+xxhash-rust = "0.8"
+# URL encoding
+percent-encoding = "2"
+# HashSet raw entry API for DISTINCT (avoid per-row allocations)
+hashbrown = { workspace = true }
+# Async runtime - needed for block_in_place in policy evaluation
+tokio = { workspace = true }
+# GeoRust ecosystem for WKT parsing and geometry types (S2 search)
+geo = "0.29"
+geo-types = "0.7"
+wkt = { version = "0.11", features = ["geo-types"] }
+# Embedded vector search (HNSW approximate nearest neighbor)
+usearch = { version = "2.16", optional = true }
+
+[features]
+# Enable native storage backends in dependencies (used by ignored integration tests that
+# load the on-disk test database).
+native = ["fluree-db-core/native"]
+# Enable embedded vector search (HNSW-based approximate nearest neighbor)
+vector = ["dep:usearch"]
+
+[dev-dependencies]
+fluree-db-indexer = { path = "../fluree-db-indexer" }
+# tokio is now a regular dependency
+criterion = "0.5"
+
+[[bench]]
+name = "vector_math"
+harness = false
+
+[lints]
+workspace = true

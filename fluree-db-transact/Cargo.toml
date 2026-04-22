@@ -1,0 +1,73 @@
+[package]
+name = "fluree-db-transact"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Transaction support for Fluree DB"
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core", features = ["credential"] }
+fluree-db-binary-index = { path = "../fluree-db-binary-index" }
+fluree-db-indexer = { path = "../fluree-db-indexer" }
+fluree-db-policy = { path = "../fluree-db-policy" }
+fluree-db-query = { path = "../fluree-db-query" }
+fluree-db-sparql = { path = "../fluree-db-sparql" }
+fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-db-ledger = { path = "../fluree-db-ledger" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
+fluree-db-shacl = { path = "../fluree-db-shacl", optional = true }
+fluree-vocab = { path = "../fluree-vocab" }
+fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
+fluree-graph-ir = { path = "../fluree-graph-ir" }
+
+# Workspace dependencies
+async-trait.workspace = true
+futures.workspace = true
+once_cell.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Content addressing
+postcard.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+# Unique ID generation
+ulid.workspace = true
+
+# Timestamps
+chrono.workspace = true
+
+# Numeric types for typed literal coercion
+bigdecimal = "0.4"
+num-bigint = "0.4"
+
+# Compression (binary commit format)
+zstd = { workspace = true }
+
+# Tempfile for streaming commit writer spool
+tempfile = "3"
+
+# Turtle/TriG parser (required for trig_meta, optional import mode)
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
+
+# Hash map for trig_meta parser + FxHashSet for worker cache
+rustc-hash = "2"
+
+# Thread-safe namespace allocator for parallel import
+parking_lot = "0.12"
+
+[features]
+default = []
+shacl = ["dep:fluree-db-shacl"]
+import = []
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+[package]
+name = "fluree-db-nameservice-sync"
+description = "Git-like remote sync for Fluree DB nameservice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
+fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-sse = { path = "../fluree-sse" }
+
+async-trait = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+bytes = { workspace = true }
+parking_lot = "0.12"
+urlencoding = { workspace = true }
+async-stream = "0.3"
+
+[dev-dependencies]
+fluree-db-core = { path = "../fluree-db-core" }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "test-util"] }
+wiremock = { workspace = true }
+tempfile = "3.19"
+
+[lints]
+workspace = true

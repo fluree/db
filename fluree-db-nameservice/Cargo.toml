@@ -1,0 +1,30 @@
+[package]
+name = "fluree-db-nameservice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Nameservice traits and implementations for Fluree DB"
+
+[features]
+default = ["native"]
+native = ["tokio/fs", "fluree-db-core/native"]
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core", default-features = false }
+fluree-vocab = { path = "../fluree-vocab" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync"] }
+tracing = { workspace = true }
+parking_lot = "0.12"
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "sync"] }
+tempfile = "3.19"
+
+[lints]
+workspace = true

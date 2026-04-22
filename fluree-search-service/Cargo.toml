@@ -1,0 +1,39 @@
+[package]
+name = "fluree-search-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Search service handlers with BM25 backend and caching for Fluree DB"
+
+[dependencies]
+fluree-search-protocol = { path = "../fluree-search-protocol" }
+fluree-db-query = { path = "../fluree-db-query" }
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
+
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+# LRU cache
+lru = { workspace = true }
+
+[features]
+default = ["bm25"]
+# Enable BM25 search backend
+bm25 = []
+# Enable vector similarity search backend
+vector = ["fluree-db-query/vector"]
+# Enable native storage backends
+native = ["fluree-db-core/native", "fluree-db-query/native"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

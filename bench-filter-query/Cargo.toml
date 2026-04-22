@@ -1,0 +1,23 @@
+[package]
+name = "bench-filter-query"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "bench-filter-query"
+path = "src/main.rs"
+
+[dependencies]
+fluree-db-api = { path = "../fluree-db-api" }
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
+fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-db-query = { path = "../fluree-db-query" }
+
+rand = { workspace = true, features = ["small_rng"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,61 @@
+[package]
+name = "fluree-db-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runtime-agnostic core library for Fluree DB queries"
+
+[features]
+# Default to runtime-agnostic behavior.
+# Enable `native` for filesystem-backed implementations that depend on tokio.
+default = []
+native = ["tokio", "moka", "dashmap", "fs2"]
+credential = ["dep:fluree-db-credential"]
+
+[dependencies]
+fluree-vocab = { path = "../fluree-vocab" }
+futures = { workspace = true }
+async-trait = { workspace = true }
+hashbrown = { workspace = true }
+once_cell = { workspace = true }
+parking_lot = "0.12"
+serde = { workspace = true }
+serde_json = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+cid = { workspace = true }
+multihash = { workspace = true }
+tokio = { workspace = true, features = ["fs"], optional = true }
+fs2 = { version = "0.4", optional = true }
+xxhash-rust = { workspace = true }
+moka = { workspace = true, optional = true }
+dashmap = { workspace = true, optional = true }
+
+# Numeric and temporal types
+num-bigint = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+bigdecimal = { version = "0.4", features = ["serde"] }
+chrono.workspace = true
+
+# Commit-local string dictionaries
+rustc-hash = "2"
+
+# Binary serialization for flakes transport
+ciborium = "0.2"
+
+# Commit v2/v3 binary codec
+zstd = { workspace = true }
+tracing = { workspace = true }
+
+# Optional: commit signing (used by commit_v2 writer)
+fluree-db-credential = { path = "../fluree-db-credential", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+postcard = { workspace = true }
+
+[lints]
+workspace = true

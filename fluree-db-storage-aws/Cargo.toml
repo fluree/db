@@ -1,0 +1,42 @@
+[package]
+name = "fluree-db-storage-aws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AWS storage backends (S3, S3 Express, DynamoDB) for Fluree DB"
+
+[features]
+default = ["s3", "dynamodb"]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-types"]
+dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-types"]
+integration-tests = []
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false }
+
+# AWS SDK dependencies (optional based on features)
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-sdk-dynamodb = { workspace = true, optional = true }
+aws-smithy-types = { workspace = true, optional = true }
+
+# Core dependencies
+async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde_json.workspace = true
+
+# Utilities
+once_cell.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

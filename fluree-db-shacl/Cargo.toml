@@ -1,0 +1,21 @@
+[package]
+name = "fluree-db-shacl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SHACL validation engine for Fluree DB"
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-query = { path = "../fluree-db-query" }
+fluree-vocab = { path = "../fluree-vocab" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+regex = "1"
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

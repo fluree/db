@@ -1,0 +1,14 @@
+[package]
+name = "fluree-db-tabular"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tabular column batch types for Fluree DB graph sources"
+
+[dependencies]
+# Error handling
+thiserror.workspace = true
+
+[lints]
+workspace = true

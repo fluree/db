@@ -1,0 +1,29 @@
+[package]
+name = "fluree-db-novelty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Novelty overlay and commit types for Fluree DB"
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core", features = ["credential"] }
+fluree-db-credential = { path = "../fluree-db-credential" }
+fluree-vocab = { path = "../fluree-vocab" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+chrono = { workspace = true }
+rayon = "1.10"
+tracing = { workspace = true }
+rustc-hash = "2"
+
+[features]
+default = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

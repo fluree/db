@@ -1,0 +1,47 @@
+# Install Fluree
+
+Fluree Memory ships as part of the `fluree` CLI. Install the binary once and you have both the database and the memory tooling.
+
+## macOS / Linux (installer script)
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.sh | sh
+```
+
+## Homebrew (macOS)
+
+```bash
+brew install fluree/tap/fluree
+```
+
+## Pre-built binary
+
+```bash
+# Linux x86_64
+curl -L https://github.com/fluree/db/releases/latest/download/fluree-db-cli-x86_64-unknown-linux-gnu.tar.xz | tar xJ
+
+# macOS aarch64
+curl -L https://github.com/fluree/db/releases/latest/download/fluree-db-cli-aarch64-apple-darwin.tar.xz | tar xJ
+```
+
+## Build from source
+
+If you have Rust installed:
+
+```bash
+git clone https://github.com/fluree/db
+cd db
+cargo install --path fluree-db-cli
+```
+
+## Verify
+
+```bash
+fluree --version
+fluree memory --help
+```
+
+You should see a list of `memory` subcommands: `init`, `add`, `recall`, `update`, `forget`, `status`, `export`, `import`, `mcp-install`.
+
+Next: [quickstart](quickstart.md).

@@ -1,0 +1,112 @@
+[package]
+name = "fluree-db-cli"
+description = "Command-line interface for Fluree DB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://flur.ee"
+
+[[bin]]
+name = "fluree"
+path = "src/main.rs"
+
+[lib]
+name = "fluree_db_cli"
+path = "src/lib.rs"
+
+[features]
+default = ["server", "iceberg", "shacl"]
+server = ["dep:fluree-db-server"]
+iceberg = ["fluree-db-api/iceberg"]
+aws = ["fluree-db-server/aws"]
+# SHACL constraint validation at transaction time
+shacl = ["fluree-db-api/shacl"]
+otel = [
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+]
+
+[dependencies]
+fluree-db-api = { path = "../fluree-db-api" }
+fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-indexer = { path = "../fluree-db-indexer" }
+fluree-vocab = { path = "../fluree-vocab" }
+fluree-db-query = { path = "../fluree-db-query" }
+fluree-db-binary-index = { path = "../fluree-db-binary-index" }
+
+# Developer memory layer
+fluree-db-memory = { path = "../fluree-db-memory", features = ["mcp"] }
+
+# MCP stdio server
+rmcp = { workspace = true }
+
+# Server embedding (optional — enables `fluree server` subcommands)
+fluree-db-server = { path = "../fluree-db-server", optional = true }
+
+clap = { workspace = true }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+
+toml = "0.8"
+toml_edit = "0.22"
+comfy-table = "7"
+colored = "2"
+clap_complete = "4"
+indicatif = "0.17"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Unix process management (server subcommand)
+libc = "0.2"
+
+# OpenTelemetry (optional, enabled by `otel` feature)
+tracing-opentelemetry = { version = "0.32.1", optional = true }
+opentelemetry = { version = "0.31.0", optional = true }
+opentelemetry-otlp = { version = "0.31.0", optional = true, features = [
+    "grpc-tonic",
+    "http-proto",
+] }
+opentelemetry_sdk = { version = "0.31.0", optional = true, features = [
+    "rt-tokio",
+    "experimental_trace_batch_span_processor_with_async_runtime",
+] }
+
+# Token command dependencies
+fluree-db-credential = { path = "../fluree-db-credential" }
+base64 = "0.22"
+bs58 = "0.5"
+shellexpand = "3"
+dirs = "5"
+hex.workspace = true
+rand.workspace = true
+sha2.workspace = true
+
+# Remote ledger client (track mode) + OIDC discovery/exchange
+reqwest = { workspace = true }
+bytes.workspace = true
+urlencoding = { workspace = true }
+percent-encoding = "2"
+open = "5"
+
+# Memory-mapped file I/O (flpack import)
+memmap2 = "0.9"
+
+# Sync command dependencies
+fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
+async-trait.workspace = true
+parking_lot = "0.12"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[lints]
+workspace = true

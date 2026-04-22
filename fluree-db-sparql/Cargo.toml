@@ -1,0 +1,39 @@
+[package]
+name = "fluree-db-sparql"
+description = "SPARQL 1.1 parser with LLM-friendly diagnostics for Fluree DB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["lowering"]
+# Enable lowering to fluree-db-query algebra (requires fluree-db-query/fluree-db-core)
+# Disable for smaller Lambda/WASM builds when only parse/validate is needed
+lowering = ["dep:fluree-db-query", "dep:fluree-db-core", "dep:fluree-vocab", "dep:fluree-graph-json-ld"]
+
+[dependencies]
+# Internal crates (for lowering - feature-gated)
+fluree-db-query = { path = "../fluree-db-query", optional = true }
+fluree-db-core = { path = "../fluree-db-core", optional = true }
+fluree-vocab = { path = "../fluree-vocab", optional = true }
+fluree-graph-json-ld = { path = "../fluree-graph-json-ld", optional = true }
+
+# Parser
+winnow = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+
+# Serialization (for diagnostics)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+insta = "1.34"
+
+[lints]
+workspace = true

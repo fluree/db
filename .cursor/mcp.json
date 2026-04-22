@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "fluree-memory": {
+      "type": "stdio",
+      "command": "fluree",
+      "args": [
+        "mcp",
+        "serve",
+        "--transport",
+        "stdio"
+      ],
+      "env": {
+        "FLUREE_HOME": "${workspaceFolder}/.fluree"
+      }
+    }
+  }
+}

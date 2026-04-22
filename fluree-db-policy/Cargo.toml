@@ -1,0 +1,20 @@
+[package]
+name = "fluree-db-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Policy enforcement for Fluree DB queries and transactions"
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-vocab = { path = "../fluree-vocab" }
+thiserror = { workspace = true }
+uuid = { version = "1.0", features = ["v4"] }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

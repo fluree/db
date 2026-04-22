@@ -1,0 +1,40 @@
+[package]
+name = "fluree-db-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Storage encryption layer for Fluree DB using AES-256-GCM"
+
+[features]
+default = []
+# Enable nameservice trait implementations (StorageList, StorageCas, StorageDelete)
+nameservice = ["fluree-db-nameservice"]
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice", optional = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Cryptography (latest stable versions as of Jan 2026)
+# - aes-gcm 0.10.3: AES-256-GCM authenticated encryption
+# - rand_core 0.6.4: Crypto-grade RNG (OsRng via getrandom)
+aes-gcm = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Secret handling with automatic zeroization
+# - zeroize 1.8.2: Securely wipe memory on drop
+zeroize = { version = "1.8", features = ["derive"] }
+
+# Base64 encoding for key configuration
+# - base64 0.22.1: Fast, correct base64 encoding/decoding
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

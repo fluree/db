@@ -1,5 +1,7 @@
-.git/
-.idea/
-db.iml
 target/
-node_modules/
+.git/
+docs/
+testsuite-sparql/
+benchmarks/
+otel/
+*.md
