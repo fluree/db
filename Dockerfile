@@ -1,16 +1,28 @@
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates tini curl bash \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r fluree --gid=1000 \
+    && useradd -r -g fluree --uid=1000 --home-dir=/var/lib/fluree --shell=/bin/bash fluree \
+    && mkdir -p /var/lib/fluree \
+    && chown -R fluree:fluree /var/lib/fluree
 
 ARG TARGETARCH
-COPY docker-artifacts/${TARGETARCH}/fluree /usr/local/bin/fluree
-RUN chmod +x /usr/local/bin/fluree
+COPY --chown=root:root --chmod=0755 docker-artifacts/${TARGETARCH}/fluree /usr/local/bin/fluree
 
-RUN mkdir -p /var/lib/fluree
-VOLUME /var/lib/fluree
+LABEL org.opencontainers.image.source="https://github.com/fluree/db"
+LABEL org.opencontainers.image.description="Fluree — semantic graph database"
+LABEL org.opencontainers.image.licenses="BUSL-1.1"
+
+USER fluree
 WORKDIR /var/lib/fluree
+VOLUME /var/lib/fluree
 
 EXPOSE 8090
+ENV RUST_LOG=info
 
-ENTRYPOINT ["fluree", "server", "run"]
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8090/health || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "fluree", "server", "run"]

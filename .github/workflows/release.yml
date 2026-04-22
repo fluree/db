@@ -323,6 +323,7 @@ jobs:
             type=semver,pattern={{version}},value=${{ needs.plan.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.plan.outputs.tag }}
             type=semver,pattern={{major}},value=${{ needs.plan.outputs.tag }}
+            type=raw,value=latest
       - uses: docker/build-push-action@v5
         with:
           context: .
