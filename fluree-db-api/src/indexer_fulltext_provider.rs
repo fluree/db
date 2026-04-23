@@ -48,11 +48,35 @@ impl ApiFulltextConfigProvider {
             .await
             .map_err(|e| format!("LedgerState::load: {e}"))?;
 
+        // [DIAG] Full ledger-state shape right after load, before we touch
+        // the binary index. Tells us whether the ns lookup saw the current
+        // head and whether the snapshot is at `t=0` (genesis) vs. some
+        // prior index_t. Remove once the Solo c3000-04 "provider returned
+        // empty" bug is diagnosed.
+        let ns_index_head_present = state
+            .ns_record
+            .as_ref()
+            .and_then(|r| r.index_head_id.as_ref())
+            .is_some();
+        let ns_commit_t = state.ns_record.as_ref().map(|r| r.commit_t);
+        let ns_index_t = state.ns_record.as_ref().map(|r| r.index_t);
+        tracing::info!(
+            ledger_id = ledger_id,
+            snapshot_t = state.snapshot.t,
+            state_t = state.t(),
+            novelty_t = state.novelty.t,
+            ns_commit_t = ?ns_commit_t,
+            ns_index_t = ?ns_index_t,
+            ns_index_head_present,
+            "[DIAG] provider.resolve: loaded ledger state"
+        );
+
         // 2. If an index exists, load the binary store so the config graph
         //    can be read via the indexed side too. Without this, only
         //    overlay/novelty entries would be visible — fine for configs
         //    committed since the last index, wrong for configs that have
         //    already been indexed.
+        let mut binary_index_loaded = false;
         if let Some(index_cid) = state
             .ns_record
             .as_ref()
@@ -93,6 +117,7 @@ impl ApiFulltextConfigProvider {
                 ns_fallback,
             );
             state.snapshot.range_provider = Some(Arc::new(provider));
+            binary_index_loaded = true;
         }
 
         // 3. Resolve `f:fullTextDefaults` against the loaded state.
@@ -104,14 +129,74 @@ impl ApiFulltextConfigProvider {
         // out (`Novelty::for_each_overlay_flake` keeps only `flake.t <= to_t`).
         let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
         let to_t = state.t();
+        // [DIAG] Probe the overlay itself for config-graph activity so we
+        // can tell "the novelty has no config flakes" from "the novelty
+        // has them but resolve_ledger_config can't find them." Counts
+        // flakes at (g_id=CONFIG_GRAPH_ID=2, index=Post, t <= to_t). Expect
+        // non-zero when config was committed into novelty (no prior index
+        // case) and zero once it's been indexed (post-first-reindex case).
+        {
+            use fluree_db_core::{IndexType, CONFIG_GRAPH_ID};
+            let mut overlay_count: usize = 0;
+            overlay.for_each_overlay_flake(
+                CONFIG_GRAPH_ID,
+                IndexType::Post,
+                None,
+                None,
+                true,
+                to_t,
+                &mut |_flake| {
+                    overlay_count += 1;
+                },
+            );
+            tracing::info!(
+                ledger_id = ledger_id,
+                to_t,
+                overlay_flakes_in_config_graph = overlay_count,
+                binary_index_loaded,
+                "[DIAG] provider.resolve: overlay/novelty config-graph probe"
+            );
+        }
         let ledger_config =
             crate::config_resolver::resolve_ledger_config(&state.snapshot, overlay, to_t)
                 .await
                 .map_err(|e| format!("resolve_ledger_config: {e}"))?;
 
-        Ok(ledger_config
+        // [DIAG] Shape of what resolve_ledger_config returned, before the
+        // per-indexer shape transform. Tells us whether we got a
+        // `LedgerConfig` at all, whether `full_text` was set, and how many
+        // properties the config carried. Remove after the Solo c3000-04
+        // "provider returned empty" bug is diagnosed.
+        let config_present = ledger_config.is_some();
+        let full_text_present = ledger_config
+            .as_ref()
+            .and_then(|cfg| cfg.full_text.as_ref())
+            .is_some();
+        let ledger_wide_property_count = ledger_config
+            .as_ref()
+            .and_then(|cfg| cfg.full_text.as_ref())
+            .map(|ft| ft.properties.len())
+            .unwrap_or(0);
+        let graph_override_count = ledger_config
+            .as_ref()
+            .map(|cfg| cfg.graph_overrides.len())
+            .unwrap_or(0);
+        let result: Vec<ConfiguredFulltextProperty> = ledger_config
             .map(|cfg| crate::config_resolver::configured_fulltext_properties_for_indexer(&cfg))
-            .unwrap_or_default())
+            .unwrap_or_default();
+        tracing::info!(
+            ledger_id = ledger_id,
+            to_t,
+            binary_index_loaded,
+            config_present,
+            full_text_present,
+            ledger_wide_property_count,
+            graph_override_count,
+            emitted_property_count = result.len(),
+            "[DIAG] provider.resolve: resolve_ledger_config result"
+        );
+
+        Ok(result)
     }
 }
 

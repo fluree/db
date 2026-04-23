@@ -55,6 +55,15 @@ pub async fn resolve_ledger_config(
     overlay: &dyn OverlayProvider,
     to_t: i64,
 ) -> Result<Option<LedgerConfig>> {
+    // [DIAG] Entry log so we can cross-reference with provider.resolve.
+    // Remove after the Solo c3000-04 "provider returned empty" bug is
+    // diagnosed.
+    tracing::info!(
+        to_t,
+        snapshot_t = snapshot.t,
+        ledger_id = %snapshot.ledger_id,
+        "[DIAG] resolve_ledger_config: entry"
+    );
     // Encode rdf:type (namespace code 3) and f:LedgerConfig (namespace code 7).
     // Both namespaces are always in default_namespace_codes().
     let rdf_type_sid = match snapshot.encode_iri(RDF_TYPE_IRI) {
@@ -71,12 +80,35 @@ pub async fn resolve_ledger_config(
             return Ok(None);
         }
     };
+    // [DIAG] Confirms both SIDs encoded. If the scan still returns empty
+    // below, it's the scan (overlay + binary range) failing, not an IRI
+    // encoding miss.
+    tracing::info!(
+        rdf_type_ns = rdf_type_sid.namespace_code,
+        rdf_type_name = %rdf_type_sid.name,
+        config_type_ns = config_type_sid.namespace_code,
+        config_type_name = %config_type_sid.name,
+        "[DIAG] resolve_ledger_config: encoded rdf:type and f:LedgerConfig SIDs"
+    );
 
     // Query: ?s rdf:type f:LedgerConfig at CONFIG_GRAPH_ID
     let config_sids =
         find_instances_of_type(snapshot, overlay, to_t, &rdf_type_sid, &config_type_sid).await?;
 
+    // [DIAG] How many f:LedgerConfig subjects we found at CONFIG_GRAPH_ID.
+    tracing::info!(
+        count = config_sids.len(),
+        sids = ?config_sids
+            .iter()
+            .map(|sid| format!("{}:{}", sid.namespace_code, sid.name))
+            .collect::<Vec<_>>(),
+        "[DIAG] resolve_ledger_config: find_instances_of_type result"
+    );
+
     if config_sids.is_empty() {
+        tracing::info!(
+            "[DIAG] resolve_ledger_config: no LedgerConfig subjects found, returning None"
+        );
         return Ok(None);
     }
 
@@ -624,15 +656,36 @@ async fn find_instances_of_type(
     let batches = execute_pattern_with_overlay_at(db, &vars, pattern, None).await?;
 
     let mut results = Vec::new();
+    let mut non_sid_bindings: usize = 0;
     for batch in &batches {
         for row in 0..batch.len() {
             if let Some(binding) = batch.get(row, subj_var) {
                 if let Some(sid) = binding.as_sid() {
                     results.push(sid.clone());
+                } else {
+                    non_sid_bindings += 1;
                 }
             }
         }
     }
+
+    // [DIAG] Scan shape: how many batches, how many rows per batch, and
+    // how many bindings came back as non-Sid (shouldn't happen for a
+    // subject variable, but logging it separates "scan returned nothing"
+    // from "scan returned something we couldn't interpret"). Remove after
+    // the Solo c3000-04 "provider returned empty" bug is diagnosed.
+    tracing::info!(
+        batches = batches.len(),
+        total_rows = batches
+            .iter()
+            .map(fluree_db_query::Batch::len)
+            .sum::<usize>(),
+        sid_bindings = results.len(),
+        non_sid_bindings,
+        config_graph_id = CONFIG_GRAPH_ID,
+        to_t,
+        "[DIAG] find_instances_of_type: scan result"
+    );
 
     Ok(results)
 }
@@ -718,10 +771,32 @@ async fn read_ref_field(
 ) -> Result<Option<Sid>> {
     let pred_sid = match try_encode(snapshot, pred_iri) {
         Some(sid) => sid,
-        None => return Ok(None),
+        None => {
+            // [DIAG] Pred IRI couldn't be encoded against the snapshot's
+            // namespaces. For `f:*` predicates this would indicate the
+            // FLUREE_DB namespace isn't in the snapshot — unexpected, but
+            // the [DIAG] line pins it down if it happens. Remove after
+            // the Solo c3000-04 "provider returned empty" bug is diagnosed.
+            tracing::info!(pred_iri, "[DIAG] read_ref_field: try_encode miss");
+            return Ok(None);
+        }
     };
 
     let bindings = query_config_predicate(snapshot, overlay, to_t, subject_sid, &pred_sid).await?;
+    // [DIAG] Only log at info for the f:fullTextDefaults read, since that
+    // is the one we're hunting; other predicates are noisy + uninteresting.
+    if pred_iri == config_iris::FULL_TEXT_DEFAULTS {
+        tracing::info!(
+            pred_iri,
+            subject_ns = subject_sid.namespace_code,
+            subject_name = %subject_sid.name,
+            pred_ns = pred_sid.namespace_code,
+            pred_name = %pred_sid.name,
+            binding_count = bindings.len(),
+            sid_bindings = bindings.iter().filter(|b| b.as_sid().is_some()).count(),
+            "[DIAG] read_ref_field: f:fullTextDefaults scan"
+        );
+    }
     for binding in bindings {
         if let Some(sid) = binding.as_sid() {
             return Ok(Some(sid.clone()));
@@ -1087,6 +1162,13 @@ async fn read_fulltext_defaults(
     to_t: i64,
     parent_sid: &Sid,
 ) -> Result<Option<FullTextDefaults>> {
+    // [DIAG] Entry + parent sid. Remove after the Solo c3000-04 "provider
+    // returned empty" bug is diagnosed.
+    tracing::info!(
+        parent_ns = parent_sid.namespace_code,
+        parent_name = %parent_sid.name,
+        "[DIAG] read_fulltext_defaults: entry"
+    );
     let group_sid = match read_ref_field(
         snapshot,
         overlay,
@@ -1097,8 +1179,24 @@ async fn read_fulltext_defaults(
     .await?
     {
         Some(sid) => sid,
-        None => return Ok(None),
+        None => {
+            // [DIAG] f:fullTextDefaults predicate not found on the
+            // LedgerConfig subject. If the user has verified the config is
+            // present via a regular query, this points at a read path
+            // difference: `read_ref_field` walks via `query_config_predicate`
+            // which uses the same GraphDbRef/eager scan path as the rdf:type
+            // lookup above.
+            tracing::info!(
+                "[DIAG] read_fulltext_defaults: f:fullTextDefaults ref absent, returning None"
+            );
+            return Ok(None);
+        }
     };
+    tracing::info!(
+        group_ns = group_sid.namespace_code,
+        group_name = %group_sid.name,
+        "[DIAG] read_fulltext_defaults: resolved f:fullTextDefaults group sid"
+    );
 
     let default_language = read_string_field(
         snapshot,
@@ -1112,9 +1210,17 @@ async fn read_fulltext_defaults(
     // Read each `f:property` ref and resolve its `f:target` IRI.
     let pred_sid = try_encode(snapshot, config_iris::FULL_TEXT_PROPERTY);
     let mut properties = Vec::new();
+    let mut target_misses: usize = 0;
     if let Some(pred_sid) = pred_sid {
         let bindings =
             query_config_predicate(snapshot, overlay, to_t, &group_sid, &pred_sid).await?;
+        // [DIAG] Raw binding count from the f:property predicate scan —
+        // tells us if we're finding the property-refs before the per-ref
+        // f:target lookup.
+        tracing::info!(
+            binding_count = bindings.len(),
+            "[DIAG] read_fulltext_defaults: f:property bindings"
+        );
         for binding in bindings {
             if let Some(prop_sid) = binding.as_sid() {
                 let target = read_iri_field(
@@ -1126,16 +1232,41 @@ async fn read_fulltext_defaults(
                 )
                 .await?;
                 match target {
-                    Some(iri) => properties.push(FullTextProperty { target: iri }),
+                    Some(iri) => {
+                        tracing::info!(
+                            prop_ns = prop_sid.namespace_code,
+                            prop_name = %prop_sid.name,
+                            target_iri = %iri,
+                            "[DIAG] read_fulltext_defaults: resolved f:target"
+                        );
+                        properties.push(FullTextProperty { target: iri });
+                    }
                     None => {
-                        tracing::warn!("FullTextProperty node without f:target — skipping");
+                        target_misses += 1;
+                        tracing::warn!(
+                            prop_ns = prop_sid.namespace_code,
+                            prop_name = %prop_sid.name,
+                            "[DIAG] FullTextProperty node without f:target — skipping"
+                        );
                     }
                 }
             }
         }
+    } else {
+        tracing::info!(
+            "[DIAG] read_fulltext_defaults: f:property predicate IRI could not be encoded"
+        );
     }
 
     let override_control = read_override_control(snapshot, overlay, to_t, &group_sid).await?;
+
+    // [DIAG] Summary before returning.
+    tracing::info!(
+        properties_found = properties.len(),
+        target_misses,
+        default_language = ?default_language,
+        "[DIAG] read_fulltext_defaults: returning Some(FullTextDefaults)"
+    );
 
     Ok(Some(FullTextDefaults {
         default_language,
