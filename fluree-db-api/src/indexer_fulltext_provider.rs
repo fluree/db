@@ -156,6 +156,71 @@ impl ApiFulltextConfigProvider {
                 binary_index_loaded,
                 "[DIAG] provider.resolve: overlay/novelty config-graph probe"
             );
+
+            // [DIAG] Dump the graph registry + a flake-count probe for
+            // EVERY registered graph. If Solo wrote config to a graph IRI
+            // that doesn't match the system-expected
+            // `urn:fluree:{ledger_id}#config`, apply_delta assigned it a
+            // fresh user-space g_id (>= 3) and the CONFIG_GRAPH_ID=2
+            // probe above will be 0 while some OTHER g_id has all the
+            // config flakes. Remove after the Solo c3000-04 "provider
+            // returned empty" bug is diagnosed.
+            let registry_entries: Vec<(fluree_db_core::GraphId, String)> = state
+                .snapshot
+                .graph_registry
+                .iter_entries()
+                .map(|(g_id, iri)| (g_id, iri.to_string()))
+                .collect();
+            tracing::info!(
+                ledger_id = ledger_id,
+                expected_config_iri = %fluree_db_core::graph_registry::config_graph_iri(ledger_id),
+                registry_entry_count = registry_entries.len(),
+                registry = ?registry_entries,
+                "[DIAG] provider.resolve: graph_registry contents"
+            );
+            for (g_id, iri) in &registry_entries {
+                let mut per_graph_count: usize = 0;
+                overlay.for_each_overlay_flake(
+                    *g_id,
+                    IndexType::Post,
+                    None,
+                    None,
+                    true,
+                    to_t,
+                    &mut |_flake| {
+                        per_graph_count += 1;
+                    },
+                );
+                if per_graph_count > 0 {
+                    tracing::info!(
+                        g_id = *g_id,
+                        iri = %iri,
+                        flake_count = per_graph_count,
+                        "[DIAG] provider.resolve: per-graph overlay probe (non-empty)"
+                    );
+                }
+            }
+            // Also probe the default graph (g_id=0), which is NOT in
+            // graph_registry's iter_entries (registry only covers named
+            // graphs). If config flakes landed there, the writer sent
+            // them with `flake.g = None`.
+            let mut default_count: usize = 0;
+            overlay.for_each_overlay_flake(
+                fluree_db_core::DEFAULT_GRAPH_ID,
+                IndexType::Post,
+                None,
+                None,
+                true,
+                to_t,
+                &mut |_flake| {
+                    default_count += 1;
+                },
+            );
+            tracing::info!(
+                g_id = fluree_db_core::DEFAULT_GRAPH_ID,
+                flake_count = default_count,
+                "[DIAG] provider.resolve: default graph overlay probe"
+            );
         }
         let ledger_config =
             crate::config_resolver::resolve_ledger_config(&state.snapshot, overlay, to_t)
