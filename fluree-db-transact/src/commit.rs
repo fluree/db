@@ -98,7 +98,7 @@ pub struct CommitOpts {
     pub skip_sequencing: bool,
     /// Additional parent commit IDs for merge commits.
     ///
-    /// When non-empty, these are appended as extra `previous_refs` on the
+    /// When non-empty, these are appended as extra `parents` on the
     /// commit record, producing a multi-parent (merge) commit. The primary
     /// parent is still derived from `base.head_commit_id`.
     pub merge_parents: Vec<ContentId>,
@@ -501,11 +501,11 @@ where
 
             // Build previous commit reference from the head commit's ContentId.
             if let Some(cid) = head_commit_id.clone() {
-                commit_record = commit_record.with_previous_ref(cid);
+                commit_record = commit_record.with_parent(cid);
             }
             // Append additional merge parent references.
             for merge_parent in &merge_parents {
-                commit_record = commit_record.with_previous_ref(merge_parent.clone());
+                commit_record = commit_record.with_parent(merge_parent.clone());
             }
 
             // 7. Content-address + write (storage-owned)

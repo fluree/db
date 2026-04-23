@@ -1,7 +1,7 @@
 //! Commit export endpoint: `GET /v1/fluree/commits/*ledger`.
 //!
 //! Returns paginated commit blobs using address-cursor pagination.
-//! Each page walks backward via `previous_ref` — O(limit) per page.
+//! Each page walks backward via `parents` — O(limit) per page.
 //!
 //! Requires `fluree.storage.*` permissions (replication-grade, not `ledger.read`).
 

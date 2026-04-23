@@ -1301,7 +1301,7 @@ pub async fn run_clone(
 
 /// Clone a ledger from an origin URI using CID-based chain walking.
 ///
-/// Downloads all commits by following the previous_ref chain from the head
+/// Downloads all commits by following the parent chain from the head
 /// commit backwards, fetching each commit + txn blob via MultiOriginFetcher.
 ///
 /// Usage: `fluree clone --origin http://localhost:8090 mydb:main`
@@ -1540,7 +1540,7 @@ pub async fn run_clone_origin(
                 bytes
             };
 
-            // Parse envelope-only (no flake decode) for previous_ref + txn CID.
+            // Parse envelope-only (no flake decode) for parent + txn CID.
             let envelope = read_commit_envelope(&commit_bytes)
                 .map_err(|e| CliError::Config(format!("clone failed (read envelope): {e}")))?;
 

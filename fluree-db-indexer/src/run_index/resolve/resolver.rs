@@ -413,9 +413,9 @@ impl CommitResolver {
         )?;
 
         // ledger:previous (ID) -- ref to parent commit(s)
-        for prev_ref in &envelope.previous_refs {
+        for parent in &envelope.parents {
             // Use CID digest hex as the subject name in FLUREE_COMMIT namespace
-            let prev_digest = prev_ref.digest_hex();
+            let prev_digest = parent.digest_hex();
             let prev_s_id = dicts
                 .subjects
                 .get_or_insert(&prev_digest, fluree_vocab::namespaces::FLUREE_COMMIT)?;
@@ -1756,8 +1756,8 @@ impl SharedResolverState {
         );
 
         // ledger:previous (ID) -- ref to parent commit(s) (chunk-local subject)
-        for prev_ref in &envelope.previous_refs {
-            let prev_digest = prev_ref.digest_hex();
+        for parent in &envelope.parents {
+            let prev_digest = parent.digest_hex();
             let prev_s_id = chunk.subjects.get_or_insert(
                 fluree_vocab::namespaces::FLUREE_COMMIT,
                 prev_digest.as_bytes(),
@@ -2104,7 +2104,7 @@ mod tests {
 
         let envelope = CodecEnvelope {
             t,
-            previous_refs: Vec::new(),
+            parents: Vec::new(),
             namespace_delta: HashMap::new(),
             txn: None,
             time: None,
@@ -2431,7 +2431,7 @@ mod tests {
 
         let envelope = CodecEnvelope {
             t: 42,
-            previous_refs: vec![ContentId::new(
+            parents: vec![ContentId::new(
                 ContentKind::Commit,
                 prev_commit_id.as_bytes(),
             )],
@@ -2539,7 +2539,7 @@ mod tests {
 
         let envelope = CodecEnvelope {
             t: 1,
-            previous_refs: Vec::new(),
+            parents: Vec::new(),
             namespace_delta: HashMap::new(),
             txn: None,
             time: None,
@@ -2578,7 +2578,7 @@ mod tests {
 
         let envelope = CodecEnvelope {
             t: 5,
-            previous_refs: Vec::new(),
+            parents: Vec::new(),
             namespace_delta: HashMap::new(),
             txn: None,
             time: None,

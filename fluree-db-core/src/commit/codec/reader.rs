@@ -161,7 +161,7 @@ pub(crate) fn read_commit_v4(bytes: &[u8]) -> Result<Commit, CommitCodecError> {
         t: header.t,
         time: envelope.time,
         flakes,
-        previous_refs: envelope.previous_refs,
+        parents: envelope.parents,
         txn: envelope.txn,
         namespace_delta: envelope.namespace_delta,
         txn_signature: envelope.txn_signature,
@@ -201,7 +201,7 @@ pub(crate) fn read_commit_envelope_v4(bytes: &[u8]) -> Result<CommitEnvelope, Co
 
     Ok(CommitEnvelope {
         t: header.t,
-        previous_refs: env.previous_refs,
+        parents: env.parents,
         txn: env.txn,
         namespace_delta: env.namespace_delta,
         txn_meta: env.txn_meta,

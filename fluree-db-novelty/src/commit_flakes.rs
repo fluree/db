@@ -249,7 +249,7 @@ mod tests {
 
         if with_previous {
             let prev_id = make_test_content_id(ContentKind::Commit, "prev-commit-bytes");
-            commit.previous_refs = vec![prev_id];
+            commit.parents = vec![prev_id];
         }
 
         commit

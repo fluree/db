@@ -555,9 +555,9 @@ async fn build_commit_jsonld<S: Storage + Clone>(
         obj["time"] = json!(time);
     }
 
-    if !commit.previous_refs.is_empty() {
+    if !commit.parents.is_empty() {
         let parents: Vec<_> = commit
-            .previous_refs
+            .parents
             .iter()
             .map(|r| {
                 json!({

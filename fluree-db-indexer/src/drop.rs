@@ -282,7 +282,7 @@ mod tests {
             t,
             time: None,
             flakes: Vec::new(),
-            previous_refs: previous.cloned().into_iter().collect(),
+            parents: previous.cloned().into_iter().collect(),
             txn: txn_cid,
             namespace_delta: std::collections::HashMap::new(),
             txn_signature: None,

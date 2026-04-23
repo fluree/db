@@ -15,7 +15,7 @@
 //! ## Export (server → client)
 //!
 //! Paginated export of commit blobs using address-cursor pagination.
-//! Pages walk backward via `previous_ref` — O(limit) per page regardless of
+//! Pages walk backward via `parents` — O(limit) per page regardless of
 //! ledger size. Used by pull and clone operations.
 
 use crate::dataset::QueryConnectionOptions;
@@ -563,7 +563,7 @@ fn decode_and_validate_commit_chain(
         // commits one parent is the prior commit and others are pre-existing.
         if let Some(prev_hash_hex) = &prev_hash {
             let ok = commit
-                .previous_refs
+                .parents
                 .iter()
                 .any(|r| r.digest_hex() == *prev_hash_hex);
             if !ok {
@@ -604,7 +604,7 @@ fn preflight_strict_next_t_and_prev(
     if let Some(expected_id) = &current.id {
         let ok = first
             .commit
-            .previous_refs
+            .parents
             .iter()
             .any(|r| r == expected_id);
         if !ok {
@@ -612,7 +612,7 @@ fn preflight_strict_next_t_and_prev(
                 "first commit previous mismatch: no parent matches expected head {expected_id:?}"
             )));
         }
-    } else if !first.commit.previous_refs.is_empty() {
+    } else if !first.commit.parents.is_empty() {
         return Err(PushError::Conflict(
             "first commit has parent refs but current head has no id".to_string(),
         ));
@@ -1015,7 +1015,7 @@ pub struct ExportCommitsResponse {
 /// Export a paginated range of commits from a ledger.
 ///
 /// Uses address-cursor pagination: each page walks backward from the cursor
-/// via `previous_ref` for up to `limit` commits. Each page is O(limit)
+/// via `parents` for up to `limit` commits. Each page is O(limit)
 /// regardless of total ledger size.
 ///
 /// Commits are returned newest → oldest. The client reverses for import.
@@ -1121,7 +1121,7 @@ impl Fluree {
             }
 
             // Enqueue all parents for traversal.
-            for parent in env.previous_refs {
+            for parent in env.parents {
                 frontier.push(parent);
             }
         }
@@ -1362,7 +1362,7 @@ impl Fluree {
         let decoded = decode_and_validate_commit_chain(base_state.ledger_id(), &request)
             .map_err(PushError::into_api_error)?;
 
-        // 4) Ancestry preflight: verify first commit's previous_ref matches local head.
+        // 4) Ancestry preflight: verify first commit's parent matches local head.
         preflight_strict_next_t_and_prev(&current_ref, &decoded)
             .map_err(PushError::into_api_error)?;
 

@@ -54,7 +54,7 @@ fn json_contains_string(v: &JsonValue, needle: &str) -> bool {
 fn make_commit_bytes(t: i64, previous: Option<&ContentId>, flakes: Vec<Flake>) -> Vec<u8> {
     let mut c = Commit::new(t, flakes);
     if let Some(prev_cid) = previous {
-        c = c.with_previous_ref(prev_cid.clone());
+        c = c.with_parent(prev_cid.clone());
     }
     let res = fluree_db_core::commit::codec::write_commit(&c, true, None).expect("write_commit");
     res.bytes

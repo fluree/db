@@ -2090,7 +2090,7 @@ where
 
     // Final commit head publish
     let commit_head_id = state
-        .previous_ref
+        .parent
         .clone()
         .ok_or_else(|| ImportError::Storage("no commit head after import".to_string()))?;
 

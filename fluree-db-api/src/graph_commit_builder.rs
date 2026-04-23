@@ -582,7 +582,7 @@ fn build_commit_detail(
         time: commit.time.clone(),
         size: blob_size,
         parents: commit
-            .previous_refs
+            .parents
             .iter()
             .map(|r| r.to_string())
             .collect(),
