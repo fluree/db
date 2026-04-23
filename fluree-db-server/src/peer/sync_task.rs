@@ -154,12 +154,12 @@ impl PeerSyncTask {
 
         // 2. Fast-forward commit head (if record has a commit)
         if record.commit_head_id.is_some() {
-            let commit_ref = RefValue {
+            let commit_head = RefValue {
                 id: record.commit_head_id.clone(),
                 t: record.commit_t,
             };
             match ns
-                .fast_forward_commit(&record.ledger_id, &commit_ref, 3)
+                .fast_forward_commit(&record.ledger_id, &commit_head, 3)
                 .await
             {
                 Ok(CasResult::Updated) => {}
@@ -191,7 +191,7 @@ impl PeerSyncTask {
                             &record.ledger_id,
                             RefKind::CommitHead,
                             actual.as_ref(),
-                            &commit_ref,
+                            &commit_head,
                         )
                         .await;
 
@@ -233,7 +233,7 @@ impl PeerSyncTask {
 
         // 3. Update index head — read current first, NOT expected=None
         if record.index_head_id.is_some() {
-            let index_ref = RefValue {
+            let index_head = RefValue {
                 id: record.index_head_id.clone(),
                 t: record.index_t,
             };
@@ -247,7 +247,7 @@ impl PeerSyncTask {
                     &record.ledger_id,
                     RefKind::IndexHead,
                     current.as_ref(),
-                    &index_ref,
+                    &index_head,
                 )
                 .await;
             match index_result {

@@ -94,7 +94,7 @@ fn require_read_write_mode(state: &AppState) -> Result<(), ServerError> {
 ///
 /// Compare-and-set push for the commit head ref.
 /// Returns 200 on success, 409 on CAS conflict.
-pub async fn push_commit_ref(
+pub async fn push_commit_head(
     State(state): State<Arc<AppState>>,
     Path(alias): Path<String>,
     StorageProxyBearer(principal): StorageProxyBearer,
@@ -113,7 +113,7 @@ pub async fn push_commit_ref(
 ///
 /// Compare-and-set push for the index head ref.
 /// Returns 200 on success, 409 on CAS conflict.
-pub async fn push_index_ref(
+pub async fn push_index_head(
     State(state): State<Arc<AppState>>,
     Path(alias): Path<String>,
     StorageProxyBearer(principal): StorageProxyBearer,
@@ -128,7 +128,7 @@ pub async fn push_index_ref(
     push_ref_inner(&state, &alias, RefKind::IndexHead, body).await
 }
 
-/// Shared implementation for push_commit_ref and push_index_ref
+/// Shared implementation for push_commit_head and push_index_head
 async fn push_ref_inner(
     state: &AppState,
     alias: &str,

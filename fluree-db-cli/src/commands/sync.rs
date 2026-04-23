@@ -194,7 +194,7 @@ fn print_fetch_result(result: &FetchResult) {
     if !result.updated.is_empty() {
         println!("{}", "Updated:".green().bold());
         for (ledger_id, tracking) in &result.updated {
-            let t = tracking.commit_ref.as_ref().map(|r| r.t).unwrap_or(0);
+            let t = tracking.commit_head.as_ref().map(|r| r.t).unwrap_or(0);
             println!("  {ledger_id} -> t={t}");
         }
     }
