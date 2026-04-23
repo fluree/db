@@ -119,6 +119,30 @@ async fn create_local(state: Arc<AppState>, request: Request) -> Result<impl Int
             }
         };
 
+        // Reject unexpected fields so callers don't silently lose data
+        // (e.g. including `@graph` expecting initial data to be loaded).
+        if let Some(obj) = body.as_object() {
+            let unexpected: Vec<&str> = obj
+                .keys()
+                .filter(|k| k.as_str() != "ledger")
+                .map(String::as_str)
+                .collect();
+            if !unexpected.is_empty() {
+                let err = ServerError::bad_request(format!(
+                    "Unexpected field(s) in create request: {}. \
+                     POST /fluree/create only accepts the `ledger` field and creates an empty ledger. \
+                     To add initial data, use POST /fluree/insert or /fluree/upsert after creation.",
+                    unexpected.join(", ")
+                ));
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(
+                    unexpected_fields = ?unexpected,
+                    "rejected create request with unexpected fields"
+                );
+                return Err(err);
+            }
+        }
+
         // Compute tx-id from the request body
         let tx_id = compute_tx_id(&body);
 

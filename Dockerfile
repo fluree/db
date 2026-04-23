@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates tini curl bash \
@@ -10,6 +10,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ARG TARGETARCH
 COPY --chown=root:root --chmod=0755 docker-artifacts/${TARGETARCH}/fluree /usr/local/bin/fluree
+
+COPY --chown=root:root --chmod=0755 <<'EOF' /usr/local/bin/fluree-entrypoint.sh
+#!/bin/sh
+set -e
+if [ ! -d "$PWD/.fluree" ]; then
+  fluree init
+fi
+exec /usr/bin/tini -- fluree server run "$@"
+EOF
 
 LABEL org.opencontainers.image.source="https://github.com/fluree/db"
 LABEL org.opencontainers.image.description="Fluree — semantic graph database"
@@ -25,4 +34,4 @@ ENV RUST_LOG=info
 HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8090/health || exit 1
 
-ENTRYPOINT ["/usr/bin/tini", "--", "fluree", "server", "run"]
+ENTRYPOINT ["/usr/local/bin/fluree-entrypoint.sh"]

@@ -173,6 +173,42 @@ async fn create_ledger_then_ledger_info() {
 }
 
 #[tokio::test]
+async fn create_rejects_unexpected_fields() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+
+    // Including `@graph` (or any other field besides `ledger`) must be rejected
+    // with 400 rather than silently dropped — otherwise callers assume their
+    // initial data was persisted when it wasn't.
+    let body = serde_json::json!({
+        "ledger": "test:main",
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [{ "@id": "ex:alice", "ex:name": "Alice" }],
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        json_contains_string(&json, "@graph"),
+        "error should name the unexpected field: {json}"
+    );
+    assert!(
+        json_contains_string(&json, "/fluree/insert"),
+        "error should direct the caller to /fluree/insert: {json}"
+    );
+}
+
+#[tokio::test]
 async fn insert_then_query_finds_value() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state.clone());
