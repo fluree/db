@@ -189,7 +189,26 @@ impl FulltextHook {
             });
             return;
         }
-        if input.config.contains(input.g_id, input.p_id) {
+        let matched = input.config.contains(input.g_id, input.p_id);
+        // [DIAG] Every LEX_ID non-fulltext assertion flowing through the
+        // hook logs whether the configured-property check matched. Lets us
+        // tell apart (a) the resolver never calling us with this op vs.
+        // (b) calling us with a p_id that doesn't match the pre-registered
+        // one. Fires once per op in this narrow LEX_ID + non-`@fulltext`
+        // slice — bounded on the user's repro ledger. Remove after the
+        // Solo c3000-04 configured-properties-match bug is diagnosed.
+        tracing::info!(
+            g_id = input.g_id,
+            p_id = input.p_id,
+            dt_id = input.dt_id,
+            lang_id = input.lang_id,
+            t = input.t,
+            is_assert = input.is_assert,
+            matched_config = matched,
+            config_empty = input.config.is_empty(),
+            "[DIAG] fulltext hook on_op: LEX_ID non-fulltext candidate"
+        );
+        if matched {
             self.entries.push(FulltextEntry {
                 g_id: input.g_id,
                 p_id: input.p_id,

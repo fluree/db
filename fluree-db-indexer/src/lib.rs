@@ -120,10 +120,29 @@ pub async fn build_index_for_record(
     // `fulltext_configured_properties` from the live ledger state. This is
     // the hook that keeps background / incremental indexing in sync with
     // `f:fullTextDefaults` changes committed after process start.
+    let provider_attached = config.fulltext_config_provider.is_some();
     if let Some(provider) = config.fulltext_config_provider.clone() {
         config.fulltext_configured_properties =
             provider.fulltext_configured_properties(ledger_id).await;
     }
+    // [DIAG] Confirms whether the api-side `FulltextConfigProvider` is
+    // reaching this code path and what it returned for the live ledger.
+    // Remove once the Solo c3000-04 configured-properties-empty bug is
+    // diagnosed. A count of 0 with `provider_attached=true` points at the
+    // provider's `resolve()` (e.g. `resolve_ledger_config` silently
+    // returning empty); `provider_attached=false` points at FlureeBuilder
+    // wiring (the provider never got attached to this `IndexerConfig`).
+    tracing::info!(
+        ledger_id = ledger_id,
+        provider_attached,
+        fulltext_configured_properties_count = config.fulltext_configured_properties.len(),
+        fulltext_configured_property_iris = ?config
+            .fulltext_configured_properties
+            .iter()
+            .map(|p| p.property_iri.as_str())
+            .collect::<Vec<_>>(),
+        "[DIAG] build_index_for_record: fulltext config refresh"
+    );
     let correlation = crate::orchestrator::current_index_request_correlation();
     let span = tracing::debug_span!(
         "index_build",

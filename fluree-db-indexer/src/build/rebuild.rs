@@ -184,6 +184,29 @@ where
             // Pre-registers each configured graph/property IRI in the global
             // dicts so `(GraphId, p_id)` lookups in `FulltextHook::on_op` are
             // stable even if no triple in this commit window touches them.
+            //
+            // [DIAG] Log what we actually received from the caller. If
+            // `count=0` here, `build_index_for_record` handed us an empty set
+            // (see [DIAG] log there). If `count>0` but the hook never emits
+            // Configured entries on c3000-04, the mismatch is in the p_id
+            // allocation: `configure_fulltext_properties` assigns a p_id to
+            // the IRI via `self.predicates.get_or_insert(...)`, but the
+            // resolver's per-commit resolution of the same IRI ends up at a
+            // different p_id. Remove this block after the bug is diagnosed.
+            tracing::info!(
+                count = config.fulltext_configured_properties.len(),
+                iris = ?config
+                    .fulltext_configured_properties
+                    .iter()
+                    .map(|p| p.property_iri.as_str())
+                    .collect::<Vec<_>>(),
+                scopes = ?config
+                    .fulltext_configured_properties
+                    .iter()
+                    .map(|p| format!("{:?}", p.scope))
+                    .collect::<Vec<_>>(),
+                "[DIAG] rebuild: entering fulltext seeding with configured properties"
+            );
             if !config.fulltext_configured_properties.is_empty() {
                 shared.configure_fulltext_properties(&config.fulltext_configured_properties);
                 tracing::debug!(
