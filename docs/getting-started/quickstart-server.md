@@ -16,7 +16,17 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fluree/db/releases/late
 brew install fluree/tap/fluree
 ```
 
-### Option 3: Download Pre-built Binary
+### Option 3: PowerShell (Windows)
+
+Open PowerShell and run:
+
+```powershell
+irm https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.ps1 | iex
+```
+
+Then open a **new** PowerShell session and verify `fluree --version`. The installer adds `%USERPROFILE%\bin` to your `PATH`. The binary is unsigned, so Windows SmartScreen may prompt on first run — click **More info → Run anyway**.
+
+### Option 4: Download Pre-built Binary
 
 Download the latest release for your platform from [GitHub Releases](https://github.com/fluree/db/releases):
 
@@ -30,7 +40,7 @@ curl -L https://github.com/fluree/db/releases/latest/download/fluree-db-cli-aarc
 chmod +x fluree-db-cli-aarch64-apple-darwin/fluree
 ```
 
-### Option 4: Build from Source
+### Option 5: Build from Source
 
 If you have Rust installed:
 
@@ -45,7 +55,7 @@ cargo build --release -p fluree-db-cli
 # Binary will be at target/release/fluree
 ```
 
-### Option 5: Docker
+### Option 6: Docker
 
 ```bash
 # Pull the image
@@ -106,7 +116,7 @@ Expected response:
 ```json
 {
   "status": "ok",
-  "version": "0.1.0"
+  "version": "4.0.1"
 }
 ```
 
@@ -152,12 +162,12 @@ Default server endpoints:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
-| `/fluree/create` | POST | Create a ledger |
-| `/fluree/drop` | POST | Drop a ledger |
-| `/fluree/query` | GET/POST | Execute queries |
-| `/fluree/insert` | POST | Insert data |
-| `/fluree/update` | POST | Update with WHERE/DELETE/INSERT |
-| `/fluree/events` | GET | SSE event stream |
+| `/v1/fluree/create` | POST | Create a ledger |
+| `/v1/fluree/drop` | POST | Drop a ledger |
+| `/v1/fluree/query` | GET/POST | Execute queries |
+| `/v1/fluree/insert` | POST | Insert data |
+| `/v1/fluree/update` | POST | Update with WHERE/DELETE/INSERT |
+| `/v1/fluree/events` | GET | SSE event stream |
 
 See the [API Reference](../api/endpoints.md) for complete endpoint documentation.
 
@@ -203,8 +213,8 @@ fluree server run --log-level debug
 fluree server run \
   --storage-path /var/lib/fluree \
   --indexing-enabled \
-  --admin-auth-mode required \
-  --admin-auth-trusted-issuer did:key:z6Mk...
+  --events-auth-mode required \
+  --events-auth-trusted-issuers did:key:z6Mk...
 ```
 
 ### With Background Indexing

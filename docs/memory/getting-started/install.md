@@ -9,11 +9,21 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.sh | sh
 ```
 
-## Homebrew (macOS)
+## Homebrew (macOS / Linux)
 
 ```bash
 brew install fluree/tap/fluree
 ```
+
+## PowerShell (Windows)
+
+Open PowerShell and run:
+
+```powershell
+irm https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.ps1 | iex
+```
+
+Open a **new** PowerShell session and verify with `fluree --version`. The binary is unsigned, so Windows SmartScreen may prompt on first run — click **More info → Run anyway**.
 
 ## Pre-built binary
 
