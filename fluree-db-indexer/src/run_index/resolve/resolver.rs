@@ -1241,33 +1241,15 @@ impl SharedResolverState {
         use crate::config::ConfiguredFulltextScope;
 
         let mut config = crate::fulltext_hook::FulltextHookConfig::default();
-        // [DIAG] Record (iri → p_id, scope, hook-key) so we can compare
-        // against the (g_id, p_id) the resolver produces at commit time.
-        // A mismatch here is the likely bug on Solo c3000-04: same IRI
-        // resolving to different p_ids in this pre-registration vs the
-        // per-commit resolve path. Remove after the bug is diagnosed.
-        let mut diag_seeded: Vec<(String, u32, String, Option<u16>)> = Vec::new();
         for entry in properties {
             let p_id = self.predicates.get_or_insert(&entry.property_iri);
             match &entry.scope {
                 ConfiguredFulltextScope::AnyGraph => {
                     config.add_any_graph(p_id);
-                    diag_seeded.push((
-                        entry.property_iri.clone(),
-                        p_id,
-                        "AnyGraph".to_string(),
-                        None,
-                    ));
                 }
                 ConfiguredFulltextScope::DefaultGraph => {
                     // Default graph is always `g_id = 0` — not in the graph dict.
                     config.add_per_graph(0, p_id);
-                    diag_seeded.push((
-                        entry.property_iri.clone(),
-                        p_id,
-                        "DefaultGraph".to_string(),
-                        Some(0),
-                    ));
                 }
                 ConfiguredFulltextScope::TxnMetaGraph => {
                     // `new_for_ledger` pre-reserves txn-meta at graph-dict slot 0
@@ -1276,12 +1258,6 @@ impl SharedResolverState {
                     // would allocate an unrelated entry for the literal
                     // sentinel string, which is the bug we're avoiding.
                     config.add_per_graph(1, p_id);
-                    diag_seeded.push((
-                        entry.property_iri.clone(),
-                        p_id,
-                        "TxnMetaGraph".to_string(),
-                        Some(1),
-                    ));
                 }
                 ConfiguredFulltextScope::NamedGraph(iri) => {
                     let raw = self.graphs.get_or_insert(iri) + 1;
@@ -1294,24 +1270,8 @@ impl SharedResolverState {
                         continue;
                     }
                     config.add_per_graph(raw as u16, p_id);
-                    diag_seeded.push((
-                        entry.property_iri.clone(),
-                        p_id,
-                        format!("NamedGraph({iri})"),
-                        Some(raw as u16),
-                    ));
                 }
             }
-        }
-        // [DIAG] Remove once the config vs resolver p_id alignment is verified.
-        for (iri, p_id, scope, g_id) in &diag_seeded {
-            tracing::info!(
-                iri = %iri,
-                p_id,
-                scope = %scope,
-                g_id = ?g_id,
-                "[DIAG] fulltext hook pre-registered"
-            );
         }
         self.fulltext_hook_config = config;
     }

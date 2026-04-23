@@ -184,29 +184,6 @@ where
             // Pre-registers each configured graph/property IRI in the global
             // dicts so `(GraphId, p_id)` lookups in `FulltextHook::on_op` are
             // stable even if no triple in this commit window touches them.
-            //
-            // [DIAG] Log what we actually received from the caller. If
-            // `count=0` here, `build_index_for_record` handed us an empty set
-            // (see [DIAG] log there). If `count>0` but the hook never emits
-            // Configured entries on c3000-04, the mismatch is in the p_id
-            // allocation: `configure_fulltext_properties` assigns a p_id to
-            // the IRI via `self.predicates.get_or_insert(...)`, but the
-            // resolver's per-commit resolution of the same IRI ends up at a
-            // different p_id. Remove this block after the bug is diagnosed.
-            tracing::info!(
-                count = config.fulltext_configured_properties.len(),
-                iris = ?config
-                    .fulltext_configured_properties
-                    .iter()
-                    .map(|p| p.property_iri.as_str())
-                    .collect::<Vec<_>>(),
-                scopes = ?config
-                    .fulltext_configured_properties
-                    .iter()
-                    .map(|p| format!("{:?}", p.scope))
-                    .collect::<Vec<_>>(),
-                "[DIAG] rebuild: entering fulltext seeding with configured properties"
-            );
             if !config.fulltext_configured_properties.is_empty() {
                 shared.configure_fulltext_properties(&config.fulltext_configured_properties);
                 tracing::debug!(
@@ -273,39 +250,21 @@ where
                     chunks.push(std::mem::take(&mut chunk));
                 }
 
-                let fulltext_before = shared
-                    .fulltext_hook
-                    .as_ref()
-                    .map_or(0, super::super::fulltext_hook::FulltextHook::entry_count);
                 let resolved = shared
                     .resolve_commit_into_chunk(&bytes, &cid.digest_hex(), &mut chunk)
                     .map_err(|e| IndexerError::StorageRead(e.to_string()))?;
-                let fulltext_after = shared
-                    .fulltext_hook
-                    .as_ref()
-                    .map_or(0, super::super::fulltext_hook::FulltextHook::entry_count);
 
                 // Accumulate totals
                 total_commit_size += resolved.size;
                 total_asserts += resolved.asserts as u64;
                 total_retracts += resolved.retracts as u64;
 
-                // [DIAG] Per-commit fulltext hook delta (temporary, info-level).
-                // Lets us verify every commit containing a configured-predicate
-                // assertion actually feeds the hook. If a commit's expected
-                // delta is 0 but it carries a configured predicate, resolution
-                // is silently dropping the op before the hook sees it. Revert
-                // to the prior `tracing::debug!("commit resolved into chunk",
-                // commit, t, ops, chunk_flakes)` once the Solo c3000-04 arena
-                // drop is diagnosed.
-                tracing::info!(
+                tracing::debug!(
                     commit = i + 1,
                     t = resolved.t,
                     ops = resolved.total_records,
-                    fulltext_entries_delta = fulltext_after.saturating_sub(fulltext_before),
-                    fulltext_entries_total = fulltext_after,
                     chunk_flakes = chunk.flake_count(),
-                    "[DIAG] commit resolved into chunk"
+                    "commit resolved into chunk"
                 );
                 if (i + 1) % 500 == 0 {
                     tracing::info!(
@@ -432,19 +391,10 @@ where
                         if let Some(&global_str) = str_remap.get(local_str) {
                             entry.string_id = global_str;
                         } else {
-                            // [DIAG] Surfaces the "entry dropped at remap" failure
-                            // mode in production logs without requiring a
-                            // debug-level rerun. Revert to `tracing::warn!` with
-                            // fewer fields once the Solo c3000-04 arena drop is
-                            // diagnosed.
-                            tracing::info!(
+                            tracing::warn!(
                                 chunk = ci,
                                 local_str,
-                                g_id = entry.g_id,
-                                p_id = entry.p_id,
-                                t = entry.t,
-                                is_assert = entry.is_assert,
-                                "[DIAG] fulltext entry string_id remap miss; skipping"
+                                "fulltext entry string_id remap miss; skipping"
                             );
                             // Mark as retraction so it's skipped by the builder.
                             entry.is_assert = false;
@@ -454,46 +404,10 @@ where
                 }
 
                 if !all_entries.is_empty() {
-                    let assert_count = all_entries.iter().filter(|e| e.is_assert).count();
-                    let retract_count = all_entries.len() - assert_count;
-                    let distinct_assert_string_ids: std::collections::BTreeSet<u32> = all_entries
-                        .iter()
-                        .filter(|e| e.is_assert)
-                        .map(|e| e.string_id)
-                        .collect();
                     tracing::info!(
                         fulltext_entries = all_entries.len(),
-                        assert_count,
-                        retract_count,
-                        distinct_assert_string_ids = distinct_assert_string_ids.len(),
                         "fulltext entries collected and remapped to global IDs"
                     );
-                    // [DIAG] Per-entry dump lets us see exactly which
-                    // (g_id, p_id, string_id, lang_id, t) assertions the hook
-                    // captured on the Solo c3000-04 repro. Bounded at 64
-                    // entries so it can't flood logs on large rebuilds.
-                    // Remove this whole `for` + truncation block after the
-                    // arena-drop bug is resolved.
-                    let dump_limit = 64usize;
-                    for (idx, entry) in all_entries.iter().take(dump_limit).enumerate() {
-                        tracing::info!(
-                            idx,
-                            g_id = entry.g_id,
-                            p_id = entry.p_id,
-                            string_id = entry.string_id,
-                            lang_id = entry.lang_id,
-                            is_assert = entry.is_assert,
-                            t = entry.t,
-                            source = ?entry.source,
-                            "[DIAG] fulltext entry captured"
-                        );
-                    }
-                    if all_entries.len() > dump_limit {
-                        tracing::info!(
-                            remaining = all_entries.len() - dump_limit,
-                            "[DIAG] fulltext entries truncated in log dump"
-                        );
-                    }
                 }
                 all_entries
             };
