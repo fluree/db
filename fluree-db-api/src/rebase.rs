@@ -557,10 +557,13 @@ impl crate::Fluree {
         // `f:fullTextDefaults`. Best-effort: failures leave the set empty and
         // fall back to the `@fulltext`-datatype-only path for this rebuild.
         if let Ok(state) = self.ledger(branch_id).await {
+            // `state.t()` covers the novelty-only case (no prior index) where
+            // `snapshot.t == 0` would drop all novelty flakes from the query.
+            let to_t = state.t();
             let snapshot = &state.snapshot;
             let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
             if let Ok(Some(cfg)) =
-                crate::config_resolver::resolve_ledger_config(snapshot, overlay, snapshot.t).await
+                crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await
             {
                 indexer_config.fulltext_configured_properties =
                     crate::config_resolver::configured_fulltext_properties_for_indexer(&cfg);

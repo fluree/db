@@ -859,3 +859,99 @@ async fn fulltext_configured_property_picked_up_by_build_index_for_ledger() {
         "non-matching title should not score: {results:?}"
     );
 }
+
+/// Reproducer for the Solo bug report (2026-04-23): first-ever index build via
+/// the background / provider path must pick up `f:fullTextDefaults` from
+/// novelty. Before the fix, `ApiFulltextConfigProvider::resolve()` called
+/// `resolve_ledger_config(snapshot, novelty, snapshot.t)` with
+/// `snapshot.t == 0` (genesis), which filtered out all novelty flakes and
+/// returned an empty configured-property list.
+#[tokio::test]
+async fn fulltext_configured_property_first_build_via_provider() {
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/fulltext-config-first-build:main";
+    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let no_auto = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    // 1) Write config (commit t=1).
+    let config_iri = format!("urn:fluree:{ledger_id}#config");
+    let config_trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix ex: <http://example.org/> .
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:fullTextDefaults <urn:config:ft> .
+            <urn:config:ft> rdf:type f:FullTextDefaults .
+            <urn:config:ft> f:property <urn:config:ft:title> .
+            <urn:config:ft:title> rdf:type f:FullTextProperty .
+            <urn:config:ft:title> f:target ex:title .
+        }}
+    "
+    );
+    ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&config_trig)
+        .execute()
+        .await
+        .expect("write config")
+        .ledger;
+
+    // 2) Insert data (commit t=2) on the configured predicate.
+    ledger = fluree
+        .insert_with_opts(
+            ledger,
+            &json!({
+                "@context": fulltext_context(),
+                "@graph": [
+                    { "@id": "ex:doc1", "ex:title": "Advanced Rust systems" },
+                    { "@id": "ex:doc2", "ex:title": "Cooking pasta recipes" },
+                ]
+            }),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_auto,
+        )
+        .await
+        .expect("insert docs")
+        .ledger;
+    let _ = ledger;
+
+    // 3) First-ever index build via the provider path — same code path as
+    //    the background worker on a freshly-committed ledger with no prior
+    //    index. Uses `build_index_for_ledger`.
+    let idx_config = fluree_db_indexer::IndexerConfig::default()
+        .with_fulltext_config_provider(fluree.fulltext_config_provider());
+    let result = fluree_db_indexer::build_index_for_ledger(
+        fluree.content_store(ledger_id),
+        fluree.nameservice(),
+        ledger_id,
+        idx_config,
+    )
+    .await
+    .expect("build_index_for_ledger");
+
+    fluree
+        .nameservice_mode()
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .await
+        .expect("publish index");
+
+    // 4) Query — plain-string `ex:title` should score via BM25 because config
+    //    enabled it, even on the first-ever indexing pass.
+    let loaded = fluree.ledger(ledger_id).await.expect("load after build");
+    let results = query_fulltext_plain(&fluree, &loaded, "Rust").await;
+    let hits: std::collections::HashSet<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(
+        hits.contains("ex:doc1"),
+        "first-ever build must pick up configured properties from novelty: {results:?}"
+    );
+}

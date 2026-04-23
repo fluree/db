@@ -96,14 +96,18 @@ impl ApiFulltextConfigProvider {
         }
 
         // 3. Resolve `f:fullTextDefaults` against the loaded state.
+        //
+        // Use `state.t()` (= max(novelty.t, snapshot.t)) as the upper bound so
+        // config flakes committed since the last index are visible. On a
+        // first-ever build there is no index, so `snapshot.t == 0` and all
+        // config lives in novelty — querying at `snapshot.t` would filter it
+        // out (`Novelty::for_each_overlay_flake` keeps only `flake.t <= to_t`).
         let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
-        let ledger_config = crate::config_resolver::resolve_ledger_config(
-            &state.snapshot,
-            overlay,
-            state.snapshot.t,
-        )
-        .await
-        .map_err(|e| format!("resolve_ledger_config: {e}"))?;
+        let to_t = state.t();
+        let ledger_config =
+            crate::config_resolver::resolve_ledger_config(&state.snapshot, overlay, to_t)
+                .await
+                .map_err(|e| format!("resolve_ledger_config: {e}"))?;
 
         Ok(ledger_config
             .map(|cfg| crate::config_resolver::configured_fulltext_properties_for_indexer(&cfg))
