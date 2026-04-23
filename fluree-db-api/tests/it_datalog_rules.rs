@@ -85,7 +85,7 @@ async fn datalog_grandparent_rule() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?parent"],
+        "select": "?parent",
         "where": {"@id": "ex:alice", "ex:parent": "?parent"}
     });
     let data_rows = support::query_jsonld(&fluree, &ledger, &data_check)
@@ -105,7 +105,7 @@ async fn datalog_grandparent_rule() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?grandparent"],
+        "select": "?grandparent",
         "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
         "reasoning": "datalog"
     });
@@ -173,7 +173,7 @@ async fn datalog_sibling_rule() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?sibling"],
+        "select": "?sibling",
         "where": {"@id": "ex:alice", "ex:sibling": "?sibling"},
         "reasoning": "datalog"
     });
@@ -215,7 +215,7 @@ async fn datalog_no_rules_returns_empty() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?grandparent"],
+        "select": "?grandparent",
         "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
         "reasoning": "datalog"
     });
@@ -289,7 +289,7 @@ async fn datalog_combined_with_owl2rl() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?fof"],
+        "select": "?fof",
         "where": {"@id": "ex:alice", "ex:friendOfFriend": "?fof"},
         "reasoning": ["owl2rl", "datalog"]
     });
@@ -369,7 +369,7 @@ async fn datalog_recursive_ancestor_rule() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?ancestor"],
+        "select": "?ancestor",
         "where": {"@id": "ex:alice", "ex:ancestor": "?ancestor"},
         "reasoning": "datalog"
     });
@@ -557,7 +557,7 @@ async fn datalog_chains_off_owl_entailments() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?interest"],
+        "select": "?interest",
         "where": {"@id": "ex:alice", "ex:learnsAbout": "?interest"},
         "reasoning": ["owl2rl", "datalog"]
     });
@@ -631,7 +631,7 @@ async fn datalog_filter_expression() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?person"],
+        "select": "?person",
         "where": {"@id": "?person", "ex:status": "senior"},
         "reasoning": "datalog"
     });
@@ -713,7 +713,7 @@ async fn datalog_filter_less_than() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?item"],
+        "select": "?item",
         "where": {"@id": "?item", "ex:affordable": true},
         "reasoning": "datalog"
     });
@@ -769,7 +769,7 @@ async fn datalog_query_time_rules() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?grandparent"],
+        "select": "?grandparent",
         "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
         "reasoning": "datalog",
         "rules": [{
@@ -816,7 +816,7 @@ async fn datalog_query_time_rules_with_id() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?grandparent"],
+        "select": "?grandparent",
         "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
         "reasoning": "datalog",
         "rules": [{
@@ -865,7 +865,7 @@ async fn datalog_query_time_rules_multiple() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?aunt"],
+        "select": "?aunt",
         "where": {"@id": "ex:brian", "ex:aunt": "?aunt"},
         "reasoning": "datalog",
         "rules": [
@@ -921,7 +921,7 @@ async fn datalog_query_time_rules_with_filter() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?person"],
+        "select": "?person",
         "where": {"@id": "?person", "ex:status": "senior"},
         "reasoning": "datalog",
         "rules": [{
@@ -1002,7 +1002,7 @@ async fn datalog_query_time_rules_merged_with_db_rules() {
         "@context": {
             "ex": "http://example.org/"
         },
-        "select": ["?aunt"],
+        "select": "?aunt",
         "where": {"@id": "ex:brian", "ex:aunt": "?aunt"},
         "reasoning": "datalog",
         "rules": [{

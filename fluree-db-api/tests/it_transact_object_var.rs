@@ -35,7 +35,7 @@ async fn insert_does_not_parse_bare_var_by_default() {
 
     let query = json!({
         "@context": ctx(),
-        "select": ["?val"],
+        "select": "?val",
         "where": [{"@id": "ex:s", "schema:text": "?val"}]
     });
     let result = support::query_jsonld(&fluree, &ledger1, &query)
@@ -75,7 +75,7 @@ async fn object_var_parsing_update_opt() {
 
     let query = json!({
         "@context": ctx(),
-        "select": ["?val"],
+        "select": "?val",
         "where": [{"@id": "ex:s", "schema:text": "?val"}]
     });
     let jsonld = support::query_jsonld(&fluree, &ledger1, &query)
@@ -136,7 +136,7 @@ async fn update_with_object_var_parsing_false_treats_bare_var_as_literal() {
 
     let query = json!({
         "@context": ctx(),
-        "select": ["?val"],
+        "select": "?val",
         "where": [{"@id": "ex:s", "schema:text": "?val"}]
     });
     let jsonld = support::query_jsonld(&fluree, &ledger1, &query)
@@ -183,7 +183,7 @@ async fn update_explicit_variable_map_parses_when_flag_false_and_bound() {
 
     let query = json!({
         "@context": ctx(),
-        "select": ["?val"],
+        "select": "?val",
         "where": [{
             "@id": "ex:s",
             "schema:foo": {"@value": "?val"}
@@ -278,7 +278,7 @@ async fn update_predicate_var_still_parses_when_flag_false() {
 
     let query = json!({
         "@context": ctx(),
-        "select": ["?p"],
+        "select": "?p",
         "where": [{"@id":"ex:s","?p":"?o"}]
     });
     let jsonld = support::query_jsonld(&fluree, &ledger2, &query)
@@ -396,7 +396,7 @@ async fn query_literal_qmark_string_with_flag_false_requires_literal_match() {
     let query = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "opts": {"objectVarParsing": false},
-        "select": ["?s"],
+        "select": "?s",
         "where": [{"@id": "?s", "ex:prop": "?not-a-var"}]
     });
 
@@ -424,7 +424,7 @@ async fn query_explicit_variable_in_where_still_parses_when_flag_false() {
     let query = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "opts": {"objectVarParsing": false},
-        "select": ["?v"],
+        "select": "?v",
         "where": [{"@id": "ex:s", "ex:prop": {"@variable": "?v"}}]
     });
 

@@ -293,7 +293,7 @@ async fn reasoning_defaults_apply() {
     let query = json!({
         "@context": {"ex": "http://example.org/"},
         "from": ledger_id,
-        "select": ["?v"],
+        "select": "?v",
         "where": {"@id": "ex:alice", "ex:name": "?v"}
     });
 
@@ -312,7 +312,7 @@ async fn reasoning_defaults_apply() {
     let query_none = json!({
         "@context": {"ex": "http://example.org/"},
         "from": ledger_id,
-        "select": ["?v"],
+        "select": "?v",
         "where": {"@id": "ex:alice", "ex:name": "?v"},
         "reasoning": "none"
     });

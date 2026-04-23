@@ -165,5 +165,5 @@ async fn reload_after_index_preserves_namespace_consistency() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    assert_eq!(result, json!(["Alpha"]));
+    assert_eq!(result, json!([["Alpha"]]));
 }

@@ -14,8 +14,8 @@ use fluree_db_api::{DataSetDb, DatasetSpec, FlureeBuilder, GraphDb, GraphSource,
 use fluree_db_core::load_commit_by_id;
 use serde_json::json;
 use support::{
-    assert_index_defaults, genesis_ledger, normalize_flat_results, normalize_rows_array,
-    MemoryFluree, MemoryLedger,
+    assert_index_defaults, genesis_ledger, normalize_flat_results, normalize_rows, MemoryFluree,
+    MemoryLedger,
 };
 
 // =============================================================================
@@ -219,7 +219,7 @@ async fn dataset_single_default_graph_basic_query() {
             "ex": "http://example.org/ns/",
             "schema": "http://schema.org/"
         },
-        "select": ["?name"],
+        "select": "?name",
         "where": {
             "@id": "?person",
             "@type": "ex:Person",
@@ -276,7 +276,7 @@ async fn dataset_multiple_default_graphs_union() {
             "ex": "http://example.org/ns/",
             "schema": "http://schema.org/"
         },
-        "select": ["?name"],
+        "select": "?name",
         "where": {
             "@id": "?person",
             "@type": "ex:Person",
@@ -344,8 +344,8 @@ async fn dataset_composed_across_connections_selecting_variables() {
         .expect("to_jsonld");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
             ["Gone with the Wind", "0-582-41805-4", "Margaret Mitchell"],
             [
                 "The Hitchhiker's Guide to the Galaxy",
@@ -394,8 +394,8 @@ async fn dataset_composed_across_connections_selecting_subgraph_depth_3() {
         .expect("to_jsonld_async");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([{
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([{
             "@id": "https://www.wikidata.org/wiki/Q2875",
             "@type": "Movie",
             "name": "Gone with the Wind",
@@ -491,7 +491,7 @@ async fn dataset_named_graph_basic() {
             "ex": "http://example.org/ns/",
             "schema": "http://schema.org/"
         },
-        "select": ["?name"],
+        "select": "?name",
         "where": {
             "@id": "?s",
             "@type": "ex:Person",
@@ -533,7 +533,7 @@ async fn dataset_from_json_single_string() {
             "schema": "http://schema.org/"
         },
         "from": "test:main",
-        "select": ["?name"],
+        "select": "?name",
         "where": {
             "@id": "?person",
             "@type": "ex:Person",
@@ -580,7 +580,7 @@ async fn dataset_from_json_array() {
             "schema": "http://schema.org/"
         },
         "from": ["p1:main", "p2:main"],
-        "select": ["?name"],
+        "select": "?name",
         "where": {
             "@id": "?person",
             "@type": "ex:Person",
@@ -628,7 +628,7 @@ async fn dataset_from_json_named() {
         },
         "from": "default:main",
         "fromNamed": ["graph1:main"],
-        "select": ["?name"],
+        "select": "?name",
         "where": {
             "@id": "?s",
             "@type": "ex:Person",
@@ -768,8 +768,8 @@ async fn dataset_cross_graph_join_in_union() {
 
     // Should find Alice works at Acme (join across union)
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([["Alice", "Acme Corp"]]))
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Alice", "Acme Corp"]]))
     );
 }
 
@@ -838,8 +838,8 @@ async fn sparql_graph_pattern_concrete_iri() {
 
     // Should return names from the named graph (people:main)
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([["Alice"], ["Bob"]]))
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Alice"], ["Bob"]]))
     );
 }
 
@@ -887,8 +887,8 @@ async fn sparql_graph_pattern_variable_iteration() {
     // People graph: Alice, Bob
     // Orgs graph: Acme Corp, Globex Inc
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
             ["orgs:main", "Acme Corp"],
             ["orgs:main", "Globex Inc"],
             ["people:main", "Alice"],
@@ -978,8 +978,8 @@ async fn sparql_graph_pattern_default_vs_named() {
 
     // Default graph should only have people
     assert_eq!(
-        normalize_flat_results(&jsonld_default),
-        normalize_flat_results(&json!(["Alice", "Bob"]))
+        normalize_rows(&jsonld_default),
+        normalize_rows(&json!([["Alice"], ["Bob"]]))
     );
 
     // Query named graph via GRAPH pattern - should get orgs
@@ -1004,8 +1004,8 @@ async fn sparql_graph_pattern_default_vs_named() {
 
     // Named graph should only have orgs
     assert_eq!(
-        normalize_flat_results(&jsonld_named),
-        normalize_flat_results(&json!(["Acme Corp", "Globex Inc"]))
+        normalize_rows(&jsonld_named),
+        normalize_rows(&json!([["Acme Corp"], ["Globex Inc"]]))
     );
 }
 
@@ -1040,7 +1040,7 @@ async fn fql_graph_pattern_basic() {
     // Query using JSON-LD ["graph", "name", {...}] syntax
     let query = json!({
         "@context": {"schema": "http://schema.org/"},
-        "select": ["?name"],
+        "select": "?name",
         "where": [
             ["graph", "people:main", {"@id": "?person", "schema:name": "?name"}]
         ]
@@ -1084,7 +1084,7 @@ async fn fql_graph_pattern_with_alias() {
     // Query using JSON-LD ["graph", <alias>, {...}] syntax with the alias "folks"
     let query = json!({
         "@context": {"schema": "http://schema.org/"},
-        "select": ["?name"],
+        "select": "?name",
         "where": [
             ["graph", "folks", {"@id": "?person", "schema:name": "?name"}]
         ]
@@ -1138,7 +1138,7 @@ async fn dataset_time_travel_at_t() {
 
     let query = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id": "?s", "schema:name": "?name"}
     });
 
@@ -1189,7 +1189,7 @@ async fn dataset_time_travel_at_time_iso() {
 
     let query = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id": "?s", "schema:name": "?name"}
     });
 
@@ -1261,7 +1261,7 @@ async fn dataset_time_travel_mixed_graphs() {
 
     let query = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id": "?s", "schema:name": "?name"}
     });
 
@@ -1300,7 +1300,7 @@ async fn dataset_time_travel_alias_syntax_at_t() {
     let query = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "from": "people:main@t:1",
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id": "?s", "schema:name": "?name"}
     });
 
@@ -1355,7 +1355,7 @@ async fn dataset_time_travel_at_commit() {
 
     let query = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id": "?s", "schema:name": "?name"}
     });
 
@@ -1402,7 +1402,7 @@ async fn dataset_time_travel_at_commit_short_prefix() {
 
     let query = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id": "?s", "schema:name": "?name"}
     });
 
@@ -1444,7 +1444,7 @@ async fn dataset_time_travel_alias_syntax_commit() {
     let query = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "from": alias_with_commit,
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id": "?s", "schema:name": "?name"}
     });
 
@@ -1552,8 +1552,8 @@ async fn sparql_single_db_graph_matching_alias() {
 
     // Should return results because alias matches
     assert_eq!(
-        normalize_flat_results(&jsonld),
-        normalize_flat_results(&json!(["Alice", "Bob"]))
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Alice"], ["Bob"]]))
     );
 }
 
@@ -1614,7 +1614,7 @@ async fn sparql_single_db_graph_variable_unbound() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     // Should return results with ?g bound to "people:main"
-    let normalized = normalize_rows_array(&jsonld);
+    let normalized = normalize_rows(&jsonld);
     assert_eq!(normalized.len(), 2);
 
     // Check that ?g is bound to the alias (first element of each row)
@@ -1657,7 +1657,7 @@ async fn sparql_single_db_graph_variable_bound_matching() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     // Should return results because bound value matches alias
-    let normalized = normalize_rows_array(&jsonld);
+    let normalized = normalize_rows(&jsonld);
     assert_eq!(normalized.len(), 2);
 }
 
@@ -1763,7 +1763,7 @@ async fn dataset_multi_ledger_time_travel_execution() {
     let query = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "from": ["ledger1:main@t:1", "ledger2:main@t:2"],
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id": "?person", "@type": "ex:Person", "schema:name": "?name"}
     });
 
@@ -1832,8 +1832,8 @@ async fn sparql_from_time_travel_suffixes() {
 
     // Expect ledger1@t=1 (Alice) + ledger2@t=2 (Carol, Dave)
     assert_eq!(
-        normalize_flat_results(&jsonld),
-        normalize_flat_results(&json!(["Alice", "Carol", "Dave"]))
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Alice"], ["Carol"], ["Dave"]]))
     );
 }
 
@@ -1876,10 +1876,7 @@ async fn single_ledger_dataset_string_functions() {
     let jsonld = result
         .to_jsonld(primary.snapshot.as_ref())
         .expect("to_jsonld");
-    assert_eq!(
-        normalize_flat_results(&jsonld),
-        normalize_flat_results(&json!(["Alice"]))
-    );
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Alice"]])));
 
     // STRLEN — should return actual lengths (not empty/unbound)
     let strlen = r#"
@@ -1898,8 +1895,8 @@ async fn single_ledger_dataset_string_functions() {
         .to_jsonld(primary.snapshot.as_ref())
         .expect("to_jsonld");
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        vec![vec![json!("Bob"), json!(3)]]
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Bob", 3]]))
     );
 
     // LCASE — should return lowercased string (not empty)
@@ -1918,10 +1915,7 @@ async fn single_ledger_dataset_string_functions() {
     let jsonld = result
         .to_jsonld(primary.snapshot.as_ref())
         .expect("to_jsonld");
-    assert_eq!(
-        normalize_flat_results(&jsonld),
-        normalize_flat_results(&json!(["alice"]))
-    );
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["alice"]])));
 }
 
 // =============================================================================
@@ -2018,7 +2012,7 @@ async fn dataset_staged_transaction_with_novel_namespace() {
         .expect("to_jsonld");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([["Alice", "Acme Corp"]]))
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Alice", "Acme Corp"]]))
     );
 }

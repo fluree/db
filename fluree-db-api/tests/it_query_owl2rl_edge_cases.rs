@@ -70,7 +70,7 @@ async fn owl2rl_allvaluesfrom_with_inverse_property() {
     // Query: what types does y have?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?type"],
+        "select": "?type",
         "where": {"@id": "ex:y", "@type": "?type"},
         "reasoning": "owl2rl"
     });
@@ -90,7 +90,7 @@ async fn owl2rl_allvaluesfrom_with_inverse_property() {
     // Also check z
     let q2 = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?type"],
+        "select": "?type",
         "where": {"@id": "ex:z", "@type": "?type"},
         "reasoning": "owl2rl"
     });
@@ -168,7 +168,7 @@ async fn owl2rl_multi_same_property_restrictions() {
     // Query: who is DrugProduct?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id": "?s", "@type": "ex:DrugProduct"},
         "reasoning": "owl2rl"
     });
@@ -242,7 +242,7 @@ async fn owl2rl_union_3_plus_branches() {
     // Query: who is MultiTarget?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id": "?s", "@type": "ex:MultiTarget"},
         "reasoning": "owl2rl"
     });
@@ -325,7 +325,7 @@ async fn owl2rl_nested_unions() {
     // Query: who is NestedTarget?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id": "?s", "@type": "ex:NestedTarget"},
         "reasoning": "owl2rl"
     });
@@ -409,7 +409,7 @@ async fn owl2rl_union_with_intersection() {
     // Query: who is UnionIntersection?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id": "?s", "@type": "ex:UnionIntersection"},
         "reasoning": "owl2rl"
     });
@@ -478,7 +478,7 @@ async fn owl2rl_inverse_in_deeper_chain() {
     // Query for alice's grandparent via chain
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?gp"],
+        "select": "?gp",
         "where": {"@id": "ex:alice", "ex:hasGrandparent": "?gp"},
         "reasoning": "owl2rl"
     });
@@ -498,7 +498,7 @@ async fn owl2rl_inverse_in_deeper_chain() {
     // Also test that inverse property works
     let q2 = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?child"],
+        "select": "?child",
         "where": {"@id": "ex:bob", "ex:hasChild": "?child"},
         "reasoning": "owl2rl"
     });
@@ -551,7 +551,7 @@ async fn owl2rl_double_inverse_normalization() {
     // Query via double inverse (should be same as original)
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?t"],
+        "select": "?t",
         "where": {"@id": "ex:source", "ex:doubleInverseProp": "?t"},
         "reasoning": "owl2rl"
     });
@@ -571,7 +571,7 @@ async fn owl2rl_double_inverse_normalization() {
     // Also verify single inverse works in opposite direction
     let q2 = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id": "ex:target", "ex:inverseProp": "?s"},
         "reasoning": "owl2rl"
     });
@@ -651,7 +651,7 @@ async fn owl2rl_partial_conditions_no_inference() {
     // Query: who is ConjunctiveClass?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id": "?s", "@type": "ex:ConjunctiveClass"},
         "reasoning": "owl2rl"
     });
@@ -722,7 +722,7 @@ async fn owl2rl_hasvalue_class_to_property_entailment() {
     // Query: what unit does mass1 have? (should be inferred)
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?unit"],
+        "select": "?unit",
         "where": {"@id": "ex:mass1", "ex:hasUnit": "?unit"},
         "reasoning": "owl2rl"
     });

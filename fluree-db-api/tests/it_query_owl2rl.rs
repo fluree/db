@@ -56,7 +56,7 @@ async fn owl2rl_same_as_symmetry() {
             "ex": "http://example.org/",
             "owl": "http://www.w3.org/2002/07/owl#"
         },
-        "select": ["?same"],
+        "select": "?same",
         "where": {"@id": "ex:carol-lynn", "owl:sameAs": "?same"},
         "reasoning": "owl2rl"
     });
@@ -100,7 +100,7 @@ async fn owl2rl_same_as_transitivity() {
             "ex": "http://example.org/",
             "owl": "http://www.w3.org/2002/07/owl#"
         },
-        "select": ["?same"],
+        "select": "?same",
         "where": {"@id": "ex:carol1", "owl:sameAs": "?same"},
         "reasoning": "owl2rl"
     });
@@ -154,7 +154,7 @@ async fn owl2rl_symmetric_property() {
     // Query: who does person-b live with?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?x"],
+        "select": "?x",
         "where": {"@id": "ex:person-b", "ex:livesWith": "?x"},
         "reasoning": "owl2rl"
     });
@@ -194,7 +194,7 @@ async fn owl2rl_transitive_property() {
     // Query: who does person-a live with?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?people"],
+        "select": "?people",
         "where": {"@id": "ex:person-a", "ex:livesWith": "?people"},
         "reasoning": "owl2rl"
     });
@@ -234,7 +234,7 @@ async fn owl2rl_inverse_of() {
     // Query: who is mom's child?
     let q1 = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?x"],
+        "select": "?x",
         "where": {"@id": "ex:mom", "ex:child": "?x"},
         "reasoning": "owl2rl"
     });
@@ -248,7 +248,7 @@ async fn owl2rl_inverse_of() {
     // Query: who is bob's parent?
     let q2 = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?x"],
+        "select": "?x",
         "where": {"@id": "ex:bob", "ex:parents": "?x"},
         "reasoning": "owl2rl"
     });
@@ -283,7 +283,7 @@ async fn owl2rl_domain_rule() {
     // Query: what type is brian?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?t"],
+        "select": "?t",
         "where": {"@id": "ex:brian", "@type": "?t"},
         "reasoning": "owl2rl"
     });
@@ -328,7 +328,7 @@ async fn owl2rl_range_rule() {
     // Query: what type is carol?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?t"],
+        "select": "?t",
         "where": {"@id": "ex:carol", "@type": "?t"},
         "reasoning": "owl2rl"
     });
@@ -383,7 +383,7 @@ async fn owl2rl_functional_property() {
             "ex": "http://example.org/",
             "owl": "http://www.w3.org/2002/07/owl#"
         },
-        "select": ["?same"],
+        "select": "?same",
         "where": {"@id": "ex:carol", "owl:sameAs": "?same"},
         "reasoning": "owl2rl"
     });
@@ -427,7 +427,7 @@ async fn owl2rl_inverse_functional_property() {
             "ex": "http://example.org/",
             "owl": "http://www.w3.org/2002/07/owl#"
         },
-        "select": ["?same"],
+        "select": "?same",
         "where": {"@id": "ex:brian1", "owl:sameAs": "?same"},
         "reasoning": "owl2rl"
     });
@@ -468,7 +468,7 @@ async fn owl2rl_sub_property_of() {
     // Query: who are bob's parents?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?p"],
+        "select": "?p",
         "where": {"@id": "ex:bob", "ex:parents": "?p"},
         "reasoning": "owl2rl"
     });
@@ -513,7 +513,7 @@ async fn owl2rl_property_chain_axiom() {
     // Query: who are person-a's grandparents?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?gp"],
+        "select": "?gp",
         "where": {"@id": "ex:person-a", "ex:grandparent": "?gp"},
         "reasoning": "owl2rl"
     });
@@ -562,7 +562,7 @@ async fn owl2rl_has_key() {
             "ex": "http://example.org/",
             "owl": "http://www.w3.org/2002/07/owl#"
         },
-        "select": ["?same"],
+        "select": "?same",
         "where": {"@id": "ex:brian", "owl:sameAs": "?same"},
         "reasoning": "owl2rl"
     });
@@ -613,7 +613,7 @@ async fn owl2rl_subclass_of() {
     // Query: who is type Human?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id": "?s", "@type": "ex:Human"},
         "reasoning": "owl2rl"
     });
@@ -653,7 +653,7 @@ async fn owl2rl_equivalent_class() {
     // Query: who is type Person?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id": "?s", "@type": "ex:Person"},
         "reasoning": "owl2rl"
     });
@@ -707,7 +707,7 @@ async fn owl2rl_has_value_forward() {
     // Query: what is mass1's unit?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?unit"],
+        "select": "?unit",
         "where": {"@id": "ex:mass1", "ex:hasUnit": "?unit"},
         "reasoning": "owl2rl"
     });
@@ -759,7 +759,7 @@ async fn owl2rl_has_value_backward() {
     // Query: who is type KilogramMagnitude?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id": "?s", "@type": "ex:KilogramMagnitude"},
         "reasoning": "owl2rl"
     });
@@ -815,7 +815,7 @@ async fn owl2rl_some_values_from() {
     // Query: who is type Wine?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id": "?s", "@type": "ex:Wine"},
         "reasoning": "owl2rl"
     });
@@ -870,7 +870,7 @@ async fn owl2rl_all_values_from() {
     // Query: what type is thing1?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?t"],
+        "select": "?t",
         "where": {"@id": "ex:thing1", "@type": "?t"},
         "reasoning": "owl2rl"
     });
@@ -924,7 +924,7 @@ async fn owl2rl_max_cardinality() {
             "ex": "http://example.org/",
             "owl": "http://www.w3.org/2002/07/owl#"
         },
-        "select": ["?same"],
+        "select": "?same",
         "where": {"@id": "ex:carol", "owl:sameAs": "?same"},
         "reasoning": "owl2rl"
     });
@@ -978,7 +978,7 @@ async fn owl2rl_intersection_of() {
     // Query: who is type Mother?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id": "?s", "@type": "ex:Mother"},
         "reasoning": "owl2rl"
     });
@@ -1039,7 +1039,7 @@ async fn owl2rl_union_of() {
     // Query: who is type Parent?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id": "?s", "@type": "ex:Parent"},
         "reasoning": "owl2rl"
     });
@@ -1093,7 +1093,7 @@ async fn owl2rl_one_of() {
     // Query: who is type RedOrGreen?
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id": "?s", "@type": "ex:RedOrGreen"},
         "reasoning": "owl2rl"
     });

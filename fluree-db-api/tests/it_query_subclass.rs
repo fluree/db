@@ -102,7 +102,7 @@ async fn subclass_creative_work_returns_book_and_movie_instances() {
     );
 
     let q_types = json!({
-        "select": ["?t"],
+        "select": "?t",
         "where": [{"@id":"https://www.wikidata.org/wiki/Q836821","@type":"?t"}]
     });
     let types = support::query_jsonld(&fluree, &ledger, &q_types)
@@ -116,7 +116,7 @@ async fn subclass_creative_work_returns_book_and_movie_instances() {
     );
 
     let q_movie = json!({
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id":"?s","@type":"https://schema.org/Movie"}
     });
     let movie_rows = support::query_jsonld(&fluree, &ledger, &q_movie)
@@ -344,7 +344,7 @@ async fn subclass_nested_stages() {
 
     let q = json!({
         "@context": {"ex":"http://example.org/"},
-        "select": ["?s"],
+        "select": "?s",
         "where": {"@id":"?s","@type":"ex:Human"}
     });
     let rows = support::query_jsonld(&fluree, &db3, &q)

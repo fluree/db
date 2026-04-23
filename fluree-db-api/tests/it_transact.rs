@@ -760,7 +760,7 @@ async fn insert_data_then_query_names() {
 
     let query = json!({
         "@context": ctx_ex_schema(),
-        "select": ["?name"],
+        "select": "?name",
         "where": {"schema:name": "?name"}
     });
 
