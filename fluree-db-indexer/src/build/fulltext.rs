@@ -107,10 +107,18 @@ pub(crate) async fn build_and_upload_fulltext_arenas<C: ContentStore + ?Sized>(
             let text = match string_dict.lookup_string(entry.string_id) {
                 Some(t) => t,
                 None => {
-                    tracing::warn!(
+                    // [DIAG] Surfaces the Pass 1 dict-lookup failure in
+                    // production logs. If this fires for a configured-predicate
+                    // value, the arena will silently miss that document.
+                    // Revert to `tracing::warn!` with (string_id, p_id) only
+                    // once the Solo c3000-04 arena drop is diagnosed.
+                    tracing::info!(
                         string_id = entry.string_id,
                         p_id = p_id,
-                        "fulltext: string_id not found in dict, skipping"
+                        g_id = entry.g_id,
+                        lang_id = entry.lang_id,
+                        t = entry.t,
+                        "[DIAG] fulltext: string_id not found in dict, skipping"
                     );
                     continue;
                 }

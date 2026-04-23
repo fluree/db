@@ -955,3 +955,386 @@ async fn fulltext_configured_property_first_build_via_provider() {
         "first-ever build must pick up configured properties from novelty: {results:?}"
     );
 }
+
+/// Reproducer for the residual Solo finding against 9d239d6: arena is built,
+/// but `fulltext(?lit, "…")` still returns null for a language-tagged value
+/// on a configured predicate. Matches the `skosxl:literalForm
+/// "Competencies"@en` shape from the bug report.
+#[tokio::test]
+async fn fulltext_configured_langtagged_literal_scores_via_arena() {
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/fulltext-config-langtag:main";
+    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let no_auto = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    // Config: make skosxl:literalForm a fulltext-configured predicate.
+    let config_iri = format!("urn:fluree:{ledger_id}#config");
+    let config_trig = format!(
+        r#"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix skosxl: <http://www.w3.org/2008/05/skos-xl#> .
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:fullTextDefaults <urn:config:ft> .
+            <urn:config:ft> rdf:type f:FullTextDefaults .
+            <urn:config:ft> f:defaultLanguage "en" .
+            <urn:config:ft> f:property <urn:config:ft:litform> .
+            <urn:config:ft:litform> rdf:type f:FullTextProperty .
+            <urn:config:ft:litform> f:target skosxl:literalForm .
+        }}
+    "#
+    );
+    ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&config_trig)
+        .execute()
+        .await
+        .expect("write config")
+        .ledger;
+
+    // Data: language-tagged literal on the configured predicate.
+    ledger = fluree
+        .insert_with_opts(
+            ledger,
+            &json!({
+                "@context": {
+                    "skosxl": "http://www.w3.org/2008/05/skos-xl#",
+                    "ex": "http://example.org/"
+                },
+                "@id": "ex:l1",
+                "@type": "skosxl:Label",
+                "skosxl:literalForm": {"@value": "Competencies", "@language": "en"}
+            }),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_auto,
+        )
+        .await
+        .expect("insert label")
+        .ledger;
+    let _ = ledger;
+
+    // Build index via the provider path (same as background worker).
+    let idx_config = fluree_db_indexer::IndexerConfig::default()
+        .with_fulltext_config_provider(fluree.fulltext_config_provider());
+    let result = fluree_db_indexer::build_index_for_ledger(
+        fluree.content_store(ledger_id),
+        fluree.nameservice(),
+        ledger_id,
+        idx_config,
+    )
+    .await
+    .expect("build_index_for_ledger");
+    fluree
+        .nameservice_mode()
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .await
+        .expect("publish index");
+
+    // Query: exact shape from the bug report.
+    let loaded = fluree.ledger(ledger_id).await.expect("load after build");
+    let query = json!({
+        "@context": {"skosxl": "http://www.w3.org/2008/05/skos-xl#"},
+        "select": ["?lit", "?score"],
+        "where": [
+            {"@id": "?ln", "skosxl:literalForm": "?lit"},
+            ["bind", "?score", "(fulltext ?lit \"competencies\")"]
+        ]
+    });
+    let result = support::query_jsonld(&fluree, &loaded, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&loaded.snapshot).expect("jsonld");
+    let rows = json_rows.as_array().expect("rows");
+    assert!(!rows.is_empty(), "expected at least one row: {rows:?}");
+    let score = rows[0].as_array().and_then(|r| r.get(1)).cloned();
+    assert!(
+        score
+            .as_ref()
+            .is_some_and(|s| s.as_f64().unwrap_or(0.0) > 0.0),
+        "configured lang-tagged value must score via arena, got {score:?} in rows {rows:?}"
+    );
+}
+
+/// Reproducer for the Solo bug "Still broken 2": incremental indexing after a
+/// new commit on a configured predicate should extend the arena, but no
+/// activity is logged and the new value never scores.
+#[tokio::test]
+async fn fulltext_configured_incremental_adds_to_arena() {
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/fulltext-config-incremental:main";
+    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let no_auto = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    let config_iri = format!("urn:fluree:{ledger_id}#config");
+    let config_trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix skosxl: <http://www.w3.org/2008/05/skos-xl#> .
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:fullTextDefaults <urn:config:ft> .
+            <urn:config:ft> rdf:type f:FullTextDefaults .
+            <urn:config:ft> f:property <urn:config:ft:litform> .
+            <urn:config:ft:litform> rdf:type f:FullTextProperty .
+            <urn:config:ft:litform> f:target skosxl:literalForm .
+        }}
+    "
+    );
+    ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&config_trig)
+        .execute()
+        .await
+        .expect("write config")
+        .ledger;
+
+    // First labelled doc.
+    ledger = fluree
+        .insert_with_opts(
+            ledger,
+            &json!({
+                "@context": {"skosxl": "http://www.w3.org/2008/05/skos-xl#", "ex": "http://example.org/"},
+                "@id": "ex:l1",
+                "@type": "skosxl:Label",
+                "skosxl:literalForm": {"@value": "Competencies", "@language": "en"}
+            }),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_auto,
+        )
+        .await
+        .expect("insert first label")
+        .ledger;
+    let _ = ledger;
+
+    // Initial full build.
+    let idx_config = fluree_db_indexer::IndexerConfig::default()
+        .with_fulltext_config_provider(fluree.fulltext_config_provider());
+    let result = fluree_db_indexer::build_index_for_ledger(
+        fluree.content_store(ledger_id),
+        fluree.nameservice(),
+        ledger_id,
+        idx_config,
+    )
+    .await
+    .expect("initial build");
+    fluree
+        .nameservice_mode()
+        .publisher()
+        .expect("publisher")
+        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .await
+        .expect("publish initial");
+
+    // New commit post-index with a NEW value on the configured predicate.
+    let mut ledger = fluree.ledger(ledger_id).await.expect("reload");
+    ledger = fluree
+        .insert_with_opts(
+            ledger,
+            &json!({
+                "@context": {"skosxl": "http://www.w3.org/2008/05/skos-xl#", "ex": "http://example.org/"},
+                "@id": "ex:l2",
+                "@type": "skosxl:Label",
+                "skosxl:literalForm": {"@value": "Performance Management", "@language": "en"}
+            }),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_auto,
+        )
+        .await
+        .expect("insert second label")
+        .ledger;
+    let _ = ledger;
+
+    // Incremental build — same provider, should route the new value through
+    // the fulltext hook and extend the arena.
+    let idx_config = fluree_db_indexer::IndexerConfig::default()
+        .with_fulltext_config_provider(fluree.fulltext_config_provider());
+    let result = fluree_db_indexer::build_index_for_ledger(
+        fluree.content_store(ledger_id),
+        fluree.nameservice(),
+        ledger_id,
+        idx_config,
+    )
+    .await
+    .expect("incremental build");
+    fluree
+        .nameservice_mode()
+        .publisher()
+        .expect("publisher")
+        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .await
+        .expect("publish incremental");
+
+    // Query: the new value ("Performance Management") must be queryable by
+    // fulltext(...) — same arena, same bucket.
+    let loaded = fluree.ledger(ledger_id).await.expect("load final");
+    let query = json!({
+        "@context": {"skosxl": "http://www.w3.org/2008/05/skos-xl#"},
+        "select": ["?lit", "?score"],
+        "where": [
+            {"@id": "?ln", "skosxl:literalForm": "?lit"},
+            ["bind", "?score", "(fulltext ?lit \"performance\")"],
+            ["filter", "(> ?score 0)"]
+        ]
+    });
+    let result = support::query_jsonld(&fluree, &loaded, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&loaded.snapshot).expect("jsonld");
+    let rows = json_rows.as_array().expect("rows");
+    assert!(
+        !rows.is_empty(),
+        "incremental indexing must add new configured values to arena: {rows:?}"
+    );
+}
+
+/// Reproducer for c3000-04 finding: two configured-predicate assertions
+/// across two separate commits with other commits in between. Arena should
+/// have docs=2, terms>=2. On S3 the user reports docs=1 after full rebuild.
+#[tokio::test]
+async fn fulltext_configured_two_commits_two_values_full_rebuild() {
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/fulltext-two-commits:main";
+    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let no_auto = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    // Commit 1 (t=1): config.
+    let config_iri = format!("urn:fluree:{ledger_id}#config");
+    let config_trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix skosxl: <http://www.w3.org/2008/05/skos-xl#> .
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:fullTextDefaults <urn:config:ft> .
+            <urn:config:ft> rdf:type f:FullTextDefaults .
+            <urn:config:ft> f:property <urn:config:ft:litform> .
+            <urn:config:ft:litform> rdf:type f:FullTextProperty .
+            <urn:config:ft:litform> f:target skosxl:literalForm .
+        }}
+    "
+    );
+    ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&config_trig)
+        .execute()
+        .await
+        .expect("write config")
+        .ledger;
+
+    // Commit 2 (t=2): first Label with "Competencies"@en on a URN-style subject.
+    ledger = fluree
+        .insert_with_opts(
+            ledger,
+            &json!({
+                "@context": {
+                    "skosxl": "http://www.w3.org/2008/05/skos-xl#",
+                    "tm": "https://ns.flur.ee/cust/tm/model/"
+                },
+                "@id": "tm:concept-1",
+                "@type": "skosxl:Label",
+                "skosxl:literalForm": {"@value": "Competencies", "@language": "en"}
+            }),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_auto,
+        )
+        .await
+        .expect("insert first label")
+        .ledger;
+
+    // Commit 3 (t=3): unrelated data to advance t.
+    ledger = fluree
+        .insert_with_opts(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:unrelated",
+                "ex:note": "spacer commit"
+            }),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_auto,
+        )
+        .await
+        .expect("insert unrelated")
+        .ledger;
+
+    // Commit 4 (t=4): second Label with "Performance Management"@en on a
+    // different-namespace subject.
+    ledger = fluree
+        .insert_with_opts(
+            ledger,
+            &json!({
+                "@context": {
+                    "skosxl": "http://www.w3.org/2008/05/skos-xl#",
+                    "ex": "http://example.org/"
+                },
+                "@id": "ex:l2",
+                "@type": "skosxl:Label",
+                "skosxl:literalForm": {"@value": "Performance Management", "@language": "en"}
+            }),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_auto,
+        )
+        .await
+        .expect("insert second label")
+        .ledger;
+    let _ = ledger;
+
+    // Single full reindex — same code path as `fluree reindex` on the server.
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    // Query BOTH values individually. Both must score.
+    let loaded = fluree.ledger(ledger_id).await.expect("load");
+    for (term, expect_match) in [("competencies", true), ("performance", true)] {
+        let bind = format!("(fulltext ?lit \"{term}\")");
+        let query = json!({
+            "@context": {"skosxl": "http://www.w3.org/2008/05/skos-xl#"},
+            "select": ["?lit", "?score"],
+            "where": [
+                {"@id": "?ln", "skosxl:literalForm": "?lit"},
+                ["bind", "?score", bind],
+                ["filter", "(> ?score 0)"]
+            ]
+        });
+        let result = support::query_jsonld(&fluree, &loaded, &query)
+            .await
+            .expect("query");
+        let json_rows = result.to_jsonld(&loaded.snapshot).expect("jsonld");
+        let rows = json_rows.as_array().expect("rows");
+        if expect_match {
+            assert!(
+                !rows.is_empty(),
+                "query for '{term}' must return at least one row; both configured assertions must be in arena after full rebuild: {rows:?}"
+            );
+        }
+    }
+}
