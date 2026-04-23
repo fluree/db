@@ -336,6 +336,116 @@ async fn drop_local(state: Arc<AppState>, request: Request) -> Result<Json<DropR
 }
 
 // =============================================================================
+// Reindex
+// =============================================================================
+
+/// Reindex request body.
+///
+/// `opts` is reserved for future per-request overrides (e.g. indexer tuning).
+/// It is accepted but ignored today — the server always reindexes using the
+/// indexer settings it is configured with.
+#[derive(Deserialize)]
+pub struct ReindexRequest {
+    /// Ledger alias (e.g. "mydb" or "mydb:main")
+    pub ledger: String,
+    /// Reserved for future use — currently ignored.
+    #[serde(default, rename = "opts")]
+    pub _opts: Option<JsonValue>,
+}
+
+/// Build statistics for a reindex response.
+#[derive(Serialize)]
+pub struct ReindexStats {
+    pub flake_count: usize,
+    pub leaf_count: usize,
+    pub branch_count: usize,
+    pub total_bytes: usize,
+}
+
+/// Reindex response.
+#[derive(Serialize)]
+pub struct ReindexResponse {
+    pub ledger_id: String,
+    pub index_t: i64,
+    pub root_id: String,
+    pub stats: ReindexStats,
+}
+
+/// Full reindex from commit history.
+///
+/// POST /fluree/reindex
+///
+/// Rebuilds the binary index for a ledger from scratch using the server's
+/// configured indexer settings. In peer mode, forwards to the transaction
+/// server.
+pub async fn reindex(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    reindex_local(state, request).await.into_response()
+}
+
+async fn reindex_local(state: Arc<AppState>, request: Request) -> Result<Json<ReindexResponse>> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: ReindexRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+
+    let span = create_request_span(
+        "ledger:reindex",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.ledger),
+        None,
+        None,
+    );
+    async move {
+        let span = tracing::Span::current();
+        tracing::info!(status = "start", ledger = %req.ledger, "ledger reindex requested");
+
+        let result = match state
+            .fluree
+            .reindex(&req.ledger, fluree_db_api::ReindexOptions::default())
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:ReindexFailed");
+                tracing::error!(error = %server_error, "ledger reindex failed");
+                return Err(server_error);
+            }
+        };
+
+        tracing::info!(
+            status = "success",
+            index_t = result.index_t,
+            "ledger reindex complete"
+        );
+        Ok(Json(ReindexResponse {
+            ledger_id: result.ledger_id,
+            index_t: result.index_t,
+            root_id: result.root_id.to_string(),
+            stats: ReindexStats {
+                flake_count: result.stats.flake_count,
+                leaf_count: result.stats.leaf_count,
+                branch_count: result.stats.branch_count,
+                total_bytes: result.stats.total_bytes,
+            },
+        }))
+    }
+    .instrument(span)
+    .await
+}
+
+// =============================================================================
 // List ledgers + graph sources
 // =============================================================================
 

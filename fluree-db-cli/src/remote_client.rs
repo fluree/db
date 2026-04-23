@@ -1026,6 +1026,31 @@ impl RemoteLedgerClient {
     }
 
     // =========================================================================
+    // Reindex
+    // =========================================================================
+
+    /// Trigger a full reindex on the remote server.
+    ///
+    /// Calls `POST {base_url}/reindex` with `{"ledger": "<alias>"}`. The server
+    /// rebuilds the ledger's index from commit history using whatever indexer
+    /// settings it is configured with. Response shape mirrors
+    /// `fluree_db_api::ReindexResult` (ledger_id, index_t, root_id, stats).
+    ///
+    /// An `opts` field is reserved in the request contract for future
+    /// per-request overrides but is currently ignored by the server.
+    pub async fn reindex(&self, ledger: &str) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("reindex");
+        let body = serde_json::json!({ "ledger": ledger });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    // =========================================================================
     // List ledgers
     // =========================================================================
 
