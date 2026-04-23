@@ -12,7 +12,7 @@ use fluree_db_core::{ContentId, ContentKind, ContentStore, DictNovelty, Flake, T
 use fluree_db_ledger::{IndexConfig, LedgerState, LedgerView};
 use fluree_db_nameservice::{CasResult, NameService, RefKind, RefPublisher, RefValue};
 use fluree_db_novelty::{generate_commit_flakes, stamp_graph_on_commit_flakes};
-use fluree_db_novelty::{Commit, CommitRef, SigningKey, TxnMetaEntry, TxnMetaValue, TxnSignature};
+use fluree_db_novelty::{Commit, SigningKey, TxnMetaEntry, TxnMetaValue, TxnSignature};
 use fluree_db_query::BinaryRangeProvider;
 use std::sync::Arc;
 use tracing::Instrument;
@@ -501,12 +501,11 @@ where
 
             // Build previous commit reference from the head commit's ContentId.
             if let Some(cid) = head_commit_id.clone() {
-                commit_record = commit_record.with_previous_ref(CommitRef::new(cid));
+                commit_record = commit_record.with_previous_ref(cid);
             }
             // Append additional merge parent references.
             for merge_parent in &merge_parents {
-                commit_record =
-                    commit_record.with_previous_ref(CommitRef::new(merge_parent.clone()));
+                commit_record = commit_record.with_previous_ref(merge_parent.clone());
             }
 
             // 7. Content-address + write (storage-owned)

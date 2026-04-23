@@ -3,7 +3,7 @@
 //! No NamespaceRegistry needed — Sids are reconstructed directly from
 //! (namespace_code, name) pairs stored in the binary format.
 //!
-//! The reader produces CID-based types (`ContentId`, `CommitRef`).
+//! The reader produces CID-based types (`ContentId`, `CommitId`).
 //!
 //! # Dispatch
 //!

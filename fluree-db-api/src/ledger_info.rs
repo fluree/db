@@ -562,7 +562,7 @@ async fn build_commit_jsonld<S: Storage + Clone>(
             .map(|r| {
                 json!({
                     "type": ["Commit"],
-                    "id": r.id.to_string(),
+                    "id": r.to_string(),
                 })
             })
             .collect();

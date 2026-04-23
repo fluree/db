@@ -113,7 +113,7 @@ pub async fn compute_missing_commits<C: ContentStore>(
             chain.push(current_id);
 
             for parent in env.previous_refs {
-                frontier.push(parent.id);
+                frontier.push(parent);
             }
         }
 

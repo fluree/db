@@ -1302,7 +1302,7 @@ mod tests {
     };
     use fluree_db_nameservice::memory::MemoryNameService;
     use fluree_db_nameservice::{NameService, Publisher};
-    use fluree_db_novelty::{Commit, CommitRef};
+    use fluree_db_novelty::Commit;
     use std::collections::HashMap;
 
     fn make_flake(s_code: u16, s_name: &str, p_code: u16, p_name: &str, val: i64, t: i64) -> Flake {
@@ -1542,7 +1542,7 @@ mod tests {
             t: 2,
             time: None,
             flakes: vec![make_flake(1, "ex:bob", 1, "ex:age", 25, 2)],
-            previous_refs: vec![CommitRef::new(cid1.clone())],
+            previous_refs: vec![cid1.clone()],
             txn: None,
             namespace_delta: HashMap::new(),
             txn_signature: None,

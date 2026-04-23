@@ -16,28 +16,10 @@
 pub mod codec;
 
 use crate::error::{Error, Result};
-use crate::{ContentId, ContentStore, Flake};
+use crate::{CommitId, ContentId, ContentStore, Flake};
 use codec::format::CommitSignature;
 use futures::stream::{self, Stream};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-/// Reference to a commit (for linking previous commits)
-///
-/// In the CID-based architecture, the content identifier IS the identity.
-/// Storage location is resolved by the `ContentStore` implementation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CommitRef {
-    /// Content identifier (CIDv1). This IS the identity.
-    pub id: ContentId,
-}
-
-impl CommitRef {
-    /// Create a new commit reference from a ContentId
-    pub fn new(id: ContentId) -> Self {
-        Self { id }
-    }
-}
 
 /// Transaction signature — audit record of who submitted a transaction.
 ///
@@ -194,7 +176,7 @@ pub struct Commit {
 
     /// Parent commit references (CID-based).
     /// Empty for genesis, one element for normal commits, two+ for merge commits.
-    pub previous_refs: Vec<CommitRef>,
+    pub previous_refs: Vec<CommitId>,
 
     /// Transaction blob CID (content-addressed reference to original txn JSON).
     /// When present, the raw transaction JSON can be loaded from this CID.
@@ -276,13 +258,13 @@ impl Commit {
     ///
     /// For normal commits, call once. For merge commits, call multiple times
     /// or use [`with_merge_parents`](Self::with_merge_parents).
-    pub fn with_previous_ref(mut self, prev_ref: CommitRef) -> Self {
+    pub fn with_previous_ref(mut self, prev_ref: CommitId) -> Self {
         self.previous_refs.push(prev_ref);
         self
     }
 
     /// Set all parent commit references at once (for merge commits).
-    pub fn with_merge_parents(mut self, refs: Vec<CommitRef>) -> Self {
+    pub fn with_merge_parents(mut self, refs: Vec<CommitId>) -> Self {
         self.previous_refs = refs;
         self
     }
@@ -313,7 +295,7 @@ impl Commit {
 
     /// Iterate over all parent commit CIDs.
     pub fn parent_ids(&self) -> impl Iterator<Item = &ContentId> {
-        self.previous_refs.iter().map(|r| &r.id)
+        self.previous_refs.iter()
     }
 }
 
@@ -355,7 +337,7 @@ pub struct CommitEnvelope {
 
     /// Parent commit references (CID-based).
     /// Empty for genesis, one element for normal commits, two+ for merge commits.
-    pub previous_refs: Vec<CommitRef>,
+    pub previous_refs: Vec<CommitId>,
 
     /// Transaction blob CID (content-addressed reference to original txn JSON)
     pub txn: Option<ContentId>,
@@ -374,7 +356,7 @@ pub struct CommitEnvelope {
 impl CommitEnvelope {
     /// Iterate over all parent commit CIDs.
     pub fn parent_ids(&self) -> impl Iterator<Item = &ContentId> {
-        self.previous_refs.iter().map(|r| &r.id)
+        self.previous_refs.iter()
     }
 }
 
@@ -768,8 +750,8 @@ mod tests {
         let id2 = make_test_content_id(ContentKind::Commit, "commit-2");
 
         let commit1 = Commit::new(1, vec![]);
-        let commit2 = Commit::new(2, vec![]).with_previous_ref(CommitRef::new(id1.clone()));
-        let commit3 = Commit::new(3, vec![]).with_previous_ref(CommitRef::new(id2.clone()));
+        let commit2 = Commit::new(2, vec![]).with_previous_ref(id1.clone());
+        let commit3 = Commit::new(3, vec![]).with_previous_ref(id2.clone());
 
         assert_eq!(commit1.parent_ids().next(), None);
         assert_eq!(commit2.parent_ids().next(), Some(&id1));
@@ -785,7 +767,7 @@ mod tests {
         let prev_id = make_test_content_id(ContentKind::Commit, "commit-0");
         let envelope = CommitEnvelope {
             t: 5,
-            previous_refs: vec![CommitRef::new(prev_id.clone())],
+            previous_refs: vec![prev_id.clone()],
             txn: None,
             namespace_delta: HashMap::from([(100, "ex:".to_string())]),
             txn_meta: Vec::new(),
@@ -898,11 +880,11 @@ mod tests {
         let c1_id = store_commit(&store, &c1).await;
 
         let c2 = Commit::new(2, vec![make_test_flake(2, 3, 20, 2)])
-            .with_previous_ref(CommitRef::new(c1_id.clone()));
+            .with_previous_ref(c1_id.clone());
         let c2_id = store_commit(&store, &c2).await;
 
         let c3 = Commit::new(3, vec![make_test_flake(3, 4, 30, 3)])
-            .with_previous_ref(CommitRef::new(c2_id.clone()));
+            .with_previous_ref(c2_id.clone());
         let c3_id = store_commit(&store, &c3).await;
 
         // Trace from head (c3), stop_at_t=0 → all 3 commits
@@ -929,10 +911,10 @@ mod tests {
         let c1 = Commit::new(1, vec![]);
         let c1_id = store_commit(&store, &c1).await;
 
-        let c2 = Commit::new(2, vec![]).with_previous_ref(CommitRef::new(c1_id.clone()));
+        let c2 = Commit::new(2, vec![]).with_previous_ref(c1_id.clone());
         let c2_id = store_commit(&store, &c2).await;
 
-        let c3 = Commit::new(3, vec![]).with_previous_ref(CommitRef::new(c2_id.clone()));
+        let c3 = Commit::new(3, vec![]).with_previous_ref(c2_id.clone());
         let c3_id = store_commit(&store, &c3).await;
 
         // stop_at_t=1 → only c3 and c2 (c1 has t=1, excluded by t <= stop_at_t)
@@ -972,7 +954,7 @@ mod tests {
             let flake = make_test_flake(branch_tag, 1, t, t);
             let mut commit = Commit::new(t, vec![flake]);
             if let Some(ref p) = prev {
-                commit = commit.with_previous_ref(CommitRef::new(p.clone()));
+                commit = commit.with_previous_ref(p.clone());
             }
             let cid = store_commit(store, &commit).await;
             prev = Some(cid.clone());

@@ -2091,8 +2091,7 @@ where
     // Final commit head publish
     let commit_head_id = state
         .previous_ref
-        .as_ref()
-        .map(|r| r.id.clone())
+        .clone()
         .ok_or_else(|| ImportError::Storage("no commit head after import".to_string()))?;
 
     nameservice

@@ -206,7 +206,7 @@ mod tests {
     use fluree_db_core::content_kind::ContentKind;
     use fluree_db_core::prelude::*;
     use fluree_db_core::storage::content_store_for;
-    use fluree_db_novelty::{Commit, CommitRef};
+    use fluree_db_novelty::Commit;
     use std::collections::BTreeMap;
 
     const LEDGER: &str = "test:main";
@@ -282,10 +282,7 @@ mod tests {
             t,
             time: None,
             flakes: Vec::new(),
-            previous_refs: previous
-                .map(|id| CommitRef::new(id.clone()))
-                .into_iter()
-                .collect(),
+            previous_refs: previous.cloned().into_iter().collect(),
             txn: txn_cid,
             namespace_delta: std::collections::HashMap::new(),
             txn_signature: None,

@@ -565,7 +565,7 @@ fn decode_and_validate_commit_chain(
             let ok = commit
                 .previous_refs
                 .iter()
-                .any(|r| r.id.digest_hex() == *prev_hash_hex);
+                .any(|r| r.digest_hex() == *prev_hash_hex);
             if !ok {
                 return Err(PushError::Invalid(format!(
                     "commit chain previous mismatch at commit[{idx}]: expected previous digest '{prev_hash_hex}'"
@@ -606,7 +606,7 @@ fn preflight_strict_next_t_and_prev(
             .commit
             .previous_refs
             .iter()
-            .any(|r| r.id == *expected_id);
+            .any(|r| r == expected_id);
         if !ok {
             return Err(PushError::Conflict(format!(
                 "first commit previous mismatch: no parent matches expected head {expected_id:?}"
@@ -1122,7 +1122,7 @@ impl Fluree {
 
             // Enqueue all parents for traversal.
             for parent in env.previous_refs {
-                frontier.push(parent.id);
+                frontier.push(parent);
             }
         }
 

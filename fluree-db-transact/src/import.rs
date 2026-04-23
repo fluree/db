@@ -26,7 +26,7 @@ mod inner {
     use fluree_db_core::{
         ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid,
     };
-    use fluree_db_novelty::CommitRef;
+    use fluree_db_core::CommitId;
 
     /// Returns `Some(mode)` for the genesis commit (no parent), `None` otherwise.
     /// The split mode is only persisted in the genesis commit envelope.
@@ -47,7 +47,7 @@ mod inner {
         /// Current transaction number. Starts at 0; first chunk produces t=1.
         pub t: i64,
         /// Reference to the previous commit (address + id).
-        pub previous_ref: Option<CommitRef>,
+        pub previous_ref: Option<CommitId>,
         /// Namespace registry (accumulates across chunks).
         pub ns_registry: NamespaceRegistry,
         /// Cumulative flake count across all commits (for progress reporting).
@@ -228,7 +228,7 @@ mod inner {
 
         // 8. Advance state
         state.t = new_t;
-        state.previous_ref = Some(CommitRef::new(commit_cid.clone()));
+        state.previous_ref = Some(commit_cid.clone());
 
         Ok(ImportCommitResult {
             commit_id: commit_cid,
@@ -361,7 +361,7 @@ mod inner {
         );
 
         state.t = new_t;
-        state.previous_ref = Some(CommitRef::new(commit_cid.clone()));
+        state.previous_ref = Some(commit_cid.clone());
 
         Ok(ImportCommitResult {
             commit_id: commit_cid,
@@ -582,7 +582,7 @@ mod inner {
 
         // 9. Advance state
         state.t = new_t;
-        state.previous_ref = Some(CommitRef::new(commit_cid.clone()));
+        state.previous_ref = Some(commit_cid.clone());
 
         Ok(ImportCommitResult {
             commit_id: commit_cid,
@@ -1014,7 +1014,7 @@ mod inner {
         );
 
         state.t = new_t;
-        state.previous_ref = Some(CommitRef::new(commit_cid.clone()));
+        state.previous_ref = Some(commit_cid.clone());
 
         Ok(ImportCommitResult {
             commit_id: commit_cid,

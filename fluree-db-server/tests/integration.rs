@@ -3,7 +3,7 @@ use fluree_db_api::{
     ExportCommitsRequest, ExportCommitsResponse, NamespaceRegistry, PushCommitsRequest,
 };
 use fluree_db_core::{ContentId, Flake, FlakeMeta, FlakeValue, Sid};
-use fluree_db_novelty::{Commit, CommitRef};
+use fluree_db_novelty::Commit;
 use fluree_db_server::config::{AdminAuthMode, DataAuthMode, EventsAuthMode};
 use fluree_db_server::{routes::build_router, AppState, ServerConfig, TelemetryConfig};
 use fluree_vocab::namespaces::{FLUREE_DB, XSD};
@@ -54,7 +54,7 @@ fn json_contains_string(v: &JsonValue, needle: &str) -> bool {
 fn make_commit_bytes(t: i64, previous: Option<&ContentId>, flakes: Vec<Flake>) -> Vec<u8> {
     let mut c = Commit::new(t, flakes);
     if let Some(prev_cid) = previous {
-        c = c.with_previous_ref(CommitRef::new(prev_cid.clone()));
+        c = c.with_previous_ref(prev_cid.clone());
     }
     let res = fluree_db_core::commit::codec::write_commit(&c, true, None).expect("write_commit");
     res.bytes

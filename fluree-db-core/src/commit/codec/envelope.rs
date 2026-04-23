@@ -16,7 +16,7 @@ use super::varint::{
 };
 use crate::ns_encoding::NsSplitMode;
 use crate::ContentId;
-use crate::{CommitRef, TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_ENTRIES};
+use crate::{CommitId, TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_ENTRIES};
 use std::collections::HashMap;
 
 // --- Presence flag bits ---
@@ -63,7 +63,7 @@ pub struct CodecEnvelope {
     /// Parent commit references (CID-based).
     /// Empty for genesis, one element for normal commits.
     /// V2 encoding only supports 0 or 1 parents; multi-parent requires v3.
-    pub previous_refs: Vec<CommitRef>,
+    pub previous_refs: Vec<CommitId>,
     pub namespace_delta: HashMap<u16, String>,
     /// Transaction blob CID
     pub txn: Option<ContentId>,
@@ -148,11 +148,11 @@ pub fn encode_envelope_fields(
             // v3: encode count followed by each commit ref.
             encode_varint(num_parents as u64, buf);
             for prev_ref in &envelope.previous_refs {
-                encode_commit_ref(prev_ref, buf)?;
+                encode_commit_id(prev_ref, buf)?;
             }
         } else {
             // v2: single commit ref (no count prefix).
-            encode_commit_ref(&envelope.previous_refs[0], buf)?;
+            encode_commit_id(&envelope.previous_refs[0], buf)?;
         }
     }
     if !envelope.namespace_delta.is_empty() {
@@ -268,12 +268,12 @@ pub fn decode_envelope(data: &[u8]) -> Result<CodecEnvelope, CommitCodecError> {
             }
             let mut refs = Vec::with_capacity(count);
             for _ in 0..count {
-                refs.push(decode_commit_ref(data, &mut pos)?);
+                refs.push(decode_commit_id(data, &mut pos)?);
             }
             refs
         } else {
             // v2: single commit ref (no count prefix).
-            vec![decode_commit_ref(data, &mut pos)?]
+            vec![decode_commit_id(data, &mut pos)?]
         }
     } else {
         Vec::new()
@@ -422,18 +422,17 @@ fn decode_len_bytes<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8], Com
 }
 
 // =============================================================================
-// CommitRef (binary CID encoding)
+// CommitId (binary CID encoding)
 // =============================================================================
 
-fn encode_commit_ref(cr: &CommitRef, buf: &mut Vec<u8>) -> Result<(), CommitCodecError> {
-    encode_len_bytes(&cr.id.to_bytes(), buf)
+fn encode_commit_id(id: &CommitId, buf: &mut Vec<u8>) -> Result<(), CommitCodecError> {
+    encode_len_bytes(&id.to_bytes(), buf)
 }
 
-fn decode_commit_ref(data: &[u8], pos: &mut usize) -> Result<CommitRef, CommitCodecError> {
+fn decode_commit_id(data: &[u8], pos: &mut usize) -> Result<CommitId, CommitCodecError> {
     let cid_bytes = decode_len_bytes(data, pos)?;
-    let content_id = ContentId::from_bytes(cid_bytes)
-        .map_err(|e| CommitCodecError::EnvelopeDecode(format!("invalid commit ref CID: {e}")))?;
-    Ok(CommitRef::new(content_id))
+    ContentId::from_bytes(cid_bytes)
+        .map_err(|e| CommitCodecError::EnvelopeDecode(format!("invalid commit id CID: {e}")))
 }
 
 // =============================================================================
@@ -674,14 +673,14 @@ mod tests {
     fn test_round_trip_with_previous_ref() {
         let prev_id = make_test_cid(ContentKind::Commit, "prev-commit");
         let mut commit = make_minimal_commit();
-        commit.previous_refs = vec![CommitRef::new(prev_id.clone())];
+        commit.previous_refs = vec![prev_id.clone()];
 
         let mut buf = Vec::new();
         encode_envelope(&commit, &mut buf).unwrap();
 
         let decoded = decode_envelope(&buf).unwrap();
         let decoded_prev = decoded.previous_refs.first().unwrap();
-        assert_eq!(decoded_prev.id, prev_id);
+        assert_eq!(decoded_prev, &prev_id);
     }
 
     #[test]
@@ -825,10 +824,7 @@ mod tests {
         let parent1 = make_test_cid(ContentKind::Commit, "parent-one");
         let parent2 = make_test_cid(ContentKind::Commit, "parent-two");
         let mut commit = make_minimal_commit();
-        commit.previous_refs = vec![
-            CommitRef::new(parent1.clone()),
-            CommitRef::new(parent2.clone()),
-        ];
+        commit.previous_refs = vec![parent1.clone(), parent2.clone()];
 
         let mut buf = Vec::new();
         encode_envelope(&commit, &mut buf).unwrap();
@@ -840,8 +836,8 @@ mod tests {
 
         let decoded = decode_envelope(&buf).unwrap();
         assert_eq!(decoded.previous_refs.len(), 2);
-        assert_eq!(decoded.previous_refs[0].id, parent1);
-        assert_eq!(decoded.previous_refs[1].id, parent2);
+        assert_eq!(decoded.previous_refs[0], parent1);
+        assert_eq!(decoded.previous_refs[1], parent2);
     }
 
     #[test]
@@ -851,7 +847,7 @@ mod tests {
         let txn_id = ContentId::new(ContentKind::Txn, b"golden-txn");
 
         let mut commit = make_minimal_commit();
-        commit.previous_refs = vec![CommitRef::new(prev_id.clone())];
+        commit.previous_refs = vec![prev_id.clone()];
         commit.txn = Some(txn_id.clone());
 
         let mut buf = Vec::new();
@@ -887,7 +883,7 @@ mod tests {
 
         // Decode the golden bytes back and verify CIDs
         let decoded = decode_envelope(&expected).unwrap();
-        assert_eq!(decoded.previous_refs.first().unwrap().id, prev_id);
+        assert_eq!(decoded.previous_refs.first().unwrap(), &prev_id);
         assert_eq!(decoded.txn.as_ref(), Some(&txn_id));
     }
 }

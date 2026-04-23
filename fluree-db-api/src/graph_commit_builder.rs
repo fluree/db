@@ -584,7 +584,7 @@ fn build_commit_detail(
         parents: commit
             .previous_refs
             .iter()
-            .map(|r| r.id.to_string())
+            .map(|r| r.to_string())
             .collect(),
         signer: commit.txn_signature.as_ref().map(|s| s.signer.clone()),
         asserts,
