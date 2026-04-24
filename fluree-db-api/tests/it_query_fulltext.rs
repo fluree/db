@@ -1202,6 +1202,30 @@ async fn fulltext_configured_incremental_adds_to_arena() {
         !rows.is_empty(),
         "incremental indexing must add new configured values to arena: {rows:?}"
     );
+
+    // The pre-existing value from the initial build must still score — an
+    // arena-extend that stomps prior docs would pass the "performance" check
+    // above but regress this one.
+    let prior_query = json!({
+        "@context": {"skosxl": "http://www.w3.org/2008/05/skos-xl#"},
+        "select": ["?lit", "?score"],
+        "where": [
+            {"@id": "?ln", "skosxl:literalForm": "?lit"},
+            ["bind", "?score", "(fulltext ?lit \"competencies\")"],
+            ["filter", "(> ?score 0)"]
+        ]
+    });
+    let prior_result = support::query_jsonld(&fluree, &loaded, &prior_query)
+        .await
+        .expect("prior-value query");
+    let prior_json = prior_result
+        .to_jsonld(&loaded.snapshot)
+        .expect("jsonld prior");
+    let prior_rows = prior_json.as_array().expect("prior rows");
+    assert!(
+        !prior_rows.is_empty(),
+        "incremental indexing must preserve prior arena docs: {prior_rows:?}"
+    );
 }
 
 /// Reproducer for c3000-04 finding: two configured-predicate assertions
