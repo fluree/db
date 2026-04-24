@@ -38,7 +38,7 @@ async fn simple_where_select_limit_without_context_returns_full_iri() {
     let ledger = seed_three_people(&fluree, "misc/simple-where-select:main").await;
 
     let query = json!({
-        "select": ["?s"],
+        "select": "?s",
         // Rust does not treat {"@id":"?s"} alone as a binding pattern; include a predicate.
         "where":  {"@id": "?s", "http://example.org/ns/name": "?name"},
         "orderBy": "?s",
@@ -62,7 +62,7 @@ async fn simple_where_select_limit_with_context_returns_compacted_iri() {
 
     let query = json!({
         "@context": ctx,
-        "select": ["?s"],
+        "select": "?s",
         // Rust does not treat {"@id":"?s"} alone as a binding pattern; include a predicate.
         "where":  {"@id": "?s", "ex:name": "?name"},
         "orderBy": "?s",
@@ -97,7 +97,7 @@ async fn class_queries_type_and_all_types() {
 
     let q1 = json!({
         "@context": ctx,
-        "select": ["?class"],
+        "select": "?class",
         "where": {"@id":"ex:jane","@type":"?class"}
     });
     let r1 = support::query_jsonld(&fluree, &ledger, &q1)
@@ -150,7 +150,7 @@ async fn result_formatting_graph_crawl_variants() {
     // Sanity: the data is queryable via WHERE.
     let sanity = json!({
         "@context": {"ex":"http://example.org/ns/"},
-        "select": ["?v"],
+        "select": "?v",
         "where": {"@id":"ex:dan","ex:x":"?v"}
     });
     let sanity_rows = support::query_jsonld(&fluree, &ledger, &sanity)

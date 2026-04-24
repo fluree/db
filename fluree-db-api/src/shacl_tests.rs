@@ -69,7 +69,7 @@ async fn shacl_cardinality_constraints() {
         .ledger;
     let query = json!({
         "@context": context.clone(),
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id": "ex:john", "schema:name": "?name"}
     });
     let db = crate::GraphDb::from_ledger_state(&ledger_ok);
@@ -151,7 +151,7 @@ async fn shacl_datatype_constraints() {
         .ledger;
     let query = json!({
         "@context": context.clone(),
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id": "ex:john", "schema:name": "?name"}
     });
     let db = crate::GraphDb::from_ledger_state(&ledger_ok);
@@ -312,7 +312,7 @@ async fn shacl_pattern_constraints() {
         .ledger;
     let query = json!({
         "@context": context.clone(),
-        "select": ["?greeting"],
+        "select": "?greeting",
         "where": {"@id": "ex:alice", "ex:greeting": "?greeting"}
     });
     let db = crate::GraphDb::from_ledger_state(&ledger_ok);
@@ -376,7 +376,7 @@ async fn shacl_has_value_constraint() {
         .ledger;
     let query = json!({
         "@context": context.clone(),
-        "select": ["?role"],
+        "select": "?role",
         "where": {"@id": "ex:alice", "schema:role": "?role"}
     });
     let db = crate::GraphDb::from_ledger_state(&ledger_ok);
@@ -440,7 +440,7 @@ async fn shacl_node_kind_constraint() {
         .ledger;
     let query = json!({
         "@context": context.clone(),
-        "select": ["?home"],
+        "select": "?home",
         "where": {"@id": "ex:alice", "schema:homepage": "?home"}
     });
     let db = crate::GraphDb::from_ledger_state(&ledger_ok);
@@ -515,7 +515,7 @@ async fn shacl_closed_constraint() {
         .ledger;
     let query = json!({
         "@context": context.clone(),
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id": "ex:alice", "schema:name": "?name"}
     });
     let db = crate::GraphDb::from_ledger_state(&ledger_ok);
@@ -626,7 +626,7 @@ async fn shacl_pattern_with_flags() {
         .ledger;
     let query = json!({
         "@context": context.clone(),
-        "select": ["?text"],
+        "select": "?text",
         "where": {"@id": "ex:msg1", "ex:text": "?text"}
     });
     let db = crate::GraphDb::from_ledger_state(&ledger_ok);
@@ -695,7 +695,7 @@ async fn shacl_in_constraint() {
         .ledger;
     let query = json!({
         "@context": context.clone(),
-        "select": ["?status"],
+        "select": "?status",
         "where": {"@id": "ex:task1", "ex:status": "?status"}
     });
     let db = crate::GraphDb::from_ledger_state(&ledger_ok);
@@ -762,7 +762,7 @@ async fn shacl_equals_constraint() {
         .ledger;
     let query = json!({
         "@context": context.clone(),
-        "select": ["?date"],
+        "select": "?date",
         "where": {"@id": "ex:event1", "ex:startDate": "?date"}
     });
     let db = crate::GraphDb::from_ledger_state(&ledger_ok);
@@ -1653,7 +1653,7 @@ async fn shacl_not_constraint() {
         .ledger;
     let query = json!({
         "@context": context.clone(),
-        "select": ["?status"],
+        "select": "?status",
         "where": {"@id": "ex:alice", "ex:status": "?status"}
     });
     let db = crate::GraphDb::from_ledger_state(&ledger_ok);
@@ -1737,7 +1737,7 @@ async fn shacl_and_constraint() {
         .ledger;
     let query = json!({
         "@context": context.clone(),
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id": "ex:alice", "schema:name": "?name"}
     });
     let db = crate::GraphDb::from_ledger_state(&ledger_ok);
@@ -1820,7 +1820,7 @@ async fn shacl_or_constraint() {
         .ledger;
     let query = json!({
         "@context": context.clone(),
-        "select": ["?email"],
+        "select": "?email",
         "where": {"@id": "ex:alice", "schema:email": "?email"}
     });
     let db = crate::GraphDb::from_ledger_state(&ledger_ok);
@@ -1903,7 +1903,7 @@ async fn shacl_xone_constraint() {
         .ledger;
     let query = json!({
         "@context": context.clone(),
-        "select": ["?id"],
+        "select": "?id",
         "where": {"@id": "ex:acct1", "ex:personalId": "?id"}
     });
     let db = crate::GraphDb::from_ledger_state(&ledger_ok);

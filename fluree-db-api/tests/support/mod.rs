@@ -272,31 +272,6 @@ pub fn normalize_rows(v: &JsonValue) -> Vec<JsonValue> {
     rows
 }
 
-/// Normalize JSON-LD row results as nested arrays for unordered comparison.
-///
-/// Similar to `normalize_rows` but preserves the inner array structure.
-pub fn normalize_rows_array(v: &JsonValue) -> Vec<Vec<JsonValue>> {
-    let mut rows: Vec<Vec<JsonValue>> = v
-        .as_array()
-        .expect("rows should be an array")
-        .iter()
-        .map(|row| {
-            // JSON-LD formatter flattens single-column selects to a flat array of values.
-            // Preserve a consistent nested-array shape for callers by wrapping scalars.
-            match row.as_array() {
-                Some(arr) => arr.to_vec(),
-                None => vec![row.clone()],
-            }
-        })
-        .collect();
-    rows.sort_by(|a, b| {
-        serde_json::to_string(a)
-            .unwrap()
-            .cmp(&serde_json::to_string(b).unwrap())
-    });
-    rows
-}
-
 /// Normalize SPARQL JSON bindings for unordered comparison.
 ///
 /// Extracts `results.bindings` from a SPARQL JSON response and sorts

@@ -10,9 +10,7 @@ mod support;
 use chrono::{DateTime, Duration, FixedOffset, SecondsFormat, TimeZone, Utc};
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{
-    assert_index_defaults, genesis_ledger, normalize_rows_array, MemoryFluree, MemoryLedger,
-};
+use support::{assert_index_defaults, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use tokio::time::sleep;
 
 fn ctx_test() -> JsonValue {
@@ -86,7 +84,7 @@ async fn query_names_at(
     fluree: &MemoryFluree,
     db_for_formatting: fluree_db_core::GraphDbRef<'_>,
     from_spec: &str,
-) -> Vec<Vec<JsonValue>> {
+) -> Vec<JsonValue> {
     let q = json!({
         "@context": ctx_test(),
         "from": [from_spec],
@@ -101,18 +99,9 @@ async fn query_names_at(
         .await
         .expect("to_jsonld_async");
 
-    // JSON-LD formatter returns single-column results as a flat array.
-    // Normalize to array-of-rows for easy comparison with expectations.
-    let names: Vec<Vec<JsonValue>> = jsonld
-        .as_array()
-        .expect("result array")
-        .iter()
-        .map(|v| vec![v.clone()])
-        .collect();
-
-    normalize_rows_array(&JsonValue::Array(
-        names.iter().map(|r| JsonValue::Array(r.clone())).collect(),
-    ))
+    // JSON-LD formatter returns array-of-arrays for array-form select
+    // (e.g. `select: ["?name"]` → `[["Alice"]]`).
+    normalize_rows(&jsonld)
 }
 
 #[tokio::test]
@@ -132,7 +121,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
             &format!("{ledger_id}@t:1")
         )
         .await,
-        normalize_rows_array(&json!([["Alice"]]))
+        normalize_rows(&json!([["Alice"]]))
     );
     assert_eq!(
         query_names_at(
@@ -141,7 +130,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
             &format!("{ledger_id}@t:2")
         )
         .await,
-        normalize_rows_array(&json!([["Alice"], ["Bob"]]))
+        normalize_rows(&json!([["Alice"], ["Bob"]]))
     );
     assert_eq!(
         query_names_at(
@@ -150,7 +139,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
             &format!("{ledger_id}@t:3")
         )
         .await,
-        normalize_rows_array(&json!([["Alice"], ["Bob"], ["Carol"]]))
+        normalize_rows(&json!([["Alice"], ["Bob"], ["Carol"]]))
     );
 
     // @iso: (use commit timestamp for t=1; should resolve to exactly t=1)
@@ -161,7 +150,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
             &format!("{ledger_id}@iso:{iso_t1}")
         )
         .await,
-        normalize_rows_array(&json!([["Alice"]]))
+        normalize_rows(&json!([["Alice"]]))
     );
 
     // Also ensure @iso: at "now" returns head state.
@@ -173,7 +162,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
             &format!("{ledger_id}@iso:{iso_now}")
         )
         .await,
-        normalize_rows_array(&json!([["Alice"], ["Bob"], ["Carol"]]))
+        normalize_rows(&json!([["Alice"], ["Bob"], ["Carol"]]))
     );
 
     // @commit: — uses hex SHA-256 digest from the ContentId
@@ -188,7 +177,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
             &format!("{ledger_id}@commit:{sha_7}")
         )
         .await,
-        normalize_rows_array(&json!([["Alice"]]))
+        normalize_rows(&json!([["Alice"]]))
     );
     assert_eq!(
         query_names_at(
@@ -197,7 +186,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
             &format!("{ledger_id}@commit:{sha_52}")
         )
         .await,
-        normalize_rows_array(&json!([["Alice"]]))
+        normalize_rows(&json!([["Alice"]]))
     );
     assert_eq!(
         query_names_at(
@@ -206,7 +195,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
             &format!("{ledger_id}@commit:{sha_6}")
         )
         .await,
-        normalize_rows_array(&json!([["Alice"]]))
+        normalize_rows(&json!([["Alice"]]))
     );
 }
 
@@ -238,7 +227,7 @@ async fn time_travel_invalid_format_errors() {
             &format!("{ledger_id}@t:1")
         )
         .await,
-        normalize_rows_array(&json!([["Alice"]]))
+        normalize_rows(&json!([["Alice"]]))
     );
 }
 
@@ -321,7 +310,7 @@ async fn time_travel_iso_too_early_errors() {
             &format!("{ledger_id}@t:1")
         )
         .await,
-        normalize_rows_array(&json!([["Alice"]]))
+        normalize_rows(&json!([["Alice"]]))
     );
 }
 
@@ -372,7 +361,7 @@ async fn time_travel_iso_between_commits_resolves_to_previous_commit() {
             &format!("{ledger_id}@iso:{mid_12}")
         )
         .await,
-        normalize_rows_array(&json!([["Alice"]]))
+        normalize_rows(&json!([["Alice"]]))
     );
     // Mid between t2 and t3 should resolve to t2
     assert_eq!(
@@ -382,7 +371,7 @@ async fn time_travel_iso_between_commits_resolves_to_previous_commit() {
             &format!("{ledger_id}@iso:{mid_23}")
         )
         .await,
-        normalize_rows_array(&json!([["Alice"], ["Bob"]]))
+        normalize_rows(&json!([["Alice"], ["Bob"]]))
     );
 }
 
@@ -441,7 +430,7 @@ async fn time_travel_branch_interaction_main_at_t() {
         .await
         .expect("to_jsonld_async");
 
-    let rows = normalize_rows_array(&jsonld);
+    let rows = normalize_rows(&jsonld);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][1], json!("main-value"));
 }

@@ -56,7 +56,7 @@ async fn seed_users(ledger_id: &str) -> (fluree_db_api::Fluree, LedgerState) {
 async fn query_names(fluree: &fluree_db_api::Fluree, ledger: &LedgerState) -> Vec<String> {
     let q = json!({
         "@context": ctx_ex_schema(),
-        "select": ["?name"],
+        "select": "?name",
         "where": {"schema:name": "?name"}
     });
     let result = support::query_jsonld(fluree, ledger, &q)
@@ -2082,7 +2082,7 @@ async fn update_wildcard_delete_duplicate_facts_across_index_and_novelty() {
                 &txn2.ledger,
                 &json!({
                     "@context": ctx_ex_schema(),
-                    "select": ["?name"],
+                    "select": "?name",
                     "where": { "@id": "ex:space1", "schema:name": "?name" }
                 }),
             )

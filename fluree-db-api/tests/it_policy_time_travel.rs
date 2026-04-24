@@ -45,7 +45,7 @@ async fn policy_applies_to_time_travel_queries() {
     let q_ssn_t1 = json!({
         "@context": {"ex":"http://example.org/ns/","schema":"http://schema.org/"},
         "from": {"@id": ledger_id, "t": 1},
-        "select": ["?ssn"],
+        "select": "?ssn",
         "where": {"@id":"ex:alice", "schema:ssn":"?ssn"}
     });
     let out = fluree
@@ -93,7 +93,7 @@ async fn policy_applies_to_time_travel_queries() {
         "@context": {"ex":"http://example.org/ns/","schema":"http://schema.org/","f":"https://ns.flur.ee/db#"},
         "from": {"@id": ledger_id, "t": 1},
         "opts": {"policy": policy.clone(), "default-allow": true},
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id":"ex:alice", "schema:name":"?name"}
     });
     let out = fluree

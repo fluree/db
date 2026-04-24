@@ -1004,6 +1004,13 @@ pub struct UnresolvedQuery {
     /// For graph crawl queries, this still contains the root variable(s)
     /// needed for execution. The graph_select field controls formatting.
     pub select: Vec<Arc<str>>,
+    /// User-declared projection shape from the input syntax.
+    ///
+    /// `Scalar` for bare-string select (`select: "?x"`), `Tuple` otherwise
+    /// (array form, or SPARQL, which has no scalar form). Propagated into
+    /// `QueryOutput::Select` / `SelectOne` so formatters can decide rendering
+    /// without inferring from `vars.len()`.
+    pub select_shape: crate::parse::lower::ProjectionShape,
     /// Ordered patterns in where clause (triples, filters, optionals, etc.)
     pub patterns: Vec<UnresolvedPattern>,
     /// Query options (limit, offset, order by, group by, etc.)
@@ -1024,6 +1031,7 @@ impl UnresolvedQuery {
             context,
             orig_context: None,
             select: Vec::new(),
+            select_shape: crate::parse::lower::ProjectionShape::default(),
             patterns: Vec::new(),
             options: UnresolvedOptions::default(),
             construct_template: None,

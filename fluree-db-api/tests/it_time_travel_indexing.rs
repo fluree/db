@@ -87,7 +87,7 @@ async fn query_names_at(fluree: &MemoryFluree, from_spec: &str) -> Vec<String> {
     let query = json!({
         "@context": {"ex": "http://example.org/"},
         "from": from_spec,
-        "select": ["?name"],
+        "select": "?name",
         "where": {"@id": "?s", "@type": "ex:Person", "ex:name": "?name"},
         "orderBy": "?name"
     });
@@ -477,7 +477,7 @@ async fn time_travel_updates_across_index_novelty_boundary() {
             let query_t1 = json!({
                 "@context": {"ex": "http://example.org/"},
                 "from": format!("{ledger_id}@t:1"),
-                "select": ["?age"],
+                "select": "?age",
                 "where": {"@id": "ex:alice", "ex:age": "?age"}
             });
             let result = fluree.query_connection(&query_t1).await.expect("query t=1");
@@ -497,7 +497,7 @@ async fn time_travel_updates_across_index_novelty_boundary() {
             let query_t2 = json!({
                 "@context": {"ex": "http://example.org/"},
                 "from": format!("{ledger_id}@t:2"),
-                "select": ["?age"],
+                "select": "?age",
                 "where": {"@id": "ex:alice", "ex:age": "?age"}
             });
             let result = fluree.query_connection(&query_t2).await.expect("query t=2");
@@ -516,7 +516,7 @@ async fn time_travel_updates_across_index_novelty_boundary() {
             let query_current = json!({
                 "@context": {"ex": "http://example.org/"},
                 "from": ledger_id,
-                "select": ["?age"],
+                "select": "?age",
                 "where": {"@id": "ex:alice", "ex:age": "?age"}
             });
             let result = fluree
@@ -733,7 +733,7 @@ async fn query_person_age(fluree: &MemoryFluree, from_spec: &str, person_id: &st
     let query = json!({
         "@context": {"ex": "http://example.org/"},
         "from": from_spec,
-        "select": ["?age"],
+        "select": "?age",
         "where": {"@id": person_id, "ex:age": "?age"}
     });
 

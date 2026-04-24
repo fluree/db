@@ -82,7 +82,7 @@ async fn policy_applies_to_named_graph_queries() {
             let q_private_ssn_no_policy = json!({
                 "@context": {"ex": "http://example.org/ns/", "schema":"http://schema.org/"},
                 "from": {"@id": ledger_id, "graph": "http://example.org/graphs/private"},
-                "select": ["?ssn"],
+                "select": "?ssn",
                 "where": {"@id":"ex:alice", "schema:ssn":"?ssn"}
             });
             let out_private = fluree
@@ -95,7 +95,7 @@ async fn policy_applies_to_named_graph_queries() {
             let q_public_name_no_policy = json!({
                 "@context": {"ex": "http://example.org/ns/", "schema":"http://schema.org/"},
                 "from": {"@id": ledger_id, "graph": "http://example.org/graphs/public"},
-                "select": ["?name"],
+                "select": "?name",
                 "where": {"@id":"ex:alice", "schema:name":"?name"}
             });
             let out_public = fluree
@@ -130,7 +130,7 @@ async fn policy_applies_to_named_graph_queries() {
                 "@context": {"ex": "http://example.org/ns/", "schema":"http://schema.org/", "f":"https://ns.flur.ee/db#"},
                 "from": format!("{ledger_id}#http://example.org/graphs/public"),
                 "opts": {"policy": policy.clone(), "default-allow": true},
-                "select": ["?name"],
+                "select": "?name",
                 "where": {"@id":"ex:alice", "schema:name":"?name"}
             });
 
@@ -146,7 +146,7 @@ async fn policy_applies_to_named_graph_queries() {
                 "@context": {"ex": "http://example.org/ns/", "schema":"http://schema.org/", "f":"https://ns.flur.ee/db#"},
                 "from": {"@id": ledger_id, "graph": "http://example.org/graphs/public"},
                 "opts": {"policy": policy.clone(), "default-allow": true},
-                "select": ["?name"],
+                "select": "?name",
                 "where": {"@id":"ex:alice", "schema:name":"?name"}
             });
 

@@ -155,7 +155,7 @@ async fn modify_policy_allows_own_property() {
     // Verify the update happened
     let (tx_result, _tally) = result.unwrap();
     let query = json!({
-        "select": ["?email"],
+        "select": "?email",
         "where": {
             "@id": "http://example.org/ns/john",
             "http://schema.org/email": "?email"

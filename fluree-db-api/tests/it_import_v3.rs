@@ -403,7 +403,7 @@ ex:bob a ex:User ;
                 "ex": "http://example.org/ns/",
                 "schema": "http://schema.org/"
             },
-            "select": ["?name"],
+            "select": "?name",
             "where": { "schema:name": "?name" }
         }),
     )

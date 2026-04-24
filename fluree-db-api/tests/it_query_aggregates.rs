@@ -183,7 +183,7 @@ async fn aggregates_implicit_grouping_count_all() {
 
     let query = json!({
         "@context": ctx,
-        "select": ["(count ?name)"],
+        "select": "(count ?name)",
         "where": { "schema:name": "?name" }
     });
 
@@ -204,7 +204,7 @@ async fn aggregates_min_implicit_grouping() {
 
     let query = json!({
         "@context": ctx,
-        "select": ["(min ?nums)"],
+        "select": "(min ?nums)",
         "where": { "ex:favNums": "?nums" }
     });
 
@@ -226,7 +226,7 @@ async fn aggregates_max_date_implicit_grouping() {
 
     let query = json!({
         "@context": ctx,
-        "select": ["(max ?birthDate)"],
+        "select": "(max ?birthDate)",
         "where": { "schema:birthDate": "?birthDate" }
     });
 
@@ -291,7 +291,7 @@ async fn aggregates_count_all_favnums_implicit_grouping() {
 
     let query = json!({
         "@context": ctx,
-        "select": ["(count ?favNums)"],
+        "select": "(count ?favNums)",
         "where": [{"@id": "?s", "ex:favNums": "?favNums"}]
     });
 

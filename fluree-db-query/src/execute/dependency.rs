@@ -132,8 +132,8 @@ mod tests {
         select_mode: SelectMode,
     ) -> ParsedQuery {
         let output = match select_mode {
-            SelectMode::Many => QueryOutput::Select(select),
-            SelectMode::One => QueryOutput::SelectOne(select),
+            SelectMode::Many => QueryOutput::select(select),
+            SelectMode::One => QueryOutput::select_one(select),
             SelectMode::Wildcard => QueryOutput::Wildcard,
             SelectMode::Construct => QueryOutput::Construct(ConstructTemplate::new(Vec::new())),
             SelectMode::Boolean => QueryOutput::Boolean,
