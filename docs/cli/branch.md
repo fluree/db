@@ -26,11 +26,14 @@ fluree branch create <NAME> [OPTIONS]
 |--------|-------------|
 | `--ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--from <BRANCH>` | Source branch to create from (defaults to "main") |
+| `--at <COMMIT-REF>` | Commit to branch at (defaults to source branch HEAD). Accepts `t:N` for a transaction number or a hex digest / full CID. |
 | `--remote <REMOTE>` | Execute against a remote server |
 
 **Description:**
 
-Creates a new branch for a ledger. The branch starts at the same transaction time as the source branch and is fully isolated -- subsequent transactions on either branch are invisible to the other.
+Creates a new branch for a ledger. By default the branch starts at the source branch's current HEAD, and is fully isolated — subsequent transactions on either branch are invisible to the other.
+
+Pass `--at` to branch from a historical commit on the source branch instead of its HEAD. The commit must be reachable from the source HEAD; the new branch starts with no index and replays from genesis on first query. `t:N` and hex-prefix resolution require the source branch to be indexed (full CIDs work unconditionally).
 
 Branches can be nested: you can create a branch from any existing branch, not just "main".
 
@@ -45,6 +48,12 @@ fluree branch create dev --ledger mydb
 
 # Create a branch from another branch
 fluree branch create feature-x --from dev
+
+# Branch at a historical point on main (transaction number)
+fluree branch create rewind --at t:5
+
+# Branch at a historical commit by hex-digest prefix
+fluree branch create rewind --at 3dd028a7
 
 # Create a branch on a remote server
 fluree branch create staging --ledger mydb --remote origin
