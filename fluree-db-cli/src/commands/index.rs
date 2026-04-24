@@ -2,6 +2,7 @@ use crate::context::{self, build_fluree, LedgerMode};
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
+use fluree_db_api::wire::ReindexResponse;
 use fluree_db_api::ReindexOptions;
 
 /// Run incremental indexing for a ledger.
@@ -127,19 +128,9 @@ pub async fn run_reindex(
     Ok(())
 }
 
-fn print_reindex_result(result: &serde_json::Value) {
-    let ledger_id = result
-        .get("ledger_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(unknown)");
-    let index_t = result
-        .get("index_t")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
-    let root_id = result
-        .get("root_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(unknown)");
-
-    println!("Reindexed {ledger_id} to t={index_t} (root: {root_id})");
+fn print_reindex_result(result: &ReindexResponse) {
+    println!(
+        "Reindexed {} to t={} (root: {})",
+        result.ledger_id, result.index_t, result.root_id
+    );
 }

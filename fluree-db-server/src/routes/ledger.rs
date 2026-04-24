@@ -11,6 +11,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use fluree_db_api::wire::{ReindexRequest, ReindexResponse};
 use fluree_db_api::{ApiError, BranchDropReport, DropMode, DropReport, DropStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -339,38 +340,6 @@ async fn drop_local(state: Arc<AppState>, request: Request) -> Result<Json<DropR
 // Reindex
 // =============================================================================
 
-/// Reindex request body.
-///
-/// `opts` is reserved for future per-request overrides (e.g. indexer tuning).
-/// It is accepted but ignored today — the server always reindexes using the
-/// indexer settings it is configured with.
-#[derive(Deserialize)]
-pub struct ReindexRequest {
-    /// Ledger alias (e.g. "mydb" or "mydb:main")
-    pub ledger: String,
-    /// Reserved for future use — currently ignored.
-    #[serde(default, rename = "opts")]
-    pub _opts: Option<JsonValue>,
-}
-
-/// Build statistics for a reindex response.
-#[derive(Serialize)]
-pub struct ReindexStats {
-    pub flake_count: usize,
-    pub leaf_count: usize,
-    pub branch_count: usize,
-    pub total_bytes: usize,
-}
-
-/// Reindex response.
-#[derive(Serialize)]
-pub struct ReindexResponse {
-    pub ledger_id: String,
-    pub index_t: i64,
-    pub root_id: String,
-    pub stats: ReindexStats,
-}
-
 /// Full reindex from commit history.
 ///
 /// POST /fluree/reindex
@@ -429,17 +398,7 @@ async fn reindex_local(state: Arc<AppState>, request: Request) -> Result<Json<Re
             index_t = result.index_t,
             "ledger reindex complete"
         );
-        Ok(Json(ReindexResponse {
-            ledger_id: result.ledger_id,
-            index_t: result.index_t,
-            root_id: result.root_id.to_string(),
-            stats: ReindexStats {
-                flake_count: result.stats.flake_count,
-                leaf_count: result.stats.leaf_count,
-                branch_count: result.stats.branch_count,
-                total_bytes: result.stats.total_bytes,
-            },
-        }))
+        Ok(Json(ReindexResponse::from(result)))
     }
     .instrument(span)
     .await

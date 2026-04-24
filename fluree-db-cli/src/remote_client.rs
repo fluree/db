@@ -242,6 +242,15 @@ impl RemoteLedgerClient {
     /// safety net, not a policy knob.
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
+    /// Per-call timeout override for `POST /reindex`.
+    ///
+    /// A full commit-history rebuild on a large ledger can legitimately run
+    /// longer than the default 5-minute request timeout; if the client
+    /// abandons the connection, the server keeps rebuilding but the user
+    /// loses the result. 1 hour is a pragmatic ceiling — the server still
+    /// owns hard cutoffs.
+    pub const REINDEX_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
     /// Create a new remote ledger client with the default 5-minute timeout.
     ///
     /// `base_url` is the Fluree API base (e.g., `http://localhost:8090/fluree`
@@ -452,6 +461,52 @@ impl RemoteLedgerClient {
             // Retry with refreshed token
             let resp2 = self
                 .build_request(method, url, content_type, &body)
+                .send()
+                .await
+                .map_err(Self::map_network_error)?;
+
+            if resp2.status().is_success() {
+                return resp2
+                    .json()
+                    .await
+                    .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+            }
+            return Err(Self::map_error(resp2).await);
+        }
+
+        Err(Self::map_error(resp).await)
+    }
+
+    /// Execute a JSON request with a per-call timeout override.
+    ///
+    /// Used for operations (e.g. `/reindex`) whose legitimate duration can
+    /// exceed `DEFAULT_TIMEOUT`. On 401, attempts token refresh and retries once.
+    async fn send_json_with_timeout(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        content_type: &str,
+        body: Option<RequestBody<'_>>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let resp = self
+            .build_request(method.clone(), url, content_type, &body)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(Self::map_network_error)?;
+
+        if resp.status().is_success() {
+            return resp
+                .json()
+                .await
+                .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+        }
+
+        if resp.status() == StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            let resp2 = self
+                .build_request(method, url, content_type, &body)
+                .timeout(timeout)
                 .send()
                 .await
                 .map_err(Self::map_network_error)?;
@@ -1033,21 +1088,29 @@ impl RemoteLedgerClient {
     ///
     /// Calls `POST {base_url}/reindex` with `{"ledger": "<alias>"}`. The server
     /// rebuilds the ledger's index from commit history using whatever indexer
-    /// settings it is configured with. Response shape mirrors
-    /// `fluree_db_api::ReindexResult` (ledger_id, index_t, root_id, stats).
+    /// settings it is configured with. Uses `REINDEX_TIMEOUT` (1 hour) because
+    /// full rebuilds can legitimately exceed the default client timeout on
+    /// large ledgers.
     ///
     /// An `opts` field is reserved in the request contract for future
     /// per-request overrides but is currently ignored by the server.
-    pub async fn reindex(&self, ledger: &str) -> Result<serde_json::Value, RemoteLedgerError> {
+    pub async fn reindex(
+        &self,
+        ledger: &str,
+    ) -> Result<fluree_db_api::wire::ReindexResponse, RemoteLedgerError> {
         let url = self.op_url_root("reindex");
         let body = serde_json::json!({ "ledger": ledger });
-        self.send_json(
-            reqwest::Method::POST,
-            &url,
-            "application/json",
-            Some(RequestBody::Json(&body)),
-        )
-        .await
+        let raw = self
+            .send_json_with_timeout(
+                reqwest::Method::POST,
+                &url,
+                "application/json",
+                Some(RequestBody::Json(&body)),
+                Self::REINDEX_TIMEOUT,
+            )
+            .await?;
+        serde_json::from_value(raw)
+            .map_err(|e| RemoteLedgerError::InvalidResponse(format!("reindex response: {e}")))
     }
 
     // =========================================================================
