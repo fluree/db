@@ -156,3 +156,364 @@ async fn history_range_emits_sidecar_events_with_op() {
         "history range must emit sidecar events with @op bound; got rows {rows:#?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Helpers shared with the coverage cases below
+// ---------------------------------------------------------------------------
+
+/// Flatten a formatted row into `(?v, ?t, ?op)` strings.
+fn flatten_v_t_op(row: &serde_json::Value) -> (String, i64, String) {
+    let v = row
+        .get("?v")
+        .and_then(|x| x.get("@value"))
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let t = row
+        .get("?t")
+        .and_then(|x| x.get("@value"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(-1);
+    let op = row
+        .get("?op")
+        .and_then(|x| x.get("@value").or(Some(x)))
+        .and_then(|x| x.as_str())
+        .unwrap_or("null")
+        .to_string();
+    (v, t, op)
+}
+
+async fn run_history_query(
+    fluree: &fluree_db_api::Fluree,
+    q: &serde_json::Value,
+) -> Vec<(String, i64, String)> {
+    let result = fluree
+        .query_from()
+        .jsonld(q)
+        .format(FormatterConfig::typed_json().with_normalize_arrays())
+        .execute_tracked()
+        .await
+        .expect("history range query");
+    let value = serde_json::to_value(&result.result).expect("serialize");
+    value
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .map(flatten_v_t_op)
+        .collect()
+}
+
+/// Variant for queries that select only `?v, ?t` (e.g. when `@op` is a
+/// constant filter rather than a bound variable).
+async fn run_history_query_no_op(
+    fluree: &fluree_db_api::Fluree,
+    q: &serde_json::Value,
+) -> Vec<(String, i64)> {
+    let result = fluree
+        .query_from()
+        .jsonld(q)
+        .format(FormatterConfig::typed_json().with_normalize_arrays())
+        .execute_tracked()
+        .await
+        .expect("history range query");
+    let value = serde_json::to_value(&result.result).expect("serialize");
+    value
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .map(|row| {
+            let v = row
+                .get("?v")
+                .and_then(|x| x.get("@value"))
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let t = row
+                .get("?t")
+                .and_then(|x| x.get("@value"))
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(-1);
+            (v, t)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Case: novelty-only history (no reindex between commits).
+//
+// Verifies the path through `flakes_to_bindings:~704`, which already
+// populated `op` from `flake.op` for overlay/novelty flakes. The new
+// `BinaryHistoryScanOperator` must not regress that path.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn history_range_novelty_only() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let ledger_id = "test/history-novelty:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+
+    // t=1 Alice / t=2 rename Alice→Alice Smith. No reindex: everything
+    // stays in novelty.
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice"}),
+        )
+        .await
+        .expect("tx1");
+    let r2 = fluree
+        .upsert(
+            r1.ledger,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice Smith"}),
+        )
+        .await
+        .expect("tx2");
+    assert_eq!(r2.receipt.t, 2);
+
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "select": ["?v", "?t", "?op"],
+        "where": [{
+            "@id": "ex:alice",
+            "ex:name": {"@value": "?v", "@t": "?t", "@op": "?op"}
+        }],
+        "orderBy": ["?t", "?op", "?v"],
+    });
+
+    let rows = run_history_query(&fluree, &q).await;
+    let expected: Vec<(String, i64, String)> = vec![
+        ("Alice".to_string(), 1, "assert".to_string()),
+        ("Alice Smith".to_string(), 2, "assert".to_string()),
+        ("Alice".to_string(), 2, "retract".to_string()),
+    ];
+    assert_eq!(rows, expected, "novelty-only history must also bind @op");
+}
+
+// ---------------------------------------------------------------------------
+// Case: `@op` as a constant filter — asserts only.
+//
+// The parser lowers `{"@op": "assert"}` into `FILTER(op(?v) = "assert")`.
+// That filter runs downstream of the scan, so the history operator
+// just needs to emit rows with op populated and the FILTER does the rest.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn history_range_op_constant_filter_assert() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let ledger_id = "test/history-op-filter:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice"}),
+        )
+        .await
+        .expect("tx1");
+    assert_eq!(reindex_to_current(&fluree, ledger_id).await, 1);
+    let _ = fluree
+        .upsert(
+            r1.ledger,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice Smith"}),
+        )
+        .await
+        .expect("tx2");
+    assert_eq!(reindex_to_current(&fluree, ledger_id).await, 2);
+
+    // Ask only for asserts. `@op: "assert"` is a FILTER constant, not a
+    // BIND — `?op` never exists as a variable, so select only `?v`/`?t`
+    // and assert the filter returns both assert events and no retracts.
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "select": ["?v", "?t"],
+        "where": [{
+            "@id": "ex:alice",
+            "ex:name": {"@value": "?v", "@t": "?t", "@op": "assert"}
+        }],
+        "orderBy": ["?t", "?v"],
+    });
+    let rows = run_history_query_no_op(&fluree, &q).await;
+    let expected: Vec<(String, i64)> =
+        vec![("Alice".to_string(), 1), ("Alice Smith".to_string(), 2)];
+    assert_eq!(
+        rows, expected,
+        "@op=\"assert\" filter must return only assert events"
+    );
+}
+
+#[tokio::test]
+async fn history_range_op_constant_filter_retract() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let ledger_id = "test/history-op-filter-retract:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice"}),
+        )
+        .await
+        .expect("tx1");
+    assert_eq!(reindex_to_current(&fluree, ledger_id).await, 1);
+    let _ = fluree
+        .upsert(
+            r1.ledger,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice Smith"}),
+        )
+        .await
+        .expect("tx2");
+    assert_eq!(reindex_to_current(&fluree, ledger_id).await, 2);
+
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "select": ["?v", "?t"],
+        "where": [{
+            "@id": "ex:alice",
+            "ex:name": {"@value": "?v", "@t": "?t", "@op": "retract"}
+        }],
+        "orderBy": ["?t", "?v"],
+    });
+    let rows = run_history_query_no_op(&fluree, &q).await;
+    let expected: Vec<(String, i64)> = vec![("Alice".to_string(), 2)];
+    assert_eq!(
+        rows, expected,
+        "@op=\"retract\" filter must return only retract events"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Case: sidecar + novelty boundary. Reindex t=1, transact t=2 (stays in
+// novelty), query spanning the boundary. Exercises the `to_t > index_t`
+// novelty merge path.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn history_range_sidecar_plus_novelty_boundary() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let ledger_id = "test/history-boundary:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+
+    // t=1: assert "Alice". Index at t=1.
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice"}),
+        )
+        .await
+        .expect("tx1");
+    assert_eq!(reindex_to_current(&fluree, ledger_id).await, 1);
+
+    // t=2: upsert "Alice Smith". DO NOT reindex — retract+assert stay
+    // in novelty, crossing the index_t boundary.
+    let _ = fluree
+        .upsert(
+            r1.ledger,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice Smith"}),
+        )
+        .await
+        .expect("tx2");
+    let status = fluree.index_status(ledger_id).await.expect("index_status");
+    assert_eq!(status.index_t, 1);
+    assert_eq!(status.commit_t, 2);
+
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "select": ["?v", "?t", "?op"],
+        "where": [{
+            "@id": "ex:alice",
+            "ex:name": {"@value": "?v", "@t": "?t", "@op": "?op"}
+        }],
+        "orderBy": ["?t", "?op", "?v"],
+    });
+    let rows = run_history_query(&fluree, &q).await;
+    let expected: Vec<(String, i64, String)> = vec![
+        // t=1 assert comes from base (base t=1 ≤ persisted_to_t=1)
+        ("Alice".to_string(), 1, "assert".to_string()),
+        // t=2 assert+retract come from novelty ((index_t, to_t])
+        ("Alice Smith".to_string(), 2, "assert".to_string()),
+        ("Alice".to_string(), 2, "retract".to_string()),
+    ];
+    assert_eq!(
+        rows, expected,
+        "history merge across index_t boundary must include novelty events"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Case: subject-unbound history. No subject in the pattern; walks the
+// branch (predicate-bound so leaflet p_const filter helps).
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn history_range_subject_unbound() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let ledger_id = "test/history-unbound-subject:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+
+    // t=1: two subjects get names.
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx(), "@graph": [
+                {"@id": "ex:alice", "ex:name": "Alice"},
+                {"@id": "ex:bob",   "ex:name": "Bob"},
+            ]}),
+        )
+        .await
+        .expect("tx1");
+    assert_eq!(reindex_to_current(&fluree, ledger_id).await, 1);
+
+    // t=2: rename Alice only.
+    let _ = fluree
+        .upsert(
+            r1.ledger,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alice Smith"}),
+        )
+        .await
+        .expect("tx2");
+    assert_eq!(reindex_to_current(&fluree, ledger_id).await, 2);
+
+    // Subject is a variable; only predicate is bound.
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "select": ["?v", "?t", "?op"],
+        "where": [{
+            "@id": "?s",
+            "ex:name": {"@value": "?v", "@t": "?t", "@op": "?op"}
+        }],
+        "orderBy": ["?t", "?op", "?v"],
+    });
+    let rows = run_history_query(&fluree, &q).await;
+    // t=1: Alice+assert, Bob+assert; t=2: Alice Smith+assert, Alice+retract
+    let expected: Vec<(String, i64, String)> = vec![
+        ("Alice".to_string(), 1, "assert".to_string()),
+        ("Bob".to_string(), 1, "assert".to_string()),
+        ("Alice Smith".to_string(), 2, "assert".to_string()),
+        ("Alice".to_string(), 2, "retract".to_string()),
+    ];
+    assert_eq!(
+        rows, expected,
+        "subject-unbound history must walk all matching leaflets"
+    );
+}

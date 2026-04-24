@@ -189,7 +189,7 @@ pub async fn execute_pattern(
     pattern: TriplePattern,
 ) -> Result<Vec<Batch>> {
     let ctx = ExecutionContext::from_graph_db_ref(db, vars);
-    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
+    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
 
     scan.open(&ctx).await?;
 
@@ -249,7 +249,7 @@ pub async fn execute_pattern_at(
     from_t: Option<i64>,
 ) -> Result<Vec<Batch>> {
     let ctx = ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t);
-    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
+    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
 
     scan.open(&ctx).await?;
 
@@ -273,7 +273,7 @@ pub async fn execute_pattern_with_overlay(
     pattern: TriplePattern,
 ) -> Result<Vec<Batch>> {
     let ctx = ExecutionContext::from_graph_db_ref(db, vars);
-    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
+    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
 
     scan.open(&ctx).await?;
 
@@ -296,7 +296,7 @@ pub async fn execute_pattern_with_overlay_at(
     from_t: Option<i64>,
 ) -> Result<Vec<Batch>> {
     let ctx = ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t);
-    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
+    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
 
     scan.open(&ctx).await?;
 

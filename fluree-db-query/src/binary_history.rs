@@ -25,8 +25,45 @@
 //! - leaflet-level skip via `p_const`, `o_type_const`, and
 //!   `history_max_t < from_t`
 //!
-//! Non-history queries and queries with no binary store fall through
-//! to `BinaryScanOperator::open` unchanged.
+//! Non-history queries delegate to `BinaryScanOperator::open` unchanged.
+//! History queries always go through `collect_history_flakes`, even when
+//! no binary store is attached: in the no-store case the persisted pass
+//! is skipped (`index_t = -1`) and the novelty walk is the whole event
+//! stream. This is deliberate — the core `range_with_overlay` genesis
+//! path calls `remove_stale_flakes` which drops retracts, and that's
+//! wrong for history mode.
+//!
+//! ## Cost model
+//!
+//! All heavy lifting happens in `open()` (three-source collection into
+//! a `Vec<Flake>`), so that's where the fuel guardrail lives.
+//!
+//! - **Persisted pass:** 1000 micro-fuel per leaflet touched — same
+//!   rate `BinaryCursor::next_batch` uses for non-history scans.
+//! - **Novelty pass:** 1 micro-fuel per matched novelty flake, charged
+//!   during the walk. A captured `FuelExceededError` short-circuits the
+//!   walk on the next callback invocation.
+//! - **Per-flake emit:** 1 micro-fuel per flake is charged downstream in
+//!   `flakes_to_bindings` when `next_batch` drains the collected vec.
+//!
+//! Together these keep a broad unindexed or index-lagged history query
+//! from doing unbounded eager work before the caller sees the first
+//! batch.
+//!
+//! ## Known follow-ups
+//!
+//! - **Per-leaf sidecar pruning.** `open_leaf_handle(..., need_replay=true)`
+//!   fetches the whole sidecar blob up front. For leaves whose directory
+//!   doesn't yet reveal any leaflet with `history_max_t >= from_t`, this
+//!   is wasted I/O on local/cached reads. Fixing this cleanly needs
+//!   either a two-pass open (dir first, sidecar on demand) or leaf-level
+//!   `history_max_t` on `LeafEntry` so we can prune without opening.
+//!   Tracked for a follow-up.
+//! - **Streaming emit.** `collect_history_flakes` materialises the full
+//!   matched event set before `next_batch` drains it. Bound-subject /
+//!   bound-predicate queries match a tiny set so this is cheap. Broad
+//!   queries (`?s ?p ?o` across a wide range) can benefit from a
+//!   leaflet-at-a-time streaming cursor — also tracked as a follow-up.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -50,9 +87,12 @@ use crate::var_registry::VarId;
 /// Scan operator that activates a dedicated history-range walk when
 /// `ctx.history_mode` is true.
 ///
-/// When history mode is not active (or no binary store is available),
-/// this wrapper transparently delegates to `BinaryScanOperator` — the
-/// regular scan path is unchanged.
+/// When history mode is not active, this wrapper transparently delegates
+/// to `BinaryScanOperator::open` — the regular scan path is unchanged.
+/// When history mode is active, the operator runs its own three-source
+/// merge (sidecar + base + novelty) regardless of whether a binary store
+/// is attached: an unindexed ledger just skips the persisted pass and
+/// takes the full event stream from novelty.
 pub struct BinaryHistoryScanOperator {
     inner: BinaryScanOperator,
     pattern: TriplePattern,
@@ -121,146 +161,164 @@ impl BinaryHistoryScanOperator {
     /// in-range base rows, merges with overlay/novelty events, and
     /// returns flakes with explicit `op`.
     async fn collect_history_flakes(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<Flake>> {
-        let store = ctx
-            .binary_store
-            .clone()
-            .ok_or_else(|| QueryError::Internal("history scan: no binary store".into()))?;
         let snapshot = ctx.active_snapshot;
         let no_overlay = NoOverlay;
         let overlay: &dyn OverlayProvider = ctx.overlay.unwrap_or(&no_overlay);
         let g_id: GraphId = ctx.binary_g_id;
 
-        let index_t = store.max_t();
+        // Index / novelty boundary. When no binary store is attached
+        // (e.g. a ledger that's never been indexed), treat everything as
+        // novelty: `index_t = -1` makes the persisted pass a no-op and
+        // the novelty merge picks up all in-range overlay events.
+        let (store_opt, index_t) = match ctx.binary_store.clone() {
+            Some(store) => {
+                let t = store.max_t();
+                (Some(store), t)
+            }
+            None => (None, -1_i64),
+        };
         let from_t = ctx.from_t.unwrap_or(0);
         let to_t = ctx.to_t;
-        // Persisted-side upper bound is clamped to index_t; anything above
-        // lives in novelty and is merged below.
         let persisted_to_t = to_t.min(index_t);
 
         // Encode bound pattern components through the snapshot to match
-        // the persisted ID space.
+        // the persisted ID space. (`build_filter_from_snapshot_sids`
+        // needs a store for s_id/p_id resolution in the persisted pass;
+        // novelty-only doesn't need the filter since we apply
+        // `flake_matches_range_eq` on decoded flakes.)
         let (s_sid, p_sid, o_val_opt) =
             BinaryScanOperator::extract_bound_terms_snapshot(snapshot, &self.pattern);
-        let filter = BinaryScanOperator::build_filter_from_snapshot_sids(
-            snapshot,
-            &self.pattern,
-            store.as_ref(),
-            &s_sid,
-            &p_sid,
-        )
-        .map_err(|e| QueryError::Internal(format!("history scan: build_filter: {e}")))?;
-
-        let order = self.pick_order(&filter);
 
         let mut flakes: Vec<Flake> = Vec::new();
 
         // ---- Persisted sources (sidecar + base rows in range) ----
-        if from_t <= persisted_to_t {
-            if let Some(branch) = store.branch_for_order(g_id, order) {
-                let leaf_indices = leaf_index_range(branch, &filter, order);
-                let view = BinaryGraphView::with_novelty(
-                    Arc::clone(&store),
-                    g_id,
-                    ctx.dict_novelty.clone(),
-                );
+        if let Some(store) = store_opt.as_ref() {
+            if from_t <= persisted_to_t {
+                let filter = BinaryScanOperator::build_filter_from_snapshot_sids(
+                    snapshot,
+                    &self.pattern,
+                    store.as_ref(),
+                    &s_sid,
+                    &p_sid,
+                )
+                .map_err(|e| QueryError::Internal(format!("history scan: build_filter: {e}")))?;
+                let order = self.pick_order(&filter);
+                if let Some(branch) = store.branch_for_order(g_id, order) {
+                    let leaf_indices = leaf_index_range(branch, &filter, order);
+                    let view = BinaryGraphView::with_novelty(
+                        Arc::clone(store),
+                        g_id,
+                        ctx.dict_novelty.clone(),
+                    );
 
-                let from_t_u32 = clamp_t_u32(from_t);
-                let persisted_to_u32 = clamp_t_u32(persisted_to_t);
+                    let from_t_u32 = clamp_t_u32(from_t);
+                    let persisted_to_u32 = clamp_t_u32(persisted_to_t);
 
-                for leaf_idx in leaf_indices {
-                    let entry = &branch.leaves[leaf_idx];
-                    let handle = store
-                        .open_leaf_handle(&entry.leaf_cid, entry.sidecar_cid.as_ref(), true)
-                        .map_err(|e| QueryError::from_io("history scan open_leaf_handle", e))?;
-                    let dir = handle.dir();
+                    for leaf_idx in leaf_indices {
+                        let entry = &branch.leaves[leaf_idx];
+                        let handle = store
+                            .open_leaf_handle(&entry.leaf_cid, entry.sidecar_cid.as_ref(), true)
+                            .map_err(|e| QueryError::from_io("history scan open_leaf_handle", e))?;
+                        let dir = handle.dir();
 
-                    for (leaflet_idx, leaflet) in dir.entries.iter().enumerate() {
-                        if !leaflet_matches_filter(leaflet, &filter) {
-                            continue;
-                        }
+                        for (leaflet_idx, leaflet) in dir.entries.iter().enumerate() {
+                            if !leaflet_matches_filter(leaflet, &filter) {
+                                continue;
+                            }
 
-                        // Sidecar: only load when the segment's t range can
-                        // overlap [from_t, persisted_to_t].
-                        let sidecar_in_range = leaflet.history_len > 0
-                            && leaflet.history_max_t >= from_t_u32
-                            && leaflet.history_min_t <= persisted_to_u32;
-                        if sidecar_in_range {
-                            let segment =
-                                handle.load_sidecar_segment(leaflet_idx).map_err(|e| {
-                                    QueryError::from_io("history scan load_sidecar_segment", e)
-                                })?;
-                            for entry_v2 in &segment {
-                                let s_id = entry_v2.s_id.as_u64();
-                                if !filter.matches(
-                                    s_id,
-                                    entry_v2.p_id,
-                                    entry_v2.o_type,
-                                    entry_v2.o_key,
-                                    entry_v2.o_i,
-                                ) {
-                                    continue;
-                                }
-                                let t = entry_v2.t as i64;
-                                if t < from_t || t > persisted_to_t {
-                                    continue;
-                                }
-                                let op = entry_v2.op == 1;
-                                if let Some(flake) = decode_event_to_flake(
-                                    &view,
-                                    store.as_ref(),
-                                    s_id,
-                                    entry_v2.p_id,
-                                    entry_v2.o_type,
-                                    entry_v2.o_key,
-                                    entry_v2.o_i,
-                                    t,
-                                    op,
-                                )? {
-                                    flakes.push(flake);
+                            // Charge 1 fuel (1000 micro-fuel) per leaflet we touch,
+                            // mirroring `BinaryCursor::next_batch` for the non-history
+                            // scan path. This is the cost-model guardrail — without
+                            // it, a broad history query could do unbounded column /
+                            // sidecar loads in `open()` before the caller ever sees
+                            // the first batch.
+                            ctx.tracker.consume_fuel(1000)?;
+
+                            // Sidecar: only load when the segment's t range can
+                            // overlap [from_t, persisted_to_t].
+                            let sidecar_in_range = leaflet.history_len > 0
+                                && leaflet.history_max_t >= from_t_u32
+                                && leaflet.history_min_t <= persisted_to_u32;
+                            if sidecar_in_range {
+                                let segment =
+                                    handle.load_sidecar_segment(leaflet_idx).map_err(|e| {
+                                        QueryError::from_io("history scan load_sidecar_segment", e)
+                                    })?;
+                                for entry_v2 in &segment {
+                                    let s_id = entry_v2.s_id.as_u64();
+                                    if !filter.matches(
+                                        s_id,
+                                        entry_v2.p_id,
+                                        entry_v2.o_type,
+                                        entry_v2.o_key,
+                                        entry_v2.o_i,
+                                    ) {
+                                        continue;
+                                    }
+                                    let t = entry_v2.t as i64;
+                                    if t < from_t || t > persisted_to_t {
+                                        continue;
+                                    }
+                                    let op = entry_v2.op == 1;
+                                    if let Some(flake) = decode_event_to_flake(
+                                        &view,
+                                        store.as_ref(),
+                                        s_id,
+                                        entry_v2.p_id,
+                                        entry_v2.o_type,
+                                        entry_v2.o_key,
+                                        entry_v2.o_i,
+                                        t,
+                                        op,
+                                    )? {
+                                        flakes.push(flake);
+                                    }
                                 }
                             }
-                        }
 
-                        // Base rows: emit rows whose t falls in range as asserts.
-                        if leaflet.row_count > 0 {
-                            let projection = ColumnProjection::all();
-                            let batch = handle
-                                .load_columns(leaflet_idx, &projection, order)
-                                .map_err(|e| QueryError::from_io("history scan load_columns", e))?;
-                            for i in 0..batch.row_count {
-                                let s_id = batch.s_id.get(i);
-                                let p_id = batch.p_id.get_or(i, 0);
-                                let o_type = batch.o_type.get_or(i, 0);
-                                let o_key = batch.o_key.get(i);
-                                let o_i = batch.o_i.get_or(i, u32::MAX);
-                                let t_u32 = batch.t.get_or(i, 0);
-                                let t = t_u32 as i64;
+                            // Base rows: emit rows whose t falls in range as asserts.
+                            if leaflet.row_count > 0 {
+                                let projection = ColumnProjection::all();
+                                let batch = handle
+                                    .load_columns(leaflet_idx, &projection, order)
+                                    .map_err(|e| {
+                                        QueryError::from_io("history scan load_columns", e)
+                                    })?;
+                                for i in 0..batch.row_count {
+                                    let s_id = batch.s_id.get(i);
+                                    let p_id = batch.p_id.get_or(i, 0);
+                                    let o_type = batch.o_type.get_or(i, 0);
+                                    let o_key = batch.o_key.get(i);
+                                    let o_i = batch.o_i.get_or(i, u32::MAX);
+                                    let t_u32 = batch.t.get_or(i, 0);
+                                    let t = t_u32 as i64;
 
-                                if !filter.matches(s_id, p_id, o_type, o_key, o_i) {
-                                    continue;
-                                }
-                                if t < from_t || t > persisted_to_t {
-                                    continue;
-                                }
-                                if let Some(flake) = decode_event_to_flake(
-                                    &view,
-                                    store.as_ref(),
-                                    s_id,
-                                    p_id,
-                                    o_type,
-                                    o_key,
-                                    o_i,
-                                    t,
-                                    true,
-                                )? {
-                                    flakes.push(flake);
+                                    if !filter.matches(s_id, p_id, o_type, o_key, o_i) {
+                                        continue;
+                                    }
+                                    if t < from_t || t > persisted_to_t {
+                                        continue;
+                                    }
+                                    if let Some(flake) = decode_event_to_flake(
+                                        &view,
+                                        store.as_ref(),
+                                        s_id,
+                                        p_id,
+                                        o_type,
+                                        o_key,
+                                        o_i,
+                                        t,
+                                        true,
+                                    )? {
+                                        flakes.push(flake);
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            }
-        }
+                } // end `if let Some(branch)`
+            } // end `if from_t <= persisted_to_t`
+        } // end `if let Some(store)`
 
         // ---- Novelty events in (index_t, to_t] ----
         if to_t > index_t {
@@ -273,7 +331,20 @@ impl BinaryHistoryScanOperator {
                 t: None,
             };
 
+            // Cost model: charge 1 fuel per matched novelty flake, **during**
+            // collection. Without this, an unindexed ledger with large
+            // novelty or a broad history query could do unbounded eager
+            // work in `open()` before the caller sees the first batch.
+            // We apply the full pattern filter (s/p/o + object bounds)
+            // inside the walk so we only charge for flakes we actually
+            // retain — otherwise a wide predicate like `?s ?p ?o` on a
+            // crowded novelty slice would charge for every flake touched
+            // even when our pattern only matches a sliver. `for_each_overlay_flake`'s
+            // callback cannot return a Result, so we capture any
+            // `FuelExceededError` and surface it after the walk.
+            let object_bounds = self.object_bounds.as_ref();
             let mut novelty: Vec<Flake> = Vec::new();
+            let mut fuel_err: Option<fluree_db_core::FuelExceededError> = None;
             overlay.for_each_overlay_flake(
                 g_id,
                 self.inner_index(),
@@ -282,14 +353,29 @@ impl BinaryHistoryScanOperator {
                 true,
                 to_t,
                 &mut |f| {
-                    if f.t > index_t && f.t <= to_t && f.t >= from_t {
-                        novelty.push(f.clone());
+                    if fuel_err.is_some() {
+                        return;
                     }
+                    if f.t <= index_t || f.t > to_t || f.t < from_t {
+                        return;
+                    }
+                    if !flake_matches_range_eq(f, &match_val) {
+                        return;
+                    }
+                    if let Some(bounds) = object_bounds {
+                        if !bounds.matches(&f.o) {
+                            return;
+                        }
+                    }
+                    if let Err(e) = ctx.tracker.consume_fuel(1) {
+                        fuel_err = Some(e);
+                        return;
+                    }
+                    novelty.push(f.clone());
                 },
             );
-            novelty.retain(|f| flake_matches_range_eq(f, &match_val));
-            if let Some(bounds) = &self.object_bounds {
-                novelty.retain(|f| bounds.matches(&f.o));
+            if let Some(e) = fuel_err {
+                return Err(e.into());
             }
             flakes.extend(novelty);
         }
@@ -321,13 +407,18 @@ impl Operator for BinaryHistoryScanOperator {
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        if !ctx.history_mode || ctx.binary_store.is_none() {
-            // Non-history queries, or queries with no binary index store,
-            // go through the unchanged scan path.
+        if !ctx.history_mode {
+            // Non-history queries go through the unchanged scan path.
             return self.inner.open(ctx).await;
         }
-        // Policy enforcement via per-flake async checks is honored below
-        // in `collect_history_flakes` (via `filter_flakes_by_policy`).
+        // History mode: we always collect flakes ourselves (with explicit op
+        // preservation) rather than going through `BinaryScanOperator::open`.
+        // The non-history path in the core `range_with_overlay` genesis
+        // fallback calls `remove_stale_flakes`, which drops retracts — fine
+        // for current-state queries but wrong for history. Running our own
+        // collector handles both the indexed and novelty-only cases
+        // correctly. Policy enforcement is applied in
+        // `collect_history_flakes` via `filter_flakes_by_policy`.
         let flakes = self.collect_history_flakes(ctx).await?;
         self.inner.prime_history_flakes(ctx, flakes)
     }
