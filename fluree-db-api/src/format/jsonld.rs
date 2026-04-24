@@ -16,7 +16,6 @@ use super::{FormatError, Result};
 use crate::QueryResult;
 use fluree_db_core::FlakeValue;
 use fluree_db_query::binding::Binding;
-use fluree_db_query::parse::ProjectionShape;
 use fluree_vocab::rdf;
 use serde_json::{json, Map, Value as JsonValue};
 
@@ -58,9 +57,7 @@ pub fn format(
     // JSON-LD `select: "?x"` (bare-string form), which is the user's opt-in
     // to scalar output. SPARQL and JSON-LD array-form select use `Tuple`
     // and skip this step — their rows stay tabular.
-    if result.output.projection_shape() == Some(ProjectionShape::Scalar)
-        && result.output.select_vars_or_empty().len() == 1
-    {
+    if result.output.should_flatten_scalar() {
         rows = rows
             .into_iter()
             .map(|row| match row {

@@ -182,6 +182,21 @@ impl QueryOutput {
         }
     }
 
+    /// Returns `true` iff rows should be flattened from `[v]` to `v` at format
+    /// time. True only when the user opted into scalar output via JSON-LD
+    /// `select: "?x"` (bare-string form) AND there is exactly one projected
+    /// variable. Wildcard, Construct, Boolean, and `Tuple`-shaped Select all
+    /// return `false`, so tabular output (SPARQL + JSON-LD array-form select)
+    /// is preserved.
+    pub fn should_flatten_scalar(&self) -> bool {
+        match self {
+            QueryOutput::Select { vars, shape } | QueryOutput::SelectOne { vars, shape } => {
+                *shape == ProjectionShape::Scalar && vars.len() == 1
+            }
+            _ => false,
+        }
+    }
+
     /// Get the construct template for Construct, `None` otherwise.
     pub fn construct_template(&self) -> Option<&ConstructTemplate> {
         match self {
