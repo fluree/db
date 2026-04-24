@@ -5,7 +5,7 @@
 
 mod support;
 
-use fluree_db_api::FlureeBuilder;
+use fluree_db_api::{CommitRef, FlureeBuilder};
 use serde_json::json;
 
 /// Extract sorted name strings from query result rows.
@@ -231,6 +231,85 @@ async fn branch_t_advances_independently() {
     // Dev is at t=3
     let dev = fluree.ledger("mydb:dev").await.unwrap();
     assert_eq!(dev.t(), 3);
+}
+
+/// Branch at a historical commit via `CommitRef::Exact`.
+///
+/// Main advances to t=3. We branch at the t=2 commit and verify the new
+/// branch starts at t=2 with no index (replay-from-genesis path).
+#[tokio::test]
+async fn create_branch_at_historical_commit() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let ctx = json!({"ex": "http://example.org/ns/"});
+
+    // t=1, t=2, t=3 on main — capture the t=2 commit id
+    let r1 = fluree
+        .insert(ledger, &json!({"@context": ctx, "@graph": [{"@id": "ex:a", "ex:val": 1}]}))
+        .await
+        .unwrap();
+    let r2 = fluree
+        .insert(r1.ledger, &json!({"@context": ctx, "@graph": [{"@id": "ex:b", "ex:val": 2}]}))
+        .await
+        .unwrap();
+    let t2_commit_id = r2.receipt.commit_id.clone();
+    let _r3 = fluree
+        .insert(r2.ledger, &json!({"@context": ctx, "@graph": [{"@id": "ex:c", "ex:val": 3}]}))
+        .await
+        .unwrap();
+
+    // Branch at t=2
+    let record = fluree
+        .create_branch("mydb", "historical", None, Some(CommitRef::Exact(t2_commit_id.clone())))
+        .await
+        .unwrap();
+
+    assert_eq!(record.commit_head_id.as_ref(), Some(&t2_commit_id));
+    assert_eq!(record.commit_t, 2);
+    assert!(
+        record.index_head_id.is_none(),
+        "historical branch should skip index copy"
+    );
+    assert_eq!(record.source_branch.as_deref(), Some("main"));
+
+    // The branch loads at t=2, not at main's current head (t=3)
+    let branch = fluree.ledger("mydb:historical").await.unwrap();
+    assert_eq!(branch.t(), 2);
+}
+
+/// Branching from a commit that isn't reachable from source HEAD is rejected.
+#[tokio::test]
+async fn create_branch_at_non_ancestor_commit_fails() {
+    use fluree_db_api::ContentId;
+    use fluree_db_core::ContentKind;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:seed", "ex:val": 1}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Fabricate a CID that isn't in the ledger's history
+    let bogus = ContentId::new(ContentKind::Commit, b"not-a-real-commit");
+
+    let err = fluree
+        .create_branch("mydb", "dev", None, Some(CommitRef::Exact(bogus)))
+        .await
+        .expect_err("non-ancestor commit should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not found") || msg.contains("not an ancestor"),
+        "expected not-found/not-ancestor error, got: {msg}"
+    );
 }
 
 /// Dropping a leaf branch (no children) fully deletes it.
