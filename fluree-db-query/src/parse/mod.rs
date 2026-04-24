@@ -2712,7 +2712,9 @@ mod tests {
 
         let optional = find_optional(&ast.patterns).expect("Should have optional");
         assert_eq!(optional.len(), 2);
-        assert!(optional.iter().all(super::ast::UnresolvedPattern::is_triple));
+        assert!(optional
+            .iter()
+            .all(super::ast::UnresolvedPattern::is_triple));
     }
 
     #[test]
