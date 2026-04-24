@@ -19,10 +19,10 @@
 //! }
 //! ```
 
-use crate::ledger_view::CommitRef;
 use crate::dataset::QueryConnectionOptions;
 use crate::format::iri::IriCompactor;
 use crate::graph::Graph;
+use crate::ledger_view::CommitRef;
 use crate::{policy_builder, ApiError, Result};
 use fluree_db_core::commit::codec::read_commit;
 use fluree_db_core::{ContentId, ContentStore, FlakeValue, OverlayProvider, Tracker};
@@ -374,11 +374,7 @@ fn build_commit_detail(
         t: commit.t,
         time: commit.time.clone(),
         size: blob_size,
-        parents: commit
-            .parents
-            .iter()
-            .map(|r| r.to_string())
-            .collect(),
+        parents: commit.parents.iter().map(ToString::to_string).collect(),
         signer: commit.txn_signature.as_ref().map(|s| s.signer.clone()),
         asserts,
         retracts,

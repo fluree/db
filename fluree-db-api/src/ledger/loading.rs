@@ -490,9 +490,11 @@ async fn verify_ancestor<C: ContentStore + ?Sized>(
     source_head: &CommitId,
     target: &CommitId,
 ) -> Result<i64> {
-    let target_envelope = load_commit_envelope_by_id(store, target).await.map_err(|_| {
-        ApiError::NotFound(format!("commit {target} not found in source namespace"))
-    })?;
+    let target_envelope = load_commit_envelope_by_id(store, target)
+        .await
+        .map_err(|_| {
+            ApiError::NotFound(format!("commit {target} not found in source namespace"))
+        })?;
 
     if source_head == target {
         return Ok(target_envelope.t);

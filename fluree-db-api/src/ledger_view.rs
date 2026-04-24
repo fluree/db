@@ -363,10 +363,7 @@ async fn resolve_t_to_commit_id(
             ))
         }
         _ => {
-            let ids: Vec<_> = matches
-                .iter()
-                .map(|h| &h[..7.min(h.len())])
-                .collect();
+            let ids: Vec<_> = matches.iter().map(|h| &h[..7.min(h.len())]).collect();
             Err(ApiError::query(format!(
                 "Ambiguous t={target_t}: multiple commits match {ids:?} (likely a rebased history). Disambiguate by passing the full commit CID."
             )))

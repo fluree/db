@@ -602,11 +602,7 @@ fn preflight_strict_next_t_and_prev(
 
     // Validate that at least one parent reference matches the current head CID.
     if let Some(expected_id) = &current.id {
-        let ok = first
-            .commit
-            .parents
-            .iter()
-            .any(|r| r == expected_id);
+        let ok = first.commit.parents.iter().any(|r| r == expected_id);
         if !ok {
             return Err(PushError::Conflict(format!(
                 "first commit previous mismatch: no parent matches expected head {expected_id:?}"
