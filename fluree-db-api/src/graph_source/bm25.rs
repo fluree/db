@@ -915,9 +915,16 @@ impl crate::Fluree {
             ledger.snapshot.encode_iri(iri)
         });
 
-        // 6. Trace commits and collect affected subjects
+        // 6. Trace commits and collect affected subjects. Branch-aware
+        //    store so the walk can resolve pre-fork ancestors when the
+        //    ledger is a branch.
         let mut affected_sids: HashSet<fluree_db_core::Sid> = HashSet::new();
-        let store = self.content_store(&ledger.snapshot.ledger_id);
+        let store = self
+            .content_store_for_record_or_id(
+                ledger.ns_record.as_ref(),
+                &ledger.snapshot.ledger_id,
+            )
+            .await?;
         let stream = trace_commits_by_id(store, head_commit_id.clone(), old_watermark);
         futures::pin_mut!(stream);
 

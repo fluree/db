@@ -28,8 +28,13 @@ pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> 
     let config = fluree_db_indexer::IndexerConfig::default()
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
 
+    let cs = fluree
+        .branched_content_store(&ledger_id)
+        .await
+        .map_err(|e| CliError::Import(format!("indexing failed: {e}")))?;
+
     let result = fluree_db_indexer::build_index_for_ledger(
-        fluree.content_store(&ledger_id),
+        cs,
         fluree.nameservice(),
         &ledger_id,
         config,

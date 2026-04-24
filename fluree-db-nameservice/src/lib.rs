@@ -17,6 +17,7 @@
 //! - [`FileNameService`]: File-based implementation using ns@v2 format
 //! - [`StorageNameService`]: Storage-backed implementation using CAS operations
 
+pub mod branched_store;
 mod error;
 mod event_bus;
 #[cfg(feature = "native")]
@@ -30,6 +31,9 @@ pub mod tracking;
 #[cfg(feature = "native")]
 pub mod tracking_file;
 
+pub use branched_store::{
+    branched_content_store_for_id, branched_content_store_for_record, build_branched_store,
+};
 pub use error::{NameServiceError, Result};
 pub use event_bus::LedgerEventBus;
 pub use ledger_config::{AuthRequirement, LedgerConfig, Origin, ReplicationDefaults};

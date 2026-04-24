@@ -889,6 +889,7 @@ pub(crate) async fn commit_with_handle(
             // Result unused: load_and_attach mutates new_state in-place
             let _store = crate::ledger_manager::load_and_attach_binary_store(
                 fluree.backend(),
+                fluree.nameservice(),
                 &mut new_state,
                 &cache_dir,
                 Some(std::sync::Arc::clone(fluree.leaflet_cache())),
@@ -1072,6 +1073,7 @@ pub(crate) async fn commit_with_handle(
             // Result unused: load_and_attach mutates new_state in-place
             let _store = crate::ledger_manager::load_and_attach_binary_store(
                 fluree.backend(),
+                fluree.nameservice(),
                 &mut new_state,
                 &cache_dir,
                 Some(std::sync::Arc::clone(fluree.leaflet_cache())),

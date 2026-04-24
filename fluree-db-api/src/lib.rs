@@ -36,6 +36,7 @@
 pub mod admin;
 pub mod block_fetch;
 pub mod bm25_worker;
+mod branched_store_helpers;
 pub mod commit_transfer;
 pub mod config_resolver;
 #[cfg(feature = "credential")]
@@ -2606,6 +2607,68 @@ impl Fluree {
         self.backend.content_store(namespace_id)
     }
 
+    /// Get a content store for `ledger_id` that walks branch ancestry on
+    /// read miss.
+    ///
+    /// For non-branched ledgers this is identical to [`Self::content_store`];
+    /// the only added cost is a single nameservice lookup. For branched
+    /// ledgers it returns a `BranchedContentStore` that resolves pre-fork
+    /// commits from the source branch's namespace, which a flat
+    /// branch-scoped store cannot do.
+    ///
+    /// Use this on any path that walks the commit chain (catch-up,
+    /// incremental indexing, full rebuild). Per-query reads against an
+    /// already-loaded `LedgerState` do not need it — the branched store
+    /// is already wired up by [`fluree_db_ledger::LedgerState::load`].
+    pub async fn branched_content_store(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Arc<dyn ContentStore>> {
+        Ok(fluree_db_nameservice::branched_content_store_for_id(
+            &self.backend,
+            self.nameservice_mode.reader(),
+            ledger_id,
+        )
+        .await?)
+    }
+
+    /// Resolve a content store from an `Option<NsRecord>`, falling back
+    /// to the flat namespace store keyed by `fallback_id` when no record
+    /// is present.
+    ///
+    /// This collapses the recurring `match record { Some(...) => ..., None
+    /// => ... }` pattern at every site that wants a branch-aware store
+    /// when an `NsRecord` is in scope but may not be loaded yet.
+    pub(crate) async fn content_store_for_record_or_id(
+        &self,
+        record: Option<&fluree_db_nameservice::NsRecord>,
+        fallback_id: &str,
+    ) -> Result<Arc<dyn ContentStore>> {
+        branched_store_helpers::content_store_for_record_or_id(
+            &self.backend,
+            self.nameservice_mode.reader(),
+            record,
+            fallback_id,
+        )
+        .await
+    }
+
+    /// Read and parse a ledger's `default_context` blob from CAS via a
+    /// branch-aware store. Returns `Ok(None)` when the record has no
+    /// `default_context` CID set; returns `Err` on read or parse failure.
+    /// Callers that want soft-fail behavior should match on the result.
+    pub(crate) async fn load_default_context_blob(
+        &self,
+        record: &fluree_db_nameservice::NsRecord,
+    ) -> Result<Option<serde_json::Value>> {
+        branched_store_helpers::load_default_context_blob(
+            &self.backend,
+            self.nameservice_mode.reader(),
+            record,
+        )
+        .await
+    }
+
     /// Build a [`fluree_db_indexer::FulltextConfigProvider`] backed by this
     /// connection's storage + nameservice. Attach it to the indexer's
     /// `IndexerConfig` (via `with_fulltext_config_provider`) so every index
@@ -3144,8 +3207,15 @@ impl Fluree {
             None => return Ok(None),
         };
 
-        // Fetch blob from CAS using canonical ID for namespace
-        let cs = self.content_store(canonical_id);
+        // Branch-aware store: branches inherit the parent's default
+        // context CID until they publish their own, and that blob lives
+        // under the source branch's namespace.
+        let cs = fluree_db_nameservice::branched_content_store_for_record(
+            self.backend(),
+            self.nameservice(),
+            &record,
+        )
+        .await?;
         let bytes = cs.get(cid).await.map_err(|e| {
             ApiError::internal(format!("failed to read default context from CAS: {e}"))
         })?;

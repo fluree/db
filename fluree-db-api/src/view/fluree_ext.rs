@@ -172,7 +172,14 @@ impl Fluree {
                 .and_then(|r| r.index_head_id.as_ref())
                 .cloned()
             {
-                let cs = self.content_store(&snapshot.snapshot.ledger_id);
+                // Branch-aware store so leaf/branch/history blobs inherited
+                // from the source branch namespace resolve on a fresh branch.
+                let cs = self
+                    .content_store_for_record_or_id(
+                        snapshot.ns_record.as_ref(),
+                        &snapshot.snapshot.ledger_id,
+                    )
+                    .await?;
                 let bytes = cs
                     .get(&index_cid)
                     .await
@@ -209,18 +216,12 @@ impl Fluree {
             }
         }
 
-        // Load default context from CAS if not already loaded.
+        // Load default context from CAS if not already loaded. Soft-fail:
+        // missing context shouldn't block loading the graph view.
         if snapshot.default_context.is_none() {
-            if let Some(ctx_id) = snapshot
-                .ns_record
-                .as_ref()
-                .and_then(|r| r.default_context.as_ref())
-            {
-                let cs = self.content_store(&snapshot.snapshot.ledger_id);
-                if let Ok(bytes) = cs.get(ctx_id).await {
-                    if let Ok(ctx) = serde_json::from_slice(&bytes) {
-                        snapshot.default_context = Some(ctx);
-                    }
+            if let Some(record) = snapshot.ns_record.as_ref() {
+                if let Ok(Some(ctx)) = self.load_default_context_blob(record).await {
+                    snapshot.default_context = Some(ctx);
                 }
             }
         }
@@ -303,7 +304,16 @@ impl Fluree {
             // Use nameservice record (not cached handle) to avoid stale index.
             if let Some(record) = self.nameservice().lookup(ledger_id).await? {
                 if let Some(index_cid) = record.index_head_id.as_ref() {
-                    let cs = self.content_store(&record.ledger_id);
+                    // Branch-aware store so historical queries on a branch
+                    // can resolve inherited leaf/branch/history blobs that
+                    // live under the source branch's namespace.
+                    let cs = fluree_db_nameservice::branched_content_store_for_record(
+                        self.backend(),
+                        self.nameservice(),
+                        &record,
+                    )
+                    .await
+                    .map_err(ApiError::from)?;
                     let bytes = cs.get(index_cid).await.map_err(|e| {
                         ApiError::internal(format!("failed to read index root {index_cid}: {e}"))
                     })?;
