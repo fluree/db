@@ -452,16 +452,20 @@ pub fn parse_subquery_patterns(
     Ok(patterns)
 }
 
-/// Parse OPTIONAL patterns with Fluree's grouping semantics
+/// Parse OPTIONAL patterns with SPARQL-canonical grouping semantics
 ///
-/// Fluree semantics: each node-map OBJECT is a SEPARATE optional.
-/// - `["optional", {nodeA}, {nodeB}]` means two separate left joins
-/// - `["optional", {nodeWithMultipleProps}]` is a single conjunctive optional
-/// - `["optional", {node}, ["filter", ...]]` keeps filter with preceding node (conjunctive)
+/// The entire `["optional", ...]` array is a single OPTIONAL block — equivalent
+/// to one SPARQL `OPTIONAL { ... }`. All items inside become a conjunctive group
+/// (a single `LeftJoin` in the algebra).
 ///
-/// Array elements (filters, nested optionals, values, etc.) are accumulated
-/// with the preceding node-map patterns to form conjunctive groups.
-/// Array elements must follow a node-map; ["optional", ["filter", ...], {...}] is invalid.
+/// - `["optional", {a}, {b}]` ≡ `OPTIONAL { a . b }` (one left join, conjunctive inner)
+/// - `["optional", {a}, ["filter", ...]]` ≡ `OPTIONAL { a FILTER(...) }`
+/// - To get two independent left joins, use two sibling arrays:
+///   `["optional", {a}], ["optional", {b}]`.
+///
+/// Filters and binds require a preceding node-map in the group, since they
+/// constrain or compute from existing bindings. Other array forms (nested
+/// optional, values, query, etc.) are self-contained.
 fn parse_optional_patterns(
     items: &[JsonValue],
     ctx: &JsonLdParseCtx,
@@ -476,25 +480,14 @@ fn parse_optional_patterns(
         ));
     }
 
-    // Accumulate patterns for the current optional group
-    let mut current_group: Vec<UnresolvedPattern> = Vec::new();
-    // Track whether we've seen a node-map in the current group
+    let mut group: Vec<UnresolvedPattern> = Vec::new();
     let mut has_node_map_anchor = false;
 
     for item in items {
         match item {
             JsonValue::Object(map) => {
-                // Fluree semantics: each node-map OBJECT is its own OPTIONAL clause.
-                // When we see a new node-map object and we already have accumulated patterns,
-                // flush the current group as one OPTIONAL and start a new one.
-                if !current_group.is_empty() {
-                    query.add_optional(std::mem::take(&mut current_group));
-                }
-
-                // Node-map object adds patterns to the new/current optional group.
                 has_node_map_anchor = true;
 
-                // Parse node-map and add its patterns to the current group
                 let mut temp_query = UnresolvedQuery::new(ctx.context.clone());
                 node_map::parse_node_map(
                     map,
@@ -504,15 +497,10 @@ fn parse_optional_patterns(
                     nested_counter,
                     object_var_parsing,
                 )?;
-                current_group.extend(temp_query.patterns);
+                group.extend(temp_query.patterns);
             }
             JsonValue::Array(inner_arr) => {
-                // Array elements are added to the current group.
-                // Some elements (filter, bind) require a node-map anchor since they
-                // constrain/compute from existing patterns. Others (query, optional,
-                // union, values, exists, etc.) are self-contained and can stand alone.
-                if !has_node_map_anchor && current_group.is_empty() {
-                    // Check if this is a constraint that needs an anchor
+                if !has_node_map_anchor {
                     let keyword = inner_arr.first().and_then(|v| v.as_str());
                     if matches!(keyword, Some("filter" | "bind")) {
                         return Err(ParseError::InvalidWhere(
@@ -522,7 +510,6 @@ fn parse_optional_patterns(
                     }
                 }
 
-                // Add to the current group
                 let mut temp_query = UnresolvedQuery::new(ctx.context.clone());
                 parse_where_array_element(
                     inner_arr,
@@ -532,7 +519,7 @@ fn parse_optional_patterns(
                     nested_counter,
                     object_var_parsing,
                 )?;
-                current_group.extend(temp_query.patterns);
+                group.extend(temp_query.patterns);
             }
             _ => {
                 return Err(ParseError::InvalidWhere(
@@ -542,9 +529,8 @@ fn parse_optional_patterns(
         }
     }
 
-    // Flush any remaining patterns as the final optional group
-    if !current_group.is_empty() {
-        query.add_optional(current_group);
+    if !group.is_empty() {
+        query.add_optional(group);
     }
     Ok(())
 }

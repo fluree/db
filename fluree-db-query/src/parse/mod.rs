@@ -2691,7 +2691,8 @@ mod tests {
 
     #[test]
     fn test_optional_multiple_patterns() {
-        // Optional with multiple patterns inside
+        // SPARQL semantics: ["optional", {a}, {b}] is one conjunctive OPTIONAL,
+        // equivalent to OPTIONAL { a . b }.
         let json = json!({
             "@context": { "ex": "http://example.org/" },
             "select": ["?s", "?name", "?email", "?phone"],
@@ -2707,13 +2708,11 @@ mod tests {
         let (ast, _) = parse_query_ast(&json, None).unwrap();
 
         assert_eq!(count_triples(&ast.patterns), 1);
-        // Fluree semantics: each node-map object becomes its own OPTIONAL clause.
-        assert_eq!(count_optionals(&ast.patterns), 2);
+        assert_eq!(count_optionals(&ast.patterns), 1);
 
         let optional = find_optional(&ast.patterns).expect("Should have optional");
-        // Each OPTIONAL should contain 1 triple pattern
-        assert_eq!(optional.len(), 1);
-        assert!(optional[0].is_triple());
+        assert_eq!(optional.len(), 2);
+        assert!(optional.iter().all(super::ast::UnresolvedPattern::is_triple));
     }
 
     #[test]
