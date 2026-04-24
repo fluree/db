@@ -324,6 +324,12 @@ async fn resolve_t_to_commit_id(
     )
     .await?;
 
+    // A rebased ledger can have multiple commits at the same `t` (old chain
+    // + new chain both leave flakes in the POST index). Collect unique
+    // matching subjects so we can detect and surface the ambiguity rather
+    // than silently returning the first one.
+    let mut seen = std::collections::HashSet::new();
+    let mut matches: Vec<String> = Vec::new();
     for flake in &flakes {
         if flake.p.namespace_code != FLUREE_DB || flake.p.name.as_ref() != fluree_vocab::db::T {
             continue;
@@ -334,20 +340,38 @@ async fn resolve_t_to_commit_id(
         if flake.s.namespace_code != FLUREE_COMMIT {
             continue;
         }
-        let hex = flake.s.name.as_ref();
-        let digest: [u8; 32] = hex::decode(hex)
-            .map_err(|e| ApiError::internal(format!("Invalid hex digest: {e}")))?
-            .try_into()
-            .map_err(|_| ApiError::internal("Digest not 32 bytes"))?;
-        return Ok(ContentId::from_sha256_digest(
-            fluree_db_core::CODEC_FLUREE_COMMIT,
-            &digest,
-        ));
+        if seen.insert(flake.s.name.as_ref()) {
+            matches.push(flake.s.name.to_string());
+        }
+        if matches.len() > 1 {
+            break;
+        }
     }
 
-    Err(ApiError::NotFound(format!(
-        "No commit found for t={target_t}"
-    )))
+    match matches.len() {
+        0 => Err(ApiError::NotFound(format!(
+            "No commit found for t={target_t}"
+        ))),
+        1 => {
+            let digest: [u8; 32] = hex::decode(&matches[0])
+                .map_err(|e| ApiError::internal(format!("Invalid hex digest: {e}")))?
+                .try_into()
+                .map_err(|_| ApiError::internal("Digest not 32 bytes"))?;
+            Ok(ContentId::from_sha256_digest(
+                fluree_db_core::CODEC_FLUREE_COMMIT,
+                &digest,
+            ))
+        }
+        _ => {
+            let ids: Vec<_> = matches
+                .iter()
+                .map(|h| &h[..7.min(h.len())])
+                .collect();
+            Err(ApiError::query(format!(
+                "Ambiguous t={target_t}: multiple commits match {ids:?} (likely a rebased history). Disambiguate by passing the full commit CID."
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
