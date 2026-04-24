@@ -19,7 +19,7 @@
 //! }
 //! ```
 
-use crate::commit_ref::{resolve_commit_prefix, resolve_t_to_commit_id, CommitRef};
+use crate::ledger_view::CommitRef;
 use crate::dataset::QueryConnectionOptions;
 use crate::format::iri::IriCompactor;
 use crate::graph::Graph;
@@ -242,22 +242,7 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
         let namespace_codes = snapshot.snapshot.namespaces();
 
         // 2. Resolve commit reference to a full CID
-        let commit_id = match self.commit_ref {
-            CommitRef::Exact(id) => id,
-            CommitRef::Prefix(prefix) => {
-                resolve_commit_prefix(
-                    &snapshot.snapshot,
-                    snapshot.novelty.as_ref(),
-                    &prefix,
-                    snapshot.t,
-                )
-                .await?
-            }
-            CommitRef::T(t) => {
-                resolve_t_to_commit_id(&snapshot.snapshot, snapshot.novelty.as_ref(), t, snapshot.t)
-                    .await?
-            }
-        };
+        let commit_id = snapshot.resolve_commit(self.commit_ref).await?;
 
         // 3. Build IRI compactor: user-supplied context > ledger default > none
         let default_ctx;

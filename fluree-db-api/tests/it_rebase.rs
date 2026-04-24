@@ -625,7 +625,7 @@ async fn rebase_rollback_on_mid_replay_failure() {
     let result = fluree.insert(dev_ledger, &dev_data1).await.unwrap();
 
     // Second commit on dev: uses a named graph that won't exist on the
-    // source state during replay, causing LedgerView::stage to fail.
+    // source state during replay, causing StagedLedger::new to fail.
     // We insert into a named graph by specifying @graph with an @id.
     let dev_data2 = json!({
         "@context": {"ex": "http://example.org/ns/"},

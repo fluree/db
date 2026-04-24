@@ -1,14 +1,26 @@
-//! A commit reference: one of several forms a caller can use to identify a
-//! commit (exact CID, hex-digest prefix, or transaction number `t`).
+//! Read-only, lock-free view of a ledger at a point in time.
 //!
-//! Each variant resolves to the canonical [`CommitId`] via the helpers in this
-//! module. The resolvers scan the commit metadata recorded in the txn-meta
-//! graph, so they require both a [`LedgerSnapshot`] and the current novelty
-//! overlay.
+//! A [`LedgerView`] bundles the indexed snapshot, novelty overlay, dictionary
+//! state, and head metadata needed to query or resolve against a ledger without
+//! taking the write lock. It's produced by [`LedgerHandle::snapshot`] and is
+//! safe to hold across `.await` points or pass to subtasks.
+//!
+//! This module also defines [`CommitRef`] — the user-facing forms for
+//! identifying a commit — and owns the resolvers that turn one into a
+//! canonical [`CommitId`] via [`LedgerView::resolve_commit`].
+//!
+//! [`LedgerHandle::snapshot`]: crate::LedgerHandle::snapshot
 
-use crate::{ApiError, Result};
-use fluree_db_core::{CommitId, ContentId, LedgerSnapshot};
+use std::sync::Arc;
+
+use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_core::db::LedgerSnapshot;
+use fluree_db_core::{CommitId, ContentId};
+use fluree_db_ledger::{LedgerState, TypeErasedStore};
+use fluree_db_nameservice::NsRecord;
 use fluree_db_novelty::Novelty;
+
+use crate::error::{ApiError, Result};
 
 /// How a caller identifies a commit.
 ///
@@ -23,11 +35,119 @@ pub enum CommitRef {
     T(i64),
 }
 
+/// Read-only view of a ledger at a point in time.
+///
+/// Holds no locks. Safe to clone, pass to subtasks, or keep across `.await`
+/// points. Underlying state is Arc-shared, so cloning is cheap.
+pub struct LedgerView {
+    /// The indexed database snapshot (cheap clone - Arc fields)
+    pub snapshot: LedgerSnapshot,
+    /// In-memory overlay of uncommitted transactions
+    pub novelty: Arc<Novelty>,
+    /// Dictionary novelty layer (subjects and strings since last index build)
+    pub dict_novelty: Arc<fluree_db_core::DictNovelty>,
+    /// Ledger-scoped runtime IDs for predicates and datatypes.
+    pub runtime_small_dicts: Arc<fluree_db_core::RuntimeSmallDicts>,
+    /// Current transaction t value
+    pub t: i64,
+    /// Content identifier of the head commit (identity)
+    pub head_commit_id: Option<ContentId>,
+    /// Content identifier of the current index root (identity)
+    pub head_index_id: Option<ContentId>,
+    /// Nameservice record (if loaded via nameservice)
+    pub ns_record: Option<NsRecord>,
+    /// Binary columnar index store (v2 only).
+    ///
+    /// Present when `snapshot.range_provider` is also set — the two are always
+    /// set/cleared together (see coherence `debug_assert` in `snapshot()`).
+    pub binary_store: Option<Arc<BinaryIndexStore>>,
+    /// Default JSON-LD @context for this ledger.
+    pub default_context: Option<serde_json::Value>,
+}
+
+impl LedgerView {
+    /// Build a view from ledger state.
+    ///
+    /// Note: `binary_store` is set to `None` here — callers that have a
+    /// binary store must set it after construction (see `LedgerHandle::snapshot()`).
+    pub(crate) fn from_state(state: &LedgerState) -> Self {
+        Self {
+            snapshot: state.snapshot.clone(),
+            novelty: Arc::clone(&state.novelty),
+            dict_novelty: Arc::clone(&state.dict_novelty),
+            runtime_small_dicts: Arc::clone(&state.runtime_small_dicts),
+            t: state.t(),
+            head_commit_id: state.head_commit_id.clone(),
+            head_index_id: state.head_index_id.clone(),
+            ns_record: state.ns_record.clone(),
+            binary_store: None,
+            default_context: state.default_context.clone(),
+        }
+    }
+
+    /// Get the ledger name (without branch suffix)
+    ///
+    /// Returns the base ledger name (e.g., "mydb"), NOT the canonical form (e.g., "mydb:main").
+    /// For the canonical ledger_id, use `ledger_id()` instead.
+    ///
+    /// Note: This matches `NsRecord.name` semantics where "name" is the base name.
+    pub fn name(&self) -> Option<&str> {
+        self.ns_record.as_ref().map(|r| r.name.as_str())
+    }
+
+    /// Get the canonical ledger ID (with branch suffix)
+    ///
+    /// Returns the canonical form (e.g., "mydb:main") suitable for cache keys.
+    /// This is the primary identifier for ledger lookups.
+    pub fn ledger_id(&self) -> Option<&str> {
+        self.ns_record.as_ref().map(|r| r.ledger_id.as_str())
+    }
+
+    /// Get index_t from the underlying LedgerSnapshot
+    pub fn index_t(&self) -> i64 {
+        self.snapshot.t
+    }
+
+    /// Resolve a [`CommitRef`] to a canonical [`CommitId`] against this
+    /// view's indexes and novelty overlay.
+    pub async fn resolve_commit(&self, commit_ref: CommitRef) -> Result<CommitId> {
+        match commit_ref {
+            CommitRef::Exact(id) => Ok(id),
+            CommitRef::Prefix(prefix) => {
+                resolve_commit_prefix(&self.snapshot, &self.novelty, &prefix, self.t).await
+            }
+            CommitRef::T(t) => {
+                resolve_t_to_commit_id(&self.snapshot, &self.novelty, t, self.t).await
+            }
+        }
+    }
+
+    /// Convert the view to a [`LedgerState`] for backward compatibility.
+    ///
+    /// This creates a `LedgerState` with the same data as the view. Use this
+    /// when you need to pass the state to APIs that expect `LedgerState`.
+    pub fn to_ledger_state(self) -> LedgerState {
+        let dict_novelty = self.dict_novelty;
+        LedgerState {
+            snapshot: self.snapshot,
+            novelty: self.novelty,
+            dict_novelty,
+            runtime_small_dicts: self.runtime_small_dicts,
+            head_commit_id: self.head_commit_id,
+            head_index_id: self.head_index_id,
+            ns_record: self.ns_record,
+            binary_store: self.binary_store.map(|store| TypeErasedStore(store)),
+            default_context: self.default_context,
+            spatial_indexes: None,
+        }
+    }
+}
+
 /// Resolve a commit hex-digest prefix to a full [`CommitId`].
 ///
 /// Uses a bounded SPOT index scan on commit subjects (same approach as
 /// `time_resolve::commit_to_t`, but returns the CID instead of `t`).
-pub(crate) async fn resolve_commit_prefix(
+async fn resolve_commit_prefix(
     snapshot: &LedgerSnapshot,
     overlay: &Novelty,
     prefix: &str,
@@ -104,7 +224,6 @@ pub(crate) async fn resolve_commit_prefix(
             "No commit found with prefix: {normalized}"
         ))),
         1 => {
-            // Reconstruct ContentId from hex digest
             let hex = &matches[0];
             let digest: [u8; 32] = hex::decode(hex)
                 .map_err(|e| ApiError::internal(format!("Invalid hex digest: {e}")))?
@@ -136,7 +255,7 @@ pub(crate) async fn resolve_commit_prefix(
 /// Queries the POST index for commit flakes where predicate = `fluree:db/t`
 /// and object = the target `t` value. The matching commit subject's hex digest
 /// is then converted to a [`CommitId`].
-pub(crate) async fn resolve_t_to_commit_id(
+async fn resolve_t_to_commit_id(
     snapshot: &LedgerSnapshot,
     overlay: &Novelty,
     target_t: i64,
@@ -159,7 +278,6 @@ pub(crate) async fn resolve_t_to_commit_id(
         )));
     }
 
-    // POST index query: predicate = fluree:db/t, object = target_t (exact match)
     let predicate = Sid::new(FLUREE_DB, fluree_vocab::db::T);
     let range_match = RangeMatch::predicate_object(predicate, FlakeValue::Long(target_t));
 
@@ -178,7 +296,6 @@ pub(crate) async fn resolve_t_to_commit_id(
     )
     .await?;
 
-    // Find the flake with our exact predicate and object value
     for flake in &flakes {
         if flake.p.namespace_code != FLUREE_DB || flake.p.name.as_ref() != fluree_vocab::db::T {
             continue;
@@ -186,7 +303,6 @@ pub(crate) async fn resolve_t_to_commit_id(
         if flake.o != FlakeValue::Long(target_t) {
             continue;
         }
-        // The subject is in FLUREE_COMMIT namespace with hex digest as name
         if flake.s.namespace_code != FLUREE_COMMIT {
             continue;
         }

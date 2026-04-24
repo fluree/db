@@ -667,7 +667,7 @@ async fn stage_commit_flakes(
     index_config: &IndexConfig,
     policy_ctx: &PolicyContext,
     graph_sids: &HashMap<GraphId, Sid>,
-) -> std::result::Result<fluree_db_ledger::LedgerView, PushError> {
+) -> std::result::Result<fluree_db_ledger::StagedLedger, PushError> {
     let mut options = fluree_db_transact::StageOptions::new()
         .with_index_config(index_config)
         .with_graph_sids(graph_sids);

@@ -33,10 +33,10 @@ use fluree_db_core::trace_commits_by_id;
 use fluree_db_core::{ledger_id::normalize_ledger_id, ContentId, ContentStore, StorageBackend};
 use fluree_db_ledger::{LedgerState, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
-use fluree_db_novelty::Novelty;
 use tokio::sync::{oneshot, Mutex, RwLock};
 
 use crate::error::{ApiError, Result};
+use crate::ledger_view::LedgerView;
 
 // ============================================================================
 // Monotonic Clock for Eviction
@@ -55,104 +55,6 @@ static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 fn monotonic_secs() -> u64 {
     let start = PROCESS_START.get_or_init(Instant::now);
     start.elapsed().as_secs()
-}
-
-// ============================================================================
-// CachedLedgerState - Read-only view (no lock held)
-// ============================================================================
-
-/// Read-only snapshot of ledger state - does NOT hold any lock
-///
-/// Safe to pass around and use for queries without blocking other operations.
-/// This is a cheap clone of the underlying state (LedgerSnapshot clone is cheap via Arc fields).
-pub struct CachedLedgerState {
-    /// The indexed database snapshot (cheap clone - Arc fields)
-    pub snapshot: LedgerSnapshot,
-    /// In-memory overlay of uncommitted transactions
-    pub novelty: Arc<Novelty>,
-    /// Dictionary novelty layer (subjects and strings since last index build)
-    pub dict_novelty: Arc<fluree_db_core::DictNovelty>,
-    /// Ledger-scoped runtime IDs for predicates and datatypes.
-    pub runtime_small_dicts: Arc<fluree_db_core::RuntimeSmallDicts>,
-    /// Current transaction t value
-    pub t: i64,
-    /// Content identifier of the head commit (identity)
-    pub head_commit_id: Option<fluree_db_core::ContentId>,
-    /// Content identifier of the current index root (identity)
-    pub head_index_id: Option<fluree_db_core::ContentId>,
-    /// Nameservice record (if loaded via nameservice)
-    pub ns_record: Option<NsRecord>,
-    /// Binary columnar index store (v2 only).
-    ///
-    /// Present when `snapshot.range_provider` is also set — the two are always
-    /// set/cleared together (see coherence `debug_assert` in `snapshot()`).
-    pub binary_store: Option<Arc<BinaryIndexStore>>,
-    /// Default JSON-LD @context for this ledger.
-    pub default_context: Option<serde_json::Value>,
-}
-
-impl CachedLedgerState {
-    /// Create a snapshot from ledger state
-    ///
-    /// Note: `binary_store` is set to `None` here — callers that have a
-    /// binary store must set it after construction (see `LedgerHandle::snapshot()`).
-    fn from_state(state: &LedgerState) -> Self {
-        Self {
-            snapshot: state.snapshot.clone(), // Cheap: Arc fields
-            novelty: Arc::clone(&state.novelty),
-            dict_novelty: Arc::clone(&state.dict_novelty),
-            runtime_small_dicts: Arc::clone(&state.runtime_small_dicts),
-            t: state.t(),
-            head_commit_id: state.head_commit_id.clone(),
-            head_index_id: state.head_index_id.clone(),
-            ns_record: state.ns_record.clone(),
-            binary_store: None,
-            default_context: state.default_context.clone(),
-        }
-    }
-
-    /// Get the ledger name (without branch suffix)
-    ///
-    /// Returns the base ledger name (e.g., "mydb"), NOT the canonical form (e.g., "mydb:main").
-    /// For the canonical ledger_id, use `ledger_id()` instead.
-    ///
-    /// Note: This matches `NsRecord.name` semantics where "name" is the base name.
-    pub fn name(&self) -> Option<&str> {
-        self.ns_record.as_ref().map(|r| r.name.as_str())
-    }
-
-    /// Get the canonical ledger ID (with branch suffix)
-    ///
-    /// Returns the canonical form (e.g., "mydb:main") suitable for cache keys.
-    /// This is the primary identifier for ledger lookups.
-    pub fn ledger_id(&self) -> Option<&str> {
-        self.ns_record.as_ref().map(|r| r.ledger_id.as_str())
-    }
-
-    /// Get index_t from the underlying LedgerSnapshot
-    pub fn index_t(&self) -> i64 {
-        self.snapshot.t
-    }
-
-    /// Convert snapshot to LedgerState for backward compatibility
-    ///
-    /// This creates a LedgerState with the same data as the snapshot.
-    /// Use this when you need to pass the state to APIs that expect LedgerState.
-    pub fn to_ledger_state(self) -> LedgerState {
-        let dict_novelty = self.dict_novelty;
-        LedgerState {
-            snapshot: self.snapshot,
-            novelty: self.novelty,
-            dict_novelty,
-            runtime_small_dicts: self.runtime_small_dicts,
-            head_commit_id: self.head_commit_id,
-            head_index_id: self.head_index_id,
-            ns_record: self.ns_record,
-            binary_store: self.binary_store.map(|store| TypeErasedStore(store)),
-            default_context: self.default_context,
-            spatial_indexes: None,
-        }
-    }
 }
 
 // ============================================================================
@@ -257,11 +159,11 @@ impl LedgerHandle {
     ///
     /// IMPORTANT: Queries must NOT execute while holding the internal lock.
     /// The snapshot is a cheap clone; the lock is released immediately after.
-    pub async fn snapshot(&self) -> CachedLedgerState {
+    pub async fn snapshot(&self) -> LedgerView {
         self.touch();
         let state = self.inner.state.lock().await;
         let binary_store = self.inner.binary_store.lock().await.clone();
-        let mut snap = CachedLedgerState::from_state(&state);
+        let mut snap = LedgerView::from_state(&state);
         snap.binary_store = binary_store;
         debug_assert!(
             snap.snapshot.range_provider.is_some() == snap.binary_store.is_some(),

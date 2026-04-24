@@ -5,7 +5,7 @@
 //! This crate provides:
 //! - Transaction parsing (JSON-LD → IR)
 //! - Flake generation from templates
-//! - Staging (creates a `LedgerView` with uncommitted changes)
+//! - Staging (creates a `StagedLedger` with uncommitted changes)
 //! - Commit (persists to storage and publishes to nameservice)
 //!
 //! ## Transaction Types

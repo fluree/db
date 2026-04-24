@@ -36,7 +36,6 @@
 pub mod admin;
 pub mod block_fetch;
 pub mod bm25_worker;
-pub mod commit_ref;
 pub mod commit_transfer;
 pub mod config_resolver;
 #[cfg(feature = "credential")]
@@ -78,6 +77,7 @@ pub mod view;
 
 // Ledger caching and management
 pub mod ledger_manager;
+pub mod ledger_view;
 
 // Search service integration (embedded adapter, remote client)
 pub mod search;
@@ -125,10 +125,11 @@ pub use import::{
 };
 pub use ledger_info::LedgerInfoBuilder;
 pub use ledger_manager::{
-    CachedLedgerState, FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager,
-    LedgerManagerConfig, LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult,
-    RemoteWatermark, UpdatePlan,
+    FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager, LedgerManagerConfig,
+    LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult, RemoteWatermark,
+    UpdatePlan,
 };
+pub use ledger_view::{CommitRef, LedgerView};
 pub use merge::MergeReport;
 pub use pack::{
     compute_missing_index_artifacts, full_ledger_pack_request, validate_pack_request, PackChunk,
@@ -194,7 +195,7 @@ pub use fluree_db_core::{
     Storage, StorageMethod, StorageRead, StorageWrite,
 };
 pub use fluree_db_ledger::{
-    HistoricalLedgerView, IndexConfig, LedgerState, LedgerView, TypeErasedStore,
+    HistoricalLedgerView, IndexConfig, LedgerState, StagedLedger, TypeErasedStore,
 };
 pub use fluree_db_nameservice::{
     ConfigCasResult, ConfigPayload, ConfigPublisher, ConfigValue, GraphSourceLookup,
