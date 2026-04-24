@@ -5,7 +5,7 @@ use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result, TypeEra
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ContentStore;
 use fluree_db_core::DictNovelty;
-use fluree_db_core::{collect_dag_cids, load_commit_by_id, CommitId};
+use fluree_db_core::{collect_dag_cids, load_commit_envelope_by_id, CommitId};
 use fluree_db_nameservice::{NameServiceError, NsRecord};
 
 impl Fluree {
@@ -301,8 +301,8 @@ impl Fluree {
             let view = self.ledger_cached(&source_id).await?.snapshot().await;
             let resolved = view.resolve_commit(commit_ref).await?;
             let store = self.content_store(&source_id);
-            let commit = verify_ancestor_and_load(&*store, &source_head, &resolved).await?;
-            Some((resolved, commit.t))
+            let resolved_t = verify_ancestor(&*store, &source_head, &resolved).await?;
+            Some((resolved, resolved_t))
         } else {
             None
         };
@@ -470,29 +470,32 @@ impl Fluree {
     }
 }
 
-/// Load `target` and verify it's reachable by walking parents from `source_head`.
+/// Verify `target` is reachable by walking parents from `source_head`, and
+/// return its `t` value.
 ///
 /// Used by `create_branch` when a caller specifies a historical commit — we
 /// only allow branching from commits on the source branch's ancestry.
-async fn verify_ancestor_and_load<C: ContentStore + ?Sized>(
+/// Loads only the target commit's envelope (not its flakes) since we just
+/// need `t` for the ancestry walk's stop condition.
+async fn verify_ancestor<C: ContentStore + ?Sized>(
     store: &C,
     source_head: &CommitId,
     target: &CommitId,
-) -> Result<fluree_db_core::Commit> {
-    let target_commit = load_commit_by_id(store, target).await.map_err(|_| {
+) -> Result<i64> {
+    let target_envelope = load_commit_envelope_by_id(store, target).await.map_err(|_| {
         ApiError::NotFound(format!("commit {target} not found in source namespace"))
     })?;
 
     if source_head == target {
-        return Ok(target_commit);
+        return Ok(target_envelope.t);
     }
 
     // Walk backward from source_head, stopping once we pass below target's t.
-    let stop_at = (target_commit.t - 1).max(0);
+    let stop_at = (target_envelope.t - 1).max(0);
     let dag = collect_dag_cids(store, source_head, stop_at).await?;
 
     if dag.iter().any(|(_, cid)| cid == target) {
-        Ok(target_commit)
+        Ok(target_envelope.t)
     } else {
         Err(ApiError::NotFound(format!(
             "commit {target} is not an ancestor of source head {source_head}"
