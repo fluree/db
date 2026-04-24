@@ -35,6 +35,29 @@ pub enum CommitRef {
     T(i64),
 }
 
+impl CommitRef {
+    /// Parse a user-supplied commit reference string.
+    ///
+    /// - `"t:N"` → [`CommitRef::T`] with transaction number `N`
+    /// - anything else → [`CommitRef::Prefix`] (full CIDs and hex-digest
+    ///   prefixes are both handled by the prefix resolver)
+    ///
+    /// [`CommitRef::Exact`] is not produced by this parser — callers holding
+    /// a concrete [`CommitId`] should construct it directly.
+    pub fn parse(s: &str) -> Result<Self> {
+        if let Some(t_str) = s.strip_prefix("t:") {
+            let t: i64 = t_str
+                .parse()
+                .map_err(|_| ApiError::query(format!("invalid t value in commit ref '{s}'")))?;
+            Ok(CommitRef::T(t))
+        } else if s.is_empty() {
+            Err(ApiError::query("empty commit reference"))
+        } else {
+            Ok(CommitRef::Prefix(s.to_string()))
+        }
+    }
+}
+
 /// Read-only view of a ledger at a point in time.
 ///
 /// Holds no locks. Safe to clone, pass to subtasks, or keep across `.await`
