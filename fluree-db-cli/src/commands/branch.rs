@@ -11,12 +11,14 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
             name,
             ledger,
             from,
+            at,
             remote,
         } => {
             run_create(
                 &name,
                 ledger.as_deref(),
                 from.as_deref(),
+                at.as_deref(),
                 dirs,
                 remote.as_deref(),
                 direct,
@@ -76,6 +78,7 @@ async fn run_create(
     name: &str,
     ledger: Option<&str>,
     from: Option<&str>,
+    at: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
     direct: bool,
@@ -84,7 +87,7 @@ async fn run_create(
         let alias = context::resolve_ledger(ledger, dirs)?;
         let (ledger_name, _) = split_ledger_id(&alias)?;
         let client = context::build_remote_client(remote_name, dirs).await?;
-        let result = client.create_branch(&ledger_name, name, from).await?;
+        let result = client.create_branch(&ledger_name, name, from, at).await?;
 
         context::persist_refreshed_tokens(&client, remote_name, dirs).await;
 
@@ -109,7 +112,7 @@ async fn run_create(
             ..
         } => {
             let (ledger_name, _) = split_ledger_id(&remote_alias)?;
-            let result = client.create_branch(&ledger_name, name, from).await?;
+            let result = client.create_branch(&ledger_name, name, from, at).await?;
 
             context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
 
@@ -117,7 +120,13 @@ async fn run_create(
         }
         LedgerMode::Local { fluree, alias } => {
             let (ledger_name, _) = split_ledger_id(&alias)?;
-            let record = fluree.create_branch(&ledger_name, name, from, None).await?;
+            let at_commit = match at {
+                Some(s) => Some(fluree_db_api::CommitRef::parse(s).map_err(CliError::from)?),
+                None => None,
+            };
+            let record = fluree
+                .create_branch(&ledger_name, name, from, at_commit)
+                .await?;
 
             let source = record.source_branch.as_deref().unwrap_or("main");
             let t = record.commit_t;

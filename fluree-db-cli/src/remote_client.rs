@@ -1045,12 +1045,15 @@ impl RemoteLedgerClient {
 
     /// Create a new branch on the remote server.
     ///
-    /// Calls `POST {base_url}/branch` with a JSON body.
+    /// Calls `POST {base_url}/branch` with a JSON body. `at` optionally
+    /// specifies a historical commit to branch from (as accepted by
+    /// `CommitRef::parse`, e.g. `"t:5"` or a hex digest / full CID).
     pub async fn create_branch(
         &self,
         ledger: &str,
         branch: &str,
         source: Option<&str>,
+        at: Option<&str>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
         let url = self.op_url_root("branch");
         let mut body = serde_json::json!({
@@ -1059,6 +1062,9 @@ impl RemoteLedgerClient {
         });
         if let Some(s) = source {
             body["source"] = serde_json::Value::String(s.to_string());
+        }
+        if let Some(a) = at {
+            body["at"] = serde_json::Value::String(a.to_string());
         }
         self.send_json(
             reqwest::Method::POST,
