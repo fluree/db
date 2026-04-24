@@ -153,7 +153,7 @@ async fn object_count_fallback_basic() {
 
     let query = json!({
         "@context": ctx,
-        "select": ["(as (count ?s) ?count)"],
+        "select": "(as (count ?s) ?count)",
         "where": [{ "@id": "?s", "schema:age": 30 }]
     });
 
@@ -174,7 +174,7 @@ async fn object_count_single_match() {
 
     let query = json!({
         "@context": ctx,
-        "select": ["(as (count ?s) ?count)"],
+        "select": "(as (count ?s) ?count)",
         "where": [{ "@id": "?s", "schema:age": 40 }]
     });
 
@@ -195,7 +195,7 @@ async fn object_count_zero_matches() {
 
     let query = json!({
         "@context": ctx,
-        "select": ["(as (count ?s) ?count)"],
+        "select": "(as (count ?s) ?count)",
         "where": [{ "@id": "?s", "schema:age": 999 }]
     });
 
@@ -272,7 +272,7 @@ async fn object_count_with_allow_all_policy() {
             }],
             "default-allow": true
         },
-        "select": ["(as (count ?s) ?count)"],
+        "select": "(as (count ?s) ?count)",
         "where": [{ "@id": "?s", "schema:age": 30 }]
     });
 
@@ -451,7 +451,7 @@ async fn object_count_at_earlier_t() {
     let ctx = context_ex_schema();
     let query = json!({
         "@context": ctx,
-        "select": ["(as (count ?s) ?count)"],
+        "select": "(as (count ?s) ?count)",
         "where": [{ "@id": "?s", "schema:age": 30 }]
     });
 

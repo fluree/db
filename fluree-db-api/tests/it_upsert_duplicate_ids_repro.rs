@@ -218,9 +218,9 @@ async fn repro_upsert_repeated_ids_create_duplicate_subject_ids() {
                 .to_jsonld(&ledger2_loaded.snapshot)
                 .unwrap();
 
-            assert_eq!(const_count, json!([1]));
-            assert_eq!(var_count, json!([1]));
-            assert_eq!(type_count, json!([1]));
+            assert_eq!(const_count, json!([[1]]));
+            assert_eq!(var_count, json!([[1]]));
+            assert_eq!(type_count, json!([[1]]));
             assert_eq!(join_counts, json!([[1, 1]]));
             assert_eq!(graph_counts, json!([[ledger_id, 1]]));
 

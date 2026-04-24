@@ -715,6 +715,10 @@ pub enum Commands {
     Reindex {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Manage the Fluree HTTP server

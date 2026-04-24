@@ -32,6 +32,29 @@ use fluree_graph_json_ld::ParsedContext;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+/// Projection shape — how each row should be rendered by row-array formatters.
+///
+/// - `Tuple` (default): every row is an array regardless of arity. This is
+///   the spec-correct shape for SPARQL (solution sequences are tabular) and
+///   for JSON-LD `select: ["?x"]` / `["?x","?y"]` (the user's array wrapper
+///   is preserved end-to-end).
+/// - `Scalar`: 1-var rows flatten to the bare value. JSON-LD sets this only
+///   when the user writes `select: "?x"` (bare string) — an explicit opt-in
+///   to scalar shape. Multi-var `Scalar` is unreachable from the parser.
+///
+/// Formatters that emit row arrays (jsonld, delimited, etc.) consult this to
+/// decide scalar-vs-tuple rendering. Object-based formatters (typed, agent_json)
+/// ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProjectionShape {
+    /// Every row is an array, regardless of arity. Default; used by SPARQL
+    /// and JSON-LD array-form select.
+    #[default]
+    Tuple,
+    /// 1-var rows flatten to scalars. JSON-LD bare-string `select: "?x"`.
+    Scalar,
+}
+
 /// Select mode determines result shape
 ///
 /// This is derived from the parsed query (select vs selectOne vs construct) and controls
@@ -98,10 +121,16 @@ impl ConstructTemplate {
 /// template, or `Many` with an empty variable list) are unrepresentable.
 #[derive(Debug, Clone)]
 pub enum QueryOutput {
-    /// Normal SELECT with explicit variable list.
-    Select(Vec<VarId>),
+    /// Normal SELECT with explicit variable list and projection shape.
+    Select {
+        vars: Vec<VarId>,
+        shape: ProjectionShape,
+    },
     /// selectOne — same as Select but formatters return first row or null.
-    SelectOne(Vec<VarId>),
+    SelectOne {
+        vars: Vec<VarId>,
+        shape: ProjectionShape,
+    },
     /// SELECT * — all bound variables from WHERE.
     Wildcard,
     /// CONSTRUCT — template patterns instantiated with bindings.
@@ -111,10 +140,29 @@ pub enum QueryOutput {
 }
 
 impl QueryOutput {
+    /// Construct a `Select` with the default (`Tuple`) shape.
+    ///
+    /// Used by SPARQL lowering and internal fixtures. JSON-LD bare-string
+    /// `select: "?x"` builds the struct variant directly with `shape: Scalar`.
+    pub fn select(vars: Vec<VarId>) -> Self {
+        Self::Select {
+            vars,
+            shape: ProjectionShape::Tuple,
+        }
+    }
+
+    /// Construct a `SelectOne` with the default (`Tuple`) shape.
+    pub fn select_one(vars: Vec<VarId>) -> Self {
+        Self::SelectOne {
+            vars,
+            shape: ProjectionShape::Tuple,
+        }
+    }
+
     /// Get select vars for Select/SelectOne, `None` otherwise.
     pub fn select_vars(&self) -> Option<&[VarId]> {
         match self {
-            QueryOutput::Select(vars) | QueryOutput::SelectOne(vars) => Some(vars),
+            QueryOutput::Select { vars, .. } | QueryOutput::SelectOne { vars, .. } => Some(vars),
             _ => None,
         }
     }
@@ -122,6 +170,31 @@ impl QueryOutput {
     /// Get select vars, or an empty slice for non-select outputs.
     pub fn select_vars_or_empty(&self) -> &[VarId] {
         self.select_vars().unwrap_or(&[])
+    }
+
+    /// Get the projection shape for Select/SelectOne, `None` otherwise.
+    pub fn projection_shape(&self) -> Option<ProjectionShape> {
+        match self {
+            QueryOutput::Select { shape, .. } | QueryOutput::SelectOne { shape, .. } => {
+                Some(*shape)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns `true` iff rows should be flattened from `[v]` to `v` at format
+    /// time. True only when the user opted into scalar output via JSON-LD
+    /// `select: "?x"` (bare-string form) AND there is exactly one projected
+    /// variable. Wildcard, Construct, Boolean, and `Tuple`-shaped Select all
+    /// return `false`, so tabular output (SPARQL + JSON-LD array-form select)
+    /// is preserved.
+    pub fn should_flatten_scalar(&self) -> bool {
+        match self {
+            QueryOutput::Select { vars, shape } | QueryOutput::SelectOne { vars, shape } => {
+                *shape == ProjectionShape::Scalar && vars.len() == 1
+            }
+            _ => false,
+        }
     }
 
     /// Get the construct template for Construct, `None` otherwise.
@@ -134,7 +207,7 @@ impl QueryOutput {
 
     /// Returns `true` for `SelectOne` output.
     pub fn is_select_one(&self) -> bool {
-        matches!(self, Self::SelectOne(_))
+        matches!(self, Self::SelectOne { .. })
     }
 
     /// Returns `true` for `Wildcard` output.
@@ -162,8 +235,12 @@ impl QueryOutput {
     pub fn variables(&self) -> Option<HashSet<VarId>> {
         match self {
             QueryOutput::Wildcard | QueryOutput::Boolean => None,
-            QueryOutput::Select(vars) | QueryOutput::SelectOne(vars) if vars.is_empty() => None,
-            QueryOutput::Select(vars) | QueryOutput::SelectOne(vars) => {
+            QueryOutput::Select { vars, .. } | QueryOutput::SelectOne { vars, .. }
+                if vars.is_empty() =>
+            {
+                None
+            }
+            QueryOutput::Select { vars, .. } | QueryOutput::SelectOne { vars, .. } => {
                 Some(vars.iter().copied().collect())
             }
             QueryOutput::Construct(t) if t.patterns.is_empty() => None,
@@ -305,9 +382,16 @@ pub(crate) fn lower_query<E: IriEncoder>(
     let options = lower_options(&ast.options, vars)?;
 
     // Build QueryOutput from mode + lowered components
+    let shape = ast.select_shape;
     let output = match select_mode {
-        SelectMode::Many => QueryOutput::Select(select_vars),
-        SelectMode::One => QueryOutput::SelectOne(select_vars),
+        SelectMode::Many => QueryOutput::Select {
+            vars: select_vars,
+            shape,
+        },
+        SelectMode::One => QueryOutput::SelectOne {
+            vars: select_vars,
+            shape,
+        },
         SelectMode::Wildcard => QueryOutput::Wildcard,
         SelectMode::Construct => {
             let template = match ast.construct_template {
@@ -1849,7 +1933,7 @@ mod tests {
         assert_eq!(query.output.select_vars().unwrap().len(), 2);
         assert_eq!(query.patterns.len(), 1);
         assert_eq!(vars.len(), 2);
-        assert!(matches!(query.output, QueryOutput::Select(_)));
+        assert!(matches!(query.output, QueryOutput::Select { .. }));
     }
 
     #[test]

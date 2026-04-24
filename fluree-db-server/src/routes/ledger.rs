@@ -11,6 +11,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use fluree_db_api::wire::{ReindexRequest, ReindexResponse};
 use fluree_db_api::{ApiError, BranchDropReport, DropMode, DropReport, DropStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -330,6 +331,74 @@ async fn drop_local(state: Arc<AppState>, request: Request) -> Result<Json<DropR
 
         tracing::info!(status = "success", drop_status = ?report.status, "ledger dropped");
         Ok(Json(DropResponse::from(report)))
+    }
+    .instrument(span)
+    .await
+}
+
+// =============================================================================
+// Reindex
+// =============================================================================
+
+/// Full reindex from commit history.
+///
+/// POST /fluree/reindex
+///
+/// Rebuilds the binary index for a ledger from scratch using the server's
+/// configured indexer settings. In peer mode, forwards to the transaction
+/// server.
+pub async fn reindex(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    reindex_local(state, request).await.into_response()
+}
+
+async fn reindex_local(state: Arc<AppState>, request: Request) -> Result<Json<ReindexResponse>> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: ReindexRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+
+    let span = create_request_span(
+        "ledger:reindex",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.ledger),
+        None,
+        None,
+    );
+    async move {
+        let span = tracing::Span::current();
+        tracing::info!(status = "start", ledger = %req.ledger, "ledger reindex requested");
+
+        let result = match state
+            .fluree
+            .reindex(&req.ledger, fluree_db_api::ReindexOptions::default())
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:ReindexFailed");
+                tracing::error!(error = %server_error, "ledger reindex failed");
+                return Err(server_error);
+            }
+        };
+
+        tracing::info!(
+            status = "success",
+            index_t = result.index_t,
+            "ledger reindex complete"
+        );
+        Ok(Json(ReindexResponse::from(result)))
     }
     .instrument(span)
     .await

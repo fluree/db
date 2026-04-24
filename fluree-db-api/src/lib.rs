@@ -75,6 +75,7 @@ pub mod tx_builder;
 #[cfg(feature = "vector")]
 pub mod vector_worker;
 pub mod view;
+pub mod wire;
 
 // Ledger caching and management
 pub mod ledger_manager;

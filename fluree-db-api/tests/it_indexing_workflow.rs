@@ -261,7 +261,7 @@ async fn indexing_coalesces_multiple_commits_and_latest_root_is_queryable() {
 
             let query = json!({
                 "@context": { "ex":"http://example.org/" },
-                "select": ["?name"],
+                "select": "?name",
                 "where": { "@id": "?s", "@type": "ex:Person", "ex:name": "?name" }
             });
 

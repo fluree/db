@@ -63,7 +63,7 @@ async fn subjects_as_predicates_variable_predicate_scan() {
     let ctx = json!({"id":"@id","ex":"http://example.com/"});
     let q = json!({
         "@context": ctx,
-        "select": ["?p"],
+        "select": "?p",
         "where": {"@id":"ex:subject-as-predicate","?p":"?o"}
     });
 
@@ -159,7 +159,7 @@ async fn equivalent_properties_equivalent_symmetric_transitive_and_graph_crawl()
     // Querying for the property defined to be equivalent returns all values.
     let q1 = json!({
         "@context": {"vocab2":"http://vocab2.example.org/"},
-        "select": ["?name"],
+        "select": "?name",
         "where": {"vocab2:firstName":"?name"},
         "reasoning": "owl2ql"
     });
@@ -176,7 +176,7 @@ async fn equivalent_properties_equivalent_symmetric_transitive_and_graph_crawl()
     // Querying for the symmetric property.
     let q2 = json!({
         "@context": {"vocab1":"http://vocab1.example.org/"},
-        "select": ["?name"],
+        "select": "?name",
         "where": {"vocab1:givenName":"?name"},
         "reasoning": "owl2ql"
     });
@@ -193,7 +193,7 @@ async fn equivalent_properties_equivalent_symmetric_transitive_and_graph_crawl()
     // Querying for the transitive properties.
     let q3 = json!({
         "@context": {"vocab3":"http://vocab3.example.fr/"},
-        "select": ["?name"],
+        "select": "?name",
         "where": {"vocab3:prenom":"?name"},
         "reasoning": "owl2ql"
     });
@@ -299,7 +299,7 @@ async fn rdfs_subpropertyof_expansion() {
     // Querying one-level up in subproperty hierarchy.
     let q1 = json!({
         "@context": {"ex":"http://example.org/ns/"},
-        "select": ["?parent"],
+        "select": "?parent",
         "where": {"@id":"ex:bob","ex:biologicalParent":"?parent"}
         // relies on default auto-RDFS (hierarchy exists)
     });
@@ -317,7 +317,7 @@ async fn rdfs_subpropertyof_expansion() {
     // Use owl2ql to ensure equivalentProperty contributes to expansion.
     let q2 = json!({
         "@context": {"ex":"http://example.org/ns/"},
-        "select": ["?parent"],
+        "select": "?parent",
         "where": {"@id":"ex:bob","ex:parent":"?parent"},
         "reasoning": "owl2ql"
     });
@@ -340,7 +340,7 @@ async fn rdfs_subpropertyof_expansion() {
     // Sanity: explicit "none" disables auto-RDFS (so parent expansion disappears).
     let q3 = json!({
         "@context": {"ex":"http://example.org/ns/"},
-        "select": ["?parent"],
+        "select": "?parent",
         "where": {"@id":"ex:bob","ex:parent":"?parent"},
         "reasoning": "none"
     });

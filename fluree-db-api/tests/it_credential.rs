@@ -11,10 +11,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
 use fluree_db_api::{credential, FlureeBuilder};
 use serde_json::{json, Value as JsonValue};
-use support::{
-    assert_index_defaults, genesis_ledger, normalize_rows, normalize_rows_array, MemoryFluree,
-    MemoryLedger,
-};
+use support::{assert_index_defaults, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 
 fn decode_hex_32(s: &str) -> [u8; 32] {
     assert_eq!(s.len(), 64, "expected 32-byte hex");
@@ -284,8 +281,8 @@ ORDER BY ?name
         .expect("credential_query_sparql root");
     let jsonld_root = result_root.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
-        normalize_rows_array(&jsonld_root),
-        normalize_rows_array(&json!([["Daniel"]]))
+        normalize_rows(&jsonld_root),
+        normalize_rows(&json!([["Daniel"]]))
     );
 
     // Pleb cannot see root.

@@ -9,8 +9,8 @@ mod support;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 use support::{
-    assert_index_defaults, context_ex_schema, genesis_ledger, normalize_rows, normalize_rows_array,
-    MemoryFluree, MemoryLedger,
+    assert_index_defaults, context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree,
+    MemoryLedger,
 };
 
 fn ctx_schema() -> serde_json::Value {
@@ -239,8 +239,8 @@ async fn query_connection_from_combined_datasets_direct_select_vars() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
             ["Gone with the Wind", "0-582-41805-4", "Margaret Mitchell"],
             [
                 "The Hitchhiker's Guide to the Galaxy",
@@ -284,8 +284,8 @@ async fn query_connection_from_named_with_graph_patterns() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
             ["Gone with the Wind", "0-582-41805-4", "Margaret Mitchell"],
             [
                 "The Hitchhiker's Guide to the Galaxy",
@@ -305,7 +305,7 @@ async fn query_connection_single_ledger_from_top_level() {
     let query = json!({
         "@context": context_ex_schema(),
         "from": "people:main",
-        "select": ["?name"],
+        "select": "?name",
         "where": {
             "@id": "?person",
             "@type": "ex:Person",
@@ -338,7 +338,7 @@ async fn query_connection_multiple_default_graphs_union() {
     let query = json!({
         "@context": context_ex_schema(),
         "from": ["people1:main", "people2:main"],
-        "select": ["?name"],
+        "select": "?name",
         "where": {
             "@id": "?person",
             "@type": "ex:Person",
@@ -370,7 +370,7 @@ async fn query_connection_uses_opts_ledger_fallback() {
     let query = json!({
         "@context": context_ex_schema(),
         "opts": { "ledger": "people:main" },
-        "select": ["?name"],
+        "select": "?name",
         "where": {
             "@id": "?person",
             "@type": "ex:Person",
@@ -470,9 +470,10 @@ WHERE {
     let ledger = fluree.ledger("people:main").await.expect("ledger load");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
+    // SPARQL queries always return array-of-arrays, even for single-var selects.
     assert_eq!(
-        normalize_flat_results(&jsonld),
-        normalize_flat_results(&json!(["Alice", "Bob"]))
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Alice"], ["Bob"]]))
     );
 }
 
@@ -485,7 +486,7 @@ async fn query_connection_jsonld_tracked_single_ledger() {
     let query = json!({
         "@context": context_ex_schema(),
         "from": "people:main",
-        "select": ["?name"],
+        "select": "?name",
         "where": {
             "@id": "?person",
             "@type": "ex:Person",

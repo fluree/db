@@ -45,7 +45,7 @@ pub use error::{ParseError, Result};
 pub(crate) use lower::{lower_query, SelectMode};
 pub use lower::{
     lower_unresolved_pattern, lower_unresolved_patterns, ConstructTemplate, GraphSelectSpec,
-    NestedSelectSpec, ParsedQuery, QueryOutput, Root, SelectionSpec,
+    NestedSelectSpec, ParsedQuery, ProjectionShape, QueryOutput, Root, SelectionSpec,
 };
 pub use policy::{JsonLdParseCtx, JsonLdParsePolicy};
 pub use where_clause::parse_where_with_counters;
@@ -265,6 +265,14 @@ fn parse_query_ast_internal(
             })
             .collect();
     }
+    // selectOne is semantically "first solution" — enforce LIMIT 1 at the query
+    // level so execution can stop after one row, rather than materializing the
+    // full sequence and discarding the rest at format time. Overrides any
+    // user-provided limit because selectOne intent is unambiguous.
+    if select_mode == SelectMode::One {
+        query.options.limit = Some(1);
+    }
+
     if implied_distinct {
         query.options.distinct = true;
         // select-distinct without explicit order defaults to sorting
@@ -548,6 +556,9 @@ fn parse_select(
     match select {
         // Case 2, 3, 5: Array form - could be simple vars, mixed, or with aggregates
         JsonValue::Array(arr) => {
+            // Record shape: array form always yields tuple rows, regardless of
+            // how many items are inside (`["?x"]` → `[[v1],[v2]]`, not `[v1,v2]`).
+            query.select_shape = ProjectionShape::Tuple;
             for item in arr {
                 match item {
                     JsonValue::String(s) => {
@@ -572,8 +583,9 @@ fn parse_select(
             query.graph_select = Some(spec);
         }
 
-        // Case 1: Single string form: "?x"
+        // Case 1: Single string form: "?x" — bare variable, scalar shape.
         JsonValue::String(s) => {
+            query.select_shape = ProjectionShape::Scalar;
             parse_select_string(s, query)?;
         }
 

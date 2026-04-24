@@ -634,7 +634,7 @@ mod tests {
             novelty: None,
             context,
             orig_context: None,
-            output: crate::QueryOutput::Select(var_ids),
+            output: crate::QueryOutput::select(var_ids),
             batches: vec![batch],
             binary_graph: None,
             graph_select: None,

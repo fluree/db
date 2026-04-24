@@ -1,7 +1,8 @@
-use crate::context::{self, build_fluree};
+use crate::context::{self, build_fluree, LedgerMode};
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
+use fluree_db_api::wire::ReindexResponse;
 use fluree_db_api::ReindexOptions;
 
 /// Run incremental indexing for a ledger.
@@ -62,30 +63,79 @@ pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> 
 }
 
 /// Run a full reindex (rebuild from commit history) for a ledger.
-pub async fn run_reindex(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
-    let alias = context::resolve_ledger(ledger, dirs)?;
-    let fluree = build_fluree(dirs)?;
-    let ledger_id = context::to_ledger_id(&alias);
+///
+/// With `--remote`, routes to the named remote's `POST /reindex` endpoint.
+/// Without `--remote` but with a local server running, auto-routes to it
+/// via `server.meta.json` (pass `--direct` to bypass).
+pub async fn run_reindex(
+    ledger: Option<&str>,
+    dirs: &FlureeDir,
+    remote_flag: Option<&str>,
+    direct: bool,
+) -> CliResult<()> {
+    if let Some(remote_name) = remote_flag {
+        let alias = context::resolve_ledger(ledger, dirs)?;
+        let client = context::build_remote_client(remote_name, dirs).await?;
+        let result = client.reindex(&alias).await?;
 
-    // Verify ledger exists
-    if !fluree.ledger_exists(&ledger_id).await.unwrap_or(false) {
-        return Err(CliError::NotFound(format!("ledger '{alias}' not found")));
+        context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+        print_reindex_result(&result);
+        return Ok(());
     }
 
-    eprintln!(
-        "  {} rebuilding index for {} from commit history...",
-        "reindex:".cyan().bold(),
-        alias
-    );
+    let mode = {
+        let mode = context::resolve_ledger_mode(ledger, dirs).await?;
+        if direct {
+            mode
+        } else {
+            context::try_server_route(mode, dirs)
+        }
+    };
 
-    let result = fluree
-        .reindex(&ledger_id, ReindexOptions::default())
-        .await?;
+    match mode {
+        LedgerMode::Tracked {
+            client,
+            remote_alias,
+            remote_name,
+            ..
+        } => {
+            let result = client.reindex(&remote_alias).await?;
 
-    println!(
-        "Reindexed {} to t={} (root: {})",
-        alias, result.index_t, result.root_id
-    );
+            context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
+
+            print_reindex_result(&result);
+        }
+        LedgerMode::Local { fluree, alias } => {
+            let ledger_id = context::to_ledger_id(&alias);
+
+            if !fluree.ledger_exists(&ledger_id).await.unwrap_or(false) {
+                return Err(CliError::NotFound(format!("ledger '{alias}' not found")));
+            }
+
+            eprintln!(
+                "  {} rebuilding index for {} from commit history...",
+                "reindex:".cyan().bold(),
+                alias
+            );
+
+            let result = fluree
+                .reindex(&ledger_id, ReindexOptions::default())
+                .await?;
+
+            println!(
+                "Reindexed {} to t={} (root: {})",
+                alias, result.index_t, result.root_id
+            );
+        }
+    }
 
     Ok(())
+}
+
+fn print_reindex_result(result: &ReindexResponse) {
+    println!(
+        "Reindexed {} to t={} (root: {})",
+        result.ledger_id, result.index_t, result.root_id
+    );
 }

@@ -251,6 +251,36 @@ If no branch suffix is provided (e.g., `"mydb"`), the server MUST normalize to `
 
 Used by `fluree publish` (and potentially future `fluree create --remote`) to create a ledger on a remote server before pushing commits.
 
+## `/reindex` Contract
+
+- Endpoint: `POST {api_base_url}/reindex`
+- Auth: admin-protected (same middleware as `/create`, `/drop`).
+- Request body:
+  ```json
+  {
+    "ledger": "mydb:main",
+    "opts": { }
+  }
+  ```
+  `opts` is optional and reserved for future per-request overrides (e.g. indexer tuning). Servers MUST accept it and MAY ignore it — today the reference server always reindexes using its own configured indexer settings.
+- Response (200 OK):
+  ```json
+  {
+    "ledger_id": "mydb:main",
+    "index_t": 42,
+    "root_id": "fluree:index:sha256:...",
+    "stats": {
+      "flake_count": 0,
+      "leaf_count": 0,
+      "branch_count": 0,
+      "total_bytes": 0
+    }
+  }
+  ```
+- Response (4xx/5xx): standard `ApiError` envelope on failure (e.g. ledger not found).
+
+The response shape mirrors `fluree_db_api::ReindexResult` — implementers should treat that Rust struct as the source of truth and add new fields only additively. Used by `fluree reindex --remote <name>` and by the CLI's auto-routing when a local server is running.
+
 ## `/exists` Response Contract
 
 - Endpoint: `GET {api_base_url}/exists?ledger=mydb:main` (or via `fluree-ledger` header)

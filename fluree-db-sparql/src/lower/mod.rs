@@ -232,9 +232,14 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
 
                 // SELECT * should behave like "wildcard select" for JSON-LD-style outputs.
                 // This lets formatters emit object rows keyed by variable name.
+                //
+                // SPARQL solution sequences are tabular by spec — every
+                // `SELECT ?x` is a sequence of single-column rows, not a list
+                // of bare values. Projection shape is `Tuple` (the default of
+                // the `select`/`select_one` helpers).
                 let output = match &select_query.select.variables {
                     SelectVariables::Star => QueryOutput::Wildcard,
-                    _ => QueryOutput::Select(select),
+                    _ => QueryOutput::select(select),
                 };
 
                 Ok(ParsedQuery {
