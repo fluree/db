@@ -17,9 +17,45 @@ pub const DEFAULT_BODY_LIMIT: usize = 52_428_800; // 50 MB
 
 // ── Indexing ────────────────────────────────────────────────────────
 
-pub const DEFAULT_INDEXING_ENABLED: bool = false;
+pub const DEFAULT_INDEXING_ENABLED: bool = true;
 pub const DEFAULT_REINDEX_MIN_BYTES: usize = 100_000;
-pub const DEFAULT_REINDEX_MAX_BYTES: usize = 1_000_000;
+
+/// Fallback hard-threshold when RAM detection is unavailable (WASM, sandbox).
+///
+/// Production defaults use [`default_reindex_max_bytes`], which returns 20%
+/// of detected system RAM. This constant is only used when that detection
+/// fails or on platforms without `sysinfo`.
+pub const DEFAULT_REINDEX_MAX_BYTES_FALLBACK: usize = 256 * 1024 * 1024; // 256 MB
+
+/// Default hard-threshold for novelty backpressure (bytes).
+///
+/// Returns 20% of system RAM on native platforms, with a 256 MB fallback
+/// when detection is unavailable. Novelty is held in memory between index
+/// builds; once it exceeds this threshold, commits block until indexing
+/// catches up. 20% of RAM leaves plenty of headroom for the query cache,
+/// incoming requests, and the indexer itself.
+#[cfg(feature = "native")]
+pub fn default_reindex_max_bytes() -> usize {
+    use sysinfo::{MemoryRefreshKind, System};
+
+    let mut sys = System::new();
+    sys.refresh_memory_specifics(MemoryRefreshKind::everything());
+
+    let total_memory_bytes = sys.total_memory() as usize;
+    if total_memory_bytes == 0 {
+        return DEFAULT_REINDEX_MAX_BYTES_FALLBACK;
+    }
+
+    // 20% of RAM, floored at 64 MB so very small hosts still have a
+    // workable buffer between soft and hard thresholds.
+    (total_memory_bytes / 5).max(64 * 1024 * 1024)
+}
+
+/// Default hard-threshold (WASM/non-native fallback).
+#[cfg(not(feature = "native"))]
+pub fn default_reindex_max_bytes() -> usize {
+    DEFAULT_REINDEX_MAX_BYTES_FALLBACK
+}
 
 // ── Auth ────────────────────────────────────────────────────────────
 
@@ -262,9 +298,9 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
 # cache_max_mb = 4096                    # global cache budget (MB); default: tiered fraction of RAM (30% <4GB, 40% 4-8GB, 50% ≥8GB)
 
 # [server.indexing]
-# enabled = {indexing_enabled}
+# enabled = {indexing_enabled}                    # disable only when a separate peer/indexer owns indexing for this storage
 # reindex_min_bytes = {reindex_min_bytes}         # {reindex_min_kb} KB — triggers background reindexing
-# reindex_max_bytes = {reindex_max_bytes}        # {reindex_max_kb} KB — blocks commits until reindexed
+# reindex_max_bytes = {reindex_max_bytes}      # {reindex_max_mb} MB (default: 20% of system RAM) — blocks commits until reindexed
 
 # [server.auth.events]
 # mode = "{auth_mode}"                      # none, optional, required
@@ -320,10 +356,17 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
 
 # [profiles.prod.server]
 # log_level = "warn"
-# [profiles.prod.server.indexing]
-# enabled = true
 # [profiles.prod.server.auth.data]
 # mode = "required"
+
+# Example: a transaction-only peer that delegates index maintenance to a
+# separate indexer process. Only disable indexing when something else
+# is producing index roots for this storage.
+# [profiles.peer.server.indexing]
+# enabled = false
+# [profiles.peer.server.peer]
+# role = "transaction"
+# tx_server_url = "http://indexer.internal:8090"
 "#,
         listen_addr = DEFAULT_LISTEN_ADDR,
         storage_comment = storage_comment,
@@ -333,8 +376,8 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
         indexing_enabled = DEFAULT_INDEXING_ENABLED,
         reindex_min_bytes = DEFAULT_REINDEX_MIN_BYTES,
         reindex_min_kb = DEFAULT_REINDEX_MIN_BYTES / 1000,
-        reindex_max_bytes = DEFAULT_REINDEX_MAX_BYTES,
-        reindex_max_kb = DEFAULT_REINDEX_MAX_BYTES / 1000,
+        reindex_max_bytes = default_reindex_max_bytes(),
+        reindex_max_mb = default_reindex_max_bytes() / (1024 * 1024),
         auth_mode = DEFAULT_AUTH_MODE,
         jwks_cache_ttl = DEFAULT_JWKS_CACHE_TTL,
         mcp_enabled = DEFAULT_MCP_ENABLED,
@@ -370,7 +413,7 @@ pub fn generate_jsonld_config_template(storage_path_override: Option<&str>) -> S
             "indexing": {
                 "enabled": DEFAULT_INDEXING_ENABLED,
                 "reindex_min_bytes": DEFAULT_REINDEX_MIN_BYTES,
-                "reindex_max_bytes": DEFAULT_REINDEX_MAX_BYTES
+                "reindex_max_bytes": default_reindex_max_bytes()
             },
             "auth": {
                 "events": { "mode": DEFAULT_AUTH_MODE },

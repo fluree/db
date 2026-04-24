@@ -317,8 +317,10 @@ pub fn build_fluree(dirs: &FlureeDir) -> CliResult<Fluree> {
         .unwrap_or(default_config.reindex_min_bytes);
     let max_bytes = thresholds
         .reindex_max_bytes
-        .unwrap_or(default_config.reindex_max_bytes);
-    builder = builder.with_novelty_thresholds(min_bytes, max_bytes);
+        .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes);
+    builder = builder
+        .without_indexing()
+        .with_novelty_thresholds(min_bytes, max_bytes);
 
     builder
         .build()

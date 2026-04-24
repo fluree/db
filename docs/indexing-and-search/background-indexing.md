@@ -137,9 +137,9 @@ Query for ex:alice's properties:
 
 ## Configuration
 
-Background indexing is enabled at the server level, and indexing is triggered based on novelty size thresholds:
+Background indexing is **on by default**. Indexing is triggered based on novelty size thresholds:
 
-- Enable/disable background indexing: `--indexing-enabled` / `FLUREE_INDEXING_ENABLED`
+- Enable/disable background indexing: `--indexing-enabled` / `FLUREE_INDEXING_ENABLED` (default `true`; disable only when a peer/indexer process owns this storage)
 - Trigger threshold (soft): `--reindex-min-bytes` / `FLUREE_REINDEX_MIN_BYTES`
 - Backpressure threshold (hard): `--reindex-max-bytes` / `FLUREE_REINDEX_MAX_BYTES`
 

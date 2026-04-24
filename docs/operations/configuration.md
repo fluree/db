@@ -42,7 +42,8 @@ log_level = "info"
 [server.indexing]
 enabled = true
 reindex_min_bytes = 100000
-reindex_max_bytes = 1000000
+# reindex_max_bytes defaults to 20% of system RAM; override only if needed:
+# reindex_max_bytes = 536870912  # 512 MB
 
 [server.auth.data]
 mode = "required"
@@ -82,16 +83,14 @@ Example `.fluree/config.jsonld`:
     "storage_path": ".fluree/storage",
     "log_level": "info",
     "indexing": {
-      "enabled": false,
-      "reindex_min_bytes": 100000,
-      "reindex_max_bytes": 1000000
+      "enabled": true,
+      "reindex_min_bytes": 100000
     }
   },
   "profiles": {
     "prod": {
       "server": {
-        "log_level": "warn",
-        "indexing": { "enabled": true }
+        "log_level": "warn"
       }
     }
   }
@@ -247,7 +246,7 @@ Example connection config (`connection.jsonld`):
 
 - `--connection-config` and `--storage-path` are mutually exclusive. If both are set, `--connection-config` takes precedence (a warning is logged).
 - Server-level settings (`--cache-max-mb`, `--indexing-enabled`, `--reindex-min-bytes`, `--reindex-max-bytes`) override any equivalent values from the connection config.
-- If `--indexing-enabled` is not explicitly set (defaults to `false`), indexing settings from the connection config are cleared. Set `--indexing-enabled` explicitly if your connection config should control indexing.
+- `--indexing-enabled` defaults to `true`. Pass `--indexing-enabled=false` only when a separate peer/indexer process owns index maintenance for the same storage.
 - AWS credentials and region are resolved via the standard AWS SDK chain (env vars, instance profile, `~/.aws/config`, etc.) — they are not part of the connection config.
 - The connection config can use `envVar` indirection for sensitive fields like S3 bucket names or encryption keys (see [ConfigurationValue](../reference/connection-config-jsonld.md#configurationvalue-env-var-indirection)).
 
@@ -313,17 +312,17 @@ Enable background indexing and configure novelty backpressure thresholds:
 
 | Flag                  | Env Var                    | Default   | Description                                     |
 | --------------------- | -------------------------- | --------- | ----------------------------------------------- |
-| `--indexing-enabled`  | `FLUREE_INDEXING_ENABLED`  | `false`   | Enable background indexing                      |
+| `--indexing-enabled`  | `FLUREE_INDEXING_ENABLED`  | `true`    | Enable background indexing (set `false` only when an external indexer process owns this storage) |
 | `--reindex-min-bytes` | `FLUREE_REINDEX_MIN_BYTES` | `100000`  | Soft threshold (triggers background indexing)   |
-| `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | `1000000` | Hard threshold (blocks commits until reindexed) |
+| `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | 20% of system RAM (256 MB fallback) | Hard threshold (blocks commits until reindexed) |
 
 Config file equivalent:
 
 ```toml
 [server.indexing]
 enabled = true
-reindex_min_bytes = 100000   # 100 KB
-reindex_max_bytes = 1000000  # 1 MB
+reindex_min_bytes = 100000         # 100 KB — soft trigger
+# reindex_max_bytes = 536870912    # 512 MB — defaults to 20% of system RAM if omitted
 ```
 
 ## Server Role Configuration
@@ -744,9 +743,9 @@ fluree server run \
 | `FLUREE_STORAGE_PATH`                   | File storage path                               | `.fluree/storage`                                                       |
 | `FLUREE_CONNECTION_CONFIG`              | JSON-LD connection config file path             | None                                                                    |
 | `FLUREE_CORS_ENABLED`                   | Enable CORS                                     | `true`                                                                  |
-| `FLUREE_INDEXING_ENABLED`               | Enable background indexing                      | `false`                                                                 |
+| `FLUREE_INDEXING_ENABLED`               | Enable background indexing                      | `true`                                                                  |
 | `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100000`                                                                |
-| `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | `1000000`                                                               |
+| `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | 20% of system RAM (256 MB fallback)                                      |
 | `FLUREE_CACHE_MAX_MB`                   | Global cache budget (MB)                        | `30/40/50% of RAM (tiered: <4GB / 4-8GB / ≥8GB)`                                                     |
 | `FLUREE_BODY_LIMIT`                     | Max request body bytes                          | `52428800`                                                              |
 | `FLUREE_LOG_LEVEL`                      | Log level                                       | `info`                                                                  |
