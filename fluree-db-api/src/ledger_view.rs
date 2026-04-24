@@ -27,7 +27,11 @@ use crate::error::{ApiError, Result};
 /// Commits have a canonical content-addressed id ([`CommitId`]), but there are
 /// several user-facing forms that resolve to the same id.
 pub enum CommitRef {
-    /// Exact CID (e.g., from API or full CID string like "bagaybqabciq...")
+    /// Fully resolved CID — no lookup needed.
+    ///
+    /// Produced by [`CommitRef::parse`] when the input is a valid multibase
+    /// CID string (e.g., `"bafybei..."`), or constructed directly by callers
+    /// that already hold a [`CommitId`].
     Exact(CommitId),
     /// Hex digest prefix (e.g., "3dd028" — the SHA-256 hex prefix of the commit)
     Prefix(String),
@@ -39,11 +43,10 @@ impl CommitRef {
     /// Parse a user-supplied commit reference string.
     ///
     /// - `"t:N"` → [`CommitRef::T`] with transaction number `N`
-    /// - anything else → [`CommitRef::Prefix`] (full CIDs and hex-digest
-    ///   prefixes are both handled by the prefix resolver)
-    ///
-    /// [`CommitRef::Exact`] is not produced by this parser — callers holding
-    /// a concrete [`CommitId`] should construct it directly.
+    /// - a valid multibase CID (e.g., `"bafybei..."`) → [`CommitRef::Exact`]
+    /// - anything else → [`CommitRef::Prefix`] (hex digest prefixes, and the
+    ///   `fluree:commit:` / `sha256:` prefixed hex forms, are all handled by
+    ///   the prefix resolver)
     pub fn parse(s: &str) -> Result<Self> {
         if let Some(t_str) = s.strip_prefix("t:") {
             let t: i64 = t_str
@@ -52,6 +55,8 @@ impl CommitRef {
             Ok(CommitRef::T(t))
         } else if s.is_empty() {
             Err(ApiError::query("empty commit reference"))
+        } else if let Ok(cid) = s.parse::<ContentId>() {
+            Ok(CommitRef::Exact(cid))
         } else {
             Ok(CommitRef::Prefix(s.to_string()))
         }
@@ -343,4 +348,24 @@ async fn resolve_t_to_commit_id(
     Err(ApiError::NotFound(format!(
         "No commit found for t={target_t}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::ContentKind;
+
+    /// `parse` must accept the multibase CID string produced by
+    /// `ContentId::Display` and return [`CommitRef::Exact`]. If it falls
+    /// through to `Prefix` instead, the prefix resolver (which scans by hex
+    /// digest) silently fails to match a base32-multibase string.
+    #[test]
+    fn parse_full_multibase_cid_produces_exact() {
+        let cid = ContentId::new(ContentKind::Commit, b"regression-probe");
+        let parsed = CommitRef::parse(&cid.to_string()).expect("parse should succeed");
+        assert!(
+            matches!(&parsed, CommitRef::Exact(c) if c == &cid),
+            "expected Exact({cid}), got a different variant"
+        );
+    }
 }
