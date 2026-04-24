@@ -92,7 +92,10 @@ async fn transact_policy_denied_includes_policy_and_fuel_tracking() {
             ledger,
             input,
             CommitOpts::default(),
-            &IndexConfig::default(),
+            &IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await
     {

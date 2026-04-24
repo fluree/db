@@ -2104,7 +2104,10 @@ mod embedded_tests {
         let ledger = LedgerState::new(db, novelty);
 
         let ns = MemoryNameService::new();
-        let index_config = IndexConfig::default(); // High threshold
+        let index_config = IndexConfig {
+            reindex_min_bytes: 100_000,
+            reindex_max_bytes: 1_000_000_000,
+        }; // High threshold
         let indexer_config = IndexerConfig::small();
 
         let (returned_ledger, result) =

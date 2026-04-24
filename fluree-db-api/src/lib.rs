@@ -1167,11 +1167,11 @@ fn derive_index_config(config: &ConnectionConfig) -> IndexConfig {
         reindex_min_bytes: indexing
             .and_then(|i| i.reindex_min_bytes)
             .map(|v| v as usize)
-            .unwrap_or(IndexConfig::default().reindex_min_bytes),
+            .unwrap_or(server_defaults::DEFAULT_REINDEX_MIN_BYTES),
         reindex_max_bytes: indexing
             .and_then(|i| i.reindex_max_bytes)
             .map(|v| v as usize)
-            .unwrap_or(IndexConfig::default().reindex_max_bytes),
+            .unwrap_or_else(server_defaults::default_reindex_max_bytes),
     }
 }
 
@@ -1224,18 +1224,15 @@ pub struct IndexingBuilderConfig {
 
 /// Default `IndexingBuilderConfig` for persistent storage (`file`, `s3`, `ipfs`).
 ///
-/// Uses [`server_defaults::default_reindex_max_bytes`] for the hard threshold
-/// (20% of RAM), so persistent Fluree instances built programmatically get the
-/// same production-sized backpressure as the server binary. The low-level
-/// `IndexConfig::default()` value (1 MB) is deliberately kept small as a safe
-/// baseline for unit tests and direct library use.
+/// Uses [`server_defaults::default_index_config`] for the novelty thresholds
+/// (RAM-tiered hard threshold), so persistent Fluree instances built
+/// programmatically get the same production-sized backpressure as the server
+/// binary. `IndexConfig` itself has no `Default` impl — configuration policy
+/// lives here in the API layer, not in the lower-level `fluree-db-ledger` crate.
 fn default_indexing_builder_config() -> IndexingBuilderConfig {
     IndexingBuilderConfig {
         indexer_config: IndexerConfig::default(),
-        index_config: IndexConfig {
-            reindex_min_bytes: server_defaults::DEFAULT_REINDEX_MIN_BYTES,
-            reindex_max_bytes: server_defaults::default_reindex_max_bytes(),
-        },
+        index_config: server_defaults::default_index_config(),
     }
 }
 
@@ -1646,10 +1643,7 @@ impl FlureeBuilder {
     ///
     /// [`without_indexing`]: FlureeBuilder::without_indexing
     pub fn with_indexing(mut self) -> Self {
-        self.indexing_config = Some(IndexingBuilderConfig {
-            indexer_config: IndexerConfig::default(),
-            index_config: IndexConfig::default(),
-        });
+        self.indexing_config = Some(default_indexing_builder_config());
         self
     }
 
@@ -2168,7 +2162,7 @@ impl FlureeBuilder {
         self.indexing_config
             .as_ref()
             .map(|c| c.index_config.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(server_defaults::default_index_config)
     }
 
     /// Spawn the background indexer worker if configured.
@@ -2550,7 +2544,7 @@ impl Fluree {
             nameservice_mode: nameservice,
             leaflet_cache,
             indexing_mode: tx::IndexingMode::Disabled,
-            index_config: IndexConfig::default(),
+            index_config: server_defaults::default_index_config(),
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
             event_bus: Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024)),
             ledger_manager: None,
@@ -2572,7 +2566,7 @@ impl Fluree {
             nameservice_mode: nameservice,
             leaflet_cache,
             indexing_mode,
-            index_config: IndexConfig::default(),
+            index_config: server_defaults::default_index_config(),
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
             event_bus: Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024)),
             ledger_manager: None,
@@ -3384,14 +3378,9 @@ mod tests {
     fn test_default_index_config_returns_defaults_without_thresholds() {
         let fluree = FlureeBuilder::memory().build_memory();
         let cfg = fluree.default_index_config();
-        assert_eq!(
-            cfg.reindex_min_bytes,
-            IndexConfig::default().reindex_min_bytes
-        );
-        assert_eq!(
-            cfg.reindex_max_bytes,
-            IndexConfig::default().reindex_max_bytes
-        );
+        let expected = server_defaults::default_index_config();
+        assert_eq!(cfg.reindex_min_bytes, expected.reindex_min_bytes);
+        assert_eq!(cfg.reindex_max_bytes, expected.reindex_max_bytes);
     }
 
     #[test]
@@ -3435,14 +3424,9 @@ mod tests {
     fn test_derive_index_config_falls_back_to_defaults() {
         let config = ConnectionConfig::default();
         let idx = derive_index_config(&config);
-        assert_eq!(
-            idx.reindex_min_bytes,
-            IndexConfig::default().reindex_min_bytes
-        );
-        assert_eq!(
-            idx.reindex_max_bytes,
-            IndexConfig::default().reindex_max_bytes
-        );
+        let expected = server_defaults::default_index_config();
+        assert_eq!(idx.reindex_min_bytes, expected.reindex_min_bytes);
+        assert_eq!(idx.reindex_max_bytes, expected.reindex_max_bytes);
     }
 
     // ========================================================================

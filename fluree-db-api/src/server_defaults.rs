@@ -57,6 +57,18 @@ pub fn default_reindex_max_bytes() -> usize {
     DEFAULT_REINDEX_MAX_BYTES_FALLBACK
 }
 
+/// Canonical default `IndexConfig` for API-layer callers.
+///
+/// Combines [`DEFAULT_REINDEX_MIN_BYTES`] with [`default_reindex_max_bytes`]
+/// so the server, CLI, programmatic `FlureeBuilder`, and any transient
+/// internal callers all resolve the same value.
+pub fn default_index_config() -> fluree_db_ledger::IndexConfig {
+    fluree_db_ledger::IndexConfig {
+        reindex_min_bytes: DEFAULT_REINDEX_MIN_BYTES,
+        reindex_max_bytes: default_reindex_max_bytes(),
+    }
+}
+
 // ── Auth ────────────────────────────────────────────────────────────
 
 pub const DEFAULT_AUTH_MODE: &str = "none";
