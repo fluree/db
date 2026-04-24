@@ -422,6 +422,116 @@ pub fn global_schema_bundle_cache() -> &'static SchemaBundleCache {
     CACHE.get_or_init(SchemaBundleCache::default)
 }
 
+// ============================================================================
+// Flakes cache
+// ============================================================================
+
+/// Cache key for [`SchemaBundleFlakesCache`].
+///
+/// Derived directly from a [`ResolvedSchemaBundle`]: same `(ledger_id, to_t)`
+/// lifetime as the bundle cache, plus the resolved source graph list so two
+/// bundles resolving to the same sources share materialized flakes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SchemaBundleFlakesCacheKey {
+    pub ledger_id: Arc<str>,
+    pub to_t: i64,
+    pub sources: Vec<GraphId>,
+}
+
+/// Process-global LRU cache of materialized schema-bundle flakes.
+///
+/// `build_schema_bundle_flakes` does ~18 overlay range reads per source graph
+/// (schema predicates + schema classes); with `f:schemaSource` configured
+/// every query would repeat that work for the same `(ledger_id, to_t,
+/// sources)` triple. Since the inputs are immutable at a given `t` and any
+/// config change advances `t`, a plain LRU cache is sufficient — no
+/// invalidation.
+pub struct SchemaBundleFlakesCache {
+    inner: moka::sync::Cache<
+        SchemaBundleFlakesCacheKey,
+        Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>,
+    >,
+}
+
+impl SchemaBundleFlakesCache {
+    /// Capacity parallels `SchemaBundleCache`: one flakes entry per bundle
+    /// entry in steady state.
+    const DEFAULT_CAPACITY: u64 = 1024;
+
+    pub fn with_capacity(capacity: u64) -> Self {
+        Self {
+            inner: moka::sync::Cache::new(capacity),
+        }
+    }
+
+    pub fn get(
+        &self,
+        key: &SchemaBundleFlakesCacheKey,
+    ) -> Option<Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>> {
+        self.inner.get(key)
+    }
+
+    pub fn insert(
+        &self,
+        key: SchemaBundleFlakesCacheKey,
+        flakes: Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>,
+    ) {
+        self.inner.insert(key, flakes);
+    }
+
+    #[cfg(test)]
+    pub fn clear(&self) {
+        self.inner.invalidate_all();
+        self.inner.run_pending_tasks();
+    }
+}
+
+impl Default for SchemaBundleFlakesCache {
+    fn default() -> Self {
+        Self::with_capacity(Self::DEFAULT_CAPACITY)
+    }
+}
+
+/// Process-global schema-bundle flakes cache.
+pub fn global_schema_bundle_flakes_cache() -> &'static SchemaBundleFlakesCache {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<SchemaBundleFlakesCache> = OnceLock::new();
+    CACHE.get_or_init(SchemaBundleFlakesCache::default)
+}
+
+/// Fetch-or-build materialized schema-bundle flakes for a resolved bundle.
+///
+/// On a cache hit, returns the shared `Arc<SchemaBundleFlakes>` without any
+/// overlay reads. On a miss, calls
+/// [`fluree_db_query::schema_bundle::build_schema_bundle_flakes`] and stores
+/// the result.
+pub async fn get_or_build_schema_bundle_flakes(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    bundle: &ResolvedSchemaBundle,
+) -> Result<Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>> {
+    let key = SchemaBundleFlakesCacheKey {
+        ledger_id: bundle.ledger_id.clone(),
+        to_t: bundle.to_t,
+        sources: bundle.sources.clone(),
+    };
+    if let Some(cached) = global_schema_bundle_flakes_cache().get(&key) {
+        return Ok(cached);
+    }
+
+    let flakes = fluree_db_query::schema_bundle::build_schema_bundle_flakes(
+        snapshot,
+        overlay,
+        bundle.to_t,
+        &bundle.sources,
+    )
+    .await
+    .map_err(|e| ApiError::OntologyImport(format!("failed to materialize schema bundle: {e}")))?;
+    let flakes = Arc::new(flakes);
+    global_schema_bundle_flakes_cache().insert(key, flakes.clone());
+    Ok(flakes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -527,17 +527,13 @@ impl Fluree {
         else {
             return Ok(());
         };
-        let flakes = fluree_db_query::schema_bundle::build_schema_bundle_flakes(
+        let flakes = crate::ontology_imports::get_or_build_schema_bundle_flakes(
             db_ref.snapshot,
             db_ref.overlay,
-            db_ref.t,
-            &bundle.sources,
+            &bundle,
         )
-        .await
-        .map_err(|e| {
-            ApiError::OntologyImport(format!("failed to materialize schema bundle: {e}"))
-        })?;
-        executable.options.schema_bundle = Some(std::sync::Arc::new(flakes));
+        .await?;
+        executable.options.schema_bundle = Some(flakes);
         Ok(())
     }
 
