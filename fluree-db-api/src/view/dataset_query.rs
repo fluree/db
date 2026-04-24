@@ -100,7 +100,7 @@ impl Fluree {
         super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
 
         // 2. Build executable with optional reasoning override from primary view
-        let executable = self.build_executable_for_dataset(dataset, &parsed)?;
+        let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
 
         // 3. Get tracker for fuel limits
         let tracker = match &input {
@@ -192,7 +192,7 @@ impl Fluree {
         super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
 
         // 2. Build executable with optional reasoning override from primary view
-        let executable = self.build_executable_for_dataset(dataset, &parsed)?;
+        let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
 
         // 3. Get tracker for fuel limits
         let tracker = match &input {
@@ -286,6 +286,7 @@ impl Fluree {
         // Build executable
         let executable = self
             .build_executable_for_dataset(dataset, &parsed)
+            .await
             .map_err(|e| {
                 crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
             })?;
@@ -399,6 +400,7 @@ impl Fluree {
 
         let executable = self
             .build_executable_for_dataset(dataset, &parsed)
+            .await
             .map_err(|e| {
                 crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
             })?;
@@ -465,8 +467,10 @@ impl Fluree {
 
     /// Build an ExecutableQuery for dataset queries.
     ///
-    /// Applies reasoning from the primary view if set.
-    fn build_executable_for_dataset(
+    /// Applies reasoning from the primary view if set. When reasoning config
+    /// on the primary view declares `f:schemaSource`, resolves the schema
+    /// bundle closure and attaches it to `executable.options.schema_bundle`.
+    async fn build_executable_for_dataset(
         &self,
         dataset: &DataSetDb,
         parsed: &fluree_db_query::parse::ParsedQuery,
@@ -485,9 +489,56 @@ impl Fluree {
                     executable.options.reasoning = effective.clone();
                 }
             }
+
+            // Resolve schema bundle against the primary view's ledger
+            // (same-ledger only). Mirrors the single-view path in
+            // `view/query.rs::attach_schema_bundle`; see that method for the
+            // reasoning-disabled short-circuit rationale.
+            Self::attach_dataset_schema_bundle(primary, &mut executable).await?;
         }
 
         Ok(executable)
+    }
+
+    async fn attach_dataset_schema_bundle(
+        primary: &crate::view::GraphDb,
+        executable: &mut ExecutableQuery,
+    ) -> Result<()> {
+        if executable.options.reasoning.is_disabled() {
+            return Ok(());
+        }
+        let Some(resolved) = primary.resolved_config() else {
+            return Ok(());
+        };
+        let Some(reasoning) = resolved.reasoning.as_ref() else {
+            return Ok(());
+        };
+        if reasoning.schema_source.is_none() {
+            return Ok(());
+        }
+        let db_ref = primary.as_graph_db_ref();
+        let Some(bundle) = crate::ontology_imports::resolve_schema_bundle(
+            db_ref.snapshot,
+            db_ref.overlay,
+            db_ref.t,
+            reasoning,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let flakes = fluree_db_query::schema_bundle::build_schema_bundle_flakes(
+            db_ref.snapshot,
+            db_ref.overlay,
+            db_ref.t,
+            &bundle.sources,
+        )
+        .await
+        .map_err(|e| {
+            ApiError::OntologyImport(format!("failed to materialize schema bundle: {e}"))
+        })?;
+        executable.options.schema_bundle = Some(std::sync::Arc::new(flakes));
+        Ok(())
     }
 
     /// Execute against dataset (multi-ledger).
