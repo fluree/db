@@ -60,6 +60,7 @@ pub mod ledger_info;
 mod merge;
 pub mod nameservice_query;
 pub(crate) mod ns_helpers;
+pub mod ontology_imports;
 mod overlay;
 pub mod pack;
 pub mod policy_builder;

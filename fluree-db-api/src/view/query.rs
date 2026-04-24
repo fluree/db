@@ -94,7 +94,7 @@ impl Fluree {
 
         // 2. Build executable with optional reasoning override
         let plan_start = std::time::Instant::now();
-        let executable = self.build_executable_for_view(db, &parsed)?;
+        let executable = self.build_executable_for_view(db, &parsed).await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
         // 3. Get tracker for fuel limits only (no tracking overhead for non-tracked calls)
@@ -158,7 +158,7 @@ impl Fluree {
         maybe_wrap_for_graph_source(db, &mut parsed);
 
         // 2. Build executable with optional reasoning override
-        let executable = self.build_executable_for_view(db, &parsed)?;
+        let executable = self.build_executable_for_view(db, &parsed).await?;
 
         // 3. Tracker (fuel limits only)
         let tracker = match &input {
@@ -269,9 +269,12 @@ impl Fluree {
         maybe_wrap_for_graph_source(db, &mut parsed);
 
         // Build executable with reasoning
-        let executable = self.build_executable_for_view(db, &parsed).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
-        })?;
+        let executable = self
+            .build_executable_for_view(db, &parsed)
+            .await
+            .map_err(|e| {
+                crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+            })?;
 
         // Execute with tracking
         let batches = self
@@ -376,9 +379,12 @@ impl Fluree {
         // Auto-wrap for graph source context
         maybe_wrap_for_graph_source(db, &mut parsed);
 
-        let executable = self.build_executable_for_view(db, &parsed).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
-        })?;
+        let executable = self
+            .build_executable_for_view(db, &parsed)
+            .await
+            .map_err(|e| {
+                crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+            })?;
 
         let batches = self
             .execute_view_tracked_with_r2rml(
@@ -470,8 +476,11 @@ impl Fluree {
     ///
     /// Also enforces config-graph datalog restrictions: if config disables
     /// datalog and the query can't override, the datalog flag and/or
-    /// query-time rules are stripped.
-    fn build_executable_for_view(
+    /// query-time rules are stripped. When reasoning config declares an
+    /// `f:schemaSource` (with optional `owl:imports` closure), the resolved
+    /// schema bundle is attached to `options.schema_bundle` so the runner
+    /// can layer it as a `SchemaBundleOverlay` at prep time.
+    async fn build_executable_for_view(
         &self,
         db: &GraphDb,
         parsed: &fluree_db_query::parse::ParsedQuery,
@@ -502,7 +511,65 @@ impl Fluree {
             }
         }
 
+        // Resolve `f:schemaSource` + `owl:imports` closure, if configured.
+        self.attach_schema_bundle(db, &mut executable).await?;
+
         Ok(executable)
+    }
+
+    /// Resolve the schema bundle from the ledger's reasoning config and attach
+    /// the projected schema flakes to `executable.options.schema_bundle`.
+    ///
+    /// Short-circuits in three cases (no bundle is built, no error is
+    /// raised):
+    /// - The view has no resolved config.
+    /// - Reasoning defaults have no `f:schemaSource`.
+    /// - The effective query reasoning is **explicitly disabled**
+    ///   (`"reasoning": "none"`). Users who opt out of reasoning must not
+    ///   be exposed to errors from an otherwise-unrelated broken ontology
+    ///   import; the bundle is a reasoning-only concern.
+    ///
+    /// Errors with [`ApiError::OntologyImport`] only when reasoning is
+    /// actually engaged and an import can't be resolved locally.
+    async fn attach_schema_bundle(
+        &self,
+        db: &GraphDb,
+        executable: &mut ExecutableQuery,
+    ) -> Result<()> {
+        if executable.options.reasoning.is_disabled() {
+            return Ok(());
+        }
+        let Some(resolved) = db.resolved_config() else {
+            return Ok(());
+        };
+        let Some(reasoning) = resolved.reasoning.as_ref() else {
+            return Ok(());
+        };
+        if reasoning.schema_source.is_none() {
+            return Ok(());
+        }
+
+        let db_ref = db.as_graph_db_ref();
+        let Some(bundle) = crate::ontology_imports::resolve_schema_bundle(
+            db_ref.snapshot,
+            db_ref.overlay,
+            db_ref.t,
+            reasoning,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        let flakes = crate::ontology_imports::get_or_build_schema_bundle_flakes(
+            db_ref.snapshot,
+            db_ref.overlay,
+            &bundle,
+        )
+        .await?;
+
+        executable.options.schema_bundle = Some(flakes);
+        Ok(())
     }
 
     /// Execute against a GraphDb with policy awareness.
