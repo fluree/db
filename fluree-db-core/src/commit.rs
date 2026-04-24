@@ -882,12 +882,10 @@ mod tests {
         let c1 = Commit::new(1, vec![make_test_flake(1, 2, 10, 1)]);
         let c1_id = store_commit(&store, &c1).await;
 
-        let c2 = Commit::new(2, vec![make_test_flake(2, 3, 20, 2)])
-            .with_parent(c1_id.clone());
+        let c2 = Commit::new(2, vec![make_test_flake(2, 3, 20, 2)]).with_parent(c1_id.clone());
         let c2_id = store_commit(&store, &c2).await;
 
-        let c3 = Commit::new(3, vec![make_test_flake(3, 4, 30, 3)])
-            .with_parent(c2_id.clone());
+        let c3 = Commit::new(3, vec![make_test_flake(3, 4, 30, 3)]).with_parent(c2_id.clone());
         let c3_id = store_commit(&store, &c3).await;
 
         // Trace from head (c3), stop_at_t=0 → all 3 commits

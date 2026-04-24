@@ -309,7 +309,9 @@ async fn create_branch_at_historical_t() {
                 .method("POST")
                 .uri("/v1/fluree/create")
                 .header("content-type", "application/json")
-                .body(Body::from(serde_json::json!({"ledger": "hist:main"}).to_string()))
+                .body(Body::from(
+                    serde_json::json!({"ledger": "hist:main"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -374,10 +376,7 @@ async fn create_branch_at_historical_t() {
         Some(2),
         "historical branch should be at t=2, got: {json}"
     );
-    assert_eq!(
-        json.get("source").and_then(|v| v.as_str()),
-        Some("main")
-    );
+    assert_eq!(json.get("source").and_then(|v| v.as_str()), Some("main"));
 
     // Bad `at` value surfaces as 400
     let bad = serde_json::json!({

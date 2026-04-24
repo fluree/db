@@ -23,10 +23,10 @@ mod inner {
     use crate::parse::trig_meta::{parse_trig_phase1, resolve_trig_meta, RawObject, RawTerm};
     use crate::value_convert::convert_string_literal;
     use fluree_db_core::ns_encoding::NsSplitMode;
+    use fluree_db_core::CommitId;
     use fluree_db_core::{
         ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid,
     };
-    use fluree_db_core::CommitId;
 
     /// Returns `Some(mode)` for the genesis commit (no parent), `None` otherwise.
     /// The split mode is only persisted in the genesis commit envelope.

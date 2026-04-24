@@ -1513,7 +1513,9 @@ mod tests {
         let cid = test_commit_id("commit-5");
         ns.publish_commit("mydb:main", 5, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "feature-x", "main", None).await.unwrap();
+        ns.create_branch("mydb", "feature-x", "main", None)
+            .await
+            .unwrap();
 
         let record = ns.lookup("mydb:feature-x").await.unwrap().unwrap();
         assert_eq!(record.name, "mydb");
@@ -1544,7 +1546,9 @@ mod tests {
         ns.publish_commit("mydb:main", 3, &cid).await.unwrap();
 
         ns.create_branch("mydb", "dev", "main", None).await.unwrap();
-        ns.create_branch("mydb", "staging", "main", None).await.unwrap();
+        ns.create_branch("mydb", "staging", "main", None)
+            .await
+            .unwrap();
 
         // Also create a different ledger to ensure filtering works
         ns.publish_ledger_init("other:main").await.unwrap();
@@ -1570,7 +1574,9 @@ mod tests {
         let cid = test_commit_id("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "dead", "main", None).await.unwrap();
+        ns.create_branch("mydb", "dead", "main", None)
+            .await
+            .unwrap();
         ns.retract("mydb:dead").await.unwrap();
 
         let branches = ns.list_branches("mydb").await.unwrap();

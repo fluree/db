@@ -29,12 +29,8 @@ const FLAG_TIME: u8 = 0x10;
 const FLAG_TXN_SIGNATURE: u8 = 0x80;
 
 /// Mask of all flag bits the current encoder/decoder understands.
-const KNOWN_FLAGS: u8 = FLAG_TXN_META
-    | FLAG_PARENT
-    | FLAG_NAMESPACE_DELTA
-    | FLAG_TXN
-    | FLAG_TIME
-    | FLAG_TXN_SIGNATURE;
+const KNOWN_FLAGS: u8 =
+    FLAG_TXN_META | FLAG_PARENT | FLAG_NAMESPACE_DELTA | FLAG_TXN | FLAG_TIME | FLAG_TXN_SIGNATURE;
 
 /// Maximum number of named graph entries per commit.
 pub const MAX_GRAPH_DELTA_ENTRIES: usize = 256;
