@@ -351,9 +351,10 @@ impl fluree_db_nameservice::NameService for NameServiceMode {
         ledger_name: &str,
         new_branch: &str,
         source_branch: &str,
+        at_commit: Option<(fluree_db_core::ContentId, i64)>,
     ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
         self.reader()
-            .create_branch(ledger_name, new_branch, source_branch)
+            .create_branch(ledger_name, new_branch, source_branch, at_commit)
             .await
     }
 

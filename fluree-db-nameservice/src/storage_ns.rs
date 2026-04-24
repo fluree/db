@@ -565,17 +565,24 @@ where
         ledger_name: &str,
         new_branch: &str,
         source_branch: &str,
+        at_commit: Option<(ContentId, i64)>,
     ) -> Result<()> {
         let key = self.ns_key(ledger_name, new_branch);
         let normalized_id = format_ledger_id(ledger_name, new_branch);
 
-        // Read the source branch to get commit head info
+        // Read the source branch to validate it exists (and to get commit info
+        // when `at_commit` is None).
         let source_record = self
             .load_record(ledger_name, source_branch)
             .await?
             .ok_or_else(|| {
                 NameServiceError::not_found(format!("source branch {ledger_name}:{source_branch}"))
             })?;
+
+        let (commit_head_id, commit_t) = match at_commit {
+            Some((id, t)) => (Some(id), t),
+            None => (source_record.commit_head_id.clone(), source_record.commit_t),
+        };
 
         let file = NsFileV2 {
             context: ns_context(),
@@ -585,12 +592,11 @@ where
                 id: ledger_name.to_string(),
             },
             branch: new_branch.to_string(),
-            commit_cid: source_record
-                .commit_head_id
+            commit_cid: commit_head_id
                 .as_ref()
                 .map(std::string::ToString::to_string),
             config_cid: None,
-            t: source_record.commit_t,
+            t: commit_t,
             index: None,
             status: "ready".to_string(),
             default_context_cid: None,

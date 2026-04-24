@@ -117,7 +117,7 @@ async fn run_create(
         }
         LedgerMode::Local { fluree, alias } => {
             let (ledger_name, _) = split_ledger_id(&alias)?;
-            let record = fluree.create_branch(&ledger_name, name, from).await?;
+            let record = fluree.create_branch(&ledger_name, name, from, None).await?;
 
             let source = record.source_branch.as_deref().unwrap_or("main");
             let t = record.commit_t;

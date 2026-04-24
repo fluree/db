@@ -60,7 +60,7 @@ async fn rebase_fast_forward() {
     let result = fluree.insert(ledger, &base_data).await.unwrap();
     let main_ledger = result.ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree.create_branch("mydb", "dev", None, None).await.unwrap();
 
     // Advance main
     let main_data = json!({
@@ -98,7 +98,7 @@ async fn rebase_clean_replay() {
     let result = fluree.insert(ledger, &base_data).await.unwrap();
     let main_ledger = result.ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree.create_branch("mydb", "dev", None, None).await.unwrap();
 
     // Transact on dev (non-overlapping)
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
@@ -145,7 +145,7 @@ async fn rebase_abort_on_conflict() {
     let result = fluree.insert(ledger, &base_data).await.unwrap();
     let main_ledger = result.ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree.create_branch("mydb", "dev", None, None).await.unwrap();
 
     // Overlapping data on dev
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
@@ -207,7 +207,7 @@ async fn rebase_take_source() {
     let result = fluree.insert(ledger, &base_data).await.unwrap();
     let main_ledger = result.ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree.create_branch("mydb", "dev", None, None).await.unwrap();
 
     // Dev: overlapping + unique data in one commit
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
@@ -256,7 +256,7 @@ async fn rebase_take_branch() {
     let result = fluree.insert(ledger, &base_data).await.unwrap();
     let main_ledger = result.ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree.create_branch("mydb", "dev", None, None).await.unwrap();
 
     // Dev: change Alice's name
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
@@ -307,7 +307,7 @@ async fn rebase_take_both() {
     let result = fluree.insert(ledger, &base_data).await.unwrap();
     let main_ledger = result.ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree.create_branch("mydb", "dev", None, None).await.unwrap();
 
     // Overlapping data on dev
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
@@ -359,7 +359,7 @@ async fn rebase_skip_conflicting() {
     let result = fluree.insert(ledger, &base_data).await.unwrap();
     let main_ledger = result.ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree.create_branch("mydb", "dev", None, None).await.unwrap();
 
     // Two commits on dev: first overlaps, second doesn't
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
@@ -413,7 +413,7 @@ async fn rebase_branch_point_updated() {
     let result = fluree.insert(ledger, &base_data).await.unwrap();
     let main_ledger = result.ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree.create_branch("mydb", "dev", None, None).await.unwrap();
 
     // Advance main
     let main_data = json!({
@@ -481,7 +481,7 @@ async fn rebase_flush_novelty_mid_replay() {
     let result = fluree.insert(ledger, &base).await.unwrap();
     let main_ledger = result.ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree.create_branch("mydb", "dev", None, None).await.unwrap();
 
     // Make several commits on dev so replaying them exceeds the threshold.
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
@@ -539,11 +539,11 @@ async fn rebase_nested_branch() {
     let main_ledger = result.ledger;
 
     // Create dev from main
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree.create_branch("mydb", "dev", None, None).await.unwrap();
 
     // Create feature from dev
     fluree
-        .create_branch("mydb", "feature", Some("dev"))
+        .create_branch("mydb", "feature", Some("dev"), None)
         .await
         .unwrap();
 
@@ -614,7 +614,7 @@ async fn rebase_rollback_on_mid_replay_failure() {
     let result = fluree.insert(ledger, &base).await.unwrap();
     let main_ledger = result.ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree.create_branch("mydb", "dev", None, None).await.unwrap();
 
     // First commit on dev: normal data (will replay successfully)
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();

@@ -445,7 +445,7 @@ async fn tutorial_step4_branch_and_merge() {
 
     // Create branch
     let branch_record = fluree
-        .create_branch("kb-branch", "reorganize", None)
+        .create_branch("kb-branch", "reorganize", None, None)
         .await
         .expect("create branch");
     assert_eq!(branch_record.branch, "reorganize");
@@ -683,7 +683,7 @@ async fn tutorial_step5_combined_workflow() {
 
     // Branch: create experiment
     fluree
-        .create_branch("kb-combined", "experiment", None)
+        .create_branch("kb-combined", "experiment", None, None)
         .await
         .expect("create branch");
 

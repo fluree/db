@@ -126,6 +126,7 @@ impl NameService for MemoryNameService {
         ledger_name: &str,
         new_branch: &str,
         source_branch: &str,
+        at_commit: Option<(ContentId, i64)>,
     ) -> Result<()> {
         let new_id = format_ledger_id(ledger_name, new_branch);
         let key = self.normalize_ledger_id(&new_id);
@@ -138,19 +139,23 @@ impl NameService for MemoryNameService {
             return Err(crate::NameServiceError::ledger_already_exists(&key));
         }
 
-        // Increment source branch's child count and copy commit head
+        // Increment source branch's child count and pick the starting commit
+        // head — either the caller-supplied historical commit or the source's
+        // current HEAD.
         let source = records.get_mut(&source_key).ok_or_else(|| {
             crate::NameServiceError::not_found(format!(
                 "source branch {ledger_name}:{source_branch}"
             ))
         })?;
         source.branches += 1;
-        let source_commit_head_id = source.commit_head_id.clone();
-        let source_commit_t = source.commit_t;
+        let (commit_head_id, commit_t) = match at_commit {
+            Some((id, t)) => (Some(id), t),
+            None => (source.commit_head_id.clone(), source.commit_t),
+        };
 
         let mut record = NsRecord::new(ledger_name, new_branch);
-        record.commit_head_id = source_commit_head_id;
-        record.commit_t = source_commit_t;
+        record.commit_head_id = commit_head_id;
+        record.commit_t = commit_t;
         record.source_branch = Some(source_branch.to_string());
         records.insert(key, record);
 
@@ -1508,7 +1513,7 @@ mod tests {
         let cid = test_commit_id("commit-5");
         ns.publish_commit("mydb:main", 5, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "feature-x", "main").await.unwrap();
+        ns.create_branch("mydb", "feature-x", "main", None).await.unwrap();
 
         let record = ns.lookup("mydb:feature-x").await.unwrap().unwrap();
         assert_eq!(record.name, "mydb");
@@ -1525,9 +1530,9 @@ mod tests {
         let cid = test_commit_id("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "dev", "main").await.unwrap();
+        ns.create_branch("mydb", "dev", "main", None).await.unwrap();
 
-        let result = ns.create_branch("mydb", "dev", "main").await;
+        let result = ns.create_branch("mydb", "dev", "main", None).await;
         assert!(result.is_err());
     }
 
@@ -1538,8 +1543,8 @@ mod tests {
         let cid = test_commit_id("commit-3");
         ns.publish_commit("mydb:main", 3, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "dev", "main").await.unwrap();
-        ns.create_branch("mydb", "staging", "main").await.unwrap();
+        ns.create_branch("mydb", "dev", "main", None).await.unwrap();
+        ns.create_branch("mydb", "staging", "main", None).await.unwrap();
 
         // Also create a different ledger to ensure filtering works
         ns.publish_ledger_init("other:main").await.unwrap();
@@ -1565,7 +1570,7 @@ mod tests {
         let cid = test_commit_id("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "dead", "main").await.unwrap();
+        ns.create_branch("mydb", "dead", "main", None).await.unwrap();
         ns.retract("mydb:dead").await.unwrap();
 
         let branches = ns.list_branches("mydb").await.unwrap();

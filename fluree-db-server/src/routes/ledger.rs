@@ -880,7 +880,7 @@ async fn create_branch_local(state: Arc<AppState>, request: Request) -> Result<i
 
         let record = match state
             .fluree
-            .create_branch(&ledger, &branch, Some(&source))
+            .create_branch(&ledger, &branch, Some(&source), None)
             .await
         {
             Ok(record) => record,

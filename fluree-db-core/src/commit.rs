@@ -304,7 +304,10 @@ impl Commit {
 // =============================================================================
 
 /// Load a single commit from a content store by CID.
-pub async fn load_commit_by_id<C: ContentStore>(store: &C, id: &ContentId) -> Result<Commit> {
+pub async fn load_commit_by_id<C: ContentStore + ?Sized>(
+    store: &C,
+    id: &ContentId,
+) -> Result<Commit> {
     let data = store
         .get(id)
         .await
