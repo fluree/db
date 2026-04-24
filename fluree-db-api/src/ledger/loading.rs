@@ -297,12 +297,20 @@ impl Fluree {
 
         // If the caller specified a historical commit, resolve it and verify
         // it's reachable from source HEAD before we touch the nameservice.
+        // A ref that resolves to the source head itself is collapsed to the
+        // default (None) path so the user still gets an index copy — otherwise
+        // `--at <head-cid>` would silently produce a slower branch than
+        // omitting `--at` entirely.
         let at_commit = if let Some(commit_ref) = source_commit {
             let view = self.ledger_cached(&source_id).await?.snapshot().await;
             let resolved = view.resolve_commit(commit_ref).await?;
-            let store = self.content_store(&source_id);
-            let resolved_t = verify_ancestor(&*store, &source_head, &resolved).await?;
-            Some((resolved, resolved_t))
+            if resolved == source_head {
+                None
+            } else {
+                let store = self.content_store(&source_id);
+                let resolved_t = verify_ancestor(&*store, &source_head, &resolved).await?;
+                Some((resolved, resolved_t))
+            }
         } else {
             None
         };
