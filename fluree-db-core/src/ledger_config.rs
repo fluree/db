@@ -100,8 +100,30 @@ pub struct ReasoningDefaults {
     pub modes: Option<Vec<String>>,
     /// `f:schemaSource` — reference to graph containing schema hierarchy.
     pub schema_source: Option<GraphSourceRef>,
+    /// `f:followOwlImports` — when `true`, resolve `owl:imports` transitively
+    /// from `schema_source` and include each imported graph in the schema
+    /// bundle used by reasoning. `None` or `Some(false)` both mean "don't
+    /// follow imports" — the bundle consists of only the starting graph.
+    /// Opt in explicitly with `true` when you want the closure.
+    pub follow_owl_imports: Option<bool>,
+    /// `f:ontologyImportMap` — explicit mapping from external `owl:imports`
+    /// IRIs to local `GraphSourceRef`s. Consulted when an import IRI does not
+    /// match a named graph in the current ledger.
+    pub ontology_import_map: Vec<OntologyImportBinding>,
     /// Override control for this setting group.
     pub override_control: OverrideControl,
+}
+
+/// One entry in `f:ontologyImportMap`.
+///
+/// Binds an external ontology IRI (as it appears in `owl:imports`) to the
+/// local graph that provides that ontology's triples.
+#[derive(Debug, Clone)]
+pub struct OntologyImportBinding {
+    /// `f:ontologyIri` — the IRI that appears in `owl:imports` statements.
+    pub ontology_iri: String,
+    /// `f:graphRef` — where to find that ontology's triples locally.
+    pub graph_ref: GraphSourceRef,
 }
 
 /// Datalog rules defaults from the config graph (`f:datalogDefaults`).

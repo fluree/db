@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use fluree_db_core::ledger_config::{
     DatalogDefaults, FullTextDefaults, FullTextProperty, GraphConfig, GraphSourceRef, LedgerConfig,
-    OverrideControl, PolicyDefaults, ReasoningDefaults, ResolvedConfig, RollbackGuard,
-    ShaclDefaults, TransactDefaults, TrustMode, TrustPolicy, ValidationMode,
+    OntologyImportBinding, OverrideControl, PolicyDefaults, ReasoningDefaults, ResolvedConfig,
+    RollbackGuard, ShaclDefaults, TransactDefaults, TrustMode, TrustPolicy, ValidationMode,
 };
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid, CONFIG_GRAPH_ID};
 use fluree_db_query::{
@@ -524,9 +524,21 @@ impl MergeableGroup for ReasoningDefaults {
     }
 
     fn merge_over(&self, base: &Self) -> Self {
+        // `ontology_import_map`: per-graph additions extend ledger-wide bindings.
+        // Per-graph entries come first so they win on duplicate ontology IRIs.
+        let mut import_map = self.ontology_import_map.clone();
+        let existing: std::collections::HashSet<String> =
+            import_map.iter().map(|b| b.ontology_iri.clone()).collect();
+        for b in &base.ontology_import_map {
+            if !existing.contains(&b.ontology_iri) {
+                import_map.push(b.clone());
+            }
+        }
         ReasoningDefaults {
             modes: self.modes.clone().or(base.modes.clone()),
             schema_source: self.schema_source.clone().or(base.schema_source.clone()),
+            follow_owl_imports: self.follow_owl_imports.or(base.follow_owl_imports),
+            ontology_import_map: import_map,
             override_control: base.override_control.effective_min(&self.override_control),
         }
     }
@@ -938,13 +950,95 @@ async fn read_reasoning_defaults(
         config_iris::SCHEMA_SOURCE,
     )
     .await?;
+    let follow_owl_imports = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::FOLLOW_OWL_IMPORTS,
+    )
+    .await?;
+    let ontology_import_map = read_ontology_import_map(snapshot, overlay, to_t, &group_sid).await?;
     let override_control = read_override_control(snapshot, overlay, to_t, &group_sid).await?;
 
     Ok(Some(ReasoningDefaults {
         modes,
         schema_source,
+        follow_owl_imports,
+        ontology_import_map,
         override_control,
     }))
+}
+
+/// Read an `f:ontologyImportMap` as a list of [`OntologyImportBinding`].
+///
+/// Each binding subject has:
+/// - `f:ontologyIri` — the external import IRI (IRI ref)
+/// - `f:graphRef` — nested `f:GraphRef` resolved via [`read_single_graph_ref_from_sid`]
+///
+/// Bindings missing either field are skipped with a debug log rather than
+/// failing the whole config read — strict error semantics live at the
+/// resolution layer in `fluree-db-api::ontology_imports`.
+async fn read_ontology_import_map(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Vec<OntologyImportBinding>> {
+    let pred_sid = match try_encode(snapshot, config_iris::ONTOLOGY_IMPORT_MAP) {
+        Some(sid) => sid,
+        None => return Ok(Vec::new()),
+    };
+
+    let bindings = query_config_predicate(snapshot, overlay, to_t, parent_sid, &pred_sid).await?;
+
+    let mut result = Vec::new();
+    for binding in bindings {
+        let Some(entry_sid) = binding.as_sid() else {
+            continue;
+        };
+        let Some(ontology_iri) = read_iri_field(
+            snapshot,
+            overlay,
+            to_t,
+            entry_sid,
+            config_iris::ONTOLOGY_IRI,
+        )
+        .await?
+        else {
+            tracing::debug!("f:ontologyImportMap entry missing f:ontologyIri — skipping");
+            continue;
+        };
+        let Some(graph_ref_sid) = read_ref_field(
+            snapshot,
+            overlay,
+            to_t,
+            entry_sid,
+            config_iris::GRAPH_REF_PROP,
+        )
+        .await?
+        else {
+            tracing::debug!(
+                ontology_iri = %ontology_iri,
+                "f:ontologyImportMap entry missing f:graphRef — skipping"
+            );
+            continue;
+        };
+        let Some(graph_ref) =
+            read_single_graph_ref_from_sid(snapshot, overlay, to_t, &graph_ref_sid).await?
+        else {
+            tracing::debug!(
+                ontology_iri = %ontology_iri,
+                "f:ontologyImportMap entry's f:graphRef could not be resolved — skipping"
+            );
+            continue;
+        };
+        result.push(OntologyImportBinding {
+            ontology_iri,
+            graph_ref,
+        });
+    }
+    Ok(result)
 }
 
 /// Read datalog defaults from a parent subject.

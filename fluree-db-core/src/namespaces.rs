@@ -104,6 +104,89 @@ pub fn is_owl_transitive_property(sid: &Sid) -> bool {
     sid.namespace_code == OWL && sid.name.as_ref() == OWL_TRANSITIVEPROPERTY
 }
 
+/// Check if a SID is owl:FunctionalProperty
+#[inline]
+pub fn is_owl_functional_property(sid: &Sid) -> bool {
+    sid.namespace_code == OWL && sid.name.as_ref() == OWL_FUNCTIONALPROPERTY
+}
+
+/// Check if a SID is owl:InverseFunctionalProperty
+#[inline]
+pub fn is_owl_inverse_functional_property(sid: &Sid) -> bool {
+    sid.namespace_code == OWL && sid.name.as_ref() == OWL_INVERSEFUNCTIONALPROPERTY
+}
+
+/// Check if a SID is owl:imports
+#[inline]
+pub fn is_owl_imports(sid: &Sid) -> bool {
+    sid.namespace_code == OWL && sid.name.as_ref() == OWL_IMPORTS
+}
+
+/// Check if a SID is owl:Ontology (the class)
+#[inline]
+pub fn is_owl_ontology_class(sid: &Sid) -> bool {
+    sid.namespace_code == OWL && sid.name.as_ref() == OWL_ONTOLOGY
+}
+
+/// Check if a SID is owl:Class
+#[inline]
+pub fn is_owl_class_class(sid: &Sid) -> bool {
+    sid.namespace_code == OWL && sid.name.as_ref() == OWL_CLASS
+}
+
+/// Check if a SID is owl:ObjectProperty
+#[inline]
+pub fn is_owl_object_property_class(sid: &Sid) -> bool {
+    sid.namespace_code == OWL && sid.name.as_ref() == OWL_OBJECTPROPERTY
+}
+
+/// Check if a SID is owl:DatatypeProperty
+#[inline]
+pub fn is_owl_datatype_property_class(sid: &Sid) -> bool {
+    sid.namespace_code == OWL && sid.name.as_ref() == OWL_DATATYPEPROPERTY
+}
+
+/// Check if a SID is rdf:Property
+#[inline]
+pub fn is_rdf_property_class(sid: &Sid) -> bool {
+    sid.namespace_code == RDF && sid.name.as_ref() == RDF_PROPERTY
+}
+
+/// Check whether `pred` is a schema-describing predicate that may be projected
+/// from an imported ontology graph into the schema bundle overlay.
+///
+/// The set is deliberately narrow: entailment-relevant RDFS/OWL predicates only.
+/// Instance-data predicates are excluded so that importing an ontology graph
+/// cannot leak its non-schema triples into query results.
+#[inline]
+pub fn is_schema_predicate(pred: &Sid) -> bool {
+    is_rdfs_subclass_of(pred)
+        || is_rdfs_subproperty_of(pred)
+        || is_rdfs_domain(pred)
+        || is_rdfs_range(pred)
+        || is_owl_inverse_of(pred)
+        || is_owl_equivalent_class(pred)
+        || is_owl_equivalent_property(pred)
+        || is_owl_same_as(pred)
+        || is_owl_imports(pred)
+}
+
+/// Check whether `cls` is a schema-describing class — when an `rdf:type <cls>`
+/// triple appears in an imported graph it should be projected into the schema
+/// bundle. Other `rdf:type` triples (instance typing) are dropped.
+#[inline]
+pub fn is_schema_class(cls: &Sid) -> bool {
+    is_owl_ontology_class(cls)
+        || is_owl_class_class(cls)
+        || is_owl_object_property_class(cls)
+        || is_owl_datatype_property_class(cls)
+        || is_owl_symmetric_property(cls)
+        || is_owl_transitive_property(cls)
+        || is_owl_functional_property(cls)
+        || is_owl_inverse_functional_property(cls)
+        || is_rdf_property_class(cls)
+}
+
 /// Baseline namespace codes (code -> prefix) matching Fluree's reserved codepoints.
 pub fn default_namespace_codes() -> HashMap<u16, String> {
     let mut map = HashMap::new();

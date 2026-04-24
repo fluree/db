@@ -32,6 +32,10 @@ Binary columnar index format: branch/leaf/leaflet hierarchy, dictionary artifact
 
 How Fluree assigns `ns_code` values for IRIs (prefix trie matching, fallback split modes), including bulk-import preflight mitigation and how the “host-only” fallback persists for future transactions.
 
+### [Ontology imports (`f:schemaSource` + `owl:imports`)](ontology-imports.md)
+
+How the reasoner consumes schema from a named `f:schemaSource` graph and transitively resolves `owl:imports`: resolution order, the `SchemaBundleOverlay` projection, schema-triple whitelist, and caching.
+
 ### [Storage Traits](storage-traits.md)
 
 Storage trait architecture: `StorageRead`, `StorageWrite`, `ContentAddressedWrite`, `Storage`, and `NameService` trait design with guidance for implementing new backends.

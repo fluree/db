@@ -1800,6 +1800,7 @@ fn lower_options(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Result<Que
             .transpose()?,
         post_binds: Vec::new(),
         reasoning,
+        schema_bundle: None,
     })
 }
 
