@@ -30,10 +30,12 @@ pub(crate) async fn content_store_for_record_or_id(
     fallback_id: &str,
 ) -> Result<Arc<dyn ContentStore>> {
     match record {
-        Some(r) => Ok(
-            fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, r)
-                .await?,
-        ),
+        Some(r) => {
+            Ok(
+                fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, r)
+                    .await?,
+            )
+        }
         None => Ok(backend.content_store(fallback_id)),
     }
 }
@@ -59,14 +61,13 @@ pub(crate) async fn load_default_context_blob(
     let Some(ctx_id) = record.default_context.as_ref() else {
         return Ok(None);
     };
-    let cs =
-        fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, record)
-            .await?;
-    let bytes = cs.get(ctx_id).await.map_err(|e| {
-        ApiError::internal(format!("failed to read default context {ctx_id}: {e}"))
-    })?;
-    let value = serde_json::from_slice(&bytes).map_err(|e| {
-        ApiError::internal(format!("failed to parse default context JSON: {e}"))
-    })?;
+    let cs = fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, record)
+        .await?;
+    let bytes = cs
+        .get(ctx_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to read default context {ctx_id}: {e}")))?;
+    let value = serde_json::from_slice(&bytes)
+        .map_err(|e| ApiError::internal(format!("failed to parse default context JSON: {e}")))?;
     Ok(Some(value))
 }

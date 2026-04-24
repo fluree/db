@@ -87,8 +87,6 @@ pub struct CachedLedgerState {
     /// Present when `snapshot.range_provider` is also set — the two are always
     /// set/cleared together (see coherence `debug_assert` in `snapshot()`).
     pub binary_store: Option<Arc<BinaryIndexStore>>,
-    /// Default JSON-LD @context for this ledger.
-    pub default_context: Option<serde_json::Value>,
 }
 
 impl CachedLedgerState {
@@ -107,7 +105,6 @@ impl CachedLedgerState {
             head_index_id: state.head_index_id.clone(),
             ns_record: state.ns_record.clone(),
             binary_store: None,
-            default_context: state.default_context.clone(),
         }
     }
 
@@ -149,7 +146,6 @@ impl CachedLedgerState {
             head_index_id: self.head_index_id,
             ns_record: self.ns_record,
             binary_store: self.binary_store.map(|store| TypeErasedStore(store)),
-            default_context: self.default_context,
             spatial_indexes: None,
         }
     }
@@ -639,25 +635,9 @@ pub(crate) async fn load_and_attach_binary_store(
     let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
     state.binary_store = Some(TypeErasedStore(te_store));
 
-    // Load default context from CAS if the nameservice record has one.
-    if state.default_context.is_none() {
-        if let Some(ctx_id) = state
-            .ns_record
-            .as_ref()
-            .and_then(|r| r.default_context.as_ref())
-        {
-            match cs.get(ctx_id).await {
-                Ok(bytes) => match serde_json::from_slice(&bytes) {
-                    Ok(ctx) => state.default_context = Some(ctx),
-                    Err(e) => tracing::warn!(%e, "failed to parse default context JSON"),
-                },
-                Err(e) => {
-                    tracing::debug!(%e, "could not load default context: {}", e);
-                }
-            }
-        }
-    }
-
+    // Default context is not loaded here. Opt-in callers route through
+    // `Fluree::db_with_default_context` / `db_at_with_default_context`,
+    // which fetch and attach the context onto the returned `GraphDb`.
     Ok(Some(arc_store))
 }
 

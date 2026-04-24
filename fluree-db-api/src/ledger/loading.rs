@@ -134,17 +134,9 @@ impl Fluree {
             }
         }
 
-        // Load default context from CAS via the branch-aware helper.
-        // Soft-fail: a missing or unparseable context shouldn't block
-        // loading the ledger itself.
-        if let Some(record) = state.ns_record.as_ref() {
-            match self.load_default_context_blob(record).await {
-                Ok(Some(ctx)) => state.default_context = Some(ctx),
-                Ok(None) => {}
-                Err(e) => tracing::warn!(%e, "could not load default context"),
-            }
-        }
-
+        // Default context is not loaded here. Opt-in callers route through
+        // `Fluree::db_with_default_context` / `db_at_with_default_context`,
+        // which fetch and attach the context onto the returned `GraphDb`.
         Ok(state)
     }
 

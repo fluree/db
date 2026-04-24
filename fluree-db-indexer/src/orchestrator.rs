@@ -329,8 +329,13 @@ impl IndexerOrchestrator {
         )
         .await
         .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?;
-        crate::build_index_for_ledger(cs, self.nameservice.as_ref(), ledger_id, self.config.clone())
-            .await
+        crate::build_index_for_ledger(
+            cs,
+            self.nameservice.as_ref(),
+            ledger_id,
+            self.config.clone(),
+        )
+        .await
     }
 
     /// Index a ledger and publish the result

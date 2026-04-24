@@ -2621,10 +2621,7 @@ impl Fluree {
     /// incremental indexing, full rebuild). Per-query reads against an
     /// already-loaded `LedgerState` do not need it — the branched store
     /// is already wired up by [`fluree_db_ledger::LedgerState::load`].
-    pub async fn branched_content_store(
-        &self,
-        ledger_id: &str,
-    ) -> Result<Arc<dyn ContentStore>> {
+    pub async fn branched_content_store(&self, ledger_id: &str) -> Result<Arc<dyn ContentStore>> {
         Ok(fluree_db_nameservice::branched_content_store_for_id(
             &self.backend,
             self.nameservice_mode.reader(),

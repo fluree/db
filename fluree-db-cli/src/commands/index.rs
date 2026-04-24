@@ -34,14 +34,10 @@ pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> 
         .await
         .map_err(|e| CliError::Import(format!("indexing failed: {e}")))?;
 
-    let result = fluree_db_indexer::build_index_for_ledger(
-        cs,
-        fluree.nameservice(),
-        &ledger_id,
-        config,
-    )
-    .await
-    .map_err(|e| CliError::Import(format!("indexing failed: {e}")))?;
+    let result =
+        fluree_db_indexer::build_index_for_ledger(cs, fluree.nameservice(), &ledger_id, config)
+            .await
+            .map_err(|e| CliError::Import(format!("indexing failed: {e}")))?;
 
     // Publish the new index
     fluree

@@ -1054,14 +1054,11 @@ impl Fluree {
         // Branch-aware ContentStore for CID-based reads — pulls walk
         // history backwards, which crosses fork points on a branched
         // ledger and would otherwise 404 on pre-fork ancestors.
-        let content_store = self
-            .branched_content_store(ledger_id)
-            .await
-            .map_err(|e| {
-                ApiError::internal(format!(
-                    "failed to build branched store for {ledger_id}: {e}"
-                ))
-            })?;
+        let content_store = self.branched_content_store(ledger_id).await.map_err(|e| {
+            ApiError::internal(format!(
+                "failed to build branched store for {ledger_id}: {e}"
+            ))
+        })?;
 
         // Determine start cursor CID.
         let start_cid: ContentId = if let Some(cid) = &request.cursor_id {

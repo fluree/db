@@ -216,23 +216,22 @@ impl Fluree {
             }
         }
 
-        // Load default context from CAS if not already loaded. Soft-fail:
-        // missing context shouldn't block loading the graph view.
-        if snapshot.default_context.is_none() {
-            if let Some(record) = snapshot.ns_record.as_ref() {
-                if let Ok(Some(ctx)) = self.load_default_context_blob(record).await {
-                    snapshot.default_context = Some(ctx);
-                }
+        // Default context is loaded lazily on the opt-in path only. The
+        // plain `db()` route returns a view with `default_context = None`
+        // so query parsing sees no auto-injection unless the caller went
+        // through `db_with_default_context`.
+        let default_context = if include_default_context {
+            match snapshot.ns_record.as_ref() {
+                Some(record) => self.load_default_context_blob(record).await.ok().flatten(),
+                None => None,
             }
-        }
+        } else {
+            None
+        };
 
         let binary_store = snapshot.binary_store.clone();
-        let default_context = snapshot.default_context.clone();
         let ledger = snapshot.to_ledger_state();
-        let mut view = GraphDb::from_ledger_state(&ledger);
-        if include_default_context {
-            view = view.with_default_context(default_context);
-        }
+        let view = GraphDb::from_ledger_state(&ledger).with_default_context(default_context);
         Ok(match binary_store {
             Some(store) => view.with_binary_store(store),
             None => view,
@@ -506,12 +505,16 @@ impl Fluree {
     ) -> Result<GraphDb> {
         let (parsed_id, _) = Self::parse_graph_ref(ledger_id)?;
         let mut view = self.db_at(ledger_id, spec).await?;
-        // Historical views don't carry default_context through their own load
-        // path, so fetch it from the current head's cached ledger state.
+        // Historical views don't load default_context through their own
+        // load path. Fetch it explicitly via the branch-aware helper using
+        // the cached current-head record.
         if view.default_context.is_none() {
             let handle = self.ledger_cached(parsed_id).await?;
             let snap = handle.snapshot().await;
-            view = view.with_default_context(snap.default_context.clone());
+            if let Some(record) = snap.ns_record.as_ref() {
+                let ctx = self.load_default_context_blob(record).await.ok().flatten();
+                view = view.with_default_context(ctx);
+            }
         }
         Ok(view)
     }

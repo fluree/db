@@ -489,10 +489,7 @@ impl crate::Fluree {
         //    ledger is a branch.
         let mut affected_sids: HashSet<fluree_db_core::Sid> = HashSet::new();
         let commit_store = self
-            .content_store_for_record_or_id(
-                ledger.ns_record.as_ref(),
-                &ledger.snapshot.ledger_id,
-            )
+            .content_store_for_record_or_id(ledger.ns_record.as_ref(), &ledger.snapshot.ledger_id)
             .await?;
         let stream = trace_commits_by_id(commit_store, head_commit_id.clone(), old_watermark);
         futures::pin_mut!(stream);
