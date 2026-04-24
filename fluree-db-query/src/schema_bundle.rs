@@ -330,15 +330,10 @@ impl OverlayProvider for SchemaBundleOverlay<'_> {
             return;
         }
 
-        // Collect base flakes and bundle flakes separately (both are already
-        // in index order), then linear-merge.
-        let mut base_flakes: Vec<Flake> = Vec::new();
-        self.base
-            .for_each_overlay_flake(g_id, index, first, rhs, leftmost, to_t, &mut |f| {
-                base_flakes.push(f.clone());
-            });
-
-        // Slice the bundle to the requested sub-range in index order.
+        // Slice the bundle to the requested sub-range in index order. Do this
+        // before touching the base so we can skip buffering base flakes
+        // entirely when the scan range misses the bundle — the common case
+        // for queries that scan arbitrary ranges unrelated to schema triples.
         let flakes = self.bundle.flakes(index);
         let start = if leftmost {
             0
@@ -352,6 +347,19 @@ impl OverlayProvider for SchemaBundleOverlay<'_> {
         } else {
             flakes.len()
         };
+        if start >= end {
+            self.base
+                .for_each_overlay_flake(g_id, index, first, rhs, leftmost, to_t, callback);
+            return;
+        }
+
+        // Bundle intersects the range — collect base flakes and linear-merge.
+        let mut base_flakes: Vec<Flake> = Vec::new();
+        self.base
+            .for_each_overlay_flake(g_id, index, first, rhs, leftmost, to_t, &mut |f| {
+                base_flakes.push(f.clone());
+            });
+
         let mut bundle_iter = flakes[start..end].iter().filter(|f| f.t <= to_t).peekable();
         let mut base_iter = base_flakes.iter().peekable();
 
