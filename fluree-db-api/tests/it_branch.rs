@@ -278,6 +278,77 @@ async fn create_branch_at_historical_commit() {
     assert_eq!(branch.t(), 2);
 }
 
+/// Branch at a historical commit via `CommitRef::T`.
+///
+/// Resolution scans the txn-meta graph for a commit with matching `t`.
+/// The scan includes the novelty overlay, so freshly committed transactions
+/// are visible without running the indexer.
+#[tokio::test]
+async fn create_branch_at_t() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let ctx = json!({"ex": "http://example.org/ns/"});
+
+    let r1 = fluree
+        .insert(ledger, &json!({"@context": ctx, "@graph": [{"@id": "ex:a", "ex:val": 1}]}))
+        .await
+        .unwrap();
+    let r2 = fluree
+        .insert(r1.ledger, &json!({"@context": ctx, "@graph": [{"@id": "ex:b", "ex:val": 2}]}))
+        .await
+        .unwrap();
+    let t2_commit_id = r2.receipt.commit_id.clone();
+    let _r3 = fluree
+        .insert(r2.ledger, &json!({"@context": ctx, "@graph": [{"@id": "ex:c", "ex:val": 3}]}))
+        .await
+        .unwrap();
+
+    let record = fluree
+        .create_branch("mydb", "historical", None, Some(CommitRef::T(2)))
+        .await
+        .unwrap();
+
+    assert_eq!(record.commit_head_id.as_ref(), Some(&t2_commit_id));
+    assert_eq!(record.commit_t, 2);
+}
+
+/// Branch at a historical commit via `CommitRef::Prefix` using a hex digest.
+///
+/// Like `T`, the prefix resolver scans novelty and tolerates unindexed sources.
+#[tokio::test]
+async fn create_branch_at_prefix() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let ctx = json!({"ex": "http://example.org/ns/"});
+
+    let r1 = fluree
+        .insert(ledger, &json!({"@context": ctx, "@graph": [{"@id": "ex:a", "ex:val": 1}]}))
+        .await
+        .unwrap();
+    let r2 = fluree
+        .insert(r1.ledger, &json!({"@context": ctx, "@graph": [{"@id": "ex:b", "ex:val": 2}]}))
+        .await
+        .unwrap();
+    let t2_commit_id = r2.receipt.commit_id.clone();
+    let _r3 = fluree
+        .insert(r2.ledger, &json!({"@context": ctx, "@graph": [{"@id": "ex:c", "ex:val": 3}]}))
+        .await
+        .unwrap();
+
+    // An 8-hex-char prefix is plenty to uniquely identify the commit in a
+    // tiny test ledger; the resolver requires >= 6 chars.
+    let prefix = t2_commit_id.digest_hex()[..8].to_string();
+    let record = fluree
+        .create_branch("mydb", "historical", None, Some(CommitRef::Prefix(prefix)))
+        .await
+        .unwrap();
+
+    assert_eq!(record.commit_head_id.as_ref(), Some(&t2_commit_id));
+    assert_eq!(record.commit_t, 2);
+}
+
 /// Branching from a commit that isn't reachable from source HEAD is rejected.
 #[tokio::test]
 async fn create_branch_at_non_ancestor_commit_fails() {
