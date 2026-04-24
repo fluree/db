@@ -14,6 +14,7 @@
 //! Build a `TriplePattern` with a `VarRegistry`, then call `execute_pattern` with a `GraphDbRef` to get result batches.
 
 pub mod aggregate;
+pub mod binary_history;
 pub mod binary_range;
 pub mod binary_scan;
 pub mod bind;
@@ -94,6 +95,7 @@ pub mod vector;
 
 // Re-exports
 pub use aggregate::{apply_aggregate, AggregateFn, AggregateOperator, AggregateSpec};
+pub use binary_history::BinaryHistoryScanOperator;
 pub use binary_range::BinaryRangeProvider;
 pub use binary_scan::BinaryScanOperator;
 pub use bind::BindOperator;

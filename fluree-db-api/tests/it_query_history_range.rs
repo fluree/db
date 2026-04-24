@@ -17,6 +17,7 @@
 //! - history sidecar events (both assert and retract, with explicit op)
 //! - base rows whose `t` falls in range (emitted as assert)
 //! - overlay/novelty events when `to_t > index_t`
+//!
 //! and each emitted row carries `t` and `op` on the binding.
 
 #![cfg(feature = "native")]
@@ -33,10 +34,7 @@ fn ctx() -> serde_json::Value {
 }
 
 /// Reindex the ledger. Returns the indexed `index_t`.
-async fn reindex_to_current(
-    fluree: &fluree_db_api::Fluree,
-    ledger_id: &str,
-) -> i64 {
+async fn reindex_to_current(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> i64 {
     fluree
         .reindex(ledger_id, ReindexOptions::default())
         .await
@@ -133,7 +131,7 @@ async fn history_range_emits_sidecar_events_with_op() {
         let t = row
             .get("?t")
             .and_then(|x| x.get("@value"))
-            .and_then(|x| x.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .unwrap_or(-1);
         let op = row
             .get("?op")
@@ -145,10 +143,13 @@ async fn history_range_emits_sidecar_events_with_op() {
     }
 
     let flattened: Vec<(String, i64, String)> = rows.iter().map(flatten).collect();
+    // orderBy (?t, ?op, ?v) with lexicographic ordering:
+    //   "assert" < "retract", so at t=2 the assert of "Alice Smith" comes
+    //   before the retract of "Alice".
     let expected: Vec<(String, i64, String)> = vec![
-        ("Alice".to_string(),       1, "assert".to_string()),
-        ("Alice".to_string(),       2, "retract".to_string()),
+        ("Alice".to_string(), 1, "assert".to_string()),
         ("Alice Smith".to_string(), 2, "assert".to_string()),
+        ("Alice".to_string(), 2, "retract".to_string()),
     ];
     assert_eq!(
         flattened, expected,

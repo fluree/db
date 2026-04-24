@@ -773,12 +773,39 @@ impl BinaryScanOperator {
         Ok(())
     }
 
+    /// Prime the scan to drain a pre-collected set of flakes instead of
+    /// running the binary cursor.
+    ///
+    /// Used by `BinaryHistoryScanOperator`, which collects history events
+    /// (sidecar + in-range base + novelty) up front and then hands them to
+    /// the existing `flakes_to_bindings` pipeline. The flakes must already
+    /// carry their correct `op` field — history mode copies it onto the
+    /// output binding at line ~704.
+    pub(crate) fn prime_history_flakes(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        flakes: Vec<Flake>,
+    ) -> Result<()> {
+        if !self.state.can_open() {
+            if self.state.is_closed() {
+                return Err(QueryError::OperatorClosed);
+            }
+            return Err(QueryError::OperatorAlreadyOpened);
+        }
+        self.store = ctx.binary_store.clone();
+        self.g_id = ctx.binary_g_id;
+        self.range_iter = Some(flakes.into_iter());
+        self.cursor = None;
+        self.state = OperatorState::Open;
+        Ok(())
+    }
+
     /// Apply policy filtering to a batch of flakes for a specific graph.
     ///
     /// When a policy enforcer is present on the execution context, we:
     /// 1) Populate the class cache for subjects in this batch (required for f:onClass)
     /// 2) Filter flakes (async, supports f:query) using the graph's snapshot/overlay/to_t.
-    async fn filter_flakes_by_policy(
+    pub(crate) async fn filter_flakes_by_policy(
         ctx: &ExecutionContext<'_>,
         snapshot: &LedgerSnapshot,
         overlay: &dyn OverlayProvider,
@@ -817,7 +844,7 @@ impl BinaryScanOperator {
     ///
     /// Therefore, we keep the bound SIDs in snapshot space for overlay matching, and only
     /// translate into store space (via full IRI strings) when constructing persisted ID filters.
-    fn extract_bound_terms_snapshot(
+    pub(crate) fn extract_bound_terms_snapshot(
         snapshot: &LedgerSnapshot,
         pattern: &TriplePattern,
     ) -> (Option<Sid>, Option<Sid>, Option<FlakeValue>) {
@@ -857,7 +884,7 @@ impl BinaryScanOperator {
     }
 
     /// Build a `BinaryFilter` from bound pattern terms.
-    fn build_filter_from_snapshot_sids(
+    pub(crate) fn build_filter_from_snapshot_sids(
         snapshot: &LedgerSnapshot,
         pattern: &TriplePattern,
         store: &BinaryIndexStore,

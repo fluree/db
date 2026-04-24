@@ -25,7 +25,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use fluree_db_core::{IndexType, ObjectBounds, Sid};
 
-use crate::binary_scan::{schema_from_pattern_with_emit, BinaryScanOperator, EmitMask};
+use crate::binary_history::BinaryHistoryScanOperator;
+use crate::binary_scan::{schema_from_pattern_with_emit, EmitMask};
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
@@ -97,13 +98,20 @@ impl ScanDatasetBuilder {
 
 impl DatasetBuilder for ScanDatasetBuilder {
     fn build(&self) -> Result<BoxedOperator> {
-        Ok(Box::new(BinaryScanOperator::new_with_emit_and_index(
-            self.pattern.clone(),
-            self.object_bounds.clone(),
-            self.inline_ops.clone(),
-            self.emit,
-            self.index_hint,
-        )))
+        // Use the history-aware wrapper at all scan sites. For non-history
+        // queries it transparently delegates to `BinaryScanOperator::open`
+        // — no behavior change on the hot path. For history queries
+        // (`ctx.history_mode == true`) it runs the dedicated sidecar+base
+        // +novelty merge in its own `open`.
+        Ok(Box::new(
+            BinaryHistoryScanOperator::new_with_emit_and_index(
+                self.pattern.clone(),
+                self.object_bounds.clone(),
+                self.inline_ops.clone(),
+                self.emit,
+                self.index_hint,
+            ),
+        ))
     }
 
     fn schema(&self) -> &[VarId] {
