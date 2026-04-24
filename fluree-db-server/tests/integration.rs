@@ -297,6 +297,109 @@ async fn insert_then_query_finds_value() {
 }
 
 #[tokio::test]
+async fn create_branch_at_historical_t() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create the ledger
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"ledger": "hist:main"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Three inserts → commits at t=1, t=2, t=3
+    for i in 1..=3 {
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": format!("ex:item{i}"),
+            "ex:val": i,
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/insert")
+                    .header("content-type", "application/json")
+                    .header("fluree-ledger", "hist:main")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "insert {i} failed: {json}");
+        assert_eq!(
+            json.get("t").and_then(serde_json::Value::as_i64),
+            Some(i),
+            "insert {i} should have t={i}"
+        );
+    }
+
+    // Branch at t=2
+    let branch_body = serde_json::json!({
+        "ledger": "hist",
+        "branch": "historical",
+        "at": "t:2",
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(branch_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "branch create failed: {json}");
+    assert_eq!(
+        json.get("ledger_id").and_then(|v| v.as_str()),
+        Some("hist:historical")
+    );
+    assert_eq!(
+        json.get("t").and_then(serde_json::Value::as_i64),
+        Some(2),
+        "historical branch should be at t=2, got: {json}"
+    );
+    assert_eq!(
+        json.get("source").and_then(|v| v.as_str()),
+        Some("main")
+    );
+
+    // Bad `at` value surfaces as 400
+    let bad = serde_json::json!({
+        "ledger": "hist",
+        "branch": "bad",
+        "at": "t:notanumber",
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(bad.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn ledger_with_slash_works_via_op_prefixed_routes() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state.clone());
