@@ -16,8 +16,8 @@ use fluree_db_api::{
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 use support::{
-    assert_index_defaults, genesis_ledger_for_fluree, normalize_rows_array,
-    normalize_sparql_bindings, start_background_indexer_local, trigger_index_and_wait_outcome,
+    assert_index_defaults, genesis_ledger_for_fluree, normalize_rows, normalize_sparql_bindings,
+    start_background_indexer_local, trigger_index_and_wait_outcome,
 };
 
 type MemoryFluree = fluree_db_api::Fluree;
@@ -134,8 +134,8 @@ async fn indexed_sparql_custom_predicate_without_type_returns_results() {
                 .to_jsonld(&view.snapshot)
                 .expect("to_jsonld (with type)");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                normalize_rows_array(&json!([
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([
                     ["cust:pkg1", "anchor-value-1"],
                     ["cust:pkg2", "anchor-value-2"],
                     ["cust:pkg3", "anchor-value-3"]
@@ -158,8 +158,8 @@ async fn indexed_sparql_custom_predicate_without_type_returns_results() {
                 .to_jsonld(&view.snapshot)
                 .expect("to_jsonld (without type)");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                normalize_rows_array(&json!([
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([
                     ["cust:pkg1", "anchor-value-1"],
                     ["cust:pkg2", "anchor-value-2"],
                     ["cust:pkg3", "anchor-value-3"]
@@ -183,8 +183,8 @@ async fn indexed_sparql_custom_predicate_without_type_returns_results() {
                 .to_jsonld(&view.snapshot)
                 .expect("to_jsonld (std pred)");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                normalize_rows_array(&json!([
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([
                     ["cust:pkg1", "cust:pkg2"],
                     ["cust:pkg2", "cust:pkg3"]
                 ])),
@@ -540,8 +540,8 @@ async fn indexed_repeated_vars_in_triple_pattern_do_not_duplicate_schema() {
                 .expect("query 1 should succeed");
             let jsonld1 = r1.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld1),
-                normalize_rows_array(&json!([["ex:a"]])),
+                normalize_rows(&jsonld1),
+                normalize_rows(&json!([["ex:a"]])),
                 "expected ?x=ex:a"
             );
 
@@ -556,8 +556,8 @@ async fn indexed_repeated_vars_in_triple_pattern_do_not_duplicate_schema() {
                 .expect("query 2 should succeed");
             let jsonld2 = r2.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld2),
-                normalize_rows_array(&json!([["ex:a", "ex:b"]])),
+                normalize_rows(&jsonld2),
+                normalize_rows(&json!([["ex:a", "ex:b"]])),
                 "expected (?x,?o)=(ex:a,ex:b)"
             );
         })
@@ -630,8 +630,8 @@ async fn indexed_multicolumn_join_shared_object_var_executes() {
                 .expect("multicolumn join query should succeed");
             let jsonld = r.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                normalize_rows_array(&json!([2])),
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
                 "expected two matching (s,o) pairs"
             );
         })
@@ -710,8 +710,8 @@ async fn indexed_overlay_count_reflects_retract_and_reassert() {
                 .expect("count at t=1");
             let jsonld = result.to_jsonld(&view1.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                normalize_rows_array(&json!([4])),
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[4]])),
                 "baseline count should be 4"
             );
 
@@ -738,8 +738,8 @@ async fn indexed_overlay_count_reflects_retract_and_reassert() {
                 .expect("count at t=2");
             let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                normalize_rows_array(&json!([3])),
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
                 "count should reflect novelty retraction"
             );
 
@@ -766,8 +766,8 @@ async fn indexed_overlay_count_reflects_retract_and_reassert() {
                 .expect("count at t=3");
             let jsonld = result.to_jsonld(&view3.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                normalize_rows_array(&json!([4])),
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[4]])),
                 "count should reflect novelty re-assertion"
             );
         })
@@ -846,8 +846,8 @@ async fn indexed_overlay_group_by_count_topk_reflects_overlay() {
                 .expect("group count at t=1");
             let jsonld = result.to_jsonld(&view1.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                normalize_rows_array(&json!([["CA", 3], ["WA", 2]])),
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([["CA", 3], ["WA", 2]])),
                 "baseline group counts should be CA=3, WA=2"
             );
 
@@ -881,8 +881,8 @@ async fn indexed_overlay_group_by_count_topk_reflects_overlay() {
                 .expect("group count at t=2");
             let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                normalize_rows_array(&json!([["CA", 5], ["WA", 1]])),
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([["CA", 5], ["WA", 1]])),
                 "group counts should reflect overlay deltas"
             );
         })
@@ -1195,8 +1195,8 @@ async fn indexed_string_functions_work_for_indexed_and_overlay_strings() {
                 .expect("indexed CONTAINS query");
             let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                vec![vec![json!("Alice Adams")]]
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([["Alice Adams"]]))
             );
 
             let indexed_strstarts = r#"
@@ -1213,8 +1213,8 @@ async fn indexed_string_functions_work_for_indexed_and_overlay_strings() {
                 .expect("indexed STRSTARTS query");
             let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                vec![vec![json!("Alice Adams")]]
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([["Alice Adams"]]))
             );
 
             let indexed_regex_prefix = r#"
@@ -1231,8 +1231,8 @@ async fn indexed_string_functions_work_for_indexed_and_overlay_strings() {
                 .expect("indexed regex-prefix query");
             let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                vec![vec![json!("Alice Adams")]]
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([["Alice Adams"]]))
             );
 
             let overlay_equality = r#"
@@ -1249,8 +1249,8 @@ async fn indexed_string_functions_work_for_indexed_and_overlay_strings() {
                 .expect("overlay equality query");
             let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                vec![vec![json!("Brian Platz")]]
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([["Brian Platz"]]))
             );
 
             let overlay_contains = r#"
@@ -1267,8 +1267,8 @@ async fn indexed_string_functions_work_for_indexed_and_overlay_strings() {
                 .expect("overlay CONTAINS query");
             let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                vec![vec![json!("Brian Platz")]]
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([["Brian Platz"]]))
             );
 
             let overlay_regex = r#"
@@ -1285,8 +1285,8 @@ async fn indexed_string_functions_work_for_indexed_and_overlay_strings() {
                 .expect("overlay REGEX query");
             let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                vec![vec![json!("Brian Platz")]]
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([["Brian Platz"]]))
             );
 
             let overlay_regex_prefix = r#"
@@ -1303,8 +1303,8 @@ async fn indexed_string_functions_work_for_indexed_and_overlay_strings() {
                 .expect("overlay REGEX prefix query");
             let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                vec![vec![json!("Brian Platz")]]
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([["Brian Platz"]]))
             );
 
             let overlay_strstarts = r#"
@@ -1321,8 +1321,8 @@ async fn indexed_string_functions_work_for_indexed_and_overlay_strings() {
                 .expect("overlay STRSTARTS query");
             let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                vec![vec![json!("Brian Platz")]]
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([["Brian Platz"]]))
             );
 
             let overlay_strlen = r#"
@@ -1339,8 +1339,8 @@ async fn indexed_string_functions_work_for_indexed_and_overlay_strings() {
                 .expect("overlay STRLEN query");
             let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                vec![vec![json!("Brian Platz"), json!(11)]]
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([["Brian Platz", 11]]))
             );
 
             let overlay_lcase = r#"
@@ -1431,8 +1431,8 @@ async fn indexed_count_with_lang_filter_counts_matching_lang_tag_rows() {
                 .expect("indexed LANG count query");
             let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                normalize_rows_array(&json!([2])),
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
                 "indexed COUNT with LANG filter should count only en-tagged literals"
             );
         })
@@ -1504,8 +1504,8 @@ async fn indexed_numeric_sum_fast_paths_work_for_identity_and_add_self() {
                 .to_jsonld(&view.snapshot)
                 .expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&baseline_json),
-                normalize_rows_array(&json!([6])),
+                normalize_rows(&baseline_json),
+                normalize_rows(&json!([[6]])),
                 "indexed SUM(?o) should add integer values directly"
             );
 
@@ -1520,8 +1520,8 @@ async fn indexed_numeric_sum_fast_paths_work_for_identity_and_add_self() {
                 .expect("indexed SUM(?o + ?o) query");
             let add_json = add_result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&add_json),
-                normalize_rows_array(&json!([12])),
+                normalize_rows(&add_json),
+                normalize_rows(&json!([[12]])),
                 "indexed SUM(?o + ?o) should double each integer value"
             );
         })
@@ -1595,8 +1595,8 @@ async fn indexed_numeric_count_fast_path_handles_threshold_filters() {
                 .expect("indexed COUNT(?s) with >= query");
             let ge_json = ge_result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&ge_json),
-                normalize_rows_array(&json!([3])),
+                normalize_rows(&ge_json),
+                normalize_rows(&json!([[3]])),
                 "indexed COUNT with ?o >= 2 should count qualifying rows"
             );
 
@@ -1614,8 +1614,8 @@ async fn indexed_numeric_count_fast_path_handles_threshold_filters() {
                 .expect("indexed COUNT(?s) with > query");
             let gt_json = gt_result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&gt_json),
-                normalize_rows_array(&json!([2])),
+                normalize_rows(&gt_json),
+                normalize_rows(&json!([[2]])),
                 "indexed COUNT with ?o > 2 should honor exclusive thresholds"
             );
         })
@@ -1686,8 +1686,8 @@ async fn indexed_numeric_avg_min_max_fast_paths_work() {
                 .expect("indexed AVG(?o) query");
             let avg_json = avg_result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&avg_json),
-                normalize_rows_array(&json!([2.5])),
+                normalize_rows(&avg_json),
+                normalize_rows(&json!([[2.5]])),
                 "indexed AVG(?o) should average numeric values directly"
             );
 
@@ -1702,8 +1702,8 @@ async fn indexed_numeric_avg_min_max_fast_paths_work() {
                 .expect("indexed MIN(?o) query");
             let min_json = min_result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&min_json),
-                normalize_rows_array(&json!([1])),
+                normalize_rows(&min_json),
+                normalize_rows(&json!([[1]])),
                 "indexed MIN(?o) should use numeric leaflet boundaries"
             );
 
@@ -1718,8 +1718,8 @@ async fn indexed_numeric_avg_min_max_fast_paths_work() {
                 .expect("indexed MAX(?o) query");
             let max_json = max_result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&max_json),
-                normalize_rows_array(&json!([4])),
+                normalize_rows(&max_json),
+                normalize_rows(&json!([[4]])),
                 "indexed MAX(?o) should use numeric leaflet boundaries"
             );
         })
@@ -1791,8 +1791,8 @@ async fn indexed_strstarts_sum_counts_prefix_matches() {
                 .expect("indexed STRSTARTS SUM query");
             let jsonld = result.to_jsonld(&indexed.snapshot).expect("to_jsonld");
             assert_eq!(
-                normalize_rows_array(&jsonld),
-                normalize_rows_array(&json!([2])),
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
                 "indexed SUM(xsd:integer(STRSTARTS(...))) should count matching rows"
             );
         })

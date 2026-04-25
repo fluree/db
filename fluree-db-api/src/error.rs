@@ -187,6 +187,16 @@ pub enum ApiError {
     #[error("Invalid configuration: {0}")]
     Config(String),
 
+    /// Unresolved `owl:imports` in the reasoning schema closure.
+    ///
+    /// Produced when a graph reachable from `f:schemaSource` declares
+    /// `owl:imports <iri>` that cannot be resolved — the IRI is neither a
+    /// named graph in the current ledger nor listed in
+    /// `f:ontologyImportMap`. Import chains are strict: unresolved imports
+    /// fail the query rather than being silently ignored.
+    #[error("Unresolved owl:imports: {0}")]
+    OntologyImport(String),
+
     /// Result formatting errors
     #[error("Format error: {0}")]
     Format(#[from] FormatError),

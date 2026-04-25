@@ -89,7 +89,7 @@ async fn exists_when_pattern_present_returns_subjects() {
 
     let q = json!({
         "@context": ctx,
-        "select": ["?person"],
+        "select": "?person",
         "where": [
             {"@id":"?person","@type":"ex:Person"},
             ["exists", {"@id":"?person","ex:givenName":"?name"}]
@@ -135,7 +135,7 @@ async fn not_exists_filters_subjects_without_nickname() {
 
     let q = json!({
         "@context": ctx,
-        "select": ["?person"],
+        "select": "?person",
         "where": [
             {"@id":"?person","ex:givenName":"?gname"},
             ["not-exists", {"@id":"?person","ex:nickname":"?name"}]
@@ -232,7 +232,7 @@ async fn minus_removes_bound_solutions() {
 
     let q = json!({
         "@context": ctx,
-        "select": ["?s"],
+        "select": "?s",
         "distinct": true,
         "where": [
             {"@id":"?s","?p":"?o"},

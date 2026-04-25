@@ -193,7 +193,7 @@ async fn host_plus_n_insert_index_reload_query() {
                 .unwrap();
             assert_eq!(
                 items,
-                json!(["Beta", "Delta"]),
+                json!([["Beta"], ["Delta"]]),
                 "deep namespace query should return both items"
             );
 
@@ -218,10 +218,10 @@ async fn host_plus_n_insert_index_reload_query() {
                 .unwrap();
             assert_eq!(
                 widget_count,
-                json!([2]),
+                json!([[2]]),
                 "should find 2 widgets after reload"
             );
-            assert_eq!(item_count, json!([2]), "should find 2 items after reload");
+            assert_eq!(item_count, json!([[2]]), "should find 2 items after reload");
         })
         .await;
 }

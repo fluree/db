@@ -74,6 +74,9 @@ pub mod rdf {
 
     /// rdf:nil IRI (RDF list terminator)
     pub const NIL: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil";
+
+    /// rdf:Property IRI (the class of RDF properties)
+    pub const PROPERTY: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property";
 }
 
 /// RDFS vocabulary constants
@@ -699,6 +702,21 @@ pub mod owl {
 
     /// owl:oneOf IRI
     pub const ONE_OF: &str = "http://www.w3.org/2002/07/owl#oneOf";
+
+    /// owl:Ontology IRI
+    pub const ONTOLOGY: &str = "http://www.w3.org/2002/07/owl#Ontology";
+
+    /// owl:imports IRI
+    pub const IMPORTS: &str = "http://www.w3.org/2002/07/owl#imports";
+
+    /// owl:Class IRI
+    pub const CLASS: &str = "http://www.w3.org/2002/07/owl#Class";
+
+    /// owl:ObjectProperty IRI
+    pub const OBJECT_PROPERTY: &str = "http://www.w3.org/2002/07/owl#ObjectProperty";
+
+    /// owl:DatatypeProperty IRI
+    pub const DATATYPE_PROPERTY: &str = "http://www.w3.org/2002/07/owl#DatatypeProperty";
 }
 
 /// OWL local names (for SID construction)
@@ -765,6 +783,21 @@ pub mod owl_names {
 
     /// owl:oneOf local name
     pub const ONE_OF: &str = "oneOf";
+
+    /// owl:Ontology local name
+    pub const ONTOLOGY: &str = "Ontology";
+
+    /// owl:imports local name
+    pub const IMPORTS: &str = "imports";
+
+    /// owl:Class local name
+    pub const CLASS: &str = "Class";
+
+    /// owl:ObjectProperty local name
+    pub const OBJECT_PROPERTY: &str = "ObjectProperty";
+
+    /// owl:DatatypeProperty local name
+    pub const DATATYPE_PROPERTY: &str = "DatatypeProperty";
 }
 
 /// JSON-LD keyword local names (for SID construction)
@@ -1473,6 +1506,30 @@ pub mod predicates {
 
     /// owl:TransitiveProperty local name (class, not predicate)
     pub const OWL_TRANSITIVEPROPERTY: &str = "TransitiveProperty";
+
+    /// owl:FunctionalProperty local name (class, not predicate)
+    pub const OWL_FUNCTIONALPROPERTY: &str = "FunctionalProperty";
+
+    /// owl:InverseFunctionalProperty local name (class, not predicate)
+    pub const OWL_INVERSEFUNCTIONALPROPERTY: &str = "InverseFunctionalProperty";
+
+    /// owl:imports local name
+    pub const OWL_IMPORTS: &str = "imports";
+
+    /// owl:Ontology local name (class)
+    pub const OWL_ONTOLOGY: &str = "Ontology";
+
+    /// owl:Class local name (class)
+    pub const OWL_CLASS: &str = "Class";
+
+    /// owl:ObjectProperty local name (class)
+    pub const OWL_OBJECTPROPERTY: &str = "ObjectProperty";
+
+    /// owl:DatatypeProperty local name (class)
+    pub const OWL_DATATYPEPROPERTY: &str = "DatatypeProperty";
+
+    /// rdf:Property local name (class)
+    pub const RDF_PROPERTY: &str = "Property";
 }
 
 /// Fluree DB namespace predicate local names (for SID construction)
@@ -1777,6 +1834,18 @@ pub mod config_iris {
 
     /// `f:schemaSource` — GraphRef pointing to schema hierarchy graph
     pub const SCHEMA_SOURCE: &str = "https://ns.flur.ee/db#schemaSource";
+
+    /// `f:followOwlImports` — boolean, follow owl:imports closure from schemaSource
+    pub const FOLLOW_OWL_IMPORTS: &str = "https://ns.flur.ee/db#followOwlImports";
+
+    /// `f:ontologyImportMap` — list of OntologyImportBinding
+    pub const ONTOLOGY_IMPORT_MAP: &str = "https://ns.flur.ee/db#ontologyImportMap";
+
+    /// `f:ontologyIri` — the external ontology IRI being mapped
+    pub const ONTOLOGY_IRI: &str = "https://ns.flur.ee/db#ontologyIri";
+
+    /// `f:graphRef` — nested GraphRef inside an OntologyImportBinding
+    pub const GRAPH_REF_PROP: &str = "https://ns.flur.ee/db#graphRef";
 
     // ---- Datalog fields ----
 

@@ -71,7 +71,7 @@ async fn test_trig_named_graph_basic() {
             let query = json!({
                 "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
                 "from": ledger_id,
-                "select": ["?name"],
+                "select": "?name",
                 "where": {"@id": "ex:alice", "schema:name": "?name"}
             });
 
@@ -90,7 +90,7 @@ async fn test_trig_named_graph_basic() {
             let query = json!({
                 "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
                 "from": &named_graph_alias,
-                "select": ["?desc"],
+                "select": "?desc",
                 "where": {"@id": "ex:event1", "schema:description": "?desc"}
             });
 
@@ -202,7 +202,7 @@ async fn test_trig_multiple_named_graphs() {
             let query = json!({
                 "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
                 "from": &products_alias,
-                "select": ["?name"],
+                "select": "?name",
                 "where": {"@id": "ex:prod1", "schema:name": "?name"}
             });
 
@@ -324,7 +324,7 @@ async fn test_update_default_graph_and_template_graph_sugar() {
             let query = json!({
                 "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
                 "from": &named_graph_alias,
-                "select": ["?desc"],
+                "select": "?desc",
                 "where": { "@id": "ex:event1", "schema:description": "?desc" }
             });
 
@@ -342,7 +342,7 @@ async fn test_update_default_graph_and_template_graph_sugar() {
             let query = json!({
                 "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
                 "from": ledger_id,
-                "select": ["?desc"],
+                "select": "?desc",
                 "where": { "@id": "ex:event1", "schema:description": "?desc" }
             });
 
@@ -404,7 +404,7 @@ async fn test_update_from_scopes_where_default_graph() {
             let query = json!({
                 "@context": { "ex": "http://example.org/", "schema": "http://schema.org/" },
                 "from": &named_g2,
-                "select": ["?d"],
+                "select": "?d",
                 "where": { "@id": "ex:s", "schema:copyFromG1": "?d" }
             });
             let results = fluree.query_connection(&query).await.expect("query g2 copy");
@@ -468,7 +468,7 @@ async fn test_update_from_multiple_default_graphs_merge_where() {
             let query = json!({
                 "@context": { "ex": "http://example.org/" },
                 "from": &named_g1,
-                "select": ["?m"],
+                "select": "?m",
                 "where": { "@id": "ex:a", "ex:marker": "?m" }
             });
             let results = fluree
@@ -523,7 +523,7 @@ async fn test_update_from_named_alias_usable_in_templates() {
             let query = json!({
                 "@context": { "ex": "http://example.org/", "schema": "http://schema.org/" },
                 "from": &named_g2,
-                "select": ["?d"],
+                "select": "?d",
                 "where": { "@id": "ex:s", "schema:description": "?d" }
             });
             let results = fluree.query_connection(&query).await.expect("query g2");
@@ -587,7 +587,7 @@ async fn test_default_graph_isolation() {
             let query = json!({
                 "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
                 "from": ledger_id,
-                "select": ["?val"],
+                "select": "?val",
                 "where": {"@id": "ex:secret", "schema:value": "?val"}
             });
 
@@ -607,7 +607,7 @@ async fn test_default_graph_isolation() {
             let query = json!({
                 "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
                 "from": &private_alias,
-                "select": ["?val"],
+                "select": "?val",
                 "where": {"@id": "ex:secret", "schema:value": "?val"}
             });
 
@@ -676,7 +676,7 @@ async fn test_txn_meta_and_named_graph_coexist() {
             let query = json!({
                 "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
                 "from": ledger_id,
-                "select": ["?name"],
+                "select": "?name",
                 "where": {"@id": "ex:alice", "schema:name": "?name"}
             });
 
@@ -694,7 +694,7 @@ async fn test_txn_meta_and_named_graph_coexist() {
             let query = json!({
                 "@context": {"ex": "http://example.org/"},
                 "from": &meta_alias,
-                "select": ["?batch"],
+                "select": "?batch",
                 "where": {"@id": "?commit", "ex:batchId": "?batch"}
             });
 
@@ -712,7 +712,7 @@ async fn test_txn_meta_and_named_graph_coexist() {
             let query = json!({
                 "@context": {"ex": "http://example.org/"},
                 "from": &audit_alias,
-                "select": ["?action"],
+                "select": "?action",
                 "where": {"@id": "ex:log1", "ex:action": "?action"}
             });
 
@@ -1127,7 +1127,7 @@ async fn test_named_graph_retraction() {
             let query = json!({
                 "@context": {"ex": "http://example.org/"},
                 "from": &users_alias,
-                "select": ["?user"],
+                "select": "?user",
                 "where": {"@id": "?user", "ex:active": true},
                 "orderBy": "?user"
             });
@@ -1170,7 +1170,7 @@ async fn test_named_graph_retraction() {
                     "t": 1,
                     "graph": "http://example.org/graphs/users"
                 },
-                "select": ["?user"],
+                "select": "?user",
                 "where": {"@id": "?user", "ex:active": true}
             });
 

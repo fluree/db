@@ -3,9 +3,12 @@
 //! This module contains QueryOptions, shared by both parse and execute modules.
 //! It lives in a neutral location to avoid circular dependencies.
 
+use std::sync::Arc;
+
 use crate::aggregate::AggregateSpec;
 use crate::ir::Expression;
 use crate::rewrite::ReasoningModes;
+use crate::schema_bundle::SchemaBundleFlakes;
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;
 
@@ -40,6 +43,16 @@ pub struct QueryOptions {
     /// Use `reasoning.effective_with_hierarchy(has_hierarchy)` at execution
     /// time to compute the actual modes to apply.
     pub reasoning: ReasoningModes,
+    /// Pre-resolved schema bundle flakes projected to `g_id=0`.
+    ///
+    /// Populated upstream (in `fluree-db-api`) from the ledger's
+    /// `f:schemaSource` and transitive `owl:imports` closure. When set, the
+    /// runner layers a [`SchemaBundleOverlay`](crate::schema_bundle::SchemaBundleOverlay)
+    /// over the query's base overlay for reasoning prep so that hierarchy
+    /// extraction and OWL axiom discovery see the full import closure.
+    ///
+    /// When `None`, reasoning reads schema from `db.g_id` directly.
+    pub schema_bundle: Option<Arc<SchemaBundleFlakes>>,
 }
 
 impl QueryOptions {
@@ -105,6 +118,15 @@ impl QueryOptions {
     /// ```
     pub fn with_reasoning(mut self, modes: ReasoningModes) -> Self {
         self.reasoning = modes;
+        self
+    }
+
+    /// Attach a pre-resolved schema bundle for reasoning.
+    ///
+    /// Populated upstream once per (ledger, `to_t`, schema-source) — see
+    /// `fluree_db_api::ontology_imports::resolve_schema_bundle`.
+    pub fn with_schema_bundle(mut self, bundle: Arc<SchemaBundleFlakes>) -> Self {
+        self.schema_bundle = Some(bundle);
         self
     }
 

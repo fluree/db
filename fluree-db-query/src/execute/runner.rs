@@ -14,6 +14,7 @@ use crate::options::QueryOptions;
 use crate::parse::ParsedQuery;
 use crate::reasoning::ReasoningOverlay;
 use crate::rewrite_owl_ql::Ontology;
+use crate::schema_bundle::SchemaBundleOverlay;
 use crate::stats_cache::cached_stats_view_for_db;
 use crate::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarRegistry;
@@ -175,9 +176,23 @@ pub async fn prepare_execution_with_binary_store(
 
         // ---- reasoning_prep: schema hierarchy, reasoning modes, derived facts, ontology ----
         let reasoning_span = tracing::debug_span!("reasoning_prep");
+        // If the upstream API layer pre-resolved an `f:schemaSource` + `owl:imports`
+        // closure into `query.options.schema_bundle`, project it as an overlay now.
+        // This makes schema-whitelisted flakes from every source graph visible at
+        // `g_id=0`, which is what RDFS/OWL extraction code scans.
+        let schema_overlay_binding: Option<SchemaBundleOverlay<'_>> = query
+            .options
+            .schema_bundle
+            .as_ref()
+            .filter(|b| !b.is_empty())
+            .map(|bundle| SchemaBundleOverlay::new(db.overlay, bundle.clone()));
+        let effective_overlay: &dyn fluree_db_core::OverlayProvider = schema_overlay_binding
+            .as_ref()
+            .map(|o| o as &dyn fluree_db_core::OverlayProvider)
+            .unwrap_or(db.overlay);
         let (hierarchy, reasoning, derived_overlay, ontology) = async {
             // Step 1: Compute schema hierarchy from overlay
-            let hierarchy = schema_hierarchy_with_overlay(db.snapshot, db.overlay, db.t);
+            let hierarchy = schema_hierarchy_with_overlay(db.snapshot, effective_overlay, db.t);
 
             // Step 2: Determine effective reasoning modes
             let reasoning =
@@ -194,19 +209,26 @@ pub async fn prepare_execution_with_binary_store(
             }
 
             // Step 3: Compute derived facts from OWL2-RL and/or datalog rules
+            //
+            // Note: `compute_derived_facts` reads the query graph (`db.g_id`)
+            // for instance data but uses `effective_overlay` so that OWL2-RL
+            // axioms (e.g. `?p a owl:TransitiveProperty`) from the import
+            // closure are visible when scanning g_id=0, and base-overlay
+            // novelty remains visible for other graphs.
             let derived_overlay =
-                compute_derived_facts(db.snapshot, db.g_id, db.overlay, db.t, &reasoning).await;
+                compute_derived_facts(db.snapshot, db.g_id, effective_overlay, db.t, &reasoning)
+                    .await;
 
             // Step 4: Build ontology for OWL2-QL mode (if enabled)
             let reasoning_overlay_for_ontology: Option<ReasoningOverlay<'_>> = derived_overlay
                 .as_ref()
-                .map(|derived| ReasoningOverlay::new(db.overlay, derived.clone()));
+                .map(|derived| ReasoningOverlay::new(effective_overlay, derived.clone()));
 
             let effective_overlay_for_ontology: &dyn fluree_db_core::OverlayProvider =
                 reasoning_overlay_for_ontology
                     .as_ref()
                     .map(|o| o as &dyn fluree_db_core::OverlayProvider)
-                    .unwrap_or(db.overlay);
+                    .unwrap_or(effective_overlay);
 
             let ontology = if reasoning.owl2ql {
                 tracing::debug!("building OWL2-QL ontology");

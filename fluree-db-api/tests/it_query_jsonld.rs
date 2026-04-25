@@ -1791,7 +1791,7 @@ async fn jsonld_bind_arithmetic_in_select() {
     // JSON-LD equivalent of: SELECT ?z WHERE { ?s ex:p ?o . BIND(?o+10 AS ?z) }
     let query = json!({
         "@context": ctx,
-        "select": ["?z"],
+        "select": "?z",
         "where": [
             {"@id": "?s", "ex:p": "?o"},
             ["bind", "?z", ["expr", ["+", "?o", 10]]]
@@ -1883,7 +1883,7 @@ async fn jsonld_bind_with_filter() {
 
     let query = json!({
         "@context": ctx,
-        "select": ["?z"],
+        "select": "?z",
         "where": [
             {"@id": "?s", "ex:p": "?o"},
             ["bind", "?z", ["expr", ["+", "?o", 10]]],
@@ -1932,7 +1932,7 @@ async fn jsonld_bind_in_union() {
 
     let query = json!({
         "@context": ctx,
-        "select": ["?z"],
+        "select": "?z",
         "where": [
             ["union",
                 [

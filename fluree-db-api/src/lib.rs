@@ -59,6 +59,7 @@ pub mod ledger_info;
 mod merge;
 pub mod nameservice_query;
 pub(crate) mod ns_helpers;
+pub mod ontology_imports;
 mod overlay;
 pub mod pack;
 pub mod policy_builder;
@@ -74,6 +75,7 @@ pub mod tx_builder;
 #[cfg(feature = "vector")]
 pub mod vector_worker;
 pub mod view;
+pub mod wire;
 
 // Ledger caching and management
 pub mod ledger_manager;

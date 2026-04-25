@@ -78,6 +78,7 @@ pub mod remote_service;
 pub mod rewrite;
 pub mod rewrite_owl_ql;
 pub mod s2_search;
+pub mod schema_bundle;
 pub mod seed;
 pub(crate) mod semijoin;
 pub mod service;
