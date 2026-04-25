@@ -1910,6 +1910,85 @@ curl -X POST http://localhost:8090/v1/fluree/merge \
   -d '{"ledger": "mydb", "source": "dev", "target": "main"}'
 ```
 
+### GET /fluree/merge-preview/{ledger}
+
+Read-only preview of merging a source branch into a target branch. Returns the rich diff — ahead/behind commit summaries, conflict keys, and fast-forward eligibility — without mutating any nameservice or content store state.
+
+Bearer token required when `data_auth.mode = required`; reads are gated on `bearer.can_read(ledger)`.
+
+**URL:**
+```
+GET /fluree/merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}
+```
+
+**Path / Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `ledger` (path) | string | Yes | Ledger name (e.g., "mydb") |
+| `source` | string | Yes | Source branch to merge from (e.g., "feature-x") |
+| `target` | string | No | Target branch (defaults to the source's parent branch) |
+| `max_commits` | number | No | Cap on per-side commit summaries returned (default 500). Server clamps to a hard maximum of 5,000 — values above are silently lowered. Bounds response size, **not** divergence-walk cost (the unbounded `count` is still computed). |
+| `max_conflict_keys` | number | No | Cap on conflict keys returned (default 200). Server clamps to a hard maximum of 5,000. Bounds response size, **not** the conflict-delta walks. |
+| `include_conflicts` | bool | No | When false, skips the conflict computation (default true). Use this to make the preview cheap on diverged branches. |
+
+**Response body (200 OK):**
+
+```json
+{
+  "source": "feature-x",
+  "target": "main",
+  "ancestor": { "commit_id": "bafy...", "t": 5 },
+  "ahead": {
+    "count": 3,
+    "commits": [
+      { "t": 8, "commit_id": "bafy...", "time": "2026-04-25T12:00:00Z",
+        "asserts": 2, "retracts": 0, "flake_count": 2, "message": null }
+    ],
+    "truncated": false
+  },
+  "behind": { "count": 1, "commits": [...], "truncated": false },
+  "fast_forward": false,
+  "conflicts": {
+    "count": 0,
+    "keys": [],
+    "truncated": false
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | string | Source branch name |
+| `target` | string | Target branch name (resolved from default when not supplied) |
+| `ancestor` | object \| null | Common ancestor `{commit_id, t}`. `null` when both heads are absent |
+| `ahead` | object | Commits on source not on target (`count`, `commits`, `truncated`) |
+| `behind` | object | Commits on target not on source |
+| `fast_forward` | bool | True when target HEAD == ancestor (or both heads absent) |
+| `conflicts` | object | Overlapping `(s, p, g)` keys touched on both sides since the ancestor. Empty when `fast_forward` or `include_conflicts=false` |
+
+Per-commit summaries (`ahead.commits[]` / `behind.commits[]`) are newest-first and include assert/retract counts plus an optional `message` extracted from `txn_meta` when an `f:message` string entry is present.
+
+**Status codes:**
+
+- `200 OK` — Preview computed successfully
+- `400 Bad Request` — Source has no branch point (e.g., main) or `source == target`
+- `401 Unauthorized` — Bearer token required
+- `404 Not Found` — Ledger or branch does not exist (or bearer cannot read it)
+
+**Examples:**
+
+```bash
+# Default target (source's parent), defaults for caps and conflict computation
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=feature-x"
+
+# Counts only — skip the conflict walks for a faster response
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&target=main&include_conflicts=false"
+
+# Cap commit lists at 50 per side
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&max_commits=50"
+```
+
 ### GET /fluree/info
 
 Get ledger metadata. Used by the CLI for `info`, `push`, `pull`, and `clone`.
