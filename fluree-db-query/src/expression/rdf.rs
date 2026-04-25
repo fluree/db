@@ -72,7 +72,7 @@ pub fn eval_datatype<R: RowAccess>(
                         })?;
                     Ok(Some(format_datatype_sid(&dt_sid)))
                 }
-                Binding::Sid(_) | Binding::IriMatch { .. } | Binding::Iri(_) => {
+                Binding::Sid { sid: _, .. } | Binding::IriMatch { .. } | Binding::Iri(_) => {
                     Ok(Some(ComparableValue::String(Arc::from("@id"))))
                 }
                 Binding::Unbound | Binding::Poisoned => Ok(None),
@@ -158,10 +158,10 @@ fn fast_same_term_encoded_ids<R: RowAccess>(
         };
 
         match binding {
-            Binding::EncodedSid { s_id } => {
+            Binding::EncodedSid { s_id, .. } => {
                 // If both sides are vars and both are EncodedSid, compare directly.
                 if let Expression::Var(v2) = other_expr {
-                    if let Some(Binding::EncodedSid { s_id: s2 }) = row.get(*v2) {
+                    if let Some(Binding::EncodedSid { s_id: s2, .. }) = row.get(*v2) {
                         return Ok(Some(*s_id == *s2));
                     }
                 }
@@ -322,7 +322,7 @@ mod tests {
         // IRI() of a Sid should return the Sid unchanged
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
         let sid = Sid::new(100, "x");
-        let col = vec![Binding::Sid(sid.clone())];
+        let col = vec![Binding::sid(sid.clone())];
         let batch = Batch::new(schema, vec![col]).unwrap();
         let row = batch.row_view(0).unwrap();
 

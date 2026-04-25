@@ -237,12 +237,12 @@ pub async fn format_async(
                             let materialized =
                                 super::materialize::materialize_binding(result, binding)?;
                             match materialized {
-                                Binding::Sid(sid) => Some(sid),
+                                Binding::Sid { sid, .. } => Some(sid),
                                 Binding::IriMatch { primary_sid, .. } => Some(primary_sid),
                                 _ => None,
                             }
                         }
-                        Some(Binding::Sid(sid)) => Some(sid.clone()),
+                        Some(Binding::Sid { sid, .. }) => Some(sid.clone()),
                         Some(Binding::IriMatch { primary_sid, .. }) => Some(primary_sid.clone()),
                         Some(Binding::Unbound | Binding::Poisoned) | None => None,
                         Some(

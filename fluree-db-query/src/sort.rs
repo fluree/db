@@ -59,7 +59,7 @@ fn materialize_encoded_for_sort(
                 .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
                 .ok()?;
             match val {
-                FlakeValue::Ref(sid) => Some(Binding::Sid(sid)),
+                FlakeValue::Ref(sid) => Some(Binding::sid(sid)),
                 other => {
                     let dt_sid = gv
                         .store()
@@ -82,16 +82,16 @@ fn materialize_encoded_for_sort(
                 }
             }
         }
-        Binding::EncodedSid { s_id } => {
+        Binding::EncodedSid { s_id, .. } => {
             // BinaryGraphView::resolve_subject_sid handles novelty routing
             // and returns Sid directly (no IRI string + trie lookup).
             let sid = gv.resolve_subject_sid(*s_id).ok()?;
-            Some(Binding::Sid(sid))
+            Some(Binding::sid(sid))
         }
         Binding::EncodedPid { p_id } => {
             // Resolve to Sid for correct namespace/name ordering
             let iri = gv.store().resolve_predicate_iri(*p_id)?;
-            Some(Binding::Sid(gv.store().encode_iri(iri)))
+            Some(Binding::sid(gv.store().encode_iri(iri)))
         }
         _ => None,
     }
@@ -211,7 +211,7 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
 
         // IRI types vs Lit types: IRI sorts before Lit
         (
-            Binding::Sid(_)
+            Binding::Sid { .. }
             | Binding::IriMatch { .. }
             | Binding::Iri(_)
             | Binding::EncodedSid { .. }
@@ -220,7 +220,7 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
         ) => Ordering::Less,
         (
             Binding::Lit { .. } | Binding::EncodedLit { .. },
-            Binding::Sid(_)
+            Binding::Sid { .. }
             | Binding::IriMatch { .. }
             | Binding::Iri(_)
             | Binding::EncodedSid { .. }
@@ -228,29 +228,35 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
         ) => Ordering::Greater,
 
         // Within IRI types: compare by concrete value or ID
-        (Binding::Sid(a), Binding::Sid(b)) => compare_sids(a, b),
+        (Binding::Sid { sid: a, .. }, Binding::Sid { sid: b, .. }) => compare_sids(a, b),
         (Binding::IriMatch { iri: a, .. }, Binding::IriMatch { iri: b, .. }) => a.cmp(b),
         (Binding::Iri(a), Binding::Iri(b)) => a.cmp(b),
-        (Binding::EncodedSid { s_id: a }, Binding::EncodedSid { s_id: b }) => a.cmp(b),
+        (Binding::EncodedSid { s_id: a, .. }, Binding::EncodedSid { s_id: b, .. }) => a.cmp(b),
         (Binding::EncodedPid { p_id: a }, Binding::EncodedPid { p_id: b }) => a.cmp(b),
         // Cross-IRI type comparisons: Sid < IriMatch/Iri < EncodedSid/EncodedPid
         // (Prefer materialized over encoded for consistent ordering)
-        (Binding::Sid(_), Binding::IriMatch { .. } | Binding::Iri(_)) => Ordering::Less,
-        (Binding::IriMatch { .. } | Binding::Iri(_), Binding::Sid(_)) => Ordering::Greater,
+        (Binding::Sid { sid: _, .. }, Binding::IriMatch { .. } | Binding::Iri(_)) => Ordering::Less,
+        (Binding::IriMatch { .. } | Binding::Iri(_), Binding::Sid { sid: _, .. }) => {
+            Ordering::Greater
+        }
         (Binding::IriMatch { iri: a, .. }, Binding::Iri(b)) => a.as_ref().cmp(b.as_ref()),
         (Binding::Iri(a), Binding::IriMatch { iri: b, .. }) => a.as_ref().cmp(b.as_ref()),
         // Encoded IRI types sort after decoded types when mixed
         (
-            Binding::Sid(_) | Binding::IriMatch { .. } | Binding::Iri(_),
+            Binding::Sid { .. } | Binding::IriMatch { .. } | Binding::Iri(_),
             Binding::EncodedSid { .. } | Binding::EncodedPid { .. },
         ) => Ordering::Less,
         (
             Binding::EncodedSid { .. } | Binding::EncodedPid { .. },
-            Binding::Sid(_) | Binding::IriMatch { .. } | Binding::Iri(_),
+            Binding::Sid { .. } | Binding::IriMatch { .. } | Binding::Iri(_),
         ) => Ordering::Greater,
         // EncodedSid vs EncodedPid: compare by ID (they're in same class)
-        (Binding::EncodedSid { s_id }, Binding::EncodedPid { p_id }) => s_id.cmp(&(*p_id as u64)),
-        (Binding::EncodedPid { p_id }, Binding::EncodedSid { s_id }) => (*p_id as u64).cmp(s_id),
+        (Binding::EncodedSid { s_id, .. }, Binding::EncodedPid { p_id }) => {
+            s_id.cmp(&(*p_id as u64))
+        }
+        (Binding::EncodedPid { p_id }, Binding::EncodedSid { s_id, .. }) => {
+            (*p_id as u64).cmp(s_id)
+        }
 
         // Within Lit types: compare by value
         (Binding::Lit { val: v1, .. }, Binding::Lit { val: v2, .. }) => {
@@ -911,9 +917,9 @@ mod tests {
 
     #[test]
     fn test_compare_bindings_sid() {
-        let sid1 = Binding::Sid(Sid::new(1, "apple"));
-        let sid2 = Binding::Sid(Sid::new(1, "banana"));
-        let sid3 = Binding::Sid(Sid::new(2, "apple"));
+        let sid1 = Binding::sid(Sid::new(1, "apple"));
+        let sid2 = Binding::sid(Sid::new(1, "banana"));
+        let sid3 = Binding::sid(Sid::new(2, "apple"));
 
         assert_eq!(compare_bindings(&sid1, &sid1), Ordering::Equal);
         assert_eq!(compare_bindings(&sid1, &sid2), Ordering::Less); // apple < banana

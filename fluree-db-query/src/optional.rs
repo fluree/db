@@ -275,8 +275,8 @@ impl PatternOptionalBuilder {
             return Ok(None);
         };
         match binding {
-            Binding::EncodedSid { s_id } => Ok(Some(*s_id)),
-            Binding::Sid(sid) => store
+            Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
+            Binding::Sid { sid, .. } => store
                 .find_subject_id_by_parts(sid.namespace_code, &sid.name)
                 .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}"))),
             _ => Ok(None),
@@ -303,14 +303,14 @@ impl PatternOptionalBuilder {
             match instr.position {
                 PatternPosition::Subject => {
                     match binding {
-                        Binding::Sid(sid) => {
+                        Binding::Sid { sid, .. } => {
                             pattern.s = Ref::Sid(sid.clone());
                         }
                         Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
                             // Use Ref::Iri so scan can encode for each target ledger
                             pattern.s = Ref::Iri(iri.clone());
                         }
-                        Binding::EncodedSid { s_id } => {
+                        Binding::EncodedSid { s_id, .. } => {
                             // Late materialized subject ID: resolve to IRI for correlation.
                             // Uses novelty-aware BinaryGraphView via ctx.graph_view().
                             let gv = ctx.graph_view().ok_or_else(|| {
@@ -331,7 +331,7 @@ impl PatternOptionalBuilder {
                 }
                 PatternPosition::Predicate => {
                     match binding {
-                        Binding::Sid(sid) => {
+                        Binding::Sid { sid, .. } => {
                             pattern.p = Ref::Sid(sid.clone());
                         }
                         Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
@@ -345,7 +345,7 @@ impl PatternOptionalBuilder {
                 }
                 PatternPosition::Object => {
                     match binding {
-                        Binding::Sid(sid) => {
+                        Binding::Sid { sid, .. } => {
                             pattern.o = Term::Sid(sid.clone());
                         }
                         Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
@@ -524,13 +524,13 @@ impl OptionalBuilder for PatternOptionalBuilder {
             }
             let binding = required_batch.get_by_col(row, instr.left_col);
             return match binding {
-                Binding::EncodedSid { s_id } => {
+                Binding::EncodedSid { s_id, .. } => {
                     let mut v = Vec::with_capacity(1 + 8);
                     v.push(b'S');
                     v.extend_from_slice(&s_id.to_le_bytes());
                     Ok(Some(v.into_boxed_slice()))
                 }
-                Binding::Sid(sid) => {
+                Binding::Sid { sid, .. } => {
                     // Fallback stable key: namespace code + suffix bytes.
                     let mut v = Vec::with_capacity(1 + 2 + sid.name_str().len());
                     v.push(b's');
@@ -636,8 +636,8 @@ impl GroupedPatternOptionalBuilder {
             return Ok(None);
         };
         match binding {
-            Binding::EncodedSid { s_id } => Ok(Some(*s_id)),
-            Binding::Sid(sid) => store
+            Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
+            Binding::Sid { sid, .. } => store
                 .find_subject_id_by_parts(sid.namespace_code, &sid.name)
                 .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}"))),
             _ => Ok(None),
@@ -870,13 +870,13 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
         let binding = required_batch.get_by_col(row, self.subject_left_col);
         let _ = ctx;
         match binding {
-            Binding::EncodedSid { s_id } => {
+            Binding::EncodedSid { s_id, .. } => {
                 let mut v = Vec::with_capacity(1 + 8);
                 v.push(b'S');
                 v.extend_from_slice(&s_id.to_le_bytes());
                 Ok(Some(v.into_boxed_slice()))
             }
-            Binding::Sid(sid) => {
+            Binding::Sid { sid, .. } => {
                 let mut v = Vec::with_capacity(1 + 2 + sid.name_str().len());
                 v.push(b's');
                 v.extend_from_slice(&sid.namespace_code.to_le_bytes());
@@ -1750,7 +1750,7 @@ mod tests {
 
         // Create a batch with normal bindings
         let columns_normal = vec![
-            vec![Binding::Sid(Sid::new(1, "alice"))],
+            vec![Binding::sid(Sid::new(1, "alice"))],
             vec![Binding::lit(
                 FlakeValue::String("Alice".to_string()),
                 Sid::new(2, "string"),
@@ -1788,7 +1788,7 @@ mod tests {
 
         // Create a required batch with one row
         let columns = vec![
-            vec![Binding::Sid(Sid::new(1, "alice"))],
+            vec![Binding::sid(Sid::new(1, "alice"))],
             vec![Binding::lit(
                 FlakeValue::String("Alice".to_string()),
                 Sid::new(2, "string"),

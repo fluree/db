@@ -178,7 +178,7 @@ impl VectorSearchOperator {
                 },
                 Some(Binding::EncodedLit { .. }) => Ok(None),
                 Some(
-                    Binding::Sid(_)
+                    Binding::Sid { .. }
                     | Binding::IriMatch { .. }
                     | Binding::Iri(_)
                     | Binding::Grouped(_)

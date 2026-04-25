@@ -73,7 +73,7 @@ async fn test_values_first_then_join() {
         vec![
             Pattern::Values {
                 vars: vec![VarId(0)], // ?s
-                rows: vec![vec![Binding::Sid(sid1)], vec![Binding::Sid(sid2)]],
+                rows: vec![vec![Binding::sid(sid1)], vec![Binding::sid(sid2)]],
             },
             Pattern::Triple(make_triple_pattern(VarId(0), "name", VarId(1))),
         ],

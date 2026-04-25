@@ -102,7 +102,7 @@ async fn test_optional_poison_blocks_subsequent() {
     let required_schema: Arc<[VarId]> = Arc::from(vec![s].into_boxed_slice());
     let required_batch = Batch::new(
         required_schema.clone(),
-        vec![vec![Binding::Sid(Sid::new(100, "alice"))]],
+        vec![vec![Binding::sid(Sid::new(100, "alice"))]],
     )
     .unwrap();
 

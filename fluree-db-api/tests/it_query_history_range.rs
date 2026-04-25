@@ -3,7 +3,8 @@
 //! Reporter scenario: a query with explicit `"from"`/`"to"` keys (e.g.
 //! `"from": "ledger@t:1", "to": "ledger@t:latest"`) should emit every
 //! assert and retract event with `t` in that range, and the `@op`
-//! binding should resolve to `"assert"` or `"retract"` per event.
+//! binding should resolve to `true` (assert) or `false` (retract)
+//! per event — mirroring `Flake.op` on disk.
 //!
 //! Before the fix:
 //! - The binary cursor only emitted currently-asserted base rows, so
@@ -44,7 +45,8 @@ async fn reindex_to_current(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> 
 }
 
 /// History-range query should emit assert + retract events from the
-/// history sidecar, with `@op` bound to `"assert"` / `"retract"`.
+/// history sidecar, with `@op` bound to `true` (assert) / `false`
+/// (retract).
 ///
 /// Sequence:
 /// - t=1: insert `ex:alice ex:name "Alice"`
@@ -119,37 +121,14 @@ async fn history_range_emits_sidecar_events_with_op() {
     let value = serde_json::to_value(&result.result).expect("serialize");
     let rows = value.as_array().expect("rows array").clone();
 
-    // Helper: flatten one formatted row `{"?v": ..., "?t": ..., "?op": ...}`
-    // into `(v_str, t_i64, op_str)` so assertions are easy to read.
-    fn flatten(row: &serde_json::Value) -> (String, i64, String) {
-        let v = row
-            .get("?v")
-            .and_then(|x| x.get("@value"))
-            .and_then(|x| x.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let t = row
-            .get("?t")
-            .and_then(|x| x.get("@value"))
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(-1);
-        let op = row
-            .get("?op")
-            .and_then(|x| x.get("@value").or(Some(x)))
-            .and_then(|x| x.as_str())
-            .unwrap_or("null")
-            .to_string();
-        (v, t, op)
-    }
-
-    let flattened: Vec<(String, i64, String)> = rows.iter().map(flatten).collect();
-    // orderBy (?t, ?op, ?v) with lexicographic ordering:
-    //   "assert" < "retract", so at t=2 the assert of "Alice Smith" comes
-    //   before the retract of "Alice".
-    let expected: Vec<(String, i64, String)> = vec![
-        ("Alice".to_string(), 1, "assert".to_string()),
-        ("Alice Smith".to_string(), 2, "assert".to_string()),
-        ("Alice".to_string(), 2, "retract".to_string()),
+    let flattened: Vec<(String, i64, bool)> = rows.iter().map(flatten_v_t_op).collect();
+    // orderBy (?t, ?op, ?v): false (retract) sorts before true (assert)
+    // numerically, so at t=2 the retract of "Alice" precedes the assert
+    // of "Alice Smith".
+    let expected: Vec<(String, i64, bool)> = vec![
+        ("Alice".to_string(), 1, true),
+        ("Alice".to_string(), 2, false),
+        ("Alice Smith".to_string(), 2, true),
     ];
     assert_eq!(
         flattened, expected,
@@ -161,8 +140,8 @@ async fn history_range_emits_sidecar_events_with_op() {
 // Helpers shared with the coverage cases below
 // ---------------------------------------------------------------------------
 
-/// Flatten a formatted row into `(?v, ?t, ?op)` strings.
-fn flatten_v_t_op(row: &serde_json::Value) -> (String, i64, String) {
+/// Flatten a formatted row into `(?v: String, ?t: i64, ?op: bool)`.
+fn flatten_v_t_op(row: &serde_json::Value) -> (String, i64, bool) {
     let v = row
         .get("?v")
         .and_then(|x| x.get("@value"))
@@ -177,16 +156,15 @@ fn flatten_v_t_op(row: &serde_json::Value) -> (String, i64, String) {
     let op = row
         .get("?op")
         .and_then(|x| x.get("@value").or(Some(x)))
-        .and_then(|x| x.as_str())
-        .unwrap_or("null")
-        .to_string();
+        .and_then(serde_json::Value::as_bool)
+        .expect("?op should be a boolean");
     (v, t, op)
 }
 
 async fn run_history_query(
     fluree: &fluree_db_api::Fluree,
     q: &serde_json::Value,
-) -> Vec<(String, i64, String)> {
+) -> Vec<(String, i64, bool)> {
     let result = fluree
         .query_from()
         .jsonld(q)
@@ -285,10 +263,10 @@ async fn history_range_novelty_only() {
     });
 
     let rows = run_history_query(&fluree, &q).await;
-    let expected: Vec<(String, i64, String)> = vec![
-        ("Alice".to_string(), 1, "assert".to_string()),
-        ("Alice Smith".to_string(), 2, "assert".to_string()),
-        ("Alice".to_string(), 2, "retract".to_string()),
+    let expected: Vec<(String, i64, bool)> = vec![
+        ("Alice".to_string(), 1, true),
+        ("Alice".to_string(), 2, false),
+        ("Alice Smith".to_string(), 2, true),
     ];
     assert_eq!(rows, expected, "novelty-only history must also bind @op");
 }
@@ -296,7 +274,7 @@ async fn history_range_novelty_only() {
 // ---------------------------------------------------------------------------
 // Case: `@op` as a constant filter — asserts only.
 //
-// The parser lowers `{"@op": "assert"}` into `FILTER(op(?v) = "assert")`.
+// The parser lowers `{"@op": true}` into `FILTER(op(?v) = true)`.
 // That filter runs downstream of the scan, so the history operator
 // just needs to emit rows with op populated and the FILTER does the rest.
 // ---------------------------------------------------------------------------
@@ -326,7 +304,7 @@ async fn history_range_op_constant_filter_assert() {
         .expect("tx2");
     assert_eq!(reindex_to_current(&fluree, ledger_id).await, 2);
 
-    // Ask only for asserts. `@op: "assert"` is a FILTER constant, not a
+    // Ask only for asserts. `@op: true` is a FILTER constant, not a
     // BIND — `?op` never exists as a variable, so select only `?v`/`?t`
     // and assert the filter returns both assert events and no retracts.
     let q = json!({
@@ -336,7 +314,7 @@ async fn history_range_op_constant_filter_assert() {
         "select": ["?v", "?t"],
         "where": [{
             "@id": "ex:alice",
-            "ex:name": {"@value": "?v", "@t": "?t", "@op": "assert"}
+            "ex:name": {"@value": "?v", "@t": "?t", "@op": true}
         }],
         "orderBy": ["?t", "?v"],
     });
@@ -345,7 +323,7 @@ async fn history_range_op_constant_filter_assert() {
         vec![("Alice".to_string(), 1), ("Alice Smith".to_string(), 2)];
     assert_eq!(
         rows, expected,
-        "@op=\"assert\" filter must return only assert events"
+        "@op=true filter must return only assert events"
     );
 }
 
@@ -382,7 +360,7 @@ async fn history_range_op_constant_filter_retract() {
         "select": ["?v", "?t"],
         "where": [{
             "@id": "ex:alice",
-            "ex:name": {"@value": "?v", "@t": "?t", "@op": "retract"}
+            "ex:name": {"@value": "?v", "@t": "?t", "@op": false}
         }],
         "orderBy": ["?t", "?v"],
     });
@@ -390,7 +368,7 @@ async fn history_range_op_constant_filter_retract() {
     let expected: Vec<(String, i64)> = vec![("Alice".to_string(), 2)];
     assert_eq!(
         rows, expected,
-        "@op=\"retract\" filter must return only retract events"
+        "@op=false filter must return only retract events"
     );
 }
 
@@ -443,12 +421,12 @@ async fn history_range_sidecar_plus_novelty_boundary() {
         "orderBy": ["?t", "?op", "?v"],
     });
     let rows = run_history_query(&fluree, &q).await;
-    let expected: Vec<(String, i64, String)> = vec![
+    let expected: Vec<(String, i64, bool)> = vec![
         // t=1 assert comes from base (base t=1 ≤ persisted_to_t=1)
-        ("Alice".to_string(), 1, "assert".to_string()),
-        // t=2 assert+retract come from novelty ((index_t, to_t])
-        ("Alice Smith".to_string(), 2, "assert".to_string()),
-        ("Alice".to_string(), 2, "retract".to_string()),
+        ("Alice".to_string(), 1, true),
+        // t=2 retract+assert come from novelty ((index_t, to_t])
+        ("Alice".to_string(), 2, false),
+        ("Alice Smith".to_string(), 2, true),
     ];
     assert_eq!(
         rows, expected,
@@ -505,15 +483,200 @@ async fn history_range_subject_unbound() {
         "orderBy": ["?t", "?op", "?v"],
     });
     let rows = run_history_query(&fluree, &q).await;
-    // t=1: Alice+assert, Bob+assert; t=2: Alice Smith+assert, Alice+retract
-    let expected: Vec<(String, i64, String)> = vec![
-        ("Alice".to_string(), 1, "assert".to_string()),
-        ("Bob".to_string(), 1, "assert".to_string()),
-        ("Alice Smith".to_string(), 2, "assert".to_string()),
-        ("Alice".to_string(), 2, "retract".to_string()),
+    // t=1: Alice+assert, Bob+assert; t=2: Alice+retract, Alice Smith+assert
+    // (false<true so retract sorts before assert at t=2).
+    let expected: Vec<(String, i64, bool)> = vec![
+        ("Alice".to_string(), 1, true),
+        ("Bob".to_string(), 1, true),
+        ("Alice".to_string(), 2, false),
+        ("Alice Smith".to_string(), 2, true),
     ];
     assert_eq!(
         rows, expected,
         "subject-unbound history must walk all matching leaflets"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// IRI-object regression coverage.
+//
+// The original fix only threaded `t` / `op` onto literal-valued objects.
+// Ref-valued objects (rdf:type, foaf:knows, skos:inScheme, etc.) showed
+// up in the result set with `?v` populated but `?t` and `?op` null,
+// because `Binding::Sid` had no metadata channel. After making the Sid
+// variant metadata-capable, the history scan must populate `t` / `op`
+// for ref-valued objects too.
+// ---------------------------------------------------------------------------
+
+/// Helper: flatten a row whose `?v` is an IRI into `(iri: String, t: i64, op: bool)`.
+fn flatten_iri_v_t_op(row: &serde_json::Value) -> (String, i64, bool) {
+    let v = row
+        .get("?v")
+        .and_then(|x| x.get("@value").or(Some(x)))
+        .and_then(|x| x.get("@id").or(Some(x)))
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let t = row
+        .get("?t")
+        .and_then(|x| x.get("@value"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(-1);
+    let op = row
+        .get("?op")
+        .and_then(|x| x.get("@value").or(Some(x)))
+        .and_then(serde_json::Value::as_bool)
+        .expect("?op should be a boolean");
+    (v, t, op)
+}
+
+async fn run_iri_history_query(
+    fluree: &fluree_db_api::Fluree,
+    q: &serde_json::Value,
+) -> Vec<(String, i64, bool)> {
+    let result = fluree
+        .query_from()
+        .jsonld(q)
+        .format(FormatterConfig::typed_json().with_normalize_arrays())
+        .execute_tracked()
+        .await
+        .expect("history range query");
+    let value = serde_json::to_value(&result.result).expect("serialize");
+    value
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .map(flatten_iri_v_t_op)
+        .collect()
+}
+
+/// Sidecar + base case: `ex:knows` (ref-valued) over a span where the
+/// initial assert lives in the persisted base columns and a later
+/// retract+assert sit in the sidecar. Verifies that `?t` / `?op` are
+/// populated identically for ref-valued and literal-valued objects.
+#[tokio::test]
+async fn history_range_iri_object_sidecar_plus_base() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let ledger_id = "test/history-iri-sidecar:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+
+    // t=1: alice knows bob (ref-valued).
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:bob", "ex:name": "Bob"},
+                    {"@id": "ex:carol", "ex:name": "Carol"},
+                    {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}},
+                ],
+            }),
+        )
+        .await
+        .expect("tx1");
+    assert_eq!(r1.receipt.t, 1);
+    assert_eq!(reindex_to_current(&fluree, ledger_id).await, 1);
+
+    // t=2: replace alice ex:knows bob → alice ex:knows carol.
+    // Upsert retracts the previous ref and asserts the new one.
+    let _ = fluree
+        .upsert(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:knows": {"@id": "ex:carol"},
+            }),
+        )
+        .await
+        .expect("tx2");
+    assert_eq!(reindex_to_current(&fluree, ledger_id).await, 2);
+
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "select": ["?v", "?t", "?op"],
+        "where": [{
+            "@id": "ex:alice",
+            "ex:knows": {"@value": "?v", "@type": "@id", "@t": "?t", "@op": "?op"}
+        }],
+        "orderBy": ["?t", "?op", "?v"],
+    });
+    let rows = run_iri_history_query(&fluree, &q).await;
+    let expected: Vec<(String, i64, bool)> = vec![
+        ("ex:bob".to_string(), 1, true),
+        ("ex:bob".to_string(), 2, false),
+        ("ex:carol".to_string(), 2, true),
+    ];
+    assert_eq!(
+        rows, expected,
+        "history range over a ref-valued predicate must bind @t and @op"
+    );
+}
+
+/// Novelty-only case: same ref-valued predicate but with no reindex,
+/// so all assert / retract events stay in novelty. Verifies the
+/// novelty branch of the history collector also threads metadata
+/// through the ref binding.
+#[tokio::test]
+async fn history_range_iri_object_novelty_only() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let ledger_id = "test/history-iri-novelty:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:bob", "ex:name": "Bob"},
+                    {"@id": "ex:carol", "ex:name": "Carol"},
+                    {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}},
+                ],
+            }),
+        )
+        .await
+        .expect("tx1");
+    let _ = fluree
+        .upsert(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:knows": {"@id": "ex:carol"},
+            }),
+        )
+        .await
+        .expect("tx2");
+
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "select": ["?v", "?t", "?op"],
+        "where": [{
+            "@id": "ex:alice",
+            "ex:knows": {"@value": "?v", "@type": "@id", "@t": "?t", "@op": "?op"}
+        }],
+        "orderBy": ["?t", "?op", "?v"],
+    });
+    let rows = run_iri_history_query(&fluree, &q).await;
+    let expected: Vec<(String, i64, bool)> = vec![
+        ("ex:bob".to_string(), 1, true),
+        ("ex:bob".to_string(), 2, false),
+        ("ex:carol".to_string(), 2, true),
+    ];
+    assert_eq!(
+        rows, expected,
+        "novelty-only history over a ref-valued predicate must bind @t and @op"
     );
 }

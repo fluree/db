@@ -545,16 +545,16 @@ mod tests {
     fn rows_match_both_bound_equal() {
         let shared = vec![VarId(0)];
         let sid = Sid::new(100, "x");
-        let input = batch_1row(&[VarId(0)], vec![Binding::Sid(sid.clone())]);
-        let minus = batch_1row(&[VarId(0)], vec![Binding::Sid(sid)]);
+        let input = batch_1row(&[VarId(0)], vec![Binding::sid(sid.clone())]);
+        let minus = batch_1row(&[VarId(0)], vec![Binding::sid(sid)]);
         assert!(rows_match(&shared, &input, 0, &minus, 0));
     }
 
     #[test]
     fn rows_match_both_bound_unequal() {
         let shared = vec![VarId(0)];
-        let input = batch_1row(&[VarId(0)], vec![Binding::Sid(Sid::new(100, "x"))]);
-        let minus = batch_1row(&[VarId(0)], vec![Binding::Sid(Sid::new(200, "y"))]);
+        let input = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(100, "x"))]);
+        let minus = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(200, "y"))]);
         assert!(!rows_match(&shared, &input, 0, &minus, 0));
     }
 
@@ -564,7 +564,7 @@ mod tests {
         // but no shared bound variables → match should NOT fire
         let shared = vec![VarId(0)];
         let input = batch_1row(&[VarId(0)], vec![Binding::Unbound]);
-        let minus = batch_1row(&[VarId(0)], vec![Binding::Sid(Sid::new(100, "x"))]);
+        let minus = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(100, "x"))]);
         assert!(
             !rows_match(&shared, &input, 0, &minus, 0),
             "no shared bound var → match must not fire"
@@ -576,7 +576,7 @@ mod tests {
         // MINUS has Unbound, input has a value — trivially compatible
         // but no shared bound variables → match should NOT fire
         let shared = vec![VarId(0)];
-        let input = batch_1row(&[VarId(0)], vec![Binding::Sid(Sid::new(100, "x"))]);
+        let input = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(100, "x"))]);
         let minus = batch_1row(&[VarId(0)], vec![Binding::Unbound]);
         assert!(
             !rows_match(&shared, &input, 0, &minus, 0),
@@ -600,7 +600,7 @@ mod tests {
         // Poisoned (from failed OPTIONAL) is not in domain
         let shared = vec![VarId(0)];
         let input = batch_1row(&[VarId(0)], vec![Binding::Poisoned]);
-        let minus = batch_1row(&[VarId(0)], vec![Binding::Sid(Sid::new(100, "x"))]);
+        let minus = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(100, "x"))]);
         assert!(
             !rows_match(&shared, &input, 0, &minus, 0),
             "poisoned is not matchable → no shared bound var"
@@ -615,11 +615,11 @@ mod tests {
         let sid = Sid::new(100, "x");
         let input = batch_1row(
             &[VarId(0), VarId(1)],
-            vec![Binding::Sid(sid.clone()), Binding::Unbound],
+            vec![Binding::sid(sid.clone()), Binding::Unbound],
         );
         let minus = batch_1row(
             &[VarId(0), VarId(1)],
-            vec![Binding::Sid(sid), Binding::Sid(Sid::new(200, "y"))],
+            vec![Binding::sid(sid), Binding::sid(Sid::new(200, "y"))],
         );
         assert!(
             rows_match(&shared, &input, 0, &minus, 0),
@@ -634,11 +634,11 @@ mod tests {
         let sid = Sid::new(100, "x");
         let input = batch_1row(
             &[VarId(0), VarId(1)],
-            vec![Binding::Sid(sid.clone()), Binding::Sid(Sid::new(300, "a"))],
+            vec![Binding::sid(sid.clone()), Binding::sid(Sid::new(300, "a"))],
         );
         let minus = batch_1row(
             &[VarId(0), VarId(1)],
-            vec![Binding::Sid(sid), Binding::Sid(Sid::new(400, "b"))],
+            vec![Binding::sid(sid), Binding::sid(Sid::new(400, "b"))],
         );
         assert!(
             !rows_match(&shared, &input, 0, &minus, 0),
@@ -654,8 +654,8 @@ mod tests {
         let batch = batch_1row(
             &[VarId(0), VarId(1)],
             vec![
-                Binding::Sid(Sid::new(100, "x")),
-                Binding::Sid(Sid::new(200, "y")),
+                Binding::sid(Sid::new(100, "x")),
+                Binding::sid(Sid::new(200, "y")),
             ],
         );
         op.build_hash_index(vec![batch]);
@@ -668,7 +668,7 @@ mod tests {
         let mut op = make_minus_with_shared(vec![VarId(0), VarId(1)]);
         let batch = batch_1row(
             &[VarId(0), VarId(1)],
-            vec![Binding::Sid(Sid::new(100, "x")), Binding::Unbound],
+            vec![Binding::sid(Sid::new(100, "x")), Binding::Unbound],
         );
         op.build_hash_index(vec![batch]);
         assert!(op.minus_hash.is_empty());
@@ -679,20 +679,20 @@ mod tests {
     fn input_row_eliminated_hash_hit() {
         let mut op = make_minus_with_shared(vec![VarId(0)]);
         let sid = Sid::new(100, "x");
-        let minus_batch = batch_1row(&[VarId(0)], vec![Binding::Sid(sid.clone())]);
+        let minus_batch = batch_1row(&[VarId(0)], vec![Binding::sid(sid.clone())]);
         op.build_hash_index(vec![minus_batch]);
 
-        let input = batch_1row(&[VarId(0)], vec![Binding::Sid(sid)]);
+        let input = batch_1row(&[VarId(0)], vec![Binding::sid(sid)]);
         assert!(op.input_row_eliminated(&input, 0));
     }
 
     #[test]
     fn input_row_eliminated_hash_miss() {
         let mut op = make_minus_with_shared(vec![VarId(0)]);
-        let minus_batch = batch_1row(&[VarId(0)], vec![Binding::Sid(Sid::new(100, "x"))]);
+        let minus_batch = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(100, "x"))]);
         op.build_hash_index(vec![minus_batch]);
 
-        let input = batch_1row(&[VarId(0)], vec![Binding::Sid(Sid::new(200, "y"))]);
+        let input = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(200, "y"))]);
         assert!(!op.input_row_eliminated(&input, 0));
     }
 
@@ -705,13 +705,13 @@ mod tests {
         let sid = Sid::new(100, "x");
         let minus_batch = batch_1row(
             &[VarId(0), VarId(1)],
-            vec![Binding::Sid(sid.clone()), Binding::Unbound],
+            vec![Binding::sid(sid.clone()), Binding::Unbound],
         );
         op.build_hash_index(vec![minus_batch]);
 
         let input = batch_1row(
             &[VarId(0), VarId(1)],
-            vec![Binding::Sid(sid), Binding::Sid(Sid::new(200, "y"))],
+            vec![Binding::sid(sid), Binding::sid(Sid::new(200, "y"))],
         );
         assert!(
             op.input_row_eliminated(&input, 0),
@@ -728,13 +728,13 @@ mod tests {
         let sid = Sid::new(100, "x");
         let minus_batch = batch_1row(
             &[VarId(0), VarId(1)],
-            vec![Binding::Sid(sid.clone()), Binding::Sid(Sid::new(200, "y"))],
+            vec![Binding::sid(sid.clone()), Binding::sid(Sid::new(200, "y"))],
         );
         op.build_hash_index(vec![minus_batch]);
 
         let input = batch_1row(
             &[VarId(0), VarId(1)],
-            vec![Binding::Sid(sid), Binding::Unbound],
+            vec![Binding::sid(sid), Binding::Unbound],
         );
         assert!(
             op.input_row_eliminated(&input, 0),

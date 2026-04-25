@@ -114,13 +114,13 @@ History queries capture both the retraction and assertion with `@op`:
 
 ```json
 [
-  [25, 1, "assert"],
-  [25, 5, "retract"],
-  [26, 5, "assert"]
+  [25, 1, true],
+  [25, 5, false],
+  [26, 5, true]
 ]
 ```
 
-Each row shows `[value, transaction_time, operation]`.
+Each row shows `[value, transaction_time, op]` where `op` is `true` for assertions and `false` for retractions.
 
 ### Valid Time vs Transaction Time
 
@@ -257,16 +257,16 @@ Track all changes to a specific entity over time by specifying a time range:
 ```
 
 The `@t` and `@op` annotations bind the transaction time and operation type:
-- **@t** - Transaction time when the fact was asserted or retracted
-- **@op** - Either `"assert"` or `"retract"`
+- **@t** - Transaction time (integer) when the fact was asserted or retracted.
+- **@op** - Boolean: `true` for assertions, `false` for retractions. Mirrors `Flake.op` on disk. Both literal- and IRI-valued objects carry the metadata.
 
 Returns results showing all changes:
 
 ```json
 [
-  ["Alice", 1, "assert"],
-  ["Alice", 5, "retract"],
-  ["Alicia", 5, "assert"]
+  ["Alice", 1, true],
+  ["Alice", 5, false],
+  ["Alicia", 5, true]
 ]
 ```
 
@@ -561,7 +561,7 @@ Use history queries to identify when a specific change happened:
 }
 ```
 
-The results show when `ex:status` changed, with `"retract"` for the old value and `"assert"` for the new value at the same transaction time.
+The results show when `ex:status` changed, with `?op = false` (retract) for the old value and `?op = true` (assert) for the new value at the same transaction time.
 
 ### Audit Trail for Compliance
 

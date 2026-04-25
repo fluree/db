@@ -299,7 +299,7 @@ impl GeoSearchOperator {
                 }
             };
             let subject_pos = *self.out_pos.get(&self.pattern.subject_var).unwrap();
-            row[subject_pos] = Binding::Sid(subject_sid);
+            row[subject_pos] = Binding::sid(subject_sid);
 
             // Add distance binding if requested
             if let Some(dist_var) = self.pattern.distance_var {
