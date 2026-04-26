@@ -223,7 +223,15 @@ Match optional data that may not exist:
 }
 ```
 
-**Multiple Optionals:**
+#### Sibling vs. grouped OPTIONAL — semantics
+
+The two forms below are **not** equivalent. Each `["optional", ...]` array is a
+single OPTIONAL block in SPARQL terms — every item inside is part of the same
+conjunctive group, and a row is null-extended only when the group as a whole
+fails to match. To express two independent left joins, write two sibling
+arrays.
+
+**Sibling OPTIONALs — two independent left joins:**
 
 ```json
 {
@@ -235,7 +243,18 @@ Match optional data that may not exist:
 }
 ```
 
-**Grouped Optionals:**
+Equivalent SPARQL:
+
+```sparql
+?person ex:name ?name .
+OPTIONAL { ?person ex:email ?email }
+OPTIONAL { ?person ex:phone ?phone }
+```
+
+`?email` and `?phone` are independent — a person with only an email keeps
+`?email` bound and gets `null` for `?phone`, and vice versa.
+
+**Grouped OPTIONAL — one conjunctive left join:**
 
 ```json
 {
@@ -247,6 +266,39 @@ Match optional data that may not exist:
     ]
   ]
 }
+```
+
+Equivalent SPARQL:
+
+```sparql
+?person ex:name ?name .
+OPTIONAL { ?person ex:email ?email . ?person ex:phone ?phone }
+```
+
+`?email` and `?phone` are bound together — a person who has an email but no
+phone is null-extended on **both** variables, because the inner conjunctive
+group did not match as a whole.
+
+#### Filters and binds inside OPTIONAL
+
+`filter` and `bind` constrain or compute from existing bindings, so they need
+something to anchor to inside the OPTIONAL block. Any binding-producing
+pattern qualifies as an anchor — a node-map, `values`, an earlier `bind`, a
+nested `optional`, or a sub-`query`. A `filter` or `bind` as the very first
+item in an OPTIONAL array is rejected.
+
+```json
+["optional",
+  { "@id": "?person", "ex:age": "?age" },
+  ["filter", "(> ?age 18)"]
+]
+```
+
+```json
+["optional",
+  ["values", ["?x", [1, 2, 3]]],
+  ["filter", "(> ?x 0)"]
+]
 ```
 
 ### Union Patterns
