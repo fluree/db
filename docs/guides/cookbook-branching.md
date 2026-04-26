@@ -196,9 +196,9 @@ After merging, the branch is still alive. You can:
 
 ```bash
 # Create a branch
-curl -X POST 'http://localhost:8090/v1/fluree/branch?ledger=mydb' \
+curl -X POST 'http://localhost:8090/v1/fluree/branch' \
   -H "Content-Type: application/json" \
-  -d '{"name": "dev", "from": "main"}'
+  -d '{"ledger": "mydb", "branch": "dev", "source": "main"}'
 
 # Query a specific branch
 curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:dev' \
@@ -206,9 +206,9 @@ curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:dev' \
   -d 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
 
 # Merge
-curl -X POST 'http://localhost:8090/v1/fluree/branch/merge?ledger=mydb' \
+curl -X POST 'http://localhost:8090/v1/fluree/merge' \
   -H "Content-Type: application/json" \
-  -d '{"source": "dev"}'
+  -d '{"ledger": "mydb", "source": "dev"}'
 ```
 
 ## Best practices

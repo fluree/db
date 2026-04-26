@@ -65,6 +65,8 @@ docker pull fluree/server:latest
 docker run -p 8090:8090 fluree/server:latest
 ```
 
+For configuration (mounted JSON-LD/TOML config files, env vars, persistent volumes, S3+DynamoDB, query peers, full Compose example), see [Running with Docker](../operations/docker.md).
+
 ## Start the Server
 
 ### Memory Storage (Development)
@@ -227,54 +229,15 @@ fluree server run \
 
 ## Docker Deployment
 
-### Basic Run
+For the full Docker guide — image internals, configuration via env vars vs mounted JSON-LD/TOML config files, persistent volumes, LRU cache and indexing tuning, S3+DynamoDB connection configs, query peers, and a production-ready Compose example — see [Running with Docker](../operations/docker.md).
+
+Minimal persistent run:
 
 ```bash
-docker run -d \
-  --name fluree \
+docker run -d --name fluree \
   -p 8090:8090 \
+  -v fluree-data:/var/lib/fluree \
   fluree/server:latest
-```
-
-### With Persistent Storage
-
-```bash
-docker run -d \
-  --name fluree \
-  -p 8090:8090 \
-  -v /path/to/data:/data \
-  -e FLUREE_STORAGE_PATH=/data \
-  fluree/server:latest
-```
-
-### Docker Compose
-
-Create `docker-compose.yml`:
-
-```yaml
-version: '3.8'
-
-services:
-  fluree:
-    image: fluree/server:latest
-    ports:
-      - "8090:8090"
-    environment:
-      FLUREE_STORAGE_PATH: /data
-      FLUREE_LOG_LEVEL: info
-      FLUREE_INDEXING_ENABLED: "true"
-    volumes:
-      - fluree-data:/data
-    restart: unless-stopped
-
-volumes:
-  fluree-data:
-```
-
-Start with:
-
-```bash
-docker-compose up -d
 ```
 
 ## Troubleshooting

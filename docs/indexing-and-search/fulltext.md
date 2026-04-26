@@ -325,7 +325,7 @@ To force the full picture — pick up config changes for *all* existing data —
 fluree reindex mydb:main
 
 # Or via the admin API
-curl -X POST https://<fluree-server>/fluree/admin/reindex \
+curl -X POST https://<fluree-server>/v1/fluree/reindex \
   -H 'Content-Type: application/json' \
   -d '{"ledger": "mydb:main"}'
 ```

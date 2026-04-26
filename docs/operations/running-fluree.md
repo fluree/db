@@ -88,25 +88,26 @@ fluree-server \
 
 ### Key API Endpoints
 
+All data-plane paths below are relative to the API base URL. For the standalone
+server this is `/v1/fluree`.
+
 **Data Operations:**
 - `POST /query` — JSON-LD and SPARQL queries
 - `POST /update` — Update transactions (WHERE/DELETE/INSERT JSON-LD or SPARQL UPDATE)
 - `POST /insert` / `POST /upsert` — Direct insert or upsert
 
 **Ledger Management:**
-- `POST /fluree/create` — Create a new ledger
-- `POST /fluree/drop` — Delete a ledger
+- `POST /create` — Create a new ledger
+- `POST /drop` — Delete a ledger or graph source
 - `GET /ledgers` — List all ledgers
-- `GET /fluree/info` — Ledger metadata
+- `GET /info/{ledger...}` — Ledger or graph-source metadata
 
 **Admin:**
 - `GET /health` — Health check
-- `GET /status` — Server statistics
-- `GET /version` — Version info
-- `POST /admin/index` — Trigger manual indexing
-- `POST /admin/compact` — Compact indexes
+- `GET /v1/fluree/stats` — Server statistics
+- `POST /reindex` — Trigger manual reindexing
 
-`POST /admin/index` triggers work and returns immediately. If you need to wait
+`POST /reindex` triggers work and returns immediately. If you need to wait
 for indexing in custom Rust code, use `trigger_index()` and set a timeout only
 when your runtime has a hard ceiling, such as Lambda.
 
@@ -124,7 +125,7 @@ Three scopes can each be set to `none`, `optional`, or `required`:
 |-------|-----------|------|
 | Data API | `/query`, `/update`, etc. | `--data-auth-mode` |
 | Events | SSE stream | `--events-auth-mode` |
-| Admin | `/fluree/create`, `/fluree/drop` | `--admin-auth-mode` |
+| Admin | `/create`, `/drop`, `/reindex` | `--admin-auth-mode` |
 
 Supported token types: **Ed25519 JWS** (`did:key` format) and **OIDC/JWKS RS256** (via `--jwks-issuer`).
 

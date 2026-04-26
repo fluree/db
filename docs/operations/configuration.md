@@ -399,8 +399,10 @@ fluree-server \
 
 ### Data API Authentication
 
-Protect query/transaction endpoints (including `/:ledger/query`, `/:ledger/insert`, `/:ledger/upsert`,
-`/:ledger/update`, `/fluree/ledger-info`, and `/fluree/exists`):
+Protect query/transaction endpoints (including `/v1/fluree/query/{ledger...}`,
+`/v1/fluree/insert/{ledger...}`, `/v1/fluree/upsert/{ledger...}`,
+`/v1/fluree/update/{ledger...}`, `/v1/fluree/info/{ledger...}`, and
+`/v1/fluree/exists/{ledger...}`):
 
 | Flag                               | Env Var                                 | Default |
 | ---------------------------------- | --------------------------------------- | ------- |
@@ -485,7 +487,8 @@ When a Bearer token is present for connection-scoped SPARQL queries (`/v1/fluree
 
 ### Admin Endpoint Authentication
 
-Protect `/v1/fluree/create` and `/v1/fluree/drop` endpoints:
+Protect `/v1/fluree/create`, `/v1/fluree/drop`, `/v1/fluree/reindex`, branch
+administration, and Iceberg mapping endpoints:
 
 | Flag                          | Env Var                             | Default |
 | ----------------------------- | ----------------------------------- | ------- |

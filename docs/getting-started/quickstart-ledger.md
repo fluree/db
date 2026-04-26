@@ -291,24 +291,26 @@ tenant2-orders:main
 
 ## Setting Default Context
 
-A ledger's default JSON-LD @context is set by the `@context` included in any transaction. The context from the most recent transaction becomes the ledger's default, which subsequent queries and transactions can use.
+A ledger may have a stored default JSON-LD `@context` that the **CLI** and **HTTP server** can auto-inject into queries that omit `@context` / `PREFIX`. Two ways to set it:
 
-Simply include the desired `@context` in your regular transactions:
+1. **At import time:** `fluree create --from data.ttl` captures `@prefix` declarations from the Turtle source and stores them as the default.
+2. **Explicitly:** `fluree context set <ledger> <ctx.json>`, or `PUT /v1/fluree/context/{ledger...}` over HTTP.
+
+Regular JSON-LD transactions (insert/update) do **not** update the default context — only the two paths above do.
 
 ```json
+// One-time setup via the CLI:
+// fluree context set mydb context.json
 {
   "@context": {
     "ex": "http://example.org/ns/",
     "schema": "http://schema.org/",
     "xsd": "http://www.w3.org/2001/XMLSchema#"
-  },
-  "insert": {
-    "@graph": [...]
   }
 }
 ```
 
-Future transactions and queries can omit the context if desired (though explicit is recommended).
+After this, the CLI (`fluree query`) and the HTTP server query endpoint will inject the stored context into queries that don't supply their own `@context` / `PREFIX`. Direct `fluree-db-api` consumers do **not** get auto-injection — they must opt in via `Fluree::db_with_default_context(...)` or include `@context` in each query. See `docs/concepts/iri-and-context.md` for the full opt-in story.
 
 ## Common Patterns
 

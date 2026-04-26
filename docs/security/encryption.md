@@ -266,7 +266,7 @@ To encrypt existing unencrypted data:
 
 ```bash
 # 1. Export (while running without encryption)
-curl -X POST "http://localhost:8090/fluree/export?ledger=mydb:main" > mydb-export.jsonld
+fluree export mydb:main --format json-ld > mydb-export.jsonld
 
 # 2. Stop server and backup/delete old data
 mv /var/lib/fluree/data /var/lib/fluree/data-unencrypted-backup
@@ -277,9 +277,7 @@ echo "Save this key securely: $FLUREE_ENCRYPTION_KEY"
 
 # 4. Start server with encryption config and import
 ./fluree-db-server --config encrypted-config.jsonld
-curl -X POST "http://localhost:8090/fluree/create?ledger=mydb" \
-  -H "Content-Type: application/json" \
-  -d @mydb-export.jsonld
+fluree create mydb --from mydb-export.jsonld
 ```
 
 ### Disabling Encryption

@@ -241,7 +241,7 @@ Look for:
 
 2. **Check indexing lag:**
    ```bash
-   curl http://localhost:8090/ledgers/mydb:main
+   curl http://localhost:8090/v1/fluree/info/mydb:main
    # High indexing lag (commit_t - index_t) can slow queries
    ```
 

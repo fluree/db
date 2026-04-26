@@ -41,7 +41,7 @@ Once the server is running (via `make server` or `make all`):
 
 ```bash
 # Run your problematic query against the server
-curl -s -X POST http://localhost:8090/otel-test:main/query \
+curl -s -X POST http://localhost:8090/v1/fluree/query/otel-test:main \
   -H 'Content-Type: application/json' \
   -d '{
     "select": ["?name", "?price"],

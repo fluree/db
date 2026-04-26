@@ -17,9 +17,9 @@ High-level introduction to the Fluree HTTP API, including:
 Complete reference for all HTTP endpoints:
 - `POST /update` - Submit update transactions (WHERE/DELETE/INSERT or SPARQL UPDATE)
 - `POST /query` - Execute queries
-- `GET /ledgers` - List ledgers
+- `GET /v1/fluree/ledgers` - List ledgers
 - `GET /health` - Health checks
-- `GET /status` - Server status
+- `GET /v1/fluree/stats` - Server status
 - And more...
 
 ### [Headers, Content Types, and Request Sizing](headers.md)

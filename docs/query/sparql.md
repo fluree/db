@@ -34,7 +34,7 @@ If a query includes any `PREFIX` declarations, the default context is not used â
 
 > **Note:** When using `fluree-db-api` directly (embedded), queries must declare their own `PREFIX` declarations. The default context is not injected automatically by the core API. Use `db_with_default_context()` or `GraphDb::with_default_context()` to opt in. See [Default Context](../concepts/iri-and-context.md#default-context) for details.
 
-You can view and manage the default context with `fluree context get/set` or `GET/PUT /fluree/context/:ledger`.
+You can view and manage the default context with `fluree context get/set` or `GET/PUT /v1/fluree/context/{ledger...}`.
 
 ## Query Forms
 

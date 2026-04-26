@@ -270,7 +270,7 @@ Each ledger can store a **default context** — a JSON object mapping prefixes t
 ### How it's populated
 
 - **Bulk import:** When importing Turtle data via `fluree create --from`, all `@prefix` declarations are captured and stored as the ledger's default context, augmented with built-in prefixes (`rdf`, `rdfs`, `xsd`, `owl`, `sh`, `geo`).
-- **Manual update:** Use the CLI (`fluree context set`) or HTTP API (`PUT /fluree/context/:ledger`) to set or replace the context at any time.
+- **Manual update:** Use the CLI (`fluree context set`) or HTTP API (`PUT /v1/fluree/context/{ledger...}`) to set or replace the context at any time.
 
 ### Core API behavior
 
@@ -336,15 +336,15 @@ Via the HTTP API:
 
 ```bash
 # Read
-curl http://localhost:8090/fluree/context/mydb:main
+curl http://localhost:8090/v1/fluree/context/mydb:main
 
 # Replace
-curl -X PUT http://localhost:8090/fluree/context/mydb:main \
+curl -X PUT http://localhost:8090/v1/fluree/context/mydb:main \
   -H "Content-Type: application/json" \
   -d '{"ex": "http://example.org/"}'
 ```
 
-See [CLI context command](../cli/context.md) and [API endpoints](../api/endpoints.md#get-flureecontextledger) for full details.
+See [CLI context command](../cli/context.md) and [API endpoints](../api/endpoints.md#get-contextledger) for full details.
 
 ### Opting out of the default context
 
