@@ -2826,6 +2826,86 @@ mod tests {
     }
 
     #[test]
+    fn test_optional_values_then_filter() {
+        // VALUES is a binding-producing pattern, so a following FILTER inside the
+        // same OPTIONAL block has an anchor and must be accepted.
+        // SPARQL: OPTIONAL { VALUES (?x) { (1) (2) (3) } FILTER(?x > 0) }
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?x"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional",
+                    ["values", ["?x", [1, 2, 3]]],
+                    ["filter", "(> ?x 0)"]
+                ]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let optional = find_optional(&ast.patterns).expect("Should have optional");
+        assert_eq!(optional.len(), 2);
+        assert!(matches!(optional[0], UnresolvedPattern::Values { .. }));
+        assert!(matches!(optional[1], UnresolvedPattern::Filter(_)));
+    }
+
+    #[test]
+    fn test_optional_bind_anchor_for_filter() {
+        // BIND inside OPTIONAL produces a binding for ?doubled, anchoring the
+        // following FILTER. The leading node-map provides the BIND anchor.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?x", "?doubled"],
+            "where": [
+                ["optional",
+                    { "@id": "?s", "ex:x": "?x" },
+                    ["bind", "?doubled", ["*", "?x", 2]],
+                    ["filter", "(> ?doubled 0)"]
+                ]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let optional = find_optional(&ast.patterns).expect("Should have optional");
+        // 1 triple from node-map + 1 bind + 1 filter
+        assert_eq!(optional.len(), 3);
+    }
+
+    #[test]
+    fn test_optional_filter_first_rejected() {
+        // FILTER as the very first item in an OPTIONAL has nothing to constrain
+        // and must be rejected.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional", ["filter", "(> ?name 0)"]]
+            ]
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_optional_bind_first_rejected() {
+        // BIND as the very first item in an OPTIONAL has nothing to bind from
+        // and must be rejected (matches the pre-existing contract).
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?x"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional", ["bind", "?x", ["+", 1, 1]]]
+            ]
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_nested_optional_structure_preserved() {
         // Nested OPTIONAL should create nested Optional(...) wrapper, not flatten
         let json = json!({

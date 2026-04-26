@@ -463,9 +463,11 @@ pub fn parse_subquery_patterns(
 /// - To get two independent left joins, use two sibling arrays:
 ///   `["optional", {a}], ["optional", {b}]`.
 ///
-/// Filters and binds require a preceding node-map in the group, since they
-/// constrain or compute from existing bindings. Other array forms (nested
-/// optional, values, query, etc.) are self-contained.
+/// Filters and binds require a preceding pattern in the group, since they
+/// constrain or compute from existing bindings. Any anchor — node-map,
+/// `values`, `bind`, nested `optional`, sub-`query`, etc. — qualifies; only a
+/// filter/bind as the very first item in the array is rejected. Other array
+/// forms are self-contained and may appear in any position.
 fn parse_optional_patterns(
     items: &[JsonValue],
     ctx: &JsonLdParseCtx,
@@ -500,11 +502,12 @@ fn parse_optional_patterns(
                 group.extend(temp_query.patterns);
             }
             JsonValue::Array(inner_arr) => {
-                if !has_node_map_anchor {
+                if !has_node_map_anchor && group.is_empty() {
                     let keyword = inner_arr.first().and_then(|v| v.as_str());
                     if matches!(keyword, Some("filter" | "bind")) {
                         return Err(ParseError::InvalidWhere(
-                            "filter and bind in optional must follow a node-map pattern"
+                            "filter and bind in optional must follow a binding-producing \
+                             pattern"
                                 .to_string(),
                         ));
                     }
