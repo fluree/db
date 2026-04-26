@@ -486,6 +486,64 @@ async fn preview_conflict_details_preserve_key_order() {
     }
 }
 
+#[tokio::test]
+async fn preview_conflict_details_work_after_binary_index_reload() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+
+    let base = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+    });
+    let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
+    support::rebuild_and_publish_index(&fluree, "mydb:main").await;
+    fluree.create_branch("mydb", "dev", None).await.unwrap();
+
+    let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .upsert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice-dev"}]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .upsert(
+            main_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice-main"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_conflict_details: true,
+                conflict_strategy: ConflictStrategy::TakeSource,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(preview.conflicts.count, 1);
+    assert_eq!(preview.conflicts.details.len(), 1);
+    let detail = &preview.conflicts.details[0];
+    let source_values = serde_json::to_string(&detail.source_values).unwrap();
+    let target_values = serde_json::to_string(&detail.target_values).unwrap();
+    assert!(source_values.contains("Alice-dev"), "{source_values}");
+    assert!(target_values.contains("Alice-main"), "{target_values}");
+}
+
 // =============================================================================
 // 4. Equal heads (no-op)
 // =============================================================================

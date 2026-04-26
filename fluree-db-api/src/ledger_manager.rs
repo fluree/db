@@ -573,7 +573,15 @@ pub(crate) async fn load_and_attach_binary_store(
         None => return Ok(None),
     };
 
-    let cs: Arc<dyn ContentStore> = backend.content_store(&state.snapshot.ledger_id);
+    // Use the nameservice record's canonical ledger id rather than
+    // snapshot.ledger_id. Imported/cloned index roots may still carry the
+    // source ledger id in their snapshot bytes.
+    let ns_ledger_id = state
+        .ns_record
+        .as_ref()
+        .map(|r| r.ledger_id.as_str())
+        .unwrap_or(state.snapshot.ledger_id.as_str());
+    let cs: Arc<dyn ContentStore> = backend.content_store(ns_ledger_id);
     let bytes = cs
         .get(&index_cid)
         .await
@@ -586,6 +594,14 @@ pub(crate) async fn load_and_attach_binary_store(
         .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
     state.snapshot.subject_watermarks = root.subject_watermarks;
     state.snapshot.string_watermark = root.string_watermark;
+    if root.stats.is_some() && state.snapshot.stats.is_none() {
+        state.snapshot.stats = root.stats;
+        tracing::debug!("loaded stats from FIR6 root");
+    }
+    if root.schema.is_some() && state.snapshot.schema.is_none() {
+        state.snapshot.schema = root.schema;
+        tracing::debug!("loaded schema from FIR6 root");
+    }
     state.dict_novelty = Arc::new(DictNovelty::with_watermarks(
         state.snapshot.subject_watermarks.clone(),
         state.snapshot.string_watermark,
@@ -625,31 +641,14 @@ pub(crate) async fn load_and_attach_binary_store(
         Arc::clone(&state.runtime_small_dicts),
         ns_fallback,
     );
+    // Always rebuild the provider here so it is coherent with the freshly
+    // loaded BinaryIndexStore, DictNovelty, and runtime dictionary state.
     state.snapshot.range_provider = Some(Arc::new(provider));
     // Also attach the type-erased store to the state so transaction staging
     // (which clones LedgerState under the write lock) can construct
     // graph-scoped BinaryRangeProviders (needed for named-graph upsert deletions).
     let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
     state.binary_store = Some(TypeErasedStore(te_store));
-
-    // Load default context from CAS if the nameservice record has one.
-    if state.default_context.is_none() {
-        if let Some(ctx_id) = state
-            .ns_record
-            .as_ref()
-            .and_then(|r| r.default_context.as_ref())
-        {
-            match cs.get(ctx_id).await {
-                Ok(bytes) => match serde_json::from_slice(&bytes) {
-                    Ok(ctx) => state.default_context = Some(ctx),
-                    Err(e) => tracing::warn!(%e, "failed to parse default context JSON"),
-                },
-                Err(e) => {
-                    tracing::debug!(%e, "could not load default context: {}", e);
-                }
-            }
-        }
-    }
 
     Ok(Some(arc_store))
 }

@@ -312,9 +312,11 @@ impl crate::Fluree {
     /// The actual replay loop + finalization, extracted so the caller can
     /// wrap it in a snapshot/rollback guard.
     async fn run_replay(&self, ctx: &ReplayContext<'_>) -> Result<RebaseReport> {
-        let mut current_state =
-            LedgerState::load(&self.nameservice_mode, ctx.source_id, self.backend()).await?;
+        let mut current_state = self.ledger(ctx.source_id).await?;
 
+        // Replay stages commits as writes to the branch. Start from the
+        // source's queryable state, but relabel the snapshot before staging so
+        // commit conflict checks and nameservice updates target the branch.
         current_state.snapshot.ledger_id = ctx.branch_id.to_string();
 
         let mut report = RebaseReport {
@@ -576,9 +578,7 @@ impl crate::Fluree {
             .publish_index(branch_id, index_result.index_t, &index_result.root_id)
             .await?;
 
-        LedgerState::load(&self.nameservice_mode, branch_id, self.backend())
-            .await
-            .map_err(Into::into)
+        self.ledger(branch_id).await
     }
 
     /// Copy index artifacts from source to branch (best-effort).

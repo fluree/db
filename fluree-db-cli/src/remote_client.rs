@@ -650,6 +650,11 @@ impl RemoteLedgerClient {
         format!("{}/{}", self.base_url, op)
     }
 
+    fn with_default_context_param(mut url: String) -> String {
+        url.push_str("?default-context=true");
+        url
+    }
+
     // =========================================================================
     // Query
     // =========================================================================
@@ -660,7 +665,7 @@ impl RemoteLedgerClient {
         ledger: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let url = self.op_url("query", ledger);
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
         self.send_json(
             reqwest::Method::POST,
             &url,
@@ -676,7 +681,7 @@ impl RemoteLedgerClient {
         ledger: &str,
         sparql: &str,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let url = self.op_url("query", ledger);
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
         self.send_json(
             reqwest::Method::POST,
             &url,
@@ -696,7 +701,7 @@ impl RemoteLedgerClient {
         sparql: &str,
         accept: &str,
     ) -> Result<bytes::Bytes, RemoteLedgerError> {
-        let url = self.op_url("query", ledger);
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
         let resp = self
             .send_raw(
                 reqwest::Method::POST,
@@ -747,7 +752,7 @@ impl RemoteLedgerClient {
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let url = self.op_url_root("query");
+        let url = Self::with_default_context_param(self.op_url_root("query"));
         self.send_json(
             reqwest::Method::POST,
             &url,

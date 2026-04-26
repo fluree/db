@@ -182,6 +182,33 @@ pub async fn seed_user_with_ssn(
     fluree.insert(ledger0, &txn).await.expect("seed").ledger
 }
 
+/// Rebuild and publish a binary index for the ledger's current commit head.
+///
+/// Use this in regression tests that need to exercise the FIR6/binary-only
+/// reload path rather than the purely in-memory novelty path.
+pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record should exist");
+    let result = fluree_db_indexer::rebuild_index_from_commits(
+        fluree.content_store(ledger_id),
+        ledger_id,
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("index rebuild should succeed");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .await
+        .expect("publish index");
+}
+
 // =============================================================================
 // Indexing helpers (native tests)
 // =============================================================================

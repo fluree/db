@@ -265,6 +265,55 @@ async fn merge_diverged_target_general_merge() {
     );
 }
 
+#[tokio::test]
+async fn merge_take_source_works_after_binary_index_reload() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+
+    let base_data = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+    });
+    let main_ledger = fluree.insert(ledger, &base_data).await.unwrap().ledger;
+    support::rebuild_and_publish_index(&fluree, "mydb:main").await;
+    fluree.create_branch("mydb", "dev", None).await.unwrap();
+
+    let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .upsert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice-dev"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    fluree
+        .upsert(
+            main_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice-main"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::TakeSource)
+        .await
+        .unwrap();
+
+    assert!(!report.fast_forward);
+    assert_eq!(report.conflict_count, 1);
+    assert_eq!(report.strategy.as_deref(), Some("take-source"));
+
+    let names = query_all_names(&fluree, "mydb:main").await;
+    assert_eq!(names, vec!["Alice-dev"]);
+}
+
 /// Merging a nonexistent source branch returns NotFound.
 #[tokio::test]
 async fn merge_nonexistent_source_fails() {

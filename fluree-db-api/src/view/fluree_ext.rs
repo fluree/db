@@ -162,61 +162,19 @@ impl Fluree {
         let handle = self.ledger_cached(ledger_id).await?;
         let mut snapshot = handle.snapshot().await;
 
-        // If no binary store attached but nameservice has an index address,
-        // load the BinaryIndexStore and attach BinaryRangeProvider.
-        // This handles the non-cached path (FlureeBuilder::file() without ledger_manager).
-        if snapshot.binary_store.is_none() {
-            if let Some(index_cid) = snapshot
-                .ns_record
-                .as_ref()
-                .and_then(|r| r.index_head_id.as_ref())
-                .cloned()
-            {
-                let cs = self.content_store(&snapshot.snapshot.ledger_id);
-                let bytes = cs
-                    .get(&index_cid)
-                    .await
-                    .map_err(|e| ApiError::internal(format!("read index root: {e}")))?;
-                let cache_dir = std::env::temp_dir().join("fluree-cache");
-                let mut store = BinaryIndexStore::load_from_root_bytes(
-                    cs,
-                    &bytes,
-                    &cache_dir,
-                    Some(Arc::clone(&self.leaflet_cache)),
-                )
-                .await
-                .map_err(|e| ApiError::internal(format!("load binary index: {e}")))?;
-
-                // Sync namespace codes between store and snapshot (bimap validation).
-                crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, &mut snapshot.snapshot)?;
-
-                let arc_store = Arc::new(store);
-                let dn = snapshot.dict_novelty.clone();
-                let runtime_small_dicts = crate::runtime_dicts::build_runtime_small_dicts(
-                    &arc_store,
-                    Some(&snapshot.novelty),
-                );
-                let ns_fallback = Some(Arc::new(snapshot.snapshot.namespaces().clone()));
-                let provider = BinaryRangeProvider::new(
-                    Arc::clone(&arc_store),
-                    dn,
-                    Arc::clone(&runtime_small_dicts),
-                    ns_fallback,
-                );
-                snapshot.snapshot.range_provider = Some(Arc::new(provider));
-                snapshot.binary_store = Some(arc_store);
-                snapshot.runtime_small_dicts = runtime_small_dicts;
-            }
-        }
-
-        // Load default context from CAS if not already loaded.
-        if snapshot.default_context.is_none() {
+        // Default context injection is opt-in for core API callers.
+        if include_default_context && snapshot.default_context.is_none() {
             if let Some(ctx_id) = snapshot
                 .ns_record
                 .as_ref()
                 .and_then(|r| r.default_context.as_ref())
             {
-                let cs = self.content_store(&snapshot.snapshot.ledger_id);
+                let ns_ledger_id = snapshot
+                    .ns_record
+                    .as_ref()
+                    .map(|r| r.ledger_id.as_str())
+                    .unwrap_or(snapshot.snapshot.ledger_id.as_str());
+                let cs = self.content_store(ns_ledger_id);
                 if let Ok(bytes) = cs.get(ctx_id).await {
                     if let Ok(ctx) = serde_json::from_slice(&bytes) {
                         snapshot.default_context = Some(ctx);
@@ -499,9 +457,7 @@ impl Fluree {
         // Historical views don't carry default_context through their own load
         // path, so fetch it from the current head's cached ledger state.
         if view.default_context.is_none() {
-            let handle = self.ledger_cached(parsed_id).await?;
-            let snap = handle.snapshot().await;
-            view = view.with_default_context(snap.default_context.clone());
+            view = view.with_default_context(self.get_default_context(parsed_id).await?);
         }
         Ok(view)
     }

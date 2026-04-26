@@ -394,11 +394,11 @@ impl crate::Fluree {
                     };
 
                     let details = if opts.include_conflict_details && !keys.is_empty() {
-                        let source_state_fut = LedgerState::load_with_store(
+                        let source_state_fut = self.load_queryable_state_with_store(
                             source_store.clone(),
                             source_record.clone(),
                         );
-                        let target_state_fut = LedgerState::load_with_store(
+                        let target_state_fut = self.load_queryable_state_with_store(
                             target_branched.clone(),
                             target_record.clone(),
                         );

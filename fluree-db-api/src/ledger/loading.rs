@@ -1,12 +1,39 @@
 use std::sync::Arc;
 
-use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result, TypeErasedStore};
-use fluree_db_binary_index::BinaryIndexStore;
+use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result};
 use fluree_db_core::ContentStore;
-use fluree_db_core::DictNovelty;
 use fluree_db_nameservice::{NameServiceError, NsRecord};
 
 impl Fluree {
+    /// Attach a binary index store and range provider to an already-loaded
+    /// ledger state when its nameservice record points at a binary index root.
+    pub(crate) async fn attach_binary_index_store(&self, state: &mut LedgerState) -> Result<()> {
+        crate::ledger_manager::load_and_attach_binary_store(
+            self.backend(),
+            state,
+            &self.binary_store_cache_dir(),
+            Some(Arc::clone(self.leaflet_cache())),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Load a branch-aware ledger state from an already-resolved nameservice
+    /// record and content store, then attach the binary range provider needed
+    /// for any path that will run indexed range queries.
+    pub(crate) async fn load_queryable_state_with_store<C>(
+        &self,
+        store: C,
+        record: NsRecord,
+    ) -> Result<LedgerState>
+    where
+        C: ContentStore + Clone + 'static,
+    {
+        let mut state = LedgerState::load_with_store(store, record).await?;
+        self.attach_binary_index_store(&mut state).await?;
+        Ok(state)
+    }
+
     /// Load a ledger by address (e.g., "mydb:main")
     ///
     /// This loads the ledger state using the connection-wide cache.
@@ -14,145 +41,7 @@ impl Fluree {
     pub async fn ledger(&self, ledger_id: &str) -> Result<LedgerState> {
         let mut state =
             LedgerState::load(&self.nameservice_mode, ledger_id, self.backend()).await?;
-
-        // If nameservice has an index address, require that the binary index root is
-        // readable and loadable. This ensures `fluree.ledger()` always returns a
-        // queryable, indexed LedgerSnapshot after (re)indexing.
-        //
-        // Note: we may already have a `LedgerSnapshot.range_provider` (e.g. attached after `load_ledger_snapshot`),
-        // but we still want `binary_store` so query execution can use `BinaryScanOperator`.
-        if let Some(index_cid) = state
-            .ns_record
-            .as_ref()
-            .and_then(|r| r.index_head_id.as_ref())
-            .cloned()
-        {
-            if state.snapshot.range_provider.is_none() || state.binary_store.is_none() {
-                // Use the NsRecord's ledger_id (canonical namespace) rather than
-                // snapshot.ledger_id, which may reflect the source ledger after
-                // a pack import/clone into a differently-named destination.
-                let ns_ledger_id = state
-                    .ns_record
-                    .as_ref()
-                    .map(|r| r.ledger_id.as_str())
-                    .unwrap_or(state.snapshot.ledger_id.as_str());
-                let cs = self.content_store(ns_ledger_id);
-                let bytes = cs.get(&index_cid).await.map_err(|e| {
-                    ApiError::internal(format!(
-                        "failed to read binary index root for {index_cid}: {e}"
-                    ))
-                })?;
-
-                let cache_dir = std::env::temp_dir().join("fluree-cache");
-
-                // Load BinaryIndexStore from FIR6 root.
-                let mut binary_index_store = BinaryIndexStore::load_from_root_bytes(
-                    Arc::clone(&cs),
-                    &bytes,
-                    &cache_dir,
-                    Some(Arc::clone(&self.leaflet_cache)),
-                )
-                .await
-                .map_err(|e| {
-                    ApiError::internal(format!(
-                        "failed to load binary index store for {index_cid}: {e}"
-                    ))
-                })?;
-
-                crate::ns_helpers::sync_store_and_snapshot_ns(
-                    &mut binary_index_store,
-                    &mut state.snapshot,
-                )?;
-
-                // Extract stats from the FIR6 root if present.
-                // Decode FIR6 root metadata once and apply:
-                // - watermarks (needed for DictNovelty/DictOverlay correctness)
-                // - optional stats + schema (for formatting/reasoning)
-                let root = fluree_db_binary_index::format::index_root::IndexRoot::decode(&bytes)
-                    .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
-
-                // Watermarks + dict novelty.
-                state.snapshot.subject_watermarks = root.subject_watermarks.clone();
-                state.snapshot.string_watermark = root.string_watermark;
-                state.dict_novelty = Arc::new(DictNovelty::with_watermarks(
-                    state.snapshot.subject_watermarks.clone(),
-                    state.snapshot.string_watermark,
-                ));
-                // Re-populate DictNovelty with any already-loaded novelty flakes so
-                // overlay translation (BinaryRangeProvider) can resolve newly-introduced IDs.
-                //
-                // Important: only allocate novelty IDs for entries *not* present in the
-                // persisted dictionaries (canonical IDs must win).
-                if !state.novelty.is_empty() {
-                    let novelty = state.novelty.as_ref();
-                    let dn = Arc::make_mut(&mut state.dict_novelty);
-                    fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
-                        dn,
-                        Some(&binary_index_store),
-                        novelty
-                            .iter_index(fluree_db_core::IndexType::Post)
-                            .map(|id| novelty.get_flake(id)),
-                    )
-                    .map_err(|e| ApiError::internal(format!("populate_dict_novelty_safe: {e}")))?;
-                }
-
-                // Stats + schema.
-                if root.stats.is_some() && state.snapshot.stats.is_none() {
-                    state.snapshot.stats = root.stats;
-                    tracing::debug!("loaded stats from FIR6 root");
-                }
-                if root.schema.is_some() && state.snapshot.schema.is_none() {
-                    state.snapshot.schema = root.schema;
-                    tracing::debug!("loaded schema from FIR6 root");
-                }
-
-                let arc_store = Arc::new(binary_index_store);
-                state.binary_store = Some(TypeErasedStore(arc_store.clone()));
-
-                // Reseed runtime small dicts from the binary index store BEFORE
-                // creating the BinaryRangeProvider. The dicts built during
-                // `load_with_store` are unseeded (IDs start at 0) and would
-                // collide with persisted predicate/datatype IDs in the binary
-                // index. Reseeding first ensures novelty-only entries get IDs
-                // above the persisted range.
-                crate::runtime_dicts::reseed_runtime_small_dicts(&mut state, &arc_store);
-
-                // Attach range provider for policy/SHACL/reasoner/property paths.
-                if state.snapshot.range_provider.is_none() {
-                    let ns_fallback = Some(Arc::new(state.snapshot.namespaces().clone()));
-                    let provider = fluree_db_query::BinaryRangeProvider::new(
-                        Arc::clone(&arc_store),
-                        state.dict_novelty.clone(),
-                        state.runtime_small_dicts.clone(),
-                        ns_fallback,
-                    );
-                    state.snapshot.range_provider = Some(Arc::new(provider));
-                }
-                tracing::info!("loaded binary index store");
-            }
-        }
-
-        // Load default context from CAS if the nameservice record has one.
-        if let Some(ctx_id) = state
-            .ns_record
-            .as_ref()
-            .and_then(|r| r.default_context.as_ref())
-        {
-            let ns_ledger_id = state
-                .ns_record
-                .as_ref()
-                .map(|r| r.ledger_id.as_str())
-                .unwrap_or(state.snapshot.ledger_id.as_str());
-            let cs = self.content_store(ns_ledger_id);
-            match cs.get(ctx_id).await {
-                Ok(bytes) => match serde_json::from_slice(&bytes) {
-                    Ok(ctx) => state.default_context = Some(ctx),
-                    Err(e) => tracing::warn!(%e, "failed to parse default context JSON"),
-                },
-                Err(e) => tracing::debug!(%e, cid = %&ctx_id, "could not load default context"),
-            }
-        }
-
+        self.attach_binary_index_store(&mut state).await?;
         Ok(state)
     }
 

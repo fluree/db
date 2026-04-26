@@ -10,7 +10,7 @@ use fluree_db_core::commit::codec::read_commit_envelope;
 use fluree_db_core::content_kind::ContentKind;
 use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{collect_dag_cids, load_commit_by_id, CommonAncestor};
-use fluree_db_core::{ConflictKey, ContentId, ContentStore, Flake};
+use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore, Flake};
 use fluree_db_ledger::{LedgerState, LedgerView};
 use fluree_db_nameservice::{NsRecord, NsRecordSnapshot};
 use fluree_db_novelty::compute_delta_keys;
@@ -293,19 +293,16 @@ impl crate::Fluree {
         let source_delta =
             compute_delta_keys(source_store.clone(), source_head_id.clone(), ancestor.t).await?;
 
-        // Compute target delta. Build a branched store if target is also a branch.
-        let target_delta = if target_record.source_branch.is_some() {
-            let target_store = LedgerState::build_branched_store(
-                &self.nameservice_mode,
-                target_record,
-                self.backend(),
-            )
-            .await?;
-            compute_delta_keys(target_store, target_head_id.clone(), ancestor.t).await?
+        // Compute target delta. Use the same branch-aware store below when
+        // loading the queryable target state for staging.
+        let target_store: BranchedContentStore = if target_record.source_branch.is_some() {
+            LedgerState::build_branched_store(&self.nameservice_mode, target_record, self.backend())
+                .await?
         } else {
-            let target_store = self.content_store(target_id);
-            compute_delta_keys(target_store, target_head_id.clone(), ancestor.t).await?
+            BranchedContentStore::leaf(self.content_store(target_id))
         };
+        let target_delta =
+            compute_delta_keys(target_store.clone(), target_head_id.clone(), ancestor.t).await?;
 
         // Find conflicts: intersection of source and target delta sets.
         let conflicts: Vec<ConflictKey> =
@@ -324,8 +321,9 @@ impl crate::Fluree {
         }
 
         // Load target state for staging the merge commit.
-        let target_state =
-            LedgerState::load(&self.nameservice_mode, target_id, self.backend()).await?;
+        let target_state = self
+            .load_queryable_state_with_store(target_store, target_record.clone())
+            .await?;
 
         // Collect source flakes and metadata: walk source commits from HEAD
         // to ancestor, gathering flakes, namespace deltas, and graph deltas.

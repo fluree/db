@@ -803,6 +803,12 @@ GET  /query?query={urlencoded-sparql}   # SPARQL Protocol GET form
 
 The `GET` form is provided for W3C SPARQL Protocol compliance. It accepts SPARQL queries via the `query` query parameter; the body forms below are preferred for larger queries and for JSON-LD. The same form is available on the ledger-scoped `/query/{ledger}` route.
 
+**Optional Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `default-context` | boolean | `false` | When `true`, use the ledger's stored default JSON-LD context if the request omits its own `@context` (JSON-LD) or `PREFIX` declarations (ledger-scoped SPARQL). |
+
 **Request Headers:**
 ```http
 Content-Type: application/json

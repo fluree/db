@@ -17,7 +17,7 @@ fluree context <COMMAND>
 
 ## Description
 
-Each ledger can have a **default context** — a JSON object mapping prefixes to IRIs (e.g., `{"ex": "http://example.org/"}`). When a JSON-LD query or transaction is sent via the **Fluree server or CLI** and omits its own `@context`, the ledger's default context is injected automatically. When using `fluree-db-api` directly, this injection does not happen unless explicitly opted into.
+Each ledger can have a **default context** — a JSON object mapping prefixes to IRIs (e.g., `{"ex": "http://example.org/"}`). When a JSON-LD query is sent via the **CLI** and omits its own `@context`, the ledger's default context is injected automatically. The HTTP API requires `?default-context=true` to opt in per request, and `fluree-db-api` requires explicit opt-in via its default-context view builders.
 
 Default context is populated automatically during bulk import (from Turtle `@prefix` declarations). This command allows reading or replacing it after the fact.
 
