@@ -9,10 +9,10 @@ use crate::raw_txn_upload::PendingRawTxnUpload;
 use chrono::Utc;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::{ContentId, ContentKind, ContentStore, DictNovelty, Flake, TXN_META_GRAPH_ID};
-use fluree_db_ledger::{IndexConfig, LedgerState, LedgerView};
+use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::{CasResult, NameService, RefKind, RefPublisher, RefValue};
 use fluree_db_novelty::{generate_commit_flakes, stamp_graph_on_commit_flakes};
-use fluree_db_novelty::{Commit, CommitRef, SigningKey, TxnMetaEntry, TxnMetaValue, TxnSignature};
+use fluree_db_novelty::{Commit, SigningKey, TxnMetaEntry, TxnMetaValue, TxnSignature};
 use fluree_db_query::BinaryRangeProvider;
 use std::sync::Arc;
 use tracing::Instrument;
@@ -98,7 +98,7 @@ pub struct CommitOpts {
     pub skip_sequencing: bool,
     /// Additional parent commit IDs for merge commits.
     ///
-    /// When non-empty, these are appended as extra `previous_refs` on the
+    /// When non-empty, these are appended as extra `parents` on the
     /// commit record, producing a multi-parent (merge) commit. The primary
     /// parent is still derived from `base.head_commit_id`.
     pub merge_parents: Vec<ContentId>,
@@ -287,7 +287,7 @@ impl CommitOpts {
 ///
 /// A tuple of (CommitReceipt, new LedgerState)
 pub async fn commit<C, N>(
-    view: LedgerView,
+    view: StagedLedger,
     mut ns_registry: NamespaceRegistry,
     content_store: &C,
     nameservice: &N,
@@ -501,12 +501,11 @@ where
 
             // Build previous commit reference from the head commit's ContentId.
             if let Some(cid) = head_commit_id.clone() {
-                commit_record = commit_record.with_previous_ref(CommitRef::new(cid));
+                commit_record = commit_record.with_parent(cid);
             }
             // Append additional merge parent references.
             for merge_parent in &merge_parents {
-                commit_record =
-                    commit_record.with_previous_ref(CommitRef::new(merge_parent.clone()));
+                commit_record = commit_record.with_parent(merge_parent.clone());
             }
 
             // 7. Content-address + write (storage-owned)
@@ -891,9 +890,10 @@ mod tests {
             ledger_name: &str,
             new_branch: &str,
             source_branch: &str,
+            at_commit: Option<(fluree_db_core::ContentId, i64)>,
         ) -> fluree_db_nameservice::Result<()> {
             self.inner
-                .create_branch(ledger_name, new_branch, source_branch)
+                .create_branch(ledger_name, new_branch, source_branch, at_commit)
                 .await
         }
 

@@ -10,7 +10,7 @@
 //!
 //! - [`LedgerState`] - Live ledger state (mutable, has novelty)
 //! - [`HistoricalLedgerView`] - Read-only view at a specific time (for time-travel)
-//! - [`LedgerView`] - Staged transactions (uncommitted changes)
+//! - [`StagedLedger`] - Staged transactions (uncommitted changes)
 //!
 //! # Example
 //!
@@ -31,7 +31,7 @@ mod staged;
 
 pub use error::{LedgerError, Result};
 pub use historical::HistoricalLedgerView;
-pub use staged::LedgerView;
+pub use staged::StagedLedger;
 
 use fluree_db_core::{
     format_ledger_id, BranchedContentStore, ContentId, ContentStore, DictNovelty, Flake,

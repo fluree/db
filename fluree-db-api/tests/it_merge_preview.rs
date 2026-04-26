@@ -21,7 +21,10 @@ async fn preview_fast_forward() {
     });
     fluree.insert(ledger, &base).await.unwrap();
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
     let dev_data = json!({
@@ -53,7 +56,10 @@ async fn preview_fast_forward_with_conflict_details_is_empty_and_mergeable() {
     });
     fluree.insert(ledger, &base).await.unwrap();
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
     fluree
         .insert(
@@ -101,7 +107,10 @@ async fn preview_diverged_no_conflicts() {
     });
     let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     // Disjoint subjects on each side.
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
@@ -151,7 +160,10 @@ async fn preview_diverged_with_conflicts() {
     });
     let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     // Both branches modify ex:alice / ex:name.
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
@@ -199,7 +211,10 @@ async fn preview_conflict_details_include_values_and_strategy_labels() {
     });
     let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     let mut dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
     dev_ledger = fluree
@@ -285,7 +300,10 @@ async fn preview_conflict_details_cover_take_branch_and_abort_labels() {
         "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
     });
     let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
     fluree
@@ -361,7 +379,10 @@ async fn preview_conflict_details_follow_conflict_key_truncation() {
         ]
     });
     let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
     fluree
@@ -426,7 +447,10 @@ async fn preview_conflict_details_preserve_key_order() {
         ]
     });
     let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
     fluree
@@ -497,7 +521,10 @@ async fn preview_conflict_details_work_after_binary_index_reload() {
     });
     let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
     support::rebuild_and_publish_index(&fluree, "mydb:main").await;
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
     fluree
@@ -560,7 +587,10 @@ async fn preview_equal_heads_is_fast_forward_with_empty_deltas() {
     });
     fluree.insert(ledger, &base).await.unwrap();
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     let preview = fluree.merge_preview("mydb", "dev", None).await.unwrap();
 
@@ -586,7 +616,10 @@ async fn preview_behind_only() {
     });
     let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     // Target advances, source does not.
     fluree
@@ -623,7 +656,10 @@ async fn preview_default_target_uses_source_parent() {
     });
     fluree.insert(ledger, &base).await.unwrap();
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     let preview = fluree.merge_preview("mydb", "dev", None).await.unwrap();
     assert_eq!(preview.target, "main");
@@ -644,7 +680,10 @@ async fn preview_self_merge_rejected() {
     });
     fluree.insert(ledger, &base).await.unwrap();
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     let err = fluree
         .merge_preview("mydb", "dev", Some("dev"))
@@ -671,7 +710,10 @@ async fn preview_truncation_caps_commits_list() {
     });
     fluree.insert(ledger, &base).await.unwrap();
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     // Five commits on dev.
     let mut dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
@@ -720,7 +762,10 @@ async fn preview_include_conflicts_false_returns_empty_conflicts() {
     });
     let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     // Real conflict on ex:alice/ex:name.
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
@@ -774,7 +819,10 @@ async fn preview_conflict_details_require_conflict_computation() {
         "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
     });
     fluree.insert(ledger, &base).await.unwrap();
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     let err = fluree
         .merge_preview_with(
@@ -805,7 +853,10 @@ async fn preview_abort_strategy_requires_conflict_computation() {
         "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
     });
     fluree.insert(ledger, &base).await.unwrap();
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     let err = fluree
         .merge_preview_with(
@@ -841,7 +892,10 @@ async fn preview_does_not_mutate_nameservice() {
     });
     let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
     fluree
@@ -958,8 +1012,14 @@ async fn preview_between_sibling_branches() {
     });
     fluree.insert(ledger, &base).await.unwrap();
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
-    fluree.create_branch("mydb", "feature", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "feature", None, None)
+        .await
+        .unwrap();
 
     // Advance dev (source).
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
@@ -1018,7 +1078,10 @@ async fn preview_max_commits_none_is_unbounded() {
     });
     fluree.insert(ledger, &base).await.unwrap();
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     // 5 commits on dev.
     let mut dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
@@ -1086,7 +1149,10 @@ async fn preview_conflict_keys_are_sorted() {
     });
     let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
 
-    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     // Modify the same predicate on each subject from both branches.
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();

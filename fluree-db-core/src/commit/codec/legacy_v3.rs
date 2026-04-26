@@ -250,7 +250,7 @@ pub fn read_commit_v3(bytes: &[u8]) -> Result<Commit, CommitCodecError> {
         t: header.t,
         time: envelope.time,
         flakes,
-        previous_refs: envelope.previous_refs,
+        parents: envelope.parents,
         txn: envelope.txn,
         namespace_delta: envelope.namespace_delta,
         txn_signature: envelope.txn_signature,
@@ -298,7 +298,7 @@ pub fn read_commit_envelope_v3(bytes: &[u8]) -> Result<CommitEnvelope, CommitCod
 
     Ok(CommitEnvelope {
         t: header.t,
-        previous_refs: env.previous_refs,
+        parents: env.parents,
         txn: env.txn,
         namespace_delta: env.namespace_delta,
         txn_meta,
@@ -842,7 +842,7 @@ mod tests {
         // Envelope
         let envelope = CodecEnvelope {
             t,
-            previous_refs: Vec::new(),
+            parents: Vec::new(),
             namespace_delta: HashMap::new(),
             txn: None,
             time: None,
@@ -986,7 +986,7 @@ mod tests {
         let blob = build_v3_test_blob(&[flake], 42);
         let envelope = crate::commit::codec::read_commit_envelope(&blob).unwrap();
         assert_eq!(envelope.t, 42);
-        assert!(envelope.previous_refs.is_empty());
+        assert!(envelope.parents.is_empty());
         assert!(envelope.txn_meta.is_empty());
     }
 

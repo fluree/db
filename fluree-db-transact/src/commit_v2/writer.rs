@@ -14,7 +14,7 @@ mod tests {
     use super::*;
     use fluree_db_core::commit::codec::{read_commit, read_commit_envelope, MAGIC};
     use fluree_db_core::{ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid};
-    use fluree_db_novelty::{Commit, CommitRef};
+    use fluree_db_novelty::Commit;
     use std::collections::HashMap;
 
     fn make_test_commit(flakes: Vec<Flake>, t: i64) -> Commit {
@@ -263,14 +263,14 @@ mod tests {
             5,
         );
         let prev_cid = ContentId::new(ContentKind::Commit, b"prev-commit-bytes");
-        commit.previous_refs = vec![CommitRef::new(prev_cid.clone())];
+        commit.parents = vec![prev_cid.clone()];
         commit.namespace_delta = HashMap::from([(200, "ex:".to_string())]);
 
         let result = write_commit(&commit, false, None).unwrap();
         let envelope = read_commit_envelope(&result.bytes).unwrap();
 
         assert_eq!(envelope.t, 5);
-        assert_eq!(envelope.previous_refs.first().unwrap().id, prev_cid);
+        assert_eq!(envelope.parents.first().unwrap(), &prev_cid);
         assert_eq!(envelope.namespace_delta.get(&200), Some(&"ex:".to_string()));
     }
 

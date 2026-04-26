@@ -110,11 +110,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Nameservice ref endpoints (for remote sync)
         .route(
             "/nameservice/refs/:alias/commit",
-            post(nameservice_refs::push_commit_ref),
+            post(nameservice_refs::push_commit_head),
         )
         .route(
             "/nameservice/refs/:alias/index",
-            post(nameservice_refs::push_index_ref),
+            post(nameservice_refs::push_index_head),
         )
         .route(
             "/nameservice/refs/:alias/init",

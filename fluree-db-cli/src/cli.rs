@@ -762,6 +762,14 @@ pub enum BranchAction {
         #[arg(long)]
         from: Option<String>,
 
+        /// Commit to branch at (defaults to source branch HEAD).
+        ///
+        /// Accepts `t:N` for a transaction number, or a hex digest / full
+        /// CID for prefix resolution. The source branch must be indexed
+        /// for `t:` / prefix resolution (full CIDs work unconditionally).
+        #[arg(long)]
+        at: Option<String>,
+
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
         remote: Option<String>,

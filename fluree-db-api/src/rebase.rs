@@ -11,7 +11,7 @@ use fluree_db_core::{
     RangeTest, DEFAULT_GRAPH_ID,
 };
 use fluree_db_core::{trace_commits_by_id, Commit};
-use fluree_db_ledger::{LedgerState, LedgerView};
+use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecordSnapshot;
 use fluree_db_novelty::compute_delta_keys;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
@@ -424,7 +424,7 @@ impl crate::Fluree {
             ApiError::internal(format!("Failed to build reverse graph during rebase: {e}"))
         })?;
 
-        let view = LedgerView::stage(state, flakes, &reverse_graph).map_err(|e| {
+        let view = StagedLedger::new(state, flakes, &reverse_graph).map_err(|e| {
             ApiError::internal(format!("Failed to stage flakes during rebase: {e}"))
         })?;
 

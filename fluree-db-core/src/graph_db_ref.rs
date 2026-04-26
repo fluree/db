@@ -16,7 +16,7 @@
 //!
 //! - `GraphDb.as_graph_db_ref()` → `self.t`
 //! - `LedgerState.as_graph_db_ref(g_id)` → `max(novelty.t, snapshot.t)`
-//! - `LedgerView.as_graph_db_ref(g_id)` → `base.t() + 1` when staged
+//! - `StagedLedger.as_graph_db_ref(g_id)` → `base.t() + 1` when staged
 //!
 //! `from_t` is NOT part of the db value identity — history range queries
 //! pass it via `RangeOptions` or as a separate parameter.

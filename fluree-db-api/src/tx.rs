@@ -16,7 +16,7 @@ use fluree_db_core::{
     RangeOptions, RangeTest, Sid,
 };
 use fluree_db_indexer::IndexerHandle;
-use fluree_db_ledger::{IndexConfig, LedgerState, LedgerView};
+use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_novelty::TxnMetaEntry;
 #[cfg(feature = "shacl")]
 use fluree_db_shacl::ShaclEngine;
@@ -231,7 +231,7 @@ fn build_per_graph_shacl_policy(
     }
 }
 
-/// Context for applying SHACL policy to an already-staged [`LedgerView`].
+/// Context for applying SHACL policy to an already-staged [`StagedLedger`].
 ///
 /// All fields are optional: callers without full transaction context (Turtle
 /// insert, commit replay) pass `None` and get sensible default behavior:
@@ -318,7 +318,7 @@ fn resolve_shapes_source_g_ids(
     }
 }
 
-/// Apply SHACL policy to an already-staged [`LedgerView`].
+/// Apply SHACL policy to an already-staged [`StagedLedger`].
 ///
 /// This is the single canonical post-stage SHACL entry point shared by every
 /// write surface (JSON-LD txn staging, Turtle insert, commit replay). It:
@@ -336,7 +336,7 @@ fn resolve_shapes_source_g_ids(
 /// is API-layer policy, not a staging primitive.
 #[cfg(feature = "shacl")]
 pub(crate) async fn apply_shacl_policy_to_staged_view(
-    view: &LedgerView,
+    view: &StagedLedger,
     ctx: StagedShaclContext<'_>,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
     let base = view.base();
@@ -475,7 +475,7 @@ async fn stage_with_config_shacl(
     txn: Txn,
     ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
-) -> std::result::Result<(LedgerView, NamespaceRegistry), fluree_db_transact::TransactError> {
+) -> std::result::Result<(StagedLedger, NamespaceRegistry), fluree_db_transact::TransactError> {
     // Capture graph_delta + tracker before stage_txn consumes the options/txn.
     // graph_delta is used both for per-graph config lookup and for rebuilding
     // graph_sids after staging (IRIs are already interned in ns_registry, so
@@ -513,7 +513,7 @@ async fn stage_with_config_shacl(
 /// staged flakes against `f:enforceUnique` annotations. Zero-cost when
 /// no `f:transactDefaults` / `f:uniqueEnabled` is configured.
 async fn enforce_unique_after_staging(
-    view: &LedgerView,
+    view: &StagedLedger,
     graph_delta: &FxHashMap<u16, String>,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
     let config = load_transaction_config(view.base()).await;
@@ -532,7 +532,7 @@ async fn enforce_unique_after_staging(
 ///
 /// Returns an empty map when no uniqueness constraints are configured (fast path).
 async fn resolve_per_graph_unique_sids(
-    view: &LedgerView,
+    view: &StagedLedger,
     config: &LedgerConfig,
     graph_delta: &FxHashMap<u16, String>,
 ) -> std::result::Result<HashMap<GraphId, FxHashSet<Sid>>, fluree_db_transact::TransactError> {
@@ -646,7 +646,7 @@ fn resolve_constraint_source_g_ids(
 /// Queries the POST index at the pre-transaction state for all subjects
 /// where `?prop f:enforceUnique true`. Returns the set of property SIDs.
 async fn read_enforce_unique_from_graph(
-    view: &LedgerView,
+    view: &StagedLedger,
     source_g_id: GraphId,
 ) -> std::result::Result<Vec<Sid>, fluree_db_transact::TransactError> {
     let snapshot = view.db();
@@ -692,7 +692,7 @@ async fn read_enforce_unique_from_graph(
 ///
 /// Returns `Ok(())` if no violations, or a `UniqueConstraintViolation` error.
 async fn enforce_unique_constraints(
-    view: &LedgerView,
+    view: &StagedLedger,
     per_graph_unique: &HashMap<GraphId, FxHashSet<Sid>>,
     graph_delta: &FxHashMap<u16, String>,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
@@ -893,7 +893,7 @@ pub struct TransactResultRef {
 
 /// Result of staging a transaction
 pub struct StageResult {
-    pub view: LedgerView,
+    pub view: StagedLedger,
     pub ns_registry: NamespaceRegistry,
     /// User-provided transaction metadata (extracted from envelope-form JSON-LD)
     pub txn_meta: Vec<TxnMetaEntry>,
@@ -1382,7 +1382,7 @@ impl crate::Fluree {
     /// Commit a staged transaction (persists commit record + publishes nameservice head).
     pub async fn commit_staged(
         &self,
-        view: LedgerView,
+        view: StagedLedger,
         ns_registry: NamespaceRegistry,
         index_config: &IndexConfig,
         commit_opts: CommitOpts,

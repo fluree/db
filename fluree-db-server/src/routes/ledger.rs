@@ -878,6 +878,13 @@ pub struct CreateBranchRequest {
     /// Source branch to create from (defaults to "main")
     #[serde(default)]
     pub source: Option<String>,
+    /// Optional commit reference to branch at.
+    ///
+    /// Accepts `"t:N"` for a transaction number or a hex digest / full CID
+    /// for prefix resolution. When omitted, the branch starts at the source
+    /// branch's current HEAD.
+    #[serde(default)]
+    pub at: Option<String>,
 }
 
 /// Create branch response
@@ -926,6 +933,14 @@ async fn create_branch_local(state: Arc<AppState>, request: Request) -> Result<i
     let ledger = req.ledger;
     let branch = req.branch;
 
+    let at_commit = match req.at.as_deref() {
+        Some(s) => Some(
+            fluree_db_api::CommitRef::parse(s)
+                .map_err(|e| ServerError::bad_request(e.to_string()))?,
+        ),
+        None => None,
+    };
+
     let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
     let trace_id = extract_trace_id(&headers.raw);
     let span = create_request_span(
@@ -949,7 +964,7 @@ async fn create_branch_local(state: Arc<AppState>, request: Request) -> Result<i
 
         let record = match state
             .fluree
-            .create_branch(&ledger, &branch, Some(&source))
+            .create_branch(&ledger, &branch, Some(&source), at_commit)
             .await
         {
             Ok(record) => record,

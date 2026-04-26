@@ -164,7 +164,7 @@ Commit-head publishing is **CAS-based** so concurrent writers get an explicit co
 
 Create and list branches:
 
-- **`create_branch(ledger_name, new_branch, source_branch)`**: Create a new branch from the source
+- **`create_branch(ledger_name, new_branch, source_branch, at_commit)`**: Create a new branch from the source. When `at_commit` is `None`, the branch starts at the source's current HEAD; when `Some((commit_id, commit_t))`, the branch starts at the supplied historical commit instead (callers are expected to verify reachability from source HEAD before passing it in).
 - **`list_branches(ledger_name)`**: List all non-retracted branches for a ledger
 
 #### Discovery

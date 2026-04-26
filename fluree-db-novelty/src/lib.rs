@@ -34,8 +34,8 @@ mod stats;
 pub use commit::{
     collect_dag_cids, collect_dag_cids_with_split_mode, find_common_ancestor, load_commit_by_id,
     load_commit_envelope_by_id, trace_commit_envelopes_by_id, trace_commits_by_id, Commit,
-    CommitEnvelope, CommitRef, CommonAncestor, TxnMetaEntry, TxnMetaValue, TxnSignature,
-    MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
+    CommitEnvelope, CommonAncestor, TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES,
+    MAX_TXN_META_ENTRIES,
 };
 pub use commit_flakes::{generate_commit_flakes, stamp_graph_on_commit_flakes};
 pub use delta::compute_delta_keys;
