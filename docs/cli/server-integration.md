@@ -220,6 +220,7 @@ implementation reference if you're porting the contract to another server.
 ```
 GET {api_base_url}/merge-preview/{ledger}?source={source}&target={target}
    &max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}
+   &include_conflict_details={bool}&strategy={strategy}
 ```
 
 | Parameter | Type | Required | Server default | Description |
@@ -230,6 +231,8 @@ GET {api_base_url}/merge-preview/{ledger}?source={source}&target={target}
 | `max_commits` | integer | No | `500` | Per-side cap on `ahead.commits` / `behind.commits` |
 | `max_conflict_keys` | integer | No | `200` | Cap on `conflicts.keys` |
 | `include_conflicts` | bool | No | `true` | When `false`, the conflict computation is skipped |
+| `include_conflict_details` | bool | No | `false` | When `true`, include source/target flake values for the returned conflict keys |
+| `strategy` | string | No | `take-both` | Strategy used for resolution labels in `conflicts.details[].resolution`; one of `take-both`, `abort`, `take-source`, `take-branch` |
 
 Auth follows the same pattern as `GET /branch/*ledger` (read-only): require
 a Bearer when `data_auth.mode == required`; gate on `can_read(ledger)`;
@@ -269,10 +272,18 @@ These rules are not negotiable; the CLI and other clients depend on them:
      Lexicographic by `(s, p, g)` is fine; what matters is that two
      requests against the same state return the same prefix.
    - `count` is the unbounded intersection size; `truncated = count > cap`.
-8. **No mutations.** Implementations must not write to the nameservice,
+8. **Conflict details.** When `include_conflict_details == true`, populate
+   `conflicts.details` for the keys returned in `conflicts.keys` after
+   truncation. Each detail includes `key`, `source_values`, `target_values`,
+   and a `resolution` annotation for the requested `strategy`. The values are
+   the current asserted values for that key at each branch HEAD; preview must
+   not apply the strategy. Use the same
+   resolved flake tuple shape as `/show` (`[s, p, o, dt, op]`, optional
+   metadata as a 6th item).
+9. **No mutations.** Implementations must not write to the nameservice,
    advance any HEAD, copy commits between namespaces, or update any cache
    that downstream operations depend on.
-9. **Server-side cap is mandatory.** Even if a client sends
+10. **Server-side cap is mandatory.** Even if a client sends
    `max_commits=10000000`, clamp to a defensive limit. The reference
    server applies two layers: when no query param is present, it falls
    back to the recommended defaults (`500` for commits, `200` for
@@ -322,7 +333,25 @@ These rules are not negotiable; the CLI and other clients depend on them:
   },
   "behind": { "count": 1, "commits": [], "truncated": false },
   "fast_forward": false,
-  "conflicts": { "count": 0, "keys": [], "truncated": false }
+  "mergeable": true,
+  "conflicts": {
+    "count": 1,
+    "keys": [{ "s": [100, "alice"], "p": [100, "status"], "g": null }],
+    "truncated": false,
+    "strategy": "take-source",
+    "details": [
+      {
+        "key": { "s": [100, "alice"], "p": [100, "status"], "g": null },
+        "source_values": [["ex:alice", "ex:status", "active", "xsd:string", true]],
+        "target_values": [["ex:alice", "ex:status", "archived", "xsd:string", true]],
+        "resolution": {
+          "source_action": "kept",
+          "target_action": "retracted",
+          "outcome": "source-wins"
+        }
+      }
+    ]
+  }
 }
 ```
 
@@ -346,11 +375,21 @@ Other conventions are not recognized — return `null`.
 `Sid`s serialize as `[ns_code, name]` tuples. Changing the encoding will
 break the CLI.
 
+When `include_conflict_details=false`, `conflicts.details` is omitted. When it
+is true, `source_values` and `target_values` are resolved flake tuples for the
+current asserted values in the same shape returned by `GET /show/*ledger`;
+`resolution` is a label only. `mergeable` is `false` when the chosen strategy
+would abort (currently `strategy=abort` with one or more conflicts). It is not
+full transaction validation for constraints that might fail during the real
+merge commit. `mergeable=true` does not guarantee a subsequent `POST /merge`
+will succeed; it only reflects the conflict/strategy interaction at preview
+time.
+
 ### Error responses
 
 | Status | When |
 |--------|------|
-| `400` | Source has no parent (e.g., `main`); or `source == target`. Body must include `"no source branch"` or `"itself"` so the CLI's matcher works. |
+| `400` | Source has no parent (e.g., `main`); `source == target`; unknown strategy; unsupported strategy; `include_conflict_details=true` with `include_conflicts=false`; `strategy=abort` with `include_conflicts=false`. Body must include `"no source branch"` or `"itself"` for the first two cases so the CLI's matcher works. |
 | `401` | Bearer required and absent/invalid. |
 | `404` | Ledger or branch does not exist; or the bearer cannot `can_read`. |
 | `5xx` | Storage / nameservice errors. |

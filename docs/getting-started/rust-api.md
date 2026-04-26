@@ -1046,6 +1046,9 @@ lists**, not the cost of computing them:
   the common ancestor — regardless of `max_commits`.
 - When `include_conflicts: true`, both `compute_delta_keys` walks scan
   the full per-side delta regardless of `max_conflict_keys`.
+- When `include_conflict_details: true`, value details are collected only
+  for the returned `conflicts.keys` after the `max_conflict_keys` cap is
+  applied.
 - Set `include_conflicts: false` for a cheap preview on heavily diverged
   branches; you still get accurate `ahead.count` / `behind.count`.
 
@@ -1053,11 +1056,18 @@ lists**, not the cost of computing them:
 
 | Type | Notable fields |
 |------|----------------|
-| `MergePreview` | `source`, `target`, `ancestor: Option<AncestorRef>`, `ahead`, `behind`, `fast_forward`, `conflicts` |
+| `MergePreview` | `source`, `target`, `ancestor: Option<AncestorRef>`, `ahead`, `behind`, `fast_forward`, `conflicts`, `mergeable` |
 | `BranchDelta` | `count` (unbounded), `commits: Vec<CommitSummary>` (newest-first, capped), `truncated` |
 | `CommitSummary` | `t`, `commit_id`, `time`, `asserts`, `retracts`, `flake_count`, `message: Option<String>` (extracted from the `f:message` `txn_meta` entry when present) |
-| `ConflictSummary` | `count` (unbounded), `keys: Vec<ConflictKey>` (sorted, capped), `truncated` |
+| `ConflictSummary` | `count` (unbounded), `keys: Vec<ConflictKey>` (sorted, capped), `truncated`, `strategy`, `details` |
+| `ConflictDetail` | `key`, `source_values`, `target_values`, `resolution` (values are the current asserted values at each branch HEAD) |
 | `ConflictKey` | `s: Sid`, `p: Sid`, `g: Option<Sid>` |
+
+`mergeable` only reflects whether the selected strategy would abort due to
+detected conflicts; it is not full validation of every constraint the eventual
+merge commit may encounter. `mergeable=true` does not guarantee a subsequent
+merge will succeed; it only reflects the conflict/strategy interaction at
+preview time.
 
 All types derive `Serialize` so the response is wire-stable; the HTTP
 endpoint at `GET /fluree/merge-preview/*ledger` returns the same struct.

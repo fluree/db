@@ -71,6 +71,8 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
             max_commits,
             max_conflict_keys,
             no_conflicts,
+            conflict_details,
+            strategy,
             json,
             ledger,
             remote,
@@ -82,6 +84,8 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
                     max_commits,
                     max_conflict_keys,
                     include_conflicts: !no_conflicts,
+                    include_conflict_details: conflict_details,
+                    strategy,
                     json,
                 },
                 ledger.as_deref(),
@@ -648,6 +652,8 @@ struct DiffOpts {
     max_commits: usize,
     max_conflict_keys: usize,
     include_conflicts: bool,
+    include_conflict_details: bool,
+    strategy: Option<String>,
     json: bool,
 }
 
@@ -675,6 +681,23 @@ async fn run_diff(
         Some(opts.max_conflict_keys)
     };
     let include_conflicts = opts.include_conflicts;
+    let include_conflict_details = opts.include_conflict_details;
+    if include_conflict_details && !include_conflicts {
+        return Err(CliError::Config(
+            "--conflict-details requires conflict computation; remove --no-conflicts".to_string(),
+        ));
+    }
+    let conflict_strategy =
+        parse_preview_strategy(opts.strategy.as_deref().unwrap_or("take-both"))?;
+    if conflict_strategy == fluree_db_api::ConflictStrategy::Abort && !include_conflicts {
+        return Err(CliError::Config(
+            "--strategy abort requires conflict computation; remove --no-conflicts".to_string(),
+        ));
+    }
+    let remote_strategy = opts
+        .strategy
+        .as_deref()
+        .or_else(|| include_conflict_details.then_some(conflict_strategy.as_str()));
 
     if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(ledger, dirs)?;
@@ -688,6 +711,8 @@ async fn run_diff(
                 max_commits,
                 max_conflict_keys,
                 Some(include_conflicts),
+                Some(include_conflict_details),
+                remote_strategy,
             )
             .await?;
 
@@ -726,6 +751,8 @@ async fn run_diff(
                     max_commits,
                     max_conflict_keys,
                     Some(include_conflicts),
+                    Some(include_conflict_details),
+                    remote_strategy,
                 )
                 .await?;
 
@@ -743,6 +770,8 @@ async fn run_diff(
                 max_commits,
                 max_conflict_keys,
                 include_conflicts,
+                include_conflict_details,
+                conflict_strategy,
             };
 
             let preview = fluree
@@ -759,6 +788,17 @@ async fn run_diff(
     }
 
     Ok(())
+}
+
+fn parse_preview_strategy(strategy: &str) -> CliResult<fluree_db_api::ConflictStrategy> {
+    let parsed = fluree_db_api::ConflictStrategy::parse_canonical(strategy)
+        .map_err(|_| CliError::Config(format!("Unknown merge preview strategy: {strategy}")))?;
+    if parsed == fluree_db_api::ConflictStrategy::Skip {
+        return Err(CliError::Config(
+            "Skip strategy is not supported for merge preview".to_string(),
+        ));
+    }
+    Ok(parsed)
 }
 
 fn print_preview_local(p: &fluree_db_api::MergePreview) {
@@ -793,6 +833,32 @@ fn print_preview_local(p: &fluree_db_api::MergePreview) {
             k.p,
             k.g.as_ref().map(ToString::to_string)
         );
+    }
+    if !p.conflicts.details.is_empty() {
+        println!(
+            "conflict details (strategy: {}):",
+            p.conflicts.strategy.as_deref().unwrap_or("take-both")
+        );
+        for detail in &p.conflicts.details {
+            println!(
+                "  - {}",
+                serde_json::to_string(&detail.key).unwrap_or_default()
+            );
+            println!(
+                "    resolution: source: {}, target: {}, outcome: {}",
+                detail.resolution.source_action,
+                detail.resolution.target_action,
+                detail.resolution.outcome
+            );
+            println!(
+                "    source: {}",
+                serde_json::to_string(&detail.source_values).unwrap_or_default()
+            );
+            println!(
+                "    target: {}",
+                serde_json::to_string(&detail.target_values).unwrap_or_default()
+            );
+        }
     }
 }
 
@@ -872,6 +938,40 @@ fn print_preview_json(v: &serde_json::Value) -> CliResult<()> {
         if let Some(keys) = keys {
             for k in keys {
                 println!("  - {}", serde_json::to_string(k).unwrap_or_default());
+            }
+        }
+        if let Some(details) = c.get("details").and_then(Value::as_array) {
+            if !details.is_empty() {
+                let strategy = c
+                    .get("strategy")
+                    .and_then(Value::as_str)
+                    .unwrap_or("take-both");
+                println!("conflict details (strategy: {strategy}):");
+                for detail in details {
+                    let key = detail
+                        .get("key")
+                        .map(|k| serde_json::to_string(k).unwrap_or_default())
+                        .unwrap_or_default();
+                    println!("  - {key}");
+                    if let Some(resolution) = detail.get("resolution") {
+                        println!(
+                            "    resolution: {}",
+                            serde_json::to_string(resolution).unwrap_or_default()
+                        );
+                    }
+                    if let Some(source_values) = detail.get("source_values") {
+                        println!(
+                            "    source: {}",
+                            serde_json::to_string(source_values).unwrap_or_default()
+                        );
+                    }
+                    if let Some(target_values) = detail.get("target_values") {
+                        println!(
+                            "    target: {}",
+                            serde_json::to_string(target_values).unwrap_or_default()
+                        );
+                    }
+                }
             }
         }
     }

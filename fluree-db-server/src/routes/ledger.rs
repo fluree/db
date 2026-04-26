@@ -1480,6 +1480,12 @@ pub struct MergePreviewQuery {
     /// Skip the conflict computation when only counts are needed. Defaults to true.
     #[serde(default)]
     pub include_conflicts: Option<bool>,
+    /// Include source/target flake values for returned conflict keys.
+    #[serde(default)]
+    pub include_conflict_details: Option<bool>,
+    /// Strategy used for conflict resolution labels. Defaults to take-both.
+    #[serde(default)]
+    pub strategy: Option<String>,
 }
 
 /// Read-only branch merge preview.
@@ -1531,7 +1537,7 @@ pub async fn merge_preview(
         // *divergence walk itself* (envelope BFS via `collect_dag_cids`)
         // is unaffected — see the `MERGE_PREVIEW_HARD_MAX_*` constant
         // comments above. Contract documented in
-        // docs/cli/server-integration.md (§Merge Preview Contract, rule 9).
+        // docs/cli/server-integration.md (§Merge Preview Contract, rule 10).
         let mut opts = fluree_db_api::MergePreviewOpts::default();
         if let Some(n) = params.max_commits {
             opts.max_commits = Some(n.min(MERGE_PREVIEW_HARD_MAX_COMMITS));
@@ -1541,6 +1547,32 @@ pub async fn merge_preview(
         }
         if let Some(b) = params.include_conflicts {
             opts.include_conflicts = b;
+        }
+        if let Some(b) = params.include_conflict_details {
+            opts.include_conflict_details = b;
+        }
+        if opts.include_conflict_details && !opts.include_conflicts {
+            return Err(ServerError::bad_request(
+                "include_conflict_details requires include_conflicts=true",
+            ));
+        }
+        if let Some(s) = params.strategy.as_deref() {
+            opts.conflict_strategy =
+                fluree_db_api::ConflictStrategy::parse_canonical(s).map_err(|_| {
+                    ServerError::bad_request(format!("Unknown merge preview strategy: {s}"))
+                })?;
+            if opts.conflict_strategy == fluree_db_api::ConflictStrategy::Skip {
+                return Err(ServerError::bad_request(
+                    "Skip strategy is not supported for merge preview",
+                ));
+            }
+        }
+        if opts.conflict_strategy == fluree_db_api::ConflictStrategy::Abort
+            && !opts.include_conflicts
+        {
+            return Err(ServerError::bad_request(
+                "strategy=abort requires include_conflicts=true for mergeable preview",
+            ));
         }
 
         let preview = state

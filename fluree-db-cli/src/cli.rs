@@ -859,6 +859,15 @@ pub enum BranchAction {
         #[arg(long)]
         no_conflicts: bool,
 
+        /// Include source/target values for returned conflict keys
+        #[arg(long)]
+        conflict_details: bool,
+
+        /// Strategy used to annotate conflict resolution labels
+        /// Options: take-both, abort, take-source, take-branch
+        #[arg(long)]
+        strategy: Option<String>,
+
         /// Emit the raw JSON preview instead of a human-readable summary
         #[arg(long)]
         json: bool,

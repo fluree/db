@@ -137,7 +137,8 @@ pub use ledger_manager::{
 };
 pub use merge::MergeReport;
 pub use merge_preview::{
-    AncestorRef, BranchDelta, ConflictSummary, MergePreview, MergePreviewOpts,
+    AncestorRef, BranchDelta, ConflictDetail, ConflictResolutionPreview, ConflictSummary,
+    MergePreview, MergePreviewOpts,
 };
 pub use pack::{
     compute_missing_index_artifacts, full_ledger_pack_request, validate_pack_request, PackChunk,
