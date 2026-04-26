@@ -122,6 +122,45 @@ listed below and, for JSON-LD bodies, also injects them into `opts`. To be
 CLI-compatible, your server must implement the contract in
 [Policy Enforcement Contract](#policy-enforcement-contract).
 
+### `fluree branch list` (read-only)
+
+- `GET {api_base_url}/branch/{ledger}` — note **singular** `branch`, ledger is a
+  greedy tail segment (`*ledger` in axum), so `mydb` and `org/mydb` both work.
+
+Returns all non-retracted branches for the ledger. Same auth bracket as other
+read endpoints (`GET /branch/*ledger` enforces Bearer when
+`data_auth.mode == required` and `can_read(ledger)`; returns `404` not `403`
+when the bearer cannot read it). See
+[Branch List Contract](#branch-list-contract).
+
+### `fluree branch create --remote <name>` (admin-protected)
+
+- `POST {api_base_url}/branch` with `{ ledger, branch, source? }`
+
+Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
+[Branch Create Contract](#branch-create-contract).
+
+### `fluree branch drop --remote <name>` (admin-protected)
+
+- `POST {api_base_url}/drop-branch` with `{ ledger, branch }`
+
+Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
+[Branch Drop Contract](#branch-drop-contract).
+
+### `fluree branch rebase --remote <name>` (admin-protected)
+
+- `POST {api_base_url}/rebase` with `{ ledger, branch, strategy? }`
+
+Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
+[Rebase Contract](#rebase-contract).
+
+### `fluree branch merge --remote <name>` (admin-protected)
+
+- `POST {api_base_url}/merge` with `{ ledger, source, target?, strategy? }`
+
+Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
+[Merge Contract](#merge-contract).
+
 ### `fluree branch diff` (read-only merge preview)
 
 - `GET {api_base_url}/merge-preview/*ledger?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=`
@@ -407,6 +446,405 @@ time.
 Validate compatibility by running `fluree branch diff dev --target feature
 --remote your-remote --json` against your server and diffing the response
 against output from the reference server on the same ledger state.
+
+## Branch List Contract
+
+`fluree branch list <ledger> --remote <name>` issues:
+
+```
+GET {api_base_url}/branch/{ledger}
+```
+
+The path segment is **singular** `branch` (not `branches`) and uses axum's
+greedy `*ledger` tail capture, so a ledger named `org/mydb` is matched by
+`/branch/org/mydb`. The endpoint takes no query parameters and no body.
+
+### Auth
+
+Read-only. Requires a Bearer when `data_auth.mode == required`; gates on
+`can_read(ledger)`; returns `404` (not `403`) when the bearer cannot read it
+to avoid existence leaks. Admin tokens are NOT required.
+
+### Response (`200 OK`)
+
+A JSON array of `BranchInfo`. Empty array when the ledger has no
+non-retracted branches.
+
+```jsonc
+[
+  {
+    "branch": "main",
+    "ledger_id": "mydb:main",
+    "t": 12,
+    "source": null
+  },
+  {
+    "branch": "feature-x",
+    "ledger_id": "mydb:feature-x",
+    "t": 15,
+    "source": "main"
+  }
+]
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `branch` | string | Branch name. |
+| `ledger_id` | string | Full `ledger:branch` identifier. |
+| `t` | integer | Current commit `t` on this branch. |
+| `source` | string \| null | Parent branch, or `null` for root branches like `main`. Omitted via `skip_serializing_if = "Option::is_none"` when null. |
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `401` | Bearer required and absent/invalid. |
+| `404` | Ledger does not exist; or the bearer cannot `can_read`. |
+| `5xx` | Storage / nameservice errors. |
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route + auth | `fluree-db-server/src/routes/ledger.rs::list_branches` |
+| Response shape | `fluree-db-server/src/routes/ledger.rs::BranchInfo` |
+| Underlying API | `fluree_db_api::Fluree::list_branches` |
+
+## Branch Create Contract
+
+`fluree branch create <name> --remote <name>` issues:
+
+```
+POST {api_base_url}/branch
+Content-Type: application/json
+
+{
+  "ledger": "mydb",
+  "branch": "feature-x",
+  "source": "main"
+}
+```
+
+The body type mirrors `fluree-db-server::routes::ledger::CreateBranchRequest`.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `ledger` | string | Yes | — | Ledger name without branch suffix. |
+| `branch` | string | Yes | — | New branch name. Must pass `validate_branch_name`. |
+| `source` | string | No | `"main"` | Parent branch to fork from. The source must already exist and have at least one commit. |
+
+### Auth
+
+Admin-protected. Same middleware as `POST /create`, `POST /drop`,
+`POST /reindex`, and `POST /iceberg/map` — registered through
+`v1_admin_protected_routes` in `fluree-db-server/src/routes/mod.rs`.
+
+### Response (`201 Created`)
+
+```jsonc
+{
+  "ledger_id": "mydb:feature-x",
+  "branch": "feature-x",
+  "source": "main",
+  "t": 12
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `ledger_id` | string | Full `ledger:branch` identifier of the new branch. |
+| `branch` | string | New branch name (echoed). |
+| `source` | string | Resolved parent branch. Empty string if the new record's `source_branch` is unexpectedly null. |
+| `t` | integer | Commit `t` at the branch point (inherited from the source's HEAD). |
+
+The CLI's pretty-printer (`print_branch_created` in
+`fluree-db-cli/src/commands/branch.rs`) reads `branch`, `source`, `t`, and
+`ledger_id` from the response — keep all four populated.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `400` | Invalid branch name (per `validate_branch_name`); malformed JSON body. |
+| `401` / `403` | Admin token required and absent/invalid (see admin-auth middleware). |
+| `404` | Source branch does not exist. |
+| `409` | A branch with this name already exists (`ApiError::LedgerExists` → 409). |
+| `5xx` | Nameservice / storage / index-copy errors. |
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route + auth | `fluree-db-server/src/routes/ledger.rs::create_branch` |
+| Request / response shapes | `CreateBranchRequest`, `CreateBranchResponse` (same file) |
+| Underlying API | `fluree_db_api::Fluree::create_branch` (`fluree-db-api/src/ledger/loading.rs`) |
+
+## Branch Drop Contract
+
+`fluree branch drop <name> --remote <name>` issues:
+
+```
+POST {api_base_url}/drop-branch
+Content-Type: application/json
+
+{
+  "ledger": "mydb",
+  "branch": "feature-x"
+}
+```
+
+Note the endpoint is `/drop-branch` (hyphenated) — separate from the
+ledger-level `POST /drop` endpoint.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ledger` | string | Yes | Ledger name without branch suffix. |
+| `branch` | string | Yes | Branch to drop. Cannot be `"main"`. |
+
+### Auth
+
+Admin-protected (same bracket as `/branch`, `/rebase`, `/merge`,
+`/create`, `/drop`, `/reindex`).
+
+### Behavior
+
+The reference server's `Fluree::drop_branch`:
+
+1. Refuses to drop `"main"` with `400`.
+2. If the branch is **retracted** already → returns status `already_retracted`.
+3. If the branch has children (`branches > 0`) → **soft-retracts** it (preserves
+   storage so children can still resolve), returns `deferred: true`.
+4. If the branch is a leaf → cancels indexing, deletes all storage artifacts
+   (commits, txns, index roots, leaves, branches, dicts, garbage records,
+   config, context), purges the nameservice record, and **cascades upward**
+   to any retracted ancestors that now have zero children.
+
+### Response (`200 OK`)
+
+```jsonc
+{
+  "ledger_id": "mydb:feature-x",
+  "status": "dropped",
+  "deferred": false,
+  "files_deleted": 14,
+  "cascaded": ["mydb:retired-parent"],
+  "warnings": []
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `ledger_id` | string | Full `ledger:branch` identifier of the dropped branch. |
+| `status` | string | `"dropped"`, `"already_retracted"`, or `"not_found"`. |
+| `deferred` | bool | `true` when the branch was retracted but storage preserved (had children). |
+| `files_deleted` | integer | Omitted when `0`. |
+| `cascaded` | string[] | Ancestor `ledger_id`s that were cascade-dropped because they were retracted with zero remaining children. Omitted when empty. |
+| `warnings` | string[] | Non-fatal warnings (e.g. partial artifact deletion). Omitted when empty. |
+
+The CLI's `print_branch_dropped` reads `ledger_id`, `deferred`,
+`files_deleted`, `cascaded`, and `warnings` — populate them all.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `400` | Attempting to drop `"main"`; malformed JSON body. |
+| `401` / `403` | Admin token required and absent/invalid. |
+| `404` | Branch not found (the underlying lookup miss surfaces as `ApiError::NotFound` → 404). |
+| `5xx` | Storage / nameservice errors during purge. |
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route + auth | `fluree-db-server/src/routes/ledger.rs::drop_branch` |
+| Request / response shapes | `DropBranchRequest`, `DropBranchResponse` (same file) |
+| Underlying API | `fluree_db_api::Fluree::drop_branch` (`fluree-db-api/src/admin.rs`) |
+| Report struct | `fluree_db_api::BranchDropReport` |
+
+## Rebase Contract
+
+`fluree branch rebase <branch> --remote <name>` issues:
+
+```
+POST {api_base_url}/rebase
+Content-Type: application/json
+
+{
+  "ledger": "mydb",
+  "branch": "feature-x",
+  "strategy": "take-both"
+}
+```
+
+| Field | Type | Required | Server default | Description |
+|-------|------|----------|----------------|-------------|
+| `ledger` | string | Yes | — | Ledger name without branch suffix. |
+| `branch` | string | Yes | — | Branch to rebase. Cannot be `"main"`. |
+| `strategy` | string | No | `"take-both"` | One of `take-both`, `abort`, `take-source`, `take-branch`, `skip`. Parsed by `ConflictStrategy::from_str_name`; unknown values respond `400`. |
+
+### Auth
+
+Admin-protected (same bracket as `/branch`, `/drop-branch`, `/merge`,
+`/create`, `/drop`, `/reindex`).
+
+### Behavior
+
+Replays the branch's unique commits on top of its source branch's current
+HEAD, detecting and resolving conflicts according to `strategy`. The branch's
+own `source_branch` (from its nameservice record) is the rebase target — there
+is no `target` field in the request.
+
+- If the branch is already up-to-date with its source (`branch_head == ancestor`),
+  the operation is a fast-forward: the branch's HEAD is advanced to the source
+  HEAD with no replay, and `fast_forward: true` is returned.
+- If `strategy == "abort"` and **any** branch commit conflicts with the source
+  delta, the rebase aborts up-front with `409 BranchConflict`. No commits are
+  written.
+- Otherwise, the branch's commits are replayed sequentially on top of the
+  source HEAD using the chosen strategy for conflict resolution.
+
+### Response (`200 OK`)
+
+```jsonc
+{
+  "ledger_id": "mydb:feature-x",
+  "branch": "feature-x",
+  "fast_forward": false,
+  "replayed": 3,
+  "skipped": 0,
+  "conflicts": 1,
+  "failures": 0,
+  "total_commits": 3,
+  "source_head_t": 18
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `ledger_id` | string | Full `ledger:branch` identifier of the rebased branch. |
+| `branch` | string | Branch name (echoed). |
+| `fast_forward` | bool | `true` when the branch had no unique commits and was just advanced. |
+| `replayed` | integer | Commits successfully replayed onto source HEAD. |
+| `skipped` | integer | Commits skipped (e.g. via `skip` strategy on conflicts). |
+| `conflicts` | integer | Total commits that contained conflicts. Note this is a count, not a list — the underlying `RebaseReport` carries `Vec<RebaseConflict>` and `Vec<RebaseFailure>`, but the HTTP response surfaces only the lengths. |
+| `failures` | integer | Commits that failed to replay (transactional / validation errors). |
+| `total_commits` | integer | Total branch commits considered for replay. |
+| `source_head_t` | integer | Source branch HEAD `t` after rebase. |
+
+The CLI's `print_rebase_result` reads `fast_forward`, `branch`, `source_head_t`,
+`replayed`, `skipped`, `conflicts`, and `failures`.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `400` | Rebasing `"main"` (`InvalidBranch`); branch has no `source_branch` (root branch); unknown / unsupported strategy; malformed JSON body. |
+| `401` / `403` | Admin token required and absent/invalid. |
+| `404` | Branch or its source not found. |
+| `409` | `BranchConflict` — currently raised when `strategy=abort` and any commit conflicts with the source delta. |
+| `5xx` | Storage / nameservice / index-build errors during replay. |
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route + auth | `fluree-db-server/src/routes/ledger.rs::rebase` |
+| Request / response shapes | `RebaseBranchRequest`, `RebaseBranchResponse` (same file) |
+| Underlying API | `fluree_db_api::Fluree::rebase_branch` (`fluree-db-api/src/rebase.rs`) |
+| Report struct | `fluree_db_api::RebaseReport` |
+| Strategy enum | `fluree_db_api::ConflictStrategy` |
+
+## Merge Contract
+
+`fluree branch merge <source> --remote <name>` issues:
+
+```
+POST {api_base_url}/merge
+Content-Type: application/json
+
+{
+  "ledger": "mydb",
+  "source": "feature-x",
+  "target": "main",
+  "strategy": "take-both"
+}
+```
+
+| Field | Type | Required | Server default | Description |
+|-------|------|----------|----------------|-------------|
+| `ledger` | string | Yes | — | Ledger name without branch suffix. |
+| `source` | string | Yes | — | Branch to merge **from**. Must have at least one commit and a `source_branch`. |
+| `target` | string | No | `source.source_branch` | Branch to merge **into**. Defaults to the source's parent branch. Must not equal `source`. |
+| `strategy` | string | No | `"take-both"` | One of `take-both`, `abort`, `take-source`, `take-branch`. Parsed by `ConflictStrategy::from_str_name`. |
+
+### Auth
+
+Admin-protected (same bracket as `/branch`, `/drop-branch`, `/rebase`,
+`/create`, `/drop`, `/reindex`).
+
+### Behavior
+
+- Computes the common ancestor between `source` HEAD and `target` HEAD using
+  a `BranchedContentStore` so sibling branches off `main` work.
+- If `target` HEAD == ancestor, performs a **fast-forward merge**: copies the
+  source's unique commit blobs into the target's namespace and advances the
+  target HEAD. No conflict resolution runs. `fast_forward: true` is reported.
+- Otherwise, performs a **general merge**: stages the union of source and
+  target deltas, resolves overlapping `(s, p, g)` keys via `strategy`, and
+  writes a single new commit on the target. `fast_forward: false` is
+  reported. If `strategy == "abort"` and conflicts exist, the merge fails
+  with `409 BranchConflict` and the target is rolled back to its
+  pre-merge nameservice snapshot.
+
+### Response (`200 OK`)
+
+```jsonc
+{
+  "ledger_id": "mydb:main",
+  "target": "main",
+  "source": "feature-x",
+  "fast_forward": false,
+  "new_head_t": 22,
+  "commits_copied": 4,
+  "conflict_count": 1,
+  "strategy": "take-both"
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `ledger_id` | string | Full `ledger:branch` identifier of the **target** after merge. |
+| `target` | string | Resolved target branch (echoed; reflects the default if the request omitted it). |
+| `source` | string | Source branch name (echoed). |
+| `fast_forward` | bool | `true` for a fast-forward merge. |
+| `new_head_t` | integer | New commit `t` of the target after merge. |
+| `commits_copied` | integer | Number of commit blobs copied into the target's namespace. For fast-forward this equals the source's unique commits; for general merge this includes the synthesized merge commit. |
+| `conflict_count` | integer | Number of conflicts resolved. `0` for fast-forward. |
+| `strategy` | string \| omitted | Strategy used. Omitted (via `skip_serializing_if`) for fast-forward merges where strategy doesn't apply. |
+
+The CLI's `print_merge_result` reads `source`, `target`, `new_head_t`,
+`commits_copied`, `fast_forward`, and `conflict_count`.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `400` | Source has no `source_branch` (a root branch like `main` cannot be the source); `source == resolved_target`; source has no commits; unknown / unsupported strategy; malformed JSON body. |
+| `401` / `403` | Admin token required and absent/invalid. |
+| `404` | Source or target branch not found. |
+| `409` | `BranchConflict` — currently raised when `strategy=abort` and conflicts exist. |
+| `5xx` | Storage / nameservice / commit-write errors. |
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route + auth | `fluree-db-server/src/routes/ledger.rs::merge` |
+| Request / response shapes | `MergeBranchRequest`, `MergeBranchResponse` (same file) |
+| Underlying API | `fluree_db_api::Fluree::merge_branch` (`fluree-db-api/src/merge.rs`) |
+| Report struct | `fluree_db_api::MergeReport` |
+| Strategy enum | `fluree_db_api::ConflictStrategy` |
 
 ## Replication Auth Contract
 
