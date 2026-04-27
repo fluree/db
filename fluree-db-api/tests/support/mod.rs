@@ -12,7 +12,7 @@
 
 pub mod span_capture;
 
-use fluree_db_api::{IndexConfig, LedgerState, Novelty};
+use fluree_db_api::{LedgerState, Novelty};
 use fluree_db_core::LedgerSnapshot;
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
@@ -241,15 +241,18 @@ pub fn start_background_indexer_local(
 // Index config assertions
 // =============================================================================
 
-/// Assert that IndexConfig defaults match expected defaults.
+/// Sanity-check that the soft reindex threshold constant is stable.
 ///
-/// Reindex threshold defaults:
-/// - min: 100_000
-/// - max: 1_000_000
+/// `IndexConfig` no longer has a `Default` impl — configuration policy lives
+/// at the API layer — so this helper only pins the soft-threshold constant
+/// used by production defaults. It's called from many tests as a cheap
+/// guard against accidental constant drift; kept for backward compatibility
+/// with those call sites.
 pub fn assert_index_defaults() {
-    let cfg = IndexConfig::default();
-    assert_eq!(cfg.reindex_min_bytes, 100_000);
-    assert_eq!(cfg.reindex_max_bytes, 1_000_000);
+    assert_eq!(
+        fluree_db_api::server_defaults::DEFAULT_REINDEX_MIN_BYTES,
+        100_000
+    );
 }
 
 // =============================================================================
