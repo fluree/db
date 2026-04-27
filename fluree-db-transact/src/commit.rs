@@ -102,6 +102,14 @@ pub struct CommitOpts {
     /// commit record, producing a multi-parent (merge) commit. The primary
     /// parent is still derived from `base.head_commit_id`.
     pub merge_parents: Vec<ContentId>,
+    /// Override the commit's `t` instead of deriving it from `base.t() + 1`.
+    ///
+    /// Used by the merge engine to stamp multi-parent commits at
+    /// `max(source_t, target_t) + 1`, ensuring `t` is monotonically
+    /// non-decreasing along every parent edge of the DAG. Must be strictly
+    /// greater than `base.t()`; the commit fails otherwise. Single-parent
+    /// commits should leave this as `None`.
+    pub merge_t: Option<i64>,
     /// ISO 8601 timestamp for the commit.
     ///
     /// When `None`, defaults to `Utc::now().to_rfc3339()`. Provide a fixed
@@ -132,6 +140,7 @@ impl std::fmt::Debug for CommitOpts {
             .field("skip_backpressure", &self.skip_backpressure)
             .field("skip_sequencing", &self.skip_sequencing)
             .field("merge_parents", &self.merge_parents.len())
+            .field("merge_t", &self.merge_t)
             .finish()
     }
 }
@@ -154,6 +163,7 @@ impl Clone for CommitOpts {
             skip_backpressure: self.skip_backpressure,
             skip_sequencing: self.skip_sequencing,
             merge_parents: self.merge_parents.clone(),
+            merge_t: self.merge_t,
             timestamp: self.timestamp.clone(),
         }
     }
@@ -251,6 +261,13 @@ impl CommitOpts {
     }
 
     /// Set additional parent commit IDs for merge commits.
+    /// Override the commit's `t` (used by multi-parent merge commits where
+    /// `max(source_t, target_t) + 1` may exceed `base.t() + 1`).
+    pub fn with_merge_t(mut self, t: i64) -> Self {
+        self.merge_t = Some(t);
+        self
+    }
+
     pub fn with_merge_parents(mut self, parents: Vec<ContentId>) -> Self {
         self.merge_parents = parents;
         self
@@ -315,6 +332,7 @@ where
         skip_backpressure,
         skip_sequencing,
         merge_parents,
+        merge_t,
         timestamp: opt_timestamp,
     } = opts;
 
@@ -397,7 +415,24 @@ where
         };
 
         // 6. Build commit record
-        let new_t = base.t() + 1;
+        //
+        // Single-parent commits use `base.t() + 1`. Multi-parent merge commits
+        // may carry an explicit `merge_t = max(source_t, target_t) + 1`,
+        // which must be strictly greater than `base.t()`. The strict-monotonic
+        // check below applies in both cases.
+        let new_t = match merge_t {
+            Some(t) => {
+                if t <= base.t() {
+                    return Err(fluree_db_core::Error::invalid_index(format!(
+                        "merge_t ({t}) must be strictly greater than base.t ({})",
+                        base.t()
+                    ))
+                    .into());
+                }
+                t
+            }
+            None => base.t() + 1,
+        };
         let flake_count = flakes.len();
 
         // Capture namespace delta once:

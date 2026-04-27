@@ -71,7 +71,8 @@ pub use stage::{generate_txn_id, stage, stage_flakes, StageOptions};
 
 #[cfg(feature = "shacl")]
 pub use stage::{
-    stage_with_shacl, validate_view_with_shacl, ShaclGraphPolicy, ShaclValidationOutcome,
+    stage_with_shacl, validate_staged_nodes, validate_view_with_shacl, ShaclGraphPolicy,
+    ShaclValidationOutcome,
 };
 
 pub mod commit_v2;

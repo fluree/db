@@ -1218,7 +1218,17 @@ impl RemoteLedgerClient {
 
     /// Merge a branch into its target on the remote server.
     ///
-    /// Calls `POST {base_url}/merge`.
+    /// Calls `POST {base_url}/merge/{ledger}` with a plan-driven body
+    /// (`docs/design/merge-custom.md`).
+    ///
+    /// `target` defaults to the source branch's parent on the server side.
+    /// To build a `MergePlan` with expected heads, this method first looks
+    /// up the current source and (resolved) target heads via
+    /// `GET /info/{ledger}:{branch}`. The two reads happen before the merge
+    /// post — if either branch advances after the lookup but before the
+    /// publish, the server's CAS-protected publish detects it and returns
+    /// `409 Conflict` with the new heads, which propagates through here as
+    /// a `RemoteLedgerError`.
     pub async fn merge_branch(
         &self,
         ledger: &str,
@@ -1226,17 +1236,96 @@ impl RemoteLedgerClient {
         target: Option<&str>,
         strategy: Option<&str>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let url = self.op_url_root("merge");
-        let mut body = serde_json::json!({
-            "ledger": ledger,
-            "source": source,
+        // Resolve target: caller-supplied or the source branch's parent.
+        // The parent comes from the `/branch/{ledger}` listing — info
+        // responses don't currently expose it.
+        let resolved_target = match target {
+            Some(t) => t.to_string(),
+            None => {
+                let branches = self.list_branches(ledger).await?;
+                let arr = branches.as_array().ok_or_else(|| {
+                    RemoteLedgerError::ServerError(
+                        "merge_branch: /branch listing did not return an array".into(),
+                    )
+                })?;
+                let parent = arr
+                    .iter()
+                    .find(|b| b.get("branch").and_then(|v| v.as_str()) == Some(source))
+                    .and_then(|b| b.get("source").and_then(|v| v.as_str()))
+                    .map(str::to_owned);
+                parent.ok_or_else(|| {
+                    RemoteLedgerError::ServerError(format!(
+                        "merge_branch: source branch '{source}' has no parent on the server; \
+                         specify --target explicitly"
+                    ))
+                })?
+            }
+        };
+
+        // Look up both heads in parallel — they feed the plan's
+        // `expected` fields. A concurrent advance between this lookup and
+        // the publish is caught by the server's CAS-protected publish and
+        // surfaces as 409 here.
+        let source_id = format!("{ledger}:{source}");
+        let target_id = format!("{ledger}:{resolved_target}");
+        let (source_info, target_info) = futures::try_join!(
+            self.ledger_info(&source_id, None),
+            self.ledger_info(&target_id, None)
+        )?;
+        let source_head = extract_commit_head(&source_info, "source").map_err(|e| {
+            RemoteLedgerError::ServerError(format!(
+                "merge_branch: source HEAD lookup for {source_id} returned no commitId: {e}"
+            ))
+        })?;
+        let target_head = extract_commit_head(&target_info, "target").map_err(|e| {
+            RemoteLedgerError::ServerError(format!(
+                "merge_branch: target HEAD lookup for {target_id} returned no commitId: {e}"
+            ))
+        })?;
+
+        // Translate the CLI's legacy `ConflictStrategy` names to the plan
+        // schema's `BaseStrategy` names. We canonicalize through
+        // `ConflictStrategy::from_str_name` first so this path accepts the
+        // same aliases the local-mode merge accepts (`TakeBoth`, `take_both`,
+        // `theirs`, `ours`, etc.) — case-insensitive, with snake/camel/kebab
+        // forms all valid. `take-branch` (the rebase-era name for "target
+        // wins") still parses there but the plan-driven server rejects it,
+        // so we re-map after canonicalization. `skip` is rebase-only;
+        // rejecting here surfaces the mismatch as a clear client error.
+        let raw = strategy.unwrap_or("take-both");
+        let canonical = fluree_db_api::ConflictStrategy::from_str_name(raw).ok_or_else(|| {
+            RemoteLedgerError::ServerError(format!(
+                "merge_branch: unknown conflict strategy '{raw}'; \
+                     expected one of take-source, take-target, take-both, abort \
+                     (or legacy alias take-branch)"
+            ))
+        })?;
+        let base_strategy = match canonical {
+            fluree_db_api::ConflictStrategy::TakeSource => "take-source",
+            fluree_db_api::ConflictStrategy::TakeBranch => "take-target",
+            fluree_db_api::ConflictStrategy::TakeBoth => "take-both",
+            fluree_db_api::ConflictStrategy::Abort => "abort",
+            fluree_db_api::ConflictStrategy::Skip => {
+                return Err(RemoteLedgerError::ServerError(
+                    "merge_branch: 'skip' is a rebase-only strategy and not supported for merge"
+                        .into(),
+                ));
+            }
+        };
+
+        let body = serde_json::json!({
+            "plan": {
+                "source": { "branch": source, "expected": source_head },
+                "target": { "branch": resolved_target, "expected": target_head },
+                "baseStrategy": base_strategy,
+            }
         });
-        if let Some(t) = target {
-            body["target"] = serde_json::Value::String(t.to_string());
-        }
-        if let Some(s) = strategy {
-            body["strategy"] = serde_json::Value::String(s.to_string());
-        }
+
+        let url = format!(
+            "{}/merge/{}",
+            self.base_url,
+            encode_ledger_path(Self::ledger_tail(ledger))
+        );
         self.send_json(
             reqwest::Method::POST,
             &url,
@@ -1248,12 +1337,14 @@ impl RemoteLedgerClient {
 
     /// List all branches for a ledger on the remote server.
     ///
-    /// Calls `GET {base_url}/branch/{ledger}`.
+    /// Calls `GET {base_url}/branch/{ledger}`. The ledger segment is
+    /// URL-encoded via [`Self::op_url`] so names containing spaces, `?`,
+    /// `#`, `%`, etc. produce well-formed URLs (matches `merge_preview`).
     pub async fn list_branches(
         &self,
         ledger: &str,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let url = format!("{}/branch/{}", self.base_url, ledger);
+        let url = self.op_url("branch", ledger);
         self.send_json(reqwest::Method::GET, &url, "application/json", None)
             .await
     }
@@ -1464,6 +1555,25 @@ enum RequestBody<'a> {
     Text(&'a str),
 }
 
+/// Extract the head commit CID from an `/info/{ledger}` response.
+///
+/// The server returns the head under one of two field names depending on
+/// mode: full responses use `commitId` (the rich shape produced by the
+/// transaction server), and the simplified proxy/peer shape uses
+/// `commit_head_id`. Accept both so a remote merge works regardless of which
+/// flavor the upstream is.
+///
+/// `which` is "source" or "target" — used only for the error message.
+fn extract_commit_head(info: &serde_json::Value, which: &str) -> Result<String, String> {
+    info.get("commitId")
+        .or_else(|| info.get("commit_head_id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!("{which} info has neither commitId nor commit_head_id field; got {info}")
+        })
+}
+
 fn extract_error_message(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -1614,6 +1724,18 @@ mod tests {
         assert_eq!(
             client.op_url("merge-preview", "weird name?:branch#x"),
             "http://localhost:8090/fluree/merge-preview/weird%20name%3F:branch%23x"
+        );
+    }
+
+    #[test]
+    fn test_op_url_branch_encodes_unsafe_chars() {
+        // `list_branches` previously interpolated the ledger segment raw;
+        // names with spaces/?/#/% would produce malformed URLs. Now goes
+        // through `op_url`, matching every other ledger-tailed endpoint.
+        let client = RemoteLedgerClient::new("http://localhost:8090/fluree", None);
+        assert_eq!(
+            client.op_url("branch", "weird name?:hash#x"),
+            "http://localhost:8090/fluree/branch/weird%20name%3F:hash%23x"
         );
     }
 

@@ -137,11 +137,19 @@ impl Fluree {
             )));
         };
 
-        // 2) Decode commits and preflight strict sequencing.
+        // 2) Decode commits structurally.
         let decoded = decode_and_validate_commit_chain(base_state.ledger_id(), &request)
             .map_err(PushError::into_api_error)?;
 
-        preflight_strict_next_t_and_prev(&current_ref, &decoded)
+        // 2b) Topological validation (parent existence in batch / receiving
+        //    namespace / current head, plus `commit.t == max(parent.t) + 1`
+        //    per commit, plus first-commit continuity). Replaces the old
+        //    linear `prev_hash` / strict-`+1` checks, which were correct for
+        //    linear chains but rejected legitimate DAG-shaped batches where
+        //    sibling-branch commits or merge parents are interleaved.
+        let validation_store = self.content_store(base_state.ledger_id());
+        validate_commit_topology(&decoded, &*validation_store, &current_ref)
+            .await
             .map_err(PushError::into_api_error)?;
 
         // 3) Validate referenced blobs are provided (if any) and pre-validate hashes.
@@ -182,7 +190,32 @@ impl Fluree {
             PushError::Invalid(format!("base snapshot namespace corruption: {e}")).into_api_error()
         })?;
 
+        // Identify which commits in the batch are on the **target's**
+        // primary-parent chain. Off-chain commits (source ancestry brought
+        // along by a merge commit's `parents[1..]`) get their bytes written
+        // to storage so the DAG is locally resolvable, but their flakes
+        // and meta-flakes are NOT applied to target novelty — those flakes
+        // belong to the source's history, and the merge commit already
+        // captured whatever the resolved view should be (or intentionally
+        // dropped them, in the `take-target` case).
+        let primary_chain = primary_chain_in_batch(&decoded, current_ref.id.as_ref());
+
         for c in &decoded {
+            let on_primary_chain = primary_chain.contains(c.digest_hex.as_str());
+
+            if !on_primary_chain {
+                // Source-ancestry commit replicated alongside a merge.
+                // Skip the per-commit validation+apply loop entirely —
+                // those flakes are not part of target novelty. The bytes
+                // are still written to storage (step 5 below).
+                tracing::debug!(
+                    digest = %c.digest_hex,
+                    t = c.commit.t,
+                    "skipping non-primary-chain commit (source ancestry); bytes written but flakes not applied to target novelty"
+                );
+                continue;
+            }
+
             // Current state is base db + evolving novelty.
             let current_t = base_state.snapshot.t.max(evolving_novelty.t);
 
@@ -222,10 +255,14 @@ impl Fluree {
                 build_policy_ctx_for_push(&base_state, &evolving_novelty, current_t, opts).await?;
 
             // 4.3 Stage flakes (policy/backpressure). No WHERE/cancellation; flakes are prebuilt.
+            // Pass `c.commit.t` so the staged view's `t` matches the inbound
+            // commit (matters for multi-parent merge commits where
+            // `commit.t > base.t() + 1`).
             let evolving_state = base_state.clone_with_novelty(Arc::new(evolving_novelty.clone()));
             let staged_view = stage_commit_flakes(
                 evolving_state,
                 &c.commit.flakes,
+                c.commit.t,
                 index_config,
                 &policy_ctx,
                 &routing.graph_sids,
@@ -518,63 +555,37 @@ fn reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid, Grap
         .collect()
 }
 
+/// Structural decode pass: parse commit bytes, reject empties on
+/// single-parent commits, capture each commit's content-addressed digest.
+///
+/// Topological validation (parent existence, `commit.t == max(parent.t) + 1`,
+/// continuity with the receiving ledger's current head) happens in
+/// [`validate_commit_topology`], which runs after this function and may
+/// touch the receiving namespace. Splitting structural-only work from
+/// I/O-bound work keeps batches that fail at the bytes level cheap.
 fn decode_and_validate_commit_chain(
     _ledger_id: &str,
     request: &PushCommitsRequest,
 ) -> std::result::Result<Vec<PushCommitDecoded>, PushError> {
     let mut out = Vec::with_capacity(request.commits.len());
 
-    let mut prev_t: Option<i64> = None;
-    let mut prev_hash: Option<String> = None;
-
     for (idx, b64) in request.commits.iter().enumerate() {
         let bytes = b64.0.clone();
         let commit = fluree_db_core::commit::codec::read_commit(&bytes)
             .map_err(|e| PushError::Invalid(format!("invalid commit[{idx}]: {e}")))?;
 
-        // Reject empty commits (no flakes) - keep semantics clear.
-        if commit.flakes.is_empty() {
+        // Reject empty commits (no flakes) — keep semantics clear.
+        // Multi-parent merge commits are exempt: a `take-target` no-op merge
+        // legitimately produces an empty commit that records only the DAG
+        // join, with no data flakes.
+        if commit.flakes.is_empty() && commit.parents.len() <= 1 {
             return Err(PushError::Invalid(format!(
                 "invalid commit[{idx}]: empty commit (no flakes)"
             )));
         }
 
-        // Derive the content digest hex for addressing.
         // V4: CID = SHA-256(full blob). No embedded hash to verify.
         let digest_hex = fluree_db_core::sha256_hex(&bytes);
-
-        // Note: commit blobs are applied to the server-selected `ledger_id` via CAS.
-        // We do not currently enforce a ledger identity embedded inside the commit bytes.
-
-        // Chain validation: strict contiguous t (+1).
-        if let Some(pt) = prev_t {
-            if commit.t != pt + 1 {
-                return Err(PushError::Invalid(format!(
-                    "commit chain is not contiguous: commit[{}].t={} does not equal prior+1={}",
-                    idx,
-                    commit.t,
-                    pt + 1
-                )));
-            }
-        }
-
-        // Chain validation: at least one parent reference must match the prior
-        // commit's hash. For normal commits this is the single parent; for merge
-        // commits one parent is the prior commit and others are pre-existing.
-        if let Some(prev_hash_hex) = &prev_hash {
-            let ok = commit
-                .parents
-                .iter()
-                .any(|r| r.digest_hex() == *prev_hash_hex);
-            if !ok {
-                return Err(PushError::Invalid(format!(
-                    "commit chain previous mismatch at commit[{idx}]: expected previous digest '{prev_hash_hex}'"
-                )));
-            }
-        }
-
-        prev_t = Some(commit.t);
-        prev_hash = Some(digest_hex.clone());
 
         out.push(PushCommitDecoded {
             commit,
@@ -586,32 +597,197 @@ fn decode_and_validate_commit_chain(
     Ok(out)
 }
 
-fn preflight_strict_next_t_and_prev(
-    current: &RefValue,
-    decoded: &[PushCommitDecoded],
-) -> std::result::Result<(), PushError> {
-    let first = decoded.first().expect("non-empty decoded");
+/// Unified topological validation for a push/import batch.
+///
+/// Replaces the legacy `prev_t` strict-`+1` and `prev_hash` linear-chain
+/// checks with a per-commit walk that's correct for both linear chains and
+/// DAG-shaped batches (where merge commits and sibling-branch commits are
+/// interleaved in topo order).
+///
+/// For each commit, every parent CID must be findable in one of:
+/// 1. earlier in the same batch (in-batch lookup, cheap),
+/// 2. the receiving namespace's content store (loaded as an envelope), or
+/// 3. (for the very first commit only) the current head ref.
+///
+/// With all parents resolved, this enforces `commit.t == max(parent.t) + 1`
+/// — the invariant the writer enforces, verified at receive time. Genesis
+/// commits (no parents) are accepted only as the first commit of a batch
+/// pushed against an empty ledger.
+///
+/// The first commit's parents must additionally include `current.id` (if
+/// the receiving ledger has a head), proving continuity with the existing
+/// chain. This is the moral equivalent of the old `prev_hash` check on the
+/// first commit, but generalized to multi-parent commits where any parent
+/// can be the continuity point.
+/// Primary-parent chain of the new HEAD within a push batch.
+///
+/// Walks from `decoded.last()` (the commit that will become the new target
+/// HEAD) backward via `parents[0]`, stopping when the parent is the current
+/// HEAD or no longer in the batch. Returns a set of `digest_hex` strings —
+/// the commits whose flakes belong to the **target's** history.
+///
+/// Multi-parent merge commits have `parents[0] = target's previous HEAD` and
+/// `parents[1..]` = source HEAD(s). Source ancestry brought along by a
+/// non-primary parent edge is reachable from the new HEAD via the DAG (so
+/// the namespace can resolve it for future merges) but its flakes were
+/// already accounted for inside the merge commit (`take-target` drops them
+/// entirely; `take-source`/`take-both` re-asserts what the merge wants).
+/// Re-applying the source-ancestry flakes via the linear push loop would
+/// **leak** retracted source values back into target novelty.
+///
+/// For purely linear batches (no merge commits) every entry's `parents[0]`
+/// chains back through the batch, so the returned set covers every commit —
+/// the existing per-commit apply behavior is unchanged.
+fn primary_chain_in_batch<'a>(
+    decoded: &'a [PushCommitDecoded],
+    current_id: Option<&fluree_db_core::ContentId>,
+) -> std::collections::HashSet<&'a str> {
+    use std::collections::HashMap;
 
-    let expected_t = current.t + 1;
-    if first.commit.t != expected_t {
-        return Err(PushError::Conflict(format!(
-            "first commit t mismatch: expected next-t={}, got {}",
-            expected_t, first.commit.t
-        )));
+    let by_digest: HashMap<&str, &PushCommitDecoded> =
+        decoded.iter().map(|c| (c.digest_hex.as_str(), c)).collect();
+
+    let mut chain: std::collections::HashSet<&'a str> =
+        std::collections::HashSet::with_capacity(decoded.len());
+
+    let Some(last) = decoded.last() else {
+        return chain;
+    };
+    let mut cursor: Option<&'a str> = Some(last.digest_hex.as_str());
+    while let Some(hex) = cursor {
+        if !chain.insert(hex) {
+            // Defensive: a cycle would otherwise spin forever. Shouldn't
+            // happen for content-addressed commits, but make it explicit.
+            break;
+        }
+        let commit = match by_digest.get(hex) {
+            Some(c) => *c,
+            None => break,
+        };
+        // Primary parent = first entry of `parents`.
+        let Some(primary_parent) = commit.commit.parents.first() else {
+            break; // genesis
+        };
+        // If primary parent is the receiving ledger's existing HEAD, we've
+        // walked off the new portion of the chain.
+        if matches!(current_id, Some(cur) if cur == primary_parent) {
+            break;
+        }
+        // Move cursor to the in-batch entry whose digest matches.
+        let primary_hex = primary_parent.digest_hex();
+        match by_digest.get(primary_hex.as_str()) {
+            Some(found) => cursor = Some(found.digest_hex.as_str()),
+            None => break, // primary already on receiving ledger
+        }
     }
 
-    // Validate that at least one parent reference matches the current head CID.
+    chain
+}
+
+async fn validate_commit_topology<C: fluree_db_core::ContentStore + ?Sized>(
+    decoded: &[PushCommitDecoded],
+    content_store: &C,
+    current: &RefValue,
+) -> std::result::Result<(), PushError> {
+    use fluree_db_core::load_commit_envelope_by_id;
+
+    // Built progressively as we walk the batch in decoded order: a parent
+    // CID resolves via the in-batch path only when it appeared **earlier**
+    // in the batch (idx < current). Indexing the whole batch up front would
+    // accept forward references — a commit at idx=2 pointing at idx=5 — and
+    // mask topo ordering bugs the application loop later trips on.
+    let mut in_batch: std::collections::HashMap<&str, i64> =
+        std::collections::HashMap::with_capacity(decoded.len());
+
+    // Continuity check on the first commit.
+    let first = decoded.first().expect("non-empty decoded");
     if let Some(expected_id) = &current.id {
-        let ok = first.commit.parents.iter().any(|r| r == expected_id);
+        let ok = first.commit.parents.iter().any(|p| p == expected_id);
         if !ok {
             return Err(PushError::Conflict(format!(
-                "first commit previous mismatch: no parent matches expected head {expected_id:?}"
+                "first commit must include current head {expected_id} as a parent",
             )));
         }
     } else if !first.commit.parents.is_empty() {
         return Err(PushError::Conflict(
-            "first commit has parent refs but current head has no id".to_string(),
+            "first commit has parents but receiving ledger has no current head".to_string(),
         ));
+    }
+
+    // Per-commit topology + t check.
+    for (idx, c) in decoded.iter().enumerate() {
+        if c.commit.parents.is_empty() {
+            // Only legal as the very first commit on an empty ledger.
+            if idx != 0 {
+                return Err(PushError::Invalid(format!(
+                    "commit[{idx}] has no parents but is not the first in batch",
+                )));
+            }
+            if current.id.is_some() {
+                return Err(PushError::Conflict(
+                    "first commit has no parents but receiving ledger has a current head"
+                        .to_string(),
+                ));
+            }
+            // Genesis on an empty ledger: `commit.t` must equal `current.t + 1`.
+            // The empty-ledger ref always carries `t = 0`, so a genesis commit
+            // here means `t == 1`.
+            let expected = current.t + 1;
+            if c.commit.t != expected {
+                return Err(PushError::Conflict(format!(
+                    "first (genesis) commit t={} does not match expected next-t={expected}",
+                    c.commit.t
+                )));
+            }
+            in_batch.insert(c.digest_hex.as_str(), c.commit.t);
+            continue;
+        }
+
+        let mut max_parent_t: i64 = i64::MIN;
+        for p in &c.commit.parents {
+            // 1. In-batch lookup — only commits that arrived **earlier** in
+            //    decoded order are visible here. A forward reference (parent
+            //    appears later in the batch) misses this map and falls through
+            //    to the receiving namespace / current-head paths, which won't
+            //    have it either, so the request is rejected with the
+            //    "parent not present" error below.
+            if let Some(&pt) = in_batch.get(p.digest_hex().as_str()) {
+                max_parent_t = max_parent_t.max(pt);
+                continue;
+            }
+            // 2. Already in receiving namespace.
+            if let Ok(env) = load_commit_envelope_by_id(content_store, p).await {
+                max_parent_t = max_parent_t.max(env.t);
+                continue;
+            }
+            // 3. First-commit-only fallback: parent is the current head ref.
+            //    (Current head is normally already on disk, so step 2 catches
+            //    it; this branch covers receivers that haven't materialized
+            //    the head locally yet.)
+            if idx == 0 {
+                if let Some(ref cid) = current.id {
+                    if cid == p {
+                        max_parent_t = max_parent_t.max(current.t);
+                        continue;
+                    }
+                }
+            }
+            return Err(PushError::Invalid(format!(
+                "commit[{idx}] references parent {p}, which is not present in the batch, \
+                 in the receiving namespace, or in the current head ref",
+            )));
+        }
+
+        let expected = max_parent_t + 1;
+        if c.commit.t != expected {
+            return Err(PushError::Invalid(format!(
+                "commit[{idx}] has t={}, expected max(parent.t)+1={}",
+                c.commit.t, expected
+            )));
+        }
+
+        // Make this commit visible to later commits in the same batch.
+        in_batch.insert(c.digest_hex.as_str(), c.commit.t);
     }
 
     Ok(())
@@ -660,13 +836,20 @@ async fn build_policy_ctx_for_push(
 async fn stage_commit_flakes(
     ledger: LedgerState,
     flakes: &[Flake],
+    commit_t: i64,
     index_config: &IndexConfig,
     policy_ctx: &PolicyContext,
     graph_sids: &HashMap<GraphId, Sid>,
 ) -> std::result::Result<fluree_db_ledger::StagedLedger, PushError> {
     let mut options = fluree_db_transact::StageOptions::new()
         .with_index_config(index_config)
-        .with_graph_sids(graph_sids);
+        .with_graph_sids(graph_sids)
+        // Stamp the staged view's `t` from the inbound commit, not from
+        // `base.t() + 1`. Pre-built commits arrive with their own `t`, and
+        // for multi-parent merges that `t` can exceed `base.t() + 1`. Without
+        // this override, per-graph policy and SHACL evaluation under the
+        // staged view would see `to_t < commit.t` and miss the staged flakes.
+        .with_staged_t(commit_t);
     if !policy_ctx.wrapper().is_root() {
         options = options.with_policy(policy_ctx);
     }
@@ -1354,12 +1537,18 @@ impl Fluree {
             blobs: blobs.clone(),
         };
 
-        // 3) Decode and validate chain.
+        // 3) Structural decode.
         let decoded = decode_and_validate_commit_chain(base_state.ledger_id(), &request)
             .map_err(PushError::into_api_error)?;
 
-        // 4) Ancestry preflight: verify first commit's parent matches local head.
-        preflight_strict_next_t_and_prev(&current_ref, &decoded)
+        // 4) Topological validation — same shape as `push_commits_with_handle`.
+        //    Handles linear and DAG-shaped batches uniformly: parent
+        //    existence in batch / receiving namespace / current head, plus
+        //    `commit.t == max(parent.t) + 1` per commit, plus first-commit
+        //    continuity with the receiving ledger's head.
+        let validation_store = self.content_store(base_state.ledger_id());
+        validate_commit_topology(&decoded, &*validation_store, &current_ref)
+            .await
             .map_err(PushError::into_api_error)?;
 
         // 5) Validate referenced blobs are provided.
@@ -1407,10 +1596,19 @@ impl Fluree {
         }
 
         // 8) Update in-memory state (novelty + dict novelty + namespace deltas).
+        //    Only apply flakes for commits on the **target's** primary-parent
+        //    chain. Source-ancestry commits brought along by a merge commit's
+        //    `parents[1..]` are stored on disk (their bytes were written in
+        //    step 6) but their flakes don't enter target novelty — those
+        //    flakes belong to source's history, and the merge commit already
+        //    captured the resolved view. See `primary_chain_in_batch` for the
+        //    walk semantics.
+        let primary_chain = primary_chain_in_batch(&decoded, current_ref.id.as_ref());
         let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base_state.ledger_id());
         let txn_meta_g_sid = base_state.snapshot.encode_iri(&txn_meta_iri);
         let all_flakes: Vec<(i64, Vec<Flake>)> = decoded
             .iter()
+            .filter(|c| primary_chain.contains(c.digest_hex.as_str()))
             .map(|c| {
                 let mut flakes = c.commit.flakes.clone();
                 let mut meta_flakes =

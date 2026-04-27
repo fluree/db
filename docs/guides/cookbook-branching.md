@@ -226,10 +226,19 @@ curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:dev' \
   -H "Content-Type: application/sparql-query" \
   -d 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
 
-# Merge
-curl -X POST http://localhost:8090/v1/fluree/merge \
+# Merge (plan-driven). Capture both heads first so the staleness guard can
+# detect a concurrent advance (see docs/design/merge-custom.md).
+SOURCE_HEAD=$(curl -s http://localhost:8090/v1/fluree/info/mydb:dev  | jq -r .commitId)
+TARGET_HEAD=$(curl -s http://localhost:8090/v1/fluree/info/mydb:main | jq -r .commitId)
+curl -X POST http://localhost:8090/v1/fluree/merge/mydb \
   -H "Content-Type: application/json" \
-  -d '{"ledger": "mydb", "source": "dev"}'
+  -d "{
+    \"plan\": {
+      \"source\": { \"branch\": \"dev\",  \"expected\": \"$SOURCE_HEAD\" },
+      \"target\": { \"branch\": \"main\", \"expected\": \"$TARGET_HEAD\" },
+      \"baseStrategy\": \"take-both\"
+    }
+  }"
 ```
 
 ## Best practices

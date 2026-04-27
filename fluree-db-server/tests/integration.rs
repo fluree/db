@@ -2820,3 +2820,310 @@ async fn commits_endpoint_without_token_returns_401() {
         "missing token should return 401 when storage proxy is enabled"
     );
 }
+
+// ============================================================================
+// Plan-driven merge: POST /merge/{ledger}
+// ============================================================================
+
+#[tokio::test]
+async fn merge_endpoint_takes_plan_in_body_and_succeeds_on_fast_forward() {
+    // Plan-driven merge surfaces under `POST /merge/{ledger}` per
+    // `docs/design/merge-custom.md`. v1 honors `plan.base_strategy` and the
+    // expected-head staleness guards; this test exercises the happy path
+    // where dev has been advanced past main and a fast-forward applies.
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create the ledger and seed with one fact so it has a commit head.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "merge-http:main" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "ledger": "merge-http",
+                        "@context": {"ex": "http://example.org/ns/"},
+                        "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Branch dev off main.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "merge-http", "branch": "dev"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Insert on dev so it advances past main.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "ledger": "merge-http:dev",
+                        "@context": {"ex": "http://example.org/ns/"},
+                        "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Look up branch heads via the per-branch info endpoint.
+    let head_for = async |branch: &str| -> String {
+        let uri = format!("/v1/fluree/info/merge-http:{branch}");
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, info) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "info {branch}: {info}");
+        info["commitId"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| panic!("branch {branch} has no commit_head_id; got {info}"))
+    };
+    let source_head = head_for("dev").await;
+    let target_head = head_for("main").await;
+
+    // POST the plan-driven merge.
+    let plan = serde_json::json!({
+        "plan": {
+            "source": { "branch": "dev",  "expected": source_head },
+            "target": { "branch": "main", "expected": target_head },
+            "baseStrategy": "take-source"
+        }
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/merge/merge-http")
+                .header("content-type", "application/json")
+                .body(Body::from(plan.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "plan-driven merge failed: {body}");
+    assert_eq!(body["fast_forward"], true);
+    assert_eq!(body["source"], "dev");
+    assert_eq!(body["target"], "main");
+    assert!(
+        body["new_head_id"].as_str().is_some(),
+        "response should include new_head_id; got {body}"
+    );
+}
+
+#[tokio::test]
+async fn merge_endpoint_rejects_stale_target_head_with_409() {
+    // The design requires the staleness guard to surface as a conflict.
+    // Passing an obviously-wrong `target.expected` proves the route plumbs
+    // expected-head validation through to `Fluree::merge`.
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "merge-stale:main" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "ledger": "merge-stale",
+                        "@context": {"ex": "http://example.org/ns/"},
+                        "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "merge-stale", "branch": "dev"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Fabricate an obviously-wrong CID for `target.expected`. The hex digest
+    // is arbitrary; the CID just has to (a) parse and (b) not match the real
+    // target HEAD.
+    let bogus_target = ContentId::from_hex_digest(
+        fluree_db_core::CODEC_FLUREE_COMMIT,
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    )
+    .expect("bogus hex digest should parse");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/info/merge-stale:dev")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (_status, info) = json_body(resp).await;
+    let real_source = info["commitId"]
+        .as_str()
+        .map(str::to_owned)
+        .expect("dev head");
+
+    let plan = serde_json::json!({
+        "plan": {
+            "source": { "branch": "dev",  "expected": real_source },
+            "target": { "branch": "main", "expected": bogus_target.to_string() },
+            "baseStrategy": "take-source"
+        }
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/merge/merge-stale")
+                .header("content-type", "application/json")
+                .body(Body::from(plan.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "stale target should 409: {body}"
+    );
+    assert!(
+        json_contains_string(&body, "stale target HEAD"),
+        "error message should call out stale target HEAD; got {body}"
+    );
+}
+
+#[tokio::test]
+async fn merge_endpoint_rejects_unknown_top_level_field_with_400() {
+    // `MergeBranchRequest` uses `deny_unknown_fields`. A stray `ledger` at
+    // the top level (the old wire shape) must fail to deserialize so callers
+    // who haven't updated to the path-bound form fail loudly.
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "merge-shape:main" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let body = serde_json::json!({
+        "ledger": "merge-shape",
+        "source": "dev",
+        "strategy": "take-source"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/merge/merge-shape")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}

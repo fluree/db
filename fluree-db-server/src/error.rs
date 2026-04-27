@@ -81,6 +81,11 @@ impl ServerError {
 
             // Ledger management
             ServerError::Api(ApiError::LedgerExists(_)) => errors::LEDGER_EXISTS,
+            // Branch-level conflicts (stale plan heads, fast-forward CAS races,
+            // abort-on-conflict merges) reuse the existing commit-conflict
+            // error type so structured-error clients see a stable conflict
+            // category instead of falling through to `err:db/Internal`.
+            ServerError::Api(ApiError::BranchConflict(_)) => errors::COMMIT_CONFLICT,
 
             // Index operations
             ServerError::Api(ApiError::IndexTimeout(_)) => errors::INDEX_TIMEOUT,
@@ -147,6 +152,10 @@ impl ServerError {
 
             // 409 - Conflict
             ServerError::Api(ApiError::LedgerExists(_)) => StatusCode::CONFLICT,
+            // Branch-level conflicts: stale plan heads, fast-forward CAS races,
+            // abort-on-conflict merges. All map to 409 per the merge-custom
+            // design (`docs/design/merge-custom.md`).
+            ServerError::Api(ApiError::BranchConflict(_)) => StatusCode::CONFLICT,
 
             // 400 - Bad Request (client errors)
             ServerError::Api(ApiError::Parse(_)) => StatusCode::BAD_REQUEST,

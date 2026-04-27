@@ -40,6 +40,10 @@ How the reasoner consumes schema from a named `f:schemaSource` graph and transit
 
 Storage trait architecture: `StorageRead`, `StorageWrite`, `ContentAddressedWrite`, `Storage`, and `NameService` trait design with guidance for implementing new backends.
 
+### [Custom Merge Commits](merge-custom.md)
+
+`MergePlan` design for the four-step merge flow (preview → query → validate → commit): per-conflict resolutions, plan-level patches, staleness guards, SHACL validation against the staged merge state, and idempotent retry semantics.
+
 ## Related Documentation
 
 - [Crate Map](../reference/crate-map.md) - Workspace architecture

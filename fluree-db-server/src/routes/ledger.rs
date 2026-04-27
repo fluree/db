@@ -1319,19 +1319,21 @@ async fn rebase_local(state: Arc<AppState>, request: Request) -> Result<impl Int
 // Merge
 // ============================================================================
 
-/// Merge branch request body
+/// Plan-driven merge request body.
+///
+/// Wire shape per `docs/design/merge-custom.md`. The `ledger` is **not** a
+/// field here — it is taken from the URL path (`POST /merge/{ledger}`); a
+/// stray top-level `ledger` field is rejected by serde's
+/// `deny_unknown_fields`.
+///
+/// v1 only honors `plan.base_strategy` (and `plan.source` / `plan.target`
+/// expected heads). `plan.resolutions` and `plan.additional_patch` round-trip
+/// through serde but are rejected by the engine with `400` until the
+/// JSON-LD compilation pass lands.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MergeBranchRequest {
-    /// Ledger name (e.g., "mydb")
-    pub ledger: String,
-    /// Source branch to merge from (e.g., "feature-x")
-    pub source: String,
-    /// Target branch to merge into (defaults to the source's parent branch)
-    #[serde(default)]
-    pub target: Option<String>,
-    /// Conflict resolution strategy (optional, defaults to "take-both")
-    #[serde(default)]
-    pub strategy: Option<String>,
+    pub plan: fluree_db_api::merge_plan::MergePlan,
 }
 
 /// Merge branch response
@@ -1347,6 +1349,8 @@ pub struct MergeBranchResponse {
     pub fast_forward: bool,
     /// New commit HEAD t of the target
     pub new_head_t: i64,
+    /// New commit HEAD CID of the target (base32-lower CID string).
+    pub new_head_id: String,
     /// Number of commit blobs copied to the target namespace
     pub commits_copied: usize,
     /// Number of conflicts detected
@@ -1356,23 +1360,40 @@ pub struct MergeBranchResponse {
     pub strategy: Option<String>,
 }
 
-/// Merge a source branch into a target branch
+/// Merge a source branch into a target branch using a [`MergePlan`].
 ///
-/// POST /fluree/merge
+/// `POST /fluree/merge/{ledger}` (plan-driven, v1).
 ///
-/// Request body:
-/// - `ledger`: Ledger name (e.g., "mydb")
-/// - `source`: Source branch to merge from (e.g., "feature-x")
-/// - `target`: Target branch to merge into (optional, defaults to source's parent)
-pub async fn merge(State(state): State<Arc<AppState>>, request: Request) -> Response {
+/// Body shape: `{ "plan": <MergePlan> }`. See `docs/design/merge-custom.md`
+/// for `MergePlan` semantics.
+///
+/// **v1 surface.** Only `plan.base_strategy` (and the staleness guards on
+/// `plan.source.expected` / `plan.target.expected`) are honored. Non-empty
+/// `plan.resolutions` or `plan.additional_patch` are rejected with `400`
+/// until the JSON-LD compilation pass lands.
+///
+/// **Breaking change vs. the previous `POST /fluree/merge`:** the ledger now
+/// lives in the URL path, not in the body, and the body is wrapped in a
+/// `plan` field with a typed shape (replacing the loose
+/// `{ ledger, source, target, strategy }` form). There were no external
+/// users of the previous shape.
+pub async fn merge(
+    Path(ledger): Path<String>,
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Response {
     if state.config.server_role == ServerRole::Peer {
         return forward_write_request(&state, request).await;
     }
 
-    merge_local(state, request).await.into_response()
+    merge_local(state, ledger, request).await.into_response()
 }
 
-async fn merge_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
+async fn merge_local(
+    state: Arc<AppState>,
+    ledger: String,
+    request: Request,
+) -> Result<impl IntoResponse> {
     let (parts, body) = request.into_parts();
     let headers = FlureeHeaders::from_headers(&parts.headers)?;
 
@@ -1388,7 +1409,7 @@ async fn merge_local(state: Arc<AppState>, request: Request) -> Result<impl Into
         "branch:merge",
         request_id.as_deref(),
         trace_id.as_deref(),
-        Some(&req.ledger),
+        Some(&ledger),
         None,
         None,
     );
@@ -1396,26 +1417,15 @@ async fn merge_local(state: Arc<AppState>, request: Request) -> Result<impl Into
     async move {
         let span = tracing::Span::current();
 
-        let strategy = match req.strategy.as_deref() {
-            Some(s) => fluree_db_api::ConflictStrategy::from_str_name(s).ok_or_else(|| {
-                ServerError::bad_request(format!("Unknown conflict strategy: {s}"))
-            })?,
-            None => fluree_db_api::ConflictStrategy::default(),
-        };
-
         tracing::info!(
             status = "start",
-            source = %req.source,
-            target = ?req.target,
-            strategy = strategy.as_str(),
-            "branch merge requested"
+            source = %req.plan.source.branch,
+            target = %req.plan.target.branch,
+            base_strategy = req.plan.base_strategy.as_str(),
+            "plan-driven branch merge requested"
         );
 
-        let report = match state
-            .fluree
-            .merge_branch(&req.ledger, &req.source, req.target.as_deref(), strategy)
-            .await
-        {
+        let report = match state.fluree.merge(&ledger, req.plan).await {
             Ok(report) => report,
             Err(e) => {
                 let server_error = ServerError::Api(e);
@@ -1425,13 +1435,14 @@ async fn merge_local(state: Arc<AppState>, request: Request) -> Result<impl Into
             }
         };
 
-        let ledger_id = fluree_db_core::ledger_id::format_ledger_id(&req.ledger, &report.target);
+        let ledger_id = fluree_db_core::ledger_id::format_ledger_id(&ledger, &report.target);
         let response = MergeBranchResponse {
             ledger_id,
             target: report.target,
             source: report.source,
             fast_forward: report.fast_forward,
             new_head_t: report.new_head_t,
+            new_head_id: report.new_head_id.to_string(),
             commits_copied: report.commits_copied,
             conflict_count: report.conflict_count,
             strategy: report.strategy,

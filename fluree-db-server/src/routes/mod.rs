@@ -42,7 +42,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/branch", post(ledger::create_branch))
         .route("/drop-branch", post(ledger::drop_branch))
         .route("/rebase", post(ledger::rebase))
-        .route("/merge", post(ledger::merge));
+        // Plan-driven merge: ledger in path, MergePlan in body. See
+        // `docs/design/merge-custom.md`. The legacy `POST /merge` form (ledger
+        // and strategy in body) is retired.
+        .route("/merge/*ledger", post(ledger::merge));
 
     #[cfg(feature = "iceberg")]
     let v1_admin_protected_routes =

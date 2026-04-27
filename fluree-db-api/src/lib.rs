@@ -57,6 +57,7 @@ mod indexer_fulltext_provider;
 mod ledger;
 pub mod ledger_info;
 mod merge;
+pub mod merge_plan;
 mod merge_preview;
 pub mod nameservice_query;
 pub(crate) mod ns_helpers;

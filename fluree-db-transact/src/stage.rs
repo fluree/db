@@ -92,6 +92,21 @@ pub struct StageOptions<'a> {
     ///
     /// The normal `stage()` path builds this internally from `txn.graph_delta`.
     pub graph_sids: Option<&'a HashMap<GraphId, Sid>>,
+
+    /// Override the staged view's `t` instead of defaulting to
+    /// `base.t() + 1`.
+    ///
+    /// Used by the push/import replay path: pre-built commits arrive with
+    /// their own `t` (which may be greater than `base.t() + 1` for
+    /// multi-parent merge commits where `commit.t == max(parent.t) + 1`).
+    /// The staged view's `to_t` filter must match the flakes' actual `t`,
+    /// otherwise per-graph policy and SHACL evaluation under
+    /// `GraphDbRef(snapshot, ..., staged_t)` can miss the new flakes
+    /// entirely.
+    ///
+    /// `None` keeps the default `base.t() + 1`, which is correct for the
+    /// regular transact path where `stage()` itself computes the new `t`.
+    pub staged_t: Option<i64>,
 }
 
 impl<'a> StageOptions<'a> {
@@ -121,6 +136,12 @@ impl<'a> StageOptions<'a> {
     /// Set the graph routing map for named-graph flakes
     pub fn with_graph_sids(mut self, graph_sids: &'a HashMap<GraphId, Sid>) -> Self {
         self.graph_sids = Some(graph_sids);
+        self
+    }
+
+    /// Set the explicit staged `t` for this view (push/import replay path).
+    pub fn with_staged_t(mut self, t: i64) -> Self {
+        self.staged_t = Some(t);
         self
     }
 }
@@ -498,7 +519,10 @@ pub async fn stage_flakes(
         }
 
         tracing::info!(flake_count = flakes.len(), "stage_flakes completed");
-        Ok(StagedLedger::new(ledger, flakes, &reverse_graph)?)
+        match options.staged_t {
+            Some(t) => Ok(StagedLedger::new_with_t(ledger, flakes, &reverse_graph, t)?),
+            None => Ok(StagedLedger::new(ledger, flakes, &reverse_graph)?),
+        }
     }
     .instrument(span)
     .await
@@ -1660,8 +1684,22 @@ pub async fn validate_view_with_shacl(
 /// When `graph_sids` is `None` (e.g., commit-transfer path where the txn
 /// context is unavailable), falls back to validating all subjects against
 /// the default graph (g_id=0) — matching the previous behavior.
+///
+/// **Touched-node scope.** Focus nodes are derived from the view's staged
+/// flakes: every flake's subject becomes a focus, and ref-objects of assert
+/// flakes are added so `sh:targetObjectsOf` shapes fire on newly-introduced
+/// edges. Retractions' objects are not expanded. This matches the design's
+/// touched-node scope (see `docs/design/merge-custom.md` §Validation pipeline) and is
+/// shared between transactions and merge-custom validations.
+///
+/// **Reused by merge.** The custom-merge engine stages its resolved patch +
+/// `additionalPatch` onto the target via `StagedLedger::new_with_t`, then
+/// calls this function to produce a [`ValidationReport`] for the
+/// `/merge/{ledger}/validate` endpoint. The reject/warn policy split that
+/// `validate_view_with_shacl` adds is a transact-time concern; the merge
+/// endpoint exposes raw violations and lets the caller decide.
 #[cfg(feature = "shacl")]
-async fn validate_staged_nodes(
+pub async fn validate_staged_nodes(
     view: &StagedLedger,
     engine: &ShaclEngine,
     graph_sids: Option<&HashMap<GraphId, Sid>>,

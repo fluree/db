@@ -1852,45 +1852,51 @@ curl -X POST http://localhost:8090/v1/fluree/rebase \
   -d '{"ledger": "mydb", "branch": "feature-x", "strategy": "abort"}'
 ```
 
-### POST /fluree/merge
+### POST /fluree/merge/{ledger}
 
-Merge a source branch into a target branch. Admin-protected.
+Merge a source branch into a target branch using a [`MergePlan`](../design/merge-custom.md). Admin-protected.
 
-Fast-forward merges copy the source commit chain into the target namespace and advance the target HEAD. When the target has diverged, Fluree performs a general merge: it computes the source and target deltas since their common ancestor, resolves overlapping `(s, p, g)` conflicts according to the requested strategy, and creates a merge commit on the target branch.
+Fast-forward merges copy the source commit chain into the target namespace and advance the target HEAD with a CAS-protected publish. When the target has diverged, Fluree performs a general merge: it detects real conflicts (refined detection — convergent edits where both branches converge on identical values do **not** conflict), applies the plan's `baseStrategy` to each conflict, and creates a multi-parent merge commit at `t = max(source_t, target_t) + 1`.
+
+**Breaking change vs. earlier releases.** The legacy form (`POST /fluree/merge` with `{ ledger, source, target, strategy }` in the body) is retired. The ledger now lives in the URL path and the body wraps a typed `MergePlan` per the design doc.
 
 **URL:**
 ```
-POST /fluree/merge
+POST /fluree/merge/{ledger}
 ```
 
 **Request body:**
 
 ```json
 {
-  "ledger": "mydb",
-  "source": "feature-x",
-  "target": "dev",
-  "strategy": "take-both"
+  "plan": {
+    "source": { "branch": "feature-x", "expected": "<source-head-cid>" },
+    "target": { "branch": "dev",       "expected": "<target-head-cid>" },
+    "baseStrategy": "take-both"
+  }
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `ledger` | string | Yes | Ledger name without branch suffix (e.g., "mydb") |
-| `source` | string | Yes | Source branch to merge from (e.g., "feature-x") |
-| `target` | string | No | Target branch to merge into (defaults to source's parent branch) |
-| `strategy` | string | No | Conflict resolution strategy for non-fast-forward merges. Defaults to `take-both`. Options: `take-both`, `abort`, `take-source`, `take-branch` |
+| `plan.source.branch` | string | Yes | Source branch to merge from (e.g., "feature-x") |
+| `plan.source.expected` | string (CID) | Yes | Commit head the caller observed for source. Stale value → `409 Conflict`. |
+| `plan.target.branch` | string | Yes | Target branch to merge into (e.g., "dev") |
+| `plan.target.expected` | string (CID) | Yes | Commit head the caller observed for target. Stale value → `409 Conflict`. |
+| `plan.baseStrategy` | string | Yes | Fallback strategy for conflicts not addressed by `resolutions`. One of `take-source`, `take-target`, `take-both`, `abort`. |
+| `plan.resolutions` | array | No | (v1: must be empty — feature is staged.) |
+| `plan.additionalPatch` | object | No | (v1: must be empty — feature is staged.) |
 
-**Conflict strategies:**
+A stray top-level `ledger` field (the old shape) is rejected with `400` so callers who haven't migrated fail loudly.
+
+**Base strategies:**
 
 | Strategy | Behavior |
 |----------|----------|
-| `take-both` | Keep source flakes as-is, so both source and target values can coexist |
-| `abort` | Fail if conflicts are detected; no merge commit is created |
 | `take-source` | Source wins: keep source flakes and retract target's conflicting values |
-| `take-branch` | Target wins: drop source flakes for conflicting keys |
-
-`skip` is a rebase-only strategy and is not supported for non-fast-forward merges.
+| `take-target` | Target wins: drop source flakes for conflicting keys (renamed from `take-branch`) |
+| `take-both` | Keep both values; source and target results coexist |
+| `abort` | Fail if conflicts are detected; no merge commit is created |
 
 **Response body (200 OK):**
 
@@ -1901,6 +1907,7 @@ POST /fluree/merge
   "source": "feature-x",
   "fast_forward": false,
   "new_head_t": 8,
+  "new_head_id": "bagaybqabciq...",
   "commits_copied": 3,
   "conflict_count": 1,
   "strategy": "take-both"
@@ -1913,36 +1920,37 @@ POST /fluree/merge
 | `target` | string | Target branch name |
 | `source` | string | Source branch name |
 | `fast_forward` | bool | Whether this merge advanced the target directly to the source HEAD |
-| `new_head_t` | number | New commit HEAD transaction time of the target |
+| `new_head_t` | number | New commit HEAD transaction time of the target. For multi-parent merge commits this is `max(source_t, target_t) + 1`, which can exceed `previous_target_t + 1`. |
+| `new_head_id` | string (CID) | New commit HEAD CID. Useful as `expected` for a subsequent retry. |
 | `commits_copied` | number | Number of commit blobs copied to the target namespace |
-| `conflict_count` | number | Number of overlapping `(s, p, g)` keys detected during a non-fast-forward merge |
-| `strategy` | string | Conflict strategy used for a non-fast-forward merge. Omitted for fast-forward merges |
+| `conflict_count` | number | Number of real conflicts detected (refined detection — see above) |
+| `strategy` | string | Strategy used for a non-fast-forward merge. Omitted for fast-forward merges |
 
 **Status codes:**
 
 - `200 OK` - Merge completed successfully
-- `400 Bad Request` - Source has no branch point (e.g., main), self-merge, unknown strategy, or unsupported merge strategy
+- `400 Bad Request` - Plan shape invalid (e.g., legacy `{ ledger, source, ... }` body, unknown `baseStrategy`, non-empty staged-feature fields)
 - `404 Not Found` - Ledger or branch does not exist
-- `409 Conflict` - Merge aborted due to conflicts when using the `abort` strategy, or the target HEAD changed during commit publishing
+- `409 Conflict` - Stale `source.expected` or `target.expected`, fast-forward CAS race with a concurrent writer, or `abort` strategy with conflicts present
 - `500 Internal Server Error` - Server error
 
 **Examples:**
 
 ```bash
-# Merge feature-x into its parent (inferred from branch point)
-curl -X POST http://localhost:8090/v1/fluree/merge \
-  -H "Content-Type: application/json" \
-  -d '{"ledger": "mydb", "source": "feature-x"}'
+# 1) Capture the source and target heads.
+SOURCE_HEAD=$(curl -s http://localhost:8090/v1/fluree/info/mydb:feature-x | jq -r .commitId)
+TARGET_HEAD=$(curl -s http://localhost:8090/v1/fluree/info/mydb:dev      | jq -r .commitId)
 
-# Merge dev into main (explicit target)
-curl -X POST http://localhost:8090/v1/fluree/merge \
+# 2) Post the plan against the path-bound ledger.
+curl -X POST "http://localhost:8090/v1/fluree/merge/mydb" \
   -H "Content-Type: application/json" \
-  -d '{"ledger": "mydb", "source": "dev", "target": "main"}'
-
-# Non-fast-forward merge with source-winning conflict resolution
-curl -X POST http://localhost:8090/v1/fluree/merge \
-  -H "Content-Type: application/json" \
-  -d '{"ledger": "mydb", "source": "dev", "target": "main", "strategy": "take-source"}'
+  -d "{
+    \"plan\": {
+      \"source\": { \"branch\": \"feature-x\", \"expected\": \"$SOURCE_HEAD\" },
+      \"target\": { \"branch\": \"dev\",       \"expected\": \"$TARGET_HEAD\" },
+      \"baseStrategy\": \"take-both\"
+    }
+  }"
 ```
 
 ### GET /fluree/merge-preview/{ledger}

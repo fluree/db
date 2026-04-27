@@ -6,7 +6,11 @@
 
 mod support;
 
-use fluree_db_api::{ConflictStrategy, FlureeBuilder};
+use fluree_db_api::merge_plan::{BaseStrategy, BranchSelector, MergePlan};
+use fluree_db_api::{
+    Base64Bytes, ConflictStrategy, ExportCommitsRequest, FlureeBuilder, IndexConfig,
+    PushCommitsRequest, QueryConnectionOptions,
+};
 use serde_json::json;
 
 /// Extract sorted name strings from query result rows.
@@ -224,6 +228,84 @@ async fn merge_into_non_parent_allowed() {
         .expect("merging into non-parent should succeed when fast-forwardable");
 
     assert!(report.fast_forward);
+}
+
+/// Diverged sibling-branch merge: both branches forked from main and each
+/// has its own commits since. Their common ancestor is reachable only by
+/// fanning out to either side's namespace, so the merge engine has to use
+/// a union content store for the ancestor walk (mirroring what
+/// `merge_preview` does). Without that, `find_common_ancestor` over
+/// `source_store` alone can't read the target HEAD's blob and the merge
+/// fails — a regression preview wouldn't expose because preview already
+/// builds the union.
+#[tokio::test]
+async fn merge_between_diverged_sibling_branches() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "feature", None, None)
+        .await
+        .unwrap();
+
+    // Diverge both siblings on disjoint subjects so the merge has work
+    // (it's no longer a no-op fast-forward).
+    let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .insert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]
+            }),
+        )
+        .await
+        .unwrap();
+    let feature_ledger = fluree.ledger("mydb:feature").await.unwrap();
+    fluree
+        .insert(
+            feature_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:carol", "ex:name": "Carol"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Merge dev → feature. Both diverged off main; the common ancestor is
+    // main's HEAD at branch time, which lives in main's namespace and is
+    // reachable from feature via its parent chain — but only through the
+    // union store. A source-only ancestor walk wouldn't be able to load
+    // feature's HEAD blob and would fail before getting to the ancestor.
+    let report = fluree
+        .merge_branch("mydb", "dev", Some("feature"), ConflictStrategy::TakeBoth)
+        .await
+        .expect("diverged sibling merge must compute the common ancestor via the union store");
+
+    assert!(
+        !report.fast_forward,
+        "branches diverged after the common ancestor; not a FF"
+    );
+    // Both writes survive the merge.
+    let names = query_all_names(&fluree, "mydb:feature").await;
+    assert!(names.contains(&"Alice".to_string()));
+    assert!(names.contains(&"Bob".to_string()));
+    assert!(names.contains(&"Carol".to_string()));
 }
 
 /// General merge when the target has diverged (not fast-forwardable).
@@ -748,4 +830,574 @@ async fn merge_explicit_target_matches_parent() {
 
     let names = query_all_names(&fluree, "mydb:main").await;
     assert_eq!(names, vec!["Alice", "Bob"]);
+}
+
+// =============================================================================
+// Plan-driven merge (Fluree::merge with MergePlan)
+// =============================================================================
+
+#[tokio::test]
+async fn merge_plan_take_source_takes_source_values() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+
+    let main_ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:age": 30}]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    // Diverge: dev sets age=31, main sets age=32 (real conflict).
+    let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .upsert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:age": 31}]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .upsert(
+            main_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:age": 32}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Capture expected heads via direct nameservice lookup.
+    let source_head = fluree
+        .ledger("mydb:dev")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .expect("dev has commits");
+    let target_head = fluree
+        .ledger("mydb:main")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .expect("main has commits");
+    let target_t = fluree.ledger("mydb:main").await.unwrap().t();
+    let source_t = fluree.ledger("mydb:dev").await.unwrap().t();
+
+    let plan = MergePlan {
+        source: BranchSelector {
+            branch: "dev".into(),
+            expected: source_head,
+            at: None,
+        },
+        target: BranchSelector {
+            branch: "main".into(),
+            expected: target_head,
+            at: None,
+        },
+        base_strategy: BaseStrategy::TakeSource,
+        resolutions: vec![],
+        additional_patch: None,
+    };
+
+    let report = fluree.merge("mydb", plan).await.unwrap();
+
+    assert!(!report.fast_forward, "branches diverged");
+    assert_eq!(report.conflict_count, 1, "one real conflict");
+    // Merge commit's t = max(source_t, target_t) + 1.
+    let expected_merge_t = source_t.max(target_t) + 1;
+    assert_eq!(
+        report.new_head_t, expected_merge_t,
+        "merge commit at max(source_t, target_t) + 1 (P2 merge_t flow-through)"
+    );
+}
+
+#[tokio::test]
+async fn merge_plan_stale_source_head_returns_branch_conflict() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .insert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Capture HEADs, then advance dev so the captured source head is stale.
+    let stale_source = fluree
+        .ledger("mydb:dev")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .expect("dev head");
+    let target_head = fluree
+        .ledger("mydb:main")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .expect("main head");
+
+    let dev_ledger2 = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .insert(
+            dev_ledger2,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:carol", "ex:name": "Carol"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let plan = MergePlan {
+        source: BranchSelector {
+            branch: "dev".into(),
+            expected: stale_source,
+            at: None,
+        },
+        target: BranchSelector {
+            branch: "main".into(),
+            expected: target_head,
+            at: None,
+        },
+        base_strategy: BaseStrategy::TakeSource,
+        resolutions: vec![],
+        additional_patch: None,
+    };
+
+    let err = fluree
+        .merge("mydb", plan)
+        .await
+        .expect_err("stale source HEAD must reject");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("stale source HEAD"),
+        "error should mention stale source HEAD; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn merge_plan_resolutions_not_yet_implemented_returns_400() {
+    use fluree_db_api::merge_plan::{MergeResolution, ResolutionAction, ResolutionKey};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    let source_head = fluree
+        .ledger("mydb:dev")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .expect("dev head");
+    let target_head = fluree
+        .ledger("mydb:main")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .expect("main head");
+
+    let plan = MergePlan {
+        source: BranchSelector {
+            branch: "dev".into(),
+            expected: source_head,
+            at: None,
+        },
+        target: BranchSelector {
+            branch: "main".into(),
+            expected: target_head,
+            at: None,
+        },
+        base_strategy: BaseStrategy::TakeSource,
+        resolutions: vec![MergeResolution {
+            key: ResolutionKey {
+                subject: "ex:alice".into(),
+                predicate: "ex:name".into(),
+                graph: None,
+            },
+            action: ResolutionAction::TakeSource,
+            custom_patch: None,
+        }],
+        additional_patch: None,
+    };
+
+    let err = fluree
+        .merge("mydb", plan)
+        .await
+        .expect_err("resolutions are not yet implemented");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("resolutions is not yet implemented"),
+        "error should call out the staged feature; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn merge_plan_fast_forward_cas_rejects_concurrent_target_advance() {
+    // Plan-driven fast-forward merges must CAS the publish against the
+    // target HEAD captured at plan-validation time. A concurrent transaction
+    // that advances target between the validation read and the publish must
+    // surface as a `BranchConflict`, not silently overwrite the new state.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+
+    let main_ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    // dev gets a unique commit so the merge has something to fast-forward.
+    let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .insert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Capture the heads the plan will reference.
+    let source_head = fluree
+        .ledger("mydb:dev")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .expect("dev head");
+    let stale_target = fluree
+        .ledger("mydb:main")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .expect("main head");
+
+    // Simulate a concurrent transaction on main: target advances between
+    // when the caller observed `stale_target` and when the merge would
+    // publish.
+    fluree
+        .insert(
+            main_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:carol", "ex:name": "Carol"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let plan = MergePlan {
+        source: BranchSelector {
+            branch: "dev".into(),
+            expected: source_head,
+            at: None,
+        },
+        target: BranchSelector {
+            branch: "main".into(),
+            expected: stale_target,
+            at: None,
+        },
+        base_strategy: BaseStrategy::TakeSource,
+        resolutions: vec![],
+        additional_patch: None,
+    };
+
+    let err = fluree
+        .merge("mydb", plan)
+        .await
+        .expect_err("stale target HEAD must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("stale target HEAD"),
+        "expected stale-target error from the plan-validation pre-check; got: {msg}"
+    );
+}
+
+// ============================================================================
+// Replication round-trip: take-target merge does not leak source value
+// ============================================================================
+
+/// Topologically sort export commits so each commit follows its in-batch
+/// parents. Required because `export_commit_range` walks the DAG via a
+/// stack-based DFS and emits commits newest-first; a simple `reverse()`
+/// produces a valid order for linear chains but not for DAG-shaped exports
+/// where a sibling-branch commit can land before its parent.
+fn topo_sort_for_push(commits: Vec<Base64Bytes>) -> Vec<Base64Bytes> {
+    use std::collections::HashSet;
+
+    let parsed: Vec<(String, Vec<String>, Base64Bytes)> = commits
+        .into_iter()
+        .map(|b| {
+            let bytes = b.0.clone();
+            let commit = fluree_db_core::commit::codec::read_commit(&bytes)
+                .expect("commit bytes should decode");
+            let digest = fluree_db_core::sha256_hex(&bytes);
+            let parents: Vec<String> = commit
+                .parents
+                .iter()
+                .map(fluree_db_core::ContentId::digest_hex)
+                .collect();
+            (digest, parents, b)
+        })
+        .collect();
+
+    let in_batch: HashSet<String> = parsed.iter().map(|(d, _, _)| d.clone()).collect();
+    let mut emitted: HashSet<String> = HashSet::new();
+    let mut output: Vec<Base64Bytes> = Vec::with_capacity(parsed.len());
+    let mut remaining = parsed;
+
+    while !remaining.is_empty() {
+        let before = remaining.len();
+        let mut still_remaining: Vec<(String, Vec<String>, Base64Bytes)> =
+            Vec::with_capacity(before);
+        for (d, parents, b) in remaining {
+            let ready = parents
+                .iter()
+                .all(|p| !in_batch.contains(p) || emitted.contains(p));
+            if ready {
+                output.push(b);
+                emitted.insert(d);
+            } else {
+                still_remaining.push((d, parents, b));
+            }
+        }
+        assert!(
+            still_remaining.len() < before,
+            "topo sort: no progress; cycle in batch?"
+        );
+        remaining = still_remaining;
+    }
+    output
+}
+
+/// Query `ex:alice`'s `ex:age` on the given ledger. Returns `None` if absent.
+async fn query_alice_age(fluree: &support::MemoryFluree, ledger_id: &str) -> Option<i64> {
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": ["?age"],
+        "where": {"@id": "ex:alice", "ex:age": "?age"}
+    });
+    let result = support::query_jsonld(fluree, &ledger, &query)
+        .await
+        .unwrap();
+    let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+    rows.as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|row| match row {
+            serde_json::Value::Number(n) => n.as_i64(),
+            serde_json::Value::Array(a) => a.first().and_then(serde_json::Value::as_i64),
+            _ => None,
+        })
+}
+
+/// **Replication round-trip lock-down for the DAG replay semantics.**
+///
+/// Setup: source ledger has main and dev branches; both modify `ex:alice
+/// ex:age` to different values. A `take-target` merge of dev → main keeps
+/// main's value and intentionally drops dev's. Source main therefore
+/// resolves to the target value.
+///
+/// We then export source main's commits (which pulls in dev's ancestry
+/// transitively via the merge commit's `parents[1]`) and import the whole
+/// DAG into a fresh target ledger. The target's main, after import, must
+/// reflect the same merged value as source's main. If push/import were to
+/// linearly apply every commit's flakes (the bug `primary_chain_in_batch`
+/// fixed), dev's pre-merge value would leak into target novelty.
+///
+/// This test exercises three architectural decisions in one assertion:
+/// 1. Refined conflict detection picks dev's update as a real conflict.
+/// 2. Merge commit at `t = max(source_t, target_t) + 1` flows through to
+///    the commit blob and through the import path's staged-`t` override.
+/// 3. The primary-chain skip in `apply_pushed_commits_to_state` keeps
+///    source-ancestry flakes out of target novelty during replay.
+#[tokio::test]
+async fn take_target_merge_replication_does_not_leak_source_value() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // ---- Source ledger: main + dev with a real conflict, take-target merge.
+    let src_id = "src:main";
+    let main_ledger = fluree
+        .create_ledger(src_id)
+        .await
+        .expect("create source ledger");
+    let main_ledger = fluree
+        .insert(
+            main_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:age": 30}]
+            }),
+        )
+        .await
+        .expect("insert base alice/age=30")
+        .ledger;
+
+    fluree
+        .create_branch("src", "dev", None, None)
+        .await
+        .expect("branch dev");
+
+    // dev: alice/age = 99 (this value MUST be dropped by take-target).
+    let dev_ledger = fluree.ledger("src:dev").await.unwrap();
+    fluree
+        .upsert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:age": 99}]
+            }),
+        )
+        .await
+        .expect("dev upsert age=99");
+
+    // main: alice/age = 40 (this value MUST survive take-target).
+    fluree
+        .upsert(
+            main_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:age": 40}]
+            }),
+        )
+        .await
+        .expect("main upsert age=40");
+
+    // Merge dev → main with TakeBranch (== plan-schema take-target). Target
+    // wins, so source's age=99 is dropped from the merge commit.
+    let report = fluree
+        .merge_branch("src", "dev", Some("main"), ConflictStrategy::TakeBranch)
+        .await
+        .expect("take-target merge");
+    assert!(
+        !report.fast_forward,
+        "branches diverged; expected general merge"
+    );
+    assert_eq!(report.conflict_count, 1, "real conflict on alice/age");
+
+    // Sanity: source main resolved to target's value.
+    fluree.disconnect_ledger(src_id).await;
+    let src_age = query_alice_age(&fluree, src_id).await;
+    assert_eq!(
+        src_age,
+        Some(40),
+        "source main after take-target merge should be target's 40, not source's 99"
+    );
+
+    // ---- Export source main's full DAG (includes dev ancestry via parents).
+    let src_handle = fluree.ledger_cached(src_id).await.expect("source handle");
+    let export = fluree
+        .export_commit_range(
+            &src_handle,
+            &ExportCommitsRequest {
+                cursor: None,
+                cursor_id: None,
+                limit: Some(100),
+            },
+        )
+        .await
+        .expect("export source main");
+    assert!(
+        export.commits.len() >= 4,
+        "export should include both branches' history + the merge commit; got {}",
+        export.commits.len()
+    );
+
+    // ---- Push the DAG (topologically sorted) to a fresh target ledger.
+    let tgt_id = "tgt:main";
+    fluree
+        .create_ledger(tgt_id)
+        .await
+        .expect("create target ledger");
+    let tgt_handle = fluree.ledger_cached(tgt_id).await.expect("target handle");
+
+    let push_commits = topo_sort_for_push(export.commits);
+    fluree
+        .push_commits_with_handle(
+            &tgt_handle,
+            PushCommitsRequest {
+                commits: push_commits,
+                blobs: export.blobs,
+            },
+            &QueryConnectionOptions::default(),
+            &IndexConfig::default(),
+        )
+        .await
+        .expect("push DAG to fresh target");
+
+    // ---- Verify: target's main shows the merged result; dev's value did
+    //      NOT leak through DAG replay.
+    fluree.disconnect_ledger(tgt_id).await;
+    let tgt_age = query_alice_age(&fluree, tgt_id).await;
+    assert_eq!(
+        tgt_age,
+        Some(40),
+        "target ledger after replication MUST reflect take-target merge result; \
+         source value (99) leaked through DAG replay if this fails"
+    );
 }

@@ -307,7 +307,7 @@ fluree branch merge <SOURCE> [OPTIONS]
 |--------|-------------|
 | `--ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--target <BRANCH>` | Target branch to merge into (defaults to source's parent branch) |
-| `--strategy <STRATEGY>` | Conflict resolution strategy (default: `take-both`). Options: `take-both`, `abort`, `take-source`, `take-branch`. |
+| `--strategy <STRATEGY>` | Conflict resolution strategy (default: `take-both`). Options: `take-both`, `abort`, `take-source`, `take-target` (also accepts the legacy alias `take-branch`). |
 | `--remote <REMOTE>` | Execute against a remote server |
 
 **Description:**
@@ -317,6 +317,10 @@ Merges a source branch into a target branch. When the target hasn't advanced sin
 When `--target` is omitted, the merge target is inferred from the source branch's parent (the branch it was created from).
 
 After a successful merge, the source branch remains intact and can continue to receive new transactions and be merged again. Only the new commits since the last merge (or branch creation) are copied.
+
+Conflict detection is **refined**: a `(s, p, g)` key is reported as a conflict only when both branches modified it relative to the merge base **and** their resulting object sets differ. Two branches that independently asserted the exact same triple are not flagged. See [`docs/design/merge-custom.md`](../design/merge-custom.md) for the full plan-driven design that this command sits on top of.
+
+In `--remote` mode the CLI looks up source and target heads first, builds a `MergePlan` with those heads as `expected` (staleness guards), and posts to `POST /v1/fluree/merge/{ledger}`. A concurrent advance between the lookup and the publish is detected by the server's CAS-protected publish and surfaces as a `409 Conflict` (the CLI prints the actual head). Re-running the command captures the new heads and tries again.
 
 **Examples:**
 

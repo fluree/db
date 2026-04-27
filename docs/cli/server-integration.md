@@ -156,10 +156,14 @@ Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
 
 ### `fluree branch merge --remote <name>` (admin-protected)
 
-- `POST {api_base_url}/merge` with `{ ledger, source, target?, strategy? }`
+- `POST {api_base_url}/merge/*ledger` with `{ "plan": MergePlan }`
 
-Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
-[Merge Contract](#merge-contract).
+Same admin auth bracket as `/create`, `/drop`, `/reindex`. The CLI looks up
+source and target heads via `/info/{ledger}:{branch}` first and pins them in
+`plan.source.expected` / `plan.target.expected` so the server's CAS-protected
+publish can detect a concurrent advance and return `409 Conflict`. See
+[Merge Contract](#merge-contract) for the full plan shape, status codes, and
+error mapping.
 
 ### `fluree branch diff` (read-only merge preview)
 
@@ -420,9 +424,9 @@ current asserted values in the same shape returned by `GET /show/*ledger`;
 `resolution` is a label only. `mergeable` is `false` when the chosen strategy
 would abort (currently `strategy=abort` with one or more conflicts). It is not
 full transaction validation for constraints that might fail during the real
-merge commit. `mergeable=true` does not guarantee a subsequent `POST /merge`
-will succeed; it only reflects the conflict/strategy interaction at preview
-time.
+merge commit. `mergeable=true` does not guarantee a subsequent
+`POST /merge/{ledger}` will succeed; it only reflects the conflict/strategy
+interaction at preview time.
 
 ### Error responses
 
@@ -760,23 +764,64 @@ The CLI's `print_rebase_result` reads `fast_forward`, `branch`, `source_head_t`,
 `fluree branch merge <source> --remote <name>` issues:
 
 ```
-POST {api_base_url}/merge
+POST {api_base_url}/merge/*ledger
 Content-Type: application/json
 
 {
-  "ledger": "mydb",
-  "source": "feature-x",
-  "target": "main",
-  "strategy": "take-both"
+  "plan": {
+    "source": { "branch": "feature-x", "expected": "<source-head-cid>" },
+    "target": { "branch": "main",      "expected": "<target-head-cid>" },
+    "baseStrategy": "take-both"
+  }
 }
 ```
 
-| Field | Type | Required | Server default | Description |
-|-------|------|----------|----------------|-------------|
-| `ledger` | string | Yes | — | Ledger name without branch suffix. |
-| `source` | string | Yes | — | Branch to merge **from**. Must have at least one commit and a `source_branch`. |
-| `target` | string | No | `source.source_branch` | Branch to merge **into**. Defaults to the source's parent branch. Must not equal `source`. |
-| `strategy` | string | No | `"take-both"` | One of `take-both`, `abort`, `take-source`, `take-branch`. Parsed by `ConflictStrategy::from_str_name`. |
+The full plan schema, semantics, and the four-step `preview → query →
+validate → commit` flow it's part of are specified in
+[`docs/design/merge-custom.md`](../design/merge-custom.md). What follows is
+the wire contract for the **commit** operation that's wired today; the
+remaining three operations are staged.
+
+### Path
+
+| Segment | Description |
+|---------|-------------|
+| `*ledger` | Ledger name without branch suffix (e.g., `"mydb"`). Greedy tail capture, identical to other ledger-tailed routes. |
+
+A stray top-level `ledger` field in the body is rejected with `400` so
+callers using the retired `{ ledger, source, target, strategy }` shape fail
+loudly.
+
+### Body
+
+```jsonc
+{
+  "plan": {
+    "source": {
+      "branch": "feature-x",
+      "expected": "<source-head-cid>"          // required staleness guard
+      // "at": "<CommitRef>"                    // reserved; must be absent in v1
+    },
+    "target": {
+      "branch": "main",
+      "expected": "<target-head-cid>"
+    },
+    "baseStrategy": "take-source",             // take-source | take-target | take-both | abort
+    "resolutions": [],                         // v1: must be empty
+    "additionalPatch": null                    // v1: must be empty/absent
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `plan.source.branch` | string | Yes | Branch to merge **from**. |
+| `plan.source.expected` | string (CID) | Yes | Source HEAD captured by the caller. Stale value → `409`. |
+| `plan.target.branch` | string | Yes | Branch to merge **into**. Must differ from `source.branch`. |
+| `plan.target.expected` | string (CID) | Yes | Target HEAD captured by the caller. Stale value → `409`. |
+| `plan.baseStrategy` | enum | Yes | Fallback strategy for conflicts not addressed by `resolutions`. |
+| `plan.resolutions` | array | No | v1: must be empty (rejected with `400` otherwise). Per-conflict actions land in a follow-up. |
+| `plan.additionalPatch` | object | No | v1: must be empty/absent (rejected with `400` otherwise). Plan-level edits land in a follow-up. |
 
 ### Auth
 
@@ -787,15 +832,23 @@ Admin-protected (same bracket as `/branch`, `/drop-branch`, `/rebase`,
 
 - Computes the common ancestor between `source` HEAD and `target` HEAD using
   a `BranchedContentStore` so sibling branches off `main` work.
-- If `target` HEAD == ancestor, performs a **fast-forward merge**: copies the
-  source's unique commit blobs into the target's namespace and advances the
-  target HEAD. No conflict resolution runs. `fast_forward: true` is reported.
-- Otherwise, performs a **general merge**: stages the union of source and
-  target deltas, resolves overlapping `(s, p, g)` keys via `strategy`, and
-  writes a single new commit on the target. `fast_forward: false` is
-  reported. If `strategy == "abort"` and conflicts exist, the merge fails
-  with `409 BranchConflict` and the target is rolled back to its
-  pre-merge nameservice snapshot.
+- If `target` HEAD == ancestor, performs a **fast-forward merge**: copies
+  the source's unique commit blobs into the target's namespace and advances
+  the target HEAD via a CAS-protected publish against the pre-merge target
+  ref. A concurrent advance between the nameservice read and this publish
+  surfaces as `409` with `err:db/CommitConflict`. `fast_forward: true` is
+  reported.
+- Otherwise, performs a **general merge**: detects real conflicts via
+  delta-key intersection plus object-set comparison (convergent edits — both
+  branches asserting identical values — are **not** reported as conflicts),
+  applies `baseStrategy` to each, restamps every resulting flake at
+  `merge_t = max(source_t, target_t) + 1`, and writes a multi-parent commit
+  on the target. The commit publish is also CAS-protected. If
+  `baseStrategy == "abort"` and conflicts exist, fails with `409`.
+- The merge engine no longer rolls back the target nameservice on error.
+  CAS-only publishes mean any error path either advanced HEAD atomically or
+  did nothing; the legacy `reset_head` rollback was force-write and would
+  clobber a winning concurrent writer.
 
 ### Response (`200 OK`)
 
@@ -806,6 +859,7 @@ Admin-protected (same bracket as `/branch`, `/drop-branch`, `/rebase`,
   "source": "feature-x",
   "fast_forward": false,
   "new_head_t": 22,
+  "new_head_id": "bagaybqabciq...",
   "commits_copied": 4,
   "conflict_count": 1,
   "strategy": "take-both"
@@ -815,26 +869,24 @@ Admin-protected (same bracket as `/branch`, `/drop-branch`, `/rebase`,
 | Field | Type | Notes |
 |-------|------|-------|
 | `ledger_id` | string | Full `ledger:branch` identifier of the **target** after merge. |
-| `target` | string | Resolved target branch (echoed; reflects the default if the request omitted it). |
-| `source` | string | Source branch name (echoed). |
+| `target` | string | Resolved target branch. |
+| `source` | string | Source branch name. |
 | `fast_forward` | bool | `true` for a fast-forward merge. |
-| `new_head_t` | integer | New commit `t` of the target after merge. |
-| `commits_copied` | integer | Number of commit blobs copied into the target's namespace. For fast-forward this equals the source's unique commits; for general merge this includes the synthesized merge commit. |
-| `conflict_count` | integer | Number of conflicts resolved. `0` for fast-forward. |
+| `new_head_t` | integer | New commit `t` of the target after merge. For multi-parent merge commits this is `max(source_t, target_t) + 1`, which can exceed `previous_target_t + 1`. |
+| `new_head_id` | string (CID) | New commit HEAD CID. Useful as the `expected` value on a subsequent retry or follow-up merge. |
+| `commits_copied` | integer | Number of commit blobs copied into the target's namespace. |
+| `conflict_count` | integer | Number of real conflicts resolved (refined detection). `0` for fast-forward. |
 | `strategy` | string \| omitted | Strategy used. Omitted (via `skip_serializing_if`) for fast-forward merges where strategy doesn't apply. |
-
-The CLI's `print_merge_result` reads `source`, `target`, `new_head_t`,
-`commits_copied`, `fast_forward`, and `conflict_count`.
 
 ### Error responses
 
-| Status | When |
-|--------|------|
-| `400` | Source has no `source_branch` (a root branch like `main` cannot be the source); `source == resolved_target`; source has no commits; unknown / unsupported strategy; malformed JSON body. |
-| `401` / `403` | Admin token required and absent/invalid. |
-| `404` | Source or target branch not found. |
-| `409` | `BranchConflict` — currently raised when `strategy=abort` and conflicts exist. |
-| `5xx` | Storage / nameservice / commit-write errors. |
+| Status | `@type` | When |
+|--------|---------|------|
+| `400` | `err:db/BadRequest` | Plan shape invalid (legacy `{ ledger, source, ... }` body, unknown `baseStrategy`, non-empty staged-feature fields, source has no parent branch and no target supplied, source == target, source has no commits). |
+| `401` / `403` | `err:api/Unauthorized` / `err:api/AccessDenied` | Admin token required and absent/invalid. |
+| `404` | `err:db/LedgerNotFound` | Source or target branch not found. |
+| `409` | `err:db/CommitConflict` | Stale `source.expected` or `target.expected`; fast-forward CAS race with a concurrent writer; `baseStrategy=abort` with conflicts present. |
+| `5xx` | `err:db/Internal` | Storage / nameservice / commit-write errors. |
 
 ### Reference implementation
 
@@ -842,9 +894,12 @@ The CLI's `print_merge_result` reads `source`, `target`, `new_head_t`,
 |---------|-------------------|
 | HTTP route + auth | `fluree-db-server/src/routes/ledger.rs::merge` |
 | Request / response shapes | `MergeBranchRequest`, `MergeBranchResponse` (same file) |
-| Underlying API | `fluree_db_api::Fluree::merge_branch` (`fluree-db-api/src/merge.rs`) |
+| Plan-driven entry point | `fluree_db_api::Fluree::merge` (`fluree-db-api/src/merge.rs`) |
+| Plan types (wire shape) | `fluree_db_api::merge_plan` (`fluree-db-api/src/merge_plan.rs`) |
+| Legacy strategy entry point | `fluree_db_api::Fluree::merge_branch` (same shared backend) |
 | Report struct | `fluree_db_api::MergeReport` |
-| Strategy enum | `fluree_db_api::ConflictStrategy` |
+| Conflict detection | `fluree_db_api::merge::detect_conflicts` (delta-key intersection + object-set comparison) |
+| `merge_t` plumbing | `fluree_db_transact::CommitOpts::merge_t`; `fluree_db_ledger::StagedLedger::new_with_t` |
 
 ## Replication Auth Contract
 

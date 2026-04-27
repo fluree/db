@@ -171,6 +171,15 @@ pub struct StagedLedger {
     staged: StagedOverlay,
     /// Unique epoch for cache keys (different from base novelty)
     staged_epoch: u64,
+    /// Logical `t` represented by this staged view.
+    ///
+    /// For ordinary single-parent transactions this is `base.t() + 1`. For
+    /// multi-parent merge commits the merge engine supplies an explicit
+    /// `merge_t = max(source_t, target_t) + 1`, which can exceed
+    /// `base.t() + 1`. Threading the actual `t` through avoids
+    /// mid-flight inconsistency between staged-view queries and the eventual
+    /// commit header — both see the same time.
+    staged_t: i64,
 }
 
 impl StagedLedger {
@@ -179,6 +188,10 @@ impl StagedLedger {
     /// `reverse_graph` maps graph Sids to GraphIds for per-graph filtering.
     /// Pass an empty map when all flakes are default-graph only.
     ///
+    /// Equivalent to [`Self::new_with_t`] with `staged_t = base.t() + 1`.
+    /// Use [`Self::new_with_t`] when staging a multi-parent merge so the
+    /// view and the eventual commit agree on `t`.
+    ///
     /// Returns `Err` if any staged flake has a graph Sid not present in
     /// `reverse_graph` (programming error — the map must be complete).
     pub fn new(
@@ -186,11 +199,36 @@ impl StagedLedger {
         flakes: Vec<Flake>,
         reverse_graph: &HashMap<Sid, GraphId>,
     ) -> Result<Self, LedgerError> {
+        let staged_t = base.t() + 1;
+        Self::new_with_t(base, flakes, reverse_graph, staged_t)
+    }
+
+    /// Build a staged ledger with an explicit `staged_t`.
+    ///
+    /// `staged_t` must be strictly greater than `base.t()`. Used by the
+    /// merge engine to stage a multi-parent commit at
+    /// `max(source_t, target_t) + 1`. For ordinary transactions, prefer
+    /// [`Self::new`] (which derives `staged_t` from `base`).
+    pub fn new_with_t(
+        base: LedgerState,
+        flakes: Vec<Flake>,
+        reverse_graph: &HashMap<Sid, GraphId>,
+        staged_t: i64,
+    ) -> Result<Self, LedgerError> {
+        if staged_t <= base.t() {
+            return Err(LedgerError::Core(fluree_db_core::Error::invalid_index(
+                format!(
+                    "staged_t ({staged_t}) must be strictly greater than base.t ({})",
+                    base.t()
+                ),
+            )));
+        }
         let staged_epoch = base.novelty.epoch + 1;
         Ok(Self {
             staged: StagedOverlay::from_flakes(flakes, reverse_graph)?,
             staged_epoch,
             base,
+            staged_t,
         })
     }
 
@@ -238,14 +276,23 @@ impl StagedLedger {
 
     /// The effective as-of time for this staged view.
     ///
-    /// When staged flakes exist, returns `base.t() + 1` (matching the `t`
-    /// assigned to staged flakes in `stage.rs`). Otherwise returns `base.t()`.
+    /// Returns the `staged_t` supplied at construction (default
+    /// `base.t() + 1`, or an explicit value via [`Self::new_with_t`] for
+    /// multi-parent merges) **regardless of whether staged flakes exist**.
+    ///
+    /// Why unconditional: a `take-target` no-op merge stages zero flakes but
+    /// its commit will still be at `merge_t`. Returning `base.t()` for the
+    /// empty case would let query/validate observe a different `t` than the
+    /// eventual commit — exactly the inconsistency the explicit-`t`
+    /// constructor was added to prevent.
+    ///
+    /// For non-merge transactions the behavior is unchanged in practice:
+    /// callers that build empty staged views via [`Self::new`] discard them
+    /// without observing `staged_t()` (no-op transactions don't reach
+    /// commit), and callers that do observe it see `base.t() + 1`, which is
+    /// also harmless because the overlay contributes nothing.
     pub fn staged_t(&self) -> i64 {
-        if self.has_staged() {
-            self.base.t() + 1
-        } else {
-            self.base.t()
-        }
+        self.staged_t
     }
 
     /// Create a `GraphDbRef` bundling snapshot, graph id, overlay, and time.
@@ -440,6 +487,67 @@ mod tests {
         let (base, flakes) = view.into_parts();
         assert_eq!(base.ledger_id(), "test:main");
         assert_eq!(flakes.len(), 1);
+    }
+
+    #[test]
+    fn test_empty_view_returns_override_staged_t() {
+        // Take-target no-op merges produce an empty staged view but the
+        // commit will still write at `merge_t`. `staged_t()` must reflect
+        // that, otherwise query/validate during the merge flow observes a
+        // different `t` than the eventual commit.
+        use fluree_db_core::LedgerSnapshot;
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let novelty = Novelty::new(0);
+        let state = LedgerState::new(snapshot, novelty);
+
+        let view = StagedLedger::new_with_t(state, vec![], &HashMap::new(), 7).unwrap();
+        assert!(!view.has_staged());
+        assert_eq!(view.staged_t(), 7, "empty view must report override t");
+    }
+
+    #[test]
+    fn test_new_with_t_overrides_staged_t() {
+        use fluree_db_core::LedgerSnapshot;
+
+        // base.t() == 0 (genesis); merge_t = 7 simulates a merge where the
+        // source branch advanced 7 transactions ahead of the merge base.
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let novelty = Novelty::new(0);
+        let state = LedgerState::new(snapshot, novelty);
+        assert_eq!(state.t(), 0);
+
+        let staged_flakes = vec![make_flake(1, 1, 100, 7)];
+        let view = StagedLedger::new_with_t(state, staged_flakes, &HashMap::new(), 7).unwrap();
+
+        assert_eq!(view.staged_t(), 7);
+    }
+
+    #[test]
+    fn test_new_with_t_rejects_non_monotonic() {
+        use fluree_db_core::LedgerSnapshot;
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let novelty = Novelty::new(0);
+        let state = LedgerState::new(snapshot, novelty);
+
+        // staged_t == base.t() is rejected (must be strictly greater).
+        let result =
+            StagedLedger::new_with_t(state, vec![make_flake(1, 1, 1, 0)], &HashMap::new(), 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_defaults_to_base_t_plus_one() {
+        use fluree_db_core::LedgerSnapshot;
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let novelty = Novelty::new(0);
+        let state = LedgerState::new(snapshot, novelty);
+
+        // Default constructor stamps staged_t = base.t() + 1 = 1.
+        let view = StagedLedger::new(state, vec![make_flake(1, 1, 1, 1)], &HashMap::new()).unwrap();
+        assert_eq!(view.staged_t(), 1);
     }
 
     #[test]

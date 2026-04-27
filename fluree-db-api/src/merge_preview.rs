@@ -13,15 +13,13 @@
 use crate::error::{ApiError, Result};
 use crate::format::iri::IriCompactor;
 use crate::graph_commit_builder::resolve_flake;
-use crate::rebase::{current_asserted_for_key, ConflictStrategy};
+use crate::rebase::ConflictStrategy;
 use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{
     find_common_ancestor, walk_commit_summaries, BranchedContentStore, CommitSummary, ConflictKey,
     ContentId, ContentStore, Flake,
 };
 use fluree_db_ledger::LedgerState;
-use fluree_db_novelty::compute_delta_keys;
-use futures::{stream, StreamExt, TryStreamExt};
 use serde::Serialize;
 use std::sync::Arc;
 use tracing::Instrument;
@@ -367,24 +365,49 @@ impl crate::Fluree {
         };
 
         // ---- Conflicts (only if relevant). --------------------------------
+        //
+        // Refined detection (per docs/design/merge-custom.md §Conflict definition): a
+        // conflict at `(s, p, g)` requires both branches to have modified the
+        // key relative to the ancestor **and** their resulting object sets to
+        // differ. Two branches that independently asserted identical values
+        // are not reported as conflicts.
+        //
+        // Implementing the second step requires the queryable source/target
+        // states (for the per-key range read), so we load them up front when
+        // conflict computation is requested.
         let conflicts = if !opts.include_conflicts || fast_forward {
             ConflictSummary::empty()
         } else {
             match (&source_head, &target_head, &ancestor) {
                 (Some(s_head), Some(t_head), Some(anc)) => {
-                    let s_delta_fut =
-                        compute_delta_keys(source_store.clone(), s_head.clone(), anc.t);
-                    let t_delta_fut =
-                        compute_delta_keys(target_branched.clone(), t_head.clone(), anc.t);
-                    let (s_delta, t_delta) = tokio::try_join!(s_delta_fut, t_delta_fut)?;
+                    // Load both queryable states. These are needed even for
+                    // the count-only path now (refined detection compares
+                    // object sets, not just delta-key intersection).
+                    let source_state_fut = self.load_queryable_state_with_store(
+                        source_store.clone(),
+                        source_record.clone(),
+                    );
+                    let target_state_fut = self.load_queryable_state_with_store(
+                        target_branched.clone(),
+                        target_record.clone(),
+                    );
+                    let (source_state, target_state) =
+                        tokio::try_join!(source_state_fut, target_state_fut)?;
 
-                    // Sort lexicographically by (s, p, g) so capped responses
-                    // are stable across builds and across requests — `HashSet`
-                    // intersection order is otherwise unspecified.
+                    let detected = crate::merge::detect_conflicts(
+                        &source_store,
+                        &target_branched,
+                        &source_state,
+                        &target_state,
+                        s_head,
+                        t_head,
+                        anc.t,
+                    )
+                    .await?;
+
+                    let count = detected.len();
                     let mut keys: Vec<ConflictKey> =
-                        s_delta.intersection(&t_delta).cloned().collect();
-                    keys.sort();
-                    let count = keys.len();
+                        detected.iter().map(|c| c.key.clone()).collect();
                     let truncated = match opts.max_conflict_keys {
                         Some(cap) if count > cap => {
                             keys.truncate(cap);
@@ -393,25 +416,19 @@ impl crate::Fluree {
                         _ => false,
                     };
 
-                    let details = if opts.include_conflict_details && !keys.is_empty() {
-                        let source_state_fut = self.load_queryable_state_with_store(
-                            source_store.clone(),
-                            source_record.clone(),
-                        );
-                        let target_state_fut = self.load_queryable_state_with_store(
-                            target_branched.clone(),
-                            target_record.clone(),
-                        );
-                        let (source_state, target_state) =
-                            tokio::try_join!(source_state_fut, target_state_fut)?;
-
-                        build_conflict_details(
-                            &keys,
+                    let details = if opts.include_conflict_details && !detected.is_empty() {
+                        // Reuse the values already loaded by detect_conflicts —
+                        // no second range read per key.
+                        let detected_for_details = match opts.max_conflict_keys {
+                            Some(cap) if count > cap => &detected[..cap],
+                            _ => &detected[..],
+                        };
+                        build_conflict_details_from_detected(
+                            detected_for_details,
                             &source_state,
                             &target_state,
                             &opts.conflict_strategy,
-                        )
-                        .await?
+                        )?
                     } else {
                         Vec::new()
                     };
@@ -461,8 +478,11 @@ impl crate::Fluree {
     }
 }
 
-async fn build_conflict_details(
-    keys: &[ConflictKey],
+/// Build conflict details from already-detected conflicts. Reuses the
+/// source/target flake values that [`crate::merge::detect_conflicts`] loaded,
+/// so this does no additional range reads.
+fn build_conflict_details_from_detected(
+    detected: &[crate::merge::DetectedConflict],
     source_state: &LedgerState,
     target_state: &LedgerState,
     strategy: &ConflictStrategy,
@@ -471,30 +491,19 @@ async fn build_conflict_details(
     let target_compactor = IriCompactor::from_namespaces(target_state.snapshot.namespaces());
     let resolution = resolution_for_strategy(strategy);
 
-    stream::iter(keys.iter().cloned())
-        .map(|key| {
-            let source_compactor = &source_compactor;
-            let target_compactor = &target_compactor;
-            let resolution = resolution.clone();
-            async move {
-                let (source_flakes, target_flakes) = tokio::try_join!(
-                    current_asserted_for_key(source_state, &key),
-                    current_asserted_for_key(target_state, &key),
-                )?;
-                let source_values = resolve_flake_list(&source_flakes, source_compactor)?;
-                let target_values = resolve_flake_list(&target_flakes, target_compactor)?;
-
-                Ok::<_, ApiError>(ConflictDetail {
-                    key,
-                    source_values,
-                    target_values,
-                    resolution,
-                })
-            }
+    detected
+        .iter()
+        .map(|c| {
+            let source_values = resolve_flake_list(&c.source_values, &source_compactor)?;
+            let target_values = resolve_flake_list(&c.target_values, &target_compactor)?;
+            Ok(ConflictDetail {
+                key: c.key.clone(),
+                source_values,
+                target_values,
+                resolution: resolution.clone(),
+            })
         })
-        .buffered(8)
-        .try_collect()
-        .await
+        .collect()
 }
 
 fn resolve_flake_list(

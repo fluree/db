@@ -145,6 +145,66 @@ async fn preview_diverged_no_conflicts() {
     assert!(preview.conflicts.keys.is_empty());
 }
 
+#[tokio::test]
+async fn preview_convergent_edits_are_not_conflicts() {
+    // Refined conflict detection: when both branches independently assert
+    // the EXACT same triple, the delta-key intersection includes that key
+    // but the resulting object sets are equal. The refined detector
+    // (docs/design/merge-custom.md §Conflict definition) drops these from the conflict
+    // report — there is no real disagreement to resolve.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+
+    let base = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:alice", "ex:age": 30}]
+    });
+    let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
+
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    // Both branches retract age=30 and assert age=31 — same end state.
+    let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .upsert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:age": 31}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    fluree
+        .upsert(
+            main_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:age": 31}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree.merge_preview("mydb", "dev", None).await.unwrap();
+
+    assert!(!preview.fast_forward, "branches diverged");
+    assert!(preview.ahead.count > 0, "source has ahead commits");
+    assert!(preview.behind.count > 0, "target has behind commits");
+    // Both branches modified ex:alice / ex:age (delta-key intersection
+    // includes that key) but converged on the same value. Refined detection
+    // reports zero conflicts.
+    assert_eq!(
+        preview.conflicts.count, 0,
+        "convergent edits should not be reported as conflicts"
+    );
+    assert!(preview.conflicts.keys.is_empty());
+}
+
 // =============================================================================
 // 3. Diverged with conflicts
 // =============================================================================
