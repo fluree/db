@@ -619,7 +619,10 @@ async fn push_roundtrip_named_graph_retractions() {
                     &tgt_handle,
                     push_req,
                     &QueryConnectionOptions::default(),
-                    &IndexConfig::default(),
+                    &IndexConfig {
+                        reindex_min_bytes: 100_000,
+                        reindex_max_bytes: 1_000_000_000,
+                    },
                 )
                 .await
                 .expect("push should succeed with named-graph retractions");

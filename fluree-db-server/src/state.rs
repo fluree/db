@@ -165,7 +165,9 @@ impl AppState {
         // so that novelty backpressure thresholds are respected for external indexers).
         let index_config = Some(IndexConfig {
             reindex_min_bytes: config.reindex_min_bytes,
-            reindex_max_bytes: config.reindex_max_bytes,
+            reindex_max_bytes: config
+                .reindex_max_bytes
+                .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes),
         });
 
         Ok(Self {
@@ -226,11 +228,20 @@ impl AppState {
             builder = builder.cache_max_mb(max_mb);
         }
         if config.indexing_enabled {
+            let max_bytes = config
+                .reindex_max_bytes
+                .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes);
+            builder = builder.with_indexing_thresholds(config.reindex_min_bytes, max_bytes);
+        } else {
+            // Peer / external-indexer mode: skip spawning a background indexer,
+            // but still set novelty thresholds so backpressure works.
+            let max_bytes = config
+                .reindex_max_bytes
+                .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes);
             builder = builder
-                .with_indexing_thresholds(config.reindex_min_bytes, config.reindex_max_bytes);
+                .without_indexing()
+                .with_novelty_thresholds(config.reindex_min_bytes, max_bytes);
         }
-        // When indexing is disabled (default), we don't call with_indexing_thresholds,
-        // so the builder stays in no-indexing mode regardless of connection config defaults.
 
         let fluree = Arc::new(builder.build_client().await?);
 

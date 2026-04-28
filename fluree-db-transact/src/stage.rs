@@ -2031,7 +2031,10 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
-        let config = IndexConfig::default();
+        let config = IndexConfig {
+            reindex_min_bytes: 100_000,
+            reindex_max_bytes: 1_000_000_000,
+        };
         let cs = content_store_for(storage.clone(), "test:main");
 
         // First: insert ex:alice with name="Alice"
@@ -2128,7 +2131,10 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
-        let config = IndexConfig::default();
+        let config = IndexConfig {
+            reindex_min_bytes: 100_000,
+            reindex_max_bytes: 1_000_000_000,
+        };
         let cs = content_store_for(storage.clone(), "test:main");
 
         // Commit 1: Insert schema:alice with schema:name="Alice"
@@ -2232,7 +2238,10 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
-        let config = IndexConfig::default();
+        let config = IndexConfig {
+            reindex_min_bytes: 100_000,
+            reindex_max_bytes: 1_000_000_000,
+        };
         let cs = content_store_for(storage.clone(), "test:main");
 
         // Commit 1: Insert schema:alice with name="Alice" and age=30
@@ -2449,7 +2458,10 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
-        let config = IndexConfig::default();
+        let config = IndexConfig {
+            reindex_min_bytes: 100_000,
+            reindex_max_bytes: 1_000_000_000,
+        };
         let cs = content_store_for(storage.clone(), "test:main");
 
         // Insert data: alice has age 30, bob has age 25

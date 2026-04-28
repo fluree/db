@@ -1116,13 +1116,17 @@ fn build_local_storage_from_config(
 }
 
 /// Check if background indexing is enabled in the parsed connection config.
+///
+/// Defaults to `true` when not explicitly configured — indexing is core
+/// functionality and should require an explicit opt-out (e.g. a peer/transactor
+/// that delegates indexing to a separate process).
 fn is_indexing_enabled(config: &ConnectionConfig) -> bool {
     config
         .defaults
         .as_ref()
         .and_then(|d| d.indexing.as_ref())
         .and_then(|i| i.indexing_enabled)
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Build IndexerConfig from connection defaults, falling back to defaults.
@@ -1163,11 +1167,11 @@ fn derive_index_config(config: &ConnectionConfig) -> IndexConfig {
         reindex_min_bytes: indexing
             .and_then(|i| i.reindex_min_bytes)
             .map(|v| v as usize)
-            .unwrap_or(IndexConfig::default().reindex_min_bytes),
+            .unwrap_or(server_defaults::DEFAULT_REINDEX_MIN_BYTES),
         reindex_max_bytes: indexing
             .and_then(|i| i.reindex_max_bytes)
             .map(|v| v as usize)
-            .unwrap_or(IndexConfig::default().reindex_max_bytes),
+            .unwrap_or_else(server_defaults::default_reindex_max_bytes),
     }
 }
 
@@ -1216,6 +1220,20 @@ pub struct IndexingBuilderConfig {
     pub indexer_config: IndexerConfig,
     /// Controls novelty backpressure thresholds.
     pub index_config: IndexConfig,
+}
+
+/// Default `IndexingBuilderConfig` for persistent storage (`file`, `s3`, `ipfs`).
+///
+/// Uses [`server_defaults::default_index_config`] for the novelty thresholds
+/// (RAM-tiered hard threshold), so persistent Fluree instances built
+/// programmatically get the same production-sized backpressure as the server
+/// binary. `IndexConfig` itself has no `Default` impl — configuration policy
+/// lives here in the API layer, not in the lower-level `fluree-db-ledger` crate.
+fn default_indexing_builder_config() -> IndexingBuilderConfig {
+    IndexingBuilderConfig {
+        indexer_config: IndexerConfig::default(),
+        index_config: server_defaults::default_index_config(),
+    }
 }
 
 fn make_leaflet_cache(
@@ -1275,6 +1293,12 @@ impl FlureeBuilder {
     /// Configure for file-based storage
     ///
     /// The path should be the root directory containing ledger data.
+    ///
+    /// Background indexing is enabled by default. Call [`without_indexing`] to
+    /// opt out — typically only appropriate when a separate process (peer or
+    /// dedicated indexer) owns index maintenance for this storage.
+    ///
+    /// [`without_indexing`]: FlureeBuilder::without_indexing
     #[cfg(feature = "native")]
     pub fn file(path: impl Into<String>) -> Self {
         let path = path.into();
@@ -1283,7 +1307,7 @@ impl FlureeBuilder {
             storage_path: Some(path),
             encryption_key: None,
             ledger_cache_config: Some(LedgerManagerConfig::default()),
-            indexing_config: None,
+            indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
         }
@@ -1362,7 +1386,7 @@ impl FlureeBuilder {
             storage_path: None,
             encryption_key: None,
             ledger_cache_config: Some(LedgerManagerConfig::default()),
-            indexing_config: None,
+            indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
         }
@@ -1611,14 +1635,28 @@ impl FlureeBuilder {
 
     /// Enable background indexing with default settings.
     ///
-    /// When enabled, `build()` will spawn a `BackgroundIndexerWorker` that
+    /// Persistent builders (`file`, `s3`, `ipfs`) enable indexing by default,
+    /// so this is mostly useful after [`without_indexing`] or on the `memory`
+    /// builder. `build()` will spawn a `BackgroundIndexerWorker` that
     /// automatically indexes ledgers when novelty exceeds the soft threshold.
     /// Must be called within a tokio runtime context.
+    ///
+    /// [`without_indexing`]: FlureeBuilder::without_indexing
     pub fn with_indexing(mut self) -> Self {
-        self.indexing_config = Some(IndexingBuilderConfig {
-            indexer_config: IndexerConfig::default(),
-            index_config: IndexConfig::default(),
-        });
+        self.indexing_config = Some(default_indexing_builder_config());
+        self
+    }
+
+    /// Disable background indexing on this builder.
+    ///
+    /// Persistent builders (`file`, `s3`, `ipfs`) enable indexing by default;
+    /// call this to opt out. The only production reason to do so is when a
+    /// separate process (a peer or dedicated indexer) owns index maintenance
+    /// for the same storage — the transactor writes commits, the other process
+    /// produces the index roots. Running without an indexer anywhere will
+    /// accumulate novelty until the hard ceiling blocks writes.
+    pub fn without_indexing(mut self) -> Self {
+        self.indexing_config = None;
         self
     }
 
@@ -1672,11 +1710,12 @@ impl FlureeBuilder {
     /// Build a file-backed Fluree instance
     ///
     /// Returns an error if storage_path is not set.
-    /// Indexing is disabled by default; call `with_indexing()` before `build()`
-    /// to enable background indexing, or use `set_indexing_mode` after building.
     ///
-    /// When indexing is enabled via `with_indexing()`, a `BackgroundIndexerWorker`
-    /// is spawned on the tokio runtime. This must be called within a tokio context.
+    /// Indexing is enabled by default for `file`-constructed builders; call
+    /// `without_indexing()` to opt out (see that method for when that's
+    /// appropriate). When indexing is enabled, a `BackgroundIndexerWorker` is
+    /// spawned on the tokio runtime, so `build()` must be called within a
+    /// tokio context.
     #[cfg(feature = "native")]
     pub fn build(mut self) -> Result<Fluree> {
         let path = self
@@ -1845,8 +1884,12 @@ impl FlureeBuilder {
 
     /// Build a memory-backed Fluree instance
     ///
-    /// Indexing is disabled by default; use `set_indexing_mode` after building
-    /// to enable background indexing.
+    /// Background indexing is **always disabled** for this builder path
+    /// regardless of `with_indexing()` — memory storage is intended for
+    /// short-lived tests and scratch use where a background worker would
+    /// outlive the `Fluree` handle. Use `set_indexing_mode` after building
+    /// if you need it, or switch to a persistent builder (`file`, `s3`,
+    /// `ipfs`), which enable indexing by default.
     pub fn build_memory(self) -> Fluree {
         let storage = MemoryStorage::new();
         let nameservice = MemoryNameService::new();
@@ -2119,7 +2162,7 @@ impl FlureeBuilder {
         self.indexing_config
             .as_ref()
             .map(|c| c.index_config.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(server_defaults::default_index_config)
     }
 
     /// Spawn the background indexer worker if configured.
@@ -2501,7 +2544,7 @@ impl Fluree {
             nameservice_mode: nameservice,
             leaflet_cache,
             indexing_mode: tx::IndexingMode::Disabled,
-            index_config: IndexConfig::default(),
+            index_config: server_defaults::default_index_config(),
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
             event_bus: Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024)),
             ledger_manager: None,
@@ -2523,7 +2566,7 @@ impl Fluree {
             nameservice_mode: nameservice,
             leaflet_cache,
             indexing_mode,
-            index_config: IndexConfig::default(),
+            index_config: server_defaults::default_index_config(),
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
             event_bus: Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024)),
             ledger_manager: None,
@@ -3368,7 +3411,10 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn test_fluree_builder_file() {
+        // `without_indexing()` keeps this a plain `#[test]` — the default
+        // background indexer would require a tokio runtime.
         let result = FlureeBuilder::file("/tmp/test")
+            .without_indexing()
             .parallelism(8)
             .cache_max_mb(1000)
             .build();
@@ -3398,14 +3444,9 @@ mod tests {
     fn test_default_index_config_returns_defaults_without_thresholds() {
         let fluree = FlureeBuilder::memory().build_memory();
         let cfg = fluree.default_index_config();
-        assert_eq!(
-            cfg.reindex_min_bytes,
-            IndexConfig::default().reindex_min_bytes
-        );
-        assert_eq!(
-            cfg.reindex_max_bytes,
-            IndexConfig::default().reindex_max_bytes
-        );
+        let expected = server_defaults::default_index_config();
+        assert_eq!(cfg.reindex_min_bytes, expected.reindex_min_bytes);
+        assert_eq!(cfg.reindex_max_bytes, expected.reindex_max_bytes);
     }
 
     #[test]
@@ -3449,14 +3490,9 @@ mod tests {
     fn test_derive_index_config_falls_back_to_defaults() {
         let config = ConnectionConfig::default();
         let idx = derive_index_config(&config);
-        assert_eq!(
-            idx.reindex_min_bytes,
-            IndexConfig::default().reindex_min_bytes
-        );
-        assert_eq!(
-            idx.reindex_max_bytes,
-            IndexConfig::default().reindex_max_bytes
-        );
+        let expected = server_defaults::default_index_config();
+        assert_eq!(idx.reindex_min_bytes, expected.reindex_min_bytes);
+        assert_eq!(idx.reindex_max_bytes, expected.reindex_max_bytes);
     }
 
     // ========================================================================

@@ -58,25 +58,18 @@ impl std::fmt::Debug for TypeErasedStore {
     }
 }
 
-/// Configuration for novelty backpressure
+/// Configuration for novelty backpressure.
+///
+/// No `Default` impl — configuration policy (RAM-tiered sizing, env/flag
+/// resolution) lives at the API layer (`fluree-db-api::server_defaults`).
+/// Callers must construct this explicitly so a missing upstream wiring
+/// fails at compile time rather than silently using a hidden default.
 #[derive(Clone, Debug)]
 pub struct IndexConfig {
-    /// Soft threshold - trigger background indexing (default 100KB)
+    /// Soft threshold — triggers background indexing.
     pub reindex_min_bytes: usize,
-    /// Hard threshold - block new commits until indexed (default 1MB)
+    /// Hard threshold — blocks new commits until indexed.
     pub reindex_max_bytes: usize,
-}
-
-impl Default for IndexConfig {
-    fn default() -> Self {
-        Self {
-            // Compatibility defaults:
-            // - reindex-min-bytes: 100000  (100 kb, decimal)
-            // - reindex-max-bytes: 1000000 (1 mb, decimal)
-            reindex_min_bytes: 100_000,
-            reindex_max_bytes: 1_000_000,
-        }
-    }
 }
 
 /// Ledger state combining indexed LedgerSnapshot with novelty overlay
