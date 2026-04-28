@@ -61,7 +61,7 @@ impl ApiFulltextConfigProvider {
         {
             // Branch-aware store so a fresh branch can read leaf/branch/history
             // blobs that were written under the source branch's namespace.
-            let cs = crate::branched_store_helpers::content_store_for_record_or_id(
+            let cs = fluree_db_nameservice::content_store_for_record_or_id(
                 &self.backend,
                 self.nameservice.as_ref(),
                 state.ns_record.as_ref(),

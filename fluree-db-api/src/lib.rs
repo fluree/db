@@ -36,7 +36,6 @@
 pub mod admin;
 pub mod block_fetch;
 pub mod bm25_worker;
-mod branched_store_helpers;
 pub mod commit_transfer;
 pub mod config_resolver;
 #[cfg(feature = "credential")]
@@ -2643,13 +2642,13 @@ impl Fluree {
         record: Option<&fluree_db_nameservice::NsRecord>,
         fallback_id: &str,
     ) -> Result<Arc<dyn ContentStore>> {
-        branched_store_helpers::content_store_for_record_or_id(
+        Ok(fluree_db_nameservice::content_store_for_record_or_id(
             &self.backend,
             self.nameservice_mode.reader(),
             record,
             fallback_id,
         )
-        .await
+        .await?)
     }
 
     /// Read and parse a ledger's `default_context` blob from CAS via a
@@ -2660,12 +2659,12 @@ impl Fluree {
         &self,
         record: &fluree_db_nameservice::NsRecord,
     ) -> Result<Option<serde_json::Value>> {
-        branched_store_helpers::load_default_context_blob(
+        Ok(fluree_db_nameservice::load_default_context_blob(
             &self.backend,
             self.nameservice_mode.reader(),
             record,
         )
-        .await
+        .await?)
     }
 
     /// Build a [`fluree_db_indexer::FulltextConfigProvider`] backed by this

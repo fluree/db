@@ -56,6 +56,81 @@ pub async fn branched_content_store_for_id(
     branched_content_store_for_record(backend, ns, &record).await
 }
 
+/// Read and parse a ledger's `default_context` blob (a JSON object) from
+/// CAS, using a branch-aware store so branches that inherit their
+/// parent's context CID resolve it under the source branch's namespace.
+///
+/// Returns:
+/// - `Ok(None)` if `record.default_context` is `None`.
+/// - `Ok(Some(value))` if the blob loads and parses as JSON.
+/// - `Err(...)` on read or parse failure. Callers that want soft-fail
+///   semantics should match on the result and log/discard the error
+///   themselves — keeping the policy at the call site lets `lib.rs`
+///   surface the error to the user while `loading.rs` and the view
+///   path swallow it.
+pub async fn load_default_context_blob(
+    backend: &StorageBackend,
+    ns: &dyn NameService,
+    record: &NsRecord,
+) -> Result<Option<serde_json::Value>> {
+    let Some(ctx_id) = record.default_context.as_ref() else {
+        return Ok(None);
+    };
+    let cs = branched_content_store_for_record(backend, ns, record).await?;
+    let bytes = cs.get(ctx_id).await.map_err(|e| {
+        NameServiceError::storage(format!("failed to read default context {ctx_id}: {e}"))
+    })?;
+    let value = serde_json::from_slice(&bytes)?;
+    Ok(Some(value))
+}
+
+/// Resolve a content store from an `Option<NsRecord>`, falling back to
+/// the **flat** namespace store keyed by `fallback_id` when no record is
+/// present.
+///
+/// Use this for call sites that haven't loaded an `NsRecord` yet (early
+/// bootstrap, etc.) and want best-effort flat behavior — no extra
+/// nameservice lookup is performed in the fallback path.
+///
+/// For call sites that always need branch ancestry walking (and are
+/// willing to pay one nameservice round-trip on the fallback path), use
+/// [`branched_content_store_for_record_or_id`] instead.
+pub async fn content_store_for_record_or_id(
+    backend: &StorageBackend,
+    ns: &dyn NameService,
+    record: Option<&NsRecord>,
+    fallback_id: &str,
+) -> Result<Arc<dyn ContentStore>> {
+    match record {
+        Some(r) => branched_content_store_for_record(backend, ns, r).await,
+        None => Ok(backend.content_store(fallback_id)),
+    }
+}
+
+/// Resolve a branch-aware content store from an `Option<NsRecord>`,
+/// falling back to a nameservice lookup by `ledger_id` when no record is
+/// present.
+///
+/// Always returns a branch-aware store: when `record` is `None`, this
+/// performs an extra nameservice lookup via
+/// [`branched_content_store_for_id`]. Use this on paths (e.g. post-commit
+/// indexing) that must traverse branch ancestry on read miss even when
+/// the cached record is stale or unavailable.
+///
+/// For paths that prefer to skip the extra lookup and accept a flat
+/// fallback, use [`content_store_for_record_or_id`].
+pub async fn branched_content_store_for_record_or_id(
+    backend: &StorageBackend,
+    ns: &dyn NameService,
+    record: Option<&NsRecord>,
+    ledger_id: &str,
+) -> Result<Arc<dyn ContentStore>> {
+    match record {
+        Some(r) => branched_content_store_for_record(backend, ns, r).await,
+        None => branched_content_store_for_id(backend, ns, ledger_id).await,
+    }
+}
+
 /// Recursively assemble the [`BranchedContentStore`] for a branched record.
 ///
 /// Public so [`fluree_db_ledger::LedgerState::build_branched_store`] can

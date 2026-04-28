@@ -32,7 +32,9 @@ pub mod tracking;
 pub mod tracking_file;
 
 pub use branched_store::{
-    branched_content_store_for_id, branched_content_store_for_record, build_branched_store,
+    branched_content_store_for_id, branched_content_store_for_record,
+    branched_content_store_for_record_or_id, build_branched_store, content_store_for_record_or_id,
+    load_default_context_blob,
 };
 pub use error::{NameServiceError, Result};
 pub use event_bus::LedgerEventBus;
