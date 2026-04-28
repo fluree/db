@@ -322,8 +322,15 @@ impl IndexerOrchestrator {
     /// 1. Attempts incremental refresh if an index exists
     /// 2. Falls back to full batched rebuild if refresh fails or no index exists
     pub async fn index_ledger(&self, ledger_id: &str) -> Result<IndexResult> {
+        let cs = fluree_db_nameservice::branched_content_store_for_id(
+            &self.backend,
+            self.nameservice.as_ref(),
+            ledger_id,
+        )
+        .await
+        .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?;
         crate::build_index_for_ledger(
-            self.backend.content_store(ledger_id),
+            cs,
             self.nameservice.as_ref(),
             ledger_id,
             self.config.clone(),
@@ -987,7 +994,31 @@ impl BackgroundIndexerWorker {
             pending_min_t = ?pending_min_t,
             "Starting index build for queued work"
         );
-        let content_store = self.backend.content_store(ledger_id);
+        let content_store = match fluree_db_nameservice::branched_content_store_for_record(
+            &self.backend,
+            self.nameservice.as_ref(),
+            &record,
+        )
+        .await
+        {
+            Ok(cs) => cs,
+            Err(e) => {
+                warn!(
+                    ledger_id = %ledger_id,
+                    error = %e,
+                    "Failed to build branched content store for indexing; aborting build"
+                );
+                let mut states = self.states.lock().await;
+                if let Some(state) = states.get_mut(ledger_id) {
+                    state.last_error = Some(e.to_string());
+                    state.phase = IndexPhase::Pending;
+                    state.next_retry_at =
+                        Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                    state.retry_count = state.retry_count.saturating_add(1);
+                }
+                return;
+            }
+        };
         let result =
             crate::build_index_for_record(content_store, &record, self.config.clone()).await;
 
@@ -1122,12 +1153,6 @@ pub struct PostCommitIndexResult {
     pub error: Option<String>,
 }
 
-/// Opportunistically refresh + publish + apply after a commit.
-///
-/// - Uses the provided `storage` for index building and apply.
-/// - Uses `target_t` explicitly (use `CommitReceipt.t`).
-/// - Never fails the commit path; returns status + error string for logging.
-/// - **Applies index even if publish fails** for local correctness.
 #[cfg(feature = "embedded-orchestrator")]
 fn current_ns_record(ledger: &LedgerState) -> Option<&fluree_db_nameservice::NsRecord> {
     let record = ledger.ns_record.as_ref()?;
@@ -1143,6 +1168,12 @@ fn current_ns_record(ledger: &LedgerState) -> Option<&fluree_db_nameservice::NsR
     }
 }
 
+/// Opportunistically refresh + publish + apply after a commit.
+///
+/// - Uses the provided `storage` for index building and apply.
+/// - Uses `target_t` explicitly (use `CommitReceipt.t`).
+/// - Never fails the commit path; returns status + error string for logging.
+/// - **Applies index even if publish fails** for local correctness.
 #[cfg(feature = "embedded-orchestrator")]
 pub async fn maybe_refresh_after_commit<S>(
     storage: &S,
@@ -1187,9 +1218,31 @@ where
     }
 
     let ledger_addr = ledger.ledger_id().to_string();
-    let cs: std::sync::Arc<dyn fluree_db_core::ContentStore> = std::sync::Arc::new(
-        fluree_db_core::content_store_for(storage.clone(), &ledger_addr),
-    );
+    let backend = StorageBackend::Managed(std::sync::Arc::new(storage.clone()));
+    let cs: std::sync::Arc<dyn fluree_db_core::ContentStore> =
+        match fluree_db_nameservice::branched_content_store_for_record_or_id(
+            &backend,
+            nameservice,
+            current_ns_record(&ledger),
+            &ledger_addr,
+        )
+        .await
+        {
+            Ok(cs) => cs,
+            Err(e) => {
+                return (
+                    ledger,
+                    PostCommitIndexResult {
+                        attempted: true,
+                        refreshed: false,
+                        published: false,
+                        applied: false,
+                        refresh: None,
+                        error: Some(format!("build branched content store: {e}")),
+                    },
+                );
+            }
+        };
 
     // Use the ledger's reindex_max_bytes as the commit-walk byte budget
     // so incremental indexing falls back to a full rebuild when the
@@ -1271,9 +1324,16 @@ where
     S: Storage + fluree_db_core::StorageMethod + Clone + Send + Sync + 'static,
 {
     let ledger_addr = ledger.ledger_id().to_string();
-    let cs: std::sync::Arc<dyn fluree_db_core::ContentStore> = std::sync::Arc::new(
-        fluree_db_core::content_store_for(storage.clone(), &ledger_addr),
-    );
+    let backend = StorageBackend::Managed(std::sync::Arc::new(storage.clone()));
+    let cs: std::sync::Arc<dyn fluree_db_core::ContentStore> =
+        fluree_db_nameservice::branched_content_store_for_record_or_id(
+            &backend,
+            nameservice,
+            current_ns_record(&ledger),
+            &ledger_addr,
+        )
+        .await
+        .map_err(|e| IndexerError::NameService(e.to_string()))?;
 
     let result = if let Some(record) = current_ns_record(&ledger) {
         crate::build_index_for_record(cs.clone(), record, indexer_config).await?

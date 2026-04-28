@@ -34,8 +34,8 @@ pub use historical::HistoricalLedgerView;
 pub use staged::LedgerView;
 
 use fluree_db_core::{
-    format_ledger_id, BranchedContentStore, ContentId, ContentStore, DictNovelty, Flake,
-    GraphDbRef, GraphId, LedgerSnapshot, RuntimeSmallDicts, StorageBackend, TXN_META_GRAPH_ID,
+    BranchedContentStore, ContentId, ContentStore, DictNovelty, Flake, GraphDbRef, GraphId,
+    LedgerSnapshot, RuntimeSmallDicts, StorageBackend, TXN_META_GRAPH_ID,
 };
 use fluree_db_nameservice::{NameService, NsRecord};
 use fluree_db_novelty::{
@@ -111,12 +111,6 @@ pub struct LedgerState {
     /// Set by `Fluree::ledger()` when a binary index is available. Used by
     /// the query engine to enable `BinaryScanOperator` for IRI resolution.
     pub binary_store: Option<TypeErasedStore>,
-    /// Default JSON-LD @context for this ledger.
-    ///
-    /// Captured from turtle @prefix declarations during import and augmented
-    /// with built-in namespace prefixes. Applied to queries that don't supply
-    /// their own @context. Loaded from CAS via `NsRecord.default_context`.
-    pub default_context: Option<serde_json::Value>,
     /// Type-erased spatial index providers, keyed by predicate IRI.
     ///
     /// Each entry is `Arc<dyn SpatialIndexProvider>`. Set by `Fluree::ledger()`
@@ -154,31 +148,16 @@ impl LedgerState {
 
     /// Build a recursive `BranchedContentStore` by walking the branch ancestry.
     ///
-    /// Each branch gets its own namespace store with its parent(s) as fallbacks.
-    /// Currently branches have a single parent; merges will add multiple parents.
+    /// Delegates to [`fluree_db_nameservice::build_branched_store`] so the
+    /// ancestry walk lives in one place — `fluree-db-indexer` reaches the
+    /// same logic via the nameservice helpers without taking on a
+    /// `fluree-db-ledger` dependency.
     pub async fn build_branched_store(
         ns: &dyn NameService,
         record: &NsRecord,
         backend: &StorageBackend,
     ) -> Result<BranchedContentStore> {
-        let source = record.source_branch.as_ref().expect("called on non-branch");
-        let parent_id = format_ledger_id(&record.name, source);
-
-        let parent_record = ns
-            .lookup(&parent_id)
-            .await?
-            .ok_or_else(|| LedgerError::not_found(&parent_id))?;
-
-        let parent_store = if parent_record.source_branch.is_some() {
-            Box::pin(Self::build_branched_store(ns, &parent_record, backend)).await?
-        } else {
-            BranchedContentStore::leaf(backend.content_store(&parent_id))
-        };
-
-        Ok(BranchedContentStore::with_parents(
-            backend.content_store(&record.ledger_id),
-            vec![parent_store],
-        ))
+        Ok(fluree_db_nameservice::build_branched_store(backend, ns, record).await?)
     }
 
     /// Load ledger state using a given content store.
@@ -248,7 +227,6 @@ impl LedgerState {
                     head_index_id,
                     ns_record: Some(record),
                     binary_store: None,
-                    default_context: None,
                     spatial_indexes: None,
                 });
             }
@@ -266,7 +244,6 @@ impl LedgerState {
             head_index_id,
             ns_record: Some(record),
             binary_store: None,
-            default_context: None,
             spatial_indexes: None,
         })
     }
@@ -387,7 +364,6 @@ impl LedgerState {
             head_index_id: None,
             ns_record: None,
             binary_store: None,
-            default_context: None,
             spatial_indexes: None,
         }
     }
