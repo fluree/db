@@ -28,15 +28,17 @@ impl Fluree {
             .cloned()
         {
             if state.snapshot.range_provider.is_none() || state.binary_store.is_none() {
-                // Use the NsRecord's ledger_id (canonical namespace) rather than
-                // snapshot.ledger_id, which may reflect the source ledger after
-                // a pack import/clone into a differently-named destination.
-                let ns_ledger_id = state
-                    .ns_record
-                    .as_ref()
-                    .map(|r| r.ledger_id.as_str())
-                    .unwrap_or(state.snapshot.ledger_id.as_str());
-                let cs = self.content_store(ns_ledger_id);
+                // Branch-aware store keyed off the NsRecord. The record's
+                // `ledger_id` is the canonical namespace (which may differ
+                // from `snapshot.ledger_id` after a pack import/clone).
+                // Required so fresh branches can read index leaf/branch/
+                // history blobs that live under the source branch's namespace.
+                let cs = self
+                    .content_store_for_record_or_id(
+                        state.ns_record.as_ref(),
+                        state.snapshot.ledger_id.as_str(),
+                    )
+                    .await?;
                 let bytes = cs.get(&index_cid).await.map_err(|e| {
                     ApiError::internal(format!(
                         "failed to read binary index root for {index_cid}: {e}"
@@ -132,27 +134,9 @@ impl Fluree {
             }
         }
 
-        // Load default context from CAS if the nameservice record has one.
-        if let Some(ctx_id) = state
-            .ns_record
-            .as_ref()
-            .and_then(|r| r.default_context.as_ref())
-        {
-            let ns_ledger_id = state
-                .ns_record
-                .as_ref()
-                .map(|r| r.ledger_id.as_str())
-                .unwrap_or(state.snapshot.ledger_id.as_str());
-            let cs = self.content_store(ns_ledger_id);
-            match cs.get(ctx_id).await {
-                Ok(bytes) => match serde_json::from_slice(&bytes) {
-                    Ok(ctx) => state.default_context = Some(ctx),
-                    Err(e) => tracing::warn!(%e, "failed to parse default context JSON"),
-                },
-                Err(e) => tracing::debug!(%e, cid = %&ctx_id, "could not load default context"),
-            }
-        }
-
+        // Default context is not loaded here. Opt-in callers route through
+        // `Fluree::db_with_default_context` / `db_at_with_default_context`,
+        // which fetch and attach the context onto the returned `GraphDb`.
         Ok(state)
     }
 
@@ -348,7 +332,15 @@ impl Fluree {
             ApiError::internal("copy_index_to_branch requires managed storage backend")
         })?;
         let method = storage.storage_method();
-        let source_store = self.content_store(source_id);
+        // Branch-aware source store so the copy can read inherited index
+        // artifacts when `source_id` itself is a branch with ancestors.
+        let source_store = fluree_db_nameservice::branched_content_store_for_id(
+            self.backend(),
+            self.nameservice(),
+            source_id,
+        )
+        .await
+        .map_err(ApiError::from)?;
 
         // Read and parse the index root
         let root_bytes = source_store.get(index_cid).await.map_err(|e| {

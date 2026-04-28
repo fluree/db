@@ -493,7 +493,7 @@ pub fn apply_to_server_config(
         }
         if is_default("reindex_max_bytes") {
             if let Some(v) = idx.reindex_max_bytes {
-                config.reindex_max_bytes = v;
+                config.reindex_max_bytes = Some(v);
             }
         }
     }

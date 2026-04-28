@@ -8,7 +8,7 @@
 
 mod support;
 
-use fluree_db_api::{CommitOpts, FlureeBuilder, LedgerState, Novelty};
+use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, LedgerState, Novelty};
 use fluree_db_core::{commit::codec::read_commit, ContentKind, LedgerSnapshot};
 use fluree_db_transact::{ir::TxnType, TxnOpts as IrTxnOpts};
 use serde_json::{json, Value as JsonValue};
@@ -36,7 +36,10 @@ async fn store_raw_txn_roundtrip_via_parallel_upload() {
     });
 
     let txn_opts = IrTxnOpts::default().store_raw_txn(true);
-    let index_config = fluree_db_api::IndexConfig::default();
+    let index_config = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
 
     // If the spawned upload had failed, commit() would have aborted here and
     // this call would return Err.

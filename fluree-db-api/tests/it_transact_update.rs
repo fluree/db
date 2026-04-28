@@ -246,7 +246,10 @@ async fn update_where_bound_typed_string_delete_and_insert_use_same_datatype_sid
             &update_txn,
             txn_opts,
             Default::default(),
-            &Default::default(),
+            &IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await
         .unwrap();
@@ -1888,7 +1891,10 @@ async fn update_values_wildcard_delete_index_plus_novelty() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/transact-update:wildcard-delete-indexed";
-    let index_cfg = IndexConfig::default();
+    let index_cfg = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
     let ledger0 = LedgerSnapshot::genesis(ledger_id);
     let ledger0 = LedgerState::new(ledger0, Novelty::new(0));
 
@@ -2016,7 +2022,10 @@ async fn update_wildcard_delete_duplicate_facts_across_index_and_novelty() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/transact-update:wildcard-delete-dup-index-novelty";
-    let index_cfg = IndexConfig::default();
+    let index_cfg = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
     let ledger0 = LedgerSnapshot::genesis(ledger_id);
     let ledger0 = LedgerState::new(ledger0, Novelty::new(0));
 
@@ -2143,7 +2152,10 @@ async fn update_values_wildcard_delete_after_updates_and_indexing() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/transact-update:wildcard-delete-updates-indexed";
-    let index_cfg = IndexConfig::default();
+    let index_cfg = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
     let ledger0 = LedgerSnapshot::genesis(ledger_id);
     let ledger0 = LedgerState::new(ledger0, Novelty::new(0));
 
