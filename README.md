@@ -36,7 +36,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fluree/db/releases/late
 irm https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.ps1 | iex
 ```
 
-Pre-built binaries for every release are also available on the [GitHub Releases page](https://github.com/fluree/db/releases).
+Pre-built binaries and the changelog for every release are on the [GitHub Releases page](https://github.com/fluree/db/releases).
 
 ## Zero to graph in 60 seconds
 
