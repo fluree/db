@@ -45,7 +45,7 @@ const MAX_CID_BYTES: usize = 128;
 
 /// Maximum number of parent commit references (merge parents).
 /// 16 is generous; real merges will almost always have 2.
-const MAX_PREVIOUS_REFS: usize = 16;
+const MAX_PARENTS: usize = 16;
 
 /// Commit envelope fields — the non-flake metadata in a v2 commit blob.
 ///
@@ -101,9 +101,9 @@ pub fn encode_envelope_fields(
     buf: &mut Vec<u8>,
 ) -> Result<(), CommitCodecError> {
     let num_parents = envelope.parents.len();
-    if num_parents > MAX_PREVIOUS_REFS {
+    if num_parents > MAX_PARENTS {
         return Err(CommitCodecError::EnvelopeEncode(format!(
-            "parents has {num_parents} entries, max is {MAX_PREVIOUS_REFS}"
+            "parents has {num_parents} entries, max is {MAX_PARENTS}"
         )));
     }
 
@@ -257,9 +257,9 @@ pub fn decode_envelope(data: &[u8]) -> Result<CodecEnvelope, CommitCodecError> {
         if v == 3 {
             // v3: varint(count) followed by count commit refs.
             let count = decode_varint(data, &mut pos)? as usize;
-            if count > MAX_PREVIOUS_REFS {
+            if count > MAX_PARENTS {
                 return Err(CommitCodecError::EnvelopeDecode(format!(
-                    "parents count {count} exceeds maximum {MAX_PREVIOUS_REFS}"
+                    "parents count {count} exceeds maximum {MAX_PARENTS}"
                 )));
             }
             let mut refs = Vec::with_capacity(count);
