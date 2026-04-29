@@ -458,17 +458,24 @@ impl NameService for FileNameService {
         ledger_name: &str,
         new_branch: &str,
         source_branch: &str,
+        at_commit: Option<(ContentId, i64)>,
     ) -> Result<()> {
         let address = Self::ns_address(ledger_name, new_branch);
         let normalized_id = format_ledger_id(ledger_name, new_branch);
 
-        // Read the source branch to get commit head info
+        // Read the source branch to validate it exists (and to get commit info
+        // when `at_commit` is None).
         let source_record = self
             .load_record(ledger_name, source_branch)
             .await?
             .ok_or_else(|| {
                 NameServiceError::not_found(format!("source branch {ledger_name}:{source_branch}"))
             })?;
+
+        let (commit_head_id, commit_t) = match at_commit {
+            Some((id, t)) => (Some(id), t),
+            None => (source_record.commit_head_id.clone(), source_record.commit_t),
+        };
 
         let file = NsFileV2 {
             context: ns_context(),
@@ -478,12 +485,11 @@ impl NameService for FileNameService {
                 id: ledger_name.to_string(),
             },
             branch: new_branch.to_string(),
-            commit_cid: source_record
-                .commit_head_id
+            commit_cid: commit_head_id
                 .as_ref()
                 .map(std::string::ToString::to_string),
             config_cid: None,
-            t: source_record.commit_t,
+            t: commit_t,
             index: None,
             status: "ready".to_string(),
             default_context_cid: None,
@@ -2251,7 +2257,9 @@ mod tests {
         let cid = test_cid("commit-5");
         ns.publish_commit("mydb:main", 5, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "feature-x", "main").await.unwrap();
+        ns.create_branch("mydb", "feature-x", "main", None)
+            .await
+            .unwrap();
 
         let record = ns.lookup("mydb:feature-x").await.unwrap().unwrap();
         assert_eq!(record.name, "mydb");
@@ -2268,9 +2276,9 @@ mod tests {
         let cid = test_cid("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "dev", "main").await.unwrap();
+        ns.create_branch("mydb", "dev", "main", None).await.unwrap();
 
-        let result = ns.create_branch("mydb", "dev", "main").await;
+        let result = ns.create_branch("mydb", "dev", "main", None).await;
         assert!(result.is_err());
     }
 
@@ -2281,8 +2289,10 @@ mod tests {
         let cid = test_cid("commit-3");
         ns.publish_commit("mydb:main", 3, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "dev", "main").await.unwrap();
-        ns.create_branch("mydb", "staging", "main").await.unwrap();
+        ns.create_branch("mydb", "dev", "main", None).await.unwrap();
+        ns.create_branch("mydb", "staging", "main", None)
+            .await
+            .unwrap();
 
         // Also create a different ledger to ensure filtering works
         ns.publish_ledger_init("other:main").await.unwrap();
@@ -2301,10 +2311,10 @@ mod tests {
         let cid = test_cid("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "release/v1.0", "main")
+        ns.create_branch("mydb", "release/v1.0", "main", None)
             .await
             .unwrap();
-        ns.create_branch("mydb", "feature/auth", "main")
+        ns.create_branch("mydb", "feature/auth", "main", None)
             .await
             .unwrap();
 
@@ -2329,7 +2339,9 @@ mod tests {
         let cid = test_cid("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "dead", "main").await.unwrap();
+        ns.create_branch("mydb", "dead", "main", None)
+            .await
+            .unwrap();
         ns.retract("mydb:dead").await.unwrap();
 
         let branches = ns.list_branches("mydb").await.unwrap();
@@ -2344,7 +2356,9 @@ mod tests {
         let cid = test_cid("commit-2");
         ns.publish_commit("mydb:main", 2, &cid).await.unwrap();
 
-        ns.create_branch("mydb", "persisted", "main").await.unwrap();
+        ns.create_branch("mydb", "persisted", "main", None)
+            .await
+            .unwrap();
 
         // Create a new FileNameService pointing to the same directory
         let ns2 = FileNameService::new(temp.path());

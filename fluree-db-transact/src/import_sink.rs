@@ -739,7 +739,7 @@ mod inner {
         fn make_envelope(t: i64) -> crate::commit_v2::CodecEnvelope {
             crate::commit_v2::CodecEnvelope {
                 t,
-                previous_refs: Vec::new(),
+                parents: Vec::new(),
                 namespace_delta: HashMap::new(),
                 txn: None,
                 time: None,

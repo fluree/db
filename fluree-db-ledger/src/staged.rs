@@ -1,7 +1,7 @@
 //! Staged transaction support
 //!
-//! This module provides `LedgerView` for staging transactions before commit.
-//! A LedgerView combines:
+//! This module provides `StagedLedger` for staging transactions before commit.
+//! A StagedLedger combines:
 //! - Base LedgerState (indexed LedgerSnapshot + committed novelty)
 //! - Staged flakes (not yet committed)
 //!
@@ -163,8 +163,8 @@ impl StagedOverlay {
 /// - Base LedgerState (indexed LedgerSnapshot + committed novelty)
 /// - Staged flakes (not yet committed)
 ///
-/// Queries against a LedgerView will see the staged changes.
-pub struct LedgerView {
+/// Queries against a StagedLedger will see the staged changes.
+pub struct StagedLedger {
     /// Base ledger state
     base: LedgerState,
     /// Staged changes
@@ -173,15 +173,15 @@ pub struct LedgerView {
     staged_epoch: u64,
 }
 
-impl LedgerView {
-    /// Create a new ledger view with staged flakes
+impl StagedLedger {
+    /// Build a staged ledger by layering `flakes` onto `base`.
     ///
     /// `reverse_graph` maps graph Sids to GraphIds for per-graph filtering.
     /// Pass an empty map when all flakes are default-graph only.
     ///
     /// Returns `Err` if any staged flake has a graph Sid not present in
     /// `reverse_graph` (programming error — the map must be complete).
-    pub fn stage(
+    pub fn new(
         base: LedgerState,
         flakes: Vec<Flake>,
         reverse_graph: &HashMap<Sid, GraphId>,
@@ -258,7 +258,7 @@ impl LedgerView {
     }
 }
 
-impl OverlayProvider for LedgerView {
+impl OverlayProvider for StagedLedger {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -393,7 +393,7 @@ mod tests {
 
         // Create view with interleaved staged flakes
         let staged_flakes = vec![make_flake(2, 1, 200, 2), make_flake(4, 1, 400, 2)];
-        let view = LedgerView::stage(state, staged_flakes, &HashMap::new()).unwrap();
+        let view = StagedLedger::new(state, staged_flakes, &HashMap::new()).unwrap();
 
         // Collect all flakes via overlay provider (g_id=0 for default graph)
         let mut collected = Vec::new();
@@ -420,7 +420,7 @@ mod tests {
         let state = LedgerState::new(snapshot, novelty);
 
         let view =
-            LedgerView::stage(state, vec![make_flake(2, 1, 200, 2)], &HashMap::new()).unwrap();
+            StagedLedger::new(state, vec![make_flake(2, 1, 200, 2)], &HashMap::new()).unwrap();
 
         // Staged epoch should be different from base epoch
         assert_eq!(view.epoch(), base_epoch + 1);
@@ -435,7 +435,7 @@ mod tests {
         let state = LedgerState::new(snapshot, novelty);
 
         let staged_flakes = vec![make_flake(1, 1, 100, 1)];
-        let view = LedgerView::stage(state, staged_flakes, &HashMap::new()).unwrap();
+        let view = StagedLedger::new(state, staged_flakes, &HashMap::new()).unwrap();
 
         let (base, flakes) = view.into_parts();
         assert_eq!(base.ledger_id(), "test:main");

@@ -12,7 +12,7 @@ Transaction flakes
         ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ fluree-db-transact :: stage()                                   │
-│   stages flakes into a LedgerView (novelty overlay)             │
+│   stages flakes into a StagedLedger (novelty overlay)             │
 └─────────────────────────────────────────────────────────────────┘
         │
         ▼
@@ -37,7 +37,7 @@ Transaction flakes
 | Crate | Role |
 |-------|------|
 | `fluree-db-shacl` | SHACL engine: shape compilation, cache, per-node validation, constraint evaluators. **No transaction-layer concerns.** |
-| `fluree-db-transact` | Staged-validation plumbing: `validate_view_with_shacl`, `validate_staged_nodes`. Knows about `LedgerView`, staged flakes, and graph routing. Defines the per-graph policy types. |
+| `fluree-db-transact` | Staged-validation plumbing: `validate_view_with_shacl`, `validate_staged_nodes`. Knows about `StagedLedger`, staged flakes, and graph routing. Defines the per-graph policy types. |
 | `fluree-db-api` | Config resolution, policy building, and the shared helper that every write surface (JSON-LD, Turtle, commit replay) calls through. |
 
 SHACL is feature-gated (`shacl`). See [Standards and feature flags](../reference/compatibility.md).
@@ -48,7 +48,7 @@ All SHACL-enforced write surfaces route through **`apply_shacl_policy_to_staged_
 
 ```rust
 pub(crate) async fn apply_shacl_policy_to_staged_view(
-    view: &LedgerView,
+    view: &StagedLedger,
     ctx: StagedShaclContext<'_>,
 ) -> Result<(), TransactError>
 ```
@@ -84,7 +84,7 @@ The transact layer's `validate_view_with_shacl` signature:
 
 ```rust
 pub async fn validate_view_with_shacl(
-    view: &LedgerView,
+    view: &StagedLedger,
     shacl_cache: &ShaclCache,
     graph_sids: Option<&HashMap<GraphId, Sid>>,
     tracker: Option<&Tracker>,

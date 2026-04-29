@@ -17,7 +17,7 @@ use crate::namespace::NamespaceRegistry;
 use fluree_db_core::OverlayProvider;
 use fluree_db_core::Tracker;
 use fluree_db_core::{Flake, FlakeValue, GraphId, Sid};
-use fluree_db_ledger::{IndexConfig, LedgerState, LedgerView};
+use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_policy::{
     is_schema_flake, populate_class_cache, PolicyContext, PolicyDecision, PolicyError,
 };
@@ -133,7 +133,7 @@ impl<'a> StageOptions<'a> {
 /// 3. Generates retractions from DELETE templates with those bindings
 /// 4. Generates assertions from INSERT templates with those bindings
 /// 5. Applies cancellation (matching assertion/retraction pairs cancel out)
-/// 6. Returns a LedgerView with the staged flakes
+/// 6. Returns a StagedLedger with the staged flakes
 ///
 /// # Arguments
 ///
@@ -176,7 +176,7 @@ pub async fn stage(
     mut txn: Txn,
     mut ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
-) -> Result<(LedgerView, NamespaceRegistry)> {
+) -> Result<(StagedLedger, NamespaceRegistry)> {
     let span = tracing::debug_span!("txn_stage",
         current_t = ledger.t(),
         txn_type = ?txn.txn_type,
@@ -412,7 +412,7 @@ pub async fn stage(
         );
 
         Ok((
-            LedgerView::stage(ledger, flakes, &reverse_graph)?,
+            StagedLedger::new(ledger, flakes, &reverse_graph)?,
             ns_registry,
         ))
     }
@@ -441,7 +441,7 @@ pub async fn stage_flakes(
     ledger: LedgerState,
     flakes: Vec<Flake>,
     options: StageOptions<'_>,
-) -> Result<LedgerView> {
+) -> Result<StagedLedger> {
     let span = tracing::debug_span!("stage_flakes", flake_count = flakes.len());
     async move {
         // 1. Backpressure check
@@ -498,7 +498,7 @@ pub async fn stage_flakes(
         }
 
         tracing::info!(flake_count = flakes.len(), "stage_flakes completed");
-        Ok(LedgerView::stage(ledger, flakes, &reverse_graph)?)
+        Ok(StagedLedger::new(ledger, flakes, &reverse_graph)?)
     }
     .instrument(span)
     .await
@@ -1512,7 +1512,7 @@ fn query_novelty_for_graph(
 ///
 /// # Returns
 ///
-/// Returns `(LedgerView, NamespaceRegistry)` if staging and validation succeed.
+/// Returns `(StagedLedger, NamespaceRegistry)` if staging and validation succeed.
 /// Returns `TransactError::ShaclViolation` if SHACL validation fails.
 #[cfg(feature = "shacl")]
 pub async fn stage_with_shacl(
@@ -1521,7 +1521,7 @@ pub async fn stage_with_shacl(
     ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
     shacl_cache: &ShaclCache,
-) -> Result<(LedgerView, NamespaceRegistry)> {
+) -> Result<(StagedLedger, NamespaceRegistry)> {
     // Capture graph_delta + tracker before stage() consumes the options/txn.
     let graph_delta = txn.graph_delta.clone();
     let tracker = options.tracker;
@@ -1589,7 +1589,7 @@ impl ShaclValidationOutcome {
     }
 }
 
-/// Validate a staged [`LedgerView`] against SHACL shapes.
+/// Validate a staged [`StagedLedger`] against SHACL shapes.
 ///
 /// `graph_sids` provides the `GraphId → Sid` mapping for per-graph validation.
 /// Pass `None` when the mapping is unavailable (e.g., commit-transfer path
@@ -1607,7 +1607,7 @@ impl ShaclValidationOutcome {
 /// The caller decides whether to propagate an error, log warnings, or both.
 #[cfg(feature = "shacl")]
 pub async fn validate_view_with_shacl(
-    view: &LedgerView,
+    view: &StagedLedger,
     shacl_cache: &ShaclCache,
     graph_sids: Option<&HashMap<GraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
@@ -1662,7 +1662,7 @@ pub async fn validate_view_with_shacl(
 /// the default graph (g_id=0) — matching the previous behavior.
 #[cfg(feature = "shacl")]
 async fn validate_staged_nodes(
-    view: &LedgerView,
+    view: &StagedLedger,
     engine: &ShaclEngine,
     graph_sids: Option<&HashMap<GraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,

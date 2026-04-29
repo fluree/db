@@ -175,7 +175,7 @@ pub enum EnforcementMode {
 /// Ledger context needed for leaf decoding and policy filtering.
 ///
 /// Groups the database snapshot, time horizon, and binary index store to avoid
-/// parameter drift. Constructed from a `CachedLedgerState` at the call site.
+/// parameter drift. Constructed from a `LedgerView` at the call site.
 pub struct LedgerBlockContext<'a> {
     /// Database snapshot.
     pub snapshot: &'a LedgerSnapshot,

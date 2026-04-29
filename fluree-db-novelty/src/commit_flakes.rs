@@ -235,7 +235,6 @@ pub fn generate_commit_flakes(commit: &Commit, ledger_id: &str, t: i64) -> Vec<F
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CommitRef;
     use fluree_db_core::{ContentId, ContentKind};
 
     fn make_test_content_id(kind: ContentKind, label: &str) -> ContentId {
@@ -250,7 +249,7 @@ mod tests {
 
         if with_previous {
             let prev_id = make_test_content_id(ContentKind::Commit, "prev-commit-bytes");
-            commit.previous_refs = vec![CommitRef::new(prev_id)];
+            commit.parents = vec![prev_id];
         }
 
         commit

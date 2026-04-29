@@ -23,15 +23,15 @@ mod inner {
     use crate::parse::trig_meta::{parse_trig_phase1, resolve_trig_meta, RawObject, RawTerm};
     use crate::value_convert::convert_string_literal;
     use fluree_db_core::ns_encoding::NsSplitMode;
+    use fluree_db_core::CommitId;
     use fluree_db_core::{
         ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid,
     };
-    use fluree_db_novelty::CommitRef;
 
     /// Returns `Some(mode)` for the genesis commit (no parent), `None` otherwise.
     /// The split mode is only persisted in the genesis commit envelope.
     fn genesis_split_mode(state: &ImportState, mode: NsSplitMode) -> Option<NsSplitMode> {
-        if state.previous_ref.is_none() {
+        if state.parent.is_none() {
             Some(mode)
         } else {
             None
@@ -47,7 +47,7 @@ mod inner {
         /// Current transaction number. Starts at 0; first chunk produces t=1.
         pub t: i64,
         /// Reference to the previous commit (address + id).
-        pub previous_ref: Option<CommitRef>,
+        pub parent: Option<CommitId>,
         /// Namespace registry (accumulates across chunks).
         pub ns_registry: NamespaceRegistry,
         /// Cumulative flake count across all commits (for progress reporting).
@@ -72,7 +72,7 @@ mod inner {
         pub fn new() -> Self {
             Self {
                 t: 0,
-                previous_ref: None,
+                parent: None,
                 ns_registry: NamespaceRegistry::new(),
                 cumulative_flakes: 0,
                 import_time: chrono::Utc::now().to_rfc3339(),
@@ -188,7 +188,7 @@ mod inner {
 
             let envelope = CodecEnvelope {
                 t: new_t,
-                previous_refs: state.previous_ref.clone().into_iter().collect(),
+                parents: state.parent.clone().into_iter().collect(),
                 namespace_delta: ns_delta,
                 txn: None,
                 time: Some(state.import_time.clone()),
@@ -228,7 +228,7 @@ mod inner {
 
         // 8. Advance state
         state.t = new_t;
-        state.previous_ref = Some(CommitRef::new(commit_cid.clone()));
+        state.parent = Some(commit_cid.clone());
 
         Ok(ImportCommitResult {
             commit_id: commit_cid,
@@ -324,7 +324,7 @@ mod inner {
 
             let envelope = CodecEnvelope {
                 t: new_t,
-                previous_refs: state.previous_ref.clone().into_iter().collect(),
+                parents: state.parent.clone().into_iter().collect(),
                 namespace_delta: ns_delta,
                 txn: None,
                 time: Some(state.import_time.clone()),
@@ -361,7 +361,7 @@ mod inner {
         );
 
         state.t = new_t;
-        state.previous_ref = Some(CommitRef::new(commit_cid.clone()));
+        state.parent = Some(commit_cid.clone());
 
         Ok(ImportCommitResult {
             commit_id: commit_cid,
@@ -543,7 +543,7 @@ mod inner {
 
         let envelope = CodecEnvelope {
             t: new_t,
-            previous_refs: state.previous_ref.clone().into_iter().collect(),
+            parents: state.parent.clone().into_iter().collect(),
             namespace_delta: ns_delta,
             txn: None,
             time: Some(state.import_time.clone()),
@@ -582,7 +582,7 @@ mod inner {
 
         // 9. Advance state
         state.t = new_t;
-        state.previous_ref = Some(CommitRef::new(commit_cid.clone()));
+        state.parent = Some(commit_cid.clone());
 
         Ok(ImportCommitResult {
             commit_id: commit_cid,
@@ -986,7 +986,7 @@ mod inner {
 
         let envelope = CodecEnvelope {
             t: new_t,
-            previous_refs: state.previous_ref.clone().into_iter().collect(),
+            parents: state.parent.clone().into_iter().collect(),
             namespace_delta: ns_delta,
             txn: None,
             time: Some(state.import_time.clone()),
@@ -1014,7 +1014,7 @@ mod inner {
         );
 
         state.t = new_t;
-        state.previous_ref = Some(CommitRef::new(commit_cid.clone()));
+        state.parent = Some(commit_cid.clone());
 
         Ok(ImportCommitResult {
             commit_id: commit_cid,

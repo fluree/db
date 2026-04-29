@@ -80,7 +80,7 @@ pub use coerce::{coerce_json_value, coerce_value, CoercionError, CoercionResult}
 pub use commit::{
     collect_dag_cids, collect_dag_cids_with_split_mode, commit_to_summary, find_common_ancestor,
     load_commit_by_id, load_commit_envelope_by_id, trace_commit_envelopes_by_id,
-    trace_commits_by_id, walk_commit_summaries, Commit, CommitEnvelope, CommitRef, CommitSummary,
+    trace_commits_by_id, walk_commit_summaries, Commit, CommitEnvelope, CommitSummary,
     CommonAncestor, TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES,
     MAX_TXN_META_ENTRIES,
 };

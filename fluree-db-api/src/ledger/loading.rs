@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use crate::ledger_view::CommitRef;
 use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result};
 use fluree_db_core::ContentStore;
+use fluree_db_core::{collect_dag_cids, load_commit_envelope_by_id, CommitId};
 use fluree_db_nameservice::{NameServiceError, NsRecord};
 
 impl Fluree {
@@ -132,23 +134,33 @@ impl Fluree {
     /// Create a new branch for a ledger.
     ///
     /// Looks up the source branch to capture its current commit state, then
-    /// creates a new [`NsRecord`] for `ledger_name:new_branch` with the commit
-    /// head copied from the source. If the source has an index, the index
-    /// files are copied into the new branch's storage namespace so the branch
-    /// owns its own copy (safe from GC on the source).
+    /// creates a new [`NsRecord`] for `ledger_name:new_branch`.
     ///
-    /// Commits are **not** copied — the branch's [`BranchedContentStore`]
+    /// When `source_commit` is `None`, the new branch starts at the source's
+    /// current HEAD and inherits its index (copied into the new branch's
+    /// storage namespace so it's safe from GC on the source). This is the
+    /// default behavior.
+    ///
+    /// When `source_commit` is `Some(ref)`, the ref is resolved to a canonical
+    /// [`CommitId`] against the source branch, verified to be reachable from
+    /// the source HEAD, and becomes the new branch's head. The index is not
+    /// copied — the index at the source HEAD is typically too fresh for a
+    /// historical branch point, so the new branch replays from genesis.
+    ///
+    /// Commits themselves are **not** copied — the branch's content store
     /// reads historical commits from the source namespace via fallback.
     ///
     /// # Errors
     ///
     /// - [`ApiError::LedgerExists`] if the branch already exists
-    /// - [`ApiError::NotFound`] if the source branch does not exist
+    /// - [`ApiError::NotFound`] if the source branch does not exist, or if
+    ///   `source_commit` resolves to a commit not reachable from source HEAD
     pub async fn create_branch(
         &self,
         ledger_name: &str,
         new_branch: &str,
         source_branch: Option<&str>,
+        source_commit: Option<CommitRef>,
     ) -> Result<NsRecord> {
         use fluree_db_core::ledger_id::{format_ledger_id, validate_branch_name};
         use tracing::info;
@@ -172,36 +184,59 @@ impl Fluree {
             .ok_or_else(|| ApiError::NotFound(source_id.clone()))?;
 
         // Verify the source branch has a commit head before creating.
-        if source_record.commit_head_id.is_none() {
-            return Err(ApiError::internal(format!(
-                "Source branch {source_id} has no commit head"
-            )));
-        }
+        let source_head = source_record.commit_head_id.clone().ok_or_else(|| {
+            ApiError::internal(format!("Source branch {source_id} has no commit head"))
+        })?;
+
+        // If the caller specified a historical commit, resolve it and verify
+        // it's reachable from source HEAD before we touch the nameservice.
+        // A ref that resolves to the source head itself is collapsed to the
+        // default (None) path so the user still gets an index copy — otherwise
+        // `--at <head-cid>` would silently produce a slower branch than
+        // omitting `--at` entirely.
+        let at_commit = if let Some(commit_ref) = source_commit {
+            let view = self.ledger_cached(&source_id).await?.snapshot().await;
+            let resolved = view.resolve_commit(commit_ref).await?;
+            if resolved == source_head {
+                None
+            } else {
+                let store = self.content_store(&source_id);
+                let resolved_t = verify_ancestor(&*store, &source_head, &resolved).await?;
+                Some((resolved, resolved_t))
+            }
+        } else {
+            None
+        };
+
+        let is_historical = at_commit.is_some();
 
         self.nameservice()
-            .create_branch(ledger_name, new_branch, source)
+            .create_branch(ledger_name, new_branch, source, at_commit)
             .await
             .map_err(|e| match e {
                 NameServiceError::LedgerAlreadyExists(a) => ApiError::ledger_exists(a),
                 other => other.into(),
             })?;
 
-        // Copy the source's index files into the new branch's namespace.
-        // This gives the branch its own copy, safe from GC on the source.
-        if let Some(ref index_cid) = source_record.index_head_id {
-            if let Err(e) = self
-                .copy_index_to_branch(&source_id, &new_id, index_cid)
-                .await
-            {
-                tracing::warn!(
-                    %e, source = %source_id, branch = %new_id,
-                    "failed to copy index to branch; branch will replay from genesis"
-                );
-            } else {
-                // Register the copied index in the new branch's nameservice record
-                self.publisher()?
-                    .publish_index(&new_id, source_record.index_t, index_cid)
-                    .await?;
+        // Historical branches replay from genesis — skip the index copy.
+        // The source's current index reflects HEAD, which is too fresh.
+        if !is_historical {
+            if let Some(ref index_cid) = source_record.index_head_id {
+                // Copy the source's index files into the new branch's
+                // namespace so it owns its own copy, safe from GC on source.
+                if let Err(e) = self
+                    .copy_index_to_branch(&source_id, &new_id, index_cid)
+                    .await
+                {
+                    tracing::warn!(
+                        %e, source = %source_id, branch = %new_id,
+                        "failed to copy index to branch; branch will replay from genesis"
+                    );
+                } else {
+                    self.publisher()?
+                        .publish_index(&new_id, source_record.index_t, index_cid)
+                        .await?;
+                }
             }
         }
 
@@ -341,5 +376,49 @@ impl Fluree {
     /// List all non-retracted branches for a ledger.
     pub async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         Ok(self.nameservice().list_branches(ledger_name).await?)
+    }
+}
+
+/// Verify `target` is reachable by walking parents from `source_head`, and
+/// return its `t` value.
+///
+/// Used by `create_branch` when a caller specifies a historical commit — we
+/// only allow branching from commits on the source branch's ancestry.
+///
+/// "Ancestry" here is the full commit DAG, not the linear first-parent chain:
+/// `collect_dag_cids` walks every parent edge (including merge parents), so
+/// any commit reachable from `source_head` via any sequence of parent edges
+/// is a valid branch point. This is what enables branching at a commit that
+/// originally lived on a side branch that was later merged into the source
+/// — once merged in, those commits are part of the source's ancestry too.
+///
+/// Loads only the target commit's envelope (not its flakes) since we just
+/// need `t` for the ancestry walk's stop condition.
+async fn verify_ancestor<C: ContentStore + ?Sized>(
+    store: &C,
+    source_head: &CommitId,
+    target: &CommitId,
+) -> Result<i64> {
+    let target_envelope = load_commit_envelope_by_id(store, target)
+        .await
+        .map_err(|_| {
+            ApiError::NotFound(format!("commit {target} not found in source namespace"))
+        })?;
+
+    if source_head == target {
+        return Ok(target_envelope.t);
+    }
+
+    // Walk backward from source_head over the full DAG (all parent edges,
+    // including merge parents), stopping once we pass below target's t.
+    let stop_at = (target_envelope.t - 1).max(0);
+    let dag = collect_dag_cids(store, source_head, stop_at).await?;
+
+    if dag.iter().any(|(_, cid)| cid == target) {
+        Ok(target_envelope.t)
+    } else {
+        Err(ApiError::NotFound(format!(
+            "commit {target} is not an ancestor of source head {source_head}"
+        )))
     }
 }

@@ -11,7 +11,7 @@ use fluree_db_core::content_kind::ContentKind;
 use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{collect_dag_cids, load_commit_by_id, CommonAncestor};
 use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore, Flake};
-use fluree_db_ledger::{LedgerState, LedgerView};
+use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_nameservice::{NsRecord, NsRecordSnapshot};
 use fluree_db_novelty::compute_delta_keys;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
@@ -341,7 +341,7 @@ impl crate::Fluree {
             ApiError::internal(format!("Failed to build reverse graph during merge: {e}"))
         })?;
 
-        let view = LedgerView::stage(target_state, resolved_flakes, &reverse_graph)
+        let view = StagedLedger::new(target_state, resolved_flakes, &reverse_graph)
             .map_err(|e| ApiError::internal(format!("Failed to stage flakes during merge: {e}")))?;
 
         // Create merge commit with the source head as an additional parent,

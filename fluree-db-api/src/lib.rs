@@ -80,6 +80,7 @@ pub mod wire;
 
 // Ledger caching and management
 pub mod ledger_manager;
+pub mod ledger_view;
 
 // Search service integration (embedded adapter, remote client)
 pub mod search;
@@ -131,10 +132,11 @@ pub use import::{
 };
 pub use ledger_info::LedgerInfoBuilder;
 pub use ledger_manager::{
-    CachedLedgerState, FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager,
-    LedgerManagerConfig, LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult,
-    RemoteWatermark, UpdatePlan,
+    FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager, LedgerManagerConfig,
+    LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult, RemoteWatermark,
+    UpdatePlan,
 };
+pub use ledger_view::{CommitRef, LedgerView};
 pub use merge::MergeReport;
 pub use merge_preview::{
     AncestorRef, BranchDelta, ConflictDetail, ConflictResolutionPreview, ConflictSummary,
@@ -204,7 +206,7 @@ pub use fluree_db_core::{
     Storage, StorageMethod, StorageRead, StorageWrite,
 };
 pub use fluree_db_ledger::{
-    HistoricalLedgerView, IndexConfig, LedgerState, LedgerView, TypeErasedStore,
+    HistoricalLedgerView, IndexConfig, LedgerState, StagedLedger, TypeErasedStore,
 };
 pub use fluree_db_nameservice::{
     ConfigCasResult, ConfigPayload, ConfigPublisher, ConfigValue, GraphSourceLookup,
@@ -360,9 +362,10 @@ impl fluree_db_nameservice::NameService for NameServiceMode {
         ledger_name: &str,
         new_branch: &str,
         source_branch: &str,
+        at_commit: Option<(fluree_db_core::ContentId, i64)>,
     ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
         self.reader()
-            .create_branch(ledger_name, new_branch, source_branch)
+            .create_branch(ledger_name, new_branch, source_branch, at_commit)
             .await
     }
 
