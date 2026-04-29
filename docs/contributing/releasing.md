@@ -1,55 +1,57 @@
 # Releasing
 
-Fluree DB uses three tools working together:
+Fluree DB releases go through a **two-phase pull-request flow**:
+
+1. **Phase 1** — On a `release/*` branch, a small script (`scripts/prepare-release.sh`) bumps the workspace version and prepends a new section to `CHANGELOG.md`. You then review, commit, push, and open a PR.
+2. **Phase 2** — After the PR is reviewed and merged to `main`, you tag the merge commit. The pushed tag triggers `.github/workflows/release.yml` (cargo-dist), which builds binaries, creates the GitHub Release, publishes Homebrew, and pushes Docker images.
+
+The split is deliberate: cargo-dist's release workflow triggers on **any** pushed `vX.Y.Z` tag regardless of branch, so the tag step is held until after merge. The script does no committing or pushing — that's all on you, so there's a clear review gate.
 
 | Tool          | Job                                                                                          |
 |---------------|----------------------------------------------------------------------------------------------|
-| `git-cliff`   | Generates `CHANGELOG.md` from conventional-commit subjects. Config: `cliff.toml`.            |
-| `cargo-release` | Bumps the workspace version, runs git-cliff, creates the release commit. Config: `release.toml`. |
-| `cargo-dist`    | Picks up the pushed `vX.Y.Z` tag, builds binaries, publishes the GitHub Release, Homebrew formula, and Docker images. Config: `dist-workspace.toml`, `.github/workflows/release.yml`. |
-
-Releases are cut via a **two-phase pull-request flow**. Phase 1 prepares the release on a branch and opens a PR. Phase 2 — after the PR is reviewed and merged — tags the merge commit, which is what actually triggers cargo-dist.
-
-This split exists deliberately: cargo-dist's release workflow triggers on **any** pushed `vX.Y.Z` tag, regardless of branch. By keeping the tag step manual and post-merge, we ensure no release ships without a reviewed PR.
+| `git-cliff`   | Generates `CHANGELOG.md` entries from conventional-commit subjects. Config: `cliff.toml`.    |
+| `scripts/prepare-release.sh` | Bumps the workspace version, refreshes `Cargo.lock`, and runs git-cliff. Stops short of committing. |
+| `cargo-dist`  | Picks up the pushed `vX.Y.Z` tag, builds and publishes everything. Config: `dist-workspace.toml`, `.github/workflows/release.yml`. |
 
 ## One-time setup
 
-Install the two tools (cargo-dist runs in CI, not locally):
+`git-cliff` is the only tool you install locally; cargo-dist runs in CI.
 
 ```bash
-cargo install cargo-release git-cliff
+cargo install git-cliff
 ```
 
 ## Phase 1 — Open the release PR
 
-From a clean `main` branch:
-
 ```bash
-# 1. Cut a release branch.
+# 1. Cut a release branch from clean main.
 git checkout main && git pull
 git checkout -b release/v4.0.2
 
-# 2. Preview the release. cargo-release is dry-run by default.
-cargo release patch
+# 2. Bump version + update CHANGELOG.md (no commit).
+scripts/prepare-release.sh 4.0.2
 
-# 3. If the diff looks right, run for real with --execute.
-cargo release patch --execute
+# 3. Review the diff.
+git diff
 
-# 4. Push the release branch and open a PR.
+# 4. Commit when satisfied. Edit CHANGELOG.md by hand first if you want to
+#    polish wording, regroup entries, drop noise, etc.
+git commit -am "release v4.0.2"
+
+# 5. Push and open a PR.
 git push -u origin release/v4.0.2
-gh pr create --title "release v4.0.2" --body "Bump workspace to 4.0.2 and regenerate CHANGELOG.md."
+gh pr create --title "release v4.0.2" \
+    --body "Bump workspace to 4.0.2. See CHANGELOG.md for details."
 ```
 
-`patch` can be replaced with `minor`, `major`, or an explicit version like `4.0.2`.
+What `prepare-release.sh` does, in order:
 
-What `cargo release patch --execute` does, on the release branch:
+1. Verifies you're on a `release/*` branch with a clean working tree.
+2. Bumps `[workspace.package].version` in the root `Cargo.toml`. Every member crate inherits via `version.workspace = true`.
+3. Runs `cargo update --workspace` to refresh `Cargo.lock`.
+4. Runs `git cliff --unreleased --tag v<version> --prepend CHANGELOG.md` — generates only the new section (commits since the previous tag) and prepends it above the existing changelog. Existing version sections are untouched.
 
-1. Confirms the working tree is clean and you're on a `release/*` branch (enforced by `release.toml`).
-2. Runs the pre-release hook: `git cliff --tag vX.Y.Z --output CHANGELOG.md` (regenerates the changelog at the workspace root, including the new version).
-3. Bumps `[workspace.package].version` in the root `Cargo.toml`. Every member crate inherits it via `version.workspace = true`.
-4. Creates a single commit (`release vX.Y.Z`) with the version bump and the regenerated `CHANGELOG.md`.
-
-It does **not** create a tag and does **not** push (both disabled in `release.toml`). That's intentional — the tag belongs on the merge commit on `main`, not on the release branch.
+It does **not** commit, tag, or push.
 
 ## Phase 2 — Tag and ship after merge
 
@@ -92,6 +94,8 @@ A `!` after the type marks a breaking change (`feat!: drop X`). Scopes render as
 
 If you squash-merge PRs, the PR title becomes the commit subject and ends up in the changelog automatically. If you merge-commit instead, the individual commit subjects are what get parsed.
 
+Hand-editing `CHANGELOG.md` after running the script is fine and expected — git-cliff gives you a starting point, not the final wording. The committed file is the source of truth for the GitHub Release notes.
+
 ## Bootstrapping the changelog
 
 The committed `CHANGELOG.md` starts as a stub. To regenerate it from full git history (covering every existing tag back to the start of the repo), run once:
@@ -102,21 +106,21 @@ git add CHANGELOG.md
 git commit -m "docs: bootstrap CHANGELOG.md from git history"
 ```
 
-This only needs to be done once. Going forward, `cargo release` keeps the file current.
+Subsequent releases use `--unreleased --prepend` (via `prepare-release.sh`) and only add the new section, so the bootstrap is one-time.
 
 ## Rolling back
 
-**Before pushing the release branch (Phase 1):**
+**During Phase 1, before pushing the branch:**
 
 ```bash
-git reset --hard HEAD~1   # drop the release commit
+git reset --hard HEAD            # if already committed
 git checkout main
 git branch -D release/vX.Y.Z
 ```
 
 **After the release PR is opened but before merge:**
 
-Just close the PR and delete the branch on GitHub. Nothing has shipped.
+Close the PR and delete the branch on GitHub. Nothing has shipped.
 
 **After Phase 2 — tag pushed but cargo-dist still running:**
 
@@ -134,8 +138,6 @@ Delete the GitHub Release from the UI, then delete the tag (commands above). The
 ## Configuration files
 
 - `cliff.toml` — git-cliff parsing rules and output template.
-- `release.toml` — cargo-release behavior: shared workspace version, hook, `tag = false`, `push = false`, `allow-branch = ["release/*"]`.
+- `scripts/prepare-release.sh` — release-prep entry point.
 - `dist-workspace.toml` — cargo-dist's distribution targets and installers.
 - `.github/workflows/release.yml` — autogenerated by cargo-dist; regenerated with `dist init`.
-
-If you change `cliff.toml` or `release.toml`, validate with `cargo release patch` (dry-run is the default) on a throwaway `release/*` branch before relying on it.
