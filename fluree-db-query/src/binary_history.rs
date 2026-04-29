@@ -38,8 +38,13 @@
 //! All heavy lifting happens in `open()` (three-source collection into
 //! a `Vec<Flake>`), so that's where the fuel guardrail lives.
 //!
-//! - **Persisted pass:** 1000 micro-fuel per leaflet touched — same
-//!   rate `BinaryCursor::next_batch` uses for non-history scans.
+//! - **Persisted pass:** `1000 + sidecar_rows + base_rows` micro-fuel per
+//!   leaflet, charged from the directory entry before any sidecar segment
+//!   or column load — overrun short-circuits before I/O. The 1000 base
+//!   matches `BinaryCursor::next_batch` for non-history scans; the
+//!   row-count terms account for sidecar replay + base-row decode work
+//!   that the non-history path doesn't perform. Overcharges on rows
+//!   rejected by `filter.matches()`; that's the guardrail tradeoff.
 //! - **Novelty pass:** 1 micro-fuel per matched novelty flake, charged
 //!   during the walk. A captured `FuelExceededError` short-circuits the
 //!   walk on the next callback invocation.
@@ -226,19 +231,24 @@ impl BinaryHistoryScanOperator {
                                 continue;
                             }
 
-                            // Charge 1 fuel (1000 micro-fuel) per leaflet we touch,
-                            // mirroring `BinaryCursor::next_batch` for the non-history
-                            // scan path. This is the cost-model guardrail — without
-                            // it, a broad history query could do unbounded column /
-                            // sidecar loads in `open()` before the caller ever sees
-                            // the first batch.
-                            ctx.tracker.consume_fuel(1000)?;
-
                             // Sidecar: only load when the segment's t range can
                             // overlap [from_t, persisted_to_t].
                             let sidecar_in_range = leaflet.history_len > 0
                                 && leaflet.history_max_t >= from_t_u32
                                 && leaflet.history_min_t <= persisted_to_u32;
+
+                            // Scale per-leaflet fuel by rows we'll actually iterate.
+                            // Both counts come from the directory entry — no I/O
+                            // needed to charge — so we short-circuit before the
+                            // sidecar segment / column load on overrun. Overcharges
+                            // on filter-rejected rows; that's the guardrail tradeoff.
+                            let sidecar_rows =
+                                if sidecar_in_range { leaflet.history_len as u64 } else { 0 };
+                            let base_rows = leaflet.row_count as u64;
+                            ctx.tracker.consume_fuel(
+                                1000u64.saturating_add(sidecar_rows).saturating_add(base_rows),
+                            )?;
+
                             if sidecar_in_range {
                                 let segment =
                                     handle.load_sidecar_segment(leaflet_idx).map_err(|e| {
