@@ -1,6 +1,6 @@
 # Running & Interfacing with Fluree DB
 
-This guide covers every way to run and interact with Fluree DB-R — from a local CLI to a distributed HTTP service to embedding it directly in a Rust application.
+This guide covers every way to run and interact with Fluree DB — from a local CLI to a distributed HTTP service to embedding it directly in a Rust application.
 
 ---
 

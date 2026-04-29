@@ -1,4 +1,4 @@
-# Fluree DB (Rust) Documentation
+# Fluree DB Documentation
 
 This `docs/` directory is the documentation “source of truth” that lives alongside the code and evolves with it.
 
