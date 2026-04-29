@@ -106,7 +106,8 @@ fn compare_for_minmax(
     let store = gv.store();
 
     // Fast path 1: subject IDs (IRIs) — compare lexicographically without allocation.
-    if let (Binding::EncodedSid { s_id: a_id }, Binding::EncodedSid { s_id: b_id }) = (a, b) {
+    if let (Binding::EncodedSid { s_id: a_id, .. }, Binding::EncodedSid { s_id: b_id, .. }) = (a, b)
+    {
         if let Ok(ord) = store.compare_subject_iri_lex(*a_id, *b_id) {
             return ord;
         }
@@ -170,7 +171,7 @@ fn materialize_for_minmax(binding: &Binding, gv: Option<&BinaryGraphView>) -> Bi
         } => {
             // BinaryGraphView handles novelty watermark routing internally.
             match gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id) {
-                Ok(fluree_db_core::FlakeValue::Ref(sid)) => Binding::Sid(sid),
+                Ok(fluree_db_core::FlakeValue::Ref(sid)) => Binding::sid(sid),
                 Ok(val) => {
                     let dt_sid = store
                         .dt_sids()
@@ -194,12 +195,12 @@ fn materialize_for_minmax(binding: &Binding, gv: Option<&BinaryGraphView>) -> Bi
                 Err(_) => binding.clone(),
             }
         }
-        Binding::EncodedSid { s_id } => match gv.resolve_subject_sid(*s_id) {
-            Ok(sid) => Binding::Sid(sid),
+        Binding::EncodedSid { s_id, .. } => match gv.resolve_subject_sid(*s_id) {
+            Ok(sid) => Binding::sid(sid),
             Err(_) => binding.clone(),
         },
         Binding::EncodedPid { p_id } => match store.resolve_predicate_iri(*p_id) {
-            Some(iri) => Binding::Sid(store.encode_iri(iri)),
+            Some(iri) => Binding::sid(store.encode_iri(iri)),
             None => binding.clone(),
         },
         _ => binding.clone(),
@@ -423,7 +424,7 @@ impl Hash for MaterializedLitKey {
 /// Also used by SemijoinOperator for EXISTS hash probing.
 pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
     match binding {
-        Binding::EncodedSid { s_id } => GroupKeyOwned::Sid(*s_id),
+        Binding::EncodedSid { s_id, .. } => GroupKeyOwned::Sid(*s_id),
         Binding::EncodedPid { p_id } => GroupKeyOwned::Pid(*p_id),
         Binding::EncodedLit {
             o_kind,
@@ -443,7 +444,9 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
             dt_id: *dt_id,
             lang_id: *lang_id,
         },
-        Binding::Sid(sid) => GroupKeyOwned::MaterializedSid(sid.namespace_code, sid.name.clone()),
+        Binding::Sid { sid, .. } => {
+            GroupKeyOwned::MaterializedSid(sid.namespace_code, sid.name.clone())
+        }
         Binding::Lit { val, dtc, .. } => {
             GroupKeyOwned::MaterializedLit(flake_value_to_key(val, dtc))
         }
@@ -1013,25 +1016,25 @@ mod tests {
         let columns = vec![
             // ?venue
             vec![
-                Binding::Sid(Sid::new(100, "venueA")),
-                Binding::Sid(Sid::new(100, "venueA")),
-                Binding::Sid(Sid::new(100, "venueA")),
-                Binding::Sid(Sid::new(100, "venueA")),
-                Binding::Sid(Sid::new(100, "venueA")),
-                Binding::Sid(Sid::new(100, "venueB")),
-                Binding::Sid(Sid::new(100, "venueB")),
-                Binding::Sid(Sid::new(100, "venueB")),
+                Binding::sid(Sid::new(100, "venueA")),
+                Binding::sid(Sid::new(100, "venueA")),
+                Binding::sid(Sid::new(100, "venueA")),
+                Binding::sid(Sid::new(100, "venueA")),
+                Binding::sid(Sid::new(100, "venueA")),
+                Binding::sid(Sid::new(100, "venueB")),
+                Binding::sid(Sid::new(100, "venueB")),
+                Binding::sid(Sid::new(100, "venueB")),
             ],
             // ?paper
             vec![
-                Binding::Sid(Sid::new(200, "paper1")),
-                Binding::Sid(Sid::new(200, "paper2")),
-                Binding::Sid(Sid::new(200, "paper3")),
-                Binding::Sid(Sid::new(200, "paper4")),
-                Binding::Sid(Sid::new(200, "paper5")),
-                Binding::Sid(Sid::new(200, "paper6")),
-                Binding::Sid(Sid::new(200, "paper7")),
-                Binding::Sid(Sid::new(200, "paper8")),
+                Binding::sid(Sid::new(200, "paper1")),
+                Binding::sid(Sid::new(200, "paper2")),
+                Binding::sid(Sid::new(200, "paper3")),
+                Binding::sid(Sid::new(200, "paper4")),
+                Binding::sid(Sid::new(200, "paper5")),
+                Binding::sid(Sid::new(200, "paper6")),
+                Binding::sid(Sid::new(200, "paper7")),
+                Binding::sid(Sid::new(200, "paper8")),
             ],
         ];
         let batch = Batch::new(schema.clone(), columns).unwrap();
@@ -1093,7 +1096,7 @@ mod tests {
         let venue_a_count = results
             .iter()
             .find(|(v, _)| {
-                if let Binding::Sid(sid) = v {
+                if let Binding::Sid { sid, .. } = v {
                     sid.name.as_ref() == "venueA"
                 } else {
                     false
@@ -1103,7 +1106,7 @@ mod tests {
         let venue_b_count = results
             .iter()
             .find(|(v, _)| {
-                if let Binding::Sid(sid) = v {
+                if let Binding::Sid { sid, .. } = v {
                     sid.name.as_ref() == "venueB"
                 } else {
                     false
@@ -1131,11 +1134,11 @@ mod tests {
         let columns = vec![
             // ?category
             vec![
-                Binding::Sid(Sid::new(100, "catA")),
-                Binding::Sid(Sid::new(100, "catA")),
-                Binding::Sid(Sid::new(100, "catA")),
-                Binding::Sid(Sid::new(100, "catB")),
-                Binding::Sid(Sid::new(100, "catB")),
+                Binding::sid(Sid::new(100, "catA")),
+                Binding::sid(Sid::new(100, "catA")),
+                Binding::sid(Sid::new(100, "catA")),
+                Binding::sid(Sid::new(100, "catB")),
+                Binding::sid(Sid::new(100, "catB")),
             ],
             // ?value
             vec![
@@ -1197,7 +1200,7 @@ mod tests {
                 let sum_val = batch.get_by_col(row_idx, 1);
                 let avg_val = batch.get_by_col(row_idx, 2);
 
-                if let Binding::Sid(sid) = cat {
+                if let Binding::Sid { sid, .. } = cat {
                     let sum = match sum_val {
                         Binding::Lit {
                             val: FlakeValue::Long(n),

@@ -466,7 +466,7 @@ impl PropertyPathOperator {
                 Ref::Sid(s) => Some(s.clone()),
                 Ref::Iri(iri) => db_for_encode.encode_iri(iri),
                 Ref::Var(_) => binding.and_then(|b| match b {
-                    Binding::Sid(s) => Some(s.clone()),
+                    Binding::Sid { sid: s, .. } => Some(s.clone()),
                     Binding::IriMatch { iri, .. } => db_for_encode.encode_iri(iri),
                     Binding::Iri(iri) => db_for_encode.encode_iri(iri),
                     _ => None,
@@ -492,9 +492,9 @@ impl PropertyPathOperator {
                         if let Some(col) = child_batch.column(*var) {
                             row.push(col[row_idx].clone());
                         } else if Some(*var) == obj_var {
-                            row.push(Binding::Sid(obj.clone()));
+                            row.push(Binding::sid(obj.clone()));
                         } else if Some(*var) == subj_var {
-                            row.push(Binding::Sid(start.clone()));
+                            row.push(Binding::sid(start.clone()));
                         } else {
                             row.push(Binding::Unbound);
                         }
@@ -514,9 +514,9 @@ impl PropertyPathOperator {
                         if let Some(col) = child_batch.column(*var) {
                             row.push(col[row_idx].clone());
                         } else if Some(*var) == subj_var {
-                            row.push(Binding::Sid(subj.clone()));
+                            row.push(Binding::sid(subj.clone()));
                         } else if Some(*var) == obj_var {
-                            row.push(Binding::Sid(target.clone()));
+                            row.push(Binding::sid(target.clone()));
                         } else {
                             row.push(Binding::Unbound);
                         }
@@ -555,9 +555,9 @@ impl PropertyPathOperator {
                         if let Some(col) = child_batch.column(*var) {
                             row.push(col[row_idx].clone());
                         } else if Some(*var) == subj_var {
-                            row.push(Binding::Sid(subj.clone()));
+                            row.push(Binding::sid(subj.clone()));
                         } else if Some(*var) == obj_var {
-                            row.push(Binding::Sid(obj.clone()));
+                            row.push(Binding::sid(obj.clone()));
                         } else {
                             row.push(Binding::Unbound);
                         }
@@ -635,9 +635,9 @@ impl Operator for PropertyPathOperator {
             for (subj, obj) in batch_results {
                 for (col_idx, var) in self.in_schema.iter().enumerate() {
                     if Some(*var) == subj_var {
-                        columns[col_idx].push(Binding::Sid(subj.clone()));
+                        columns[col_idx].push(Binding::sid(subj.clone()));
                     } else if Some(*var) == obj_var {
-                        columns[col_idx].push(Binding::Sid(obj.clone()));
+                        columns[col_idx].push(Binding::sid(obj.clone()));
                     } else {
                         columns[col_idx].push(Binding::Unbound);
                     }

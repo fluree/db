@@ -648,7 +648,7 @@ impl NestedLoopJoinOperator {
                     !matches!(
                         binding,
                         Binding::Unbound
-                            | Binding::Sid(_)
+                            | Binding::Sid { .. }
                             | Binding::IriMatch { .. }
                             | Binding::Iri(_)
                             | Binding::EncodedSid { .. }
@@ -678,14 +678,14 @@ impl NestedLoopJoinOperator {
             match instr.position {
                 PatternPosition::Subject => {
                     match binding {
-                        Binding::Sid(sid) => {
+                        Binding::Sid { sid, .. } => {
                             pattern.s = Ref::Sid(sid.clone());
                         }
                         Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
                             // Use Ref::Iri so scan can encode for each target ledger
                             pattern.s = Ref::Iri(iri.clone());
                         }
-                        Binding::EncodedSid { s_id } => {
+                        Binding::EncodedSid { s_id, .. } => {
                             // Resolve encoded s_id to IRI (novelty-aware via BinaryGraphView)
                             if let Some(gv) = gv {
                                 let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
@@ -718,14 +718,14 @@ impl NestedLoopJoinOperator {
                 }
                 PatternPosition::Predicate => {
                     match binding {
-                        Binding::Sid(sid) => {
+                        Binding::Sid { sid, .. } => {
                             pattern.p = Ref::Sid(sid.clone());
                         }
                         Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
                             // Use Term::Iri so scan can encode for each target ledger
                             pattern.p = Ref::Iri(iri.clone());
                         }
-                        Binding::EncodedSid { s_id } => {
+                        Binding::EncodedSid { s_id, .. } => {
                             // Allow cross-position reuse: an IRI bound as a subject/object can
                             // be used to bind a predicate position. Resolve via subject dict.
                             if let Some(gv) = gv {
@@ -759,7 +759,7 @@ impl NestedLoopJoinOperator {
                 }
                 PatternPosition::Object => {
                     match binding {
-                        Binding::Sid(sid) => {
+                        Binding::Sid { sid, .. } => {
                             pattern.o = Term::Sid(sid.clone());
                         }
                         Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
@@ -802,7 +802,7 @@ impl NestedLoopJoinOperator {
                             }
                             // Otherwise leave as variable
                         }
-                        Binding::EncodedSid { s_id } => {
+                        Binding::EncodedSid { s_id, .. } => {
                             // Resolve encoded s_id to IRI (novelty-aware)
                             if let Some(gv) = gv {
                                 let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
@@ -1129,8 +1129,8 @@ impl Operator for NestedLoopJoinOperator {
                     let left_batch = self.current_left_batch.as_ref().unwrap();
                     let store = ctx.binary_store.as_deref();
                     match left_batch.get_by_col(left_row, left_col) {
-                        Binding::EncodedSid { s_id } => Some(*s_id),
-                        Binding::Sid(sid) => store.and_then(|s| {
+                        Binding::EncodedSid { s_id, .. } => Some(*s_id),
+                        Binding::Sid { sid, .. } => store.and_then(|s| {
                             s.find_subject_id_by_parts(sid.namespace_code, &sid.name)
                                 .ok()
                                 .flatten()
@@ -1602,7 +1602,7 @@ impl NestedLoopJoinOperator {
                     let obj_binding = if o_type_val == OType::IRI_REF.as_u16()
                         || o_type_val == OType::BLANK_NODE.as_u16()
                     {
-                        Binding::EncodedSid { s_id: o_key_val }
+                        Binding::encoded_sid(o_key_val)
                     } else {
                         let p_id = entry.p_const.unwrap_or_else(|| batch.p_id.get_or(row, 0));
                         let o_i = batch.o_i.get_or(row, u32::MAX);
@@ -1738,7 +1738,14 @@ impl NestedLoopJoinOperator {
                                                 ))
                                             })?,
                                     };
-                                materialized_object_binding(store, o_type_val, p_id, val, Some(t))
+                                materialized_object_binding(
+                                    store,
+                                    o_type_val,
+                                    p_id,
+                                    val,
+                                    Some(t),
+                                    None,
+                                )
                             }
                         }
                     };
@@ -2140,7 +2147,7 @@ impl NestedLoopJoinOperator {
                                 })?;
                             let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
                             for _ in &self.right_new_vars {
-                                right_bindings.push(Binding::EncodedSid { s_id });
+                                right_bindings.push(Binding::encoded_sid(s_id));
                             }
                             if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
                                 continue;
@@ -2233,7 +2240,7 @@ impl NestedLoopJoinOperator {
                                 })?;
                             let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
                             for _ in &self.right_new_vars {
-                                right_bindings.push(Binding::EncodedSid { s_id });
+                                right_bindings.push(Binding::encoded_sid(s_id));
                             }
                             if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
                                 continue;
@@ -2390,7 +2397,9 @@ fn build_probe_object_binding(
 ) -> Result<Binding> {
     use fluree_db_core::o_type::{DecodeKind, OType};
 
-    if let Some(binding) = late_materialized_object_binding(o_type_val, o_key_val, p_id, t, o_i) {
+    if let Some(binding) =
+        late_materialized_object_binding(o_type_val, o_key_val, p_id, t, o_i, None)
+    {
         return Ok(binding);
     }
 
@@ -2424,6 +2433,7 @@ fn build_probe_object_binding(
         p_id,
         val,
         Some(t),
+        None,
     ))
 }
 
@@ -2974,7 +2984,7 @@ mod tests {
 
         // Create a batch with one row that has NO Poisoned bindings
         let columns_normal = vec![
-            vec![Binding::Sid(Sid::new(1, "alice"))],
+            vec![Binding::sid(Sid::new(1, "alice"))],
             vec![Binding::lit(
                 FlakeValue::String("Alice".to_string()),
                 Sid::new(2, "string"),
@@ -2987,7 +2997,7 @@ mod tests {
 
         // Create a batch where Poisoned is in position 1 (NOT used for binding)
         let columns_poisoned_unused = vec![
-            vec![Binding::Sid(Sid::new(1, "alice"))],
+            vec![Binding::sid(Sid::new(1, "alice"))],
             vec![Binding::Poisoned], // This is in position 1, not used for binding ?s
         ];
         let batch_poisoned_unused = Batch::new(left_schema, columns_poisoned_unused).unwrap();
@@ -3292,7 +3302,7 @@ mod tests {
         // Left batch: ?s = some:subject (a Sid)
         let left_batch = Batch::new(
             left_schema,
-            vec![vec![Binding::Sid(Sid::new(1, "some:subject"))]],
+            vec![vec![Binding::sid(Sid::new(1, "some:subject"))]],
         )
         .unwrap();
 
@@ -3301,7 +3311,7 @@ mod tests {
         let right_batch = Batch::new(
             right_schema,
             vec![
-                vec![Binding::Sid(Sid::new(1, "some:other"))],
+                vec![Binding::sid(Sid::new(1, "some:other"))],
                 vec![Binding::lit(FlakeValue::Long(42), Sid::new(2, "long"))],
             ],
         )

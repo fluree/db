@@ -341,7 +341,7 @@ async fn owl2rl_domain_range_and_chain_visible_via_execute_with_overlay() {
         for row_idx in 0..batch.len() {
             let row = batch.row_view(row_idx).unwrap();
             match row.get(x) {
-                Some(Binding::Sid(sid)) => got.push(sid.clone()),
+                Some(Binding::Sid { sid, .. }) => got.push(sid.clone()),
                 Some(other) => panic!("Expected Sid binding for ?x, got {other:?}"),
                 None => panic!("Expected binding for ?x"),
             }
@@ -379,7 +379,7 @@ async fn owl2rl_domain_range_and_chain_visible_via_execute_with_overlay() {
         for row_idx in 0..batch.len() {
             let row = batch.row_view(row_idx).unwrap();
             match row.get(o) {
-                Some(Binding::Sid(sid)) => got_o.push(sid.clone()),
+                Some(Binding::Sid { sid, .. }) => got_o.push(sid.clone()),
                 Some(other) => panic!("Expected Sid binding for ?o, got {other:?}"),
                 None => panic!("Expected binding for ?o"),
             }

@@ -231,7 +231,7 @@ fn stamp_binding(
     ctx: &ExecutionContext<'_>,
 ) -> Result<Binding> {
     match binding {
-        Binding::Sid(ref sid) => sid_to_iri_match(sid, ledger_id, ctx),
+        Binding::Sid { ref sid, .. } => sid_to_iri_match(sid, ledger_id, ctx),
         Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => Err(QueryError::Internal(
             "EncodedSid/EncodedPid reached stamp_provenance — binary store should have \
                  been disabled for multi-ledger datasets"

@@ -162,7 +162,9 @@ fn sparql_table_cell(
         Binding::Unbound | Binding::Poisoned => String::new(),
 
         // Use display compaction (includes auto-derived fallback prefixes)
-        Binding::Sid(sid) => compact_bnode_strip(compactor.compact_sid_for_display(sid).ok()),
+        Binding::Sid { sid, .. } => {
+            compact_bnode_strip(compactor.compact_sid_for_display(sid).ok())
+        }
         Binding::IriMatch { iri, .. } => {
             compact_bnode_strip(compactor.compact_iri_for_display(iri).ok())
         }
@@ -170,7 +172,7 @@ fn sparql_table_cell(
 
         Binding::Lit { val, .. } => flake_value_to_table_cell(val, compactor),
 
-        Binding::EncodedSid { s_id } => {
+        Binding::EncodedSid { s_id, .. } => {
             let Some(gv) = gv else {
                 return Ok(format!("{b:?}"));
             };

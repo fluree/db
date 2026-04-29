@@ -238,9 +238,7 @@ impl PropertyJoinOperator {
         pred_idx: usize,
         probe_match: BatchedSubjectProbeMatch,
     ) -> Result<()> {
-        let subject = Binding::EncodedSid {
-            s_id: probe_match.subject_id,
-        };
+        let subject = Binding::encoded_sid(probe_match.subject_id);
         if let Some(key) = Self::subject_key(ctx, &subject)? {
             if let Some(entry) = all_subject_values.get_mut(&key) {
                 entry.1 |= 1u64 << pred_idx;
@@ -260,9 +258,7 @@ impl PropertyJoinOperator {
         all_subject_values: &mut FxHashMap<SubjectKey, (Binding, u64, Vec<Vec<Binding>>)>,
         spot_match: BatchedSpotStarMatch,
     ) -> Result<()> {
-        let subject = Binding::EncodedSid {
-            s_id: spot_match.subject_id,
-        };
+        let subject = Binding::encoded_sid(spot_match.subject_id);
         if let Some(key) = Self::subject_key(ctx, &subject)? {
             if let Some(entry) = all_subject_values.get_mut(&key) {
                 entry.1 |= 1u64 << spot_match.predicate_idx;
@@ -461,8 +457,8 @@ impl PropertyJoinOperator {
 
     fn subject_key_single(subject: &Binding) -> Option<SubjectKey> {
         match subject {
-            Binding::EncodedSid { s_id } => Some(SubjectKey::Id(*s_id)),
-            Binding::Sid(sid) => Some(SubjectKey::Sid(sid.clone())),
+            Binding::EncodedSid { s_id, .. } => Some(SubjectKey::Id(*s_id)),
+            Binding::Sid { sid, .. } => Some(SubjectKey::Sid(sid.clone())),
             Binding::IriMatch { primary_sid, .. } => Some(SubjectKey::Sid(primary_sid.clone())),
             Binding::Iri(iri) => Some(SubjectKey::Iri(iri.clone())),
             _ => None,
@@ -476,7 +472,7 @@ impl PropertyJoinOperator {
         Ok(match subject {
             Binding::IriMatch { iri, .. } => Some(SubjectKey::Iri(iri.clone())),
             Binding::Iri(iri) => Some(SubjectKey::Iri(iri.clone())),
-            Binding::Sid(sid) => {
+            Binding::Sid { sid, .. } => {
                 // In dataset mode, use canonical IRI strings as join keys.
                 // Prefer decoding within the active ledger when available.
                 let Some(iri) = ctx
@@ -488,7 +484,7 @@ impl PropertyJoinOperator {
                 };
                 Some(SubjectKey::Iri(Arc::from(iri)))
             }
-            Binding::EncodedSid { s_id } => {
+            Binding::EncodedSid { s_id, .. } => {
                 // Resolve to canonical IRI for cross-ledger comparison.
                 // Novelty-aware via ctx.resolve_subject_iri().
                 match ctx.resolve_subject_iri(*s_id) {
@@ -1108,7 +1104,7 @@ mod tests {
     #[test]
     fn test_subject_key_single_prefers_encoded_ids() {
         // Single-ledger mode should not require IRI decoding for EncodedSid.
-        let key = PropertyJoinOperator::subject_key_single(&Binding::EncodedSid { s_id: 42 });
+        let key = PropertyJoinOperator::subject_key_single(&Binding::encoded_sid(42));
         assert!(matches!(key, Some(SubjectKey::Id(42))));
     }
 
@@ -1118,10 +1114,10 @@ mod tests {
         let op = PropertyJoinOperator::new(&patterns, HashMap::new()).unwrap();
 
         let subject_sid = Sid::new(1, "alice");
-        let subject_binding = Binding::Sid(subject_sid.clone());
+        let subject_binding = Binding::sid(subject_sid.clone());
         let values = vec![
-            vec![Binding::Sid(Sid::new(200, "Alice"))], // name
-            vec![Binding::Sid(Sid::new(201, "30"))],    // age
+            vec![Binding::sid(Sid::new(200, "Alice"))], // name
+            vec![Binding::sid(Sid::new(201, "30"))],    // age
         ];
 
         let rows = PropertyJoinOperator::generate_rows(
@@ -1132,7 +1128,7 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].len(), 3);
-        assert!(matches!(&rows[0][0], Binding::Sid(s) if *s == subject_sid));
+        assert!(matches!(&rows[0][0], Binding::Sid { sid: s, .. } if *s == subject_sid));
     }
 
     #[test]
@@ -1140,16 +1136,16 @@ mod tests {
         let patterns = make_property_join_patterns();
         let op = PropertyJoinOperator::new(&patterns, HashMap::new()).unwrap();
 
-        let subject_binding = Binding::Sid(Sid::new(1, "alice"));
+        let subject_binding = Binding::sid(Sid::new(1, "alice"));
         let values = vec![
             vec![
-                Binding::Sid(Sid::new(200, "Alice")),
-                Binding::Sid(Sid::new(201, "Alicia")),
+                Binding::sid(Sid::new(200, "Alice")),
+                Binding::sid(Sid::new(201, "Alicia")),
             ], // 2 names
             vec![
-                Binding::Sid(Sid::new(300, "30")),
-                Binding::Sid(Sid::new(301, "31")),
-                Binding::Sid(Sid::new(302, "32")),
+                Binding::sid(Sid::new(300, "30")),
+                Binding::sid(Sid::new(301, "31")),
+                Binding::sid(Sid::new(302, "32")),
             ], // 3 ages
         ];
 
@@ -1168,9 +1164,9 @@ mod tests {
         let patterns = make_property_join_patterns();
         let op = PropertyJoinOperator::new(&patterns, HashMap::new()).unwrap();
 
-        let subject_binding = Binding::Sid(Sid::new(1, "alice"));
+        let subject_binding = Binding::sid(Sid::new(1, "alice"));
         let values = vec![
-            vec![Binding::Sid(Sid::new(200, "Alice"))], // has name
+            vec![Binding::sid(Sid::new(200, "Alice"))], // has name
             vec![],                                     // no age
         ];
 
@@ -1186,9 +1182,9 @@ mod tests {
 
     #[test]
     fn test_generate_rows_missing_optional_uses_poisoned() {
-        let subject_binding = Binding::Sid(Sid::new(1, "alice"));
+        let subject_binding = Binding::sid(Sid::new(1, "alice"));
         let values = vec![
-            vec![Binding::Sid(Sid::new(200, "Alice"))], // required name
+            vec![Binding::sid(Sid::new(200, "Alice"))], // required name
             vec![],                                     // optional probability
         ];
 

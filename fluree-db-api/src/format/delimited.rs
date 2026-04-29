@@ -370,7 +370,7 @@ fn write_binding_cell(
         Binding::Unbound | Binding::Poisoned => {
             // Empty cell
         }
-        Binding::Sid(sid) => {
+        Binding::Sid { sid, .. } => {
             write_compacted_sid(cell, compactor, sid)?;
         }
         Binding::IriMatch { iri, .. } => {
@@ -384,7 +384,7 @@ fn write_binding_cell(
         Binding::Lit { val, .. } => {
             write_flake_value(cell, val, compactor);
         }
-        Binding::EncodedSid { s_id } => {
+        Binding::EncodedSid { s_id, .. } => {
             let gv = require_graph_view(gv)?;
             let store = gv.store();
             let iri = store.resolve_subject_iri(*s_id).map_err(|e| {
@@ -659,7 +659,7 @@ mod tests {
     fn test_tsv_sid_binding_no_context() {
         // Without @context, Sid outputs full IRI (no compaction possible)
         let snapshot = make_test_snapshot();
-        let result = make_result(&["?s"], vec![vec![Binding::Sid(Sid::new(100, "alice"))]]);
+        let result = make_result(&["?s"], vec![vec![Binding::sid(Sid::new(100, "alice"))]]);
         let tsv = format_tsv(&result, &snapshot).unwrap();
         assert_eq!(tsv, "s\nhttp://example.org/alice\n");
     }
@@ -670,7 +670,7 @@ mod tests {
         let snapshot = make_test_snapshot();
         let result = make_result_with_context(
             &["?s"],
-            vec![vec![Binding::Sid(Sid::new(100, "alice"))]],
+            vec![vec![Binding::sid(Sid::new(100, "alice"))]],
             make_test_context(),
         );
         let tsv = format_tsv(&result, &snapshot).unwrap();
@@ -713,7 +713,7 @@ mod tests {
         let snapshot = make_test_snapshot();
         let result = make_result(
             &["?a", "?b"],
-            vec![vec![Binding::Sid(Sid::new(100, "x")), Binding::Unbound]],
+            vec![vec![Binding::sid(Sid::new(100, "x")), Binding::Unbound]],
         );
         let tsv = format_tsv(&result, &snapshot).unwrap();
         assert_eq!(tsv, "a\tb\nhttp://example.org/x\t\n");
@@ -725,9 +725,9 @@ mod tests {
         let result = make_result(
             &["?s"],
             vec![
-                vec![Binding::Sid(Sid::new(100, "a"))],
-                vec![Binding::Sid(Sid::new(100, "b"))],
-                vec![Binding::Sid(Sid::new(100, "c"))],
+                vec![Binding::sid(Sid::new(100, "a"))],
+                vec![Binding::sid(Sid::new(100, "b"))],
+                vec![Binding::sid(Sid::new(100, "c"))],
             ],
         );
         let tsv = format_tsv(&result, &snapshot).unwrap();
@@ -743,9 +743,9 @@ mod tests {
         let result = make_result(
             &["?s"],
             vec![
-                vec![Binding::Sid(Sid::new(100, "a"))],
-                vec![Binding::Sid(Sid::new(100, "b"))],
-                vec![Binding::Sid(Sid::new(100, "c"))],
+                vec![Binding::sid(Sid::new(100, "a"))],
+                vec![Binding::sid(Sid::new(100, "b"))],
+                vec![Binding::sid(Sid::new(100, "c"))],
             ],
         );
         let (tsv, total) = format_tsv_limited(&result, &snapshot, 2).unwrap();
@@ -882,7 +882,7 @@ mod tests {
         let snapshot = make_test_snapshot();
         let result = make_result_with_context(
             &["?s"],
-            vec![vec![Binding::Sid(Sid::new(100, "alice"))]],
+            vec![vec![Binding::sid(Sid::new(100, "alice"))]],
             make_test_context(),
         );
         let csv = format_csv(&result, &snapshot).unwrap();

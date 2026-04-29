@@ -345,12 +345,12 @@ curl -X POST http://localhost:8090/v1/fluree/query \
 Response:
 ```json
 [
-  ["Alice", 1, "assert"],
-  ["Alice", 5, "retract"]
+  ["Alice", 1, true],
+  ["Alice", 5, false]
 ]
 ```
 
-The `@t` annotation captures the transaction time and `@op` shows whether each value was asserted or retracted.
+The `@t` annotation captures the transaction time and `@op` binds a boolean — `true` for assertions, `false` for retractions (mirroring `Flake.op` on disk).
 
 ## Error Handling
 

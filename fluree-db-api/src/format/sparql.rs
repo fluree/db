@@ -133,7 +133,7 @@ fn format_binding(
         Binding::Unbound | Binding::Poisoned => Ok(None),
 
         // Reference (IRI or blank node)
-        Binding::Sid(sid) => {
+        Binding::Sid { sid, .. } => {
             // SPARQL JSON output uses compact IRIs where possible (not full IRIs).
             let iri = compactor.compact_sid(sid)?;
             // Check if it's a blank node (starts with _:)
@@ -480,7 +480,7 @@ mod tests {
     fn test_format_binding_uri() {
         let compactor = make_test_compactor();
         let result = make_test_result();
-        let binding = Binding::Sid(Sid::new(100, "alice"));
+        let binding = Binding::sid(Sid::new(100, "alice"));
         let formatted = format_binding(&result, &binding, &compactor)
             .unwrap()
             .unwrap();

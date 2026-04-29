@@ -73,23 +73,23 @@ async fn test_group_by_with_count() {
             rows: vec![
                 vec![
                     Binding::lit(FlakeValue::String("NYC".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "alice")),
+                    Binding::sid(Sid::new(100, "alice")),
                 ],
                 vec![
                     Binding::lit(FlakeValue::String("NYC".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "bob")),
+                    Binding::sid(Sid::new(100, "bob")),
                 ],
                 vec![
                     Binding::lit(FlakeValue::String("LA".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "carol")),
+                    Binding::sid(Sid::new(100, "carol")),
                 ],
                 vec![
                     Binding::lit(FlakeValue::String("LA".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "dan")),
+                    Binding::sid(Sid::new(100, "dan")),
                 ],
                 vec![
                     Binding::lit(FlakeValue::String("LA".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "eve")),
+                    Binding::sid(Sid::new(100, "eve")),
                 ],
             ],
         }],
@@ -226,23 +226,23 @@ async fn test_group_by_with_having() {
             rows: vec![
                 vec![
                     Binding::lit(FlakeValue::String("NYC".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "alice")),
+                    Binding::sid(Sid::new(100, "alice")),
                 ],
                 vec![
                     Binding::lit(FlakeValue::String("NYC".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "bob")),
+                    Binding::sid(Sid::new(100, "bob")),
                 ],
                 vec![
                     Binding::lit(FlakeValue::String("LA".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "carol")),
+                    Binding::sid(Sid::new(100, "carol")),
                 ],
                 vec![
                     Binding::lit(FlakeValue::String("LA".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "dan")),
+                    Binding::sid(Sid::new(100, "dan")),
                 ],
                 vec![
                     Binding::lit(FlakeValue::String("LA".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "eve")),
+                    Binding::sid(Sid::new(100, "eve")),
                 ],
             ],
         }],
@@ -547,11 +547,11 @@ async fn test_order_by_on_grouped_var_errors() {
             rows: vec![
                 vec![
                     Binding::lit(FlakeValue::String("NYC".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "alice")),
+                    Binding::sid(Sid::new(100, "alice")),
                 ],
                 vec![
                     Binding::lit(FlakeValue::String("NYC".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "bob")),
+                    Binding::sid(Sid::new(100, "bob")),
                 ],
             ],
         }],
@@ -587,11 +587,11 @@ async fn test_aggregate_on_group_by_key_errors() {
             rows: vec![
                 vec![
                     Binding::lit(FlakeValue::String("NYC".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "alice")),
+                    Binding::sid(Sid::new(100, "alice")),
                 ],
                 vec![
                     Binding::lit(FlakeValue::String("NYC".into()), xsd_string()),
-                    Binding::Sid(Sid::new(100, "bob")),
+                    Binding::sid(Sid::new(100, "bob")),
                 ],
             ],
         }],
