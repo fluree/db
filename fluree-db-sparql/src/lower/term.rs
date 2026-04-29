@@ -305,7 +305,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     .encoder
                     .encode_iri(&full_iri)
                     .ok_or_else(|| LowerError::unknown_namespace(&full_iri, iri.span))?;
-                Ok(Binding::Sid(sid))
+                Ok(Binding::sid(sid))
             }
             SparqlTerm::Literal(lit) => match &lit.value {
                 LiteralValue::Simple(s) => Ok(Binding::lit(

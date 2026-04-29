@@ -200,7 +200,8 @@ cors_enabled = true
 [server.indexing]
 enabled = true
 reindex_min_bytes = 100_000
-reindex_max_bytes = 1_000_000
+# reindex_max_bytes defaults to 20% of system RAM; uncomment to override
+# reindex_max_bytes = 536_870_912  # 512 MB
 ```
 
 For S3/DynamoDB backends, use `connection_config` instead of `storage_path`:

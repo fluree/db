@@ -995,16 +995,18 @@ Query the history of entities using the standard `/query` endpoint with `from` a
 ```
 
 The `@t` and `@op` annotations capture transaction metadata:
-- **@t** - Transaction time when the value was asserted or retracted
-- **@op** - Operation type: `"assert"` or `"retract"`
+- **@t** - Transaction time (integer) when the fact was asserted or retracted.
+- **@op** - Operation type as a boolean: `true` for assertions, `false` for retractions. (Mirrors `Flake.op` on disk; constants `"assert"` / `"retract"` are not accepted.)
+
+Both annotations work uniformly for literal-valued and IRI-valued objects.
 
 **Response:**
 
 ```json
 [
-  ["Alice", 30, 1, "assert"],
-  ["Alice", 30, 5, "retract"],
-  ["Alicia", 31, 5, "assert"]
+  ["Alice", 30, 1, true],
+  ["Alice", 30, 5, false],
+  ["Alicia", 31, 5, true]
 ]
 ```
 

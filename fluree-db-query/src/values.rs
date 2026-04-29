@@ -247,8 +247,8 @@ fn bindings_compatible_for_values(ctx: &ExecutionContext<'_>, a: &Binding, b: &B
 
     match (a, b) {
         // Compare SID to IRI-bearing bindings by decoding SID via primary db.
-        (Binding::Sid(sid), Binding::Iri(iri) | Binding::IriMatch { iri, .. })
-        | (Binding::Iri(iri) | Binding::IriMatch { iri, .. }, Binding::Sid(sid)) => ctx
+        (Binding::Sid { sid, .. }, Binding::Iri(iri) | Binding::IriMatch { iri, .. })
+        | (Binding::Iri(iri) | Binding::IriMatch { iri, .. }, Binding::Sid { sid, .. }) => ctx
             .active_snapshot
             .decode_sid(sid)
             .map(|decoded| decoded == iri.as_ref())

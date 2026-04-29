@@ -836,8 +836,8 @@ ORDER BY ?t
 ```
 
 The `<< subject predicate object >>` syntax (RDF-star) treats the triple as an entity that can have metadata:
-- `f:t` - Transaction time when the fact was asserted or retracted
-- `f:op` - Operation type: `"assert"` or `"retract"`
+- `f:t` - Transaction time (integer) when the fact was asserted or retracted.
+- `f:op` - Operation type as a boolean: `true` for assertions, `false` for retractions. Mirrors `Flake.op` on disk.
 
 **Filter by operation type:**
 
@@ -851,7 +851,7 @@ TO <ledger:main@t:latest>
 WHERE {
   << ex:alice ex:age ?age >> f:t ?t .
   << ex:alice ex:age ?age >> f:op ?op .
-  FILTER(?op = "retract")
+  FILTER(?op = false)
 }
 ```
 

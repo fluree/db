@@ -131,7 +131,7 @@ pub fn star_const_ordered_limit_operator(
             let mut col_s: Vec<Binding> = Vec::with_capacity(rows.len());
             let mut col_label: Vec<Binding> = Vec::with_capacity(rows.len());
             for (label, lang, s_id) in rows {
-                col_s.push(Binding::EncodedSid { s_id });
+                col_s.push(Binding::encoded_sid(s_id));
                 let lit = FlakeValue::String(label.to_string());
                 col_label.push(match lang {
                     Some(tag) => Binding::lit_lang(lit, tag),

@@ -272,6 +272,76 @@ async fn notify_index_only_trims_novelty() {
         .await;
 }
 
+/// Catch-up across a branch fork point must not 404 on the parent commit.
+///
+/// Regression test for the bug where the commit-chain walker scoped its
+/// content store to the branch's own namespace, causing reads of pre-fork
+/// commits (which live under the source branch's prefix) to fail with
+/// "Not found".
+#[tokio::test]
+async fn notify_branch_catch_up_resolves_pre_fork_parent() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_name = "it/notify-branch";
+    let main_id = "it/notify-branch:main";
+    let dev_id = "it/notify-branch:dev";
+    let manager = fluree
+        .ledger_manager()
+        .expect("ledger_manager should be present");
+
+    // 1. Create main and seed one commit so commit_head_id is set
+    //    (create_branch uses the source branch's commit head).
+    fluree
+        .create_ledger(ledger_name)
+        .await
+        .expect("create_ledger");
+    let main_ledger = fluree.ledger(main_id).await.expect("open main");
+    let _ = insert_data(&fluree, main_ledger, "seed").await;
+
+    // 2. Create branch dev from main at t=1
+    fluree
+        .create_branch(ledger_name, "dev", None)
+        .await
+        .expect("create_branch");
+
+    // 3. Cache the dev branch — its initial commit_t equals main's t at
+    //    fork time. Critical: this is the local_t the catch-up walker
+    //    will compare against when dev advances.
+    let dev_ledger = fluree.ledger(dev_id).await.expect("open dev");
+    let local_t_before = dev_ledger.t();
+    let _handle = manager.get_or_load(dev_id).await.expect("cache dev");
+
+    // 4. Transact on dev — this commit's `previous` points at the t=1
+    //    commit that lives under main's namespace, not dev's.
+    let _dev_after = insert_data(&fluree, dev_ledger, "dev-only").await;
+
+    // 5. Notify on dev — small gap, takes the CommitCatchUp path.
+    //    Without the branched-store fix, this fails with "Not found"
+    //    when the walker tries to read the parent envelope from dev's
+    //    own prefix. With the fix, BranchedContentStore falls through
+    //    to main's namespace and resolves it.
+    let result = manager
+        .notify(NsNotify {
+            ledger_id: dev_id.to_string(),
+            record: None,
+        })
+        .await
+        .expect("notify on dev branch");
+
+    assert!(
+        matches!(result, NotifyResult::CommitsApplied { count: 1 }),
+        "expected CommitsApplied {{ count: 1 }} via branch-aware catch-up, got: {result:?}"
+    );
+
+    let handle = manager.get_or_load(dev_id).await.expect("re-load dev");
+    let state = handle.snapshot().await;
+    assert_eq!(
+        state.t,
+        local_t_before + 1,
+        "cached dev branch should be at t={} after incremental apply",
+        local_t_before + 1
+    );
+}
+
 #[tokio::test]
 async fn notify_returns_not_loaded_for_uncached_ledger() {
     let fluree = FlureeBuilder::memory().build_memory();

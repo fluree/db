@@ -54,6 +54,7 @@ impl ApiFulltextConfigProvider {
         //    already been indexed.
         crate::ledger_manager::load_and_attach_binary_store(
             &self.backend,
+            self.nameservice.as_ref(),
             &mut state,
             &self.cache_dir,
             Some(Arc::clone(&self.leaflet_cache)),

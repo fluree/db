@@ -268,14 +268,12 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
             }
         };
 
-        // 3. Build IRI compactor: user-supplied context > ledger default > none
-        let default_ctx;
+        // 3. Build IRI compactor: user-supplied context, or namespace-derived
+        //    prefixes only. The ledger's stored default context is no longer
+        //    auto-applied here — callers that want it must pass it via
+        //    `with_context(...)` on the builder.
         let compactor = if let Some(ctx) = &self.user_context {
             IriCompactor::new(namespace_codes, ctx)
-        } else if let Some(ctx_json) = &snapshot.default_context {
-            default_ctx = ParsedContext::parse(None, ctx_json)
-                .map_err(|e| ApiError::internal(format!("bad default @context: {e}")))?;
-            IriCompactor::new(namespace_codes, &default_ctx)
         } else {
             IriCompactor::from_namespaces(namespace_codes)
         };

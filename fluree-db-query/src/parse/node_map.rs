@@ -138,12 +138,15 @@ fn add_metadata_bind_pattern(
     Ok(())
 }
 
-/// Add a FILTER pattern for a constant comparison (e.g., `op(?val) = "assert"`).
+/// Add a FILTER pattern for a constant comparison (e.g., `op(?val) = true`).
 ///
-/// Creates: `FILTER(func(?object_var) = constant_value)`
+/// Creates: `FILTER(func(?object_var) = constant)`. The constant is
+/// supplied as an already-built `UnresolvedExpression` so callers can
+/// pick the right literal type (string for `@type`/`@language`,
+/// boolean for `@op`).
 fn add_metadata_filter_pattern(
     func_name: &str,
-    constant_value: &str,
+    constant: crate::parse::ast::UnresolvedExpression,
     object: &UnresolvedTerm,
     query: &mut UnresolvedQuery,
     pattern: &UnresolvedTriplePattern,
@@ -164,7 +167,7 @@ fn add_metadata_filter_pattern(
     };
     let filter_expr = UnresolvedExpression::Call {
         func: Arc::from("="),
-        args: vec![func_expr, UnresolvedExpression::string(constant_value)],
+        args: vec![func_expr, constant],
     };
     let filter_pattern = UnresolvedPattern::Filter(filter_expr);
 
@@ -770,30 +773,33 @@ fn parse_property(
                 )?;
             }
 
-            // Handle @op: variable creates BIND, constant creates FILTER
-            if let Some(op_var) = parsed.op_var {
-                if is_variable(&op_var) {
-                    // Variable binding: BIND(op(?val) AS ?op)
-                    add_metadata_bind_pattern(
-                        "op",
-                        op_var,
-                        &object,
-                        query,
-                        &pattern,
-                        &mut pattern_added,
-                        "@op variable binding",
-                    )?;
-                } else {
-                    // Constant filter: FILTER(op(?val) = "assert")
-                    add_metadata_filter_pattern(
-                        "op",
-                        &op_var,
-                        &object,
-                        query,
-                        &pattern,
-                        &mut pattern_added,
-                        "@op filter",
-                    )?;
+            // Handle @op: variable creates BIND, boolean constant creates FILTER.
+            if let Some(op_ann) = parsed.op_var {
+                match op_ann {
+                    OpAnnotation::Variable(var) => {
+                        // BIND(op(?val) AS ?op)
+                        add_metadata_bind_pattern(
+                            "op",
+                            var,
+                            &object,
+                            query,
+                            &pattern,
+                            &mut pattern_added,
+                            "@op variable binding",
+                        )?;
+                    }
+                    OpAnnotation::Constant(b) => {
+                        // FILTER(op(?val) = true|false)
+                        add_metadata_filter_pattern(
+                            "op",
+                            crate::parse::ast::UnresolvedExpression::boolean(b),
+                            &object,
+                            query,
+                            &pattern,
+                            &mut pattern_added,
+                            "@op filter",
+                        )?;
+                    }
                 }
             }
 
@@ -896,9 +902,22 @@ struct ParsedValueObject {
     dt_var: Option<Arc<str>>,
     /// Transaction time variable (if @t is "?var")
     t_var: Option<Arc<str>>,
-    /// Operation variable (if @op is "?var") - for history queries
-    /// Binds to "assert" or "retract" indicating the flake operation
-    op_var: Option<Arc<str>>,
+    /// Operation annotation for history queries — either a variable
+    /// binding or a boolean constant filter (`true` = assert,
+    /// `false` = retract).
+    op_var: Option<OpAnnotation>,
+}
+
+/// `@op` annotation parsed from a value object.
+///
+/// `Variable` produces a `BIND(op(?v) AS ?out)`; `Constant` produces a
+/// `FILTER(op(?v) = <bool>)`. The on-disk `Flake.op` is a boolean, so
+/// the user-facing surface mirrors that — assert is `true`, retract is
+/// `false`.
+#[derive(Debug, Clone)]
+enum OpAnnotation {
+    Variable(Arc<str>),
+    Constant(bool),
 }
 
 fn parse_value_object(
@@ -984,45 +1003,33 @@ fn parse_value_object(
         None
     };
 
-    // Optional @op - Fluree-specific operation binding for history queries (must be a variable like "?op")
-    // In history mode, this binds to "assert" or "retract" indicating the flake's operation type.
-    // Can also be a constant "assert" or "retract" to filter by operation type.
-    let explicit_op_var: Option<Arc<str>> = if let Some(op_val) = obj.get("@op") {
-        let op_str = op_val.as_str().ok_or_else(|| {
-            ParseError::InvalidWhere(
-                "@op must be a string (variable like \"?op\" or constant \"assert\"/\"retract\")"
-                    .to_string(),
-            )
-        })?;
-        if is_variable(op_str) {
-            Some(Arc::from(op_str))
-        } else if op_str == "assert" || op_str == "retract" {
-            // Constant filter value - store as-is for filter generation
-            Some(Arc::from(op_str))
-        } else {
-            return Err(ParseError::InvalidWhere(
-                "@op must be a variable (e.g., \"?op\") or one of \"assert\", \"retract\""
-                    .to_string(),
-            ));
+    // Optional @op - Fluree-specific operation binding for history queries.
+    // Variable form (`"?op"`) creates a BIND that binds to a boolean
+    // (`true` = assert, `false` = retract); constant form (`true` or
+    // `false`) creates a FILTER selecting only matching events.
+    let explicit_op_var: Option<OpAnnotation> = if let Some(op_val) = obj.get("@op") {
+        match op_val {
+            JsonValue::String(s) if is_variable(s) => {
+                Some(OpAnnotation::Variable(Arc::from(s.as_str())))
+            }
+            JsonValue::Bool(b) => Some(OpAnnotation::Constant(*b)),
+            _ => {
+                return Err(ParseError::InvalidWhere(
+                    "@op must be a variable (e.g., \"?op\") or a boolean constant (true = assert, false = retract)"
+                        .to_string(),
+                ));
+            }
         }
     } else {
         None
     };
 
-    // If @type is @id, treat @value as IRI/ref
+    // If @type is @id, treat @value as IRI/ref. Both `@t` and `@op` are
+    // permitted here: ref-valued object bindings carry the same history
+    // metadata as literals (see `Binding::Sid { t, op }`), so the
+    // parser-generated `BIND(t(?v) AS ?t)` / `BIND(op(?v) AS ?op)`
+    // resolve uniformly.
     if matches!(explicit_dt.as_deref(), Some("@id")) {
-        // @t is not supported with @type: "@id" (ref objects don't carry t in bindings)
-        if explicit_t_var.is_some() {
-            return Err(ParseError::InvalidWhere(
-                "@t binding is not supported with @type: \"@id\"; @t only applies to literal values".to_string()
-            ));
-        }
-        // @op is not supported with @type: "@id" (ref objects don't carry op in bindings)
-        if explicit_op_var.is_some() {
-            return Err(ParseError::InvalidWhere(
-                "@op binding is not supported with @type: \"@id\"; @op only applies to literal values".to_string()
-            ));
-        }
         let s = value_val.as_str().ok_or_else(|| {
             ParseError::InvalidWhere("@value must be a string when @type is @id".to_string())
         })?;
@@ -1031,8 +1038,8 @@ fn parse_value_object(
             dtc: None,
             lang_var: None,
             dt_var: None,
-            t_var: None,
-            op_var: None,
+            t_var: explicit_t_var,
+            op_var: explicit_op_var,
         });
     }
 

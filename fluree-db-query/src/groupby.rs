@@ -332,7 +332,7 @@ mod tests {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1), VarId(2)].into_boxed_slice());
         let columns = vec![
             vec![Binding::lit(FlakeValue::String("NYC".into()), xsd_string())],
-            vec![Binding::Sid(Sid::new(100, "alice"))],
+            vec![Binding::sid(Sid::new(100, "alice"))],
             vec![Binding::lit(FlakeValue::Long(30), xsd_long())],
         ];
         let batch = Batch::new(schema.clone(), columns).unwrap();
@@ -373,7 +373,7 @@ mod tests {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1), VarId(2)].into_boxed_slice());
         let columns = vec![
             vec![Binding::lit(FlakeValue::String("NYC".into()), xsd_string())],
-            vec![Binding::Sid(Sid::new(100, "alice"))],
+            vec![Binding::sid(Sid::new(100, "alice"))],
             vec![Binding::lit(FlakeValue::Long(30), xsd_long())],
         ];
         let batch = Batch::new(schema.clone(), columns).unwrap();
@@ -383,7 +383,7 @@ mod tests {
 
         let row = vec![
             Binding::lit(FlakeValue::String("NYC".into()), xsd_string()),
-            Binding::Sid(Sid::new(100, "alice")),
+            Binding::sid(Sid::new(100, "alice")),
             Binding::lit(FlakeValue::Long(30), xsd_long()),
         ];
 
@@ -413,9 +413,9 @@ mod tests {
                 Binding::lit(FlakeValue::String("NYC".into()), xsd_string()),
             ],
             vec![
-                Binding::Sid(Sid::new(100, "alice")),
-                Binding::Sid(Sid::new(100, "bob")),
-                Binding::Sid(Sid::new(100, "carol")),
+                Binding::sid(Sid::new(100, "alice")),
+                Binding::sid(Sid::new(100, "bob")),
+                Binding::sid(Sid::new(100, "carol")),
             ],
             vec![
                 Binding::lit(FlakeValue::Long(30), xsd_long()),
@@ -501,10 +501,10 @@ mod tests {
                 Binding::lit(FlakeValue::String("LA".into()), xsd_string()),
             ],
             vec![
-                Binding::Sid(Sid::new(100, "alice")),
-                Binding::Sid(Sid::new(100, "bob")),
-                Binding::Sid(Sid::new(100, "carol")),
-                Binding::Sid(Sid::new(100, "dan")),
+                Binding::sid(Sid::new(100, "alice")),
+                Binding::sid(Sid::new(100, "bob")),
+                Binding::sid(Sid::new(100, "carol")),
+                Binding::sid(Sid::new(100, "dan")),
             ],
             vec![
                 Binding::lit(FlakeValue::Long(30), xsd_long()),

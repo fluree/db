@@ -10,6 +10,7 @@ impl Fluree {
     pub(crate) async fn attach_binary_index_store(&self, state: &mut LedgerState) -> Result<()> {
         crate::ledger_manager::load_and_attach_binary_store(
             self.backend(),
+            self.nameservice(),
             state,
             &self.binary_store_cache_dir(),
             Some(Arc::clone(self.leaflet_cache())),
@@ -42,6 +43,9 @@ impl Fluree {
         let mut state =
             LedgerState::load(&self.nameservice_mode, ledger_id, self.backend()).await?;
         self.attach_binary_index_store(&mut state).await?;
+        // Default context is not loaded here. Opt-in callers route through
+        // `Fluree::db_with_default_context` / `db_at_with_default_context`,
+        // which fetch and attach the context onto the returned `GraphDb`.
         Ok(state)
     }
 
@@ -237,7 +241,15 @@ impl Fluree {
             ApiError::internal("copy_index_to_branch requires managed storage backend")
         })?;
         let method = storage.storage_method();
-        let source_store = self.content_store(source_id);
+        // Branch-aware source store so the copy can read inherited index
+        // artifacts when `source_id` itself is a branch with ancestors.
+        let source_store = fluree_db_nameservice::branched_content_store_for_id(
+            self.backend(),
+            self.nameservice(),
+            source_id,
+        )
+        .await
+        .map_err(ApiError::from)?;
 
         // Read and parse the index root
         let root_bytes = source_store.get(index_cid).await.map_err(|e| {

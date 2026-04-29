@@ -230,7 +230,7 @@ impl<'a> FlakeGenerator<'a> {
                 }
                 if let Some(binding) = bindings.get(row, *var_id) {
                     match binding {
-                        Binding::Sid(sid) => Ok(Some(sid.clone())),
+                        Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
                         Binding::IriMatch { primary_sid, .. } => Ok(Some(primary_sid.clone())),
                         Binding::Unbound | Binding::Poisoned => Ok(None),
                         Binding::Grouped(_) => Err(TransactError::InvalidTerm(
@@ -281,7 +281,7 @@ impl<'a> FlakeGenerator<'a> {
                 }
                 if let Some(binding) = bindings.get(row, *var_id) {
                     match binding {
-                        Binding::Sid(sid) => Ok(Some(sid.clone())),
+                        Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
                         Binding::IriMatch { primary_sid, .. } => Ok(Some(primary_sid.clone())),
                         Binding::Unbound | Binding::Poisoned => Ok(None),
                         Binding::Grouped(_) => Err(TransactError::InvalidTerm(
@@ -339,7 +339,7 @@ impl<'a> FlakeGenerator<'a> {
                 }
                 if let Some(binding) = bindings.get(row, *var_id) {
                     match binding {
-                        Binding::Sid(sid) => {
+                        Binding::Sid { sid, .. } => {
                             Ok((Some(FlakeValue::Ref(sid.clone())), Some(DT_ID.clone())))
                         }
                         Binding::IriMatch { primary_sid, .. } => {

@@ -224,7 +224,9 @@ fn format_row_with_types(
 fn binding_type_label(binding: &Binding, compactor: &IriCompactor) -> Result<Option<String>> {
     match binding {
         Binding::Unbound | Binding::Poisoned => Ok(None),
-        Binding::Sid(_) | Binding::IriMatch { .. } | Binding::Iri(_) => Ok(Some("uri".to_string())),
+        Binding::Sid { .. } | Binding::IriMatch { .. } | Binding::Iri(_) => {
+            Ok(Some("uri".to_string()))
+        }
         Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => Ok(Some("uri".to_string())),
         Binding::Lit { dtc, .. } => {
             if dtc.lang_tag().is_some() {

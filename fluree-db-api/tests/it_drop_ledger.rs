@@ -249,7 +249,7 @@ async fn drop_ledger_cancels_pending_indexing() {
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
-                ..Default::default()
+                reindex_max_bytes: 1_000_000_000,
             };
 
             // Make commits to create indexing work

@@ -134,7 +134,7 @@ fn resolve_subject_term(
                 };
 
                 match binding {
-                    Binding::Sid(sid) => {
+                    Binding::Sid { sid, .. } => {
                         let expanded_iri = compactor.decode_sid(sid)?;
                         Ok(Some(IrTerm::iri(expanded_iri)))
                     }
@@ -207,7 +207,7 @@ fn resolve_predicate_term(
                 };
 
                 match binding {
-                    Binding::Sid(sid) => {
+                    Binding::Sid { sid, .. } => {
                         let expanded_iri = compactor.decode_sid(sid)?;
                         Ok(Some(IrTerm::iri(expanded_iri)))
                     }
@@ -304,7 +304,7 @@ fn binding_to_ir_term(
         Binding::Unbound | Binding::Poisoned => Ok(None),
 
         // Reference - IRI (expanded)
-        Binding::Sid(sid) => {
+        Binding::Sid { sid, .. } => {
             let expanded_iri = compactor.decode_sid(sid)?;
             Ok(Some(IrTerm::iri(expanded_iri)))
         }

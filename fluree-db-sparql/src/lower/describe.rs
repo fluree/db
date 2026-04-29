@@ -67,7 +67,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         if !explicit_sids.is_empty() {
             let rows = explicit_sids
                 .into_iter()
-                .map(|sid| vec![Binding::Sid(sid)])
+                .map(|sid| vec![Binding::sid(sid)])
                 .collect();
             branches.push(vec![Pattern::Values {
                 vars: vec![describe_var],

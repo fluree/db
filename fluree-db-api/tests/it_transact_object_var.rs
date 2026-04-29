@@ -67,7 +67,10 @@ async fn object_var_parsing_update_opt() {
                 ..Default::default()
             },
             fluree_db_transact::CommitOpts::default(),
-            &fluree_db_ledger::IndexConfig::default(),
+            &fluree_db_ledger::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await
         .unwrap()
@@ -94,7 +97,10 @@ async fn object_var_parsing_update_opt() {
                 ..Default::default()
             },
             fluree_db_transact::CommitOpts::default(),
-            &fluree_db_ledger::IndexConfig::default(),
+            &fluree_db_ledger::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await
         .unwrap()
@@ -128,7 +134,10 @@ async fn update_with_object_var_parsing_false_treats_bare_var_as_literal() {
                 ..Default::default()
             },
             fluree_db_transact::CommitOpts::default(),
-            &fluree_db_ledger::IndexConfig::default(),
+            &fluree_db_ledger::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await
         .unwrap()
@@ -175,7 +184,10 @@ async fn update_explicit_variable_map_parses_when_flag_false_and_bound() {
                 ..Default::default()
             },
             fluree_db_transact::CommitOpts::default(),
-            &fluree_db_ledger::IndexConfig::default(),
+            &fluree_db_ledger::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await
         .unwrap()
@@ -222,7 +234,10 @@ async fn update_id_var_still_parses_when_flag_false() {
                 ..Default::default()
             },
             fluree_db_transact::CommitOpts::default(),
-            &fluree_db_ledger::IndexConfig::default(),
+            &fluree_db_ledger::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await
         .unwrap()
@@ -270,7 +285,10 @@ async fn update_predicate_var_still_parses_when_flag_false() {
                 ..Default::default()
             },
             fluree_db_transact::CommitOpts::default(),
-            &fluree_db_ledger::IndexConfig::default(),
+            &fluree_db_ledger::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await
         .unwrap()
@@ -464,7 +482,10 @@ async fn update_literal_qmark_string_where_binds_and_updates() {
             &update,
             txn_opts,
             fluree_db_transact::CommitOpts::default(),
-            &fluree_db_ledger::IndexConfig::default(),
+            &fluree_db_ledger::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await
         .unwrap()

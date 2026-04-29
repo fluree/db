@@ -162,34 +162,76 @@ impl Fluree {
         let handle = self.ledger_cached(ledger_id).await?;
         let mut snapshot = handle.snapshot().await;
 
-        // Default context injection is opt-in for core API callers.
-        if include_default_context && snapshot.default_context.is_none() {
-            if let Some(ctx_id) = snapshot
+        // If no binary store attached but nameservice has an index address,
+        // load the BinaryIndexStore and attach BinaryRangeProvider.
+        // This handles the non-cached path (FlureeBuilder::file() without ledger_manager).
+        if snapshot.binary_store.is_none() {
+            if let Some(index_cid) = snapshot
                 .ns_record
                 .as_ref()
-                .and_then(|r| r.default_context.as_ref())
+                .and_then(|r| r.index_head_id.as_ref())
+                .cloned()
             {
-                let ns_ledger_id = snapshot
-                    .ns_record
-                    .as_ref()
-                    .map(|r| r.ledger_id.as_str())
-                    .unwrap_or(snapshot.snapshot.ledger_id.as_str());
-                let cs = self.content_store(ns_ledger_id);
-                if let Ok(bytes) = cs.get(ctx_id).await {
-                    if let Ok(ctx) = serde_json::from_slice(&bytes) {
-                        snapshot.default_context = Some(ctx);
-                    }
-                }
+                // Branch-aware store so leaf/branch/history blobs inherited
+                // from the source branch namespace resolve on a fresh branch.
+                let cs = self
+                    .content_store_for_record_or_id(
+                        snapshot.ns_record.as_ref(),
+                        &snapshot.snapshot.ledger_id,
+                    )
+                    .await?;
+                let bytes = cs
+                    .get(&index_cid)
+                    .await
+                    .map_err(|e| ApiError::internal(format!("read index root: {e}")))?;
+                let cache_dir = std::env::temp_dir().join("fluree-cache");
+                let mut store = BinaryIndexStore::load_from_root_bytes(
+                    cs,
+                    &bytes,
+                    &cache_dir,
+                    Some(Arc::clone(&self.leaflet_cache)),
+                )
+                .await
+                .map_err(|e| ApiError::internal(format!("load binary index: {e}")))?;
+
+                // Sync namespace codes between store and snapshot (bimap validation).
+                crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, &mut snapshot.snapshot)?;
+
+                let arc_store = Arc::new(store);
+                let dn = snapshot.dict_novelty.clone();
+                let runtime_small_dicts = crate::runtime_dicts::build_runtime_small_dicts(
+                    &arc_store,
+                    Some(&snapshot.novelty),
+                );
+                let ns_fallback = Some(Arc::new(snapshot.snapshot.namespaces().clone()));
+                let provider = BinaryRangeProvider::new(
+                    Arc::clone(&arc_store),
+                    dn,
+                    Arc::clone(&runtime_small_dicts),
+                    ns_fallback,
+                );
+                snapshot.snapshot.range_provider = Some(Arc::new(provider));
+                snapshot.binary_store = Some(arc_store);
+                snapshot.runtime_small_dicts = runtime_small_dicts;
             }
         }
 
+        // Default context is loaded lazily on the opt-in path only. The
+        // plain `db()` route returns a view with `default_context = None`
+        // so query parsing sees no auto-injection unless the caller went
+        // through `db_with_default_context`.
+        let default_context = if include_default_context {
+            match snapshot.ns_record.as_ref() {
+                Some(record) => self.load_default_context_blob(record).await.ok().flatten(),
+                None => None,
+            }
+        } else {
+            None
+        };
+
         let binary_store = snapshot.binary_store.clone();
-        let default_context = snapshot.default_context.clone();
         let ledger = snapshot.to_ledger_state();
-        let mut view = GraphDb::from_ledger_state(&ledger);
-        if include_default_context {
-            view = view.with_default_context(default_context);
-        }
+        let view = GraphDb::from_ledger_state(&ledger).with_default_context(default_context);
         Ok(match binary_store {
             Some(store) => view.with_binary_store(store),
             None => view,
@@ -261,7 +303,16 @@ impl Fluree {
             // Use nameservice record (not cached handle) to avoid stale index.
             if let Some(record) = self.nameservice().lookup(ledger_id).await? {
                 if let Some(index_cid) = record.index_head_id.as_ref() {
-                    let cs = self.content_store(&record.ledger_id);
+                    // Branch-aware store so historical queries on a branch
+                    // can resolve inherited leaf/branch/history blobs that
+                    // live under the source branch's namespace.
+                    let cs = fluree_db_nameservice::branched_content_store_for_record(
+                        self.backend(),
+                        self.nameservice(),
+                        &record,
+                    )
+                    .await
+                    .map_err(ApiError::from)?;
                     let bytes = cs.get(index_cid).await.map_err(|e| {
                         ApiError::internal(format!("failed to read index root {index_cid}: {e}"))
                     })?;
@@ -454,8 +505,9 @@ impl Fluree {
     ) -> Result<GraphDb> {
         let (parsed_id, _) = Self::parse_graph_ref(ledger_id)?;
         let mut view = self.db_at(ledger_id, spec).await?;
-        // Historical views don't carry default_context through their own load
-        // path, so fetch it from the current head's cached ledger state.
+        // Historical views don't load default_context through their own
+        // load path. Fetch it explicitly via the branch-aware helper using
+        // the cached current-head record.
         if view.default_context.is_none() {
             view = view.with_default_context(self.get_default_context(parsed_id).await?);
         }

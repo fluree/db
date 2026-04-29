@@ -679,14 +679,23 @@ impl BinaryScanOperator {
             let mut bindings: Vec<Binding> = vec![Binding::Unbound; base_len];
 
             if let Some(pos) = self.s_var_pos.filter(|p| *p < base_len) {
-                bindings[pos] = Binding::Sid(flake.s.clone());
+                bindings[pos] = Binding::sid(flake.s.clone());
             }
             if let Some(pos) = self.p_var_pos.filter(|p| *p < base_len) {
-                bindings[pos] = Binding::Sid(flake.p.clone());
+                bindings[pos] = Binding::sid(flake.p.clone());
             }
             if let Some(pos) = self.o_var_pos.filter(|p| *p < base_len) {
                 bindings[pos] = match &flake.o {
-                    FlakeValue::Ref(r) => Binding::Sid(r.clone()),
+                    // Object bindings carry the assertion time for both
+                    // ref- and literal-valued flakes — `T(?v)` resolves
+                    // uniformly. The `op` channel is only populated in
+                    // history mode, where the scan emits both asserts
+                    // and retracts; current-state scans only ever see
+                    // asserts so the distinction would be misleading.
+                    FlakeValue::Ref(r) if ctx.history_mode => {
+                        Binding::sid_with_t_op(r.clone(), flake.t, flake.op)
+                    }
+                    FlakeValue::Ref(r) => Binding::sid_with_t(r.clone(), flake.t),
                     v => {
                         let dtc = match flake
                             .m
@@ -773,12 +782,39 @@ impl BinaryScanOperator {
         Ok(())
     }
 
+    /// Prime the scan to drain a pre-collected set of flakes instead of
+    /// running the binary cursor.
+    ///
+    /// Used by `BinaryHistoryScanOperator`, which collects history events
+    /// (sidecar + in-range base + novelty) up front and then hands them to
+    /// the existing `flakes_to_bindings` pipeline. The flakes must already
+    /// carry their correct `op` field — history mode copies it onto the
+    /// output binding at line ~704.
+    pub(crate) fn prime_history_flakes(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        flakes: Vec<Flake>,
+    ) -> Result<()> {
+        if !self.state.can_open() {
+            if self.state.is_closed() {
+                return Err(QueryError::OperatorClosed);
+            }
+            return Err(QueryError::OperatorAlreadyOpened);
+        }
+        self.store = ctx.binary_store.clone();
+        self.g_id = ctx.binary_g_id;
+        self.range_iter = Some(flakes.into_iter());
+        self.cursor = None;
+        self.state = OperatorState::Open;
+        Ok(())
+    }
+
     /// Apply policy filtering to a batch of flakes for a specific graph.
     ///
     /// When a policy enforcer is present on the execution context, we:
     /// 1) Populate the class cache for subjects in this batch (required for f:onClass)
     /// 2) Filter flakes (async, supports f:query) using the graph's snapshot/overlay/to_t.
-    async fn filter_flakes_by_policy(
+    pub(crate) async fn filter_flakes_by_policy(
         ctx: &ExecutionContext<'_>,
         snapshot: &LedgerSnapshot,
         overlay: &dyn OverlayProvider,
@@ -817,7 +853,7 @@ impl BinaryScanOperator {
     ///
     /// Therefore, we keep the bound SIDs in snapshot space for overlay matching, and only
     /// translate into store space (via full IRI strings) when constructing persisted ID filters.
-    fn extract_bound_terms_snapshot(
+    pub(crate) fn extract_bound_terms_snapshot(
         snapshot: &LedgerSnapshot,
         pattern: &TriplePattern,
     ) -> (Option<Sid>, Option<Sid>, Option<FlakeValue>) {
@@ -857,7 +893,7 @@ impl BinaryScanOperator {
     }
 
     /// Build a `BinaryFilter` from bound pattern terms.
-    fn build_filter_from_snapshot_sids(
+    pub(crate) fn build_filter_from_snapshot_sids(
         snapshot: &LedgerSnapshot,
         pattern: &TriplePattern,
         store: &BinaryIndexStore,
@@ -1151,14 +1187,14 @@ impl BinaryScanOperator {
             // Subject binding.
             if let Some(pos) = self.s_var_pos {
                 let binding = if late_materialize {
-                    Binding::EncodedSid { s_id }
+                    Binding::encoded_sid(s_id)
                 } else {
                     // BinaryGraphView::resolve_subject_sid is novelty-aware:
                     // novel subjects return Sid directly without IRI round-trip.
                     let sid = view
                         .resolve_subject_sid(s_id)
                         .map_err(|e| QueryError::from_io("resolve_subject_sid", e))?;
-                    Binding::Sid(sid)
+                    Binding::sid(sid)
                 };
                 if !Self::set_binding_at(&mut bindings, pos, binding) {
                     continue;
@@ -1170,7 +1206,7 @@ impl BinaryScanOperator {
                 let binding = if late_materialize {
                     Binding::EncodedPid { p_id }
                 } else {
-                    Binding::Sid(self.resolve_p_id(p_id))
+                    Binding::sid(self.resolve_p_id(p_id))
                 };
                 if !Self::set_binding_at(&mut bindings, pos, binding) {
                     continue;
@@ -1178,21 +1214,33 @@ impl BinaryScanOperator {
             }
 
             // Object binding.
+            //
+            // The non-history binary-scan path emits `op = None` — object
+            // ops only matter to history queries, which use the
+            // `BinaryHistoryScanOperator` collector path (see
+            // `flakes_to_bindings`). Threading `None` here keeps the
+            // metadata channel uniform for ref- and literal-valued
+            // objects without changing behaviour for current-state scans.
             if let Some(pos) = self.o_var_pos {
                 let binding = if needs_o_decode || !late_materialize {
                     let val = decoded_o.expect("decoded object required");
-                    materialized_object_binding(self.store(), o_type, p_id, val, t_opt)
+                    materialized_object_binding(self.store(), o_type, p_id, val, t_opt, None)
                 } else if let Some(encoded) =
-                    late_materialized_object_binding(o_type, o_key, p_id, t_enc, o_i)
+                    late_materialized_object_binding(o_type, o_key, p_id, t_enc, o_i, None)
                 {
                     encoded
                 } else {
                     // Fallback: decode if we don't have a safe encoded representation.
                     // This preserves correctness for uncommon/custom OTypes.
                     match decode_value(o_type, o_key, p_id) {
-                        Ok(val) => {
-                            materialized_object_binding(self.store(), o_type, p_id, val, t_opt)
-                        }
+                        Ok(val) => materialized_object_binding(
+                            self.store(),
+                            o_type,
+                            p_id,
+                            val,
+                            t_opt,
+                            None,
+                        ),
                         Err(e) => {
                             return Err(QueryError::dictionary_lookup(format!(
                                 "binary scan object decode fallback failed: o_type={o_type}, o_key={o_key}, p_id={p_id}: {e}"

@@ -41,13 +41,13 @@ fn materialize_encoded_binding(
 ) -> std::io::Result<Binding> {
     let store = gv.store();
     match binding {
-        Binding::EncodedSid { s_id } => {
+        Binding::EncodedSid { s_id, .. } => {
             let iri = store.resolve_subject_iri(*s_id)?;
             let sid = store.encode_iri(&iri);
-            Ok(Binding::Sid(sid))
+            Ok(Binding::sid(sid))
         }
         Binding::EncodedPid { p_id } => match store.resolve_predicate_iri(*p_id) {
-            Some(iri) => Ok(Binding::Sid(store.encode_iri(iri))),
+            Some(iri) => Ok(Binding::sid(store.encode_iri(iri))),
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("Unknown predicate ID: {p_id}"),
@@ -75,7 +75,7 @@ fn materialize_encoded_lit(binding: &Binding, gv: &BinaryGraphView) -> std::io::
     let store = gv.store();
     let val = gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?;
     match val {
-        FlakeValue::Ref(sid) => Ok(Binding::Sid(sid)),
+        FlakeValue::Ref(sid) => Ok(Binding::sid(sid)),
         other => {
             let dt_sid = store
                 .dt_sids()

@@ -608,7 +608,7 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
             let sid = encoder
                 .encode_iri(iri)
                 .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))?;
-            Ok(Binding::Sid(sid))
+            Ok(Binding::sid(sid))
         }
         UnresolvedValue::Literal { value, dtc } => {
             // Build initial FlakeValue from the literal
