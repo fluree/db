@@ -218,9 +218,9 @@ async fn repro_upsert_repeated_ids_create_duplicate_subject_ids() {
                 .to_jsonld(&ledger2_loaded.snapshot)
                 .unwrap();
 
-            assert_eq!(const_count, json!([1]));
-            assert_eq!(var_count, json!([1]));
-            assert_eq!(type_count, json!([1]));
+            assert_eq!(const_count, json!([[1]]));
+            assert_eq!(var_count, json!([[1]]));
+            assert_eq!(type_count, json!([[1]]));
             assert_eq!(join_counts, json!([[1, 1]]));
             assert_eq!(graph_counts, json!([[ledger_id, 1]]));
 
@@ -244,13 +244,13 @@ async fn repro_upsert_repeated_ids_create_duplicate_subject_ids() {
                 for row in 0..batch.len() {
                     let b = batch.get_by_col(row, 0);
                     match b {
-                        Binding::EncodedSid { s_id } => {
+                        Binding::EncodedSid { s_id, .. } => {
                             let bg = bg.expect("EncodedSid requires binary_graph");
                             encoded_ids.push(*s_id);
                             decoded_iris
                                 .push(bg.resolve_subject_iri(*s_id).expect("decode subject iri"));
                         }
-                        Binding::Sid(sid) => decoded_iris.push(sid_to_iri(sid, codes)),
+                        Binding::Sid { sid, .. } => decoded_iris.push(sid_to_iri(sid, codes)),
                         other => panic!("unexpected binding for ?m: {other:?}"),
                     }
                 }

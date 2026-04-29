@@ -269,19 +269,18 @@ impl LedgerHandle {
     /// The state lock is held for the brief atomic swap of both `state` and
     /// `binary_store`, ensuring coherence between `db.range_provider` and
     /// `binary_store` (lock ordering: state → binary_store).
+    ///
+    /// `cs` MUST be branch-aware for branched ledgers (built via
+    /// [`fluree_db_nameservice::branched_content_store_for_record`]) so the
+    /// index root and any inherited leaf/branch blobs that live under a
+    /// parent branch's namespace can be resolved.
     pub async fn apply_index_v2(
         &self,
         index_id: &ContentId,
-        backend: &StorageBackend,
+        cs: Arc<dyn ContentStore>,
         cache_dir: &std::path::Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
     ) -> Result<()> {
-        // Load index root by CID via content store
-        let ledger_id = {
-            let state = self.inner.state.lock().await;
-            state.snapshot.ledger_id.clone()
-        };
-        let cs: Arc<dyn ContentStore> = backend.content_store(&ledger_id);
         let bytes = cs
             .get(index_id)
             .await
@@ -460,22 +459,35 @@ use fluree_db_query::BinaryRangeProvider;
 /// to the LedgerState's LedgerSnapshot, and return the Arc'd store.
 ///
 /// Returns `Ok(None)` if no index_head_id is present or the root is not v2.
+///
+/// `nameservice` is used to assemble a branch-aware content store when the
+/// ledger is a branch — without it, the index root and any inherited
+/// leaf/branch blobs that live under the source branch's namespace would
+/// 404 on a fresh branch that hasn't yet had its own index built.
 pub(crate) async fn load_and_attach_binary_store(
     backend: &StorageBackend,
+    nameservice: &dyn fluree_db_nameservice::NameService,
     state: &mut LedgerState,
     cache_dir: &std::path::Path,
     leaflet_cache: Option<Arc<LeafletCache>>,
 ) -> std::result::Result<Option<Arc<BinaryIndexStore>>, ApiError> {
-    let index_cid = match state
-        .ns_record
-        .as_ref()
-        .and_then(|r| r.index_head_id.as_ref())
-    {
+    let record = match state.ns_record.as_ref() {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let index_cid = match record.index_head_id.as_ref() {
         Some(cid) => cid.clone(),
         None => return Ok(None),
     };
 
-    let cs: Arc<dyn ContentStore> = backend.content_store(&state.snapshot.ledger_id);
+    // Branch-aware store: walks branch ancestry on read miss so a fresh
+    // branch can read leaf/branch/history blobs written under the source
+    // branch's namespace. Also uses `record.ledger_id` (canonical) rather
+    // than `snapshot.ledger_id`, which may still carry a source id for
+    // imported/cloned roots.
+    let cs: Arc<dyn ContentStore> =
+        fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, record)
+            .await?;
     let bytes = cs
         .get(&index_cid)
         .await
@@ -488,6 +500,14 @@ pub(crate) async fn load_and_attach_binary_store(
         .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
     state.snapshot.subject_watermarks = root.subject_watermarks;
     state.snapshot.string_watermark = root.string_watermark;
+    if root.stats.is_some() && state.snapshot.stats.is_none() {
+        state.snapshot.stats = root.stats;
+        tracing::debug!("loaded stats from FIR6 root");
+    }
+    if root.schema.is_some() && state.snapshot.schema.is_none() {
+        state.snapshot.schema = root.schema;
+        tracing::debug!("loaded schema from FIR6 root");
+    }
     state.dict_novelty = Arc::new(DictNovelty::with_watermarks(
         state.snapshot.subject_watermarks.clone(),
         state.snapshot.string_watermark,
@@ -527,31 +547,14 @@ pub(crate) async fn load_and_attach_binary_store(
         Arc::clone(&state.runtime_small_dicts),
         ns_fallback,
     );
+    // Always rebuild the provider here so it is coherent with the freshly
+    // loaded BinaryIndexStore, DictNovelty, and runtime dictionary state.
     state.snapshot.range_provider = Some(Arc::new(provider));
     // Also attach the type-erased store to the state so transaction staging
     // (which clones LedgerState under the write lock) can construct
     // graph-scoped BinaryRangeProviders (needed for named-graph upsert deletions).
     let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
     state.binary_store = Some(TypeErasedStore(te_store));
-
-    // Load default context from CAS if the nameservice record has one.
-    if state.default_context.is_none() {
-        if let Some(ctx_id) = state
-            .ns_record
-            .as_ref()
-            .and_then(|r| r.default_context.as_ref())
-        {
-            match cs.get(ctx_id).await {
-                Ok(bytes) => match serde_json::from_slice(&bytes) {
-                    Ok(ctx) => state.default_context = Some(ctx),
-                    Err(e) => tracing::warn!(%e, "failed to parse default context JSON"),
-                },
-                Err(e) => {
-                    tracing::debug!(%e, "could not load default context: {}", e);
-                }
-            }
-        }
-    }
 
     Ok(Some(arc_store))
 }
@@ -691,6 +694,7 @@ impl LedgerManager {
                 // Non-fatal: if loading fails, log and continue without binary index.
                 let binary_store = match load_and_attach_binary_store(
                     &self.backend,
+                    self.nameservice_mode.reader(),
                     &mut state,
                     &self.config.cache_dir,
                     self.config.leaflet_cache.clone(),
@@ -878,6 +882,7 @@ impl LedgerManager {
                         // Attempt to load binary index store (v2 only)
                         let new_binary_store = match load_and_attach_binary_store(
                             &self.backend,
+                            self.nameservice_mode.reader(),
                             &mut new_state,
                             &self.config.cache_dir,
                             self.config.leaflet_cache.clone(),
@@ -1251,6 +1256,20 @@ impl LedgerManager {
             "notify: computed update plan"
         );
 
+        // Build a branch-aware content store once for any plan variant that
+        // walks the commit chain or loads index blobs. For non-branched
+        // ledgers this returns a flat namespace store with no extra cost
+        // beyond the `ns_record` lookup we already did above.
+        let cs_for_record = || async {
+            fluree_db_nameservice::branched_content_store_for_record(
+                &self.backend,
+                self.nameservice_mode.reader(),
+                &ns_record,
+            )
+            .await
+            .map_err(ApiError::from)
+        };
+
         match plan {
             UpdatePlan::Noop => Ok(NotifyResult::Current),
 
@@ -1263,10 +1282,11 @@ impl LedgerManager {
                     %index_head_id, index_t,
                     "notify: applying index update (incremental)"
                 );
+                let cs = cs_for_record().await?;
                 handle
                     .apply_index_v2(
                         &index_head_id,
-                        &self.backend,
+                        cs,
                         &self.config.cache_dir,
                         self.config.leaflet_cache.clone(),
                     )
@@ -1288,14 +1308,15 @@ impl LedgerManager {
                 );
 
                 let ledger_id_canonical = handle.ledger_id().to_string();
-                let cs: Arc<dyn ContentStore> = self.backend.content_store(&ledger_id_canonical);
+                let cs: Arc<dyn ContentStore> = cs_for_record().await?;
 
                 // Load commits outside any lock.
                 // trace_commits_by_id walks HEAD → oldest, stopping at local_t.
                 // Collect then reverse to apply oldest → newest.
                 let mut commits = Vec::with_capacity(gap as usize);
                 {
-                    let stream = trace_commits_by_id(cs, commit_head_id.clone(), local_t);
+                    let stream =
+                        trace_commits_by_id(Arc::clone(&cs), commit_head_id.clone(), local_t);
                     futures::pin_mut!(stream);
                     while let Some(result) = futures::StreamExt::next(&mut stream).await {
                         let commit = result.map_err(|e| {
@@ -1368,12 +1389,13 @@ impl LedgerManager {
                     }
                 }
 
-                // Apply index update if present (after commits so novelty has latest flakes)
+                // Apply index update if present (after commits so novelty has latest flakes).
+                // Reuse the same branch-aware store built above for the commit walk.
                 if let Some((index_head_id, _index_t)) = index_update {
                     handle
                         .apply_index_v2(
                             &index_head_id,
-                            &self.backend,
+                            Arc::clone(&cs),
                             &self.config.cache_dir,
                             self.config.leaflet_cache.clone(),
                         )

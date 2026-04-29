@@ -104,7 +104,7 @@ async fn policy_inline_denies_restricted_property_in_graph_crawl() {
             "policy": query["opts"]["policy"].clone(),
             "default-allow": true
         },
-        "select": ["?name"],
+        "select": "?name",
         "where": { "@id": "?s", "@type": "ex:User", "schema:name": "?name" }
     });
     let sanity_result = fluree
@@ -173,7 +173,7 @@ async fn policy_per_source_override_takes_precedence_over_global() {
         "opts": {
             "default-allow": false
         },
-        "select": ["?name"],
+        "select": "?name",
         "where": {
             "@id": "?s",
             "@type": "ex:User",

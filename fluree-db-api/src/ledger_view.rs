@@ -89,8 +89,6 @@ pub struct LedgerView {
     /// Present when `snapshot.range_provider` is also set — the two are always
     /// set/cleared together (see coherence `debug_assert` in `snapshot()`).
     pub binary_store: Option<Arc<BinaryIndexStore>>,
-    /// Default JSON-LD @context for this ledger.
-    pub default_context: Option<serde_json::Value>,
 }
 
 impl LedgerView {
@@ -109,7 +107,6 @@ impl LedgerView {
             head_index_id: state.head_index_id.clone(),
             ns_record: state.ns_record.clone(),
             binary_store: None,
-            default_context: state.default_context.clone(),
         }
     }
 
@@ -165,7 +162,6 @@ impl LedgerView {
             head_index_id: self.head_index_id,
             ns_record: self.ns_record,
             binary_store: self.binary_store.map(|store| TypeErasedStore(store)),
-            default_context: self.default_context,
             spatial_indexes: None,
         }
     }

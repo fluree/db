@@ -2,6 +2,12 @@
 //!
 //! Simple JSON format with compact IRIs. Rows are arrays aligned to SELECT order:
 //! `[["ex:alice", "Alice", 30], ...]`
+//!
+//! Row shaping is driven by `ProjectionShape`:
+//! - `Tuple` (default; SPARQL and JSON-LD array-form select): every row stays
+//!   as an array, preserving tabular semantics.
+//! - `Scalar` (JSON-LD bare-string `select: "?x"` only): 1-var rows flatten
+//!   to bare values — opt-in scalar output.
 
 use super::config::FormatterConfig;
 use super::datatype::is_inferable_datatype;
@@ -47,8 +53,11 @@ pub fn format(
         }
     }
 
-    // For a 1-column SELECT, return a flat array of values (not `[ [v1], [v2] ]`).
-    if !result.output.is_wildcard() && result.output.select_vars_or_empty().len() == 1 {
+    // Scalar shaping: flatten 1-var rows to bare values. Fires only for
+    // JSON-LD `select: "?x"` (bare-string form), which is the user's opt-in
+    // to scalar output. SPARQL and JSON-LD array-form select use `Tuple`
+    // and skip this step — their rows stay tabular.
+    if result.output.should_flatten_scalar() {
         rows = rows
             .into_iter()
             .map(|row| match row {
@@ -73,7 +82,7 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
         Binding::Unbound | Binding::Poisoned => Ok(JsonValue::Null),
 
         // Reference (IRI or blank node) - compact using @context
-        Binding::Sid(sid) => Ok(JsonValue::String(compactor.compact_sid(sid)?)),
+        Binding::Sid { sid, .. } => Ok(JsonValue::String(compactor.compact_sid(sid)?)),
 
         // IriMatch: use canonical IRI, then compact (multi-ledger mode)
         Binding::IriMatch { iri, .. } => Ok(JsonValue::String(compactor.compact_iri(iri)?)),
@@ -266,7 +275,10 @@ pub(crate) fn format_binding_with_result(
 
 // NOTE: encoded binding materialization is centralized in `format::materialize`.
 
-/// Format row as array.
+/// Format a single row as a `JsonValue::Array` of length `select.len()`.
+///
+/// Always returns array-shaped output regardless of arity. Scalar flattening is
+/// applied once at the top-level `format()` when `ProjectionShape::Scalar` is set.
 fn format_row_array(
     result: &QueryResult,
     batch: &fluree_db_query::Batch,
@@ -274,16 +286,6 @@ fn format_row_array(
     select: &[fluree_db_query::VarId],
     compactor: &IriCompactor,
 ) -> Result<JsonValue> {
-    // If only one variable is selected, return a flat array of values.
-    // (not an array of 1-element rows).
-    if select.len() == 1 {
-        let var_id = select[0];
-        return match batch.get(row_idx, var_id) {
-            Some(binding) => format_binding_with_result(result, binding, compactor),
-            None => Ok(JsonValue::Null),
-        };
-    }
-
     let values: Result<Vec<_>> = select
         .iter()
         .map(|&var_id| match batch.get(row_idx, var_id) {
@@ -385,7 +387,7 @@ mod tests {
     #[test]
     fn test_format_binding_sid() {
         let compactor = make_test_compactor();
-        let binding = Binding::Sid(Sid::new(100, "alice"));
+        let binding = Binding::sid(Sid::new(100, "alice"));
         let result = format_binding(&binding, &compactor).unwrap();
         // Without @context, returns full IRI
         assert_eq!(result, json!("http://example.org/alice"));

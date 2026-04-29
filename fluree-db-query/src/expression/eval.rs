@@ -123,12 +123,12 @@ impl Expression {
                     })?;
                     Ok(ComparableValue::try_from(&val).ok())
                 }
-                Some(Binding::Sid(sid)) => Ok(Some(ComparableValue::Sid(sid.clone()))),
+                Some(Binding::Sid { sid, .. }) => Ok(Some(ComparableValue::Sid(sid.clone()))),
                 Some(Binding::IriMatch { iri, .. }) => {
                     Ok(Some(ComparableValue::Iri(Arc::clone(iri))))
                 }
                 Some(Binding::Iri(iri)) => Ok(Some(ComparableValue::Iri(Arc::clone(iri)))),
-                Some(Binding::EncodedSid { s_id }) => {
+                Some(Binding::EncodedSid { s_id, .. }) => {
                     let Some(resolved) = ctx.and_then(|c| c.resolve_subject_iri(*s_id)) else {
                         return Ok(None);
                     };

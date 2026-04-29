@@ -698,7 +698,10 @@ async fn transact_with_explicit_commit() {
         .commit_staged(
             stage.view,
             stage.ns_registry,
-            &fluree_db_ledger::IndexConfig::default(),
+            &fluree_db_ledger::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
             fluree_db_transact::CommitOpts::default(),
         )
         .await
@@ -760,7 +763,7 @@ async fn insert_data_then_query_names() {
 
     let query = json!({
         "@context": ctx_ex_schema(),
-        "select": ["?name"],
+        "select": "?name",
         "where": {"schema:name": "?name"}
     });
 

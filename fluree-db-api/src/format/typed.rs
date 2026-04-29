@@ -81,7 +81,7 @@ pub(crate) fn format_binding(
         Binding::Unbound | Binding::Poisoned => Ok(JsonValue::Null),
 
         // Reference - use @id notation
-        Binding::Sid(sid) => {
+        Binding::Sid { sid, .. } => {
             let iri = compactor.compact_sid(sid)?;
             Ok(json!({"@id": iri}))
         }
@@ -337,7 +337,7 @@ mod tests {
             novelty: None,
             context: crate::ParsedContext::default(),
             orig_context: None,
-            output: crate::QueryOutput::Select(vec![]),
+            output: crate::QueryOutput::select(vec![]),
             batches: vec![],
             binary_graph: None,
             graph_select: None,
@@ -348,7 +348,7 @@ mod tests {
     fn test_format_binding_sid() {
         let compactor = make_test_compactor();
         let result = make_test_result();
-        let binding = Binding::Sid(Sid::new(100, "alice"));
+        let binding = Binding::sid(Sid::new(100, "alice"));
         let formatted = format_binding(&result, &binding, &compactor).unwrap();
         assert_eq!(formatted, json!({"@id": "http://example.org/alice"}));
     }

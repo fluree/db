@@ -193,6 +193,51 @@ Or as JSON-LD:
 }
 ```
 
+**HTTP / Docker:** the same JSON-LD config goes into a regular `/update` transaction. Wrap it in `@graph` and POST to the ledger:
+
+```bash
+curl -X POST 'http://localhost:8090/v1/fluree/update?ledger=mydb:main' \
+  -H 'Content-Type: application/json' \
+  -d @- <<'JSON'
+{
+  "@context": {
+    "f": "https://ns.flur.ee/db#",
+    "ex": "http://example.org/"
+  },
+  "@graph": [
+    {
+      "@id": "urn:fluree:mydb:main:config:ledger",
+      "@type": "f:LedgerConfig",
+      "@graph": "urn:fluree:mydb:main#config",
+      "f:fullTextDefaults": {
+        "@type": "f:FullTextDefaults",
+        "f:defaultLanguage": "en",
+        "f:property": [
+          { "@type": "f:FullTextProperty", "f:target": { "@id": "ex:title" } },
+          { "@type": "f:FullTextProperty", "f:target": { "@id": "ex:body" } }
+        ]
+      }
+    }
+  ]
+}
+JSON
+```
+
+The config is stored in the ledger's `#config` named graph (note the `"@graph": "urn:fluree:mydb:main#config"` placement directive on the resource). To verify, query the config graph:
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "@context": { "f": "https://ns.flur.ee/db#" },
+    "from": "mydb:main",
+    "from-named": ["urn:fluree:mydb:main#config"],
+    "where": [{ "@graph": "urn:fluree:mydb:main#config",
+                "@id": "?cfg", "f:fullTextDefaults": "?defaults" }],
+    "select": ["?cfg", "?defaults"]
+  }'
+```
+
 After writing config, trigger a reindex so existing values on `ex:title` and `ex:body` get indexed. See [Reindexing after a config change](#reindexing-after-a-config-change) below.
 
 **Data writes don't change.** Once config is in place and the reindex has run, just insert plain strings the way you always would:
@@ -325,7 +370,7 @@ To force the full picture — pick up config changes for *all* existing data —
 fluree reindex mydb:main
 
 # Or via the admin API
-curl -X POST https://<fluree-server>/fluree/admin/reindex \
+curl -X POST https://<fluree-server>/v1/fluree/reindex \
   -H 'Content-Type: application/json' \
   -d '{"ledger": "mydb:main"}'
 ```

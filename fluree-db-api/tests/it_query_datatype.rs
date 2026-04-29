@@ -107,7 +107,7 @@ async fn datatype_query_explicit_typed_value_object_matches() {
 
     let q = json!({
         "@context": ctx,
-        "select": ["?name"],
+        "select": "?name",
         // Rust normalizes xsd:int to xsd:integer.
         "where": {"ex:name":"?name","ex:age":{"@value":36,"@type":"xsd:integer"}}
     });
@@ -189,7 +189,7 @@ async fn custom_datatype_equality_matches_indexed_and_novelty_rows_after_reindex
 
     let q = json!({
         "@context": ctx,
-        "select": ["?s"],
+        "select": "?s",
         "where": {
             "@id": "?s",
             "ex:label": {"@value": "Abcdefg", "@type": "ex:mystring"}

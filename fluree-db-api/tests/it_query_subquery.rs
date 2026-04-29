@@ -430,7 +430,7 @@ async fn subquery_with_values_filters_results() {
 
     let q = json!({
         "@context": ctx,
-        "select": ["?person"],
+        "select": "?person",
         "where": [
             ["query", {
                 "@context": ctx,

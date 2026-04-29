@@ -74,6 +74,7 @@
   - [ContentId and ContentStore](design/content-id-and-contentstore.md)
   - [Index format](design/index-format.md)
   - [Namespace allocation and fallback modes](design/namespace-allocation.md)
+  - [Ontology imports (`f:schemaSource` + `owl:imports`)](design/ontology-imports.md)
   - [Storage traits](design/storage-traits.md)
 
 - [HTTP API (fluree-db-server)](api/README.md)
@@ -173,6 +174,7 @@
 
 - [Operations](operations/README.md)
   - [Configuration](operations/configuration.md)
+  - [Running with Docker](operations/docker.md)
   - [Storage modes (memory/file/AWS/IPFS)](operations/storage.md)
   - [IPFS storage](operations/ipfs-storage.md)
   - [DynamoDB nameservice](operations/dynamodb-guide.md)

@@ -14,6 +14,7 @@
 //! Build a `TriplePattern` with a `VarRegistry`, then call `execute_pattern` with a `GraphDbRef` to get result batches.
 
 pub mod aggregate;
+pub mod binary_history;
 pub mod binary_range;
 pub mod binary_scan;
 pub mod bind;
@@ -77,6 +78,7 @@ pub mod remote_service;
 pub mod rewrite;
 pub mod rewrite_owl_ql;
 pub mod s2_search;
+pub mod schema_bundle;
 pub mod seed;
 pub(crate) mod semijoin;
 pub mod service;
@@ -94,6 +96,7 @@ pub mod vector;
 
 // Re-exports
 pub use aggregate::{apply_aggregate, AggregateFn, AggregateOperator, AggregateSpec};
+pub use binary_history::BinaryHistoryScanOperator;
 pub use binary_range::BinaryRangeProvider;
 pub use binary_scan::BinaryScanOperator;
 pub use bind::BindOperator;
@@ -187,7 +190,7 @@ pub async fn execute_pattern(
     pattern: TriplePattern,
 ) -> Result<Vec<Batch>> {
     let ctx = ExecutionContext::from_graph_db_ref(db, vars);
-    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
+    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
 
     scan.open(&ctx).await?;
 
@@ -247,7 +250,7 @@ pub async fn execute_pattern_at(
     from_t: Option<i64>,
 ) -> Result<Vec<Batch>> {
     let ctx = ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t);
-    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
+    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
 
     scan.open(&ctx).await?;
 
@@ -271,7 +274,7 @@ pub async fn execute_pattern_with_overlay(
     pattern: TriplePattern,
 ) -> Result<Vec<Batch>> {
     let ctx = ExecutionContext::from_graph_db_ref(db, vars);
-    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
+    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
 
     scan.open(&ctx).await?;
 
@@ -294,7 +297,7 @@ pub async fn execute_pattern_with_overlay_at(
     from_t: Option<i64>,
 ) -> Result<Vec<Batch>> {
     let ctx = ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t);
-    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
+    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
 
     scan.open(&ctx).await?;
 

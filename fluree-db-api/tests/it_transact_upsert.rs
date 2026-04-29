@@ -699,7 +699,7 @@ async fn novelty_dedup_prevents_duplicate_assertions() {
     // Novelty dedup: only 3 distinct values should exist, not 6
     let query = json!({
         "@context": ctx,
-        "select": ["?status"],
+        "select": "?status",
         "where": { "@id": "ex:task1", "ex:status": "?status" }
     });
     let result = support::query_jsonld(&fluree, &ledger, &query)

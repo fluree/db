@@ -391,7 +391,7 @@ mod tests {
             novelty: None,
             context: fluree_graph_json_ld::ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::Select(vec![]),
+            output: QueryOutput::select(vec![]),
             batches: vec![],
             binary_graph: None,
             graph_select: None,

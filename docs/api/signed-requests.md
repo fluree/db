@@ -249,20 +249,11 @@ Fluree resolves DIDs to public keys:
 2. **did:web**: Fetched from `https://example.com/.well-known/did.json`
 3. **did:ion**: Resolved via ION network
 
-### Public Key Registration
+### Public Key Resolution
 
-For production use, register public keys with Fluree:
-
-```bash
-curl -X POST http://localhost:8090/admin/keys \
-  -H "Content-Type: application/json" \
-  -d '{
-    "did": "did:key:z6Mkh...",
-    "publicKey": "...",
-    "algorithm": "EdDSA",
-    "permissions": ["query", "transact"]
-  }'
-```
+Standalone server signed requests verify Ed25519 JWS material from the request
+itself (for example embedded JWK / `did:key`) or configured OIDC/JWKS issuers.
+There is no `/admin/keys` registration endpoint.
 
 ## Request Verification
 

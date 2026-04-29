@@ -87,8 +87,11 @@ async fn push_ledger_local(
         opts.policy_class = Some(headers.policy_class.clone());
     }
 
-    // Index config: server-level override if present, else default.
-    let index_config_owned = state.index_config.clone().unwrap_or_default();
+    // Index config: server-level override if present, else canonical default.
+    let index_config_owned = state
+        .index_config
+        .clone()
+        .unwrap_or_else(fluree_db_api::server_defaults::default_index_config);
     let index_config = &index_config_owned;
 
     // Parse JSON body.

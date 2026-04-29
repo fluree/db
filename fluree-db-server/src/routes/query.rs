@@ -46,6 +46,18 @@ use tracing::Instrument;
 pub struct SparqlParams {
     /// The SPARQL query string (URL-encoded)
     pub query: Option<String>,
+    /// Opt in to using the ledger's stored default context for this request.
+    ///
+    /// Defaults to false. For JSON-LD, this injects the context only when the
+    /// query omits `@context`/`context`. For ledger-scoped SPARQL, this makes
+    /// default prefixes available when the query has no explicit `PREFIX`.
+    #[serde(
+        default,
+        alias = "default_context",
+        alias = "use-default-context",
+        alias = "use_default_context"
+    )]
+    pub default_context: bool,
     /// Optional default graph URI (part of W3C SPARQL Protocol).
     // Kept for: full SPARQL Protocol compliance — BSBM and other tools may send this param.
     // Use when: implementing default-graph-uri scoping in query execution.
@@ -171,6 +183,50 @@ fn inject_headers_into_query(query: &mut JsonValue, headers: &FlureeHeaders) {
             headers.inject_into_opts(opts_obj);
         }
     }
+}
+
+fn jsonld_query_has_context(query: &JsonValue) -> bool {
+    query.get("@context").is_some() || query.get("context").is_some()
+}
+
+async fn inject_default_context_if_requested(
+    state: &AppState,
+    ledger_id: &str,
+    query: &mut JsonValue,
+    use_default_context: bool,
+) -> Result<()> {
+    if !use_default_context || jsonld_query_has_context(query) {
+        return Ok(());
+    }
+
+    if let Some(ctx) = state
+        .fluree
+        .get_default_context(ledger_id)
+        .await
+        .map_err(ServerError::Api)?
+    {
+        if let Some(obj) = query.as_object_mut() {
+            obj.insert("@context".to_string(), ctx);
+        }
+    }
+    Ok(())
+}
+
+async fn attach_default_context_to_graph(
+    state: &AppState,
+    ledger_id: &str,
+    graph: GraphDb,
+    use_default_context: bool,
+) -> Result<GraphDb> {
+    if !use_default_context {
+        return Ok(graph);
+    }
+    let ctx = state
+        .fluree
+        .get_default_context(ledger_id)
+        .await
+        .map_err(ServerError::Api)?;
+    Ok(graph.with_default_context(ctx))
 }
 
 /// Execute a query
@@ -378,6 +434,14 @@ pub async fn query(
         )
         .await;
 
+        inject_default_context_if_requested(
+            &state,
+            &ledger_id,
+            &mut query_json,
+            params.default_context,
+        )
+        .await?;
+
         execute_query(&state, &ledger_id, &query_json, delimited).await
     }
     }
@@ -473,7 +537,15 @@ pub async fn query_ledger(
             headers.identity.as_deref(),
         )
         .await;
-        return execute_sparql_ledger(&state, &ledger, &sparql, identity.as_deref(), delimited, &headers)
+        return execute_sparql_ledger(
+            &state,
+            &ledger,
+            &sparql,
+            identity.as_deref(),
+            delimited,
+            &headers,
+            params.default_context,
+        )
             .await;
     }
 
@@ -527,6 +599,14 @@ pub async fn query_ledger(
         policy_class,
     )
     .await;
+
+    inject_default_context_if_requested(
+        &state,
+        &ledger_id,
+        &mut query_json,
+        params.default_context,
+    )
+    .await?;
 
     execute_query(&state, &ledger_id, &query_json, delimited).await
     }
@@ -1211,6 +1291,7 @@ async fn execute_sparql_ledger(
     identity: Option<&str>,
     delimited: Option<DelimitedFormat>,
     headers: &FlureeHeaders,
+    use_default_context: bool,
 ) -> Result<Response> {
     // Create span for peer mode loading
     let span = tracing::debug_span!(
@@ -1295,16 +1376,24 @@ async fn execute_sparql_ledger(
             let result = if qc_opts.has_any_policy_inputs() {
                 let view = state.fluree.db_with_policy(ledger_id, &qc_opts).await
                     .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?;
+                let view =
+                    attach_default_context_to_graph(state, ledger_id, view, use_default_context)
+                        .await?;
                 view.query(state.fluree.as_ref())
                     .sparql(sparql)
                     .execute_formatted()
                     .await
                     .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?
             } else {
-                state
-                    .fluree
-                    .graph(ledger_id)
-                    .query()
+                let view = if use_default_context {
+                    state.fluree.db_with_default_context(ledger_id).await
+                } else {
+                    state.fluree.db(ledger_id).await
+                }
+                .inspect_err(|_| {
+                    set_span_error_code(&span, "error:QueryFailed");
+                })?;
+                view.query(state.fluree.as_ref())
                     .sparql(sparql)
                     .execute_formatted()
                     .await
@@ -1339,6 +1428,8 @@ async fn execute_sparql_ledger(
             }
             let view = state.fluree.db_with_policy(ledger_id, &qc_opts).await
                 .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?;
+            let view = attach_default_context_to_graph(state, ledger_id, view, use_default_context)
+                .await?;
             let result = view.query(state.fluree.as_ref())
                 .sparql(sparql)
                 .execute_formatted()
@@ -1637,7 +1728,13 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
             .inspect_err(|_| {
                 set_span_error_code(&span, "error:LedgerLoad");
             })?;
-        let graph = GraphDb::from_ledger_state(&ledger);
+        let graph = attach_default_context_to_graph(
+            state,
+            ledger_id,
+            GraphDb::from_ledger_state(&ledger),
+            use_default_context,
+        )
+        .await?;
         let fluree = &state.fluree;
 
         // Tracked SPARQL: if tracking headers are present, use tracked execution path

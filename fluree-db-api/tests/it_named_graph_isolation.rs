@@ -432,7 +432,7 @@ async fn pre_index_upsert_isolates_named_graphs() {
             let query = json!({
                 "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
                 "from": &alpha_alias,
-                "select": ["?score"],
+                "select": "?score",
                 "where": {"@id": "ex:alice", "schema:score": "?score"}
             });
 
@@ -454,7 +454,7 @@ async fn pre_index_upsert_isolates_named_graphs() {
             let query = json!({
                 "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
                 "from": &beta_alias,
-                "select": ["?score"],
+                "select": "?score",
                 "where": {"@id": "ex:alice", "schema:score": "?score"}
             });
 
@@ -478,7 +478,7 @@ async fn pre_index_upsert_isolates_named_graphs() {
                     "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
                 },
                 "from": &alpha_alias,
-                "select": ["?type"],
+                "select": "?type",
                 "where": {"@id": "ex:alice", "rdf:type": "?type"}
             });
 
@@ -619,7 +619,10 @@ async fn push_roundtrip_named_graph_retractions() {
                     &tgt_handle,
                     push_req,
                     &QueryConnectionOptions::default(),
-                    &IndexConfig::default(),
+                    &IndexConfig {
+                        reindex_min_bytes: 100_000,
+                        reindex_max_bytes: 1_000_000_000,
+                    },
                 )
                 .await
                 .expect("push should succeed with named-graph retractions");
@@ -646,7 +649,7 @@ async fn push_roundtrip_named_graph_retractions() {
                     "schema": "http://schema.org/"
                 },
                 "from": &hr_alias,
-                "select": ["?name"],
+                "select": "?name",
                 "where": {
                     "@id": "?s",
                     "rdf:type": {"@id": "ex:Employee"},
@@ -679,7 +682,7 @@ async fn push_roundtrip_named_graph_retractions() {
                     "schema": "http://schema.org/"
                 },
                 "from": &payroll_alias,
-                "select": ["?salary"],
+                "select": "?salary",
                 "where": {
                     "@id": "ex:alice",
                     "schema:salary": "?salary"

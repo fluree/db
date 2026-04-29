@@ -215,7 +215,7 @@ fn format_binding_xml(
     match binding {
         Binding::Unbound | Binding::Poisoned => Ok(None),
 
-        Binding::Sid(sid) => {
+        Binding::Sid { sid, .. } => {
             let iri = compactor.decode_sid(sid)?;
             Ok(Some(if iri.starts_with("_:") {
                 let mut s = String::from("<bnode>");
@@ -355,7 +355,7 @@ mod tests {
             novelty: None,
             context: fluree_graph_json_ld::ParsedContext::default(),
             orig_context: None,
-            output: fluree_db_query::parse::QueryOutput::Select(vec![]),
+            output: fluree_db_query::parse::QueryOutput::select(vec![]),
             batches: vec![],
             binary_graph: None,
             graph_select: None,
@@ -380,11 +380,11 @@ mod tests {
         let mut result = make_test_result();
 
         let s_var = result.vars.get_or_insert("?s");
-        result.output = fluree_db_query::parse::QueryOutput::Select(vec![s_var]);
+        result.output = fluree_db_query::parse::QueryOutput::select(vec![s_var]);
 
         let schema = std::sync::Arc::from(vec![s_var].into_boxed_slice());
         let sid = Sid::new(100, "alice");
-        let batch = Batch::single_row(schema, vec![Binding::Sid(sid)]).unwrap();
+        let batch = Batch::single_row(schema, vec![Binding::sid(sid)]).unwrap();
         result.batches = vec![batch];
 
         let xml = format(&result, &compactor, &FormatterConfig::sparql_xml()).unwrap();

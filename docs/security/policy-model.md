@@ -1,722 +1,235 @@
 # Policy Model and Inputs
 
-Fluree's policy system provides fine-grained access control by evaluating policies against requests. This document explains the policy model, structure, and evaluation process.
+This is the reference for Fluree's access-control policy model. For a conceptual introduction, see [Policy enforcement](../concepts/policy-enforcement.md). For worked examples, see the [policy cookbook](../guides/cookbook-policies.md). For Rust-side wiring (building a `PolicyContext`, `wrap_identity_policy_view`, transaction helpers), see [Programmatic policy API](programmatic-policy.md).
 
-## Policy Structure
+## Policy node shape
 
-A policy consists of four main components:
-
-```json
-{
-  "@context": {
-    "f": "https://ns.flur.ee/db#",
-    "ex": "http://example.org/ns/"
-  },
-  "@id": "ex:example-policy",
-  "@type": "f:Policy",
-  "f:subject": "did:key:z6Mkh...",
-  "f:action": "query",
-  "f:resource": {
-    "@type": "schema:Person"
-  },
-  "f:allow": true
-}
-```
-
-### 1. Subject (Who)
-
-Specifies who the policy applies to:
-
-**Specific DID:**
-```json
-{
-  "f:subject": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
-}
-```
-
-**Any Subject (wildcard):**
-```json
-{
-  "f:subject": "*"
-}
-```
-
-**Variable (for conditions):**
-```json
-{
-  "f:subject": "?user"
-}
-```
-
-**Role-Based:**
-```json
-{
-  "f:subject": {
-    "ex:role": "admin"
-  }
-}
-```
-
-**Group-Based:**
-```json
-{
-  "f:subject": {
-    "ex:memberOf": "ex:engineering-team"
-  }
-}
-```
-
-### 2. Action (What)
-
-Specifies which operation:
-
-**Query:**
-```json
-{
-  "f:action": "query"
-}
-```
-
-**Transact:**
-```json
-{
-  "f:action": "transact"
-}
-```
-
-**Multiple Actions:**
-```json
-{
-  "f:action": ["query", "transact"]
-}
-```
-
-**All Actions:**
-```json
-{
-  "f:action": "*"
-}
-```
-
-### 3. Resource (Which Data)
-
-Specifies what data the policy applies to:
-
-**By Type:**
-```json
-{
-  "f:resource": {
-    "@type": "schema:Person"
-  }
-}
-```
-
-**By Predicate:**
-```json
-{
-  "f:resource": {
-    "f:predicate": "ex:salary"
-  }
-}
-```
-
-**Specific Entity:**
-```json
-{
-  "f:resource": {
-    "@id": "ex:alice"
-  }
-}
-```
-
-**Pattern with Variables:**
-```json
-{
-  "f:resource": {
-    "@type": "ex:Document",
-    "ex:department": "?dept"
-  }
-}
-```
-
-**All Resources:**
-```json
-{
-  "f:resource": "*"
-}
-```
-
-### 4. Allow/Deny
-
-Specifies whether to grant or deny access:
-
-**Allow:**
-```json
-{
-  "f:allow": true
-}
-```
-
-**Deny:**
-```json
-{
-  "f:allow": false
-}
-```
-
-## Conditions
-
-Policies can include conditions that must be satisfied:
+Every policy is a JSON-LD node. Required `@type`: `f:AccessPolicy` (the IRI is `https://ns.flur.ee/db#AccessPolicy`). A second class IRI (e.g. `ex:CorpPolicy`) is conventional and allows the policy to be loaded by `policy-class`.
 
 ```json
 {
-  "@id": "ex:same-department-policy",
-  "f:subject": "?user",
-  "f:action": "query",
-  "f:resource": {
-    "@type": "schema:Person",
-    "ex:department": "?dept"
-  },
-  "f:condition": [
-    { "@id": "?user", "ex:department": "?dept" }
-  ],
-  "f:allow": true
-}
-```
-
-This allows users to query people in their own department.
-
-### Multiple Conditions
-
-```json
-{
-  "f:subject": "?user",
-  "f:resource": {
-    "@id": "?doc",
-    "ex:status": "published"
-  },
-  "f:condition": [
-    { "@id": "?user", "ex:clearanceLevel": "?level" },
-    { "@id": "?doc", "ex:requiredClearance": "?reqLevel" },
-    { "f:filter": "?level >= ?reqLevel" }
-  ],
-  "f:allow": true
-}
-```
-
-## Policy Evaluation
-
-### Input Context
-
-When evaluating policies, Fluree has access to:
-
-**Request Context:**
-- **subject**: DID from signed request or authentication
-- **action**: Operation being performed (query, transact)
-- **resource**: Target entity/pattern being accessed
-- **timestamp**: Current time
-
-**Data Context:**
-- **graph**: Current ledger state
-- **entity properties**: Properties of entities being accessed
-- **relationships**: Graph connections
-- **history**: Historical data (if needed)
-
-**Example:**
-```text
-Request: Query for ex:alice's data
-Context:
-  - subject: did:key:z6Mkh...
-  - action: query
-  - resource: ex:alice
-  - graph: mydb:main@t:100
-```
-
-### Evaluation Steps
-
-1. **Collect Applicable Policies**
-   - Match subject (is this user covered?)
-   - Match action (is this operation covered?)
-   - Match resource (is this data covered?)
-
-2. **Evaluate Conditions**
-   - Execute condition queries
-   - Check filters
-   - Variable bindings must match
-
-3. **Combine Results**
-   - Apply combining algorithm
-   - Resolve conflicts
-
-4. **Return Decision**
-   - Allow or Deny
-   - With reasons (for debugging)
-
-### Evaluation Example
-
-**Policy:**
-```json
-{
-  "f:subject": "did:key:z6Mkhabc...",
-  "f:action": "query",
-  "f:resource": { "@type": "ex:PublicData" },
-  "f:allow": true
-}
-```
-
-**Request:**
-```text
-subject: did:key:z6Mkhabc...
-action: query
-resource: ex:document-123 (type: ex:PublicData)
-```
-
-**Evaluation:**
-```text
-✓ Subject matches: did:key:z6Mkhabc...
-✓ Action matches: query
-✓ Resource matches: ex:document-123 is ex:PublicData
-→ Result: ALLOW
-```
-
-## Combining Algorithms
-
-### Deny Overrides (Default)
-
-Most restrictive policy wins:
-
-```text
-Policy 1: ALLOW
-Policy 2: DENY
-→ Result: DENY
-```
-
-Logic:
-1. If any policy denies → DENY
-2. If any policy allows → ALLOW
-3. If no policies match → DENY (default deny)
-
-### Allow Overrides
-
-Most permissive policy wins:
-
-```text
-Policy 1: DENY
-Policy 2: ALLOW
-→ Result: ALLOW
-```
-
-Logic:
-1. If any policy allows → ALLOW
-2. If any policy denies → DENY
-3. If no policies match → DENY (default deny)
-
-### First Applicable
-
-First matching policy wins:
-
-```text
-Policy 1 (matches): ALLOW
-Policy 2 (matches): DENY
-→ Result: ALLOW (first match)
-```
-
-## Default Policies
-
-### Default Deny
-
-Recommended for production:
-
-```json
-{
-  "@id": "ex:default-deny",
-  "f:subject": "*",
-  "f:action": "*",
-  "f:resource": "*",
-  "f:allow": false,
-  "f:priority": -1000
-}
-```
-
-All access denied unless explicitly allowed.
-
-### Default Allow
-
-For development only:
-
-```json
-{
-  "@id": "ex:default-allow",
-  "f:subject": "*",
-  "f:action": "*",
-  "f:resource": "*",
-  "f:allow": true
-}
-```
-
-All access allowed unless explicitly denied.
-
-> **Note:** `default-allow` governs access for any requester — including unknown identities — once no matching policy restrictions apply. This is intentional for deployments where an application layer handles authorization and Fluree stores signed transactions for provenance. Set `default-allow: false` for fail-closed behavior when an identity is unknown or has no matching policy. See the [Policy Combining Algorithm](programmatic-policy.md#policy-combining-algorithm) for the three-state identity resolution.
-
-## Policy Priority
-
-Control policy evaluation order with priority:
-
-```json
-{
-  "@id": "ex:admin-override",
-  "f:subject": { "ex:role": "admin" },
-  "f:action": "*",
+  "@id": "ex:somePolicy",
+  "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+  "f:required": true,
+  "f:onProperty": [{"@id": "ex:salary"}],
+  "f:onClass":    [{"@id": "ex:Employee"}],
+  "f:onSubject":  [{"@id": "ex:alice"}],
+  "f:action": [{"@id": "f:view"}, {"@id": "f:modify"}],
+  "f:query": "<JSON-encoded WHERE>",
   "f:allow": true,
-  "f:priority": 1000
+  "f:exMessage": "Reason returned to caller on denial"
 }
 ```
 
-Higher priority policies evaluated first.
+### Predicate reference
 
-## Variable Binding
+| Predicate | Type | Required? | Description |
+|-----------|------|-----------|-------------|
+| `f:action` | array of IRIs (or single IRI string) | yes | Which operations the policy governs. Values: `f:view` (queries), `f:modify` (transactions). |
+| `f:allow` | boolean | one of `f:allow` / `f:query` | Static decision. `true` permits, `false` denies. Takes precedence over `f:query` if both are present. |
+| `f:query` | string (JSON-encoded JSON-LD WHERE) | one of `f:allow` / `f:query` | Dynamic decision. The targeted flake is permitted when the query returns at least one row. `?$this` and `?$identity` are pre-bound. |
+| `f:onProperty` | array of `@id` references | no | Restrict the policy to flakes whose predicate is one of these IRIs. |
+| `f:onClass` | array of `@id` references | no | Restrict the policy to flakes whose subject has one of these `rdf:type`s. |
+| `f:onSubject` | array of `@id` references | no | Restrict the policy to flakes whose subject IRI is one of these. |
+| `f:required` | boolean | no, defaults to `false` | When `true`, the policy MUST allow for access to its targets to be granted, regardless of `default-allow`. |
+| `f:exMessage` | string | no | User-facing error message returned when this policy denies a transaction. |
 
-Variables in policies bind to values from context:
+If neither `f:allow` nor `f:query` is present, the policy is **deny by default**.
+
+If multiple targeting predicates are present, they intersect: the policy applies only to flakes that match the property AND the class AND the subject sets.
+
+If all targeting predicates are omitted, the policy is a **default policy** that applies to every flake of its `f:action`s.
+
+### Action values
+
+`f:action` carries IRIs in the `f:` namespace:
+
+- `"f:view"` (or `{"@id": "f:view"}`) — queries.
+- `"f:modify"` (or `{"@id": "f:modify"}`) — transactions.
+- Both: `[{"@id": "f:view"}, {"@id": "f:modify"}]`.
+
+A policy with no `f:action` defaults to applying to both view and modify.
+
+## `f:query` syntax
+
+`f:query` is a string containing a JSON-encoded JSON-LD query. The engine parses the string and runs the query as a subquery for each candidate flake, with two pre-bound variables:
+
+| Variable | Binding |
+|----------|---------|
+| `?$this` | The IRI of the subject being read or written. |
+| `?$identity` | The IRI of the requesting identity (resolved from `opts.identity`, `policy_values["?$identity"]`, or the verified bearer-token subject). |
+
+Anything else binds via the embedded WHERE just like a normal Fluree query.
+
+Because RDF can't carry structured JSON values natively, stored policies must JSON-encode the query (`serde_json::to_string`). For inline policies passed via `opts.policy`, you can also use the JSON-LD typed-literal form `{"@type": "@json", "@value": {...}}` to avoid manually escaping.
+
+Example (string form, suitable for storing in a transaction):
+
+```json
+"f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/role\": \"hr\"}}"
+```
+
+Example (typed-literal form, suitable for inline policies):
+
+```json
+"f:query": {
+  "@type": "@json",
+  "@value": {
+    "where": {"@id": "?$identity", "http://example.org/role": "hr"}
+  }
+}
+```
+
+> **Inline policies must use full IRIs.** Compact IRIs (`schema:ssn`) inside an inline policy passed through `opts.policy` are not expanded against the request `@context`. Use full IRIs (`http://schema.org/ssn`).
+
+## Combining algorithm
+
+When more than one policy targets the same flake, the engine combines them as follows:
+
+1. If any **required** policy (`f:required: true`) targets the flake and does not allow it (either `f:allow: false`, missing `f:allow`, or `f:query` returning no rows), access is **denied** for that flake. Required policies are *gates*: they cannot be overridden by other allows or by `default-allow`.
+2. If at least one targeted (but not required) policy allows the flake, access is **granted**. Non-required allows combine with allow-overrides semantics.
+3. If a targeted policy's `f:query` returns false (no rows), that policy *applied but did not permit* — the flake is denied even if `default-allow` is `true`. Default-allow only applies when **no** policy targets the flake.
+4. If no policies target the flake, `default-allow` decides. `false` denies; `true` permits.
+
+`f:allow` always takes precedence over `f:query`: if both are set on the same policy, `f:allow` wins.
+
+For a deeper treatment, including the three-state identity resolution semantics (`FoundWithPolicies` / `FoundNoPolicies` / `NotFound`), see the [Policy combining algorithm](programmatic-policy.md#policy-combining-algorithm) section in the programmatic policy API reference.
+
+## Default-allow
+
+`default-allow` is the fallback decision for flakes that no policy targets:
+
+| Setting | Behavior |
+|---------|----------|
+| `default-allow: false` | Fail-closed. A flake with no targeting policies is denied. **Recommended for production.** |
+| `default-allow: true` | Fail-open. A flake with no targeting policies is allowed. Useful in development or in deployments where an application layer handles authorization and Fluree is recording signed transactions for provenance. |
+
+Important: `default-allow: true` does **not** override required policies that fail. It only governs the no-policy case.
+
+## Identity resolution
+
+When `opts.identity` is set, Fluree resolves it to a `?$identity` SID and applies the identity's `f:policyClass` automatically — every stored policy of that class is loaded into the request's policy set.
+
+The resolution path:
+
+```
+opts.identity  →  policy_class               →  policy             →  policy_values["?$identity"]
+   (highest)                                                                  (lowest)
+```
+
+If multiple are set, the higher-priority binding wins. `policy_values["?$identity"]` is a manual escape hatch — useful when you want to test a specific identity SID without going through the full resolution path.
+
+A request with no identity supplied uses an "anonymous" context: only inline policies, no class-based discovery, no `?$identity` binding.
+
+## Where policies come from
+
+Two delivery paths, often combined:
+
+### Stored policies
+
+Persist policies as data in the ledger. The policy node carries the class type alongside `f:AccessPolicy`:
 
 ```json
 {
-  "f:subject": "?user",
-  "f:resource": {
-    "ex:owner": "?user"
-  },
-  "f:allow": true
+  "@id": "ex:salary-restriction",
+  "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+  ...
 }
 ```
 
-**Evaluation:**
-```text
-Request subject: did:key:z6Mkhabc...
-Bind: ?user = did:key:z6Mkhabc...
-
-Check resource:
-  ex:document-123 ex:owner did:key:z6Mkhabc...
-  
-Match! → ALLOW
-```
-
-## Pattern Matching
-
-Policies can match patterns:
+Identities tag themselves with `f:policyClass`:
 
 ```json
 {
-  "f:resource": {
-    "@type": "?type",
-    "ex:visibility": "public"
-  },
-  "f:condition": [
-    { "f:filter": "?type != ex:SensitiveData" }
-  ],
-  "f:allow": true
+  "@id": "ex:aliceIdentity",
+  "ex:user": {"@id": "ex:alice"},
+  "f:policyClass": [{"@id": "ex:CorpPolicy"}]
 }
 ```
 
-Allows access to any public data except SensitiveData.
+When `opts.identity = "ex:aliceIdentity"`, every `f:AccessPolicy` whose `@type` includes `ex:CorpPolicy` is loaded for the request — no per-request policy listing needed. Stored policies are versioned, time-travelable, branchable, and consistent across all callers.
 
-## Time-Based Policies
+### Inline policies
 
-Policies can be time-dependent:
+Pass policies in `opts.policy` (an array of policy nodes) for ad-hoc requests:
 
 ```json
 {
-  "f:subject": "?user",
-  "f:action": "query",
-  "f:resource": {
-    "ex:availableFrom": "?startDate",
-    "ex:availableUntil": "?endDate"
-  },
-  "f:condition": [
-    { "f:filter": "NOW() >= ?startDate && NOW() <= ?endDate" }
-  ],
-  "f:allow": true
-}
-```
-
-## Property-Level Access Control
-
-Control access to specific properties:
-
-```json
-{
-  "@id": "ex:hide-salary",
-  "f:subject": "*",
-  "f:action": "query",
-  "f:resource": {
-    "f:predicate": "ex:salary"
-  },
-  "f:allow": false
-}
-```
-
-```json
-{
-  "@id": "ex:show-salary-to-hr",
-  "f:subject": { "ex:role": "hr" },
-  "f:action": "query",
-  "f:resource": {
-    "f:predicate": "ex:salary"
-  },
-  "f:allow": true
-}
-```
-
-## Entity-Level Access Control
-
-Control access to specific entities:
-
-```json
-{
-  "f:subject": "?user",
-  "f:action": "*",
-  "f:resource": {
-    "@id": "?entity",
-    "ex:owner": "?user"
-  },
-  "f:allow": true
-}
-```
-
-Users can access entities they own.
-
-## Policy Examples
-
-### Public Read, Authenticated Write
-
-```json
-[
-  {
-    "@id": "ex:public-read",
-    "f:subject": "*",
-    "f:action": "query",
-    "f:allow": true
-  },
-  {
-    "@id": "ex:authenticated-write",
-    "f:subject": "?user",
-    "f:action": "transact",
-    "f:condition": [
-      { "@id": "?user", "@type": "ex:AuthenticatedUser" }
+  "from": "mydb:main",
+  "select": "?x",
+  "where": [...],
+  "opts": {
+    "policy": [
+      {"@id": "ex:adhoc", "@type": "f:AccessPolicy", "f:action": "f:view", "f:allow": true}
     ],
-    "f:allow": true
-  }
-]
-```
-
-### Department Isolation
-
-```json
-{
-  "@id": "ex:department-isolation",
-  "f:subject": "?user",
-  "f:action": "*",
-  "f:resource": {
-    "ex:department": "?dept"
-  },
-  "f:condition": [
-    { "@id": "?user", "ex:department": "?dept" }
-  ],
-  "f:allow": true
-}
-```
-
-### Hierarchical Permissions
-
-```json
-{
-  "@id": "ex:manager-access",
-  "f:subject": "?manager",
-  "f:action": "*",
-  "f:resource": {
-    "ex:reportsTo": "?manager"
-  },
-  "f:allow": true
-}
-```
-
-Managers can access data of their reports.
-
-### Time-Window Access
-
-```json
-{
-  "@id": "ex:business-hours-only",
-  "f:subject": "?user",
-  "f:action": "transact",
-  "f:condition": [
-    { "f:filter": "HOUR(NOW()) >= 9 && HOUR(NOW()) <= 17" }
-  ],
-  "f:allow": true
-}
-```
-
-### Clearance-Level Access
-
-```json
-{
-  "@id": "ex:clearance-policy",
-  "f:subject": "?user",
-  "f:resource": {
-    "ex:classificationLevel": "?docLevel"
-  },
-  "f:condition": [
-    { "@id": "?user", "ex:clearance": "?userLevel" },
-    { "f:filter": "?userLevel >= ?docLevel" }
-  ],
-  "f:allow": true
-}
-```
-
-## Policy Debugging
-
-### Policy Trace
-
-Enable policy tracing to see evaluation:
-
-```bash
-curl -X POST http://localhost:8090/v1/fluree/query \
-  -H "X-Fluree-Policy-Trace: true" \
-  -d '{...}'
-```
-
-Response includes trace:
-```json
-{
-  "results": [...],
-  "policy_trace": [
-    {
-      "policy": "ex:policy-1",
-      "matched": true,
-      "conditions_met": true,
-      "decision": "allow"
-    },
-    {
-      "policy": "ex:policy-2",
-      "matched": false,
-      "reason": "subject mismatch"
-    }
-  ],
-  "final_decision": "allow"
-}
-```
-
-### Test Policies
-
-Test policy evaluation:
-
-```javascript
-async function testPolicy(policyId, testCases) {
-  for (const test of testCases) {
-    const result = await evaluatePolicy({
-      policy: policyId,
-      subject: test.subject,
-      action: test.action,
-      resource: test.resource
-    });
-    
-    console.log(`Test: ${test.name}`);
-    console.log(`Expected: ${test.expected}`);
-    console.log(`Actual: ${result.decision}`);
-    console.log(`Match: ${result.decision === test.expected ? 'PASS' : 'FAIL'}`);
+    "default-allow": false
   }
 }
 ```
 
-## Best Practices
+Useful for tests, admin scripts, and migration tooling. Inline policies and stored policies can coexist in a single request.
 
-### 1. Start with Default Deny
+## Request-time options
 
-```json
-{
-  "f:subject": "*",
-  "f:action": "*",
-  "f:allow": false,
-  "f:priority": -1000
+Each request can supply these `opts` fields (JSON-LD form). Over SPARQL, the equivalent fluree-* HTTP headers carry the same values.
+
+| `opts` field | HTTP header | Description |
+|--------------|-------------|-------------|
+| `identity` | `fluree-identity` | IRI of an identity entity. Drives `f:policyClass` discovery and binds `?$identity`. |
+| `policy-class` | `fluree-policy-class` | Class IRI(s) to load stored policies by. Repeated header or comma-separated. |
+| `policy-values` | `fluree-policy-values` | JSON object of additional `?$var` bindings injected into every policy's `f:query`. |
+| `policy` | `fluree-policy` | Inline policy array (full JSON-LD). |
+| `default-allow` | `fluree-default-allow` | `true` / `false`. Fallback decision for flakes that no policy targets. |
+
+When the server is configured with `data_auth_default_policy_class`, a verified bearer token's identity claim is auto-applied to `policy-values` and the configured class to `policy-class` — no client-side opts needed. See [Configuration](../operations/configuration.md) and [Authentication](authentication.md) for the bearer-token flow.
+
+## Read enforcement vs write enforcement
+
+The same model governs both, distinguished by `f:action`:
+
+- **`f:view`** — applied during query execution. Flakes that fail the policy are filtered before the query plan emits results. The query never sees them.
+- **`f:modify`** — applied during transaction staging. The transaction is rejected — with `f:exMessage` if provided — when a write would touch flakes the identity isn't allowed to modify.
+
+A single policy can govern both. See [Policy in queries](policy-in-queries.md) and [Policy in transactions](policy-in-transactions.md) for path-specific details.
+
+## Performance notes
+
+Two phases:
+
+- **Load.** The relevant policies for a request are gathered once (from `policy-class` lookups + inline `policy`). Cost is small and proportional to the size of the policy set.
+- **Apply.** During plan execution, each candidate flake is checked against the matching subset of the policy set. Cost is proportional to the number of touched flakes × the average per-flake check cost.
+
+Two practical implications:
+
+1. **Target every policy you can.** A policy with `f:onProperty` or `f:onClass` only runs on flakes whose predicate or rdf:type matches. Default policies (no targeting) run on every flake.
+2. **Keep `f:query` cheap.** It runs once per targeted flake. Lean on identity-side properties already loaded (`@type`, `f:policyClass`, role flags) rather than deep traversals.
+
+## Policies are queryable data
+
+Because each policy is just a JSON-LD node, you can query the policies themselves:
+
+```sparql
+PREFIX f: <https://ns.flur.ee/db#>
+PREFIX ex: <http://example.org/>
+
+SELECT ?policy ?action ?onProperty
+WHERE {
+  ?policy a f:AccessPolicy ;
+          a ex:CorpPolicy ;
+          f:action ?action ;
+          f:onProperty ?onProperty .
 }
 ```
 
-### 2. Use Specific Policies
+History queries against the same shape produce a complete audit trail of policy changes over time. See [Time travel](../concepts/time-travel.md) for query-at-t syntax.
 
-Prefer specific over general:
+## Related documentation
 
-Good:
-```json
-{
-  "f:resource": { "@type": "ex:PublicDocument" },
-  "f:allow": true
-}
-```
-
-Less secure:
-```json
-{
-  "f:resource": "*",
-  "f:allow": true
-}
-```
-
-### 3. Organize by Role
-
-Group policies by role:
-
-```json
-{
-  "@id": "ex:admin-policies",
-  "@type": "ex:PolicySet",
-  "ex:includes": [
-    "ex:admin-query-policy",
-    "ex:admin-transact-policy",
-    "ex:admin-delete-policy"
-  ]
-}
-```
-
-### 4. Document Policies
-
-Add descriptions:
-
-```json
-{
-  "@id": "ex:policy-1",
-  "rdfs:label": "Public read access",
-  "rdfs:comment": "Allows anyone to read public documents",
-  "f:subject": "*",
-  "f:action": "query",
-  "f:resource": { "ex:visibility": "public" },
-  "f:allow": true
-}
-```
-
-### 5. Test Thoroughly
-
-Test all policy paths:
-- Positive cases (should allow)
-- Negative cases (should deny)
-- Edge cases
-- Condition evaluation
-
-### 6. Monitor Policy Usage
-
-Log policy decisions:
-
-```javascript
-policyLogger.info({
-  timestamp: new Date(),
-  subject: request.subject,
-  action: request.action,
-  resource: request.resource,
-  decision: policyResult.decision,
-  policies_evaluated: policyResult.policies
-});
-```
-
-## Related Documentation
-
-- [Policy in Queries](policy-in-queries.md) - Query-time enforcement
-- [Policy in Transactions](policy-in-transactions.md) - Transaction-time enforcement
-- [Signed Requests](../api/signed-requests.md) - Authentication
-- [Policy Enforcement Concepts](../concepts/policy-enforcement.md) - High-level overview
+- [Policy enforcement (concepts)](../concepts/policy-enforcement.md) — model and architecture
+- [Cookbook: Access control policies](../guides/cookbook-policies.md) — worked examples and patterns
+- [Policy in queries](policy-in-queries.md) — read-time enforcement details
+- [Policy in transactions](policy-in-transactions.md) — write-time enforcement details
+- [Programmatic policy API (Rust)](programmatic-policy.md) — `PolicyContext`, builder helpers, combining algorithm
+- [Authentication](authentication.md) — identities, JWTs, bearer-token verification
+- [Configuration](../operations/configuration.md) — server-side policy defaults (`data_auth_default_policy_class`, etc.)
+- [Vocabulary reference](../reference/vocabulary.md#policy-vocabulary) — predicate IRIs

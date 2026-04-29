@@ -339,6 +339,7 @@ impl Fluree {
             // Result unused: load_and_attach mutates new_state in-place
             let _store = crate::ledger_manager::load_and_attach_binary_store(
                 self.backend(),
+                self.nameservice(),
                 &mut new_state,
                 &cache_dir,
                 Some(std::sync::Arc::clone(self.leaflet_cache())),
@@ -1046,8 +1047,14 @@ impl Fluree {
             .ok_or_else(|| ApiError::NotFound("Ledger has no commits".to_string()))?;
         let head_t = head_ref.t;
 
-        // Build a ContentStore bridge for CID-based reads.
-        let content_store = self.content_store(ledger_id);
+        // Branch-aware ContentStore for CID-based reads — pulls walk
+        // history backwards, which crosses fork points on a branched
+        // ledger and would otherwise 404 on pre-fork ancestors.
+        let content_store = self.branched_content_store(ledger_id).await.map_err(|e| {
+            ApiError::internal(format!(
+                "failed to build branched store for {ledger_id}: {e}"
+            ))
+        })?;
 
         // Determine start cursor CID.
         let start_cid: ContentId = if let Some(cid) = &request.cursor_id {

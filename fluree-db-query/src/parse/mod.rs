@@ -45,7 +45,7 @@ pub use error::{ParseError, Result};
 pub(crate) use lower::{lower_query, SelectMode};
 pub use lower::{
     lower_unresolved_pattern, lower_unresolved_patterns, ConstructTemplate, GraphSelectSpec,
-    NestedSelectSpec, ParsedQuery, QueryOutput, Root, SelectionSpec,
+    NestedSelectSpec, ParsedQuery, ProjectionShape, QueryOutput, Root, SelectionSpec,
 };
 pub use policy::{JsonLdParseCtx, JsonLdParsePolicy};
 pub use where_clause::parse_where_with_counters;
@@ -265,6 +265,14 @@ fn parse_query_ast_internal(
             })
             .collect();
     }
+    // selectOne is semantically "first solution" — enforce LIMIT 1 at the query
+    // level so execution can stop after one row, rather than materializing the
+    // full sequence and discarding the rest at format time. Overrides any
+    // user-provided limit because selectOne intent is unambiguous.
+    if select_mode == SelectMode::One {
+        query.options.limit = Some(1);
+    }
+
     if implied_distinct {
         query.options.distinct = true;
         // select-distinct without explicit order defaults to sorting
@@ -548,6 +556,9 @@ fn parse_select(
     match select {
         // Case 2, 3, 5: Array form - could be simple vars, mixed, or with aggregates
         JsonValue::Array(arr) => {
+            // Record shape: array form always yields tuple rows, regardless of
+            // how many items are inside (`["?x"]` → `[[v1],[v2]]`, not `[v1,v2]`).
+            query.select_shape = ProjectionShape::Tuple;
             for item in arr {
                 match item {
                     JsonValue::String(s) => {
@@ -572,8 +583,9 @@ fn parse_select(
             query.graph_select = Some(spec);
         }
 
-        // Case 1: Single string form: "?x"
+        // Case 1: Single string form: "?x" — bare variable, scalar shape.
         JsonValue::String(s) => {
+            query.select_shape = ProjectionShape::Scalar;
             parse_select_string(s, query)?;
         }
 
@@ -2691,7 +2703,8 @@ mod tests {
 
     #[test]
     fn test_optional_multiple_patterns() {
-        // Optional with multiple patterns inside
+        // SPARQL semantics: ["optional", {a}, {b}] is one conjunctive OPTIONAL,
+        // equivalent to OPTIONAL { a . b }.
         let json = json!({
             "@context": { "ex": "http://example.org/" },
             "select": ["?s", "?name", "?email", "?phone"],
@@ -2707,13 +2720,13 @@ mod tests {
         let (ast, _) = parse_query_ast(&json, None).unwrap();
 
         assert_eq!(count_triples(&ast.patterns), 1);
-        // Fluree semantics: each node-map object becomes its own OPTIONAL clause.
-        assert_eq!(count_optionals(&ast.patterns), 2);
+        assert_eq!(count_optionals(&ast.patterns), 1);
 
         let optional = find_optional(&ast.patterns).expect("Should have optional");
-        // Each OPTIONAL should contain 1 triple pattern
-        assert_eq!(optional.len(), 1);
-        assert!(optional[0].is_triple());
+        assert_eq!(optional.len(), 2);
+        assert!(optional
+            .iter()
+            .all(super::ast::UnresolvedPattern::is_triple));
     }
 
     #[test]
@@ -2817,6 +2830,86 @@ mod tests {
             "where": [
                 { "@id": "?s" },
                 ["optional"]  // No patterns
+            ]
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_optional_values_then_filter() {
+        // VALUES is a binding-producing pattern, so a following FILTER inside the
+        // same OPTIONAL block has an anchor and must be accepted.
+        // SPARQL: OPTIONAL { VALUES (?x) { (1) (2) (3) } FILTER(?x > 0) }
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?x"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional",
+                    ["values", ["?x", [1, 2, 3]]],
+                    ["filter", "(> ?x 0)"]
+                ]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let optional = find_optional(&ast.patterns).expect("Should have optional");
+        assert_eq!(optional.len(), 2);
+        assert!(matches!(optional[0], UnresolvedPattern::Values { .. }));
+        assert!(matches!(optional[1], UnresolvedPattern::Filter(_)));
+    }
+
+    #[test]
+    fn test_optional_bind_anchor_for_filter() {
+        // BIND inside OPTIONAL produces a binding for ?doubled, anchoring the
+        // following FILTER. The leading node-map provides the BIND anchor.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?x", "?doubled"],
+            "where": [
+                ["optional",
+                    { "@id": "?s", "ex:x": "?x" },
+                    ["bind", "?doubled", ["*", "?x", 2]],
+                    ["filter", "(> ?doubled 0)"]
+                ]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let optional = find_optional(&ast.patterns).expect("Should have optional");
+        // 1 triple from node-map + 1 bind + 1 filter
+        assert_eq!(optional.len(), 3);
+    }
+
+    #[test]
+    fn test_optional_filter_first_rejected() {
+        // FILTER as the very first item in an OPTIONAL has nothing to constrain
+        // and must be rejected.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional", ["filter", "(> ?name 0)"]]
+            ]
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_optional_bind_first_rejected() {
+        // BIND as the very first item in an OPTIONAL has nothing to bind from
+        // and must be rejected (matches the pre-existing contract).
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?x"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional", ["bind", "?x", ["+", 1, 1]]]
             ]
         });
 

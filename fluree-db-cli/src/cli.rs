@@ -715,6 +715,10 @@ pub enum Commands {
     Reindex {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Manage the Fluree HTTP server
@@ -827,6 +831,54 @@ pub enum BranchAction {
         /// Options: take-both, abort, take-source, take-branch
         #[arg(long, default_value = "take-both")]
         strategy: String,
+
+        /// Ledger name (defaults to active ledger)
+        #[arg(long)]
+        ledger: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show a read-only merge preview between two branches
+    ///
+    /// Returns the rich diff (commits ahead/behind, conflict keys,
+    /// fast-forward eligibility) without mutating any state.
+    Diff {
+        /// Source branch name (e.g., "dev", "feature-x")
+        source: String,
+
+        /// Target branch (defaults to source's parent branch)
+        #[arg(long)]
+        target: Option<String>,
+
+        /// Cap on per-side commit list (default: 50 in CLI; 500 over HTTP).
+        /// Pass 0 for unbounded (local mode only).
+        #[arg(long, default_value_t = 50)]
+        max_commits: usize,
+
+        /// Cap on conflict keys returned (default: 50).
+        /// Pass 0 for unbounded (local mode only).
+        #[arg(long, default_value_t = 50)]
+        max_conflict_keys: usize,
+
+        /// Skip the conflict computation when only counts are needed
+        #[arg(long)]
+        no_conflicts: bool,
+
+        /// Include source/target values for returned conflict keys
+        #[arg(long)]
+        conflict_details: bool,
+
+        /// Strategy used to annotate conflict resolution labels
+        /// Options: take-both, abort, take-source, take-branch
+        #[arg(long)]
+        strategy: Option<String>,
+
+        /// Emit the raw JSON preview instead of a human-readable summary
+        #[arg(long)]
+        json: bool,
 
         /// Ledger name (defaults to active ledger)
         #[arg(long)]

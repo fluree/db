@@ -952,6 +952,140 @@ This design keeps retry/timeout policy out of the database layer. Different
 deployment contexts (Lambda with 100ms backoff, HTTP handler with 5s deadline,
 integration test with immediate assertion) each wrap the same primitive differently.
 
+### Branch Diff (Merge Preview)
+
+`Fluree::merge_preview` returns the rich diff between two branches —
+ahead/behind commit summaries, the common ancestor, conflict keys, and
+fast-forward eligibility — **without mutating any state**. It uses the
+same primitives as `merge_branch` but skips the publish/copy steps,
+making it cheap enough to call on every UI render.
+
+```rust
+use fluree_db_api::{FlureeBuilder, MergePreviewOpts, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // ... create ledger, branch, transact on dev, etc.
+
+    // Default: previewing dev → main with the spec defaults
+    // (cap each commit list at 500, conflict keys at 200, run conflicts).
+    let preview = fluree.merge_preview("mydb", "dev", None).await?;
+
+    println!(
+        "{} ahead, {} behind, fast-forward: {}",
+        preview.ahead.count, preview.behind.count, preview.fast_forward,
+    );
+
+    if preview.fast_forward {
+        println!("merge would advance {} → {}", preview.source, preview.target);
+    } else {
+        println!("merge has {} conflict(s)", preview.conflicts.count);
+        for k in &preview.conflicts.keys {
+            println!("  - s={} p={}", k.s, k.p);
+        }
+    }
+    Ok(())
+}
+```
+
+#### Tuning the preview
+
+`merge_preview_with` takes a `MergePreviewOpts` for callers that need
+control over response size or want to skip the conflict computation:
+
+```rust
+use fluree_db_api::{FlureeBuilder, MergePreviewOpts, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Cheap preview: counts only, no conflict walks.
+    let counts = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            Some("main"),
+            MergePreviewOpts {
+                max_commits: Some(0),       // counts only — no commit summaries
+                max_conflict_keys: Some(0),
+                include_conflicts: false,
+            },
+        )
+        .await?;
+
+    // Direct Rust callers can opt in to **unbounded** results — useful for
+    // tooling that needs the full divergence. The HTTP layer always supplies
+    // a bound, so this is a Rust-only escape hatch.
+    let full = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                max_commits: None,
+                max_conflict_keys: None,
+                include_conflicts: true,
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+#### What the caps do (and don't) control
+
+`max_commits` and `max_conflict_keys` cap the **size of the returned
+lists**, not the cost of computing them:
+
+- `BranchDelta::count` on each side reflects the full unbounded
+  divergence — computed by walking every commit envelope between HEAD and
+  the common ancestor — regardless of `max_commits`.
+- When `include_conflicts: true`, both `compute_delta_keys` walks scan
+  the full per-side delta regardless of `max_conflict_keys`.
+- When `include_conflict_details: true`, value details are collected only
+  for the returned `conflicts.keys` after the `max_conflict_keys` cap is
+  applied.
+- Set `include_conflicts: false` for a cheap preview on heavily diverged
+  branches; you still get accurate `ahead.count` / `behind.count`.
+
+#### Response shape
+
+| Type | Notable fields |
+|------|----------------|
+| `MergePreview` | `source`, `target`, `ancestor: Option<AncestorRef>`, `ahead`, `behind`, `fast_forward`, `conflicts`, `mergeable` |
+| `BranchDelta` | `count` (unbounded), `commits: Vec<CommitSummary>` (newest-first, capped), `truncated` |
+| `CommitSummary` | `t`, `commit_id`, `time`, `asserts`, `retracts`, `flake_count`, `message: Option<String>` (extracted from the `f:message` `txn_meta` entry when present) |
+| `ConflictSummary` | `count` (unbounded), `keys: Vec<ConflictKey>` (sorted, capped), `truncated`, `strategy`, `details` |
+| `ConflictDetail` | `key`, `source_values`, `target_values`, `resolution` (values are the current asserted values at each branch HEAD) |
+| `ConflictKey` | `s: Sid`, `p: Sid`, `g: Option<Sid>` |
+
+`mergeable` only reflects whether the selected strategy would abort due to
+detected conflicts; it is not full validation of every constraint the eventual
+merge commit may encounter. `mergeable=true` does not guarantee a subsequent
+merge will succeed; it only reflects the conflict/strategy interaction at
+preview time.
+
+All types derive `Serialize` so the response is wire-stable; the HTTP
+endpoint at `GET /v1/fluree/merge-preview/{ledger...}` returns the same struct.
+See `docs/api/endpoints.md` and `docs/cli/server-integration.md` for the
+HTTP contract.
+
+#### Reusable primitives in `fluree-db-core`
+
+The per-commit summary types and DAG walker are factored into core for
+reuse outside the merge-preview flow (e.g., git-log-style commit history
+viewers, indexer integration). Re-exported from `fluree-db-api`:
+
+- `walk_commit_summaries(store, head, stop_at_t, max) -> Result<(Vec<CommitSummary>, usize)>`
+  — newest-first walk that returns both the (capped) summary list and the
+  unbounded total count.
+- `commit_to_summary(commit) -> CommitSummary` — pure function, no I/O.
+- `find_common_ancestor(store, head_a, head_b)` — dual-frontier BFS.
+
 ### Time Travel Queries
 
 ```rust

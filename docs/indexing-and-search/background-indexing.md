@@ -137,9 +137,9 @@ Query for ex:alice's properties:
 
 ## Configuration
 
-Background indexing is enabled at the server level, and indexing is triggered based on novelty size thresholds:
+Background indexing is **on by default**. Indexing is triggered based on novelty size thresholds:
 
-- Enable/disable background indexing: `--indexing-enabled` / `FLUREE_INDEXING_ENABLED`
+- Enable/disable background indexing: `--indexing-enabled` / `FLUREE_INDEXING_ENABLED` (default `true`; disable only when a peer/indexer process owns this storage)
 - Trigger threshold (soft): `--reindex-min-bytes` / `FLUREE_REINDEX_MIN_BYTES`
 - Backpressure threshold (hard): `--reindex-max-bytes` / `FLUREE_REINDEX_MAX_BYTES`
 
@@ -158,7 +158,7 @@ This setting is part of the Rust `IndexerConfig` used by the indexer pipeline; i
 ### Check Index Status
 
 ```bash
-curl http://localhost:8090/ledgers/mydb:main
+curl http://localhost:8090/v1/fluree/info/mydb:main
 ```
 
 Response:
@@ -262,7 +262,8 @@ Old index snapshots are retained for time-travel safety and concurrent query saf
 - `IndexerConfig.gc_max_old_indexes`
 - `IndexerConfig.gc_min_time_mins`
 
-You can also trigger cleanup via the admin endpoint `POST /admin/compact?ledger=...` (see [API Endpoints](../api/endpoints.md#admin-endpoints)).
+No standalone HTTP compaction endpoint is currently exposed. Use `POST
+/v1/fluree/reindex` when you need to force a full index refresh.
 
 ## Troubleshooting
 
@@ -309,10 +310,10 @@ You can also trigger cleanup via the admin endpoint `POST /admin/compact?ledger=
 
 ```javascript
 setInterval(async () => {
-  const status = await fetch('http://localhost:8090/ledgers/mydb:main')
+  const status = await fetch('http://localhost:8090/v1/fluree/info/mydb:main')
     .then(r => r.json());
   
-  const lag = status.commit_t - status.index_t;
+  const lag = status.t - status.index.t;
   if (lag > 50) {
     console.warn(`High indexing lag: ${lag} transactions`);
   }
@@ -349,13 +350,13 @@ if (lag > 100) {
 }
 ```
 
-### 5. Scheduled Compaction
+### 5. Scheduled Reindex
 
-Run compaction during off-peak hours:
+Run a full reindex during off-peak hours when you need to rebuild indexes:
 
 ```bash
 # Cron job
-0 2 * * * curl -X POST http://localhost:8090/admin/compact
+0 2 * * * curl -X POST http://localhost:8090/v1/fluree/reindex -H "Content-Type: application/json" -d '{"ledger":"mydb:main"}'
 ```
 
 ## Related Documentation

@@ -48,7 +48,7 @@ Submit an **update** transaction (WHERE/DELETE/INSERT JSON-LD or SPARQL UPDATE) 
 **URL:**
 ```
 POST /update?ledger={ledger-id}
-POST /:ledger/update
+POST /update/{ledger-id}
 ```
 
 **Query Parameters:**
@@ -192,8 +192,7 @@ Insert new data into a ledger. Data must not conflict with existing data.
 **URL:**
 ```
 POST /insert?ledger={ledger-id}
-POST /:ledger/insert
-POST /fluree/insert
+POST /insert/{ledger-id}
 ```
 
 **Supported Content Types:**
@@ -227,8 +226,7 @@ Upsert data into a ledger. For each (subject, predicate) pair, existing values a
 **URL:**
 ```
 POST /upsert?ledger={ledger-id}
-POST /:ledger/upsert
-POST /fluree/upsert
+POST /upsert/{ledger-id}
 ```
 
 **Supported Content Types:**
@@ -728,7 +726,7 @@ ledger. `/snapshot` filters results to the principal's authorized scope
 **Availability:** These endpoints are only available on transaction servers
 (direct storage mode). Proxy-mode instances return `404 Not Found`.
 
-### POST /fluree/nameservice/refs/{alias}/commit
+### POST /nameservice/refs/{alias}/commit
 
 Compare-and-set push for a ledger's commit-head ref.
 
@@ -753,12 +751,12 @@ Compare-and-set push for a ledger's commit-head ref.
 { "status": "conflict", "actual": { /* current server-side RefValue */ } }
 ```
 
-### POST /fluree/nameservice/refs/{alias}/index
+### POST /nameservice/refs/{alias}/index
 
 Compare-and-set push for a ledger's index-head ref. Same request/response shape
 as `/commit` above.
 
-### POST /fluree/nameservice/refs/{alias}/init
+### POST /nameservice/refs/{alias}/init
 
 Create a ledger entry in the nameservice if it does not already exist.
 Idempotent.
@@ -770,7 +768,7 @@ Idempotent.
 { "created": false }  // already existed; no change
 ```
 
-### GET /fluree/nameservice/snapshot
+### GET /nameservice/snapshot
 
 Return a full snapshot of all ledger (`NsRecord`) and graph-source
 (`GraphSourceRecord`) records visible to the caller.
@@ -802,6 +800,12 @@ GET  /query?query={urlencoded-sparql}   # SPARQL Protocol GET form
 ```
 
 The `GET` form is provided for W3C SPARQL Protocol compliance. It accepts SPARQL queries via the `query` query parameter; the body forms below are preferred for larger queries and for JSON-LD. The same form is available on the ledger-scoped `/query/{ledger}` route.
+
+**Optional Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `default-context` | boolean | `false` | When `true`, use the ledger's stored default JSON-LD context if the request omits its own `@context` (JSON-LD) or `PREFIX` declarations (ledger-scoped SPARQL). |
 
 **Request Headers:**
 ```http
@@ -989,16 +993,18 @@ Query the history of entities using the standard `/query` endpoint with `from` a
 ```
 
 The `@t` and `@op` annotations capture transaction metadata:
-- **@t** - Transaction time when the value was asserted or retracted
-- **@op** - Operation type: `"assert"` or `"retract"`
+- **@t** - Transaction time (integer) when the fact was asserted or retracted.
+- **@op** - Operation type as a boolean: `true` for assertions, `false` for retractions. (Mirrors `Flake.op` on disk; constants `"assert"` / `"retract"` are not accepted.)
+
+Both annotations work uniformly for literal-valued and IRI-valued objects.
 
 **Response:**
 
 ```json
 [
-  ["Alice", 30, 1, "assert"],
-  ["Alice", 30, 5, "retract"],
-  ["Alicia", 31, 5, "assert"]
+  ["Alice", 30, 1, true],
+  ["Alice", 30, 5, false],
+  ["Alicia", 31, 5, true]
 ]
 ```
 
@@ -1043,8 +1049,8 @@ Return a query plan without executing the query. Accepts the same body formats a
 
 **URL:**
 ```
-GET  /fluree/explain[/{ledger}]
-POST /fluree/explain[/{ledger}]
+GET  /explain[/{ledger...}]
+POST /explain[/{ledger...}]
 ```
 
 **Behavior:**
@@ -1067,148 +1073,28 @@ A JSON object describing the logical / physical plan. Shape mirrors the query en
 
 ```bash
 # Explain a SPARQL query
-curl -X POST http://localhost:8090/fluree/explain/mydb \
+curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
   -H "Content-Type: application/sparql-query" \
   --data 'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10'
 
 # Explain a JSON-LD query
-curl -X POST http://localhost:8090/fluree/explain/mydb \
+curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
   -H "Content-Type: application/json" \
   -d '{"select":["?s"],"where":{"@id":"?s"}}'
 ```
 
-## Nameservice Query Endpoint
+## Nameservice Metadata
 
-### POST /nameservice/query
-
-Query metadata about all ledgers and graph sources in the nameservice.
-
-**URL:**
-```
-POST /nameservice/query
-```
-
-**Request Headers:**
-```http
-Content-Type: application/json
-Accept: application/json
-```
-
-Or for SPARQL:
-```http
-Content-Type: application/sparql-query
-Accept: application/sparql-results+json
-```
-
-**Request Body (JSON-LD Query):**
-
-```json
-{
-  "@context": {
-    "f": "https://ns.flur.ee/db#"
-  },
-  "select": ["?ledger", "?branch", "?t"],
-  "where": [
-    { "@id": "?ns", "@type": "f:LedgerSource", "f:ledger": "?ledger", "f:branch": "?branch", "f:t": "?t" }
-  ],
-  "orderBy": [{"var": "?t", "desc": true}]
-}
-```
-
-**Request Body (SPARQL):**
-
-```sparql
-PREFIX f: <https://ns.flur.ee/db#>
-
-SELECT ?ledger ?branch ?t
-WHERE {
-  ?ns a f:LedgerSource ;
-      f:ledger ?ledger ;
-      f:branch ?branch ;
-      f:t ?t .
-}
-ORDER BY DESC(?t)
-```
-
-**Response (JSON-LD Query):**
-
-```json
-[
-  ["customers", "main", 150],
-  ["products", "main", 100],
-  ["inventory", "dev", 50]
-]
-```
-
-**Response (SPARQL):**
-
-```json
-{
-  "head": {
-    "vars": ["ledger", "branch", "t"]
-  },
-  "results": {
-    "bindings": [
-      {
-        "ledger": { "type": "literal", "value": "customers" },
-        "branch": { "type": "literal", "value": "main" },
-        "t": { "type": "literal", "value": "150", "datatype": "http://www.w3.org/2001/XMLSchema#long" }
-      }
-    ]
-  }
-}
-```
-
-**Available Properties:**
-
-Ledger records (`@type: "f:LedgerSource"`):
-- `f:ledger` - Ledger name
-- `f:branch` - Branch name
-- `f:t` - Transaction number
-- `f:status` - "ready" or "retracted"
-- `f:ledgerCommit` - Commit ContentId reference
-- `f:ledgerIndex` - Index info with ContentId and t
-
-Graph source records (`@type: "f:GraphSourceDatabase"`):
-- `f:name` - Graph source name
-- `f:branch` - Branch name
-- `f:config` - Configuration JSON
-- `f:dependencies` - Source ledger dependencies
-- `f:indexId` - Index ContentId
-- `f:indexT` - Index t value
-
-**Status Codes:**
-- `200 OK` - Query successful
-- `400 Bad Request` - Invalid query syntax
-- `500 Internal Server Error` - Server error
-
-**Example:**
-
-```bash
-# Find all ledgers on main branch
-curl -X POST http://localhost:8090/nameservice/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "@context": {"f": "https://ns.flur.ee/db#"},
-    "select": ["?ledger"],
-    "where": [{"@id": "?ns", "f:ledger": "?ledger", "f:branch": "main"}]
-  }'
-
-# Find all graph sources
-curl -X POST http://localhost:8090/nameservice/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "@context": {"f": "https://ns.flur.ee/db#"},
-    "select": ["?name", "?type"],
-    "where": [{"@id": "?gs", "@type": "f:GraphSourceDatabase", "f:name": "?name"}]
-  }'
-```
+The standalone server does not expose a general-purpose `POST /nameservice/query`
+endpoint. Use `GET /ledgers` to list ledgers and graph sources,
+`GET /info/{ledger-id}` for metadata about a single ledger or graph source, and
+`GET /nameservice/snapshot` for authenticated remote-sync snapshots.
 
 ## Ledger Management Endpoints
 
 ### GET /ledgers
 
-List all ledgers.
+List all ledgers and graph sources.
 
 **URL:**
 ```
@@ -1243,90 +1129,19 @@ GET /ledgers
 **Example:**
 
 ```bash
-curl http://localhost:8090/ledgers
+curl http://localhost:8090/v1/fluree/ledgers
 ```
 
-### GET /ledgers/:id
+For metadata about a specific ledger or graph source, use `GET /info/{ledger-id}`.
+To create a ledger, use `POST /create`.
 
-Get metadata for a specific ledger.
-
-**URL:**
-```
-GET /ledgers/{ledger-id}
-```
-
-**Path Parameters:**
-- `ledger-id`: Ledger identifier (format: `name:branch`)
-
-**Response:**
-
-```json
-{
-  "ledger_id": "mydb:main",
-  "branch": "main",
-  "commit_t": 5,
-  "index_t": 5,
-  "commit_id": "bafybeig...commitT5",
-  "index_id": "bafybeig...indexRootT5",
-  "created": "2024-01-22T10:00:00.000Z",
-  "last_updated": "2024-01-22T10:30:00.000Z",
-  "retracted": false
-}
-```
-
-**Example:**
-
-```bash
-curl http://localhost:8090/ledgers/mydb:main
-```
-
-### POST /ledgers
-
-Create a new ledger explicitly (usually ledgers are created implicitly on first transaction).
-
-**URL:**
-```
-POST /ledgers
-```
-
-**Request Body:**
-
-```json
-{
-  "ledger_id": "mydb:main",
-  "config": {
-    "default_context": "http://example.org/context.jsonld"
-  }
-}
-```
-
-**Response:**
-
-```json
-{
-  "ledger_id": "mydb:main",
-  "branch": "main",
-  "commit_t": 0,
-  "index_t": 0,
-  "created": "2024-01-22T10:00:00.000Z"
-}
-```
-
-**Example:**
-
-```bash
-curl -X POST http://localhost:8090/ledgers \
-  -H "Content-Type: application/json" \
-  -d '{"ledger_id": "mydb:main"}'
-```
-
-### POST /fluree/create
+### POST /create
 
 Create a new ledger.
 
 **URL:**
 ```
-POST /fluree/create
+POST /create
 ```
 
 **Authentication:** When admin auth is enabled (`--admin-auth-mode=required`), requires Bearer token from a trusted issuer. See [Admin Authentication](#admin-authentication).
@@ -1370,29 +1185,29 @@ POST /fluree/create
 
 ```bash
 # Create ledger (no auth required in default mode)
-curl -X POST http://localhost:8090/fluree/create \
+curl -X POST http://localhost:8090/v1/fluree/create \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb:main"}'
 
 # Create ledger with auth token (when admin auth enabled)
-curl -X POST http://localhost:8090/fluree/create \
+curl -X POST http://localhost:8090/v1/fluree/create \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer eyJ..." \
   -d '{"ledger": "mydb:main"}'
 
 # Create with short ledger ID (auto-resolves to :main)
-curl -X POST http://localhost:8090/fluree/create \
+curl -X POST http://localhost:8090/v1/fluree/create \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb"}'
 ```
 
-### POST /fluree/drop
+### POST /drop
 
 Drop (delete) a ledger.
 
 **URL:**
 ```
-POST /fluree/drop
+POST /drop
 ```
 
 **Authentication:** When admin auth is enabled (`--admin-auth-mode=required`), requires Bearer token from a trusted issuer. See [Admin Authentication](#admin-authentication).
@@ -1460,34 +1275,34 @@ Safe to call multiple times:
 
 ```bash
 # Soft drop (retract only, preserve files)
-curl -X POST http://localhost:8090/fluree/drop \
+curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb:main"}'
 
 # Hard drop (delete all files - IRREVERSIBLE)
-curl -X POST http://localhost:8090/fluree/drop \
+curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb:main", "hard": true}'
 
 # Drop with auth token (when admin auth enabled)
-curl -X POST http://localhost:8090/fluree/drop \
+curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer eyJ..." \
   -d '{"ledger": "mydb:main", "hard": true}'
 
 # Drop with short ledger ID (auto-resolves to :main)
-curl -X POST http://localhost:8090/fluree/drop \
+curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb"}'
 ```
 
-### GET /fluree/context/:ledger
+### GET /context/{ledger...}
 
 Get the default JSON-LD context for a ledger.
 
 **URL:**
 ```
-GET /fluree/context/{ledger-id}
+GET /context/{ledger-id}
 ```
 
 **Path Parameters:**
@@ -1516,16 +1331,16 @@ If no default context has been set, `"@context"` is `null`.
 **Example:**
 
 ```bash
-curl http://localhost:8090/fluree/context/mydb:main
+curl http://localhost:8090/v1/fluree/context/mydb:main
 ```
 
-### PUT /fluree/context/:ledger
+### PUT /context/{ledger...}
 
 Replace the default JSON-LD context for a ledger.
 
 **URL:**
 ```
-PUT /fluree/context/{ledger-id}
+PUT /context/{ledger-id}
 ```
 
 **Path Parameters:**
@@ -1565,23 +1380,23 @@ A JSON object mapping prefixes to IRIs. Either a bare object or wrapped in `{"@c
 
 ```bash
 # Set context
-curl -X PUT http://localhost:8090/fluree/context/mydb:main \
+curl -X PUT http://localhost:8090/v1/fluree/context/mydb:main \
   -H "Content-Type: application/json" \
   -d '{"ex": "http://example.org/", "foaf": "http://xmlns.com/foaf/0.1/"}'
 
 # Wrapped form also accepted
-curl -X PUT http://localhost:8090/fluree/context/mydb:main \
+curl -X PUT http://localhost:8090/v1/fluree/context/mydb:main \
   -H "Content-Type: application/json" \
   -d '{"@context": {"ex": "http://example.org/"}}'
 ```
 
-### POST /fluree/branch
+### POST /branch
 
 Create a new branch for a ledger.
 
 **URL:**
 ```
-POST /fluree/branch
+POST /branch
 ```
 
 **Authentication:** When admin auth is enabled (`--admin-auth-mode=required`), requires Bearer token from a trusted issuer. See [Admin Authentication](#admin-authentication).
@@ -1649,13 +1464,13 @@ curl -X POST http://localhost:8090/v1/fluree/branch \
   -d '{"ledger": "mydb", "branch": "rewind", "at": "t:5"}'
 ```
 
-### GET /fluree/branch/{ledger}
+### GET /branch/{ledger-name}
 
 List all non-retracted branches for a ledger.
 
 **URL:**
 ```
-GET /fluree/branch/{ledger-name}
+GET /branch/{ledger-name}
 ```
 
 **Response:**
@@ -1681,7 +1496,7 @@ GET /fluree/branch/{ledger-name}
 | `branch` | Branch name |
 | `ledger_id` | Full ledger:branch identifier |
 | `t` | Current transaction time on this branch |
-| `source` | Source branch (only present for branches created via `/fluree/branch`) |
+| `source` | Source branch (only present for branches created via `/branch`) |
 
 **Examples:**
 
@@ -1689,13 +1504,13 @@ GET /fluree/branch/{ledger-name}
 curl http://localhost:8090/v1/fluree/branch/mydb
 ```
 
-### POST /fluree/drop-branch
+### POST /drop-branch
 
 Drop a branch from a ledger. Admin-protected.
 
 **URL:**
 ```
-POST /fluree/drop-branch
+POST /drop-branch
 ```
 
 **Request body:**
@@ -1761,13 +1576,13 @@ curl -X POST http://localhost:8090/v1/fluree/drop-branch \
   -d '{"ledger": "mydb", "branch": "dev"}'
 ```
 
-### POST /fluree/rebase
+### POST /rebase
 
 Rebase a branch onto its source branch's current HEAD. Admin-protected.
 
 **URL:**
 ```
-POST /fluree/rebase
+POST /rebase
 ```
 
 **Request body:**
@@ -1846,15 +1661,15 @@ curl -X POST http://localhost:8090/v1/fluree/rebase \
   -d '{"ledger": "mydb", "branch": "feature-x", "strategy": "abort"}'
 ```
 
-### POST /fluree/merge
+### POST /merge
 
-Merge a source branch into a target branch (fast-forward only). Admin-protected.
+Merge a source branch into a target branch. Admin-protected.
 
-Currently only fast-forward merges are supported: the target branch must not have any new commits since the source branch was created from it. If the target has diverged, rebase the source branch first, then merge.
+Fast-forward merges copy the source commit chain into the target namespace and advance the target HEAD. When the target has diverged, Fluree performs a general merge: it computes the source and target deltas since their common ancestor, resolves overlapping `(s, p, g)` conflicts according to the requested strategy, and creates a merge commit on the target branch.
 
 **URL:**
 ```
-POST /fluree/merge
+POST /merge
 ```
 
 **Request body:**
@@ -1863,7 +1678,8 @@ POST /fluree/merge
 {
   "ledger": "mydb",
   "source": "feature-x",
-  "target": "dev"
+  "target": "dev",
+  "strategy": "take-both"
 }
 ```
 
@@ -1872,6 +1688,18 @@ POST /fluree/merge
 | `ledger` | string | Yes | Ledger name without branch suffix (e.g., "mydb") |
 | `source` | string | Yes | Source branch to merge from (e.g., "feature-x") |
 | `target` | string | No | Target branch to merge into (defaults to source's parent branch) |
+| `strategy` | string | No | Conflict resolution strategy for non-fast-forward merges. Defaults to `take-both`. Options: `take-both`, `abort`, `take-source`, `take-branch` |
+
+**Conflict strategies:**
+
+| Strategy | Behavior |
+|----------|----------|
+| `take-both` | Keep source flakes as-is, so both source and target values can coexist |
+| `abort` | Fail if conflicts are detected; no merge commit is created |
+| `take-source` | Source wins: keep source flakes and retract target's conflicting values |
+| `take-branch` | Target wins: drop source flakes for conflicting keys |
+
+`skip` is a rebase-only strategy and is not supported for non-fast-forward merges.
 
 **Response body (200 OK):**
 
@@ -1880,9 +1708,11 @@ POST /fluree/merge
   "ledger_id": "mydb:dev",
   "target": "dev",
   "source": "feature-x",
-  "fast_forward": true,
+  "fast_forward": false,
   "new_head_t": 8,
-  "commits_copied": 3
+  "commits_copied": 3,
+  "conflict_count": 1,
+  "strategy": "take-both"
 }
 ```
 
@@ -1891,16 +1721,18 @@ POST /fluree/merge
 | `ledger_id` | string | Full ledger:branch identifier of the target |
 | `target` | string | Target branch name |
 | `source` | string | Source branch name |
-| `fast_forward` | bool | Always `true` (only fast-forward is supported) |
+| `fast_forward` | bool | Whether this merge advanced the target directly to the source HEAD |
 | `new_head_t` | number | New commit HEAD transaction time of the target |
 | `commits_copied` | number | Number of commit blobs copied to the target namespace |
+| `conflict_count` | number | Number of overlapping `(s, p, g)` keys detected during a non-fast-forward merge |
+| `strategy` | string | Conflict strategy used for a non-fast-forward merge. Omitted for fast-forward merges |
 
 **Status codes:**
 
 - `200 OK` - Merge completed successfully
-- `400 Bad Request` - Source has no branch point (e.g., main), self-merge, or target mismatch
+- `400 Bad Request` - Source has no branch point (e.g., main), self-merge, unknown strategy, or unsupported merge strategy
 - `404 Not Found` - Ledger or branch does not exist
-- `409 Conflict` - Target has diverged; fast-forward not possible
+- `409 Conflict` - Merge aborted due to conflicts when using the `abort` strategy, or the target HEAD changed during commit publishing
 - `500 Internal Server Error` - Server error
 
 **Examples:**
@@ -1915,21 +1747,125 @@ curl -X POST http://localhost:8090/v1/fluree/merge \
 curl -X POST http://localhost:8090/v1/fluree/merge \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb", "source": "dev", "target": "main"}'
+
+# Non-fast-forward merge with source-winning conflict resolution
+curl -X POST http://localhost:8090/v1/fluree/merge \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "source": "dev", "target": "main", "strategy": "take-source"}'
 ```
 
-### GET /fluree/info
+### GET /merge-preview/{ledger-name}
+
+Read-only preview of merging a source branch into a target branch. Returns the rich diff — ahead/behind commit summaries, conflict keys, and fast-forward eligibility — without mutating any nameservice or content store state.
+
+Bearer token required when `data_auth.mode = required`; reads are gated on `bearer.can_read(ledger)`.
+
+**URL:**
+```
+GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}&include_conflict_details={bool}&strategy={strategy}
+```
+
+**Path / Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `ledger` (path) | string | Yes | Ledger name (e.g., "mydb") |
+| `source` | string | Yes | Source branch to merge from (e.g., "feature-x") |
+| `target` | string | No | Target branch (defaults to the source's parent branch) |
+| `max_commits` | number | No | Cap on per-side commit summaries returned (default 500). Server clamps to a hard maximum of 5,000 — values above are silently lowered. Bounds response size, **not** divergence-walk cost (the unbounded `count` is still computed). |
+| `max_conflict_keys` | number | No | Cap on conflict keys returned (default 200). Server clamps to a hard maximum of 5,000. Bounds response size, **not** the conflict-delta walks. |
+| `include_conflicts` | bool | No | When false, skips the conflict computation (default true). Use this to make the preview cheap on diverged branches. |
+| `include_conflict_details` | bool | No | When true, includes source/target flake values for the returned conflict keys. Defaults to false. Details are computed after `max_conflict_keys` is applied. |
+| `strategy` | string | No | Strategy used to annotate conflict details. Defaults to `take-both`. Options: `take-both`, `abort`, `take-source`, `take-branch`. |
+
+**Response body (200 OK):**
+
+```json
+{
+  "source": "feature-x",
+  "target": "main",
+  "ancestor": { "commit_id": "bafy...", "t": 5 },
+  "ahead": {
+    "count": 3,
+    "commits": [
+      { "t": 8, "commit_id": "bafy...", "time": "2026-04-25T12:00:00Z",
+        "asserts": 2, "retracts": 0, "flake_count": 2, "message": null }
+    ],
+    "truncated": false
+  },
+  "behind": { "count": 1, "commits": [...], "truncated": false },
+  "fast_forward": false,
+  "mergeable": true,
+  "conflicts": {
+    "count": 1,
+    "keys": [{ "s": [100, "alice"], "p": [100, "status"], "g": null }],
+    "truncated": false,
+    "strategy": "take-source",
+    "details": [
+      {
+        "key": { "s": [100, "alice"], "p": [100, "status"], "g": null },
+        "source_values": [["ex:alice", "ex:status", "active", "xsd:string", true]],
+        "target_values": [["ex:alice", "ex:status", "archived", "xsd:string", true]],
+        "resolution": {
+          "source_action": "kept",
+          "target_action": "retracted",
+          "outcome": "source-wins"
+        }
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | string | Source branch name |
+| `target` | string | Target branch name (resolved from default when not supplied) |
+| `ancestor` | object \| null | Common ancestor `{commit_id, t}`. `null` when both heads are absent |
+| `ahead` | object | Commits on source not on target (`count`, `commits`, `truncated`) |
+| `behind` | object | Commits on target not on source |
+| `fast_forward` | bool | True when target HEAD == ancestor (or both heads absent) |
+| `mergeable` | bool | False only when the selected preview strategy would abort, e.g. `strategy=abort` with conflicts. This is a strategy/conflict signal, not full transaction validation. `mergeable=true` does not guarantee a subsequent `POST /merge` will succeed; it only reflects the conflict/strategy interaction at preview time. |
+| `conflicts` | object | Overlapping `(s, p, g)` keys touched on both sides since the ancestor. Empty when `fast_forward` or `include_conflicts=false` |
+
+Per-commit summaries (`ahead.commits[]` / `behind.commits[]`) are newest-first and include assert/retract counts plus an optional `message` extracted from `txn_meta` when an `f:message` string entry is present.
+
+When `include_conflict_details=true`, `conflicts.details[]` contains one entry for each returned conflict key. `source_values` and `target_values` are the current asserted values for that key at each branch HEAD, using the same resolved flake tuple format as `/show`: `[subject, predicate, object, datatype, operation]`, with an optional metadata object as the 6th tuple item. The `resolution` object is an annotation only; preview does not apply the strategy or mutate state.
+
+**Status codes:**
+
+- `200 OK` — Preview computed successfully
+- `400 Bad Request` — Source has no branch point (e.g., main), `source == target`, unknown strategy, unsupported preview strategy, `include_conflict_details=true` with `include_conflicts=false`, or `strategy=abort` with `include_conflicts=false`
+- `401 Unauthorized` — Bearer token required
+- `404 Not Found` — Ledger or branch does not exist (or bearer cannot read it)
+
+**Examples:**
+
+```bash
+# Default target (source's parent), defaults for caps and conflict computation
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=feature-x"
+
+# Counts only — skip the conflict walks for a faster response
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&target=main&include_conflicts=false"
+
+# Cap commit lists at 50 per side
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&max_commits=50"
+
+# Include value details and labels for a source-winning merge
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&target=main&include_conflict_details=true&strategy=take-source"
+```
+
+### GET /info/{ledger-id}
 
 Get ledger metadata. Used by the CLI for `info`, `push`, `pull`, and `clone`.
 
 **URL:**
 ```
-GET /fluree/info?ledger={ledger-id}
+GET /info/{ledger-id}
 ```
 
-**Query Parameters:**
-- `ledger` (required): Ledger ID (e.g., "mydb" or "mydb:main")
-
-**Alternative:** Use the `fluree-ledger` header instead of query parameter.
+**Path Parameters:**
+- `ledger-id`: Ledger ID (e.g., "mydb" or "mydb:main")
 
 **Response (non-proxy mode):**
 
@@ -1979,7 +1915,6 @@ Returns simplified nameservice-only metadata:
 
 **Status Codes:**
 - `200 OK` - Ledger found
-- `400 Bad Request` - Missing ledger parameter
 - `401 Unauthorized` - Authentication required
 - `404 Not Found` - Ledger not found
 
@@ -1987,26 +1922,24 @@ Returns simplified nameservice-only metadata:
 
 ```bash
 # Get ledger info
-curl "http://localhost:8090/fluree/info?ledger=mydb:main"
+curl "http://localhost:8090/v1/fluree/info/mydb:main"
 
 # With auth token
-curl "http://localhost:8090/fluree/info?ledger=mydb:main" \
+curl "http://localhost:8090/v1/fluree/info/mydb:main" \
   -H "Authorization: Bearer eyJ..."
 ```
 
-### GET /fluree/exists
+### GET /exists/{ledger-id}
 
 Check if a ledger exists in the nameservice.
 
 **URL:**
 ```
-GET /fluree/exists?ledger={ledger-id}
+GET /exists/{ledger-id}
 ```
 
-**Query Parameters:**
-- `ledger`: Ledger ID (e.g., "mydb" or "mydb:main")
-
-**Alternative:** Use the `fluree-ledger` header instead of query parameter.
+**Path Parameters:**
+- `ledger-id`: Ledger ID (e.g., "mydb" or "mydb:main")
 
 **Response:**
 
@@ -2024,7 +1957,6 @@ GET /fluree/exists?ledger={ledger-id}
 
 **Status Codes:**
 - `200 OK` - Check completed successfully (regardless of whether ledger exists)
-- `400 Bad Request` - Missing ledger parameter
 - `500 Internal Server Error` - Server error
 
 **Usage Notes:**
@@ -2038,16 +1970,12 @@ This is a lightweight check that only queries the nameservice without loading th
 **Examples:**
 
 ```bash
-# Check via query parameter
-curl "http://localhost:8090/fluree/exists?ledger=mydb:main"
-
-# Check via header
-curl http://localhost:8090/fluree/exists \
-  -H "fluree-ledger: mydb:main"
+# Check a ledger ID
+curl "http://localhost:8090/v1/fluree/exists/mydb:main"
 
 # Conditional create-or-load in shell
-if curl -s "http://localhost:8090/fluree/exists?ledger=mydb" | jq -e '.exists == false' > /dev/null; then
-  curl -X POST http://localhost:8090/fluree/create \
+if curl -s "http://localhost:8090/v1/fluree/exists/mydb" | jq -e '.exists == false' > /dev/null; then
+  curl -X POST http://localhost:8090/v1/fluree/create \
     -H "Content-Type: application/json" \
     -d '{"ledger": "mydb"}'
 fi
@@ -2085,13 +2013,13 @@ GET /health
 curl http://localhost:8090/health
 ```
 
-### GET /status
+### GET /stats
 
-Detailed server status and statistics.
+Detailed server statistics.
 
 **URL:**
 ```
-GET /status
+GET /stats
 ```
 
 **Response:**
@@ -2124,33 +2052,7 @@ GET /status
 **Example:**
 
 ```bash
-curl http://localhost:8090/status
-```
-
-### GET /version
-
-Server version information.
-
-**URL:**
-```
-GET /version
-```
-
-**Response:**
-
-```json
-{
-  "version": "0.1.0",
-  "git_commit": "abc123def456",
-  "build_date": "2024-01-15",
-  "rust_version": "1.75.0"
-}
-```
-
-**Example:**
-
-```bash
-curl http://localhost:8090/version
+curl http://localhost:8090/v1/fluree/stats
 ```
 
 ## Events Endpoint
@@ -2182,15 +2084,21 @@ Server-Sent Events (SSE) stream of nameservice changes for ledgers and graph sou
 >
 > BM25 search **is** available in queries via the `f:graphSource` / `f:searchText` pattern in where clauses — see the query documentation for details.
 
-Graph source metadata can be discovered via the [POST /nameservice/query](#post-nameservicequery) endpoint using `@type: "f:GraphSourceDatabase"`.
+Graph source metadata can be discovered via `GET /ledgers` or `GET /info/{graph-source-id}`.
 
-### POST /fluree/iceberg/map
+### POST {api_base_url}/iceberg/map
 
 Map an Iceberg table (or R2RML-mapped relational source backed by Iceberg) as a graph source. Admin-protected — requires the admin Bearer token when an admin token is configured. Available only when the server is built with the `iceberg` feature.
 
 **URL:**
 ```
-POST /fluree/iceberg/map
+POST {api_base_url}/iceberg/map
+```
+
+For the standalone server and Docker image defaults, this is:
+
+```bash
+POST http://localhost:8090/v1/fluree/iceberg/map
 ```
 
 **Request Body:**
@@ -2248,7 +2156,7 @@ POST /fluree/iceberg/map
 ```
 
 **Status Codes:**
-- `200 OK` — graph source created
+- `201 Created` — graph source created
 - `400 Bad Request` — missing required fields or invalid R2RML
 - `401/403` — admin auth required
 - `500 Internal Server Error` — catalog connection or mapping failure
@@ -2257,52 +2165,77 @@ See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
 ## Admin Endpoints
 
-### POST /admin/index
+### POST /reindex
 
-Trigger manual indexing for a ledger.
+Trigger a full manual reindex for a ledger. Walks the entire commit chain and rebuilds the binary index from scratch using the server's configured indexer settings. Admin-protected — requires the admin Bearer token when admin auth is enabled.
 
-This endpoint triggers background indexing and returns immediately. If you call
-indexing through the Rust API via `trigger_index()`, the optional
-`TriggerIndexOptions.timeout_ms` is caller-owned: omit it to wait indefinitely,
-or set it explicitly when the calling environment has a hard runtime limit such
-as AWS Lambda's 15-minute maximum.
+This endpoint runs the reindex synchronously and returns when the new root is committed. For large ledgers it may run for many minutes; configure your HTTP client timeout accordingly. In peer mode, the request is forwarded to the transaction server.
 
 **URL:**
 ```
-POST /admin/index?ledger={ledger-id}
+POST /reindex
+```
+
+**Request Body:**
+
+```json
+{
+  "ledger": "mydb:main"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger` | string | Ledger alias (`name` or `name:branch`). Required. |
+| `opts`   | object | Reserved for future per-request indexer overrides. Currently accepted but ignored. |
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/reindex \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <admin-token>' \
+  -d '{"ledger": "mydb:main"}'
 ```
 
 **Response:**
 
 ```json
 {
-  "ledger": "mydb:main",
-  "status": "indexing",
-  "target_t": 10
+  "ledger_id": "mydb:main",
+  "index_t": 42,
+  "root_id": "fluree:cid:bafy…",
+  "stats": {
+    "flake_count": 184273,
+    "leaf_count": 614,
+    "branch_count": 23,
+    "total_bytes": 47185920
+  }
 }
 ```
 
-### POST /admin/compact
+| Field | Description |
+|-------|-------------|
+| `ledger_id` | Ledger alias the reindex was run against |
+| `index_t` | Transaction time the new index was built at (matches the head commit) |
+| `root_id` | ContentId of the newly written index root |
+| `stats.flake_count` | Total flakes in the rebuilt index |
+| `stats.leaf_count` | Number of leaf nodes written |
+| `stats.branch_count` | Number of branch nodes written |
+| `stats.total_bytes` | Bytes written to storage during the reindex |
 
-Trigger compaction for a ledger (cleanup old indexes).
+**Status Codes:**
+- `200 OK` — reindex complete
+- `400 Bad Request` — missing/invalid `ledger`
+- `401/403` — admin auth required
+- `404 Not Found` — ledger does not exist
+- `500 Internal Server Error` — reindex failed
 
-**URL:**
-```
-POST /admin/compact?ledger={ledger-id}
-```
-
-### GET /admin/stats
-
-Get detailed server statistics.
-
-**URL:**
-```
-GET /admin/stats
-```
+When triggering indexing through the Rust API instead, see `Fluree::reindex` and `ReindexOptions`. For background incremental indexing (which runs automatically as commits are made), see [Background indexing](../indexing-and-search/background-indexing.md).
 
 ## Admin Authentication
 
-Administrative endpoints (`/fluree/create`, `/fluree/drop`) can be protected with Bearer token authentication.
+Administrative endpoints (`/create`, `/drop`, `/reindex`, branch operations, and Iceberg mapping when enabled) can be protected with Bearer token authentication.
 
 ### Configuration
 
@@ -2346,7 +2279,7 @@ Admin tokens use the same JWS format as other Fluree tokens. Required claims:
 Include the token in the Authorization header:
 
 ```bash
-curl -X POST http://localhost:8090/fluree/create \
+curl -X POST http://localhost:8090/v1/fluree/create \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer eyJhbGciOiJFZERTQSIsImp3ayI6ey..." \
   -d '{"ledger": "mydb:main"}'

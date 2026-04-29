@@ -54,7 +54,7 @@ Other optional arguments: `refs`, `severity`, `rationale`, `alternatives`. Retur
 
 ### `memory_update`
 
-Supersede an existing memory. Use `content` (not `text`) for the new body.
+Patch an existing memory in place. The memory keeps its ID; only the fields you pass are changed. Use `content` (not `text`) for the new body.
 
 ```json
 {

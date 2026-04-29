@@ -180,7 +180,10 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
         let parsed = op.to_json_with_trig_meta()?;
         let txn_json = parsed.json;
         let trig_meta = parsed.trig_meta;
-        let index_config = self.core.index_config.unwrap_or_default();
+        let index_config = self
+            .core
+            .index_config
+            .unwrap_or_else(crate::server_defaults::default_index_config);
 
         // Load the current ledger state
         let ledger_state = self.graph.fluree.ledger(&self.graph.ledger_id).await?;

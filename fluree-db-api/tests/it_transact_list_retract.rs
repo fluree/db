@@ -68,7 +68,13 @@ async fn count_items(fluree: &fluree_db_api::Fluree, ledger: &fluree_db_api::Led
     if arr.is_empty() {
         return 0;
     }
-    arr[0].as_u64().map(|v| v as usize).unwrap_or(0)
+    // SPARQL always returns array-of-arrays (one inner array per binding row).
+    arr[0]
+        .as_array()
+        .and_then(|row| row.first())
+        .and_then(serde_json::Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(0)
 }
 
 /// Three distinct `@list` entries, wildcard DELETE WHERE.

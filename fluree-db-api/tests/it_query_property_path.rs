@@ -81,7 +81,7 @@ async fn property_path_one_or_more_no_vars_matches_transitively() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    assert_eq!(sanity_rows, json!(["ex:f"]));
+    assert_eq!(sanity_rows, json!([["ex:f"]]));
 
     // Property path traversal from ex:a should reach ex:f.
     let sanity_path = json!({
@@ -97,7 +97,7 @@ async fn property_path_one_or_more_no_vars_matches_transitively() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    assert!(normalize_rows(&sanity_path_rows).contains(&json!("ex:f")));
+    assert!(normalize_rows(&sanity_path_rows).contains(&json!(["ex:f"])));
 
     // Use VALUES to seed a single solution row and treat the (non-)transitive pattern
     // as a filter, so we can assert reachability without relying on graph crawl output.
@@ -128,7 +128,7 @@ async fn property_path_one_or_more_no_vars_matches_transitively() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    assert_eq!(r_plus, json!([1]));
+    assert_eq!(r_plus, json!([[1]]));
 }
 
 #[tokio::test]
@@ -146,7 +146,7 @@ async fn property_path_one_or_more_object_var_with_and_without_cycle() {
         .unwrap()
         .to_jsonld(&ledger1.snapshot)
         .unwrap();
-    assert_eq!(non, json!(["ex:b"]));
+    assert_eq!(non, json!([["ex:b"]]));
 
     // Use @path with string form
     let q_plus = json!({
@@ -164,7 +164,7 @@ async fn property_path_one_or_more_object_var_with_and_without_cycle() {
         .unwrap();
     assert_eq!(
         normalize_rows(&plus),
-        normalize_rows(&json!(["ex:b", "ex:c", "ex:d", "ex:e"]))
+        normalize_rows(&json!([["ex:b"], ["ex:c"], ["ex:d"], ["ex:e"]]))
     );
 
     // Add cycle: e knows a. One-or-more from a should now include a as reachable.
@@ -186,7 +186,7 @@ async fn property_path_one_or_more_object_var_with_and_without_cycle() {
         .unwrap();
     assert_eq!(
         normalize_rows(&plus2),
-        normalize_rows(&json!(["ex:a", "ex:b", "ex:c", "ex:d", "ex:e"]))
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"], ["ex:d"], ["ex:e"]]))
     );
 }
 
@@ -205,7 +205,7 @@ async fn property_path_one_or_more_subject_var_with_and_without_cycle() {
         .unwrap()
         .to_jsonld(&ledger1.snapshot)
         .unwrap();
-    assert_eq!(non, json!(["ex:d"]));
+    assert_eq!(non, json!([["ex:d"]]));
 
     let q_plus = json!({
         "@context": {
@@ -222,7 +222,7 @@ async fn property_path_one_or_more_subject_var_with_and_without_cycle() {
         .unwrap();
     assert_eq!(
         normalize_rows(&plus),
-        normalize_rows(&json!(["ex:d", "ex:b", "ex:a"]))
+        normalize_rows(&json!([["ex:d"], ["ex:b"], ["ex:a"]]))
     );
 
     // Add cycle: e knows a. Now e is also in the reverse transitive set.
@@ -236,7 +236,7 @@ async fn property_path_one_or_more_subject_var_with_and_without_cycle() {
         .unwrap();
     assert_eq!(
         normalize_rows(&plus2),
-        normalize_rows(&json!(["ex:d", "ex:b", "ex:a", "ex:e"]))
+        normalize_rows(&json!([["ex:d"], ["ex:b"], ["ex:a"], ["ex:e"]]))
     );
 }
 
@@ -336,7 +336,7 @@ async fn property_path_zero_or_more_object_var_and_subject_object_vars() {
         .unwrap();
     assert_eq!(
         normalize_rows(&star),
-        normalize_rows(&json!(["ex:a", "ex:b", "ex:c", "ex:d", "ex:e"]))
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"], ["ex:d"], ["ex:e"]]))
     );
 
     // Subject+object vars, disjoint graphs
@@ -407,7 +407,7 @@ async fn property_path_array_form() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["ex:b", "ex:c", "ex:d", "ex:e"]))
+        normalize_rows(&json!([["ex:b"], ["ex:c"], ["ex:d"], ["ex:e"]]))
     );
 }
 
@@ -478,7 +478,7 @@ async fn property_path_inverse_object_var() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    assert_eq!(normalize_rows(&result), normalize_rows(&json!(["ex:a"])));
+    assert_eq!(normalize_rows(&result), normalize_rows(&json!([["ex:a"]])));
 }
 
 #[tokio::test]
@@ -500,7 +500,7 @@ async fn property_path_inverse_subject_var() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    assert_eq!(normalize_rows(&result), normalize_rows(&json!(["ex:b"])));
+    assert_eq!(normalize_rows(&result), normalize_rows(&json!([["ex:b"]])));
 }
 
 // -- Alternative (|) tests --
@@ -534,7 +534,7 @@ async fn property_path_alternative_object_var() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["ex:b", "ex:x"]))
+        normalize_rows(&json!([["ex:b"], ["ex:x"]]))
     );
 }
 
@@ -559,7 +559,7 @@ async fn property_path_alternative_with_inverse() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["ex:a", "ex:c", "ex:d"]))
+        normalize_rows(&json!([["ex:a"], ["ex:c"], ["ex:d"]]))
     );
 }
 
@@ -592,7 +592,7 @@ async fn property_path_alternative_array_form() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["ex:b", "ex:x"]))
+        normalize_rows(&json!([["ex:b"], ["ex:x"]]))
     );
 }
 
@@ -627,7 +627,7 @@ async fn property_path_alternative_duplicate_semantics() {
     // Bag semantics: ex:b appears once per matching branch
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["ex:b", "ex:b"]))
+        normalize_rows(&json!([["ex:b"], ["ex:b"]]))
     );
 }
 
@@ -679,7 +679,7 @@ async fn property_path_sequence_two_step_string_form() {
         .to_jsonld(&ledger.snapshot)
         .unwrap();
     // alice's friend is bob, bob's name is "Bob"
-    assert_eq!(normalize_rows(&result), normalize_rows(&json!(["Bob"])));
+    assert_eq!(normalize_rows(&result), normalize_rows(&json!([["Bob"]])));
 }
 
 #[tokio::test]
@@ -701,7 +701,7 @@ async fn property_path_sequence_two_step_array_form() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    assert_eq!(normalize_rows(&result), normalize_rows(&json!(["Bob"])));
+    assert_eq!(normalize_rows(&result), normalize_rows(&json!([["Bob"]])));
 }
 
 #[tokio::test]
@@ -728,7 +728,7 @@ async fn property_path_sequence_three_step() {
     // alice -> friend bob -> friend carol -> address addr1 -> city "Springfield"
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["Springfield"]))
+        normalize_rows(&json!([["Springfield"]]))
     );
 }
 
@@ -753,7 +753,7 @@ async fn property_path_sequence_with_inverse_step() {
         .to_jsonld(&ledger.snapshot)
         .unwrap();
     // alice <--parent-- bob, bob's name is "Bob"
-    assert_eq!(normalize_rows(&result), normalize_rows(&json!(["Bob"])));
+    assert_eq!(normalize_rows(&result), normalize_rows(&json!([["Bob"]])));
 }
 
 #[tokio::test]
@@ -810,7 +810,7 @@ async fn property_path_sequence_transitive_step_allowed() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["Bob", "Carol"]))
+        normalize_rows(&json!([["Bob"], ["Carol"]]))
     );
 }
 
@@ -861,7 +861,7 @@ async fn property_path_alternative_of_sequences() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["Bob", "Carol"]))
+        normalize_rows(&json!([["Bob"], ["Carol"]]))
     );
 }
 
@@ -893,7 +893,7 @@ async fn property_path_alternative_mixed_simple_and_sequence() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["Alice", "Bob"]))
+        normalize_rows(&json!([["Alice"], ["Bob"]]))
     );
 }
 
@@ -963,7 +963,7 @@ async fn property_path_alternative_of_sequences_duplicate_semantics() {
     // Bag semantics: "Bob" appears once per matching branch
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["Bob", "Bob"]))
+        normalize_rows(&json!([["Bob"], ["Bob"]]))
     );
 }
 
@@ -992,7 +992,7 @@ async fn property_path_inverse_one_or_more() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["ex:a", "ex:b"]))
+        normalize_rows(&json!([["ex:a"], ["ex:b"]]))
     );
 }
 
@@ -1018,7 +1018,7 @@ async fn property_path_inverse_zero_or_more() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["ex:a", "ex:b"]))
+        normalize_rows(&json!([["ex:a"], ["ex:b"]]))
     );
 }
 
@@ -1068,7 +1068,7 @@ async fn property_path_sequence_with_alternative_step() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["Bob", "Bobby"]))
+        normalize_rows(&json!([["Bob"], ["Bobby"]]))
     );
 }
 
@@ -1093,7 +1093,7 @@ async fn property_path_sequence_with_alternative_step_array_form() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["Bob", "Bobby"]))
+        normalize_rows(&json!([["Bob"], ["Bobby"]]))
     );
 }
 
@@ -1157,7 +1157,7 @@ async fn property_path_inverse_of_sequence() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["ex:alice"])),
+        normalize_rows(&json!([["ex:alice"]])),
     );
 }
 
@@ -1185,7 +1185,7 @@ async fn property_path_inverse_of_alternative() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["ex:alice"])),
+        normalize_rows(&json!([["ex:alice"]])),
     );
 }
 
@@ -1213,6 +1213,6 @@ async fn property_path_inverse_of_three_step_sequence() {
         .unwrap();
     assert_eq!(
         normalize_rows(&result),
-        normalize_rows(&json!(["ex:alice"])),
+        normalize_rows(&json!([["ex:alice"]])),
     );
 }

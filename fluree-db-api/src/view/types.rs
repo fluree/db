@@ -577,8 +577,11 @@ impl GraphDb {
     /// # Example
     ///
     /// ```ignore
-    /// let view = GraphDb::from_ledger_state(&ledger)
-    ///     .with_default_context(ledger.default_context.clone());
+    /// // Prefer the high-level opt-in API on `Fluree`:
+    /// let view = fluree.db_with_default_context("mydb:main").await?;
+    /// // Or fetch + attach manually:
+    /// let ctx = fluree.get_default_context("mydb:main").await?;
+    /// let view = GraphDb::from_ledger_state(&ledger).with_default_context(ctx);
     /// ```
     pub fn with_default_context(mut self, ctx: Option<serde_json::Value>) -> Self {
         self.default_context = ctx;

@@ -424,9 +424,7 @@ impl Operator for S2SearchOperator {
                         }
 
                         // Add subject binding (encoded for late materialization)
-                        row[subject_pos] = Binding::EncodedSid {
-                            s_id: result.subject_id,
-                        };
+                        row[subject_pos] = Binding::encoded_sid(result.subject_id);
 
                         // Add distance binding if requested
                         if let Some(dist_pos) = distance_pos {
@@ -466,9 +464,7 @@ impl Operator for S2SearchOperator {
                             }
                         }
 
-                        row[subject_pos] = Binding::EncodedSid {
-                            s_id: result.subject_id,
-                        };
+                        row[subject_pos] = Binding::encoded_sid(result.subject_id);
 
                         for (col_idx, binding) in row.into_iter().enumerate() {
                             columns[col_idx].push(binding);
@@ -497,9 +493,7 @@ impl Operator for S2SearchOperator {
                             }
                         }
 
-                        row[subject_pos] = Binding::EncodedSid {
-                            s_id: result.subject_id,
-                        };
+                        row[subject_pos] = Binding::encoded_sid(result.subject_id);
 
                         for (col_idx, binding) in row.into_iter().enumerate() {
                             columns[col_idx].push(binding);
@@ -528,9 +522,7 @@ impl Operator for S2SearchOperator {
                             }
                         }
 
-                        row[subject_pos] = Binding::EncodedSid {
-                            s_id: result.subject_id,
-                        };
+                        row[subject_pos] = Binding::encoded_sid(result.subject_id);
 
                         for (col_idx, binding) in row.into_iter().enumerate() {
                             columns[col_idx].push(binding);

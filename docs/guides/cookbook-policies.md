@@ -1,10 +1,29 @@
 # Cookbook: Access Control Policies
 
-Fluree policies enforce access control at the database level — individual facts (flakes) are filtered based on who's asking. The same query returns different results for different users, automatically. No application-layer filtering needed.
+Fluree policies enforce access control inside the database — individual facts (flakes) are filtered based on the requesting identity. The same query returns different results for different users, automatically. No application-layer filtering needed.
+
+This cookbook walks through the common patterns. For the underlying model see [Policy enforcement](../concepts/policy-enforcement.md); for the full reference see [Policy model and inputs](../security/policy-model.md).
+
+## How a policy is shaped
+
+Every policy is a JSON-LD node typed `f:AccessPolicy`. It has three orthogonal pieces:
+
+| Field | Purpose |
+|-------|---------|
+| **What it targets** | `f:onProperty`, `f:onClass`, `f:onSubject` (any combination, each an array of `@id` references). Omit all three to make a default policy that applies to every flake. |
+| **What it governs** | `f:action` — `f:view` (queries), `f:modify` (transactions), or both. |
+| **Whether it permits** | Either `f:allow: true` (unconditional allow), `f:allow: false` (deny), or `f:query: "<JSON-encoded WHERE>"` (allow when the embedded query returns at least one binding for the target). |
+
+Two more knobs:
+
+- `f:required: true` — the policy *must* allow for access to be granted on its targets, even if `default-allow` is true. Use it for hard constraints.
+- `f:exMessage` — error message returned to the caller when the policy denies a transaction.
+
+Inside `f:query`, two special variables are pre-bound: `?$this` (the entity being checked) and `?$identity` (the requesting identity, supplied via `policy-values`).
 
 ## Quick start
 
-### 1. Set up sample data
+### 1. Insert sample data
 
 ```bash
 fluree insert '{
@@ -41,9 +60,25 @@ fluree insert '{
 }'
 ```
 
-### 2. Add policies
+Add identity records that link DIDs / users to the entities they represent:
 
-Policies are data in the ledger — insert them like any other data:
+```bash
+fluree insert '{
+  "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+  "@graph": [
+    { "@id": "ex:aliceIdentity", "ex:user": {"@id": "ex:alice"},
+      "f:policyClass": [{"@id": "ex:CorpPolicy"}] },
+    { "@id": "ex:bobIdentity",   "ex:user": {"@id": "ex:bob"},
+      "f:policyClass": [{"@id": "ex:CorpPolicy"}] }
+  ]
+}'
+```
+
+`f:policyClass` tags an identity with the set of policy classes that apply to it — every stored policy of that class will be loaded automatically when this identity makes a request.
+
+### 2. Insert policies
+
+Policies are data — they go into the ledger like any other graph:
 
 ```bash
 fluree insert '{
@@ -54,282 +89,268 @@ fluree insert '{
   },
   "@graph": [
     {
-      "@id": "ex:policy-see-own-dept",
-      "@type": "f:Policy",
-      "f:subject": "?user",
-      "f:action": "query",
-      "f:resource": {
-        "@type": "schema:Person",
-        "ex:department": "?dept"
-      },
-      "f:condition": [
-        {"@id": "?user", "ex:department": "?dept"}
-      ],
-      "f:allow": true
+      "@id": "ex:salary-restriction",
+      "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+      "f:required": true,
+      "f:onProperty": [{"@id": "ex:salary"}],
+      "f:action": [{"@id": "f:view"}],
+      "f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/user\": {\"@id\": \"?$subject\"}, \"http://example.org/role\": \"manager\", \"http://example.org/department\": \"?dept\"}, \"$where\": {\"@id\": \"?$this\", \"http://example.org/department\": \"?dept\"}}"
     },
     {
-      "@id": "ex:policy-hide-salary",
-      "@type": "f:Policy",
-      "f:action": "query",
-      "f:resource": {"f:predicate": "ex:salary"},
-      "f:allow": false
-    },
-    {
-      "@id": "ex:policy-manager-sees-salary",
-      "@type": "f:Policy",
-      "f:subject": "?user",
-      "f:action": "query",
-      "f:resource": {
-        "f:predicate": "ex:salary",
-        "ex:department": "?dept"
-      },
-      "f:condition": [
-        {"@id": "?user", "ex:role": "manager", "ex:department": "?dept"}
-      ],
+      "@id": "ex:default-view",
+      "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+      "f:action": [{"@id": "f:view"}],
       "f:allow": true
     }
   ]
 }'
 ```
 
-These three policies create:
-- **Department isolation** — Users can only see people in their own department
-- **Salary hidden by default** — Nobody sees salary data
-- **Managers see department salaries** — Managers can see salaries for their own department
+What this set of two policies says:
 
-### 3. Query as different users
+1. **`ex:salary-restriction`** is **required** for `ex:salary`: a request can read `ex:salary` only when `f:query` returns a binding. The query says: *given the identity, find the user it represents; if that user is a manager in the same department as the entity being viewed (`?$this`), allow*.
+2. **`ex:default-view`** allows reading everything else.
 
-**As Alice** (engineer, platform):
+`f:query` is stored as a JSON string inside the policy because RDF can't hold structured JSON natively. When loaded, the engine parses it and runs it as a subquery with `?$this` and `?$identity` pre-bound.
 
-```bash
-fluree query '{
-  "@context": {"schema": "http://schema.org/", "ex": "http://example.org/"},
-  "select": ["?name", "?salary"],
-  "where": [
-    {"@id": "?person", "schema:name": "?name"},
-    ["optional", {"@id": "?person", "ex:salary": "?salary"}]
-  ],
-  "opts": {"identity": "ex:alice"}
-}'
-```
+### 3. Query as different identities
 
-Alice sees names of platform team members (Alice, Bob) but no salaries.
-
-**As Bob** (manager, platform):
+**As Alice (engineer in platform — no manager privilege)**:
 
 ```bash
 fluree query '{
   "@context": {"schema": "http://schema.org/", "ex": "http://example.org/"},
+  "from": "mydb:main",
   "select": ["?name", "?salary"],
   "where": [
-    {"@id": "?person", "schema:name": "?name"},
-    ["optional", {"@id": "?person", "ex:salary": "?salary"}]
+    {"@id": "?p", "schema:name": "?name"},
+    ["optional", {"@id": "?p", "ex:salary": "?salary"}]
   ],
-  "opts": {"identity": "ex:bob"}
-}'
-```
-
-Bob sees names and salaries for platform team members, but not Carol (marketing).
-
-## Patterns
-
-### Public read, authenticated write
-
-```json
-[
-  {
-    "@id": "ex:public-read",
-    "@type": "f:Policy",
-    "f:subject": "*",
-    "f:action": "query",
-    "f:allow": true
-  },
-  {
-    "@id": "ex:authenticated-write",
-    "@type": "f:Policy",
-    "f:subject": "?user",
-    "f:action": "transact",
-    "f:condition": [
-      {"@id": "?user", "@type": "ex:AuthenticatedUser"}
-    ],
-    "f:allow": true
+  "opts": {
+    "identity": "ex:aliceIdentity",
+    "policy-class": ["ex:CorpPolicy"],
+    "default-allow": false
   }
-]
+}'
 ```
 
-### Owner-only access
+Alice sees every name but no salaries — the required policy denies `ex:salary` because she isn't a manager.
 
-Users can only access entities they own:
+**As Bob (manager in platform)**:
+
+Same query, but `"identity": "ex:bobIdentity"`. Bob sees salaries for Alice and Bob (same department) but Carol's salary stays hidden — different department.
+
+## Inline policies (no insert needed)
+
+Don't want to commit policies to the ledger yet? Pass them inline via `opts.policy`:
 
 ```json
 {
-  "@id": "ex:owner-only",
-  "@type": "f:Policy",
-  "f:subject": "?user",
-  "f:action": "*",
-  "f:resource": {"ex:owner": "?user"},
+  "from": "mydb:main",
+  "select": "?name",
+  "where": [{"@id": "?p", "schema:name": "?name"}],
+  "opts": {
+    "policy": [
+      {
+        "@id": "ex:adhoc-allow",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        "f:allow": true
+      }
+    ],
+    "default-allow": false
+  }
+}
+```
+
+Inline policies are useful for one-off queries, automated tests, and admin scripts. Stored policies (with `policy-class`) are the right approach for production access control because they're versioned, time-travelable, and consistent across all requests.
+
+## Patterns
+
+### Public read
+
+```json
+{
+  "@id": "ex:public-read",
+  "@type": "f:AccessPolicy",
+  "f:action": [{"@id": "f:view"}],
   "f:allow": true
 }
 ```
 
-### Visibility levels
+A default-allow policy with no targeting applies to every flake.
 
-Public, internal, and confidential content:
+### Owner-only access
 
 ```json
-[
-  {
-    "@id": "ex:public-visible",
-    "@type": "f:Policy",
-    "f:subject": "*",
-    "f:action": "query",
-    "f:resource": {"ex:visibility": "public"},
-    "f:allow": true
-  },
-  {
-    "@id": "ex:internal-visible",
-    "@type": "f:Policy",
-    "f:subject": "?user",
-    "f:action": "query",
-    "f:resource": {"ex:visibility": "internal"},
-    "f:condition": [
-      {"@id": "?user", "@type": "ex:Employee"}
-    ],
-    "f:allow": true
-  },
-  {
-    "@id": "ex:confidential-visible",
-    "@type": "f:Policy",
-    "f:subject": "?user",
-    "f:action": "query",
-    "f:resource": {"ex:visibility": "confidential"},
-    "f:condition": [
-      {"@id": "?user", "ex:role": "manager"}
-    ],
-    "f:allow": true
-  }
-]
+{
+  "@id": "ex:owner-only",
+  "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+  "f:required": true,
+  "f:action": [{"@id": "f:view"}, {"@id": "f:modify"}],
+  "f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/user\": {\"@id\": \"?$user\"}}, \"$where\": {\"@id\": \"?$this\", \"http://example.org/owner\": {\"@id\": \"?$user\"}}}"
+}
 ```
 
-### Property redaction
+The query resolves `?$identity → user`, then checks that `?$this` (the entity being read or written) has that user as its `ex:owner`.
 
-Hide specific properties from unauthorized users:
+### Property redaction (hide a property unless permitted)
 
 ```json
 [
   {
     "@id": "ex:hide-ssn",
-    "@type": "f:Policy",
-    "f:action": "query",
-    "f:resource": {"f:predicate": "ex:ssn"},
-    "f:allow": false
+    "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+    "f:required": true,
+    "f:onProperty": [{"@id": "ex:ssn"}],
+    "f:action": [{"@id": "f:view"}],
+    "f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/role\": \"hr\"}}"
   },
   {
-    "@id": "ex:hr-sees-ssn",
-    "@type": "f:Policy",
-    "f:subject": "?user",
-    "f:action": "query",
-    "f:resource": {"f:predicate": "ex:ssn"},
-    "f:condition": [
-      {"@id": "?user", "ex:role": "hr"}
-    ],
+    "@id": "ex:default-view",
+    "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+    "f:action": [{"@id": "f:view"}],
     "f:allow": true
   }
 ]
 ```
 
-### Hierarchical access (manager sees reports)
+`f:onProperty` scopes the restriction to `ex:ssn` only — every other property still falls under `ex:default-view`. `f:required: true` means the SSN policy MUST allow for any SSN flake to be visible (the default allow doesn't override it on this property).
+
+### Class-scoped restriction
 
 ```json
 {
-  "@id": "ex:manager-sees-reports",
-  "@type": "f:Policy",
-  "f:subject": "?manager",
-  "f:action": "query",
-  "f:resource": {"ex:reportsTo": "?manager"},
-  "f:allow": true
+  "@id": "ex:employee-only",
+  "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+  "f:required": true,
+  "f:onClass": [{"@id": "ex:Employee"}],
+  "f:action": [{"@id": "f:view"}],
+  "f:query": "{\"where\": {\"@id\": \"?$identity\", \"@type\": \"http://example.org/Employee\"}}"
 }
 ```
 
-### Multi-tenant isolation
+Anyone querying for `ex:Employee` instances must themselves be tagged as an employee.
 
-Each tenant sees only their data:
+### Multi-tenant isolation
 
 ```json
 {
   "@id": "ex:tenant-isolation",
-  "@type": "f:Policy",
-  "f:subject": "?user",
-  "f:action": "*",
-  "f:resource": {"ex:tenant": "?tenantId"},
-  "f:condition": [
-    {"@id": "?user", "ex:tenant": "?tenantId"}
-  ],
-  "f:allow": true
+  "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+  "f:required": true,
+  "f:action": [{"@id": "f:view"}, {"@id": "f:modify"}],
+  "f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/tenant\": \"?tenant\"}, \"$where\": {\"@id\": \"?$this\", \"http://example.org/tenant\": \"?tenant\"}}"
 }
 ```
 
-### Default deny
+Each tenant only sees and writes data tagged with their own `ex:tenant`. Required-no-targeting means it applies to every flake.
 
-For production, start with a default-deny policy:
+### Hierarchical access (manager sees direct reports)
 
 ```json
 {
-  "@id": "ex:default-deny",
-  "@type": "f:Policy",
-  "f:subject": "*",
-  "f:action": "*",
-  "f:resource": "*",
-  "f:allow": false,
-  "f:priority": -1000
+  "@id": "ex:manager-sees-reports",
+  "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+  "f:onClass": [{"@id": "schema:Person"}],
+  "f:action": [{"@id": "f:view"}],
+  "f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/user\": {\"@id\": \"?$mgr\"}}, \"$where\": {\"@id\": \"?$this\", \"http://example.org/reportsTo\": {\"@id\": \"?$mgr\"}}}"
 }
 ```
 
-Then add specific allow policies. Higher priority policies are evaluated first.
+### Write protection
 
-## Policy evaluation rules
-
-1. **Deny overrides** (default) — If any policy denies access, it's denied
-2. **No matching policy = deny** — Unlisted resources are inaccessible
-3. **Conditions must match** — If a condition query returns no results, the policy doesn't apply
-4. **Variables bind from context** — `?user` binds to the requesting identity's IRI
-
-## HTTP API with policies
-
-Policies are enforced via the `Authorization` header:
-
-```bash
-# Query with a specific identity
-curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:main' \
-  -H "Authorization: Bearer <JWT token>" \
-  -H "Content-Type: application/sparql-query" \
-  -d 'SELECT ?name ?salary WHERE { ?p schema:name ?name . OPTIONAL { ?p ex:salary ?salary } }'
+```json
+{
+  "@id": "ex:no-direct-writes",
+  "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+  "f:required": true,
+  "f:onProperty": [{"@id": "ex:approved"}],
+  "f:action": [{"@id": "f:modify"}],
+  "f:exMessage": "ex:approved is set by the workflow service only.",
+  "f:query": "{\"where\": {\"@id\": \"?$identity\", \"@type\": \"http://example.org/WorkflowService\"}}"
+}
 ```
 
-The JWT token's subject claim is used as the identity for policy evaluation.
+When the policy denies a transaction, `f:exMessage` is returned to the client.
+
+## Combining algorithm
+
+When multiple policies match a flake:
+
+- A **required** policy must allow. If any required policy denies (or returns no `f:query` bindings), access is denied.
+- If no required policy applies, **any** allow is enough — Fluree uses *allow-overrides* over the non-required set.
+- If no policy applies, the request falls back to `default-allow`. Setting `default-allow: false` is the fail-closed default for production.
+
+See [Policy model and inputs](../security/policy-model.md#policy-combining-algorithm) for the full state diagram.
+
+## Invoking policies via HTTP
+
+Policies are passed via opts on JSON-LD requests, and via headers on SPARQL requests.
+
+### JSON-LD
+
+```bash
+curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:main' \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $JWT" \
+  -d '{
+    "from": "mydb:main",
+    "select": "?name",
+    "where": [{"@id": "?p", "schema:name": "?name"}],
+    "opts": {
+      "identity": "ex:aliceIdentity",
+      "policy-class": ["ex:CorpPolicy"],
+      "default-allow": false
+    }
+  }'
+```
+
+### SPARQL (headers — no `opts` block in SPARQL)
+
+```bash
+curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:main' \
+  -H 'Content-Type: application/sparql-query' \
+  -H "Authorization: Bearer $JWT" \
+  -H 'fluree-identity: ex:aliceIdentity' \
+  -H 'fluree-policy-class: ex:CorpPolicy' \
+  -H 'fluree-default-allow: false' \
+  -d 'SELECT ?name WHERE { ?p <http://schema.org/name> ?name }'
+```
+
+| Header | JSON-LD `opts` field | Value |
+|--------|----------------------|-------|
+| `fluree-identity` | `identity` | IRI of an identity entity |
+| `fluree-policy-class` | `policy-class` | Comma-separated or repeated header; matches `f:policyClass` on stored policies |
+| `fluree-policy-values` | `policy-values` | JSON object — extra `?$var` bindings for policy queries |
+| `fluree-policy` | `policy` | Inline JSON-LD policy array |
+| `fluree-default-allow` | `default-allow` | `true` / `false` |
+
+When the bearer token is verified and the server is configured with `data_auth_default_policy_class`, the verified identity is auto-applied to `policy-values` and the configured class to `policy-class`. See [Configuration](../operations/configuration.md) for those server-side settings.
 
 ## Policies are data
 
-Because policies are stored as flakes in the ledger:
+Because policies live as flakes in the ledger:
 
-- **Time-travelable** — See what policies were in effect at any point in history
-- **Auditable** — Query the policies themselves: `SELECT ?policy ?action WHERE { ?policy a f:Policy ; f:action ?action }`
-- **Versionable** — Policies change through normal transactions, with full history
-- **Branchable** — Test new policies on a branch before merging to main
+- **Time-travel** — query at any past `t` to see the policies in effect then.
+- **Audit** — `SELECT ?p ?action WHERE { ?p a f:AccessPolicy ; f:action ?action }`.
+- **Versionable** — change policies through normal transactions; full history kept.
+- **Branchable** — try new policies on a branch before merging to main.
 
 ## Best practices
 
-1. **Start with default deny** — Explicitly allow what's needed
-2. **Use type-based policies** — They're the most efficient (use OPST index)
-3. **Test with multiple identities** — Verify the same query returns correct results for each role
-4. **Document policy intent** — Add `rdfs:label` and `rdfs:comment` to policy entities
-5. **Separate read and write** — Different policies for `query` vs `transact`
-6. **Monitor performance** — Complex condition queries add overhead
+1. **Start with `default-allow: false` and required policies.** Fail-closed is easier to reason about than fail-open.
+2. **Tag every stored policy with a class** (e.g. `ex:CorpPolicy`) and tag every identity with `f:policyClass`. Pass `policy-class` at query time — Fluree pulls in the matching policy set automatically.
+3. **Use `f:onProperty` / `f:onClass` / `f:onSubject` aggressively.** A targeted policy is cheaper to evaluate than a default policy, because Fluree can short-circuit during flake filtering.
+4. **Keep `f:query` simple.** It runs once per flake-target during evaluation. Lean on tagged identity properties (`@type`, `f:policyClass`, role flags) rather than deep traversals.
+5. **Test with multiple identities.** Verify the same query returns the right shape for each role.
+6. **Document intent.** Add `rdfs:label` and `rdfs:comment` to your policy nodes so audits are readable.
 
 ## Related documentation
 
-- [Policy Model](../security/policy-model.md) — Full policy structure reference
-- [Policy in Queries](../security/policy-in-queries.md) — Query-time enforcement details
-- [Policy in Transactions](../security/policy-in-transactions.md) — Write-time enforcement
-- [Authentication](../security/authentication.md) — Identity and token setup
-- [Policy Concepts](../concepts/policy-enforcement.md) — Architecture overview
+- [Policy enforcement (concepts)](../concepts/policy-enforcement.md) — model and architecture
+- [Policy model and inputs](../security/policy-model.md) — full reference
+- [Policy in queries](../security/policy-in-queries.md) — query-time enforcement details
+- [Policy in transactions](../security/policy-in-transactions.md) — transaction-time enforcement
+- [Programmatic policy API (Rust)](../security/programmatic-policy.md) — building policy contexts in code
+- [Authentication](../security/authentication.md) — identity, JWTs, and bearer tokens

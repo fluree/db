@@ -395,32 +395,9 @@ Export Fluree data to:
 
 ### Experimental Status
 
-Track feature status:
-
-```bash
-curl http://localhost:8090/features
-```
-
-Response:
-```json
-{
-  "stable": [
-    "sparql-1.1-query",
-    "json-ld-1.1",
-    "time-travel",
-    "bm25-search",
-    "vector-search"
-  ],
-  "experimental": [
-    "property-paths",
-    "reasoning"
-  ],
-  "planned": [
-    "geosparql",
-    "sparql-federation"
-  ]
-}
-```
+Feature availability is currently documented in this compatibility matrix and by
+crate feature flags; the standalone server does not expose a `/features` HTTP
+endpoint.
 
 ## Browser Support
 

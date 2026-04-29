@@ -355,7 +355,13 @@ async fn stream_pack_inner(
     validate_pack_request(request)?;
 
     let ledger_id = handle.ledger_id();
-    let content_store = fluree.content_store(ledger_id);
+    // Branch-aware store: packing a branched ledger requires reading
+    // pre-fork ancestor commits that live under the source branch's
+    // namespace.
+    let content_store = fluree
+        .branched_content_store(ledger_id)
+        .await
+        .map_err(|e| format!("failed to build branched store for {ledger_id}: {e}"))?;
 
     // --- Early validation: verify all want CIDs exist ---
     for want_cid in &request.want {

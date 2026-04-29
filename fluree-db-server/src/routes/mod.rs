@@ -38,6 +38,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let v1_admin_protected_routes = Router::new()
         .route("/create", post(ledger::create))
         .route("/drop", post(ledger::drop))
+        .route("/reindex", post(ledger::reindex))
         .route("/branch", post(ledger::create_branch))
         .route("/drop-branch", post(ledger::drop_branch))
         .route("/rebase", post(ledger::rebase))
@@ -63,6 +64,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/info/*ledger", get(ledger::info_ledger_tail))
         .route("/exists/*ledger", get(ledger::exists_ledger_tail))
         .route("/branch/*ledger", get(ledger::list_branches))
+        .route("/merge-preview/*ledger", get(ledger::merge_preview))
         // Merge admin-protected routes
         .merge(v1_admin_protected_routes)
         // Query endpoints

@@ -674,8 +674,13 @@ pub async fn run_push(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
         ))
     })?;
 
-    // Use ContentStore for CID-based chain walking (storage-agnostic).
-    let content_store = fluree.content_store(&ledger_id);
+    // Use a branch-aware ContentStore for CID-based chain walking. Without
+    // the branch fallback, walking past a fork point on a branched ledger
+    // 404s on every pre-fork ancestor.
+    let content_store = fluree
+        .branched_content_store(&ledger_id)
+        .await
+        .map_err(|e| CliError::Config(format!("failed to build branched store: {e}")))?;
 
     let mut to_push_cids: Vec<fluree_db_core::ContentId> = Vec::new();
 
@@ -877,8 +882,13 @@ pub async fn run_publish(
         ))
     })?;
 
-    // Walk the full commit chain (oldest → newest).
-    let content_store = fluree.content_store(&ledger_id);
+    // Walk the full commit chain (oldest → newest). Walking to genesis on
+    // a branched ledger always crosses the fork point, so we need the
+    // branch-aware store to resolve pre-fork ancestors.
+    let content_store = fluree
+        .branched_content_store(&ledger_id)
+        .await
+        .map_err(|e| CliError::Config(format!("failed to build branched store: {e}")))?;
 
     let mut to_push_cids: Vec<fluree_db_core::ContentId> = Vec::new();
     {

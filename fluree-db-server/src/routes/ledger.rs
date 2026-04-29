@@ -11,6 +11,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use fluree_db_api::wire::{ReindexRequest, ReindexResponse};
 use fluree_db_api::{ApiError, BranchDropReport, DropMode, DropReport, DropStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -330,6 +331,74 @@ async fn drop_local(state: Arc<AppState>, request: Request) -> Result<Json<DropR
 
         tracing::info!(status = "success", drop_status = ?report.status, "ledger dropped");
         Ok(Json(DropResponse::from(report)))
+    }
+    .instrument(span)
+    .await
+}
+
+// =============================================================================
+// Reindex
+// =============================================================================
+
+/// Full reindex from commit history.
+///
+/// POST /fluree/reindex
+///
+/// Rebuilds the binary index for a ledger from scratch using the server's
+/// configured indexer settings. In peer mode, forwards to the transaction
+/// server.
+pub async fn reindex(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    reindex_local(state, request).await.into_response()
+}
+
+async fn reindex_local(state: Arc<AppState>, request: Request) -> Result<Json<ReindexResponse>> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: ReindexRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+
+    let span = create_request_span(
+        "ledger:reindex",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.ledger),
+        None,
+        None,
+    );
+    async move {
+        let span = tracing::Span::current();
+        tracing::info!(status = "start", ledger = %req.ledger, "ledger reindex requested");
+
+        let result = match state
+            .fluree
+            .reindex(&req.ledger, fluree_db_api::ReindexOptions::default())
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:ReindexFailed");
+                tracing::error!(error = %server_error, "ledger reindex failed");
+                return Err(server_error);
+            }
+        };
+
+        tracing::info!(
+            status = "success",
+            index_t = result.index_t,
+            "ledger reindex complete"
+        );
+        Ok(Json(ReindexResponse::from(result)))
     }
     .instrument(span)
     .await
@@ -1374,6 +1443,160 @@ async fn merge_local(state: Arc<AppState>, request: Request) -> Result<impl Into
             "branch merged"
         );
         Ok((StatusCode::OK, Json(response)))
+    }
+    .instrument(span)
+    .await
+}
+
+// ============================================================================
+// Merge Preview (read-only)
+// ============================================================================
+
+/// Hard cap on `max_commits` — clamps the per-side commit list returned to
+/// the client regardless of what they request. 10x the recommended default.
+///
+/// **What this protects:** response body size and the per-commit
+/// `load_commit_by_id` reads (one full commit blob loaded per summary
+/// returned).
+///
+/// **What this does NOT protect:** the underlying divergence walk. The
+/// `count` field on each side reflects the full unbounded divergence —
+/// computed by walking every commit envelope between HEAD and the common
+/// ancestor — so a request against branches diverged by N commits costs N
+/// envelope reads regardless of the cap. If you need to reject huge
+/// divergences, add an operational guard before invoking the walk
+/// (e.g., refuse when ancestor.t < target.t - SOME_LIMIT).
+const MERGE_PREVIEW_HARD_MAX_COMMITS: usize = 5_000;
+
+/// Hard cap on `max_conflict_keys`. 25x the recommended default.
+///
+/// **What this protects:** the size of `conflicts.keys` in the response.
+///
+/// **What this does NOT protect:** the conflict computation. When
+/// `include_conflicts=true`, both `compute_delta_keys` walks scan the full
+/// per-side delta regardless of cap. Clients that need a fast preview
+/// should pass `include_conflicts=false`.
+const MERGE_PREVIEW_HARD_MAX_CONFLICT_KEYS: usize = 5_000;
+
+/// Query parameters for [`merge_preview`].
+#[derive(Deserialize)]
+pub struct MergePreviewQuery {
+    /// Source branch.
+    pub source: String,
+    /// Target branch (optional; defaults to the source's parent).
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Cap on per-side commit list. Defaults to 500.
+    #[serde(default)]
+    pub max_commits: Option<usize>,
+    /// Cap on conflict keys returned. Defaults to 200.
+    #[serde(default)]
+    pub max_conflict_keys: Option<usize>,
+    /// Skip the conflict computation when only counts are needed. Defaults to true.
+    #[serde(default)]
+    pub include_conflicts: Option<bool>,
+    /// Include source/target flake values for returned conflict keys.
+    #[serde(default)]
+    pub include_conflict_details: Option<bool>,
+    /// Strategy used for conflict resolution labels. Defaults to take-both.
+    #[serde(default)]
+    pub strategy: Option<String>,
+}
+
+/// Read-only branch merge preview.
+///
+/// GET /fluree/merge-preview/*ledger?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=
+///
+/// Returns a JSON [`fluree_db_api::MergePreview`] with ahead/behind commit
+/// summaries, conflict keys, and fast-forward eligibility — without mutating
+/// any ledger state.
+pub async fn merge_preview(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    Query(params): Query<MergePreviewQuery>,
+    headers: FlureeHeaders,
+    bearer: MaybeDataBearer,
+) -> Result<Json<fluree_db_api::MergePreview>> {
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+
+    let span = create_request_span(
+        "branch:merge-preview",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&ledger),
+        None,
+        None,
+    );
+    async move {
+        let span = tracing::Span::current();
+
+        // Same auth pattern as list_branches: Bearer required when configured.
+        let data_auth = state.config.data_auth();
+        if data_auth.mode == crate::config::DataAuthMode::Required && bearer.0.is_none() {
+            set_span_error_code(&span, "error:Unauthorized");
+            return Err(ServerError::unauthorized("Bearer token required"));
+        }
+        if let Some(p) = bearer.0.as_ref() {
+            if !p.can_read(&ledger) {
+                set_span_error_code(&span, "error:Forbidden");
+                return Err(ServerError::not_found("Ledger not found"));
+            }
+        }
+
+        // Start from the API's default (which carries the recommended caps)
+        // and override only fields the caller supplied. Caller values are
+        // additionally clamped to the server-side hard maximums so a
+        // request like `max_commits=10000000` cannot blow out the response
+        // body or force unbounded `load_commit_by_id` reads. The
+        // *divergence walk itself* (envelope BFS via `collect_dag_cids`)
+        // is unaffected — see the `MERGE_PREVIEW_HARD_MAX_*` constant
+        // comments above. Contract documented in
+        // docs/cli/server-integration.md (§Merge Preview Contract, rule 10).
+        let mut opts = fluree_db_api::MergePreviewOpts::default();
+        if let Some(n) = params.max_commits {
+            opts.max_commits = Some(n.min(MERGE_PREVIEW_HARD_MAX_COMMITS));
+        }
+        if let Some(n) = params.max_conflict_keys {
+            opts.max_conflict_keys = Some(n.min(MERGE_PREVIEW_HARD_MAX_CONFLICT_KEYS));
+        }
+        if let Some(b) = params.include_conflicts {
+            opts.include_conflicts = b;
+        }
+        if let Some(b) = params.include_conflict_details {
+            opts.include_conflict_details = b;
+        }
+        if opts.include_conflict_details && !opts.include_conflicts {
+            return Err(ServerError::bad_request(
+                "include_conflict_details requires include_conflicts=true",
+            ));
+        }
+        if let Some(s) = params.strategy.as_deref() {
+            opts.conflict_strategy =
+                fluree_db_api::ConflictStrategy::parse_canonical(s).map_err(|_| {
+                    ServerError::bad_request(format!("Unknown merge preview strategy: {s}"))
+                })?;
+            if opts.conflict_strategy == fluree_db_api::ConflictStrategy::Skip {
+                return Err(ServerError::bad_request(
+                    "Skip strategy is not supported for merge preview",
+                ));
+            }
+        }
+        if opts.conflict_strategy == fluree_db_api::ConflictStrategy::Abort
+            && !opts.include_conflicts
+        {
+            return Err(ServerError::bad_request(
+                "strategy=abort requires include_conflicts=true for mergeable preview",
+            ));
+        }
+
+        let preview = state
+            .fluree
+            .merge_preview_with(&ledger, &params.source, params.target.as_deref(), opts)
+            .await
+            .map_err(ServerError::Api)?;
+
+        Ok(Json(preview))
     }
     .instrument(span)
     .await

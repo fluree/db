@@ -577,10 +577,12 @@ async fn jsonld_optional_two_separate() {
 }
 
 #[tokio::test]
-async fn jsonld_optional_two_in_same_vector() {
-    // Mirrors "query with two optionals in the same vector"
+async fn jsonld_optional_conjunctive_inner() {
+    // SPARQL semantics: ["optional", {a}, {b}] is one OPTIONAL with conjunctive inner —
+    // both a and b must match together, or both go null. Equivalent to
+    // SPARQL OPTIONAL { ?s :favColor ?favColor . ?s :email ?email }.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "query/optional-two-same-vector:main";
+    let ledger_id = "query/optional-conjunctive:main";
 
     let ledger0 = genesis_ledger(&fluree, ledger_id);
     let ctx = context_ex_schema();
@@ -615,12 +617,14 @@ async fn jsonld_optional_two_in_same_vector() {
         .expect("query");
     let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
 
+    // Only Alice has BOTH favColor and email — the conjunctive inner matches.
+    // Brian has neither, Cam has only email — both null-extend on both vars.
     assert_eq!(
         normalize_rows(&json_rows),
         normalize_rows(&json!([
             ["Alice", "Green", "alice@flur.ee"],
             ["Brian", null, null],
-            ["Cam", null, "cam@flur.ee"]
+            ["Cam", null, null]
         ]))
     );
 }
@@ -849,11 +853,78 @@ async fn jsonld_optional_with_filter() {
 }
 
 #[tokio::test]
-async fn jsonld_optional_with_multiple_triples() {
-    // OPTIONAL with multiple node patterns (separate objects) - each is a separate optional
-    // Fluree semantics: ["optional", {node1}, {node2}] means two separate left joins
+async fn jsonld_optional_with_filter_multivalue_skosxl() {
+    // Regression for the SKOS-XL "language picker" bug:
+    // ?child has N candidate prefLabels. OPTIONAL { triple-chain . FILTER(lang=en) }
+    // must emit ONLY the matching label, not also a spurious null-extended row for
+    // each non-matching candidate (SPARQL 1.1 §8.1: LeftJoin null-extends only when
+    // NO inner solution is compatible).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "query/optional-multi-triple:main";
+    let ledger_id = "query/optional-filter-multivalue:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let ctx = json!({
+        "skos":   "http://www.w3.org/2004/02/skos/core#",
+        "skosxl": "http://www.w3.org/2008/05/skos-xl#",
+        "ex":     "https://example.com/"
+    });
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            { "@id": "ex:c1",   "@type": "skos:Concept" },
+            { "@id": "ex:L-en", "@type": "skosxl:Label",
+              "skosxl:literalForm": { "@value": "Spreadsheet Work",   "@language": "en" } },
+            { "@id": "ex:L-fr", "@type": "skosxl:Label",
+              "skosxl:literalForm": { "@value": "Travail sur tableur","@language": "fr" } },
+            { "@id": "ex:L-zh", "@type": "skosxl:Label",
+              "skosxl:literalForm": { "@value": "电子表格工作",         "@language": "zh" } },
+            { "@id": "ex:c1", "skosxl:prefLabel": [
+                { "@id": "ex:L-en" }, { "@id": "ex:L-fr" }, { "@id": "ex:L-zh" }
+            ]}
+        ]
+    });
+
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert")
+        .ledger;
+
+    let query = json!({
+        "@context": ctx,
+        "selectDistinct": ["?child", "?xlLang"],
+        "where": [
+            { "@id": "?child", "@type": "skos:Concept" },
+            ["optional",
+                { "@id": "?child", "skosxl:prefLabel": { "@id": "?xlLn" } },
+                { "@id": "?xlLn",  "skosxl:literalForm": "?xlLang" },
+                ["filter", "(= (lang ?xlLang) \"en\")"]
+            ]
+        ]
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+
+    // Expected: exactly one row (the en label). NO spurious null-extended row,
+    // even though fr and zh candidates fail the filter.
+    assert_eq!(
+        normalize_rows(&json_rows),
+        normalize_rows(&json!([
+            ["ex:c1", { "@value": "Spreadsheet Work", "@language": "en" }]
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn jsonld_two_independent_optionals() {
+    // Two sibling ["optional", ...] arrays = two independent left joins (SPARQL: two
+    // separate OPTIONAL { } blocks). Each OPTIONAL can independently null-extend.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "query/optional-two-independent:main";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
     let ctx = context_ex_schema();
 
@@ -872,17 +943,13 @@ async fn jsonld_optional_with_multiple_triples() {
         .expect("insert")
         .ledger;
 
-    // Query: select users, optionally get age, optionally get city (separate optionals)
-    // Two node-map objects = two separate optional joins
     let query = json!({
         "@context": ctx,
         "select": ["?name", "?age", "?city"],
         "where": [
             {"@id": "?s", "@type": "ex:User", "schema:name": "?name"},
-            ["optional",
-                {"@id": "?s", "ex:age": "?age"},
-                {"@id": "?s", "ex:city": "?city"}
-            ]
+            ["optional", {"@id": "?s", "ex:age": "?age"}],
+            ["optional", {"@id": "?s", "ex:city": "?city"}]
         ],
         "orderBy": "?name"
     });
@@ -892,7 +959,6 @@ async fn jsonld_optional_with_multiple_triples() {
         .expect("query");
     let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
 
-    // Each optional is independent: Alice has both, Brian has only age, Cam has only city
     assert_eq!(
         json_rows,
         json!([
@@ -1791,7 +1857,7 @@ async fn jsonld_bind_arithmetic_in_select() {
     // JSON-LD equivalent of: SELECT ?z WHERE { ?s ex:p ?o . BIND(?o+10 AS ?z) }
     let query = json!({
         "@context": ctx,
-        "select": ["?z"],
+        "select": "?z",
         "where": [
             {"@id": "?s", "ex:p": "?o"},
             ["bind", "?z", ["expr", ["+", "?o", 10]]]
@@ -1883,7 +1949,7 @@ async fn jsonld_bind_with_filter() {
 
     let query = json!({
         "@context": ctx,
-        "select": ["?z"],
+        "select": "?z",
         "where": [
             {"@id": "?s", "ex:p": "?o"},
             ["bind", "?z", ["expr", ["+", "?o", 10]]],
@@ -1932,7 +1998,7 @@ async fn jsonld_bind_in_union() {
 
     let query = json!({
         "@context": ctx,
-        "select": ["?z"],
+        "select": "?z",
         "where": [
             ["union",
                 [

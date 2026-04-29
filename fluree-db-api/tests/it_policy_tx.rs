@@ -142,7 +142,10 @@ async fn modify_policy_allows_own_property() {
             ledger,
             input,
             CommitOpts::default(),
-            &IndexConfig::default(),
+            &IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await;
 
@@ -155,7 +158,7 @@ async fn modify_policy_allows_own_property() {
     // Verify the update happened
     let (tx_result, _tally) = result.unwrap();
     let query = json!({
-        "select": ["?email"],
+        "select": "?email",
         "where": {
             "@id": "http://example.org/ns/john",
             "http://schema.org/email": "?email"
@@ -260,7 +263,10 @@ async fn modify_policy_denies_other_property() {
             ledger,
             input,
             CommitOpts::default(),
-            &IndexConfig::default(),
+            &IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await;
 
@@ -343,7 +349,10 @@ async fn view_only_policy_blocks_modify() {
             ledger,
             input,
             CommitOpts::default(),
-            &IndexConfig::default(),
+            &IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await;
 
@@ -440,7 +449,10 @@ async fn modify_query_always_false_denies() {
             ledger,
             input,
             CommitOpts::default(),
-            &IndexConfig::default(),
+            &IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await;
 

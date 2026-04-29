@@ -75,6 +75,10 @@ Response format determined by `Accept` header:
 
 ## API Endpoints
 
+Except for root diagnostics such as `/health` and `/.well-known/fluree.json`,
+HTTP API paths are under the discovered API base URL. The standalone server
+defaults to `/v1/fluree`.
+
 ### Transaction Endpoints
 
 **POST /update**
@@ -93,11 +97,6 @@ Response format determined by `Accept` header:
 - Returns: Query results
 - Supports history queries via time range in `from` clause (see [Time Travel](../concepts/time-travel.md))
 
-**POST /nameservice/query**
-- Query metadata about all ledgers and graph sources
-- Parameters: None (query in request body)
-- Returns: Query results over nameservice records
-
 ### Ledger Management
 
 **GET /ledgers**
@@ -105,16 +104,15 @@ Response format determined by `Accept` header:
 - Parameters: None
 - Returns: Array of ledger metadata
 
-**GET /ledgers/:ledger-id**
+**GET /info/:ledger-id**
 - Get specific ledger metadata
 - Parameters: `ledger-id` (ledger:branch)
 - Returns: Ledger details (commit_t, index_t, etc.)
 
-**POST /ledgers**
+**POST /create**
 - Create a new ledger explicitly
-- Parameters: `ledger-id`, `config`
+- Parameters: `ledger`
 - Returns: Ledger metadata
-- Note: The HTTP server also supports implicit creation on first transaction; the Rust library API requires explicit `create_ledger` before transacting
 
 ### System Endpoints
 
@@ -123,15 +121,10 @@ Response format determined by `Accept` header:
 - Parameters: None
 - Returns: Server health status
 
-**GET /status**
+**GET /stats**
 - Server status and statistics
 - Parameters: None
 - Returns: Detailed server state
-
-**GET /version**
-- Server version information
-- Parameters: None
-- Returns: Version details
 
 ## Request Format
 
@@ -242,7 +235,7 @@ Fluree supports multiple authentication mechanisms, configured per endpoint grou
 No authentication required (default):
 
 ```bash
-curl http://localhost:8090/mydb:main/query \
+curl http://localhost:8090/v1/fluree/query/mydb:main \
   -H "Content-Type: application/json" \
   -d '{"select": ["?s"], "where": [{"@id": "?s"}]}'
 ```
@@ -256,7 +249,7 @@ Bearer tokens in the `Authorization` header. Fluree supports two token types wit
 ```bash
 TOKEN=$(fluree token create --private-key @~/.fluree/key --read-all --write-all)
 
-curl http://localhost:8090/mydb:main/query \
+curl http://localhost:8090/v1/fluree/query/mydb:main \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"select": ["?s"], "where": [{"@id": "?s"}]}'
@@ -265,7 +258,7 @@ curl http://localhost:8090/mydb:main/query \
 **OIDC/JWKS (RS256)** - Tokens from external identity providers, verified against the provider's JWKS endpoint. Requires the `oidc` feature and `--jwks-issuer` server configuration:
 
 ```bash
-curl http://localhost:8090/mydb:main/query \
+curl http://localhost:8090/v1/fluree/query/mydb:main \
   -H "Authorization: Bearer <oidc-token>" \
   -H "Content-Type: application/json" \
   -d '{"select": ["?s"], "where": [{"@id": "?s"}]}'
@@ -285,14 +278,14 @@ Bearer tokens carry permission scopes that control access:
 
 #### Connection-Scoped SPARQL
 
-When a bearer token is present for connection-scoped SPARQL queries (`/fluree/query` with `Content-Type: application/sparql-query`), FROM/FROM NAMED clauses are checked against the token's read scope (`fluree.ledger.read.all` or `fluree.ledger.read.ledgers`). Out-of-scope ledgers return 404 (no existence leak).
+When a bearer token is present for connection-scoped SPARQL queries (`/v1/fluree/query` with `Content-Type: application/sparql-query`), FROM/FROM NAMED clauses are checked against the token's read scope (`fluree.ledger.read.all` or `fluree.ledger.read.ledgers`). Out-of-scope ledgers return 404 (no existence leak).
 
 ### Signed Requests (JWS/VC)
 
 Cryptographically signed request bodies using Ed25519 JWS or Verifiable Credentials. The signed payload carries the request itself plus the signer's identity for policy evaluation.
 
 ```bash
-curl http://localhost:8090/mydb:main/query \
+curl http://localhost:8090/v1/fluree/query/mydb:main \
   -H "Content-Type: application/jose" \
   -d '<compact-jws-string>'
 ```

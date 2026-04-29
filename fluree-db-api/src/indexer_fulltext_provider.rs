@@ -17,8 +17,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fluree_db_binary_index::BinaryIndexStore;
-use fluree_db_core::ContentStore;
 use fluree_db_indexer::{ConfiguredFulltextProperty, FulltextConfigProvider};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NameService;
@@ -33,6 +31,7 @@ pub(crate) struct ApiFulltextConfigProvider {
     pub(crate) backend: StorageBackend,
     pub(crate) nameservice: Arc<dyn NameService>,
     pub(crate) leaflet_cache: Arc<fluree_db_binary_index::LeafletCache>,
+    pub(crate) cache_dir: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for ApiFulltextConfigProvider {
@@ -53,57 +52,29 @@ impl ApiFulltextConfigProvider {
         //    overlay/novelty entries would be visible — fine for configs
         //    committed since the last index, wrong for configs that have
         //    already been indexed.
-        if let Some(index_cid) = state
-            .ns_record
-            .as_ref()
-            .and_then(|r| r.index_head_id.as_ref())
-            .cloned()
-        {
-            let ns_ledger_id = state
-                .ns_record
-                .as_ref()
-                .map(|r| r.ledger_id.as_str())
-                .unwrap_or(state.snapshot.ledger_id.as_str());
-            let cs = self.backend.content_store(ns_ledger_id);
-            let bytes = cs
-                .get(&index_cid)
-                .await
-                .map_err(|e| format!("read binary index root {index_cid}: {e}"))?;
-            let cache_dir = std::env::temp_dir().join("fluree-cache");
-            let mut binary_index_store = BinaryIndexStore::load_from_root_bytes(
-                Arc::clone(&cs),
-                &bytes,
-                &cache_dir,
-                Some(Arc::clone(&self.leaflet_cache)),
-            )
-            .await
-            .map_err(|e| format!("load binary index store: {e}"))?;
-            crate::ns_helpers::sync_store_and_snapshot_ns(
-                &mut binary_index_store,
-                &mut state.snapshot,
-            )
-            .map_err(|e| format!("sync ns: {e}"))?;
-            let arc_store = Arc::new(binary_index_store);
-            state.binary_store = Some(crate::TypeErasedStore(arc_store.clone()));
-            let ns_fallback = Some(Arc::new(state.snapshot.namespaces().clone()));
-            let provider = fluree_db_query::BinaryRangeProvider::new(
-                Arc::clone(&arc_store),
-                state.dict_novelty.clone(),
-                state.runtime_small_dicts.clone(),
-                ns_fallback,
-            );
-            state.snapshot.range_provider = Some(Arc::new(provider));
-        }
-
-        // 3. Resolve `f:fullTextDefaults` against the loaded state.
-        let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
-        let ledger_config = crate::config_resolver::resolve_ledger_config(
-            &state.snapshot,
-            overlay,
-            state.snapshot.t,
+        crate::ledger_manager::load_and_attach_binary_store(
+            &self.backend,
+            self.nameservice.as_ref(),
+            &mut state,
+            &self.cache_dir,
+            Some(Arc::clone(&self.leaflet_cache)),
         )
         .await
-        .map_err(|e| format!("resolve_ledger_config: {e}"))?;
+        .map_err(|e| format!("load binary index store: {e}"))?;
+
+        // 3. Resolve `f:fullTextDefaults` against the loaded state.
+        //
+        // Use `state.t()` (= max(novelty.t, snapshot.t)) as the upper bound so
+        // config flakes committed since the last index are visible. On a
+        // first-ever build there is no index, so `snapshot.t == 0` and all
+        // config lives in novelty — querying at `snapshot.t` would filter it
+        // out (`Novelty::for_each_overlay_flake` keeps only `flake.t <= to_t`).
+        let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
+        let to_t = state.t();
+        let ledger_config =
+            crate::config_resolver::resolve_ledger_config(&state.snapshot, overlay, to_t)
+                .await
+                .map_err(|e| format!("resolve_ledger_config: {e}"))?;
 
         Ok(ledger_config
             .map(|cfg| crate::config_resolver::configured_fulltext_properties_for_indexer(&cfg))

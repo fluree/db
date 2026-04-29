@@ -12,7 +12,7 @@
 
 pub mod span_capture;
 
-use fluree_db_api::{IndexConfig, LedgerState, Novelty};
+use fluree_db_api::{LedgerState, Novelty};
 use fluree_db_core::LedgerSnapshot;
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
@@ -182,6 +182,33 @@ pub async fn seed_user_with_ssn(
     fluree.insert(ledger0, &txn).await.expect("seed").ledger
 }
 
+/// Rebuild and publish a binary index for the ledger's current commit head.
+///
+/// Use this in regression tests that need to exercise the FIR6/binary-only
+/// reload path rather than the purely in-memory novelty path.
+pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record should exist");
+    let result = fluree_db_indexer::rebuild_index_from_commits(
+        fluree.content_store(ledger_id),
+        ledger_id,
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("index rebuild should succeed");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .await
+        .expect("publish index");
+}
+
 // =============================================================================
 // Indexing helpers (native tests)
 // =============================================================================
@@ -241,15 +268,18 @@ pub fn start_background_indexer_local(
 // Index config assertions
 // =============================================================================
 
-/// Assert that IndexConfig defaults match expected defaults.
+/// Sanity-check that the soft reindex threshold constant is stable.
 ///
-/// Reindex threshold defaults:
-/// - min: 100_000
-/// - max: 1_000_000
+/// `IndexConfig` no longer has a `Default` impl — configuration policy lives
+/// at the API layer — so this helper only pins the soft-threshold constant
+/// used by production defaults. It's called from many tests as a cheap
+/// guard against accidental constant drift; kept for backward compatibility
+/// with those call sites.
 pub fn assert_index_defaults() {
-    let cfg = IndexConfig::default();
-    assert_eq!(cfg.reindex_min_bytes, 100_000);
-    assert_eq!(cfg.reindex_max_bytes, 1_000_000);
+    assert_eq!(
+        fluree_db_api::server_defaults::DEFAULT_REINDEX_MIN_BYTES,
+        100_000
+    );
 }
 
 // =============================================================================
@@ -269,31 +299,6 @@ pub fn normalize_rows(v: &JsonValue) -> Vec<JsonValue> {
             .cmp(&serde_json::to_string(b).unwrap_or_default())
     });
 
-    rows
-}
-
-/// Normalize JSON-LD row results as nested arrays for unordered comparison.
-///
-/// Similar to `normalize_rows` but preserves the inner array structure.
-pub fn normalize_rows_array(v: &JsonValue) -> Vec<Vec<JsonValue>> {
-    let mut rows: Vec<Vec<JsonValue>> = v
-        .as_array()
-        .expect("rows should be an array")
-        .iter()
-        .map(|row| {
-            // JSON-LD formatter flattens single-column selects to a flat array of values.
-            // Preserve a consistent nested-array shape for callers by wrapping scalars.
-            match row.as_array() {
-                Some(arr) => arr.to_vec(),
-                None => vec![row.clone()],
-            }
-        })
-        .collect();
-    rows.sort_by(|a, b| {
-        serde_json::to_string(a)
-            .unwrap()
-            .cmp(&serde_json::to_string(b).unwrap())
-    });
     rows
 }
 

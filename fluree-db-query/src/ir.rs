@@ -1963,9 +1963,11 @@ pub enum Function {
     // =========================================================================
     // Fluree-specific functions
     // =========================================================================
-    /// Transaction time
+    /// Transaction time of the matching flake (i64).
     T,
-    /// Operation type for history queries ("assert" or "retract")
+    /// Operation type of the matching flake in history queries — boolean
+    /// (`true` = assert, `false` = retract). Mirrors `Flake.op` on disk;
+    /// returns `None` for current-state scans.
     Op,
 
     // =========================================================================

@@ -364,7 +364,7 @@ async fn upsert_enforce_unique_urn_iris_after_indexing() {
                 .unwrap()
                 .to_jsonld(&fluree.ledger(ledger_id).await.unwrap().snapshot)
                 .unwrap();
-            assert_eq!(count, json!([1]), "entity should appear exactly once");
+            assert_eq!(count, json!([[1]]), "entity should appear exactly once");
         })
         .await;
 }

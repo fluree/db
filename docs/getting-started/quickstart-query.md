@@ -304,15 +304,15 @@ curl -X POST http://localhost:8090/v1/fluree/query \
   }'
 ```
 
-The `@t` annotation binds the transaction time and `@op` shows the operation type (`"assert"` or `"retract"`).
+The `@t` annotation binds the transaction time, and `@op` binds the operation type as a boolean (`true` = assert, `false` = retract).
 
 Response shows all changes:
 
 ```json
 [
-  ["Alice", 30, 1, "assert"],
-  ["Alice", 30, 5, "retract"],
-  ["Alicia", 31, 5, "assert"]
+  ["Alice", 30, 1, true],
+  ["Alice", 30, 5, false],
+  ["Alicia", 31, 5, true]
 ]
 ```
 
@@ -342,9 +342,9 @@ Response:
 
 ```json
 [
-  [30, 1, "assert"],
-  [30, 5, "retract"],
-  [31, 5, "assert"]
+  [30, 1, true],
+  [30, 5, false],
+  [31, 5, true]
 ]
 ```
 

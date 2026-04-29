@@ -432,6 +432,24 @@ The `@shared` prefix uses the `@` character, which is forbidden in branch names 
 
 `LedgerState::build_branched_store()` recursively walks the branch ancestry via nameservice `source_branch` metadata, constructing the `BranchedContentStore` tree. This uses `Box::pin` for the recursive async calls.
 
+The actual ancestry walk lives in **`fluree-db-nameservice`** (`branched_store::build_branched_store`), and `LedgerState::build_branched_store` is a thin wrapper that delegates there. This keeps the helper available to crates that don't depend on `fluree-db-ledger` (notably `fluree-db-indexer`'s background worker).
+
+### When to Use BranchedContentStore
+
+Any code path that walks the commit chain or loads index blobs for a branched ledger MUST use a branch-aware content store. Per-query reads against an already-loaded `LedgerState` are fine — `LedgerState::load` already wires the branched store up.
+
+Use the nameservice helpers, not the flat `StorageBackend::content_store(...)`:
+
+| Helper | When to use |
+|---|---|
+| `fluree_db_nameservice::branched_content_store_for_record(backend, ns, &record)` | An `NsRecord` is in scope (no extra lookup) |
+| `fluree_db_nameservice::branched_content_store_for_id(backend, ns, ledger_id)` | No `NsRecord` available — does one nameservice lookup |
+| `Fluree::branched_content_store(&self, ledger_id)` | API / CLI callers — wraps `_for_id` |
+
+Both helpers return the flat namespace store unchanged for non-branched ledgers, so adding them to non-branch code paths costs at most a single nameservice lookup.
+
+A flat `backend.content_store(ledger_id)` on the commit-chain walk path will 404 the moment the walker steps past the fork point and tries to read an ancestor commit from the wrong namespace.
+
 ## Type Erasure with AnyStorage
 
 For dynamic dispatch (e.g., runtime-selected storage backends), use `AnyStorage`:

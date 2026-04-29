@@ -42,18 +42,63 @@ fluree iceberg map execution-log \
 
 Once mapped, graph sources appear in `fluree list`, can be inspected with `fluree info`, and removed with `fluree drop`. See [CLI iceberg reference](../cli/iceberg.md) for all options.
 
+### HTTP API
+
+When running the Fluree server (or Docker image) with the `iceberg` feature enabled, map a table by POSTing to `{api_base_url}/iceberg/map` (default: `/v1/fluree/iceberg/map`). The endpoint is admin-protected — include the admin Bearer token if admin auth is configured.
+
+```bash
+# REST catalog with R2RML mapping (mapping passed inline)
+curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d @- <<'JSON'
+{
+  "name": "warehouse-orders",
+  "mode": "rest",
+  "catalog_uri": "https://polaris.example.com/api/catalog",
+  "table": "sales.orders",
+  "warehouse": "my-warehouse",
+  "auth_bearer": "polaris-token-here",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "r2rml_type": "text/turtle"
+}
+JSON
+```
+
+```bash
+# Direct S3 mode (no catalog server)
+curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{
+    "name": "execution-log",
+    "mode": "direct",
+    "table_location": "s3://bucket/warehouse/logs/execution_log",
+    "r2rml": "...",
+    "r2rml_type": "text/turtle",
+    "s3_region": "us-east-1",
+    "s3_path_style": true
+  }'
+```
+
+R2RML can be omitted to auto-generate a direct mapping. AWS credentials for `direct` mode are read from the server's environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
+
 ### Rust API
+
+`R2rmlCreateConfig::new` and `new_direct` take the R2RML mapping as a **content string** (Turtle or JSON-LD), not a file path — read the file yourself first. To reference an already-stored mapping by address instead, build the config directly with `R2rmlMappingInput::Address(...)`.
 
 **REST catalog mode (Polaris-style):**
 
 ```rust
 use fluree_db_api::R2rmlCreateConfig;
 
+let mapping = std::fs::read_to_string("mappings/orders.ttl")?;
+
 let config = R2rmlCreateConfig::new(
     "warehouse-orders",
     "https://polaris.example.com/api/catalog",
     "sales.orders",
-    "fluree:file://mappings/orders.ttl",
+    mapping,
 )
 .with_warehouse("my-warehouse")
 .with_auth_bearer("my-token")
@@ -67,10 +112,12 @@ fluree.create_r2rml_graph_source(config).await?;
 ```rust
 use fluree_db_api::R2rmlCreateConfig;
 
+let mapping = std::fs::read_to_string("mappings/execution_log.ttl")?;
+
 let config = R2rmlCreateConfig::new_direct(
     "execution-log",
     "s3://bucket/warehouse/logs/execution_log",
-    "fluree:file://mappings/execution_log.ttl",
+    mapping,
 )
 .with_s3_region("us-east-1")
 .with_s3_path_style(true);

@@ -145,10 +145,10 @@ async fn graph_crawl_applies_novelty_retractions() {
         rows.len(),
         rows
     );
-    // Single-column SELECT flattens to scalar in JSON-LD format.
+    // SPARQL always returns array-of-arrays (one array per binding row).
     assert_eq!(
         rows[0],
-        json!("updated description"),
+        json!(["updated description"]),
         "SPARQL should return only the updated description"
     );
 
@@ -249,7 +249,7 @@ async fn graph_crawl_applies_novelty_retractions_for_indexed_base_rows() {
     );
     assert_eq!(
         rows[0],
-        json!("updated description"),
+        json!(["updated description"]),
         "SPARQL should return only the updated description"
     );
 
@@ -340,7 +340,7 @@ async fn graph_crawl_applies_novelty_retractions_for_list_indexed_values() {
     let rows = sparql_json.as_array().expect("sparql rows");
     assert_eq!(
         rows,
-        &vec![json!("desc c")],
+        &vec![json!(["desc c"])],
         "SPARQL should return only the updated single description"
     );
 

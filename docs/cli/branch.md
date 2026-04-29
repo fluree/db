@@ -235,9 +235,59 @@ Rebased 'dev': 3 commits replayed, 0 skipped, 1 conflicts, 0 failures.
   New branch point: t=8
 ```
 
+### fluree branch diff
+
+Show a read-only merge preview between two branches.
+
+**Usage:**
+
+```bash
+fluree branch diff <SOURCE> [OPTIONS]
+```
+
+**Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `<SOURCE>` | Source branch name to preview merging from (e.g., "dev", "feature-x") |
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--target <BRANCH>` | Target branch to preview merging into (defaults to source's parent branch) |
+| `--max-commits <N>` | Cap on per-side commit summaries shown (default: 50; pass 0 for unbounded in local mode) |
+| `--max-conflict-keys <N>` | Cap on conflict keys shown (default: 50; pass 0 for unbounded in local mode) |
+| `--no-conflicts` | Skip conflict computation for a cheaper preview |
+| `--conflict-details` | Include source/target flake values for returned conflict keys |
+| `--strategy <STRATEGY>` | Strategy used for conflict detail labels (default: `take-both`). Options: `take-both`, `abort`, `take-source`, `take-branch` |
+| `--json` | Emit the raw JSON preview |
+| `--ledger <LEDGER>` | Ledger name (defaults to active ledger) |
+| `--remote <REMOTE>` | Execute against a remote server |
+
+**Description:**
+
+`branch diff` reports ahead/behind commits, fast-forward eligibility, and conflicting `(subject, predicate, graph)` keys without mutating state. With `--conflict-details`, the preview also shows the source and target values for the returned conflict keys and annotates what the selected strategy would do.
+
+**Examples:**
+
+```bash
+# Preview merging dev into its parent
+fluree branch diff dev
+
+# Preview a specific target
+fluree branch diff dev --target main
+
+# Show value details and source-winning labels
+fluree branch diff dev --target main --conflict-details --strategy take-source
+
+# Emit raw JSON for UI tooling
+fluree branch diff dev --conflict-details --json
+```
+
 ### fluree branch merge
 
-Merge a branch into its parent branch (fast-forward only).
+Merge a source branch into a target branch.
 
 **Usage:**
 
@@ -280,6 +330,9 @@ fluree branch merge feature-x --target dev
 # Merge for a specific ledger
 fluree branch merge dev --ledger mydb
 
+# Merge with source-winning conflict resolution
+fluree branch merge dev --target main --strategy take-source
+
 # Merge on a remote server
 fluree branch merge dev --ledger mydb --remote origin
 ```
@@ -288,6 +341,12 @@ fluree branch merge dev --ledger mydb --remote origin
 
 ```
 Merged 'dev' into 'main' (fast-forward to t=8, 3 commits copied).
+```
+
+**Output (non-fast-forward):**
+
+```
+Merged 'dev' into 'main' (t=9, 3 commits copied, 1 conflicts).
 ```
 
 ## See Also

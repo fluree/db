@@ -403,7 +403,7 @@ ex:bob a ex:User ;
                 "ex": "http://example.org/ns/",
                 "schema": "http://schema.org/"
             },
-            "select": ["?name"],
+            "select": "?name",
             "where": { "schema:name": "?name" }
         }),
     )
@@ -625,7 +625,10 @@ ex:bob schema:name "Bob" ;
             &delete_data,
             fluree_db_api::TxnOpts::default(),
             fluree_db_api::CommitOpts::default(),
-            &fluree_db_ledger::IndexConfig::default(),
+            &fluree_db_ledger::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await
         .expect("retract should succeed");

@@ -415,8 +415,10 @@ pub struct ServerConfig {
     pub reindex_min_bytes: usize,
 
     /// Novelty size (bytes) that blocks new commits until reindexing completes (hard threshold)
-    #[arg(long, env = "FLUREE_REINDEX_MAX_BYTES", default_value_t = server_defaults::DEFAULT_REINDEX_MAX_BYTES)]
-    pub reindex_max_bytes: usize,
+    ///
+    /// Default: 20% of system RAM (256 MB fallback). Set explicitly to override.
+    #[arg(long, env = "FLUREE_REINDEX_MAX_BYTES")]
+    pub reindex_max_bytes: Option<usize>,
 
     /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 50% if ≥8GB)
     ///
@@ -649,7 +651,7 @@ impl Default for ServerConfig {
             cors_enabled: server_defaults::DEFAULT_CORS_ENABLED,
             indexing_enabled: server_defaults::DEFAULT_INDEXING_ENABLED,
             reindex_min_bytes: server_defaults::DEFAULT_REINDEX_MIN_BYTES,
-            reindex_max_bytes: server_defaults::DEFAULT_REINDEX_MAX_BYTES,
+            reindex_max_bytes: None,
             cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
             log_level: server_defaults::DEFAULT_LOG_LEVEL.to_string(),

@@ -107,7 +107,7 @@ async fn reverse_predicate_in_where_finds_kid() {
             "parent":{"@reverse":"ex:child"}
         },
         "where": {"@id":"?s","parent":"?x"},
-        "select": ["?s"],
+        "select": "?s",
         "distinct": true
     });
 
@@ -131,7 +131,7 @@ async fn reverse_at_type_in_where_finds_classes() {
             "isTypeObject":{"@reverse":"@type"}
         },
         "where": {"@id":"?class","isTypeObject":"?x"},
-        "select": ["?class"],
+        "select": "?class",
         "distinct": true
     });
 
@@ -155,7 +155,7 @@ async fn forward_at_type_in_where_finds_classes() {
     let q = json!({
         "@context": {"ex":"http://example.org/ns/"},
         "where": {"@id":"?x","@type":"?class"},
-        "select": ["?class"],
+        "select": "?class",
         "distinct": true
     });
 
@@ -262,7 +262,7 @@ async fn reverse_predicate_in_where_selects_parents() {
 
     let q = json!({
         "@context": ctx,
-        "select": ["?parent"],
+        "select": "?parent",
         "distinct": true,
         "where": {"@id":"ex:kid","parent":"?parent"}
     });
@@ -286,13 +286,13 @@ async fn type_reverse_and_forward_agree_on_classes() {
 
     let q_reverse = json!({
         "@context": {"ex":"http://example.org/ns/","isTypeObject":{"@reverse":"@type"}},
-        "select": ["?class"],
+        "select": "?class",
         "distinct": true,
         "where": {"@id":"?class","isTypeObject":"?x"}
     });
     let q_forward = json!({
         "@context": {"ex":"http://example.org/ns/"},
-        "select": ["?class"],
+        "select": "?class",
         "distinct": true,
         "where": {"@id":"?x","@type":"?class"}
     });

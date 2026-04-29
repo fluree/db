@@ -133,7 +133,7 @@ async fn geof_distance_in_filter_finds_nearby_cities() {
     // Paris coordinates for reference point - using s-expression filter
     let query = json!({
         "@context": ctx,
-        "select": ["?name"],
+        "select": "?name",
         "where": [
             {"@id": "?city", "@type": "ex:City", "ex:name": "?name", "ex:location": "?loc"},
             // Filter: distance from Paris < 500km (500000 meters)
@@ -184,7 +184,7 @@ async fn geof_distance_in_bind_calculates_distances() {
     // Get distance from Paris to London using bind with s-expression
     let query = json!({
         "@context": ctx,
-        "select": ["?distance"],
+        "select": "?distance",
         "where": [
             {"@id": "ex:paris", "ex:location": "?paris_loc"},
             {"@id": "ex:london", "ex:location": "?london_loc"},
@@ -226,7 +226,7 @@ async fn geof_distance_with_literal_wkt_points() {
     // Query using literal WKT points in BIND
     let query = json!({
         "@context": geo_context(),
-        "select": ["?distance"],
+        "select": "?distance",
         "where": [
             {"@id": "ex:placeholder", "ex:name": "?name"},
             // Paris to London using literal WKT strings
@@ -340,8 +340,9 @@ async fn geof_distance_via_sparql() {
 
     let rows = result.as_array().expect("result should be array");
     assert_eq!(rows.len(), 1, "Should have exactly one result");
-    // For single-variable select, the value is directly in rows[0] (not rows[0][0])
-    let distance = rows[0].as_f64().expect("distance should be number");
+    // SPARQL queries always return array-of-arrays, even for single-var selects.
+    let row = rows[0].as_array().expect("row should be array");
+    let distance = row[0].as_f64().expect("distance should be number");
 
     // Paris to London is approximately 343.5 km (343500 meters)
     assert!(

@@ -36,7 +36,7 @@ The `@context` defines namespace mappings for IRI expansion/compaction:
 }
 ```
 
-When querying via the **Fluree HTTP server or CLI**, omitting `@context` causes the ledger's [default context](../concepts/iri-and-context.md#default-context) to be injected automatically. To opt out and get full IRIs in results, pass an empty object: `"@context": {}`. See [opting out of the default context](../concepts/iri-and-context.md#opting-out-of-the-default-context).
+When querying via the **CLI**, omitting `@context` causes the ledger's [default context](../concepts/iri-and-context.md#default-context) to be injected automatically. The HTTP API defaults this behavior off; pass `?default-context=true` to opt in for a request. To opt out explicitly, pass an empty object: `"@context": {}`. See [opting out of the default context](../concepts/iri-and-context.md#opting-out-of-the-default-context).
 
 > **Note:** When using `fluree-db-api` directly (embedded), `@context` is not injected automatically. Queries must supply their own context or use full IRIs. Use `db_with_default_context()` or `GraphDb::with_default_context()` to opt in.
 
@@ -223,7 +223,15 @@ Match optional data that may not exist:
 }
 ```
 
-**Multiple Optionals:**
+#### Sibling vs. grouped OPTIONAL — semantics
+
+The two forms below are **not** equivalent. Each `["optional", ...]` array is a
+single OPTIONAL block in SPARQL terms — every item inside is part of the same
+conjunctive group, and a row is null-extended only when the group as a whole
+fails to match. To express two independent left joins, write two sibling
+arrays.
+
+**Sibling OPTIONALs — two independent left joins:**
 
 ```json
 {
@@ -235,7 +243,18 @@ Match optional data that may not exist:
 }
 ```
 
-**Grouped Optionals:**
+Equivalent SPARQL:
+
+```sparql
+?person ex:name ?name .
+OPTIONAL { ?person ex:email ?email }
+OPTIONAL { ?person ex:phone ?phone }
+```
+
+`?email` and `?phone` are independent — a person with only an email keeps
+`?email` bound and gets `null` for `?phone`, and vice versa.
+
+**Grouped OPTIONAL — one conjunctive left join:**
 
 ```json
 {
@@ -247,6 +266,39 @@ Match optional data that may not exist:
     ]
   ]
 }
+```
+
+Equivalent SPARQL:
+
+```sparql
+?person ex:name ?name .
+OPTIONAL { ?person ex:email ?email . ?person ex:phone ?phone }
+```
+
+`?email` and `?phone` are bound together — a person who has an email but no
+phone is null-extended on **both** variables, because the inner conjunctive
+group did not match as a whole.
+
+#### Filters and binds inside OPTIONAL
+
+`filter` and `bind` constrain or compute from existing bindings, so they need
+something to anchor to inside the OPTIONAL block. Any binding-producing
+pattern qualifies as an anchor — a node-map, `values`, an earlier `bind`, a
+nested `optional`, or a sub-`query`. A `filter` or `bind` as the very first
+item in an OPTIONAL array is rejected.
+
+```json
+["optional",
+  { "@id": "?person", "ex:age": "?age" },
+  ["filter", "(> ?age 18)"]
+]
+```
+
+```json
+["optional",
+  ["values", ["?x", [1, 2, 3]]],
+  ["filter", "(> ?x 0)"]
+]
 ```
 
 ### Union Patterns
@@ -801,8 +853,10 @@ History queries let you see all changes (assertions and retractions) within a ti
 
 Use `@t` and `@op` annotations on value objects to capture metadata:
 
-- **@t** - Binds the transaction time when the fact was asserted/retracted
-- **@op** - Binds the operation type: `"assert"` or `"retract"`
+- **@t** - Binds the transaction time (integer) when the fact was asserted/retracted.
+- **@op** - Binds the operation type as a boolean: `true` for assertions, `false` for retractions. (Mirrors `Flake.op` on disk; constants `"assert"` / `"retract"` are *not* accepted — use `true` / `false`.)
+
+Both annotations work uniformly for literal-valued and IRI-valued objects.
 
 **Entity History:**
 
@@ -851,6 +905,8 @@ Use `@t` and `@op` annotations on value objects to capture metadata:
 
 **Filter by Operation:**
 
+You can either use a constant `@op` shorthand (preferred) or filter on the bound variable:
+
 ```json
 {
   "@context": { "ex": "http://example.org/ns/" },
@@ -858,11 +914,12 @@ Use `@t` and `@op` annotations on value objects to capture metadata:
   "to": "ledger:main@t:latest",
   "select": ["?name", "?t"],
   "where": [
-    { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } },
-    ["filter", "(= ?op \"retract\")"]
+    { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": false } }
   ]
 }
 ```
+
+The shorthand `"@op": false` lowers to `FILTER(op(?name) = false)`. Equivalent long form using a bound variable: `"@op": "?op"` plus `["filter", "(= ?op false)"]`.
 
 **All Properties History:**
 

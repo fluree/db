@@ -997,11 +997,14 @@ impl crate::Fluree {
         // behavior.
         match self.ledger(&ledger_id).await {
             Ok(state) => {
+                // Use `state.t()` (= max(novelty.t, snapshot.t)) so that on a
+                // first-ever reindex (no prior index, all config in novelty)
+                // the config query isn't filtered out by
+                // `Novelty::for_each_overlay_flake`'s `flake.t <= to_t` guard.
+                let to_t = state.t();
                 let snapshot = &state.snapshot;
                 let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
-                match crate::config_resolver::resolve_ledger_config(snapshot, overlay, snapshot.t)
-                    .await
-                {
+                match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
                     Ok(Some(cfg)) => {
                         indexer_config.fulltext_configured_properties =
                             crate::config_resolver::configured_fulltext_properties_for_indexer(

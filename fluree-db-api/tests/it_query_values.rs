@@ -78,7 +78,7 @@ async fn values_top_level_no_where_single_var() {
 
     let query = json!({
         "@context": context_ex_schema(),
-        "select": ["?foo"],
+        "select": "?foo",
         "values": ["?foo", ["foo1","foo2","foo3"]]
     });
 
@@ -145,7 +145,7 @@ async fn values_equivalent_iri_forms_var_in_id_map() {
     let q1 = json!({
         "@context": ctx,
         "where": [{"@id":"?s","ex:friend":{"@id":"ex:alice"}}],
-        "select": ["?s"]
+        "select": "?s"
     });
 
     // variable via VALUES
@@ -153,7 +153,7 @@ async fn values_equivalent_iri_forms_var_in_id_map() {
         "@context": ctx,
         "values": ["?friend", [{"@value":"ex:alice","@type":"@id"}]],
         "where": [{"@id":"?s","ex:friend":"?friend"}],
-        "select": ["?s"]
+        "select": "?s"
     });
 
     // variable inside id-map
@@ -161,7 +161,7 @@ async fn values_equivalent_iri_forms_var_in_id_map() {
         "@context": ctx,
         "values": ["?friend", [{"@value":"ex:alice","@type":"@id"}]],
         "where": [{"@id":"?s","ex:friend":{"@id":"?friend"}}],
-        "select": ["?s"]
+        "select": "?s"
     });
 
     let r1 = support::query_jsonld(&fluree, &ledger, &q1)
@@ -292,7 +292,7 @@ async fn values_match_meta_language_tag() {
 
     let query = json!({
         "@context": ctx,
-        "select": ["?s"],
+        "select": "?s",
         "where": [
             {"@id":"?s","ex:greeting":"?greet"},
             ["values", ["?greet", [{"@value":"Здраво","@language":"sb"}]]]
@@ -369,7 +369,7 @@ async fn values_federated_query_connection_from_two_ledgers() {
     let query = json!({
         "@context": ctx,
         "from": ["values-test:main", "other-ledger:main"],
-        "select": ["?name"],
+        "select": "?name",
         "where": [
             {"@id":"?s","schema:name":"?name"},
             ["values", ["?s", [

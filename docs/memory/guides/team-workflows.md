@@ -18,10 +18,10 @@ That's it. No server, no sync daemon, no API tokens. Git is the sync mechanism.
 - `.fluree-memory/.gitignore`
 - Any IDE config MCP-install created: `.cursor/mcp.json`, `.cursor/rules/fluree_rules.md`, `.vscode/mcp.json`, `.vscode/fluree_rules.md`, `.zed/settings.json`
 
-❌ Don't commit (the `.fluree-memory/.gitignore` already handles this):
-- `.fluree-memory/.local/user.ttl` — your personal memories
-- `.fluree-memory/.local/mcp.log` — noisy and personal
-- `.fluree/` — the Fluree storage dir (can be re-hydrated from `repo.ttl`)
+❌ Don't commit:
+- `.fluree-memory/.local/user.ttl` — your personal memories *(handled by `.fluree-memory/.gitignore`)*
+- `.fluree-memory/.local/mcp.log` — noisy and personal *(handled by `.fluree-memory/.gitignore`)*
+- `.fluree/` — the Fluree storage dir, can be re-hydrated from `repo.ttl` *(add this to your project's root `.gitignore` — `.fluree-memory/.gitignore` only covers its own subtree)*
 
 ## Reviewing memory in PRs
 

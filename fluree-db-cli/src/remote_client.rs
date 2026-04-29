@@ -242,6 +242,15 @@ impl RemoteLedgerClient {
     /// safety net, not a policy knob.
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
+    /// Per-call timeout override for `POST /reindex`.
+    ///
+    /// A full commit-history rebuild on a large ledger can legitimately run
+    /// longer than the default 5-minute request timeout; if the client
+    /// abandons the connection, the server keeps rebuilding but the user
+    /// loses the result. 1 hour is a pragmatic ceiling — the server still
+    /// owns hard cutoffs.
+    pub const REINDEX_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
     /// Create a new remote ledger client with the default 5-minute timeout.
     ///
     /// `base_url` is the Fluree API base (e.g., `http://localhost:8090/fluree`
@@ -468,6 +477,52 @@ impl RemoteLedgerClient {
         Err(Self::map_error(resp).await)
     }
 
+    /// Execute a JSON request with a per-call timeout override.
+    ///
+    /// Used for operations (e.g. `/reindex`) whose legitimate duration can
+    /// exceed `DEFAULT_TIMEOUT`. On 401, attempts token refresh and retries once.
+    async fn send_json_with_timeout(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        content_type: &str,
+        body: Option<RequestBody<'_>>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let resp = self
+            .build_request(method.clone(), url, content_type, &body)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(Self::map_network_error)?;
+
+        if resp.status().is_success() {
+            return resp
+                .json()
+                .await
+                .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+        }
+
+        if resp.status() == StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            let resp2 = self
+                .build_request(method, url, content_type, &body)
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(Self::map_network_error)?;
+
+            if resp2.status().is_success() {
+                return resp2
+                    .json()
+                    .await
+                    .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+            }
+            return Err(Self::map_error(resp2).await);
+        }
+
+        Err(Self::map_error(resp).await)
+    }
+
     /// Execute a request with additional headers. On 401, attempt token refresh and retry once.
     async fn send_json_with_headers(
         &self,
@@ -595,6 +650,11 @@ impl RemoteLedgerClient {
         format!("{}/{}", self.base_url, op)
     }
 
+    fn with_default_context_param(mut url: String) -> String {
+        url.push_str("?default-context=true");
+        url
+    }
+
     // =========================================================================
     // Query
     // =========================================================================
@@ -605,7 +665,7 @@ impl RemoteLedgerClient {
         ledger: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let url = self.op_url("query", ledger);
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
         self.send_json(
             reqwest::Method::POST,
             &url,
@@ -621,7 +681,7 @@ impl RemoteLedgerClient {
         ledger: &str,
         sparql: &str,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let url = self.op_url("query", ledger);
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
         self.send_json(
             reqwest::Method::POST,
             &url,
@@ -641,7 +701,7 @@ impl RemoteLedgerClient {
         sparql: &str,
         accept: &str,
     ) -> Result<bytes::Bytes, RemoteLedgerError> {
-        let url = self.op_url("query", ledger);
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
         let resp = self
             .send_raw(
                 reqwest::Method::POST,
@@ -692,7 +752,7 @@ impl RemoteLedgerClient {
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let url = self.op_url_root("query");
+        let url = Self::with_default_context_param(self.op_url_root("query"));
         self.send_json(
             reqwest::Method::POST,
             &url,
@@ -1026,6 +1086,39 @@ impl RemoteLedgerClient {
     }
 
     // =========================================================================
+    // Reindex
+    // =========================================================================
+
+    /// Trigger a full reindex on the remote server.
+    ///
+    /// Calls `POST {base_url}/reindex` with `{"ledger": "<alias>"}`. The server
+    /// rebuilds the ledger's index from commit history using whatever indexer
+    /// settings it is configured with. Uses `REINDEX_TIMEOUT` (1 hour) because
+    /// full rebuilds can legitimately exceed the default client timeout on
+    /// large ledgers.
+    ///
+    /// An `opts` field is reserved in the request contract for future
+    /// per-request overrides but is currently ignored by the server.
+    pub async fn reindex(
+        &self,
+        ledger: &str,
+    ) -> Result<fluree_db_api::wire::ReindexResponse, RemoteLedgerError> {
+        let url = self.op_url_root("reindex");
+        let body = serde_json::json!({ "ledger": ledger });
+        let raw = self
+            .send_json_with_timeout(
+                reqwest::Method::POST,
+                &url,
+                "application/json",
+                Some(RequestBody::Json(&body)),
+                Self::REINDEX_TIMEOUT,
+            )
+            .await?;
+        serde_json::from_value(raw)
+            .map_err(|e| RemoteLedgerError::InvalidResponse(format!("reindex response: {e}")))
+    }
+
+    // =========================================================================
     // List ledgers
     // =========================================================================
 
@@ -1161,6 +1254,76 @@ impl RemoteLedgerClient {
         ledger: &str,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
         let url = format!("{}/branch/{}", self.base_url, ledger);
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// Read-only merge preview between two branches on the remote server.
+    ///
+    /// Calls `GET {base_url}/merge-preview/{ledger}?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=&include_conflict_details=&strategy=`.
+    /// The ledger path segment is URL-encoded (via [`op_url`](Self::op_url))
+    /// so names containing spaces, `?`, `#`, `%`, etc. produce well-formed URLs.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_preview(
+        &self,
+        ledger: &str,
+        source: &str,
+        target: Option<&str>,
+        max_commits: Option<usize>,
+        max_conflict_keys: Option<usize>,
+        include_conflicts: Option<bool>,
+        include_conflict_details: Option<bool>,
+        strategy: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url("merge-preview", ledger);
+        let mut sep = '?';
+        let push = |url: &mut String, sep: &mut char, key: &str, val: String| {
+            url.push(*sep);
+            url.push_str(key);
+            url.push('=');
+            url.push_str(&val);
+            *sep = '&';
+        };
+        push(
+            &mut url,
+            &mut sep,
+            "source",
+            urlencoding::encode(source).into_owned(),
+        );
+        if let Some(t) = target {
+            push(
+                &mut url,
+                &mut sep,
+                "target",
+                urlencoding::encode(t).into_owned(),
+            );
+        }
+        if let Some(n) = max_commits {
+            push(&mut url, &mut sep, "max_commits", n.to_string());
+        }
+        if let Some(n) = max_conflict_keys {
+            push(&mut url, &mut sep, "max_conflict_keys", n.to_string());
+        }
+        if let Some(b) = include_conflicts {
+            push(&mut url, &mut sep, "include_conflicts", b.to_string());
+        }
+        if let Some(b) = include_conflict_details {
+            push(
+                &mut url,
+                &mut sep,
+                "include_conflict_details",
+                b.to_string(),
+            );
+        }
+        if let Some(s) = strategy {
+            push(
+                &mut url,
+                &mut sep,
+                "strategy",
+                urlencoding::encode(s).into_owned(),
+            );
+        }
+
         self.send_json(reqwest::Method::GET, &url, "application/json", None)
             .await
     }
@@ -1438,6 +1601,19 @@ mod tests {
         assert_eq!(
             client.op_url("query", "trigger-test:testing"),
             "http://localhost:8090/fluree/query/trigger-test:testing"
+        );
+    }
+
+    #[test]
+    fn test_op_url_merge_preview_encodes_unsafe_chars() {
+        // Regression: merge-preview previously interpolated the ledger raw,
+        // breaking on names with spaces/?/#/% etc. The implementation now
+        // routes through `op_url` so these get URL-encoded the same as
+        // every other ledger-tailed endpoint.
+        let client = RemoteLedgerClient::new("http://localhost:8090/fluree", None);
+        assert_eq!(
+            client.op_url("merge-preview", "weird name?:branch#x"),
+            "http://localhost:8090/fluree/merge-preview/weird%20name%3F:branch%23x"
         );
     }
 

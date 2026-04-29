@@ -768,3 +768,132 @@ async fn nested_branch_data_isolation() {
     let rows = result.to_jsonld(&feature.snapshot).unwrap();
     assert_eq!(extract_names(&rows), vec!["Alice", "Bob", "Carol"]);
 }
+
+/// Incremental indexing on a branch must walk pre-fork ancestors.
+///
+/// Regression test for the bug where the background indexer scoped its
+/// content store to the branch's own namespace. Once the branch's first
+/// commit referenced a parent that lives under the source branch's
+/// prefix, both incremental indexing AND the full-rebuild fallback
+/// would 404 on every retry.
+///
+/// Also covers the binary-store attach path: after the branch is
+/// indexed, opening it must successfully read the index root that was
+/// just written under the branch namespace AND fall back to the
+/// parent's namespace for any inherited blobs.
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn branch_incremental_index_resolves_pre_fork_parent() {
+    use fluree_db_api::tx::IndexingMode;
+    use fluree_db_api::TriggerIndexOptions;
+    use std::sync::Arc;
+
+    let mut fluree = FlureeBuilder::memory().build_memory();
+    let (local, indexer_handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::default(),
+    );
+    fluree.set_indexing_mode(IndexingMode::Background(indexer_handle));
+
+    local
+        .run_until(async move {
+            // 1. Create main and seed two commits, then index — main has its
+            //    own commit chain and a published index root under main's prefix.
+            let ledger = fluree.create_ledger("mydb-bidx").await.unwrap();
+            let seed = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+            });
+            let r1 = fluree.insert(ledger, &seed).await.unwrap();
+            let main_after = r1.ledger;
+            let bob = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]
+            });
+            let r2 = fluree.insert(main_after, &bob).await.unwrap();
+            let main_t = r2.ledger.t();
+            assert!(main_t >= 2);
+
+            // Index main.
+            fluree
+                .trigger_index("mydb-bidx:main", TriggerIndexOptions::default())
+                .await
+                .expect("index main");
+
+            // 2. Branch dev from main. Dev inherits main's commit_head_id and
+            //    index_head_id at fork time — both point at blobs in main's
+            //    namespace.
+            fluree
+                .create_branch("mydb-bidx", "dev", None, None)
+                .await
+                .expect("create_branch");
+
+            // 3. Insert one commit on dev. Its `previous` points at main's
+            //    head — a CID whose blob lives only under main's prefix.
+            let dev_ledger = fluree.ledger("mydb-bidx:dev").await.expect("open dev");
+            let dev_commit = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:carol", "ex:name": "Carol"}]
+            });
+            let r3 = fluree
+                .insert(dev_ledger, &dev_commit)
+                .await
+                .expect("dev insert");
+            let dev_t = r3.ledger.t();
+            assert_eq!(dev_t, main_t + 1, "dev should advance from main's head");
+
+            // 4. Trigger indexing on dev. The indexer's commit-chain walk
+            //    crosses the fork: dev@dev_t in dev's namespace → previous
+            //    main@main_t in main's namespace. Without the branched store,
+            //    both incremental and the full-rebuild fallback 404 here —
+            //    and `process_ledger` keeps retrying without notifying
+            //    waiters, so the trigger would hang forever. The explicit
+            //    timeout turns a regression into a clean failure instead
+            //    of an infinite hang in CI.
+            let res = fluree
+                .trigger_index(
+                    "mydb-bidx:dev",
+                    TriggerIndexOptions::default().with_timeout(15_000),
+                )
+                .await
+                .expect("incremental index on dev should succeed across fork");
+            assert!(
+                res.index_t >= dev_t,
+                "dev's index_t={} should advance to cover commit_t={}",
+                res.index_t,
+                dev_t
+            );
+
+            // 5. Re-open dev to exercise the binary-store attach path. This
+            //    used to fail too — the index root and any inherited
+            //    leaf/branch blobs that live under main's namespace would 404
+            //    against dev's flat store.
+            let dev_after = fluree
+                .ledger("mydb-bidx:dev")
+                .await
+                .expect("re-open dev after indexing");
+            assert!(
+                dev_after.index_t() >= dev_t,
+                "re-opened dev should see the published index"
+            );
+
+            // 6. Sanity: the indexed branch returns content from across the
+            //    fork (Alice and Bob from main pre-fork, Carol from dev's own commit).
+            let query = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "select": ["?name"],
+                "where": {"@id": "?s", "ex:name": "?name"}
+            });
+            let result = support::query_jsonld(&fluree, &dev_after, &query)
+                .await
+                .unwrap();
+            let rows = result.to_jsonld(&dev_after.snapshot).unwrap();
+            assert_eq!(
+                extract_names(&rows),
+                vec!["Alice", "Bob", "Carol"],
+                "indexed branch should see pre-fork ancestors and its own commits"
+            );
+        })
+        .await;
+}

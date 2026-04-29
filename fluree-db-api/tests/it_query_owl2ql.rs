@@ -37,7 +37,7 @@ async fn owl2ql_equivalent_property_expands_across_properties() {
     // Query p2 should see p1 value when owl2ql enabled
     let q = json!({
         "@context": {"ex":"http://example.org/"},
-        "select": ["?v"],
+        "select": "?v",
         "where": {"@id":"ex:s","ex:p2":"?v"},
         "reasoning": "owl2ql"
     });
@@ -72,7 +72,7 @@ async fn owl_ql_alias_string_is_accepted() {
 
     let q = json!({
         "@context": {"ex":"http://example.org/"},
-        "select": ["?v"],
+        "select": "?v",
         "where": {"@id":"ex:s","ex:p2":"?v"},
         "reasoning": "owl-ql"
     });

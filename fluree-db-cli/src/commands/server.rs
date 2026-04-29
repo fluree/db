@@ -1029,7 +1029,13 @@ fn print_resolved_config(config: &ServerConfig, dirs: &FlureeDir) {
     eprintln!("  indexing:     {}", config.indexing_enabled);
     if config.indexing_enabled {
         eprintln!("    min_bytes:  {}", config.reindex_min_bytes);
-        eprintln!("    max_bytes:  {}", config.reindex_max_bytes);
+        eprintln!(
+            "    max_bytes:  {}",
+            config
+                .reindex_max_bytes
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "(default: 20% of RAM)".into())
+        );
     }
     eprintln!(
         "  cache_max_mb: {}",

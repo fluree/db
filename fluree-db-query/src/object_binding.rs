@@ -14,17 +14,32 @@ fn encoded_i_val(o_i: u32) -> i32 {
     }
 }
 
+/// Build a late-materialized object binding for the binary scan path.
+///
+/// `op` is `Some(true|false)` only in history mode (assert/retract) — it
+/// then flows onto ref-valued bindings (`EncodedSid` / blank-node `Sid`)
+/// alongside `t`, mirroring how literal-valued objects already carry the
+/// metadata. Callers outside history mode pass `None`.
 pub(crate) fn late_materialized_object_binding(
     o_type: u16,
     o_key: u64,
     p_id: u32,
     t: i64,
     o_i: u32,
+    op: Option<bool>,
 ) -> Option<Binding> {
     let ot = OType::from_u16(o_type);
     match ot.decode_kind() {
-        DecodeKind::IriRef => Some(Binding::EncodedSid { s_id: o_key }),
-        DecodeKind::BlankNode => Some(Binding::Sid(Sid::new(0, format!("_:b{o_key}")))),
+        DecodeKind::IriRef => Some(Binding::EncodedSid {
+            s_id: o_key,
+            t: Some(t),
+            op,
+        }),
+        DecodeKind::BlankNode => Some(Binding::Sid {
+            sid: Sid::new(0, format!("_:b{o_key}")),
+            t: Some(t),
+            op,
+        }),
         DecodeKind::StringDict => {
             let (dt_id, lang_id) = if ot.is_lang_string() {
                 (DatatypeDictId::LANG_STRING.as_u16(), ot.payload())
@@ -74,15 +89,22 @@ pub(crate) fn late_materialized_object_binding(
     }
 }
 
+/// Build a materialized object binding for the binary scan path.
+///
+/// `op` mirrors the meaning in `late_materialized_object_binding`: it is
+/// `Some(...)` only in history mode and is threaded onto the ref- and
+/// literal-valued binding alike, so downstream `T(?v)` / `OP(?v)`
+/// resolves uniformly across object types.
 pub(crate) fn materialized_object_binding(
     store: &BinaryIndexStore,
     o_type: u16,
     p_id: u32,
     val: FlakeValue,
     t: Option<i64>,
+    op: Option<bool>,
 ) -> Binding {
     match val {
-        FlakeValue::Ref(sid) => Binding::Sid(sid),
+        FlakeValue::Ref(sid) => Binding::Sid { sid, t, op },
         other => {
             let dtc = match store.resolve_lang_tag(o_type).map(Arc::from) {
                 Some(lang) => DatatypeConstraint::LangTag(lang),
@@ -96,7 +118,7 @@ pub(crate) fn materialized_object_binding(
                 val: other,
                 dtc,
                 t,
-                op: None,
+                op,
                 p_id: Some(p_id),
             }
         }

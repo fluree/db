@@ -374,7 +374,7 @@ impl ComparableValue {
                 FlakeValue::Boolean(b),
                 datatypes.xsd_boolean.clone(),
             )),
-            ComparableValue::Sid(sid) => Ok(Binding::Sid(sid)),
+            ComparableValue::Sid(sid) => Ok(Binding::sid(sid)),
             ComparableValue::Vector(v) => Ok(Binding::lit(
                 FlakeValue::Vector(v.to_vec()),
                 datatypes.fluree_vector.clone(),
@@ -409,7 +409,7 @@ impl ComparableValue {
                 // (UUID, IRI() function) that don't exist in the database.
                 if let Some(ctx) = ctx {
                     if let Some(sid) = ctx.active_snapshot.encode_iri_strict(&iri) {
-                        return Ok(Binding::Sid(sid));
+                        return Ok(Binding::sid(sid));
                     }
                 }
                 Ok(Binding::Iri(iri))

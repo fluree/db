@@ -66,12 +66,11 @@ impl Fluree {
         ledger: &LedgerState,
         query_json: &JsonValue,
     ) -> Result<QueryResult> {
-        let (vars, parsed) = parse_jsonld_query(
-            query_json,
-            &ledger.snapshot,
-            ledger.default_context.as_ref(),
-            None,
-        )?;
+        // No default-context auto-injection on this internal R2RML path —
+        // callers that want it should pre-merge `@context` into `query_json`
+        // (or wrap via `Fluree::db_with_default_context` if/when this method
+        // is refactored to take a `&GraphDb`).
+        let (vars, parsed) = parse_jsonld_query(query_json, &ledger.snapshot, None, None)?;
         let executable = ExecutableQuery::simple(parsed.clone());
 
         let r2rml_provider = crate::r2rml_provider!(self);
@@ -103,8 +102,8 @@ impl Fluree {
         ledger: &LedgerState,
         sparql: &str,
     ) -> Result<QueryResult> {
-        let (vars, parsed) =
-            parse_sparql_to_ir(sparql, &ledger.snapshot, ledger.default_context.as_ref())?;
+        // See `query_graph_source` above — no default-context injection here.
+        let (vars, parsed) = parse_sparql_to_ir(sparql, &ledger.snapshot, None)?;
         let executable = ExecutableQuery::simple(parsed.clone());
 
         let r2rml_provider = crate::r2rml_provider!(self);

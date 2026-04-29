@@ -20,7 +20,7 @@ WHERE {
 
 ### Default Prefixes
 
-When querying via the **Fluree HTTP server or CLI**, a ledger's [default context](../concepts/iri-and-context.md#default-context) prefix mappings are injected into SPARQL queries that have no explicit `PREFIX` declarations. For example, if the default context includes `{"ex": "http://example.org/ns/"}`, this query works without a `PREFIX` line:
+When querying via the **CLI**, a ledger's [default context](../concepts/iri-and-context.md#default-context) prefix mappings are injected into SPARQL queries that have no explicit `PREFIX` declarations. The HTTP API defaults this behavior off; pass `?default-context=true` on ledger-scoped query requests to opt in. For example, if the default context includes `{"ex": "http://example.org/ns/"}`, this query works without a `PREFIX` line when default-context injection is enabled:
 
 ```sparql
 SELECT ?name ?age
@@ -34,7 +34,7 @@ If a query includes any `PREFIX` declarations, the default context is not used â
 
 > **Note:** When using `fluree-db-api` directly (embedded), queries must declare their own `PREFIX` declarations. The default context is not injected automatically by the core API. Use `db_with_default_context()` or `GraphDb::with_default_context()` to opt in. See [Default Context](../concepts/iri-and-context.md#default-context) for details.
 
-You can view and manage the default context with `fluree context get/set` or `GET/PUT /fluree/context/:ledger`.
+You can view and manage the default context with `fluree context get/set` or `GET/PUT /v1/fluree/context/{ledger...}`.
 
 ## Query Forms
 
@@ -836,8 +836,8 @@ ORDER BY ?t
 ```
 
 The `<< subject predicate object >>` syntax (RDF-star) treats the triple as an entity that can have metadata:
-- `f:t` - Transaction time when the fact was asserted or retracted
-- `f:op` - Operation type: `"assert"` or `"retract"`
+- `f:t` - Transaction time (integer) when the fact was asserted or retracted.
+- `f:op` - Operation type as a boolean: `true` for assertions, `false` for retractions. Mirrors `Flake.op` on disk.
 
 **Filter by operation type:**
 
@@ -851,7 +851,7 @@ TO <ledger:main@t:latest>
 WHERE {
   << ex:alice ex:age ?age >> f:t ?t .
   << ex:alice ex:age ?age >> f:op ?op .
-  FILTER(?op = "retract")
+  FILTER(?op = false)
 }
 ```
 

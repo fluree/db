@@ -709,7 +709,6 @@ where
             head_index_id: base.head_index_id,
             ns_record: base.ns_record,
             binary_store: base.binary_store,
-            default_context: base.default_context,
             spatial_indexes: base.spatial_indexes,
         };
 
@@ -1023,7 +1022,10 @@ mod tests {
             .unwrap();
 
         // Commit
-        let config = IndexConfig::default();
+        let config = IndexConfig {
+            reindex_min_bytes: 100_000,
+            reindex_max_bytes: 1_000_000_000,
+        };
         let cs = content_store_for(storage.clone(), "test:main");
         let (receipt, new_state) = commit(
             view,
@@ -1061,7 +1063,10 @@ mod tests {
             .unwrap();
 
         // Commit should fail
-        let config = IndexConfig::default();
+        let config = IndexConfig {
+            reindex_min_bytes: 100_000,
+            reindex_max_bytes: 1_000_000_000,
+        };
         let cs = content_store_for(storage.clone(), "test:main");
         let result = commit(
             view,
@@ -1084,7 +1089,10 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
-        let config = IndexConfig::default();
+        let config = IndexConfig {
+            reindex_min_bytes: 100_000,
+            reindex_max_bytes: 1_000_000_000,
+        };
         let cs = content_store_for(storage.clone(), "test:main");
 
         // First commit
@@ -1213,7 +1221,10 @@ mod tests {
             .await
             .unwrap();
 
-        let config = IndexConfig::default();
+        let config = IndexConfig {
+            reindex_min_bytes: 100_000,
+            reindex_max_bytes: 1_000_000_000,
+        };
         let cs = content_store_for(storage.clone(), "test:main");
         let result = commit(
             view,

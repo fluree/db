@@ -8,8 +8,8 @@ use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
 use support::{
-    assert_index_defaults, genesis_ledger, normalize_rows, normalize_rows_array,
-    normalize_sparql_bindings, MemoryFluree, MemoryLedger,
+    assert_index_defaults, genesis_ledger, normalize_rows, normalize_sparql_bindings, MemoryFluree,
+    MemoryLedger,
 };
 
 fn normalize_object_rows(value: &JsonValue) -> Vec<String> {
@@ -408,8 +408,8 @@ async fn sparql_filter_query_outputs_jsonld_and_sparql_json() {
 
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([["bbob", 23], ["jdoe", 42], ["jdoe", 99]]))
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["bbob", 23], ["jdoe", 42], ["jdoe", 99]]))
     );
 
     let sparql_json = result
@@ -455,8 +455,7 @@ async fn sparql_count_star_counts_solutions() {
         .await
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    // Single-variable queries return flat array
-    assert_eq!(jsonld, json!([4]));
+    assert_eq!(jsonld, json!([[4]]));
 }
 
 #[tokio::test]
@@ -490,8 +489,8 @@ async fn sparql_count_distinct_with_group_by_and_order_by() {
     // fbueller has no favNums so won't appear
     // ORDER BY DESC means jbob first, then jdoe, then bbob
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([["jbob", 7], ["jdoe", 4], ["bbob", 1]]))
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["jbob", 7], ["jdoe", 4], ["bbob", 1]]))
     );
 }
 
@@ -529,8 +528,7 @@ async fn sparql_delete_data_removes_specified_triples() {
         .await
         .unwrap();
     let jsonld = result.to_jsonld(&ledger2.snapshot).expect("to_jsonld");
-    // Single-variable queries return flat array
-    assert_eq!(jsonld, json!([42, 99]));
+    assert_eq!(jsonld, json!([[42], [99]]));
 }
 
 #[tokio::test]
@@ -596,7 +594,7 @@ async fn sparql_lang_filter_limits_language_tagged_literals() {
         .await
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(jsonld, json!([{"@value": "Heyyyy", "@language": "en"}]));
+    assert_eq!(jsonld, json!([[{"@value": "Heyyyy", "@language": "en"}]]));
 }
 
 #[tokio::test]
@@ -621,7 +619,7 @@ async fn sparql_union_combines_unioned_patterns() {
         .await
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(jsonld, json!(["Alice", "Bob"]));
+    assert_eq!(jsonld, json!([["Alice"], ["Bob"]]));
 }
 
 #[tokio::test]
@@ -662,10 +660,7 @@ async fn sparql_optional_includes_unbound_values_as_null() {
         ["ex:jdoe", 99]
     ]);
 
-    assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&expected)
-    );
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&expected));
 }
 
 #[tokio::test]
@@ -700,10 +695,7 @@ async fn sparql_optional_multi_pattern_requires_conjunctive_match() {
         ["ex:jdoe", null, null]
     ]);
 
-    assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&expected)
-    );
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&expected));
 }
 
 #[tokio::test]
@@ -736,10 +728,7 @@ async fn sparql_group_by_with_optional_preserves_grouped_lists() {
         ["ex:jdoe", [3, 7, 42, 99]]
     ]);
 
-    assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&expected)
-    );
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&expected));
 }
 
 #[tokio::test]
@@ -772,10 +761,7 @@ async fn sparql_omitted_subjects_match_expanded_subject_bindings() {
         ["ex:jdoe", "Jane Doe", 99]
     ]);
 
-    assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&expected)
-    );
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&expected));
 }
 
 #[tokio::test]
@@ -797,16 +783,13 @@ async fn sparql_scalar_sha512_function_binds_values() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     let expected = json!([
-        "f162b1f2b3a824f459164fe40ffc24a019993058061ca1bf90eca98a4652f98ccaa5f17496be3da45ce30a1f79f45d82d8b8b532c264d4455babc1359aaa461d",
-        "eca2f5ab92fddbf2b1c51a60f5269086ce2415cb37964a05ae8a0b999625a8a50df876e97d34735ebae3fa3abb088fca005a596312fdf3326c4e73338f4c8c90",
-        "696ba1c7597f0d80287b8f0917317a904fa23a8c25564331a0576a482342d3807c61eff8e50bf5cf09859cfdeb92d448490073f34fb4ea4be43663d2359b51a9",
-        "fee256e1850ef33410630557356ea3efd56856e9045e59350dbceb6b5794041d50991093c07ad871e1124e6961f2198c178057cf391435051ac24eb8952bc401"
+        ["f162b1f2b3a824f459164fe40ffc24a019993058061ca1bf90eca98a4652f98ccaa5f17496be3da45ce30a1f79f45d82d8b8b532c264d4455babc1359aaa461d"],
+        ["eca2f5ab92fddbf2b1c51a60f5269086ce2415cb37964a05ae8a0b999625a8a50df876e97d34735ebae3fa3abb088fca005a596312fdf3326c4e73338f4c8c90"],
+        ["696ba1c7597f0d80287b8f0917317a904fa23a8c25564331a0576a482342d3807c61eff8e50bf5cf09859cfdeb92d448490073f34fb4ea4be43663d2359b51a9"],
+        ["fee256e1850ef33410630557356ea3efd56856e9045e59350dbceb6b5794041d50991093c07ad871e1124e6961f2198c178057cf391435051ac24eb8952bc401"]
     ]);
 
-    assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&expected)
-    );
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&expected));
 }
 
 #[tokio::test]
@@ -830,6 +813,8 @@ async fn sparql_aggregate_avg_over_values() {
     let avg = jsonld
         .as_array()
         .and_then(|arr| arr.first())
+        .and_then(|row| row.as_array())
+        .and_then(|row| row.first())
         .and_then(serde_json::Value::as_f64)
         .expect("avg result");
     assert!((avg - 17.666_666_666_666_67).abs() < 1e-12);
@@ -859,6 +844,7 @@ async fn sparql_group_by_having_filters_groups() {
         .as_array()
         .expect("avg rows array")
         .iter()
+        .flat_map(|row| row.as_array().expect("row array").iter())
         .filter_map(serde_json::Value::as_f64)
         .collect();
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -914,7 +900,7 @@ async fn sparql_having_aggregate_without_select_alias() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    assert_eq!(jsonld, json!(["ex:jbob"]));
+    assert_eq!(jsonld, json!([["ex:jbob"]]));
 }
 
 #[tokio::test]
@@ -935,7 +921,7 @@ async fn sparql_multiple_select_expressions_with_aggregate_alias() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    let rows = normalize_rows_array(&jsonld);
+    let rows = normalize_rows(&jsonld);
     assert_eq!(rows.len(), 1);
     let avg = rows[0][0].as_f64().expect("avg");
     let ceil = rows[0][1].as_f64().expect("ceil");
@@ -963,8 +949,8 @@ async fn sparql_group_concat_aggregate_per_group() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([["0, 3, 5, 6, 7, 8, 9"], ["3, 7, 42, 99"], ["23"]]))
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["0, 3, 5, 6, 7, 8, 9"], ["3, 7, 42, 99"], ["23"]]))
     );
 }
 
@@ -990,8 +976,8 @@ async fn sparql_concat_function_formats_strings() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
             ["bbob-Billy Bob"],
             ["dankeshön-Ferris Bueller"],
             ["jbob-Jenny Bob"],
@@ -1023,7 +1009,7 @@ async fn sparql_mix_of_grouped_values_and_aggregates() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    let mut rows: Vec<(String, String, Vec<i64>, f64, i64)> = normalize_rows_array(&jsonld)
+    let mut rows: Vec<(String, String, Vec<i64>, f64, i64)> = normalize_rows(&jsonld)
         .into_iter()
         .map(|row| {
             let fav_nums = row[0]
@@ -1095,8 +1081,8 @@ async fn sparql_count_aggregate_per_group() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([[7], [4], [1]]))
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([[7], [4], [1]]))
     );
 }
 
@@ -1120,8 +1106,8 @@ async fn sparql_count_star_per_group() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([[7], [4], [1]]))
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([[7], [4], [1]]))
     );
 }
 
@@ -1144,7 +1130,7 @@ async fn sparql_sample_aggregate_returns_one_value() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    let rows = normalize_rows_array(&jsonld);
+    let rows = normalize_rows(&jsonld);
     assert_eq!(rows.len(), 3);
     for row in rows {
         assert!(row[0].as_i64().is_some());
@@ -1171,8 +1157,8 @@ async fn sparql_sum_aggregate_per_group() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([[38], [151], [23]]))
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([[38], [151], [23]]))
     );
 }
 
@@ -1194,10 +1180,7 @@ async fn sparql_sum_boolean_comparison_counts_true_rows() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([[3]]))
-    );
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([[3]])));
 }
 
 #[tokio::test]
@@ -1219,7 +1202,7 @@ async fn sparql_order_by_ascending_sorts_results() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    assert_eq!(jsonld, json!(["bbob", "dankeshön", "jbob", "jdoe"]));
+    assert_eq!(jsonld, json!([["bbob"], ["dankeshön"], ["jbob"], ["jdoe"]]));
 }
 
 #[tokio::test]
@@ -1241,7 +1224,7 @@ async fn sparql_order_by_descending_sorts_results() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    assert_eq!(jsonld, json!(["jdoe", "jbob", "dankeshön", "bbob"]));
+    assert_eq!(jsonld, json!([["jdoe"], ["jbob"], ["dankeshön"], ["bbob"]]));
 }
 
 #[tokio::test]
@@ -1266,8 +1249,8 @@ async fn sparql_values_filters_bindings() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!(["bbob", "jdoe"]))
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["bbob"], ["jdoe"]]))
     );
 }
 
@@ -1412,8 +1395,8 @@ async fn sparql_base_iri_compacts_relative_ids() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
             ["1", "For Whom the Bell Tolls"],
             ["2", "The Hitchhiker's Guide to the Galaxy"]
         ]))
@@ -1440,8 +1423,8 @@ async fn sparql_prefix_declarations_compact_ids() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
             ["book:1", "For Whom the Bell Tolls"],
             ["book:2", "The Hitchhiker's Guide to the Galaxy"]
         ]))
@@ -1507,8 +1490,8 @@ async fn sparql_concat_with_langtag_argument() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&json!([
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
             ["Billy Bob's handle is bbob"],
             ["Ferris Bueller's handle is dankeshön"],
             ["Jenny Bob's handle is jbob"],
@@ -1531,7 +1514,7 @@ async fn sparql_property_path_inverse_object_var() {
         .await
         .expect("inverse path query should succeed");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!(["ex:a"])));
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["ex:a"]])));
 }
 
 #[tokio::test]
@@ -1548,7 +1531,7 @@ async fn sparql_property_path_inverse_subject_var() {
         .await
         .expect("inverse path subject var query should succeed");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!(["ex:b"])));
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["ex:b"]])));
 }
 
 #[tokio::test]
@@ -1575,7 +1558,7 @@ async fn sparql_property_path_alternative_object_var() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!(["ex:b", "ex:x"]))
+        normalize_rows(&json!([["ex:b"], ["ex:x"]]))
     );
 }
 
@@ -1595,7 +1578,7 @@ async fn sparql_property_path_alternative_with_inverse() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!(["ex:a", "ex:c", "ex:d"]))
+        normalize_rows(&json!([["ex:a"], ["ex:c"], ["ex:d"]]))
     );
 }
 
@@ -1624,7 +1607,7 @@ async fn sparql_property_path_alternative_three_way() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!(["ex:b", "ex:c", "ex:d"]))
+        normalize_rows(&json!([["ex:b"], ["ex:c"], ["ex:d"]]))
     );
 }
 
@@ -1654,7 +1637,7 @@ async fn sparql_property_path_alternative_duplicate_semantics() {
     // Bag semantics: ex:b appears once per matching branch
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!(["ex:b", "ex:b"]))
+        normalize_rows(&json!([["ex:b"], ["ex:b"]]))
     );
 }
 
@@ -1694,7 +1677,7 @@ async fn sparql_property_path_sequence_two_step() {
         .await
         .expect("two-step sequence query should succeed");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!(["Bob"])));
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Bob"]])));
 }
 
 #[tokio::test]
@@ -1711,7 +1694,7 @@ async fn sparql_property_path_sequence_three_step() {
         .await
         .expect("three-step sequence query should succeed");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!(["Carol"])));
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Carol"]])));
 }
 
 #[tokio::test]
@@ -1728,7 +1711,7 @@ async fn sparql_property_path_sequence_with_inverse() {
         .await
         .expect("sequence with inverse query should succeed");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!(["Alice"])));
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Alice"]])));
 }
 
 #[tokio::test]
@@ -1776,7 +1759,7 @@ async fn sparql_property_path_sequence_transitive_step_allowed() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!(["Bob", "Carol"]))
+        normalize_rows(&json!([["Bob"], ["Carol"]]))
     );
 }
 
@@ -1800,7 +1783,7 @@ async fn sparql_property_path_inverse_one_or_more() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!(["ex:a", "ex:b"]))
+        normalize_rows(&json!([["ex:a"], ["ex:b"]]))
     );
 }
 
@@ -1821,7 +1804,7 @@ async fn sparql_property_path_inverse_zero_or_more() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!(["ex:a", "ex:b"]))
+        normalize_rows(&json!([["ex:a"], ["ex:b"]]))
     );
 }
 
@@ -1842,7 +1825,7 @@ async fn sparql_property_path_alternative_of_sequences() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!(["Bob", "Carol"]))
+        normalize_rows(&json!([["Bob"], ["Carol"]]))
     );
 }
 
@@ -1869,7 +1852,7 @@ async fn sparql_property_path_alternative_mixed_simple_and_sequence() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!(["Alice", "Bob"]))
+        normalize_rows(&json!([["Alice"], ["Bob"]]))
     );
 }
 
@@ -1889,7 +1872,7 @@ async fn sparql_property_path_sequence_with_alternative_step() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!(["Bob", "Bobby"]))
+        normalize_rows(&json!([["Bob"], ["Bobby"]]))
     );
 }
 
@@ -1930,7 +1913,7 @@ async fn sparql_property_path_sequence_with_middle_alternative() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!(["Carol", "Caz"]))
+        normalize_rows(&json!([["Carol"], ["Caz"]]))
     );
 }
 
@@ -1952,7 +1935,7 @@ async fn sparql_property_path_inverse_of_sequence() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!(["ex:alice"]))
+        normalize_rows(&json!([["ex:alice"]]))
     );
 }
 
@@ -1974,7 +1957,7 @@ async fn sparql_property_path_inverse_of_alternative() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!(["ex:alice"]))
+        normalize_rows(&json!([["ex:alice"]]))
     );
 }
 
@@ -2222,7 +2205,7 @@ async fn sparql_bind_iri_with_optional_propagates_binding() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         jsonld,
-        json!(["Hello"]),
+        json!([["Hello"]]),
         "control: direct IRI in OPTIONAL should find label"
     );
 
@@ -2240,7 +2223,7 @@ async fn sparql_bind_iri_with_optional_propagates_binding() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         jsonld,
-        json!(["Hello"]),
+        json!([["Hello"]]),
         "BIND+OPTIONAL should propagate IRI into OPTIONAL"
     );
 }
@@ -2617,7 +2600,7 @@ async fn sparql_substr_multibyte_characters() {
         .expect("SUBSTR query");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    assert_eq!(jsonld, json!(["べ物"]));
+    assert_eq!(jsonld, json!([["べ物"]]));
 }
 
 #[tokio::test]
@@ -2637,7 +2620,7 @@ async fn sparql_substr_multibyte_no_length() {
         .expect("SUBSTR no-length query");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    assert_eq!(jsonld, json!(["べ物"]));
+    assert_eq!(jsonld, json!([["べ物"]]));
 }
 
 #[tokio::test]
@@ -2717,7 +2700,7 @@ async fn sparql_tz_returns_string() {
         .expect("TZ query");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    assert_eq!(jsonld, json!(["Z"]));
+    assert_eq!(jsonld, json!([["Z"]]));
 }
 
 #[tokio::test]
@@ -2938,7 +2921,7 @@ async fn sparql_xsd_cast_double_from_integer() {
         .await
         .expect("xsd:double cast query");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(jsonld, json!([42.0]));
+    assert_eq!(jsonld, json!([[42.0]]));
 }
 
 #[tokio::test]
@@ -2958,7 +2941,7 @@ async fn sparql_xsd_cast_string_from_integer() {
         .await
         .expect("xsd:string cast query");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(jsonld, json!(["42"]));
+    assert_eq!(jsonld, json!([["42"]]));
 }
 
 #[tokio::test]
@@ -2979,7 +2962,7 @@ async fn sparql_xsd_cast_invalid_returns_unbound() {
         .expect("invalid cast should not error");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     // Unbound projected variables serialize as null in JSON-LD
-    assert_eq!(jsonld, json!([null]));
+    assert_eq!(jsonld, json!([[null]]));
 }
 
 // ============================================================================
@@ -3026,6 +3009,7 @@ async fn sparql_bind01_exact_w3c_unbound_predicate() {
         .as_array()
         .expect("array")
         .iter()
+        .flat_map(|row| row.as_array().expect("row array").iter())
         .filter_map(serde_json::Value::as_i64)
         .collect();
     values.sort();
@@ -3071,6 +3055,7 @@ async fn sparql_bind_expression_in_select() {
         .as_array()
         .expect("array")
         .iter()
+        .flat_map(|row| row.as_array().expect("row array").iter())
         .map(|v| v.as_i64().expect("int"))
         .collect();
     values.sort();
@@ -3252,6 +3237,7 @@ async fn sparql_bind_in_union() {
         .as_array()
         .expect("array")
         .iter()
+        .flat_map(|row| row.as_array().expect("row array").iter())
         .filter_map(serde_json::Value::as_i64)
         .collect();
     values.sort();
@@ -3294,6 +3280,7 @@ async fn sparql_bind_with_filter() {
         .as_array()
         .expect("array")
         .iter()
+        .flat_map(|row| row.as_array().expect("row array").iter())
         .filter_map(serde_json::Value::as_i64)
         .collect();
     values.sort();
@@ -3481,8 +3468,8 @@ async fn sparql_star_query_with_optional_and_filter() {
     ]);
 
     assert_eq!(
-        normalize_rows_array(&jsonld),
-        normalize_rows_array(&expected),
+        normalize_rows(&jsonld),
+        normalize_rows(&expected),
         "Star query with OPTIONAL + FILTER should return matching rows.\nGot: {jsonld:#}"
     );
 }
@@ -3512,7 +3499,7 @@ async fn sparql_service_self_reference_returns_data() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         jsonld,
-        json!(["bbob", "dankeshön", "jbob", "jdoe"]),
+        json!([["bbob"], ["dankeshön"], ["jbob"], ["jdoe"]]),
         "SERVICE self-reference should return all handles.\nGot: {jsonld:#}"
     );
 }

@@ -377,10 +377,10 @@ Implementors MUST return these status codes consistently so the CLI can provide 
 | Endpoint | Success | Missing token | Bad token | Insufficient scope | Not found / no access |
 |----------|---------|---------------|-----------|---------------------|-----------------------|
 | `GET /.well-known/fluree.json` | `200` | n/a | n/a | n/a | `404` (not implemented) |
-| `POST /fluree/create` | `201` | `401` | `401` | `403` | n/a |
-| `POST /fluree/drop` | `200` | `401` | `401` | `403` | `404` |
-| `POST /fluree/query` | `200` | `401` | `401` | `404` (anti-leak) | `404` (anti-leak) |
-| `POST /fluree/update` | `200` | `401` | `401` | `404` (anti-leak) | `404` (anti-leak) |
+| `POST /v1/fluree/create` | `201` | `401` | `401` | `403` | n/a |
+| `POST /v1/fluree/drop` | `200` | `401` | `401` | `403` | `404` |
+| `POST /v1/fluree/query` | `200` | `401` | `401` | `404` (anti-leak) | `404` (anti-leak) |
+| `POST /v1/fluree/update` | `200` | `401` | `401` | `404` (anti-leak) | `404` (anti-leak) |
 | `POST /v1/fluree/auth/exchange` | `200` | n/a | `401` | `403` | n/a |
 | `GET /v1/fluree/whoami` | `200` | `200` (token_present=false) | `200` (verified=false) | n/a | n/a |
 

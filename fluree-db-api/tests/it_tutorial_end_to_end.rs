@@ -369,7 +369,7 @@ async fn tutorial_step3_update_and_time_travel() {
     // Query current state: should see updated content
     let query = json!({
         "@context": ctx(),
-        "select": ["?content"],
+        "select": "?content",
         "where": [{"@id": "ex:doc1", "ex:content": "?content"}]
     });
 
@@ -387,7 +387,7 @@ async fn tutorial_step3_update_and_time_travel() {
     let time_travel_query = json!({
         "@context": ctx(),
         "from": ["kb-timetravel:main@t:1"],
-        "select": ["?content"],
+        "select": "?content",
         "where": [{"@id": "ex:doc1", "ex:content": "?content"}]
     });
 
@@ -526,7 +526,7 @@ async fn tutorial_step4_branch_and_merge() {
     let branch_ledger = fluree.ledger("kb-branch:reorganize").await.unwrap();
     let vis_query = json!({
         "@context": ctx(),
-        "select": ["?vis"],
+        "select": "?vis",
         "where": [{"@id": "ex:doc3", "ex:visibility": "?vis"}]
     });
     let result = support::query_jsonld(&fluree, &branch_ledger, &vis_query)
@@ -662,7 +662,7 @@ async fn tutorial_step5_combined_workflow() {
     let tt_query = json!({
         "@context": ctx(),
         "from": ["kb-combined:main@t:1"],
-        "select": ["?content"],
+        "select": "?content",
         "where": [{"@id": "ex:doc1", "ex:content": "?content"}]
     });
     let result = fluree
@@ -791,7 +791,7 @@ async fn tutorial_turtle_insert() {
             "schema": "http://schema.org/",
             "ex": "http://example.org/"
         },
-        "select": ["?name"],
+        "select": "?name",
         "where": [{"@id": "ex:alice", "schema:name": "?name"}]
     });
     let result = support::query_jsonld(&fluree, &ledger, &query)

@@ -349,7 +349,11 @@ impl<'a> OwnedTransactBuilder<'a> {
     pub async fn execute(self) -> Result<TransactResult> {
         self.core.validate().map_err(ApiError::Builder)?;
 
-        let index_config = self.core.index_config.unwrap_or_default();
+        let index_config = self
+            .core
+            .index_config
+            .clone()
+            .unwrap_or_else(crate::server_defaults::default_index_config);
 
         // Pre-built Txn IR path (e.g., SPARQL UPDATE lowered to Txn)
         if let Some(txn) = self.core.pre_built_txn {
@@ -506,7 +510,11 @@ impl<'a> OwnedTransactBuilder<'a> {
     pub async fn stage(self) -> Result<Staged> {
         self.core.validate().map_err(ApiError::Builder)?;
 
-        let index_config = self.core.index_config.unwrap_or_default();
+        let index_config = self
+            .core
+            .index_config
+            .clone()
+            .unwrap_or_else(crate::server_defaults::default_index_config);
 
         // Pre-built Txn IR path
         if let Some(txn) = self.core.pre_built_txn {
@@ -745,7 +753,10 @@ pub(crate) async fn commit_with_handle(
 ) -> Result<TransactResultRef> {
     core.validate().map_err(ApiError::Builder)?;
 
-    let index_config = core.index_config.unwrap_or_default();
+    let index_config = core
+        .index_config
+        .clone()
+        .unwrap_or_else(crate::server_defaults::default_index_config);
     let store_raw_txn = core.txn_opts.store_raw_txn.unwrap_or(false);
 
     // Create tracker from builder-level tracking options when present.
@@ -889,6 +900,7 @@ pub(crate) async fn commit_with_handle(
             // Result unused: load_and_attach mutates new_state in-place
             let _store = crate::ledger_manager::load_and_attach_binary_store(
                 fluree.backend(),
+                fluree.nameservice(),
                 &mut new_state,
                 &cache_dir,
                 Some(std::sync::Arc::clone(fluree.leaflet_cache())),
@@ -1072,6 +1084,7 @@ pub(crate) async fn commit_with_handle(
             // Result unused: load_and_attach mutates new_state in-place
             let _store = crate::ledger_manager::load_and_attach_binary_store(
                 fluree.backend(),
+                fluree.nameservice(),
                 &mut new_state,
                 &cache_dir,
                 Some(std::sync::Arc::clone(fluree.leaflet_cache())),
