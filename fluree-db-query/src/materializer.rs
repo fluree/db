@@ -321,7 +321,7 @@ impl Materializer {
         match binding {
             Binding::Unbound | Binding::Poisoned => JoinKey::Absent,
 
-            Binding::Sid(sid) => {
+            Binding::Sid { sid, .. } => {
                 match self.mode {
                     JoinKeyMode::SingleLedger => {
                         // In single-ledger mode, (namespace_code, name) is a valid key
@@ -351,7 +351,7 @@ impl Materializer {
 
             Binding::Iri(iri) => JoinKey::Iri(Cow::Borrowed(iri.as_ref())),
 
-            Binding::EncodedSid { s_id } => {
+            Binding::EncodedSid { s_id, .. } => {
                 match self.mode {
                     JoinKeyMode::SingleLedger => JoinKey::Sid(*s_id),
                     JoinKeyMode::MultiLedger => {
@@ -422,13 +422,13 @@ impl Materializer {
         match binding {
             Binding::Unbound | Binding::Poisoned => None,
 
-            Binding::Sid(sid) => Some(ComparableValue::Sid(sid.clone())),
+            Binding::Sid { sid, .. } => Some(ComparableValue::Sid(sid.clone())),
 
             Binding::IriMatch { iri, .. } => Some(ComparableValue::Iri(Arc::clone(iri))),
 
             Binding::Iri(iri) => Some(ComparableValue::Iri(Arc::clone(iri))),
 
-            Binding::EncodedSid { s_id } => {
+            Binding::EncodedSid { s_id, .. } => {
                 let iri = self.resolve_iri(*s_id);
                 Some(ComparableValue::Iri(iri))
             }
@@ -472,7 +472,7 @@ impl Materializer {
         match binding {
             Binding::Unbound | Binding::Poisoned => None,
 
-            Binding::Sid(sid) => {
+            Binding::Sid { sid, .. } => {
                 // Decode to full IRI string.
                 // IMPORTANT: `namespace_code:name` is an internal representation and is not a full IRI.
                 // Unknown namespace code → None (strict decode).
@@ -494,7 +494,7 @@ impl Materializer {
 
             Binding::Iri(iri) => Some(Arc::clone(iri)),
 
-            Binding::EncodedSid { s_id } => Some(self.resolve_iri(*s_id)),
+            Binding::EncodedSid { s_id, .. } => Some(self.resolve_iri(*s_id)),
 
             Binding::EncodedPid { p_id } => self
                 .graph_view
@@ -537,20 +537,20 @@ impl Materializer {
             // Already materialized
             Binding::Unbound
             | Binding::Poisoned
-            | Binding::Sid(_)
+            | Binding::Sid { .. }
             | Binding::IriMatch { .. }
             | Binding::Iri(_)
             | Binding::Lit { .. }
             | Binding::Grouped(_) => binding.clone(),
 
-            Binding::EncodedSid { s_id } => {
+            Binding::EncodedSid { s_id, .. } => {
                 let sid = self.resolve_sid(*s_id);
-                Binding::Sid(sid)
+                Binding::sid(sid)
             }
 
             Binding::EncodedPid { p_id } => {
                 let sid = self.resolve_pid(*p_id);
-                Binding::Sid(sid)
+                Binding::sid(sid)
             }
 
             Binding::EncodedLit {
@@ -565,7 +565,7 @@ impl Materializer {
                 .graph_view
                 .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
             {
-                Ok(FlakeValue::Ref(sid)) => Binding::Sid(sid),
+                Ok(FlakeValue::Ref(sid)) => Binding::sid(sid),
                 Ok(val) => {
                     let dt_sid = self
                         .graph_view

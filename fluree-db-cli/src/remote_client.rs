@@ -650,6 +650,11 @@ impl RemoteLedgerClient {
         format!("{}/{}", self.base_url, op)
     }
 
+    fn with_default_context_param(mut url: String) -> String {
+        url.push_str("?default-context=true");
+        url
+    }
+
     // =========================================================================
     // Query
     // =========================================================================
@@ -660,7 +665,7 @@ impl RemoteLedgerClient {
         ledger: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let url = self.op_url("query", ledger);
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
         self.send_json(
             reqwest::Method::POST,
             &url,
@@ -676,7 +681,7 @@ impl RemoteLedgerClient {
         ledger: &str,
         sparql: &str,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let url = self.op_url("query", ledger);
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
         self.send_json(
             reqwest::Method::POST,
             &url,
@@ -696,7 +701,7 @@ impl RemoteLedgerClient {
         sparql: &str,
         accept: &str,
     ) -> Result<bytes::Bytes, RemoteLedgerError> {
-        let url = self.op_url("query", ledger);
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
         let resp = self
             .send_raw(
                 reqwest::Method::POST,
@@ -747,7 +752,7 @@ impl RemoteLedgerClient {
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let url = self.op_url_root("query");
+        let url = Self::with_default_context_param(self.op_url_root("query"));
         self.send_json(
             reqwest::Method::POST,
             &url,
@@ -1247,6 +1252,76 @@ impl RemoteLedgerClient {
             .await
     }
 
+    /// Read-only merge preview between two branches on the remote server.
+    ///
+    /// Calls `GET {base_url}/merge-preview/{ledger}?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=&include_conflict_details=&strategy=`.
+    /// The ledger path segment is URL-encoded (via [`op_url`](Self::op_url))
+    /// so names containing spaces, `?`, `#`, `%`, etc. produce well-formed URLs.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_preview(
+        &self,
+        ledger: &str,
+        source: &str,
+        target: Option<&str>,
+        max_commits: Option<usize>,
+        max_conflict_keys: Option<usize>,
+        include_conflicts: Option<bool>,
+        include_conflict_details: Option<bool>,
+        strategy: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url("merge-preview", ledger);
+        let mut sep = '?';
+        let push = |url: &mut String, sep: &mut char, key: &str, val: String| {
+            url.push(*sep);
+            url.push_str(key);
+            url.push('=');
+            url.push_str(&val);
+            *sep = '&';
+        };
+        push(
+            &mut url,
+            &mut sep,
+            "source",
+            urlencoding::encode(source).into_owned(),
+        );
+        if let Some(t) = target {
+            push(
+                &mut url,
+                &mut sep,
+                "target",
+                urlencoding::encode(t).into_owned(),
+            );
+        }
+        if let Some(n) = max_commits {
+            push(&mut url, &mut sep, "max_commits", n.to_string());
+        }
+        if let Some(n) = max_conflict_keys {
+            push(&mut url, &mut sep, "max_conflict_keys", n.to_string());
+        }
+        if let Some(b) = include_conflicts {
+            push(&mut url, &mut sep, "include_conflicts", b.to_string());
+        }
+        if let Some(b) = include_conflict_details {
+            push(
+                &mut url,
+                &mut sep,
+                "include_conflict_details",
+                b.to_string(),
+            );
+        }
+        if let Some(s) = strategy {
+            push(
+                &mut url,
+                &mut sep,
+                "strategy",
+                urlencoding::encode(s).into_owned(),
+            );
+        }
+
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
     // =========================================================================
     // Push commits
     // =========================================================================
@@ -1520,6 +1595,19 @@ mod tests {
         assert_eq!(
             client.op_url("query", "trigger-test:testing"),
             "http://localhost:8090/fluree/query/trigger-test:testing"
+        );
+    }
+
+    #[test]
+    fn test_op_url_merge_preview_encodes_unsafe_chars() {
+        // Regression: merge-preview previously interpolated the ledger raw,
+        // breaking on names with spaces/?/#/% etc. The implementation now
+        // routes through `op_url` so these get URL-encoded the same as
+        // every other ledger-tailed endpoint.
+        let client = RemoteLedgerClient::new("http://localhost:8090/fluree", None);
+        assert_eq!(
+            client.op_url("merge-preview", "weird name?:branch#x"),
+            "http://localhost:8090/fluree/merge-preview/weird%20name%3F:branch%23x"
         );
     }
 

@@ -730,6 +730,98 @@ async fn advance_frontier<C: ContentStore>(
     Ok(None)
 }
 
+// =============================================================================
+// CommitSummary - lightweight per-commit info for diff/log views
+// =============================================================================
+
+/// Per-commit summary suitable for diff/log views.
+///
+/// Built by counting [`Flake`] ops on a loaded [`Commit`]. The optional
+/// `message` is extracted from `txn_meta` when an entry with predicate
+/// `f:message` (namespace `FLUREE_DB`, local name `"message"`) is present
+/// and its value is a plain string. Other conventions are not recognized
+/// today.
+#[derive(Clone, Debug, Serialize)]
+pub struct CommitSummary {
+    pub t: i64,
+    pub commit_id: ContentId,
+    /// ISO 8601 from [`Commit::time`]. `None` for legacy commits without a timestamp.
+    pub time: Option<String>,
+    pub asserts: usize,
+    pub retracts: usize,
+    pub flake_count: usize,
+    /// Extracted from [`Commit::txn_meta`] when an `f:message` entry with a
+    /// string value is present. Often `None`.
+    pub message: Option<String>,
+}
+
+/// Build a [`CommitSummary`] from a fully-loaded [`Commit`].
+///
+/// Pure function — no I/O. The `commit.id` must be `Some` (it always is for
+/// commits loaded via [`load_commit_by_id`]).
+pub fn commit_to_summary(commit: &Commit) -> CommitSummary {
+    let commit_id = commit
+        .id
+        .clone()
+        .expect("commit_to_summary requires a Commit with id set (loaded via load_commit_by_id)");
+
+    let mut asserts = 0usize;
+    let mut retracts = 0usize;
+    for f in &commit.flakes {
+        if f.op {
+            asserts += 1;
+        } else {
+            retracts += 1;
+        }
+    }
+
+    let message = commit.txn_meta.iter().find_map(|entry| {
+        if entry.predicate_ns == fluree_vocab::namespaces::FLUREE_DB
+            && entry.predicate_name == "message"
+        {
+            if let TxnMetaValue::String(s) = &entry.value {
+                return Some(s.clone());
+            }
+        }
+        None
+    });
+
+    CommitSummary {
+        t: commit.t,
+        commit_id,
+        time: commit.time.clone(),
+        asserts,
+        retracts,
+        flake_count: commit.flakes.len(),
+        message,
+    }
+}
+
+/// Walk commits from `head` back to `stop_at_t` (exclusive), summarising each.
+///
+/// Returns `(summaries, total_count)`. `summaries` is newest-first (descending
+/// `t`) and capped by `max`. `total_count` always reflects the full divergence
+/// regardless of cap; truncation is implied by `summaries.len() < total_count`.
+///
+/// Reuses [`collect_dag_cids`] (one byte-range envelope read per commit in
+/// the divergence) plus one full [`load_commit_by_id`] per summary returned.
+pub async fn walk_commit_summaries<C: ContentStore>(
+    store: &C,
+    head: &ContentId,
+    stop_at_t: i64,
+    max: Option<usize>,
+) -> Result<(Vec<CommitSummary>, usize)> {
+    let dag = collect_dag_cids(store, head, stop_at_t).await?;
+    let total = dag.len();
+    let take_n = max.map_or(total, |cap| cap.min(total));
+    let mut summaries = Vec::with_capacity(take_n);
+    for (_t, cid) in dag.iter().take(take_n) {
+        let commit = load_commit_by_id(store, cid).await?;
+        summaries.push(commit_to_summary(&commit));
+    }
+    Ok((summaries, total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1139,5 +1231,184 @@ mod tests {
 
         assert_eq!(ancestor.commit_id, chain[0]);
         assert_eq!(ancestor.t, 1);
+    }
+
+    // =========================================================================
+    // CommitSummary / commit_to_summary / walk_commit_summaries tests
+    // =========================================================================
+
+    fn make_retract_flake(s: i64, p: i64, o: i64, t: i64) -> Flake {
+        Flake::new(
+            Sid::new(s as u16, format!("s{s}")),
+            Sid::new(p as u16, format!("p{p}")),
+            FlakeValue::Long(o),
+            Sid::new(2, "long"),
+            t,
+            false,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_commit_to_summary_counts_asserts_and_retracts() {
+        let cid = make_test_content_id(ContentKind::Commit, "summary-1");
+        let mut commit = Commit::new(
+            7,
+            vec![
+                make_test_flake(1, 2, 10, 7),
+                make_test_flake(1, 3, 11, 7),
+                make_retract_flake(2, 2, 20, 7),
+            ],
+        );
+        commit.id = Some(cid.clone());
+        commit.time = Some("2026-01-01T00:00:00Z".to_string());
+
+        let summary = commit_to_summary(&commit);
+        assert_eq!(summary.t, 7);
+        assert_eq!(summary.commit_id, cid);
+        assert_eq!(summary.asserts, 2);
+        assert_eq!(summary.retracts, 1);
+        assert_eq!(summary.flake_count, 3);
+        assert_eq!(summary.time.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert!(summary.message.is_none());
+    }
+
+    #[test]
+    fn test_commit_to_summary_extracts_f_message() {
+        let cid = make_test_content_id(ContentKind::Commit, "summary-msg");
+        let mut commit = Commit::new(3, vec![]);
+        commit.id = Some(cid);
+        commit.txn_meta = vec![TxnMetaEntry::new(
+            fluree_vocab::namespaces::FLUREE_DB,
+            "message",
+            TxnMetaValue::string("initial commit"),
+        )];
+
+        let summary = commit_to_summary(&commit);
+        assert_eq!(summary.message.as_deref(), Some("initial commit"));
+    }
+
+    #[test]
+    fn test_commit_to_summary_ignores_non_string_message() {
+        let cid = make_test_content_id(ContentKind::Commit, "summary-msg-int");
+        let mut commit = Commit::new(3, vec![]);
+        commit.id = Some(cid);
+        commit.txn_meta = vec![TxnMetaEntry::new(
+            fluree_vocab::namespaces::FLUREE_DB,
+            "message",
+            TxnMetaValue::long(42),
+        )];
+
+        let summary = commit_to_summary(&commit);
+        assert!(summary.message.is_none());
+    }
+
+    #[test]
+    fn test_commit_to_summary_ignores_other_namespace_message() {
+        let cid = make_test_content_id(ContentKind::Commit, "summary-msg-otherns");
+        let mut commit = Commit::new(3, vec![]);
+        commit.id = Some(cid);
+        // Same local name "message" but different namespace — should be ignored.
+        commit.txn_meta = vec![TxnMetaEntry::new(
+            999,
+            "message",
+            TxnMetaValue::string("not-a-commit-message"),
+        )];
+
+        let summary = commit_to_summary(&commit);
+        assert!(summary.message.is_none());
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn test_walk_commit_summaries_orders_newest_first() {
+        let store = MemoryContentStore::new();
+        let chain = store_chain(&store, 1, 4, None, 1).await;
+
+        let (summaries, total) = walk_commit_summaries(&store, chain.last().unwrap(), 0, None)
+            .await
+            .unwrap();
+
+        assert_eq!(total, 4);
+        assert_eq!(summaries.len(), 4);
+        // Newest-first (descending t).
+        assert_eq!(summaries[0].t, 4);
+        assert_eq!(summaries[1].t, 3);
+        assert_eq!(summaries[2].t, 2);
+        assert_eq!(summaries[3].t, 1);
+        // Each chain commit has one assert flake.
+        assert!(summaries.iter().all(|s| s.asserts == 1 && s.retracts == 0));
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn test_walk_commit_summaries_respects_stop_at_t() {
+        let store = MemoryContentStore::new();
+        let chain = store_chain(&store, 1, 4, None, 1).await;
+
+        // stop_at_t = 2 → only commits with t > 2 (t=3 and t=4).
+        let (summaries, total) = walk_commit_summaries(&store, chain.last().unwrap(), 2, None)
+            .await
+            .unwrap();
+
+        assert_eq!(total, 2);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].t, 4);
+        assert_eq!(summaries[1].t, 3);
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn test_walk_commit_summaries_caps_with_max() {
+        let store = MemoryContentStore::new();
+        let chain = store_chain(&store, 1, 5, None, 1).await;
+
+        // 5 commits in the divergence; cap to 2.
+        let (summaries, total) = walk_commit_summaries(&store, chain.last().unwrap(), 0, Some(2))
+            .await
+            .unwrap();
+
+        assert_eq!(total, 5, "total should reflect the full divergence");
+        assert_eq!(summaries.len(), 2, "summaries should be capped");
+        // Newest first.
+        assert_eq!(summaries[0].t, 5);
+        assert_eq!(summaries[1].t, 4);
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn test_walk_commit_summaries_handles_merge_commit() {
+        // Build:
+        //   shared: c1
+        //   branch_a: c1 <- a2 <- a3
+        //   branch_b: c1 <- b2
+        //   merge:   m4 with parents [a3, b2]
+        // walk_commit_summaries from m4 with stop_at_t = 0 should visit each of
+        // {m4, a3, a2, b2, c1} exactly once → total = 5.
+        let store = MemoryContentStore::new();
+        let shared = store_chain(&store, 1, 1, None, 1).await;
+        let branch_a = store_chain(&store, 2, 2, Some(shared[0].clone()), 100).await;
+        let branch_b = store_chain(&store, 2, 1, Some(shared[0].clone()), 200).await;
+
+        let merge_commit = Commit::new(4, vec![])
+            .with_previous_ref(CommitRef::new(branch_a.last().unwrap().clone()))
+            .with_previous_ref(CommitRef::new(branch_b[0].clone()));
+        let merge_id = store_commit(&store, &merge_commit).await;
+
+        let (summaries, total) = walk_commit_summaries(&store, &merge_id, 0, None)
+            .await
+            .unwrap();
+
+        assert_eq!(total, 5);
+        assert_eq!(summaries.len(), 5);
+        // Strictly t-descending.
+        for pair in summaries.windows(2) {
+            assert!(
+                pair[0].t >= pair[1].t,
+                "expected newest-first ordering: {} >= {}",
+                pair[0].t,
+                pair[1].t
+            );
+        }
     }
 }

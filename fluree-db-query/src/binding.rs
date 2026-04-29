@@ -41,7 +41,19 @@ pub enum Binding {
     ///
     /// Used in single-ledger mode where SID comparison is sufficient.
     /// For multi-ledger queries, prefer `IriMatch` which carries canonical IRI.
-    Sid(Sid),
+    ///
+    /// `t` and `op` carry history-mode metadata for ref-valued *object*
+    /// bindings (mirroring the Lit variant). Subject and predicate
+    /// bindings always set both to None — `T(?s)` / `OP(?p)` therefore
+    /// return null rather than inventing semantics for those positions.
+    /// Both fields are intentionally excluded from `PartialEq` and
+    /// `Hash` so set semantics (joins, DISTINCT, GROUP BY) ignore them,
+    /// exactly as for `Lit`.
+    Sid {
+        sid: Sid,
+        t: Option<i64>,
+        op: Option<bool>,
+    },
     /// IRI reference with canonical IRI and per-ledger SID cache
     ///
     /// Used in multi-ledger (dataset) mode to ensure correct cross-ledger joins.
@@ -97,8 +109,10 @@ pub enum Binding {
     /// - `dt_id`/`lang_id`/`i_val` provide literal metadata
     /// - `t` is the assertion transaction time (metadata)
     ///
-    /// NOTE: EncodedLit represents only literal values. References are still
-    /// represented as `Binding::Sid` (resolved via subject dictionaries).
+    /// NOTE: EncodedLit represents only literal values. References use
+    /// `Binding::Sid` (eagerly resolved via subject dictionaries) or
+    /// `Binding::EncodedSid` (late-materialised); both can carry the
+    /// same `t` / `op` history metadata that EncodedLit does.
     EncodedLit {
         o_kind: u8,
         o_key: u64,
@@ -113,6 +127,11 @@ pub enum Binding {
     /// Used to defer subject dictionary lookups until join/output time.
     /// The `s_id` is the raw u64 from the binary index.
     ///
+    /// `t` and `op` mirror the metadata fields on `Sid` and are
+    /// populated only for ref-valued *object* bindings produced from a
+    /// flake in history mode. They are intentionally excluded from
+    /// `PartialEq` and `Hash`.
+    ///
     /// # Single-Ledger Only
     ///
     /// `EncodedSid` comparison by `s_id` is only valid within a single ledger.
@@ -121,6 +140,10 @@ pub enum Binding {
     EncodedSid {
         /// Raw subject/ref ID from binary index
         s_id: u64,
+        /// Optional transaction time (history-mode object bindings only).
+        t: Option<i64>,
+        /// Optional operation type for history queries (true = assert, false = retract).
+        op: Option<bool>,
     },
     /// Encoded predicate ID (late materialization).
     ///
@@ -198,12 +221,90 @@ impl Binding {
         }
     }
 
+    /// Create a `Sid` binding without `t` / `op` metadata.
+    ///
+    /// Conventional constructor for subject and predicate bindings,
+    /// and any other ref binding that genuinely has no flake-scoped
+    /// metadata to carry (e.g. bindings synthesised from constants,
+    /// VALUES rows, or expression evaluation).
+    ///
+    /// Ref-valued *object* bindings emitted from a flake should use
+    /// [`Binding::sid_with_t`] (current-state scans) or
+    /// [`Binding::sid_with_t_op`] (history scans) so `T(?v)` / `OP(?v)`
+    /// resolve uniformly across literal- and IRI-valued predicates.
+    pub fn sid(sid: Sid) -> Self {
+        Binding::Sid {
+            sid,
+            t: None,
+            op: None,
+        }
+    }
+
+    /// Create a `Sid` binding with assertion-time metadata only.
+    ///
+    /// Used by ref-valued *object* bindings emitted by non-history
+    /// scans, mirroring how `Binding::Lit` already carries `t` for
+    /// literal-valued objects. `op` stays `None` because the
+    /// assert/retract distinction is only meaningful in history mode
+    /// (current-state scans only see asserts).
+    pub fn sid_with_t(sid: Sid, t: i64) -> Self {
+        Binding::Sid {
+            sid,
+            t: Some(t),
+            op: None,
+        }
+    }
+
+    /// Create a `Sid` binding with full history metadata.
+    ///
+    /// Used by ref-valued *object* bindings produced from a flake in
+    /// history mode. Subject and predicate bindings should use
+    /// `Binding::sid` instead.
+    pub fn sid_with_t_op(sid: Sid, t: i64, op: bool) -> Self {
+        Binding::Sid {
+            sid,
+            t: Some(t),
+            op: Some(op),
+        }
+    }
+
+    /// Extract the transaction time metadata from a binding, if any.
+    ///
+    /// Centralises the variant list so callers (notably `eval_t` and
+    /// any future `T()` consumers) don't need to enumerate every
+    /// metadata-carrying variant. Subject/predicate `Sid` and
+    /// `EncodedSid` bindings always return `None` because they don't
+    /// carry per-flake `t` — the field is only populated for object
+    /// bindings emitted by the scan.
+    pub fn t(&self) -> Option<i64> {
+        match self {
+            Binding::Lit { t, .. } => *t,
+            Binding::EncodedLit { t, .. } => Some(*t),
+            Binding::Sid { t, .. } => *t,
+            Binding::EncodedSid { t, .. } => *t,
+            _ => None,
+        }
+    }
+
+    /// Extract the operation type metadata from a binding, if any.
+    ///
+    /// Same rationale as `t()` — only populated for object bindings in
+    /// history mode.
+    pub fn op(&self) -> Option<bool> {
+        match self {
+            Binding::Lit { op, .. } => *op,
+            Binding::Sid { op, .. } => *op,
+            Binding::EncodedSid { op, .. } => *op,
+            _ => None,
+        }
+    }
+
     /// Create a binding from a flake's object value
     ///
     /// Automatically routes `FlakeValue::Ref` to `Binding::Sid`.
     pub fn from_object(val: FlakeValue, dt: Sid) -> Self {
         match val {
-            FlakeValue::Ref(sid) => Binding::Sid(sid),
+            FlakeValue::Ref(sid) => Binding::sid(sid),
             other => Binding::Lit {
                 val: other,
                 dtc: DatatypeConstraint::Explicit(dt),
@@ -219,7 +320,7 @@ impl Binding {
     /// Preserves language tags from `FlakeMeta.lang` for langString values.
     pub fn from_object_with_meta(val: FlakeValue, dt: Sid, meta: Option<FlakeMeta>) -> Self {
         match val {
-            FlakeValue::Ref(sid) => Binding::Sid(sid),
+            FlakeValue::Ref(sid) => Binding::sid(sid),
             other => {
                 let dtc = match meta.and_then(|m| m.lang.map(Arc::from)) {
                     Some(lang) => DatatypeConstraint::LangTag(lang),
@@ -242,7 +343,11 @@ impl Binding {
     /// as it preserves all metadata including the transaction time for `@t` bindings.
     pub fn from_object_with_t(val: FlakeValue, dt: Sid, meta: Option<FlakeMeta>, t: i64) -> Self {
         match val {
-            FlakeValue::Ref(sid) => Binding::Sid(sid),
+            FlakeValue::Ref(sid) => Binding::Sid {
+                sid,
+                t: Some(t),
+                op: None,
+            },
             other => {
                 let dtc = match meta.and_then(|m| m.lang.map(Arc::from)) {
                     Some(lang) => DatatypeConstraint::LangTag(lang),
@@ -262,7 +367,9 @@ impl Binding {
     /// Create a binding from a flake's object value with full metadata including t and op.
     ///
     /// This is used for history mode queries where both the transaction time and
-    /// operation type (assert/retract) need to be captured.
+    /// operation type (assert/retract) need to be captured. Both literal and
+    /// ref-valued objects carry the metadata so the parser-generated
+    /// `BIND(t(?v) AS ?t)` / `BIND(op(?v) AS ?op)` patterns work uniformly.
     pub fn from_object_with_t_op(
         val: FlakeValue,
         dt: Sid,
@@ -271,7 +378,7 @@ impl Binding {
         op: bool,
     ) -> Self {
         match val {
-            FlakeValue::Ref(sid) => Binding::Sid(sid),
+            FlakeValue::Ref(sid) => Binding::sid_with_t_op(sid, t, op),
             other => {
                 let dtc = match meta.and_then(|m| m.lang.map(Arc::from)) {
                     Some(lang) => DatatypeConstraint::LangTag(lang),
@@ -285,6 +392,27 @@ impl Binding {
                     p_id: None,
                 }
             }
+        }
+    }
+
+    /// Create a raw `EncodedSid` binding without history metadata.
+    pub fn encoded_sid(s_id: u64) -> Self {
+        Binding::EncodedSid {
+            s_id,
+            t: None,
+            op: None,
+        }
+    }
+
+    /// Create an `EncodedSid` binding with history metadata.
+    ///
+    /// Used by ref-valued object bindings emitted from the
+    /// late-materialised binary scan path in history mode.
+    pub fn encoded_sid_with_t_op(s_id: u64, t: i64, op: bool) -> Self {
+        Binding::EncodedSid {
+            s_id,
+            t: Some(t),
+            op: Some(op),
         }
     }
 
@@ -335,13 +463,13 @@ impl Binding {
     pub fn is_matchable(&self) -> bool {
         matches!(
             self,
-            Binding::Sid(_) | Binding::IriMatch { .. } | Binding::Iri(_) | Binding::Lit { .. }
+            Binding::Sid { .. } | Binding::IriMatch { .. } | Binding::Iri(_) | Binding::Lit { .. }
         )
     }
 
     /// Check if this is a reference/Sid binding (not IriMatch)
     pub fn is_sid(&self) -> bool {
-        matches!(self, Binding::Sid(_))
+        matches!(self, Binding::Sid { .. })
     }
 
     /// Check if this is an IriMatch binding (multi-ledger IRI reference)
@@ -353,7 +481,7 @@ impl Binding {
     pub fn is_iri_type(&self) -> bool {
         matches!(
             self,
-            Binding::Sid(_)
+            Binding::Sid { .. }
                 | Binding::IriMatch { .. }
                 | Binding::Iri(_)
                 | Binding::EncodedSid { .. }
@@ -394,7 +522,7 @@ impl Binding {
     /// Get the raw s_id from an EncodedSid binding.
     pub fn encoded_s_id(&self) -> Option<u64> {
         match self {
-            Binding::EncodedSid { s_id } => Some(*s_id),
+            Binding::EncodedSid { s_id, .. } => Some(*s_id),
             _ => None,
         }
     }
@@ -418,7 +546,7 @@ impl Binding {
             "as_sid() called on EncodedSid — use GraphDbRef::eager() for infrastructure queries"
         );
         match self {
-            Binding::Sid(sid) => Some(sid),
+            Binding::Sid { sid, .. } => Some(sid),
             _ => None,
         }
     }
@@ -430,7 +558,7 @@ impl Binding {
     /// For others: returns None
     pub fn get_sid_for_ledger(&self, _ledger_alias: &str) -> Option<&Sid> {
         match self {
-            Binding::Sid(sid) => Some(sid),
+            Binding::Sid { sid, .. } => Some(sid),
             Binding::IriMatch { primary_sid, .. } => Some(primary_sid),
             _ => None,
         }
@@ -498,22 +626,6 @@ impl Binding {
         );
         match self {
             Binding::Lit { val, dtc, .. } => Some((val, dtc)),
-            _ => None,
-        }
-    }
-
-    /// Get the operation type if this is a Lit binding with op set
-    pub fn op(&self) -> Option<bool> {
-        match self {
-            Binding::Lit { op, .. } => *op,
-            _ => None,
-        }
-    }
-
-    /// Get the transaction time if this is a Lit binding with t set
-    pub fn t(&self) -> Option<i64> {
-        match self {
-            Binding::Lit { t, .. } => *t,
             _ => None,
         }
     }
@@ -599,7 +711,7 @@ impl From<&Binding> for bool {
             } => *b,
             Binding::Lit { .. } => true,
             Binding::EncodedLit { .. } => true,
-            Binding::Sid(_) => true,
+            Binding::Sid { .. } => true,
             Binding::IriMatch { .. } => true,
             Binding::Iri(_) => true,
             Binding::EncodedSid { .. } => true,
@@ -630,8 +742,12 @@ impl PartialEq for Binding {
             (Binding::Unbound, Binding::Unbound) => true,
             (Binding::Poisoned, Binding::Poisoned) => true,
 
-            // Same-variant SID comparison (single-ledger mode)
-            (Binding::Sid(a), Binding::Sid(b)) => a == b,
+            // Same-variant SID comparison (single-ledger mode).
+            // `t` and `op` are metadata only and intentionally ignored — same
+            // discipline as the `Lit` variant, so set semantics (joins,
+            // DISTINCT, GROUP BY) treat a metadata-bearing object binding as
+            // equal to a metadata-free one with the same SID.
+            (Binding::Sid { sid: a, .. }, Binding::Sid { sid: b, .. }) => a == b,
 
             // IriMatch: compare canonical IRIs (multi-ledger mode)
             // This is the key for correct cross-ledger joins
@@ -650,12 +766,12 @@ impl PartialEq for Binding {
             // Sid vs IriMatch: These should not be compared directly.
             // If this happens, it indicates mixed single/multi-ledger mode which is a bug.
             // Return false to be conservative (no accidental matches).
-            (Binding::Sid(_), Binding::IriMatch { .. }) => false,
-            (Binding::IriMatch { .. }, Binding::Sid(_)) => false,
+            (Binding::Sid { .. }, Binding::IriMatch { .. }) => false,
+            (Binding::IriMatch { .. }, Binding::Sid { .. }) => false,
 
             // Sid vs Iri: Cannot compare without decode context
-            (Binding::Sid(_), Binding::Iri(_)) => false,
-            (Binding::Iri(_), Binding::Sid(_)) => false,
+            (Binding::Sid { .. }, Binding::Iri(_)) => false,
+            (Binding::Iri(_), Binding::Sid { .. }) => false,
 
             (
                 Binding::Lit {
@@ -706,20 +822,24 @@ impl PartialEq for Binding {
                 }
             },
 
-            // EncodedSid: compare by s_id directly (single-ledger only)
-            (Binding::EncodedSid { s_id: a }, Binding::EncodedSid { s_id: b }) => a == b,
+            // EncodedSid: compare by s_id directly (single-ledger only).
+            // `t` / `op` are metadata only and ignored, mirroring `Sid`.
+            (
+                Binding::EncodedSid { s_id: a, .. },
+                Binding::EncodedSid { s_id: b, .. },
+            ) => a == b,
 
             // EncodedPid: compare by p_id directly (single-ledger only)
             (Binding::EncodedPid { p_id: a }, Binding::EncodedPid { p_id: b }) => a == b,
 
             // EncodedSid vs Sid: NOT equal (don't mix encoded/decoded modes)
             // This prevents accidental mixing which could corrupt hash structures
-            (Binding::EncodedSid { .. }, Binding::Sid(_)) => false,
-            (Binding::Sid(_), Binding::EncodedSid { .. }) => false,
+            (Binding::EncodedSid { .. }, Binding::Sid { .. }) => false,
+            (Binding::Sid { .. }, Binding::EncodedSid { .. }) => false,
 
             // EncodedPid vs Sid: NOT equal
-            (Binding::EncodedPid { .. }, Binding::Sid(_)) => false,
-            (Binding::Sid(_), Binding::EncodedPid { .. }) => false,
+            (Binding::EncodedPid { .. }, Binding::Sid { .. }) => false,
+            (Binding::Sid { .. }, Binding::EncodedPid { .. }) => false,
 
             // EncodedSid/EncodedPid vs IriMatch/Iri: NOT equal (single vs multi-ledger)
             (Binding::EncodedSid { .. }, Binding::IriMatch { .. } | Binding::Iri(_)) => false,
@@ -757,7 +877,9 @@ impl std::hash::Hash for Binding {
             Binding::Poisoned => {
                 1u8.hash(state);
             }
-            Binding::Sid(sid) => {
+            Binding::Sid { sid, .. } => {
+                // `t` / `op` are metadata only and excluded from hashing
+                // to keep equality and hash consistent — see `PartialEq`.
                 2u8.hash(state);
                 sid.hash(state);
             }
@@ -797,8 +919,9 @@ impl std::hash::Hash for Binding {
                     p_id.hash(state);
                 }
             }
-            Binding::EncodedSid { s_id } => {
-                // Distinct discriminant from Sid (2) - they are not interchangeable
+            Binding::EncodedSid { s_id, .. } => {
+                // Distinct discriminant from Sid (2) - they are not interchangeable.
+                // `t` / `op` are metadata only and excluded.
                 7u8.hash(state);
                 s_id.hash(state);
             }
@@ -1366,7 +1489,7 @@ mod tests {
     fn test_batch_new() {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let columns = vec![
-            vec![Binding::Sid(test_sid()), Binding::Unbound],
+            vec![Binding::sid(test_sid()), Binding::Unbound],
             vec![
                 Binding::lit(FlakeValue::Long(1), xsd_long()),
                 Binding::lit(FlakeValue::Long(2), xsd_long()),
@@ -1407,8 +1530,8 @@ mod tests {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let columns = vec![
             vec![
-                Binding::Sid(Sid::new(1, "a")),
-                Binding::Sid(Sid::new(1, "b")),
+                Binding::sid(Sid::new(1, "a")),
+                Binding::sid(Sid::new(1, "b")),
             ],
             vec![
                 Binding::lit(FlakeValue::Long(10), xsd_long()),
@@ -1420,7 +1543,7 @@ mod tests {
 
         // Get by VarId
         let b = batch.get(0, VarId(0)).unwrap();
-        assert!(matches!(b, Binding::Sid(_)));
+        assert!(matches!(b, Binding::Sid { .. }));
 
         let b = batch.get(1, VarId(1)).unwrap();
         let (val, _) = b.as_lit().unwrap();
@@ -1544,7 +1667,7 @@ mod tests {
     fn test_batch_from_parts_round_trips_normal_batch() {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let columns = vec![
-            vec![Binding::Sid(test_sid()), Binding::Unbound],
+            vec![Binding::sid(test_sid()), Binding::Unbound],
             vec![
                 Binding::lit(FlakeValue::Long(1), xsd_long()),
                 Binding::lit(FlakeValue::Long(2), xsd_long()),
@@ -1635,7 +1758,7 @@ mod tests {
         // is_poisoned
         assert!(poisoned.is_poisoned());
         assert!(!Binding::Unbound.is_poisoned());
-        assert!(!Binding::Sid(test_sid()).is_poisoned());
+        assert!(!Binding::sid(test_sid()).is_poisoned());
         assert!(!Binding::lit(FlakeValue::Long(42), xsd_long()).is_poisoned());
     }
 
@@ -1648,7 +1771,7 @@ mod tests {
         assert!(!Binding::Unbound.is_matchable());
 
         // Sid IS matchable
-        assert!(Binding::Sid(test_sid()).is_matchable());
+        assert!(Binding::sid(test_sid()).is_matchable());
 
         // Lit IS matchable
         assert!(Binding::lit(FlakeValue::Long(42), xsd_long()).is_matchable());
@@ -1672,7 +1795,7 @@ mod tests {
         assert_ne!(Binding::Poisoned, Binding::Unbound);
 
         // Poisoned != Sid
-        assert_ne!(Binding::Poisoned, Binding::Sid(test_sid()));
+        assert_ne!(Binding::Poisoned, Binding::sid(test_sid()));
     }
 
     #[test]
@@ -1701,7 +1824,7 @@ mod tests {
         // is_grouped
         assert!(grouped.is_grouped());
         assert!(!Binding::Unbound.is_grouped());
-        assert!(!Binding::Sid(test_sid()).is_grouped());
+        assert!(!Binding::sid(test_sid()).is_grouped());
 
         // as_grouped
         let inner = grouped.as_grouped().unwrap();
@@ -1889,14 +2012,14 @@ mod tests {
         let sid_a = test_sid();
         let sid_b = test_sid();
 
-        let a = Binding::Sid(sid_a.clone());
-        let b = Binding::Sid(sid_b.clone());
+        let a = Binding::sid(sid_a.clone());
+        let b = Binding::sid(sid_b.clone());
 
         // Should use PartialEq which compares SIDs
         assert!(a.eq_for_join(&b));
 
         // Different SIDs should not match
-        let c = Binding::Sid(Sid::new(999, "other"));
+        let c = Binding::sid(Sid::new(999, "other"));
         assert!(!a.eq_for_join(&c));
     }
 
@@ -1919,7 +2042,7 @@ mod tests {
             ledger_alias: Arc::from("test/ledger"),
             iri: Arc::from("http://example.org/test"),
         };
-        let sid = Binding::Sid(test_sid());
+        let sid = Binding::sid(test_sid());
 
         assert!(!iri_match.eq_for_join(&sid));
     }

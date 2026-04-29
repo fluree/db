@@ -265,7 +265,7 @@ fn encoded_binding_cache_key(binding: &Binding) -> Option<EncodedBindingCacheKey
                 lang_id: *lang_id,
             })
         }
-        Binding::EncodedSid { s_id } => Some(EncodedBindingCacheKey::Sid { s_id: *s_id }),
+        Binding::EncodedSid { s_id, .. } => Some(EncodedBindingCacheKey::Sid { s_id: *s_id }),
         Binding::EncodedPid { p_id } => Some(EncodedBindingCacheKey::Pid { p_id: *p_id }),
         _ => None,
     }

@@ -1091,7 +1091,7 @@ fn materialize_one_binding(
 ) -> Result<()> {
     let store_ref = gv.store();
     match b {
-        Binding::EncodedSid { s_id } => {
+        Binding::EncodedSid { s_id, .. } => {
             let iri = store_ref.resolve_subject_iri(*s_id).map_err(|e| {
                 TransactError::Query(fluree_db_query::QueryError::Internal(format!(
                     "resolve_subject_iri: {e}"
@@ -1102,7 +1102,7 @@ fn materialize_one_binding(
                     "encode_iri returned None for subject IRI: {iri}"
                 )))
             })?;
-            *b = Binding::Sid(sid);
+            *b = Binding::sid(sid);
         }
         Binding::EncodedPid { p_id } => {
             let iri = store_ref.resolve_predicate_iri(*p_id).ok_or_else(|| {
@@ -1115,7 +1115,7 @@ fn materialize_one_binding(
                     "encode_iri returned None for predicate IRI: {iri}"
                 )))
             })?;
-            *b = Binding::Sid(sid);
+            *b = Binding::sid(sid);
         }
         Binding::EncodedLit {
             o_kind,
@@ -1137,7 +1137,7 @@ fn materialize_one_binding(
                 })?;
             match val {
                 FlakeValue::Ref(sid) => {
-                    *b = Binding::Sid(sid);
+                    *b = Binding::sid(sid);
                 }
                 other => {
                     let dt_sid = store_ref
@@ -1220,7 +1220,7 @@ fn binding_to_flake_object(
     materializer: Option<&mut fluree_db_query::Materializer>,
 ) -> Option<(FlakeValue, Sid)> {
     match binding {
-        Binding::Sid(sid) => Some((FlakeValue::Ref(sid.clone()), Sid::new(1, "id"))),
+        Binding::Sid { sid, .. } => Some((FlakeValue::Ref(sid.clone()), Sid::new(1, "id"))),
         Binding::IriMatch { primary_sid, .. } => {
             Some((FlakeValue::Ref(primary_sid.clone()), Sid::new(1, "id")))
         }
@@ -1256,7 +1256,7 @@ fn binding_to_flake_object(
 /// Convert a TemplateTerm to a Binding for VALUES clause
 fn template_term_to_binding(term: &TemplateTerm) -> Result<Binding> {
     match term {
-        TemplateTerm::Sid(sid) => Ok(Binding::Sid(sid.clone())),
+        TemplateTerm::Sid(sid) => Ok(Binding::sid(sid.clone())),
         TemplateTerm::Value(val) => {
             let dt = infer_datatype(val);
             Ok(Binding::lit(val.clone(), dt))
@@ -1852,16 +1852,14 @@ mod tests {
     fn column_needs_materialization_detects_each_encoded_variant() {
         // Already-concrete bindings — must NOT trigger rewrite.
         let concrete = vec![
-            Binding::Sid(Sid::new(1, "a")),
+            Binding::sid(Sid::new(1, "a")),
             Binding::Unbound,
             Binding::Poisoned,
         ];
         assert!(!column_needs_materialization(&concrete));
 
         // Each Encoded* variant must trigger rewrite individually.
-        assert!(column_needs_materialization(&[Binding::EncodedSid {
-            s_id: 7
-        }]));
+        assert!(column_needs_materialization(&[Binding::encoded_sid(7)]));
         assert!(column_needs_materialization(&[Binding::EncodedPid {
             p_id: 3
         }]));
@@ -1877,8 +1875,8 @@ mod tests {
 
         // A column with a single encoded entry among many concrete entries
         // must still trigger — early-exit on first hit.
-        let mut mixed = vec![Binding::Sid(Sid::new(1, "a")); 8];
-        mixed.push(Binding::EncodedSid { s_id: 1 });
+        let mut mixed = vec![Binding::sid(Sid::new(1, "a")); 8];
+        mixed.push(Binding::encoded_sid(1));
         mixed.extend(std::iter::repeat_n(Binding::Unbound, 4));
         assert!(column_needs_materialization(&mixed));
     }

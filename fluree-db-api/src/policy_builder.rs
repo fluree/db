@@ -822,7 +822,7 @@ async fn query_predicate(
 
         for flake in flakes {
             match flake.o {
-                FlakeValue::Ref(sid) => results.push(Binding::Sid(sid)),
+                FlakeValue::Ref(sid) => results.push(Binding::sid(sid)),
                 val => {
                     let dtc = match flake
                         .m

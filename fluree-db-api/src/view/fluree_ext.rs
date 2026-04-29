@@ -509,12 +509,7 @@ impl Fluree {
         // load path. Fetch it explicitly via the branch-aware helper using
         // the cached current-head record.
         if view.default_context.is_none() {
-            let handle = self.ledger_cached(parsed_id).await?;
-            let snap = handle.snapshot().await;
-            if let Some(record) = snap.ns_record.as_ref() {
-                let ctx = self.load_default_context_blob(record).await.ok().flatten();
-                view = view.with_default_context(ctx);
-            }
+            view = view.with_default_context(self.get_default_context(parsed_id).await?);
         }
         Ok(view)
     }

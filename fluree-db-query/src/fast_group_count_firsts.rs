@@ -253,7 +253,7 @@ impl Operator for PredicateGroupCountFirstsOperator {
             self.pos += 1;
 
             if o_type == OType::IRI_REF.as_u16() {
-                col_o.push(Binding::EncodedSid { s_id: o_key });
+                col_o.push(Binding::encoded_sid(o_key));
             } else {
                 let val = view
                     .decode_value(o_type, o_key, p_id)
@@ -1428,7 +1428,7 @@ fn compute_group_by_object_star_topk(
 
     for (k, st) in rows {
         if k.o_type == OType::IRI_REF.as_u16() {
-            col_o1.push(Binding::EncodedSid { s_id: k.o_key });
+            col_o1.push(Binding::encoded_sid(k.o_key));
         } else {
             let val = view
                 .decode_value(k.o_type, k.o_key, p_id)
@@ -1453,22 +1453,13 @@ fn compute_group_by_object_star_topk(
             dt_count.clone(),
         ));
         if want_min {
-            col_min.push(
-                st.min_s
-                    .map_or(Binding::Unbound, |s| Binding::EncodedSid { s_id: s }),
-            );
+            col_min.push(st.min_s.map_or(Binding::Unbound, Binding::encoded_sid));
         }
         if want_max {
-            col_max.push(
-                st.max_s
-                    .map_or(Binding::Unbound, |s| Binding::EncodedSid { s_id: s }),
-            );
+            col_max.push(st.max_s.map_or(Binding::Unbound, Binding::encoded_sid));
         }
         if want_sample {
-            col_sample.push(
-                st.sample_s
-                    .map_or(Binding::Unbound, |s| Binding::EncodedSid { s_id: s }),
-            );
+            col_sample.push(st.sample_s.map_or(Binding::Unbound, Binding::encoded_sid));
         }
     }
 

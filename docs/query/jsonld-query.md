@@ -36,7 +36,7 @@ The `@context` defines namespace mappings for IRI expansion/compaction:
 }
 ```
 
-When querying via the **Fluree HTTP server or CLI**, omitting `@context` causes the ledger's [default context](../concepts/iri-and-context.md#default-context) to be injected automatically. To opt out and get full IRIs in results, pass an empty object: `"@context": {}`. See [opting out of the default context](../concepts/iri-and-context.md#opting-out-of-the-default-context).
+When querying via the **CLI**, omitting `@context` causes the ledger's [default context](../concepts/iri-and-context.md#default-context) to be injected automatically. The HTTP API defaults this behavior off; pass `?default-context=true` to opt in for a request. To opt out explicitly, pass an empty object: `"@context": {}`. See [opting out of the default context](../concepts/iri-and-context.md#opting-out-of-the-default-context).
 
 > **Note:** When using `fluree-db-api` directly (embedded), `@context` is not injected automatically. Queries must supply their own context or use full IRIs. Use `db_with_default_context()` or `GraphDb::with_default_context()` to opt in.
 
@@ -853,8 +853,10 @@ History queries let you see all changes (assertions and retractions) within a ti
 
 Use `@t` and `@op` annotations on value objects to capture metadata:
 
-- **@t** - Binds the transaction time when the fact was asserted/retracted
-- **@op** - Binds the operation type: `"assert"` or `"retract"`
+- **@t** - Binds the transaction time (integer) when the fact was asserted/retracted.
+- **@op** - Binds the operation type as a boolean: `true` for assertions, `false` for retractions. (Mirrors `Flake.op` on disk; constants `"assert"` / `"retract"` are *not* accepted — use `true` / `false`.)
+
+Both annotations work uniformly for literal-valued and IRI-valued objects.
 
 **Entity History:**
 
@@ -903,6 +905,8 @@ Use `@t` and `@op` annotations on value objects to capture metadata:
 
 **Filter by Operation:**
 
+You can either use a constant `@op` shorthand (preferred) or filter on the bound variable:
+
 ```json
 {
   "@context": { "ex": "http://example.org/ns/" },
@@ -910,11 +914,12 @@ Use `@t` and `@op` annotations on value objects to capture metadata:
   "to": "ledger:main@t:latest",
   "select": ["?name", "?t"],
   "where": [
-    { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } },
-    ["filter", "(= ?op \"retract\")"]
+    { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": false } }
   ]
 }
 ```
+
+The shorthand `"@op": false` lowers to `FILTER(op(?name) = false)`. Equivalent long form using a bound variable: `"@op": "?op"` plus `["filter", "(= ?op false)"]`.
 
 **All Properties History:**
 

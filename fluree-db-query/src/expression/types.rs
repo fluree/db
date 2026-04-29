@@ -78,7 +78,7 @@ pub fn eval_is_blank<R: RowAccess>(
     match &args[0] {
         Expression::Var(v) => {
             let is_blank = match row.get(*v) {
-                Some(Binding::Sid(s)) => s.namespace_code == namespaces::BLANK_NODE,
+                Some(Binding::Sid { sid: s, .. }) => s.namespace_code == namespaces::BLANK_NODE,
                 Some(Binding::IriMatch {
                     iri, primary_sid, ..
                 }) => {
@@ -86,7 +86,7 @@ pub fn eval_is_blank<R: RowAccess>(
                         || iri.as_ref().starts_with("_:")
                 }
                 Some(Binding::Iri(iri)) => iri.as_ref().starts_with("_:"),
-                Some(Binding::EncodedSid { s_id }) => {
+                Some(Binding::EncodedSid { s_id, .. }) => {
                     SubjectId::from_u64(*s_id).ns_code() == namespaces::BLANK_NODE
                 }
                 _ => false,

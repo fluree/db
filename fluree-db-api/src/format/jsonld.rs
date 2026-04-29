@@ -82,7 +82,7 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
         Binding::Unbound | Binding::Poisoned => Ok(JsonValue::Null),
 
         // Reference (IRI or blank node) - compact using @context
-        Binding::Sid(sid) => Ok(JsonValue::String(compactor.compact_sid(sid)?)),
+        Binding::Sid { sid, .. } => Ok(JsonValue::String(compactor.compact_sid(sid)?)),
 
         // IriMatch: use canonical IRI, then compact (multi-ledger mode)
         Binding::IriMatch { iri, .. } => Ok(JsonValue::String(compactor.compact_iri(iri)?)),
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn test_format_binding_sid() {
         let compactor = make_test_compactor();
-        let binding = Binding::Sid(Sid::new(100, "alice"));
+        let binding = Binding::sid(Sid::new(100, "alice"));
         let result = format_binding(&binding, &compactor).unwrap();
         // Without @context, returns full IRI
         assert_eq!(result, json!("http://example.org/alice"));

@@ -801,6 +801,12 @@ GET  /query?query={urlencoded-sparql}   # SPARQL Protocol GET form
 
 The `GET` form is provided for W3C SPARQL Protocol compliance. It accepts SPARQL queries via the `query` query parameter; the body forms below are preferred for larger queries and for JSON-LD. The same form is available on the ledger-scoped `/query/{ledger}` route.
 
+**Optional Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `default-context` | boolean | `false` | When `true`, use the ledger's stored default JSON-LD context if the request omits its own `@context` (JSON-LD) or `PREFIX` declarations (ledger-scoped SPARQL). |
+
 **Request Headers:**
 ```http
 Content-Type: application/json
@@ -987,16 +993,18 @@ Query the history of entities using the standard `/query` endpoint with `from` a
 ```
 
 The `@t` and `@op` annotations capture transaction metadata:
-- **@t** - Transaction time when the value was asserted or retracted
-- **@op** - Operation type: `"assert"` or `"retract"`
+- **@t** - Transaction time (integer) when the fact was asserted or retracted.
+- **@op** - Operation type as a boolean: `true` for assertions, `false` for retractions. (Mirrors `Flake.op` on disk; constants `"assert"` / `"retract"` are not accepted.)
+
+Both annotations work uniformly for literal-valued and IRI-valued objects.
 
 **Response:**
 
 ```json
 [
-  ["Alice", 30, 1, "assert"],
-  ["Alice", 30, 5, "retract"],
-  ["Alicia", 31, 5, "assert"]
+  ["Alice", 30, 1, true],
+  ["Alice", 30, 5, false],
+  ["Alicia", 31, 5, true]
 ]
 ```
 
@@ -1648,9 +1656,9 @@ curl -X POST http://localhost:8090/v1/fluree/rebase \
 
 ### POST /merge
 
-Merge a source branch into a target branch (fast-forward only). Admin-protected.
+Merge a source branch into a target branch. Admin-protected.
 
-Currently only fast-forward merges are supported: the target branch must not have any new commits since the source branch was created from it. If the target has diverged, rebase the source branch first, then merge.
+Fast-forward merges copy the source commit chain into the target namespace and advance the target HEAD. When the target has diverged, Fluree performs a general merge: it computes the source and target deltas since their common ancestor, resolves overlapping `(s, p, g)` conflicts according to the requested strategy, and creates a merge commit on the target branch.
 
 **URL:**
 ```
@@ -1663,7 +1671,8 @@ POST /merge
 {
   "ledger": "mydb",
   "source": "feature-x",
-  "target": "dev"
+  "target": "dev",
+  "strategy": "take-both"
 }
 ```
 
@@ -1672,6 +1681,18 @@ POST /merge
 | `ledger` | string | Yes | Ledger name without branch suffix (e.g., "mydb") |
 | `source` | string | Yes | Source branch to merge from (e.g., "feature-x") |
 | `target` | string | No | Target branch to merge into (defaults to source's parent branch) |
+| `strategy` | string | No | Conflict resolution strategy for non-fast-forward merges. Defaults to `take-both`. Options: `take-both`, `abort`, `take-source`, `take-branch` |
+
+**Conflict strategies:**
+
+| Strategy | Behavior |
+|----------|----------|
+| `take-both` | Keep source flakes as-is, so both source and target values can coexist |
+| `abort` | Fail if conflicts are detected; no merge commit is created |
+| `take-source` | Source wins: keep source flakes and retract target's conflicting values |
+| `take-branch` | Target wins: drop source flakes for conflicting keys |
+
+`skip` is a rebase-only strategy and is not supported for non-fast-forward merges.
 
 **Response body (200 OK):**
 
@@ -1680,9 +1701,11 @@ POST /merge
   "ledger_id": "mydb:dev",
   "target": "dev",
   "source": "feature-x",
-  "fast_forward": true,
+  "fast_forward": false,
   "new_head_t": 8,
-  "commits_copied": 3
+  "commits_copied": 3,
+  "conflict_count": 1,
+  "strategy": "take-both"
 }
 ```
 
@@ -1691,16 +1714,18 @@ POST /merge
 | `ledger_id` | string | Full ledger:branch identifier of the target |
 | `target` | string | Target branch name |
 | `source` | string | Source branch name |
-| `fast_forward` | bool | Always `true` (only fast-forward is supported) |
+| `fast_forward` | bool | Whether this merge advanced the target directly to the source HEAD |
 | `new_head_t` | number | New commit HEAD transaction time of the target |
 | `commits_copied` | number | Number of commit blobs copied to the target namespace |
+| `conflict_count` | number | Number of overlapping `(s, p, g)` keys detected during a non-fast-forward merge |
+| `strategy` | string | Conflict strategy used for a non-fast-forward merge. Omitted for fast-forward merges |
 
 **Status codes:**
 
 - `200 OK` - Merge completed successfully
-- `400 Bad Request` - Source has no branch point (e.g., main), self-merge, or target mismatch
+- `400 Bad Request` - Source has no branch point (e.g., main), self-merge, unknown strategy, or unsupported merge strategy
 - `404 Not Found` - Ledger or branch does not exist
-- `409 Conflict` - Target has diverged; fast-forward not possible
+- `409 Conflict` - Merge aborted due to conflicts when using the `abort` strategy, or the target HEAD changed during commit publishing
 - `500 Internal Server Error` - Server error
 
 **Examples:**

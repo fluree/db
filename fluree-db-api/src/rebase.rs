@@ -8,7 +8,7 @@ use crate::error::{ApiError, Result};
 use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{
     range_with_overlay, ConflictKey, ContentId, Flake, IndexType, RangeMatch, RangeOptions,
-    RangeTest,
+    RangeTest, DEFAULT_GRAPH_ID,
 };
 use fluree_db_core::{trace_commits_by_id, Commit};
 use fluree_db_ledger::{LedgerState, LedgerView};
@@ -42,14 +42,33 @@ pub enum ConflictStrategy {
 }
 
 impl ConflictStrategy {
+    /// Parse a canonical strategy name from a string.
+    ///
+    /// Unlike [`Self::from_str_name`], this intentionally rejects aliases such
+    /// as `ours` and `theirs` for API surfaces that require a strict wire
+    /// contract.
+    pub fn parse_canonical(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "take-both" => Ok(Self::TakeBoth),
+            "abort" => Ok(Self::Abort),
+            "take-source" => Ok(Self::TakeSource),
+            "take-branch" => Ok(Self::TakeBranch),
+            "skip" => Ok(Self::Skip),
+            _ => Err(format!("Unknown conflict strategy: {s}")),
+        }
+    }
+
     /// Parse a strategy name from a string (case-insensitive).
     pub fn from_str_name(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "take-both" | "takeboth" | "take_both" => Some(Self::TakeBoth),
-            "abort" => Some(Self::Abort),
-            "take-source" | "takesource" | "take_source" | "theirs" => Some(Self::TakeSource),
-            "take-branch" | "takebranch" | "take_branch" | "ours" => Some(Self::TakeBranch),
-            "skip" => Some(Self::Skip),
+        let normalized = s.to_lowercase();
+        if let Ok(strategy) = Self::parse_canonical(&normalized) {
+            return Some(strategy);
+        }
+
+        match normalized.as_str() {
+            "takeboth" | "take_both" => Some(Self::TakeBoth),
+            "takesource" | "take_source" | "theirs" => Some(Self::TakeSource),
+            "takebranch" | "take_branch" | "ours" => Some(Self::TakeBranch),
             _ => None,
         }
     }
@@ -293,9 +312,11 @@ impl crate::Fluree {
     /// The actual replay loop + finalization, extracted so the caller can
     /// wrap it in a snapshot/rollback guard.
     async fn run_replay(&self, ctx: &ReplayContext<'_>) -> Result<RebaseReport> {
-        let mut current_state =
-            LedgerState::load(&self.nameservice_mode, ctx.source_id, self.backend()).await?;
+        let mut current_state = self.ledger(ctx.source_id).await?;
 
+        // Replay stages commits as writes to the branch. Start from the
+        // source's queryable state, but relabel the snapshot before staging so
+        // commit conflict checks and nameservice updates target the branch.
         current_state.snapshot.ledger_id = ctx.branch_id.to_string();
 
         let mut report = RebaseReport {
@@ -478,45 +499,19 @@ impl crate::Fluree {
         conflicting_keys: &[ConflictKey],
         source_state: &LedgerState,
     ) -> Result<Vec<Flake>> {
-        let t = source_state.t();
         let mut retractions = Vec::new();
 
         for key in conflicting_keys {
-            let g_id = match &key.g {
-                None => fluree_db_core::DEFAULT_GRAPH_ID,
-                Some(g_sid) => source_state
-                    .snapshot
-                    .decode_sid(g_sid)
-                    .and_then(|iri| source_state.snapshot.graph_registry.graph_id_for_iri(&iri))
-                    .unwrap_or(fluree_db_core::DEFAULT_GRAPH_ID),
-            };
-
-            let match_val = RangeMatch::subject_predicate(key.s.clone(), key.p.clone());
-            let opts = RangeOptions {
-                to_t: Some(t),
-                ..Default::default()
-            };
-
-            let source_flakes = range_with_overlay(
-                &source_state.snapshot,
-                g_id,
-                source_state.novelty.as_ref(),
-                IndexType::Spot,
-                RangeTest::Eq,
-                match_val,
-                opts,
-            )
-            .await?;
-
-            for flake in source_flakes {
-                if flake.op && flake.g == key.g {
-                    retractions.push(Flake {
+            retractions.extend(
+                current_asserted_for_key(source_state, key)
+                    .await?
+                    .into_iter()
+                    .map(|flake| Flake {
                         op: false,
                         t: 0, // overwritten by commit
                         ..flake
-                    });
-                }
-            }
+                    }),
+            );
         }
 
         Ok(retractions)
@@ -583,9 +578,7 @@ impl crate::Fluree {
             .publish_index(branch_id, index_result.index_t, &index_result.root_id)
             .await?;
 
-        LedgerState::load(&self.nameservice_mode, branch_id, self.backend())
-            .await
-            .map_err(Into::into)
+        self.ledger(branch_id).await
     }
 
     /// Copy index artifacts from source to branch (best-effort).
@@ -686,4 +679,43 @@ fn find_conflicting_keys(
             }
         })
         .collect()
+}
+
+pub(crate) async fn current_asserted_for_key(
+    state: &LedgerState,
+    key: &ConflictKey,
+) -> Result<Vec<Flake>> {
+    let g_id = match &key.g {
+        None => DEFAULT_GRAPH_ID,
+        Some(g_sid) => match state
+            .snapshot
+            .decode_sid(g_sid)
+            .and_then(|iri| state.snapshot.graph_registry.graph_id_for_iri(&iri))
+        {
+            Some(g_id) => g_id,
+            None => return Ok(Vec::new()),
+        },
+    };
+
+    let match_val = RangeMatch::subject_predicate(key.s.clone(), key.p.clone());
+    let opts = RangeOptions {
+        to_t: Some(state.t()),
+        ..Default::default()
+    };
+
+    let flakes = range_with_overlay(
+        &state.snapshot,
+        g_id,
+        state.novelty.as_ref(),
+        IndexType::Spot,
+        RangeTest::Eq,
+        match_val,
+        opts,
+    )
+    .await?;
+
+    Ok(flakes
+        .into_iter()
+        .filter(|flake| flake.op && flake.g == key.g)
+        .collect())
 }

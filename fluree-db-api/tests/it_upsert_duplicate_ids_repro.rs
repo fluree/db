@@ -244,13 +244,13 @@ async fn repro_upsert_repeated_ids_create_duplicate_subject_ids() {
                 for row in 0..batch.len() {
                     let b = batch.get_by_col(row, 0);
                     match b {
-                        Binding::EncodedSid { s_id } => {
+                        Binding::EncodedSid { s_id, .. } => {
                             let bg = bg.expect("EncodedSid requires binary_graph");
                             encoded_ids.push(*s_id);
                             decoded_iris
                                 .push(bg.resolve_subject_iri(*s_id).expect("decode subject iri"));
                         }
-                        Binding::Sid(sid) => decoded_iris.push(sid_to_iri(sid, codes)),
+                        Binding::Sid { sid, .. } => decoded_iris.push(sid_to_iri(sid, codes)),
                         other => panic!("unexpected binding for ?m: {other:?}"),
                     }
                 }

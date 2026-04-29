@@ -57,6 +57,7 @@ mod indexer_fulltext_provider;
 mod ledger;
 pub mod ledger_info;
 mod merge;
+mod merge_preview;
 pub mod nameservice_query;
 pub(crate) mod ns_helpers;
 pub mod ontology_imports;
@@ -110,6 +111,10 @@ pub use dataset::{
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result};
 pub use fluree_db_core::ContentId;
+pub use fluree_db_core::{
+    commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
+    ConflictKey,
+};
 pub use format::{AgentJsonContext, FormatError, FormatterConfig, OutputFormat, QueryOutput};
 pub use graph::Graph;
 pub use graph_commit_builder::{CommitBuilder, CommitDetail, ResolvedFlake, ResolvedValue};
@@ -131,6 +136,10 @@ pub use ledger_manager::{
     RemoteWatermark, UpdatePlan,
 };
 pub use merge::MergeReport;
+pub use merge_preview::{
+    AncestorRef, BranchDelta, ConflictDetail, ConflictResolutionPreview, ConflictSummary,
+    MergePreview, MergePreviewOpts,
+};
 pub use pack::{
     compute_missing_index_artifacts, full_ledger_pack_request, validate_pack_request, PackChunk,
     PackStreamError, PackStreamResult,
@@ -2202,6 +2211,11 @@ impl FlureeBuilder {
                     backend: backend.clone(),
                     nameservice: ns_for_provider,
                     leaflet_cache: Arc::new(fluree_db_binary_index::LeafletCache::with_max_mb(64)),
+                    cache_dir: self
+                        .ledger_cache_config
+                        .as_ref()
+                        .map(|config| config.cache_dir.clone())
+                        .unwrap_or_else(|| LedgerManagerConfig::default().cache_dir),
                 },
             ) as Arc<dyn fluree_db_indexer::FulltextConfigProvider>;
             let indexer_config = idx_config
@@ -2727,6 +2741,7 @@ impl Fluree {
                 backend: self.backend.clone(),
                 nameservice: self.nameservice_mode.as_arc_reader(),
                 leaflet_cache: Arc::clone(&self.leaflet_cache),
+                cache_dir: self.binary_store_cache_dir(),
             },
         )
     }

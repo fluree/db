@@ -271,7 +271,7 @@ impl Bm25SearchOperator {
                         Ok(None)
                     }
                 }
-                Some(Binding::Sid(sid)) => {
+                Some(Binding::Sid { sid, .. }) => {
                     // If user bound f:searchText to an IRI, treat its decoded IRI as the search string.
                     // (Not typical, but keeps query robust.)
                     Ok(ctx.decode_sid(sid))
@@ -286,7 +286,7 @@ impl Bm25SearchOperator {
                 }
                 Some(Binding::Grouped(_)) => Ok(None),
                 // EncodedSid/EncodedPid: decode to IRI string if store available
-                Some(Binding::EncodedSid { s_id }) => {
+                Some(Binding::EncodedSid { s_id, .. }) => {
                     // Novelty-aware: use graph_view() for subject resolution.
                     match ctx.resolve_subject_iri(*s_id) {
                         Some(Ok(iri)) => Ok(Some(iri)),

@@ -341,7 +341,7 @@ fn try_eval_simple_exists_semijoin(
     let Some(binding) = batch.get(row_idx, *subject_var) else {
         return Ok(Some(false));
     };
-    let Binding::Sid(sid) = binding else {
+    let Binding::Sid { sid, .. } = binding else {
         // Only handle the common single-ledger SID binding here.
         return Ok(None);
     };

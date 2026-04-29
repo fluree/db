@@ -208,7 +208,7 @@ pub fn label_regex_type_operator(
                 if !has {
                     continue;
                 }
-                col_s.push(Binding::EncodedSid { s_id });
+                col_s.push(Binding::encoded_sid(s_id));
                 let (label, lang) = &hit_labels[idx];
                 let lit = FlakeValue::String(label.clone());
                 col_label.push(match lang {

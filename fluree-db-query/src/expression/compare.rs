@@ -79,7 +79,7 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
         };
 
         match binding {
-            Binding::EncodedSid { s_id } => {
+            Binding::EncodedSid { s_id, .. } => {
                 let Some(lhs_iri) = ctx
                     .resolve_subject_iri(*s_id)
                     .transpose()
@@ -100,7 +100,7 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
                 log_fastpath_hit_once("EncodedSid");
                 Ok(Some(out))
             }
-            Binding::Sid(sid) => {
+            Binding::Sid { sid, .. } => {
                 let eq = match other {
                     ComparableValue::Sid(rhs) => {
                         if sid == &rhs {
