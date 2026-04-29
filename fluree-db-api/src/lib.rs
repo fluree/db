@@ -68,6 +68,7 @@ pub mod policy_view;
 mod query;
 mod rebase;
 pub mod remote_service;
+mod revert;
 pub(crate) mod runtime_dicts;
 pub mod server_defaults;
 mod time_resolve;
@@ -157,6 +158,7 @@ pub use query::builder::{
 pub use query::nameservice_builder::NameserviceQueryBuilder;
 pub use query::{QueryResult, TrackedErrorResponse, TrackedQueryResponse};
 pub use rebase::{ConflictStrategy, RebaseConflict, RebaseFailure, RebaseReport};
+pub use revert::RevertReport;
 pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,
     TransactResultRef,

@@ -1562,6 +1562,13 @@ pub mod db {
     /// System-controlled: derived from signed credential DID or `opts.identity`.
     pub const IDENTITY: &str = "identity";
 
+    /// db:reverts - commit ID being undone by a revert commit. One entry per
+    /// reverted commit; the value is the reverted commit's CID rendered as a
+    /// string (multibase-encoded CIDv1, matching `ContentId::Display`).
+    /// Mirrors git's "This reverts commit <hash>" convention so consumers can
+    /// reconstruct revert provenance from the txn-meta graph.
+    pub const REVERTS: &str = "reverts";
+
     /// db:txn - transaction address (optional)
     pub const TXN: &str = "txn";
 
