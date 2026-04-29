@@ -1,429 +1,148 @@
 # Policy Enforcement
 
-**Differentiator**: Fluree's policy system provides fine-grained, data-level access control that is enforced at query time, not at the application layer. This enables secure multi-tenant deployments, compliance with data privacy regulations, and trustless data sharing where users can only access data they're authorized to see.
+Fluree enforces access control inside the database. Individual facts (flakes) are filtered against policy rules during query and transaction execution, so the same query returns different results to different identities — automatically. The application doesn't filter; the database does.
 
-## What Is Policy Enforcement?
+## Why triple-level
 
-**Policy enforcement** in Fluree is a declarative access control system that filters query results based on rules defined in the data itself. Unlike traditional database access control that operates at the table or row level, Fluree policies operate at the triple (fact) level, providing unprecedented granularity.
+Most databases enforce access at the row, table, or schema level. That granularity is awkward for graph data, where a single subject may have facts that are public (`schema:name`), employee-only (`ex:department`), and HR-only (`ex:salary`). Fluree's enforcement happens **per flake** — `?subject ?predicate ?object` — so policies can permit `name`, allow `department` to platform employees, and restrict `salary` to managers in the same department, all from one query.
 
-### Key Characteristics
+The consequences:
 
-- **Data-Level Control**: Policies control access to individual facts (triples), not entire records
-- **Query-Time Enforcement**: Policies are evaluated during query execution, not at the application layer
-- **Declarative Rules**: Policies are expressed as data in the ledger, making them queryable and auditable
-- **Context-Aware**: Policies can consider user identity, roles, data relationships, and more
+- **No application-side filtering.** Security can't be bypassed by buggy code paths because the database never returns flakes the requester isn't allowed to see.
+- **Auditable.** Policies are themselves data. They live in the ledger, are time-travelable, and can be queried — `SELECT ?p WHERE { ?p a f:AccessPolicy }`.
+- **Multi-tenant ready.** A single ledger can serve many tenants, with isolation enforced at flake level.
+- **Compliance-friendly.** GDPR / HIPAA-style "minimum necessary" access is the default behavior, not a check the app forgot to do.
 
-## Why Policy Enforcement Matters
+## What a policy looks like
 
-### Traditional Access Control Limitations
+Every policy is a JSON-LD node typed `f:AccessPolicy`. A policy has three orthogonal pieces:
 
-Most databases provide access control at coarse granularity:
+- **Targeting** — `f:onProperty`, `f:onClass`, `f:onSubject` (each an array of `@id` references). Omit them all to make a *default policy* that applies to every flake.
+- **Action** — `f:action` with values `f:view` (queries) and/or `f:modify` (transactions).
+- **Decision** — either:
+  - `f:allow: true` — unconditional allow, or
+  - `f:allow: false` — unconditional deny, or
+  - `f:query: "<JSON-encoded WHERE>"` — allow when the embedded query produces at least one binding for the targeted flake.
 
-- **Database-level**: All or nothing access
-- **Table-level**: Access to entire tables
-- **Row-level**: Access to entire rows (still coarse for graph data)
+Two further knobs:
 
-**Problems:**
-- Over-privileged access (users see more than needed)
-- Complex application logic to filter results
-- Security vulnerabilities if application logic is bypassed
-- Difficult to audit who can access what
+- `f:required: true` — the policy *must* allow for access to the targeted flake to be granted, even when `default-allow` is true. Use it for hard constraints (PII protection, write barriers).
+- `f:exMessage` — a string returned to the caller when this policy denies a transaction.
 
-### Fluree's Approach
-
-Fluree policies operate at the **triple level**:
-
-- Control access to individual facts
-- Enforced automatically by the query engine
-- Cannot be bypassed by application code
-- Fully auditable (policies are data)
-
-**Benefits:**
-- Fine-grained security
-- Simplified application code
-- Compliance-ready (GDPR, HIPAA, etc.)
-- Multi-tenant ready
-
-## Policy Model
-
-### Policy Structure
-
-A policy in Fluree consists of:
-
-1. **Target**: What data the policy applies to (subjects, predicates, objects)
-2. **Conditions**: When the policy applies (user, role, context)
-3. **Actions**: What operations are allowed (read, write, etc.)
-
-### Policy Example
+A worked example:
 
 ```json
 {
-  "@context": {
-    "f": "https://ns.flur.ee/db#",
-    "ex": "http://example.org/ns/"
-  },
-  "@id": "ex:doctor-patient-policy",
-  "@type": "f:Policy",
-  "f:subject": "?user",
-  "f:action": "query",
-  "f:resource": {
-    "@type": "ex:Patient",
-    "ex:assignedDoctor": "?user"
-  },
-  "f:condition": [
-    { "@id": "?user", "ex:role": "doctor" }
-  ],
-  "f:allow": true
+  "@id": "ex:salary-restriction",
+  "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+  "f:required": true,
+  "f:onProperty": [{"@id": "ex:salary"}],
+  "f:action": [{"@id": "f:view"}],
+  "f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/role\": \"manager\"}}"
 }
 ```
 
-This policy allows doctors to read medical records only for patients assigned to them.
+Translation: *for every flake whose property is `ex:salary` and that someone is trying to read, this policy must allow. The embedded `f:query` runs with `?$identity` pre-bound to the requester; if it returns a binding (i.e. the identity has role `"manager"`), the flake is permitted.*
 
-## Policy Inputs
+## Variables in `f:query`
 
-Policies have access to contextual information:
+Inside an `f:query`, two variables are pre-bound:
 
-### Authentication Context
+| Variable | Meaning |
+|----------|---------|
+| `?$this` | The subject of the targeted flake (the entity being read or written). |
+| `?$identity` | The IRI of the requesting identity, supplied via `policy-values`. |
 
-- **User Identity**: Who is making the request
-- **Roles**: What roles the user has
-- **Groups**: What groups the user belongs to
-- **Attributes**: Custom user attributes
+Anything else is bound by the embedded WHERE just like a normal Fluree query.
 
-### Query Context
+## How the engine combines policies
 
-- **Ledger**: Which ledger is being queried
-- **Graph**: Which named graph (if applicable)
-- **Time**: Transaction time for time-travel queries
+When a request hits a flake, the engine collects every policy that targets it:
 
-### Data Context
+1. **Required policies** (with `f:required: true`) must all allow. If any required policy denies — including by returning no `f:query` bindings — the flake is denied.
+2. If no required policies target the flake, **any** allow is enough. Fluree uses *allow-overrides* across the non-required set.
+3. If no policies apply at all, the request falls back to `default-allow`.
 
-- **Subject**: The subject being accessed
-- **Predicate**: The predicate being accessed
-- **Object**: The object value
-- **Relationships**: Related data in the graph
+`default-allow: false` is fail-closed and the right choice for most production deployments.
 
-## Policy Evaluation
+## Where policies come from
 
-### Query-Time Enforcement
+Two delivery channels, often mixed:
 
-When a query executes:
+- **Stored** — write policies into the ledger as data. Tag each policy with a class (e.g. `ex:CorpPolicy`), and tag each identity entity with `f:policyClass` linking to that class. At request time, pass `policy-class: ["ex:CorpPolicy"]` and the engine pulls the matching policy set from the ledger automatically. Stored policies are versioned, time-travelable, and consistent across all callers — the right approach for production.
+- **Inline** — pass policies in `opts.policy` (an array of policy nodes) or via the `fluree-policy` HTTP header. Useful for ad-hoc queries, automated tests, and admin scripts.
 
-1. **Query Parsing**: Query is parsed into patterns
-2. **Policy Resolution**: Relevant policies are identified
-3. **Pattern Filtering**: Query patterns are filtered based on policies
-4. **Result Filtering**: Results are filtered to remove unauthorized data
-5. **Result Return**: Only authorized data is returned
+The two can be combined: a query can carry a `policy-class` *and* an additional inline `policy`.
 
-### Example Query with Policy
+## Identity binding
 
-**Query:**
-
-```sparql
-SELECT ?patient ?record
-WHERE {
-  ?patient ex:medicalRecord ?record .
-}
-```
-
-**Policy Applied:**
-
-- Doctor can only see records for assigned patients
-- Patient can only see their own records
-- Admin can see all records
-
-**Result:**
-
-Each user sees different results based on their authorization, even with the same query.
-
-## Policy Types
-
-### Subject-Based Policies
-
-Control access based on the subject being accessed:
+An identity entity ties a caller (DID, JWT subject, application user) to graph nodes that policies can reason about:
 
 ```json
 {
-  "f:subject": "?user",
-  "f:action": "query",
-  "f:resource": { "@type": "ex:Patient", "ex:owner": "?user" },
-  "f:allow": true
+  "@id": "ex:aliceIdentity",
+  "ex:user": {"@id": "ex:alice"},
+  "f:policyClass": [{"@id": "ex:CorpPolicy"}]
 }
 ```
 
-### Predicate-Based Policies
-
-Control access to specific predicates:
-
-```json
-{
-  "f:subject": "?user",
-  "f:action": "query",
-  "f:resource": { "f:predicate": "ex:salary" },
-  "f:condition": [
-    { "@id": "?user", "ex:role": "hr-manager" }
-  ],
-  "f:allow": true
-}
-```
-
-### Object-Based Policies
-
-Control access based on object values:
-
-```json
-{
-  "f:action": "query",
-  "f:resource": { "ex:classification": "public" },
-  "f:allow": true
-}
-```
-
-### Relationship-Based Policies
-
-Control access based on graph relationships:
-
-```json
-{
-  "f:subject": "?user",
-  "f:action": "query",
-  "f:resource": { "@type": "ex:Document", "ex:sharedWith": "?user" },
-  "f:allow": true
-}
-```
-
-## Use Cases
-
-### Multi-Tenant Applications
-
-Each tenant sees only their data:
-
-```json
-{
-  "f:subject": "?user",
-  "f:action": "*",
-  "f:resource": { "ex:tenant": "?tenantId" },
-  "f:condition": [
-    { "@id": "?user", "ex:tenant": "?tenantId" }
-  ],
-  "f:allow": true
-}
-```
-
-### Healthcare Compliance (HIPAA)
-
-Doctors can only access patient data they're authorized for:
-
-```json
-{
-  "f:subject": "?doctor",
-  "f:action": "query",
-  "f:resource": {
-    "@type": "ex:Patient",
-    "ex:assignedDoctor": "?doctor"
-  },
-  "f:condition": [
-    { "@id": "?doctor", "ex:role": "doctor" }
-  ],
-  "f:allow": true
-}
-```
-
-### Data Privacy (GDPR)
-
-Users can only access their own personal data:
-
-```json
-{
-  "f:subject": "?user",
-  "f:action": "query",
-  "f:resource": { "@id": "?user" },
-  "f:allow": true
-}
-```
-
-### Role-Based Access Control (RBAC)
-
-Different roles have different access levels:
-
-```json
-[
-  {
-    "f:subject": "?user",
-    "f:action": "*",
-    "f:resource": { "f:predicate": "ex:sensitiveData" },
-    "f:condition": [
-      { "@id": "?user", "ex:role": "admin" }
-    ],
-    "f:allow": true
-  },
-  {
-    "f:subject": "?user",
-    "f:action": "query",
-    "f:resource": { "f:predicate": "ex:sensitiveData" },
-    "f:condition": [
-      { "@id": "?user", "ex:role": "auditor" }
-    ],
-    "f:allow": true
-  }
-]
-```
-
-## Policy in Queries
-
-### Explicit Policy Context
-
-Queries can specify policy context:
-
-```json
-{
-  "select": ["?data"],
-  "where": [["?subject", "ex:data", "?data"]],
-  "policy": {
-    "auth": {
-      "subject": "ex:user123",
-      "roles": ["user"]
-    }
-  }
-}
-```
-
-### Implicit Policy Context
-
-When using the HTTP API, policy context comes from authentication:
-
-```http
-GET /query?ledger=mydb:main
-Authorization: Bearer <JWT token>
-```
-
-The JWT token contains the user identity and roles used for policy evaluation.
-
-## Policy in Transactions
-
-Policies can also control write access:
-
-```json
-{
-  "f:target": {
-    "f:predicate": "ex:salary"
-  },
-  "f:conditions": [
-    {
-      "f:rule": "f:equals",
-      "f:path": ["f:auth", "f:role"],
-      "f:value": "hr-manager"
-    }
-  ],
-  "f:actions": ["f:write"]
-}
-```
+Caller traffic carrying `identity: "ex:aliceIdentity"` causes:
 
-This policy allows only HR managers to modify salary data.
+1. Fluree binds `?$identity` to `ex:aliceIdentity` in every `f:query`.
+2. Stored policies tagged `ex:CorpPolicy` are loaded.
+3. Each policy's `f:query` runs against the snapshot, with `?$identity` and `?$this` pre-bound, deciding flake by flake whether the request is permitted.
 
-## Performance Considerations
+The `ex:user` link is a domain-specific convention — your `f:query`s use it to reach from the identity to the human/service the policies should reason about. Any modeling works; nothing about that link is special to Fluree.
 
-### Policy Evaluation Overhead
+## What you control at the request boundary
 
-Policy evaluation adds overhead to queries:
+Each request can supply:
 
-- **Pattern Matching**: Policies must be matched against query patterns
-- **Condition Evaluation**: Policy conditions must be evaluated
-- **Result Filtering**: Results must be filtered
+- **`identity`** — IRI of the calling identity entity. Used to pre-bind `?$identity` and to discover the identity's `f:policyClass`.
+- **`policy-class`** — one or more class IRIs to pull stored policies by class.
+- **`policy-values`** — an object of additional `?$var` bindings injected into every policy's `f:query`.
+- **`policy`** — an inline JSON-LD policy array.
+- **`default-allow`** — boolean fallback for flakes no policy targets.
 
-**Optimization Strategies:**
-- Index policies for fast lookup
-- Cache policy evaluation results
-- Optimize policy conditions
-- Use efficient policy rules
+Over JSON-LD, these go inside `opts`. Over SPARQL, they're sent as `fluree-*` headers (SPARQL has no `opts` block). When the server is configured with a default policy class, a verified bearer token's identity is auto-applied — see the [policy cookbook](../guides/cookbook-policies.md#invoking-policies-via-http) for the request shapes and the server-side `data_auth_default_policy_class` option in [Configuration](../operations/configuration.md).
 
-### Query Planning
+## Query enforcement vs transaction enforcement
 
-The query planner considers policies:
+The same policy model governs both, distinguished by `f:action`:
 
-- **Early Filtering**: Apply policies as early as possible
-- **Index Usage**: Use indexes that align with policy filters
-- **Join Optimization**: Consider policy constraints in join planning
+- **`f:view`** — runs during query execution. Flakes that fail the policy are filtered from the result; the query never sees them.
+- **`f:modify`** — runs during transaction staging. The transaction is rejected (with `f:exMessage` if provided) if a write would touch flakes the identity isn't allowed to modify.
 
-## Best Practices
+A single policy can govern both (`"f:action": [{"@id": "f:view"}, {"@id": "f:modify"}]`). Most realistic policy sets mix view-only restrictions, modify-only restrictions, and a small number of `[f:view, f:modify]` defaults.
 
-### Policy Design
+## Policies are data
 
-1. **Principle of Least Privilege**: Grant minimum necessary access
-2. **Explicit Rules**: Make policies explicit and clear
-3. **Test Policies**: Test policies thoroughly before deployment
-4. **Document Policies**: Document policy intent and rationale
+Because policies are flakes:
 
-### Policy Management
+- **Time travel.** Query at past `t` to see what was in effect.
+- **Branchable.** Trial policies on a branch before merging.
+- **Versionable.** Edit through normal transactions; full history kept.
+- **Self-querying.** Run reports over the policies themselves.
 
-1. **Version Control**: Track policy changes over time
-2. **Audit Policies**: Regularly audit who can access what
-3. **Policy Testing**: Test policies with different user contexts
-4. **Performance Monitoring**: Monitor policy evaluation performance
+This makes policy management a normal Fluree workflow rather than a sidecar problem.
 
-### Security Considerations
+## Performance shape
 
-1. **Policy Validation**: Validate policy syntax and semantics
-2. **Policy Testing**: Test edge cases and boundary conditions
-3. **Audit Logging**: Log policy evaluation decisions
-4. **Regular Review**: Regularly review and update policies
+Policy evaluation has two phases — load (read the policies relevant to this request once) and apply (filter flakes during plan execution). Cost scales mostly with the apply phase: how many flakes the request touches, and how expensive each policy's `f:query` is.
 
-## Comparison with Traditional Approaches
+Two practical implications:
 
-### Application-Level Filtering
+- **Target policies.** A policy with `f:onProperty` or `f:onClass` only runs on flakes whose predicate or rdf:type matches. Default policies (no targeting) run on every flake. Prefer targeting wherever it makes sense.
+- **Keep `f:query` cheap.** Lean on identity attributes already loaded (`@type`, `f:policyClass`, role flags) rather than deep traversals.
 
-**Traditional Approach:**
-```python
-# Application code must filter results
-results = db.query("SELECT * FROM data")
-filtered = [r for r in results if user.can_access(r)]
-```
+For deeper architectural detail see [Policy model and inputs](../security/policy-model.md), [Policy in queries](../security/policy-in-queries.md), and [Policy in transactions](../security/policy-in-transactions.md).
 
-**Problems:**
-- Security depends on application code
-- Easy to bypass if code has bugs
-- Complex filtering logic
-- Difficult to audit
+## Related documentation
 
-### Fluree Policy Approach
-
-**Fluree Approach:**
-```sparql
-# Policy enforced automatically by database
-SELECT ?data WHERE { ?subject ex:data ?data }
-# User only sees authorized data automatically
-```
-
-**Benefits:**
-- Security enforced by database
-- Cannot be bypassed
-- Simple query code
-- Fully auditable
-
-## Policy Architecture
-
-### Policy Storage
-
-Policies are stored as data in the ledger:
-
-- **Queryable**: Policies can be queried like any other data
-- **Versioned**: Policy changes are tracked over time
-- **Auditable**: Complete history of policy changes
-
-### Policy Evaluation Engine
-
-The policy evaluation engine:
-
-- **Integrates with Query Engine**: Evaluates policies during query execution
-- **Efficient**: Optimized for performance
-- **Extensible**: Supports custom policy rules
-
-### Policy API
-
-Policies are managed through:
-
-- **Data Transactions**: Create/update policies via transactions
-- **Query API**: Query existing policies
-- **Admin API**: Administrative operations on policies
-
-Policy enforcement makes Fluree uniquely suited for applications requiring fine-grained access control, multi-tenant architectures, and compliance with data privacy regulations. By enforcing policies at the database level, Fluree ensures security cannot be bypassed by application code, providing a foundation for trustless data sharing and secure multi-party systems.
+- [Cookbook: Access control policies](../guides/cookbook-policies.md) — worked examples for common patterns
+- [Policy model and inputs](../security/policy-model.md) — full reference
+- [Policy in queries](../security/policy-in-queries.md) — query-time behavior
+- [Policy in transactions](../security/policy-in-transactions.md) — transaction-time behavior
+- [Programmatic policy API (Rust)](../security/programmatic-policy.md) — building policy contexts in code
+- [Authentication](../security/authentication.md) — identity, JWTs, and bearer tokens
+- [Configuration](../operations/configuration.md) — server-side policy defaults (`data_auth_default_policy_class`, etc.)

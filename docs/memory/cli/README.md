@@ -24,7 +24,8 @@ A few flags show up across many subcommands:
 | `--scope <repo\|user>` | `repo` | `add`; filter on `recall` |
 | `--tags <t1,t2>` | none | `add`, `update`; filter on `recall` |
 | `--kind <kind>` | `fact` on `add` | `add`; filter on `recall` |
-| `--format <text\|json\|context>` | `text` | `add`, `recall`, `update` |
+| `--format <text\|json>` | `text` | `add`, `update` |
+| `--format <text\|json\|context>` | `text` | `recall` (XML `context` is for LLM injection) |
 
 See [What is a memory?](../concepts/what-is-a-memory.md) for the kind taxonomy.
 

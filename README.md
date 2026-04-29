@@ -134,16 +134,29 @@ Every transaction is immutable. Query data as it existed at any point in time �
 fluree query --at 2024-06-15T00:00:00Z 'SELECT * WHERE { ?s ?p ?o }'
 ```
 
+Learn more: [Time travel concepts](docs/concepts/time-travel.md), [time-travel cookbook](docs/guides/cookbook-time-travel.md).
+
 ### Integrated search
 
 BM25 full-text search and HNSW vector similarity are built into the query engine — not bolted-on external services. Search results participate in joins, filters, and aggregations like any other graph pattern.
 
-```sparql
-SELECT ?doc ?score WHERE {
-  ?doc <http://fluree.com/ns/fulltext> "knowledge graph" .
-  ?doc <http://fluree.com/ns/score> ?score .
-} ORDER BY DESC(?score) LIMIT 10
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "from": "mydb:main",
+  "where": [
+    { "@id": "?doc", "ex:title": "?title" },
+    ["bind", "?score", "(fulltext ?title \"knowledge graph\")"]
+  ],
+  "select": ["?doc", "?title", "?score"],
+  "orderBy": [["desc", "?score"]],
+  "limit": 10
+}
 ```
+
+For dedicated BM25 / HNSW graph sources, the same query engine drives the `f:graphSource` / `f:searchText` / `f:queryVector` patterns and can be backed by an embedded index or a remote `fluree-search-httpd` service.
+
+Learn more: [BM25 full-text](docs/indexing-and-search/bm25.md), [vector search](docs/indexing-and-search/vector-search.md), [search cookbook](docs/guides/cookbook-search.md).
 
 ### Git-like data management
 
@@ -158,17 +171,31 @@ fluree branch merge experiment     # fast-forward merge into main
 fluree branch drop experiment      # clean up
 ```
 
+Learn more: [branching cookbook](docs/guides/cookbook-branching.md), [Ledgers and the nameservice](docs/concepts/ledgers-and-nameservice.md).
+
 ### Triple-level access control
 
-Policies are data in the ledger, enforced at query time. Users see only what they're authorized to see — not rows, not tables, individual facts. No application-layer filtering required.
+Policies are data in the ledger, enforced at query and transaction time. Users see only what they're authorized to see — not rows, not tables, individual facts. No application-layer filtering required.
+
+See [Policy enforcement](docs/concepts/policy-enforcement.md) for the model, the [policy cookbook](docs/guides/cookbook-policies.md) for worked examples, and [Policy model and inputs](docs/security/policy-model.md) for the reference.
 
 ### Reasoning and inference
 
 RDFS subclass/subproperty reasoning, OWL 2 RL forward-chaining, and user-defined Datalog rules. The database infers facts you didn't explicitly store.
 
+Learn more: [Reasoning and inference](docs/concepts/reasoning.md), [OWL & RDFS support reference](docs/reference/owl-rdfs-support.md), [Datalog rules](docs/query/datalog-rules.md).
+
 ### Standards-first
 
 Full SPARQL 1.1 with zero compliance failures against the W3C test suite. Native JSON-LD for idiomatic JSON APIs. Both query languages access the same engine with the same capabilities — time travel, policies, graph sources, and all.
+
+Learn more: [SPARQL reference](docs/query/sparql.md), [JSON-LD Query reference](docs/query/jsonld-query.md), [Standards and feature flags](docs/reference/compatibility.md).
+
+### Also worth knowing
+
+- **[SHACL validation](docs/guides/cookbook-shacl.md)** — declarative shape constraints enforced at transaction time, with violations reported per-target, per-property.
+- **[OWL ontology imports](docs/design/ontology-imports.md)** — pull external vocabularies into a ledger via `f:schemaSource` + `owl:imports`, materialized at commit time.
+- **[Apache Iceberg / R2RML](docs/graph-sources/iceberg.md)** — query Parquet warehouses and relational stores as first-class graph sources alongside native Fluree data.
 
 ## Use it your way
 
@@ -188,29 +215,39 @@ curl -X POST http://localhost:8090/v1/fluree/query?ledger=mydb:main \
 **Rust library** — Embed Fluree directly in your application. No server process needed.
 ```rust
 let fluree = FlureeBuilder::memory().build_memory();
-let ledger = fluree.create_ledger("mydb").await?;
-let result = ledger.query_sparql("SELECT ?s WHERE { ?s a <http://schema.org/Person> }").await?;
+fluree.create_ledger("mydb").await?;
+
+let result = fluree.graph("mydb:main")
+    .query()
+    .sparql("SELECT ?s WHERE { ?s a <http://schema.org/Person> }")
+    .execute()
+    .await?;
+```
+
+**MCP server** — Expose Fluree to AI assistants over the Model Context Protocol.
+```bash
+fluree mcp serve            # stdio transport for Claude Desktop, Cursor, etc.
 ```
 
 ## Capabilities
 
 | | |
 |---|---|
-| **Query languages** | SPARQL 1.1, JSON-LD Query |
-| **Data formats** | JSON-LD, Turtle, TriG, N-Triples, N-Quads |
-| **Time travel** | Transaction number, ISO timestamp, commit ID |
-| **Full-text search** | Integrated BM25 with Block-Max WAND |
-| **Vector search** | Embedded HNSW or remote service |
-| **Reasoning** | RDFS, OWL 2 QL, OWL 2 RL, Datalog rules |
-| **Access control** | Triple-level policy enforcement |
-| **Geospatial** | GeoSPARQL, S2 cell indexing |
-| **Verifiability** | JWS-signed transactions, Verifiable Credentials |
-| **Data sources** | Apache Iceberg, R2RML relational mappings |
-| **Storage backends** | Memory, file, AWS S3 + DynamoDB, IPFS |
-| **Replication** | Clone, push, pull between instances |
-| **Branching** | Fork ledgers, independent commit histories |
-| **Observability** | OpenTelemetry tracing, structured logging |
-| **Validation** | SHACL shape constraints |
+| **Query languages** | [SPARQL 1.1](docs/query/sparql.md), [JSON-LD Query](docs/query/jsonld-query.md) |
+| **Data formats** | JSON-LD, [Turtle, TriG](docs/transactions/turtle.md), N-Triples, N-Quads |
+| **Time travel** | [Transaction number, ISO timestamp, commit ID](docs/concepts/time-travel.md) |
+| **Full-text search** | [Integrated BM25 with Block-Max WAND](docs/indexing-and-search/bm25.md) |
+| **Vector search** | [Embedded HNSW or remote service](docs/indexing-and-search/vector-search.md) |
+| **Reasoning** | [RDFS, OWL 2 QL, OWL 2 RL, Datalog rules](docs/reference/owl-rdfs-support.md) |
+| **Access control** | [Triple-level policy enforcement](docs/concepts/policy-enforcement.md) |
+| **Geospatial** | [GeoSPARQL, S2 cell indexing](docs/indexing-and-search/geospatial.md) |
+| **Verifiability** | [JWS-signed transactions, Verifiable Credentials](docs/api/signed-requests.md) |
+| **Data sources** | [Apache Iceberg](docs/graph-sources/iceberg.md), [R2RML relational mappings](docs/graph-sources/r2rml.md) |
+| **Storage backends** | [Memory, file, AWS S3 + DynamoDB, IPFS](docs/operations/storage.md) |
+| **Replication** | [Clone, push, pull between instances](docs/operations/query-peers.md) |
+| **Branching** | [Fork ledgers, independent commit histories](docs/guides/cookbook-branching.md) |
+| **Observability** | [OpenTelemetry tracing, structured logging](docs/operations/telemetry.md) |
+| **Validation** | [SHACL shape constraints](docs/guides/cookbook-shacl.md) |
 
 ## Documentation
 

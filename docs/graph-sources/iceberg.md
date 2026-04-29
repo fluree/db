@@ -85,16 +85,20 @@ R2RML can be omitted to auto-generate a direct mapping. AWS credentials for `dir
 
 ### Rust API
 
+`R2rmlCreateConfig::new` and `new_direct` take the R2RML mapping as a **content string** (Turtle or JSON-LD), not a file path — read the file yourself first. To reference an already-stored mapping by address instead, build the config directly with `R2rmlMappingInput::Address(...)`.
+
 **REST catalog mode (Polaris-style):**
 
 ```rust
 use fluree_db_api::R2rmlCreateConfig;
 
+let mapping = std::fs::read_to_string("mappings/orders.ttl")?;
+
 let config = R2rmlCreateConfig::new(
     "warehouse-orders",
     "https://polaris.example.com/api/catalog",
     "sales.orders",
-    "fluree:file://mappings/orders.ttl",
+    mapping,
 )
 .with_warehouse("my-warehouse")
 .with_auth_bearer("my-token")
@@ -108,10 +112,12 @@ fluree.create_r2rml_graph_source(config).await?;
 ```rust
 use fluree_db_api::R2rmlCreateConfig;
 
+let mapping = std::fs::read_to_string("mappings/execution_log.ttl")?;
+
 let config = R2rmlCreateConfig::new_direct(
     "execution-log",
     "s3://bucket/warehouse/logs/execution_log",
-    "fluree:file://mappings/execution_log.ttl",
+    mapping,
 )
 .with_s3_region("us-east-1")
 .with_s3_path_style(true);
