@@ -1246,6 +1246,53 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// Revert one or more commits on `branch` of `ledger`.
+    ///
+    /// Calls `POST {base_url}/revert`. The body is a [`RevertPayload`]
+    /// describing exactly one of: a single commit, a list of commits, or a
+    /// git-style range. Each commit reference is a string parsed by
+    /// [`fluree_db_api::CommitRef::parse`] on the server.
+    pub async fn revert(
+        &self,
+        ledger: &str,
+        branch: &str,
+        payload: &crate::commands::branch::RevertPayload,
+        strategy: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("revert");
+        let mut body = serde_json::json!({
+            "ledger": ledger,
+            "branch": branch,
+        });
+        match payload {
+            crate::commands::branch::RevertPayload::Single(c) => {
+                body["commit"] = serde_json::Value::String(c.clone());
+            }
+            crate::commands::branch::RevertPayload::Set(items) => {
+                body["commits"] = serde_json::Value::Array(
+                    items
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                );
+            }
+            crate::commands::branch::RevertPayload::Range { from, to } => {
+                body["range"] = serde_json::json!({ "from": from, "to": to });
+            }
+        }
+        if let Some(s) = strategy {
+            body["strategy"] = serde_json::Value::String(s.to_string());
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
     /// List all branches for a ledger on the remote server.
     ///
     /// Calls `GET {base_url}/branch/{ledger}`.

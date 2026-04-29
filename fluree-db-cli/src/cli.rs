@@ -888,6 +888,46 @@ pub enum BranchAction {
         #[arg(long)]
         remote: Option<String>,
     },
+
+    /// Revert one or more commits by writing a new commit that undoes them
+    ///
+    /// Accepts either a list of positional commit references (cherry-pick
+    /// style) or `--from`/`--to` to revert a git-style range. Each commit
+    /// reference may be a `t:N` transaction number, a hex digest prefix, or
+    /// a full commit ID — same forms accepted by `branch create --at`.
+    Revert {
+        /// Commits to revert (positional). May appear once for the
+        /// single-commit case or multiple times for cherry-pick. Mutually
+        /// exclusive with `--from`/`--to`.
+        commits: Vec<String>,
+
+        /// Range start (exclusive). Requires `--to`. Mutually exclusive with
+        /// positional commits.
+        #[arg(long, requires = "to")]
+        from: Option<String>,
+
+        /// Range end (inclusive). Requires `--from`. Mutually exclusive with
+        /// positional commits.
+        #[arg(long, requires = "from")]
+        to: Option<String>,
+
+        /// Branch the revert commit will be written to (defaults to active branch)
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// Conflict resolution strategy (default: "abort")
+        /// Options: abort, take-source, take-branch
+        #[arg(long, default_value = "abort")]
+        strategy: String,
+
+        /// Ledger name (defaults to active ledger)
+        #[arg(long)]
+        ledger: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
 }
 
 /// Memory subcommands.

@@ -42,7 +42,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/branch", post(ledger::create_branch))
         .route("/drop-branch", post(ledger::drop_branch))
         .route("/rebase", post(ledger::rebase))
-        .route("/merge", post(ledger::merge));
+        .route("/merge", post(ledger::merge))
+        .route("/revert", post(ledger::revert));
 
     #[cfg(feature = "iceberg")]
     let v1_admin_protected_routes =

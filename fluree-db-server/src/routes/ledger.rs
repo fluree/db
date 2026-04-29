@@ -1449,6 +1449,205 @@ async fn merge_local(state: Arc<AppState>, request: Request) -> Result<impl Into
 }
 
 // ============================================================================
+// Revert
+// ============================================================================
+
+/// Revert request body.
+///
+/// Exactly one of `commit`, `commits`, or `range` must be supplied; the server
+/// rejects requests that omit all three or supply more than one.
+///
+/// Each commit-reference field accepts the same string forms parsed by
+/// [`fluree_db_api::CommitRef::parse`]: `t:N`, a hex digest prefix, or a full
+/// commit ID.
+#[derive(Deserialize)]
+pub struct RevertRequest {
+    /// Ledger name (e.g., "mydb").
+    pub ledger: String,
+    /// Branch the revert commit will be written to (e.g., "main").
+    pub branch: String,
+    /// Conflict resolution strategy. Defaults to `abort` so callers must
+    /// explicitly opt in to automatic resolution. Accepted values:
+    /// `abort`, `take-source`, `take-branch`.
+    #[serde(default)]
+    pub strategy: Option<String>,
+    /// Single commit to revert. Mutually exclusive with `commits`/`range`.
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// Set of commits to revert (cherry-pick style). Mutually exclusive with
+    /// `commit`/`range`.
+    #[serde(default)]
+    pub commits: Option<Vec<String>>,
+    /// Git-style range `from..to` (`from` exclusive, `to` inclusive). Mutually
+    /// exclusive with `commit`/`commits`.
+    #[serde(default)]
+    pub range: Option<RevertRangeBody>,
+}
+
+#[derive(Deserialize)]
+pub struct RevertRangeBody {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Serialize)]
+pub struct RevertResponse {
+    /// Full ledger:branch identifier the revert was written to.
+    pub ledger_id: String,
+    /// Branch the revert was written to.
+    pub branch: String,
+    /// Commit IDs reverted (newest-first, the order applied).
+    pub reverted_commits: Vec<fluree_db_api::ContentId>,
+    /// Number of `(s, p, g)` keys that conflicted before resolution.
+    pub conflict_count: usize,
+    /// Conflict-resolution strategy applied.
+    pub strategy: String,
+    /// `t` of the freshly written revert commit.
+    pub new_head_t: i64,
+    /// Commit ID of the freshly written revert commit.
+    pub new_head_id: fluree_db_api::ContentId,
+}
+
+/// Revert one or more commits on a branch.
+///
+/// `POST /fluree/revert`
+///
+/// See [`RevertRequest`] for the body shape.
+pub async fn revert(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    revert_local(state, request).await.into_response()
+}
+
+async fn revert_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
+    let (parts, body) = request.into_parts();
+    let headers = FlureeHeaders::from_headers(&parts.headers)?;
+
+    let body_bytes = axum::body::to_bytes(body, 50 * 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: RevertRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+    let span = create_request_span(
+        "branch:revert",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.ledger),
+        None,
+        None,
+    );
+
+    async move {
+        let span = tracing::Span::current();
+
+        let strategy = match req.strategy.as_deref() {
+            Some(s) => fluree_db_api::ConflictStrategy::from_str_name(s).ok_or_else(|| {
+                ServerError::bad_request(format!("Unknown conflict strategy: {s}"))
+            })?,
+            None => fluree_db_api::ConflictStrategy::Abort,
+        };
+
+        let provided = [
+            req.commit.is_some(),
+            req.commits.is_some(),
+            req.range.is_some(),
+        ]
+        .iter()
+        .filter(|p| **p)
+        .count();
+        if provided != 1 {
+            return Err(ServerError::bad_request(
+                "Exactly one of `commit`, `commits`, or `range` must be provided".to_string(),
+            ));
+        }
+
+        let report = if let Some(commit) = req.commit {
+            let commit_ref = parse_commit_ref(&commit)?;
+            tracing::info!(
+                status = "start",
+                branch = %req.branch,
+                strategy = strategy.as_str(),
+                "branch revert (single) requested"
+            );
+            state
+                .fluree
+                .revert_commit(&req.ledger, &req.branch, commit_ref, strategy)
+                .await
+        } else if let Some(commits) = req.commits {
+            let parsed: std::result::Result<Vec<_>, _> =
+                commits.iter().map(|s| parse_commit_ref(s)).collect();
+            let parsed = parsed?;
+            tracing::info!(
+                status = "start",
+                branch = %req.branch,
+                count = parsed.len(),
+                strategy = strategy.as_str(),
+                "branch revert (set) requested"
+            );
+            state
+                .fluree
+                .revert_commits(&req.ledger, &req.branch, parsed, strategy)
+                .await
+        } else if let Some(range) = req.range {
+            let from = parse_commit_ref(&range.from)?;
+            let to = parse_commit_ref(&range.to)?;
+            tracing::info!(
+                status = "start",
+                branch = %req.branch,
+                strategy = strategy.as_str(),
+                "branch revert (range) requested"
+            );
+            state
+                .fluree
+                .revert_range(&req.ledger, &req.branch, from, to, strategy)
+                .await
+        } else {
+            unreachable!("validated above");
+        };
+
+        let report = match report {
+            Ok(report) => report,
+            Err(e) => {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:BranchRevertFailed");
+                tracing::error!(error = %server_error, "branch revert failed");
+                return Err(server_error);
+            }
+        };
+
+        let ledger_id = fluree_db_core::ledger_id::format_ledger_id(&req.ledger, &report.branch);
+        let response = RevertResponse {
+            ledger_id,
+            branch: report.branch,
+            reverted_commits: report.reverted_commits,
+            conflict_count: report.conflict_count,
+            strategy: report.strategy,
+            new_head_t: report.new_head_t,
+            new_head_id: report.new_head_id,
+        };
+
+        tracing::info!(
+            status = "success",
+            new_head_t = response.new_head_t,
+            "branch revert succeeded"
+        );
+        Ok((StatusCode::OK, Json(response)))
+    }
+    .instrument(span)
+    .await
+}
+
+fn parse_commit_ref(s: &str) -> Result<fluree_db_api::CommitRef> {
+    fluree_db_api::CommitRef::parse(s)
+        .map_err(|e| ServerError::bad_request(format!("Invalid commit reference {s:?}: {e}")))
+}
+
+// ============================================================================
 // Merge Preview (read-only)
 // ============================================================================
 
