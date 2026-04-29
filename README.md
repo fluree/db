@@ -8,18 +8,35 @@ Billions of triples on commodity hardware. Over 2M triples/second bulk import. [
 
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue)](#license)
 
+> [!NOTE]
+> **Fluree Memory** — is part of the Fluree DB CLI.
+> Persistent, searchable memory for AI coding assistants. Give Claude Code, Cursor, and other AI tools long-term project memory: facts, decisions, and preferences persist across sessions in a Fluree ledger you control — scoped per-repo or per-user, shareable via git.
+> [Fluree Memory docs →](https://labs.flur.ee/docs)
+
 ## Install
 
+**Docker** — pre-configured HTTP server, ready to accept queries on port 8090. Best for trying out the API or running Fluree as a service.
+
 ```bash
-# Homebrew
-brew install fluree
-
-# Cargo
-cargo install fluree
-
-# Docker
 docker run -p 8090:8090 fluree/server:latest
 ```
+
+**Homebrew, shell installer, or Windows PowerShell** — installs the `fluree` binary that bundles both the CLI and the embedded server (`fluree server run`).
+
+```bash
+# Homebrew (macOS / Linux)
+brew install fluree/tap/fluree
+
+# Shell installer (macOS / Linux)
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.ps1 | iex
+```
+
+Pre-built binaries for every release are also available on the [GitHub Releases page](https://github.com/fluree/db/releases).
 
 ## Zero to graph in 60 seconds
 
@@ -197,7 +214,9 @@ let result = ledger.query_sparql("SELECT ?s WHERE { ?s a <http://schema.org/Pers
 
 ## Documentation
 
-Full documentation lives in [`docs/`](docs/README.md):
+For documentation and more information, visit [labs.flur.ee/docs](https://labs.flur.ee/docs).
+
+Full documentation also lives in [`docs/`](docs/README.md):
 
 - [Getting started](docs/getting-started/README.md) — Install, create a ledger, write and query data
 - [Fluree for SQL developers](docs/getting-started/fluree-for-sql-developers.md) — Coming from relational? Start here
