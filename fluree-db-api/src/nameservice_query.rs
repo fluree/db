@@ -25,7 +25,6 @@
 
 use crate::ledger_info::{gs_record_to_jsonld, ns_record_to_jsonld};
 use crate::{ApiError, FlureeBuilder, GraphDb, Result};
-use fluree_db_ledger::IndexConfig;
 use fluree_db_nameservice::NameService;
 use fluree_db_transact::{CommitOpts, TxnOpts, TxnType};
 use serde_json::{json, Value as JsonValue};
@@ -89,7 +88,7 @@ where
 
     // 7. Insert all records as JSON-LD transaction
     let txn_json = json!({ "@graph": all_records });
-    let index_config = IndexConfig::default();
+    let index_config = crate::server_defaults::default_index_config();
 
     let result = temp_fluree
         .transact(

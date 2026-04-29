@@ -9,7 +9,7 @@
 
 mod support;
 
-use fluree_db_api::{FlureeBuilder, LedgerManagerConfig};
+use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerManagerConfig};
 use serde_json::json;
 use std::sync::Arc;
 use support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
@@ -1630,7 +1630,10 @@ async fn test_commit_opts_identity_and_user_claims_in_txn_meta() {
             &data,
             TxnOpts::default(),
             commit_opts,
-            &fluree_db_api::IndexConfig::default(),
+            &IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
         )
         .await
         .expect("insert with identity + body f:message + body f:author");

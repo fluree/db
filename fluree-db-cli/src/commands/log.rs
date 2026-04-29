@@ -34,10 +34,19 @@ pub async fn run(
 
     let commit_head_id = record
         .commit_head_id
+        .clone()
         .ok_or_else(|| CliError::NotFound(format!("ledger '{alias}' has no commits")))?;
 
-    // Walk commit chain by CID
-    let store = fluree.content_store(&ledger_id);
+    // Walk commit chain by CID. Use a branch-aware store so the walk can
+    // cross fork points — pre-fork commits live under the source branch's
+    // namespace, not the current branch's.
+    let store = fluree_db_nameservice::branched_content_store_for_record(
+        fluree.backend(),
+        fluree.nameservice(),
+        &record,
+    )
+    .await
+    .map_err(|e| CliError::Config(format!("failed to build branched store: {e}")))?;
     let stream: std::pin::Pin<
         Box<dyn futures::Stream<Item = fluree_db_core::Result<fluree_db_core::Commit>>>,
     > = Box::pin(fluree_db_core::trace_commits_by_id(

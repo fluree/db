@@ -172,7 +172,14 @@ impl Fluree {
                 .and_then(|r| r.index_head_id.as_ref())
                 .cloned()
             {
-                let cs = self.content_store(&snapshot.snapshot.ledger_id);
+                // Branch-aware store so leaf/branch/history blobs inherited
+                // from the source branch namespace resolve on a fresh branch.
+                let cs = self
+                    .content_store_for_record_or_id(
+                        snapshot.ns_record.as_ref(),
+                        &snapshot.snapshot.ledger_id,
+                    )
+                    .await?;
                 let bytes = cs
                     .get(&index_cid)
                     .await
@@ -209,29 +216,22 @@ impl Fluree {
             }
         }
 
-        // Load default context from CAS if not already loaded.
-        if snapshot.default_context.is_none() {
-            if let Some(ctx_id) = snapshot
-                .ns_record
-                .as_ref()
-                .and_then(|r| r.default_context.as_ref())
-            {
-                let cs = self.content_store(&snapshot.snapshot.ledger_id);
-                if let Ok(bytes) = cs.get(ctx_id).await {
-                    if let Ok(ctx) = serde_json::from_slice(&bytes) {
-                        snapshot.default_context = Some(ctx);
-                    }
-                }
+        // Default context is loaded lazily on the opt-in path only. The
+        // plain `db()` route returns a view with `default_context = None`
+        // so query parsing sees no auto-injection unless the caller went
+        // through `db_with_default_context`.
+        let default_context = if include_default_context {
+            match snapshot.ns_record.as_ref() {
+                Some(record) => self.load_default_context_blob(record).await.ok().flatten(),
+                None => None,
             }
-        }
+        } else {
+            None
+        };
 
         let binary_store = snapshot.binary_store.clone();
-        let default_context = snapshot.default_context.clone();
         let ledger = snapshot.to_ledger_state();
-        let mut view = GraphDb::from_ledger_state(&ledger);
-        if include_default_context {
-            view = view.with_default_context(default_context);
-        }
+        let view = GraphDb::from_ledger_state(&ledger).with_default_context(default_context);
         Ok(match binary_store {
             Some(store) => view.with_binary_store(store),
             None => view,
@@ -303,7 +303,16 @@ impl Fluree {
             // Use nameservice record (not cached handle) to avoid stale index.
             if let Some(record) = self.nameservice().lookup(ledger_id).await? {
                 if let Some(index_cid) = record.index_head_id.as_ref() {
-                    let cs = self.content_store(&record.ledger_id);
+                    // Branch-aware store so historical queries on a branch
+                    // can resolve inherited leaf/branch/history blobs that
+                    // live under the source branch's namespace.
+                    let cs = fluree_db_nameservice::branched_content_store_for_record(
+                        self.backend(),
+                        self.nameservice(),
+                        &record,
+                    )
+                    .await
+                    .map_err(ApiError::from)?;
                     let bytes = cs.get(index_cid).await.map_err(|e| {
                         ApiError::internal(format!("failed to read index root {index_cid}: {e}"))
                     })?;
@@ -496,12 +505,16 @@ impl Fluree {
     ) -> Result<GraphDb> {
         let (parsed_id, _) = Self::parse_graph_ref(ledger_id)?;
         let mut view = self.db_at(ledger_id, spec).await?;
-        // Historical views don't carry default_context through their own load
-        // path, so fetch it from the current head's cached ledger state.
+        // Historical views don't load default_context through their own
+        // load path. Fetch it explicitly via the branch-aware helper using
+        // the cached current-head record.
         if view.default_context.is_none() {
             let handle = self.ledger_cached(parsed_id).await?;
             let snap = handle.snapshot().await;
-            view = view.with_default_context(snap.default_context.clone());
+            if let Some(record) = snap.ns_record.as_ref() {
+                let ctx = self.load_default_context_blob(record).await.ok().flatten();
+                view = view.with_default_context(ctx);
+            }
         }
         Ok(view)
     }

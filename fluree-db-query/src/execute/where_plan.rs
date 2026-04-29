@@ -1497,11 +1497,8 @@ pub fn build_where_operators_seeded_with_needed(
             }
 
             Pattern::Optional(_inner_patterns) => {
-                // OPTIONAL with conjunctive semantics: all inner patterns must match together.
-                //
-                // The parser now creates separate Optional patterns for each node-map in
-                // `["optional", {node1}, {node2}]`, so by the time we get here, each Optional
-                // contains patterns from a SINGLE node-map (conjunctive group).
+                // OPTIONAL with conjunctive semantics: all inner patterns must match together
+                // (SPARQL 1.1 §8.1 LeftJoin).
                 //
                 // Two paths:
                 // 1. Fast path: single triple pattern uses PatternOptionalBuilder (direct scan)

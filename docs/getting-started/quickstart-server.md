@@ -262,7 +262,6 @@ services:
     environment:
       FLUREE_STORAGE_PATH: /data
       FLUREE_LOG_LEVEL: info
-      FLUREE_INDEXING_ENABLED: "true"
     volumes:
       - fluree-data:/data
     restart: unless-stopped
