@@ -1665,7 +1665,7 @@ fn parse_commit_ref(s: &str) -> Result<fluree_db_api::CommitRef> {
 /// envelope reads regardless of the cap. If you need to reject huge
 /// divergences, add an operational guard before invoking the walk
 /// (e.g., refuse when ancestor.t < target.t - SOME_LIMIT).
-const MERGE_PREVIEW_HARD_MAX_COMMITS: usize = 5_000;
+const PREVIEW_HARD_MAX_COMMITS: usize = 5_000;
 
 /// Hard cap on `max_conflict_keys`. 25x the recommended default.
 ///
@@ -1675,7 +1675,7 @@ const MERGE_PREVIEW_HARD_MAX_COMMITS: usize = 5_000;
 /// `include_conflicts=true`, both `compute_delta_keys` walks scan the full
 /// per-side delta regardless of cap. Clients that need a fast preview
 /// should pass `include_conflicts=false`.
-const MERGE_PREVIEW_HARD_MAX_CONFLICT_KEYS: usize = 5_000;
+const PREVIEW_HARD_MAX_CONFLICT_KEYS: usize = 5_000;
 
 /// Query parameters for [`merge_preview`].
 #[derive(Deserialize)]
@@ -1754,10 +1754,10 @@ pub async fn merge_preview(
         // docs/cli/server-integration.md (§Merge Preview Contract, rule 10).
         let mut opts = fluree_db_api::MergePreviewOpts::default();
         if let Some(n) = params.max_commits {
-            opts.max_commits = Some(n.min(MERGE_PREVIEW_HARD_MAX_COMMITS));
+            opts.max_commits = Some(n.min(PREVIEW_HARD_MAX_COMMITS));
         }
         if let Some(n) = params.max_conflict_keys {
-            opts.max_conflict_keys = Some(n.min(MERGE_PREVIEW_HARD_MAX_CONFLICT_KEYS));
+            opts.max_conflict_keys = Some(n.min(PREVIEW_HARD_MAX_CONFLICT_KEYS));
         }
         if let Some(b) = params.include_conflicts {
             opts.include_conflicts = b;
@@ -1794,6 +1794,164 @@ pub async fn merge_preview(
             .merge_preview_with(&ledger, &params.source, params.target.as_deref(), opts)
             .await
             .map_err(ServerError::Api)?;
+
+        Ok(Json(preview))
+    }
+    .instrument(span)
+    .await
+}
+
+// ============================================================================
+// Revert Preview (read-only)
+// ============================================================================
+
+/// Query parameters for [`revert_preview`].
+///
+/// Exactly one of `commit`, `commits`, or (`from`, `to`) must be supplied.
+/// `commits` is comma-separated to keep the URL-encoded shape compact for
+/// modest sets; clients with many CIDs should call the mutating endpoint
+/// (`POST /revert`) which accepts a JSON array.
+#[derive(Deserialize)]
+pub struct RevertPreviewQuery {
+    /// Branch the revert would be applied to.
+    pub branch: String,
+    /// Single commit reference (mutually exclusive with `commits`/`from`/`to`).
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// Comma-separated list of commit references (mutually exclusive with
+    /// `commit`/`from`/`to`).
+    #[serde(default)]
+    pub commits: Option<String>,
+    /// Range start, exclusive. Requires `to`.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Range end, inclusive. Requires `from`.
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Cap on returned commit list. Defaults to 500.
+    #[serde(default)]
+    pub max_commits: Option<usize>,
+    /// Cap on returned conflict keys. Defaults to 200.
+    #[serde(default)]
+    pub max_conflict_keys: Option<usize>,
+    /// Skip conflict computation when only counts are needed. Defaults to true.
+    #[serde(default)]
+    pub include_conflicts: Option<bool>,
+    /// Strategy used for the `revertable` verdict. Defaults to `abort`.
+    #[serde(default)]
+    pub strategy: Option<String>,
+}
+
+/// Read-only revert preview.
+///
+/// `GET /fluree/revert-preview/*ledger?branch=&commit=&commits=&from=&to=&strategy=&max_commits=&max_conflict_keys=&include_conflicts=`
+///
+/// Returns a [`fluree_db_api::RevertPreview`] describing what a revert with
+/// the given selection would do — without writing a commit.
+pub async fn revert_preview(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    Query(params): Query<RevertPreviewQuery>,
+    headers: FlureeHeaders,
+    bearer: MaybeDataBearer,
+) -> Result<Json<fluree_db_api::RevertPreview>> {
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+    let span = create_request_span(
+        "branch:revert-preview",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&ledger),
+        None,
+        None,
+    );
+    async move {
+        let span = tracing::Span::current();
+
+        // Same data-auth pattern as merge-preview.
+        let data_auth = state.config.data_auth();
+        if data_auth.mode == crate::config::DataAuthMode::Required && bearer.0.is_none() {
+            set_span_error_code(&span, "error:Unauthorized");
+            return Err(ServerError::unauthorized("Bearer token required"));
+        }
+        if let Some(p) = bearer.0.as_ref() {
+            if !p.can_read(&ledger) {
+                set_span_error_code(&span, "error:Forbidden");
+                return Err(ServerError::not_found("Ledger not found"));
+            }
+        }
+
+        let mut opts = fluree_db_api::RevertPreviewOpts::default();
+        if let Some(n) = params.max_commits {
+            opts.max_commits = Some(n.min(PREVIEW_HARD_MAX_COMMITS));
+        }
+        if let Some(n) = params.max_conflict_keys {
+            opts.max_conflict_keys = Some(n.min(PREVIEW_HARD_MAX_CONFLICT_KEYS));
+        }
+        if let Some(b) = params.include_conflicts {
+            opts.include_conflicts = b;
+        }
+        if let Some(s) = params.strategy.as_deref() {
+            opts.conflict_strategy = fluree_db_api::ConflictStrategy::parse_canonical(s)
+                .map_err(|_| {
+                    ServerError::bad_request(format!("Unknown revert preview strategy: {s}"))
+                })?;
+        }
+
+        // Validate exactly one selection form supplied.
+        let has_single = params.commit.is_some();
+        let has_set = params.commits.is_some();
+        let has_range = params.from.is_some() || params.to.is_some();
+        let supplied = [has_single, has_set, has_range]
+            .iter()
+            .filter(|p| **p)
+            .count();
+        if supplied != 1 {
+            return Err(ServerError::bad_request(
+                "Exactly one of `commit`, `commits`, or `from`+`to` must be provided".to_string(),
+            ));
+        }
+        if has_range && (params.from.is_none() || params.to.is_none()) {
+            return Err(ServerError::bad_request(
+                "`from` and `to` must be supplied together".to_string(),
+            ));
+        }
+
+        let preview = if let Some(commit) = params.commit {
+            let commit_ref = parse_commit_ref(&commit)?;
+            state
+                .fluree
+                .revert_commit_preview_with(&ledger, &params.branch, commit_ref, opts)
+                .await
+                .map_err(ServerError::Api)?
+        } else if let Some(commits_csv) = params.commits {
+            let parsed: std::result::Result<Vec<_>, _> = commits_csv
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(parse_commit_ref)
+                .collect();
+            let parsed = parsed?;
+            if parsed.is_empty() {
+                return Err(ServerError::bad_request(
+                    "`commits` must contain at least one commit reference".to_string(),
+                ));
+            }
+            state
+                .fluree
+                .revert_commits_preview_with(&ledger, &params.branch, parsed, opts)
+                .await
+                .map_err(ServerError::Api)?
+        } else {
+            // Range
+            let from = parse_commit_ref(params.from.as_deref().unwrap())?;
+            let to = parse_commit_ref(params.to.as_deref().unwrap())?;
+            state
+                .fluree
+                .revert_range_preview_with(&ledger, &params.branch, from, to, opts)
+                .await
+                .map_err(ServerError::Api)?
+        };
 
         Ok(Json(preview))
     }

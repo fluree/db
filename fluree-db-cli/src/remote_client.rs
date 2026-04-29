@@ -1293,6 +1293,80 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// Read-only preview of a revert.
+    ///
+    /// Calls `GET {base_url}/revert-preview/{ledger}?branch=&commit=...`. The
+    /// shape of the query string depends on `payload`:
+    /// - `Single` ⇒ `&commit=<ref>`
+    /// - `Set`    ⇒ `&commits=<ref1>,<ref2>,...` (comma-separated)
+    /// - `Range`  ⇒ `&from=<ref>&to=<ref>`
+    pub async fn revert_preview(
+        &self,
+        ledger: &str,
+        branch: &str,
+        payload: &crate::commands::branch::RevertPayload,
+        strategy: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url("revert-preview", ledger);
+        let mut sep = '?';
+        let push = |url: &mut String, sep: &mut char, key: &str, val: String| {
+            url.push(*sep);
+            url.push_str(key);
+            url.push('=');
+            url.push_str(&val);
+            *sep = '&';
+        };
+        push(
+            &mut url,
+            &mut sep,
+            "branch",
+            urlencoding::encode(branch).into_owned(),
+        );
+        match payload {
+            crate::commands::branch::RevertPayload::Single(c) => {
+                push(
+                    &mut url,
+                    &mut sep,
+                    "commit",
+                    urlencoding::encode(c).into_owned(),
+                );
+            }
+            crate::commands::branch::RevertPayload::Set(items) => {
+                let csv = items.join(",");
+                push(
+                    &mut url,
+                    &mut sep,
+                    "commits",
+                    urlencoding::encode(&csv).into_owned(),
+                );
+            }
+            crate::commands::branch::RevertPayload::Range { from, to } => {
+                push(
+                    &mut url,
+                    &mut sep,
+                    "from",
+                    urlencoding::encode(from).into_owned(),
+                );
+                push(
+                    &mut url,
+                    &mut sep,
+                    "to",
+                    urlencoding::encode(to).into_owned(),
+                );
+            }
+        }
+        if let Some(s) = strategy {
+            push(
+                &mut url,
+                &mut sep,
+                "strategy",
+                urlencoding::encode(s).into_owned(),
+            );
+        }
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
     /// List all branches for a ledger on the remote server.
     ///
     /// Calls `GET {base_url}/branch/{ledger}`.

@@ -920,6 +920,17 @@ pub enum BranchAction {
         #[arg(long, default_value = "abort")]
         strategy: String,
 
+        /// Show what the revert would do without writing a commit. Returns
+        /// the resolved commit list, conflict count, and whether the chosen
+        /// strategy would let it proceed.
+        #[arg(long)]
+        preview: bool,
+
+        /// When `--preview` is set: emit the raw JSON `RevertPreview`
+        /// instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+
         /// Ledger name (defaults to active ledger)
         #[arg(long)]
         ledger: Option<String>,

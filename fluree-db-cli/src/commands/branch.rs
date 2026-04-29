@@ -73,6 +73,8 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
             to,
             branch,
             strategy,
+            preview,
+            json,
             ledger,
             remote,
         } => {
@@ -82,6 +84,8 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
                 to.as_deref(),
                 branch.as_deref(),
                 &strategy,
+                preview,
+                json,
                 ledger.as_deref(),
                 dirs,
                 remote.as_deref(),
@@ -657,6 +661,8 @@ async fn run_revert(
     to: Option<&str>,
     branch: Option<&str>,
     strategy: &str,
+    preview: bool,
+    json: bool,
     ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
@@ -702,6 +708,16 @@ async fn run_revert(
         let (ledger_name, default_branch) = split_ledger_id(&alias)?;
         let branch_name = branch.unwrap_or(&default_branch);
         let client = context::build_remote_client(remote_name, dirs).await?;
+
+        if preview {
+            let result = client
+                .revert_preview(&ledger_name, branch_name, &payload, Some(strategy))
+                .await?;
+            context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+            print_revert_preview_json(&result, json)?;
+            return Ok(());
+        }
+
         let result = client
             .revert(&ledger_name, branch_name, &payload, Some(strategy))
             .await?;
@@ -733,55 +749,185 @@ async fn run_revert(
         } => {
             let (ledger_name, default_branch) = split_ledger_id(&remote_alias)?;
             let branch_name = branch.unwrap_or(&default_branch);
-            let result = client
-                .revert(&ledger_name, branch_name, &payload, Some(strategy))
-                .await?;
-
-            context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
-
-            print_revert_result(&result)?;
+            if preview {
+                let result = client
+                    .revert_preview(&ledger_name, branch_name, &payload, Some(strategy))
+                    .await?;
+                context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
+                print_revert_preview_json(&result, json)?;
+            } else {
+                let result = client
+                    .revert(&ledger_name, branch_name, &payload, Some(strategy))
+                    .await?;
+                context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
+                print_revert_result(&result)?;
+            }
         }
         LedgerMode::Local { fluree, alias } => {
             let (ledger_name, default_branch) = split_ledger_id(&alias)?;
             let branch_name = branch.unwrap_or(&default_branch);
 
-            let report = match payload {
-                RevertPayload::Single(s) => {
-                    let commit_ref =
-                        fluree_db_api::CommitRef::parse(&s).map_err(CliError::from)?;
-                    fluree
-                        .revert_commit(&ledger_name, branch_name, commit_ref, conflict_strategy)
-                        .await?
-                }
-                RevertPayload::Set(items) => {
-                    let mut refs = Vec::with_capacity(items.len());
-                    for s in &items {
-                        refs.push(fluree_db_api::CommitRef::parse(s).map_err(CliError::from)?);
+            if preview {
+                let preview_report = match payload {
+                    RevertPayload::Single(s) => {
+                        let commit_ref =
+                            fluree_db_api::CommitRef::parse(&s).map_err(CliError::from)?;
+                        fluree
+                            .revert_commit_preview_with(
+                                &ledger_name,
+                                branch_name,
+                                commit_ref,
+                                preview_opts(conflict_strategy.clone()),
+                            )
+                            .await?
                     }
-                    fluree
-                        .revert_commits(&ledger_name, branch_name, refs, conflict_strategy)
-                        .await?
-                }
-                RevertPayload::Range { from, to } => {
-                    let from_ref =
-                        fluree_db_api::CommitRef::parse(&from).map_err(CliError::from)?;
-                    let to_ref = fluree_db_api::CommitRef::parse(&to).map_err(CliError::from)?;
-                    fluree
-                        .revert_range(
-                            &ledger_name,
-                            branch_name,
-                            from_ref,
-                            to_ref,
-                            conflict_strategy,
-                        )
-                        .await?
-                }
-            };
+                    RevertPayload::Set(items) => {
+                        let mut refs = Vec::with_capacity(items.len());
+                        for s in &items {
+                            refs.push(
+                                fluree_db_api::CommitRef::parse(s).map_err(CliError::from)?,
+                            );
+                        }
+                        fluree
+                            .revert_commits_preview_with(
+                                &ledger_name,
+                                branch_name,
+                                refs,
+                                preview_opts(conflict_strategy.clone()),
+                            )
+                            .await?
+                    }
+                    RevertPayload::Range { from, to } => {
+                        let from_ref =
+                            fluree_db_api::CommitRef::parse(&from).map_err(CliError::from)?;
+                        let to_ref =
+                            fluree_db_api::CommitRef::parse(&to).map_err(CliError::from)?;
+                        fluree
+                            .revert_range_preview_with(
+                                &ledger_name,
+                                branch_name,
+                                from_ref,
+                                to_ref,
+                                preview_opts(conflict_strategy.clone()),
+                            )
+                            .await?
+                    }
+                };
+                print_revert_preview_local(&preview_report, json)?;
+            } else {
+                let report = match payload {
+                    RevertPayload::Single(s) => {
+                        let commit_ref =
+                            fluree_db_api::CommitRef::parse(&s).map_err(CliError::from)?;
+                        fluree
+                            .revert_commit(
+                                &ledger_name,
+                                branch_name,
+                                commit_ref,
+                                conflict_strategy,
+                            )
+                            .await?
+                    }
+                    RevertPayload::Set(items) => {
+                        let mut refs = Vec::with_capacity(items.len());
+                        for s in &items {
+                            refs.push(
+                                fluree_db_api::CommitRef::parse(s).map_err(CliError::from)?,
+                            );
+                        }
+                        fluree
+                            .revert_commits(&ledger_name, branch_name, refs, conflict_strategy)
+                            .await?
+                    }
+                    RevertPayload::Range { from, to } => {
+                        let from_ref =
+                            fluree_db_api::CommitRef::parse(&from).map_err(CliError::from)?;
+                        let to_ref =
+                            fluree_db_api::CommitRef::parse(&to).map_err(CliError::from)?;
+                        fluree
+                            .revert_range(
+                                &ledger_name,
+                                branch_name,
+                                from_ref,
+                                to_ref,
+                                conflict_strategy,
+                            )
+                            .await?
+                    }
+                };
 
-            print_revert_report_local(&report);
+                print_revert_report_local(&report);
+            }
         }
     }
 
+    Ok(())
+}
+
+fn preview_opts(strategy: fluree_db_api::ConflictStrategy) -> fluree_db_api::RevertPreviewOpts {
+    fluree_db_api::RevertPreviewOpts {
+        conflict_strategy: strategy,
+        ..Default::default()
+    }
+}
+
+fn print_revert_preview_local(
+    preview: &fluree_db_api::RevertPreview,
+    as_json: bool,
+) -> CliResult<()> {
+    if as_json {
+        let json = serde_json::to_string_pretty(preview)
+            .map_err(|e| CliError::Config(format!("Failed to serialize preview: {e}")))?;
+        println!("{json}");
+        return Ok(());
+    }
+
+    println!(
+        "Would revert {} commit(s) on '{}' ({} conflicts, revertable={}).",
+        preview.reverted_count,
+        preview.branch,
+        preview.conflicts.count,
+        preview.revertable,
+    );
+    if preview.truncated {
+        println!(
+            "  (showing {} of {} commits)",
+            preview.reverted_commits.len(),
+            preview.reverted_count,
+        );
+    }
+    Ok(())
+}
+
+fn print_revert_preview_json(result: &serde_json::Value, as_json: bool) -> CliResult<()> {
+    if as_json {
+        let pretty = serde_json::to_string_pretty(result)
+            .map_err(|e| CliError::Config(format!("Failed to format preview: {e}")))?;
+        println!("{pretty}");
+        return Ok(());
+    }
+
+    let branch = result
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(unknown)");
+    let reverted_count = result
+        .get("reverted_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let conflict_count = result
+        .get("conflicts")
+        .and_then(|c| c.get("count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let revertable = result
+        .get("revertable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    println!(
+        "Would revert {reverted_count} commit(s) on '{branch}' ({conflict_count} conflicts, revertable={revertable}).",
+    );
     Ok(())
 }
 

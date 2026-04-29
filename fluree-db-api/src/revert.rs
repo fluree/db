@@ -82,13 +82,8 @@ impl crate::Fluree {
             strategy = strategy.as_str()
         );
         async move {
-            self.revert_inner(
-                ledger_name,
-                branch,
-                RevertSource::Commits(NonEmpty::from(commit)),
-                strategy,
-            )
-            .await
+            self.revert_inner(ledger_name, branch, RevertSource::single(commit), strategy)
+                .await
         }
         .instrument(span)
         .await
@@ -126,11 +121,10 @@ impl crate::Fluree {
             strategy = strategy.as_str()
         );
         async move {
-            let commits = NonEmpty::try_from_vec(commits).ok_or_else(|| {
+            let source = RevertSource::try_set(commits).ok_or_else(|| {
                 ApiError::InvalidBranch("Revert requires at least one commit".to_string())
             })?;
-            self.revert_inner(ledger_name, branch, RevertSource::Commits(commits), strategy)
-                .await
+            self.revert_inner(ledger_name, branch, source, strategy).await
         }
         .instrument(span)
         .await
@@ -159,13 +153,8 @@ impl crate::Fluree {
             strategy = strategy.as_str()
         );
         async move {
-            self.revert_inner(
-                ledger_name,
-                branch,
-                RevertSource::Range { from, to },
-                strategy,
-            )
-            .await
+            self.revert_inner(ledger_name, branch, RevertSource::range(from, to), strategy)
+                .await
         }
         .instrument(span)
         .await
@@ -192,72 +181,28 @@ impl crate::Fluree {
             _ => {}
         }
 
-        let branch_id = format_ledger_id(ledger_name, branch);
-        let branch_record = self
-            .nameservice()
-            .lookup(&branch_id)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(branch_id.clone()))?;
-        let branch_head_id = branch_record.commit_head_id.clone().ok_or_else(|| {
-            ApiError::InvalidBranch(format!("Branch {branch_id} has no commits to revert"))
-        })?;
+        let ctx = self.build_revert_context(ledger_name, branch, source).await?;
 
-        let branch_store: BranchedContentStore = if branch_record.source_branch.is_some() {
-            LedgerState::build_branched_store(
-                &self.nameservice_mode,
-                &branch_record,
-                self.backend(),
-            )
-            .await?
-        } else {
-            BranchedContentStore::leaf(self.content_store(&branch_id))
-        };
-
-        // Resolve user-supplied [`CommitRef`]s against the branch's current
-        // view — same path used by `branch create --at`.
-        let branch_state = self.ledger(&branch_id).await?;
-        let view = LedgerView::from_state(&branch_state);
-        let resolved = match source {
-            RevertSource::Commits(NonEmpty { head, tail }) => {
-                let head = view.resolve_commit(head).await?;
-                let mut resolved_tail = Vec::with_capacity(tail.len());
-                for r in tail {
-                    resolved_tail.push(view.resolve_commit(r).await?);
-                }
-                ResolvedSource::Commits(NonEmpty {
-                    head,
-                    tail: resolved_tail,
-                })
-            }
-            RevertSource::Range { from, to } => {
-                let from = view.resolve_commit(from).await?;
-                let to = view.resolve_commit(to).await?;
-                ResolvedSource::Range { from, to }
-            }
-        };
-
-        let plan = resolve_revert_plan(&branch_store, &branch_head_id, &resolved).await?;
-
-        let conflict_keys = compute_conflict_keys(
-            &branch_store,
-            &branch_head_id,
-            &plan.reverted_set,
-            plan.oldest_t,
-        )
-        .await?;
-
-        if strategy == ConflictStrategy::Abort && !conflict_keys.is_empty() {
+        if strategy == ConflictStrategy::Abort && !ctx.conflict_keys.is_empty() {
             return Err(ApiError::BranchConflict(format!(
                 "Revert aborted: {} conflict(s) on {} with abort strategy",
-                conflict_keys.len(),
+                ctx.conflict_keys.len(),
                 branch
             )));
         }
 
-        let snapshot = NsRecordSnapshot::from_record(&branch_record);
+        let snapshot = NsRecordSnapshot::from_record(&ctx.branch_record);
         if let Some(ref lm) = self.ledger_manager {
-            lm.disconnect(&branch_id).await;
+            lm.disconnect(&ctx.branch_id).await;
         }
+
+        let RevertContext {
+            branch_id,
+            branch_record,
+            branch_store,
+            plan,
+            conflict_keys,
+        } = ctx;
 
         let result = self
             .write_revert_commit(
@@ -303,6 +248,78 @@ impl crate::Fluree {
                 Err(e)
             }
         }
+    }
+
+    /// Resolve `source` against `branch`'s current state, walk the DAG, build
+    /// the revert plan, and compute conflict keys — every step that
+    /// [`Self::revert_inner`] performs *before* mutating state. Shared with the
+    /// preview path.
+    pub(crate) async fn build_revert_context(
+        &self,
+        ledger_name: &str,
+        branch: &str,
+        source: RevertSource,
+    ) -> Result<RevertContext> {
+        let branch_id = format_ledger_id(ledger_name, branch);
+        let branch_record = self
+            .nameservice()
+            .lookup(&branch_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(branch_id.clone()))?;
+        let branch_head_id = branch_record.commit_head_id.clone().ok_or_else(|| {
+            ApiError::InvalidBranch(format!("Branch {branch_id} has no commits to revert"))
+        })?;
+
+        let branch_store: BranchedContentStore = if branch_record.source_branch.is_some() {
+            LedgerState::build_branched_store(
+                &self.nameservice_mode,
+                &branch_record,
+                self.backend(),
+            )
+            .await?
+        } else {
+            BranchedContentStore::leaf(self.content_store(&branch_id))
+        };
+
+        // Resolve user-supplied [`CommitRef`]s against the branch's current
+        // view — same path used by `branch create --at`.
+        let branch_state = self.ledger(&branch_id).await?;
+        let view = LedgerView::from_state(&branch_state);
+        let resolved = match source {
+            RevertSource::Commits(NonEmpty { head, tail }) => {
+                let head = view.resolve_commit(head).await?;
+                let mut resolved_tail = Vec::with_capacity(tail.len());
+                for r in tail {
+                    resolved_tail.push(view.resolve_commit(r).await?);
+                }
+                ResolvedSource::Commits(NonEmpty {
+                    head,
+                    tail: resolved_tail,
+                })
+            }
+            RevertSource::Range { from, to } => {
+                let from = view.resolve_commit(from).await?;
+                let to = view.resolve_commit(to).await?;
+                ResolvedSource::Range { from, to }
+            }
+        };
+
+        let plan = resolve_revert_plan(&branch_store, &branch_head_id, &resolved).await?;
+        let conflict_keys = compute_conflict_keys(
+            &branch_store,
+            &branch_head_id,
+            &plan.reverted_set,
+            plan.oldest_t,
+        )
+        .await?;
+
+        Ok(RevertContext {
+            branch_id,
+            branch_record,
+            branch_store,
+            plan,
+            conflict_keys,
+        })
     }
 
     async fn write_revert_commit<C: ContentStore + Clone + 'static>(
@@ -447,13 +464,13 @@ impl crate::Fluree {
 /// can rely on `first`, `iter`, etc. without empty-checks. Constructed only
 /// at validation boundaries.
 #[derive(Clone, Debug)]
-struct NonEmpty<T> {
+pub(crate) struct NonEmpty<T> {
     head: T,
     tail: Vec<T>,
 }
 
 impl<T> NonEmpty<T> {
-    fn try_from_vec(v: Vec<T>) -> Option<Self> {
+    pub(crate) fn try_from_vec(v: Vec<T>) -> Option<Self> {
         let mut iter = v.into_iter();
         let head = iter.next()?;
         Some(Self {
@@ -462,18 +479,18 @@ impl<T> NonEmpty<T> {
         })
     }
 
-    fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
+    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
         std::iter::once(&self.head).chain(self.tail.iter())
     }
 
-    fn into_vec(self) -> Vec<T> {
+    pub(crate) fn into_vec(self) -> Vec<T> {
         let mut v = Vec::with_capacity(1 + self.tail.len());
         v.push(self.head);
         v.extend(self.tail);
         v
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         1 + self.tail.len()
     }
 }
@@ -489,9 +506,37 @@ impl<T> From<T> for NonEmpty<T> {
 
 /// Caller-supplied source of the commit list, with [`CommitRef`]s still
 /// unresolved.
-enum RevertSource {
+pub(crate) enum RevertSource {
     Commits(NonEmpty<CommitRef>),
     Range { from: CommitRef, to: CommitRef },
+}
+
+impl RevertSource {
+    /// Wrap a single [`CommitRef`] as a one-element source.
+    pub(crate) fn single(commit: CommitRef) -> Self {
+        Self::Commits(NonEmpty::from(commit))
+    }
+
+    /// Wrap a non-empty list of [`CommitRef`]s; returns `None` if `commits`
+    /// is empty so callers must validate at the boundary.
+    pub(crate) fn try_set(commits: Vec<CommitRef>) -> Option<Self> {
+        NonEmpty::try_from_vec(commits).map(Self::Commits)
+    }
+
+    /// Build a git-style range source.
+    pub(crate) fn range(from: CommitRef, to: CommitRef) -> Self {
+        Self::Range { from, to }
+    }
+}
+
+/// Everything [`Fluree::revert_inner`] needs after resolution and validation
+/// but before mutating state. Shared with the preview path.
+pub(crate) struct RevertContext {
+    pub(crate) branch_id: String,
+    pub(crate) branch_record: fluree_db_nameservice::NsRecord,
+    pub(crate) branch_store: BranchedContentStore,
+    pub(crate) plan: RevertPlan,
+    pub(crate) conflict_keys: Vec<ConflictKey>,
 }
 
 /// Source after [`CommitRef`] resolution, ready for plan computation.
@@ -501,14 +546,14 @@ enum ResolvedSource {
 }
 
 /// The resolved set of commits to revert.
-struct RevertPlan {
+pub(crate) struct RevertPlan {
     /// Reverted commits ordered newest-first by `t` (application order).
-    ordered_commits: NonEmpty<CommitId>,
+    pub(crate) ordered_commits: NonEmpty<CommitId>,
     /// Same set as `ordered_commits`, indexed for membership checks.
-    reverted_set: FxHashSet<CommitId>,
+    pub(crate) reverted_set: FxHashSet<CommitId>,
     /// `t` of the oldest reverted commit. Used as the lower bound when
     /// scanning intervening commits for conflicts.
-    oldest_t: i64,
+    pub(crate) oldest_t: i64,
 }
 
 /// Internal result of attempting to write the revert commit.

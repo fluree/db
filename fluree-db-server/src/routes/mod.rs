@@ -66,6 +66,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/exists/*ledger", get(ledger::exists_ledger_tail))
         .route("/branch/*ledger", get(ledger::list_branches))
         .route("/merge-preview/*ledger", get(ledger::merge_preview))
+        .route("/revert-preview/*ledger", get(ledger::revert_preview))
         // Merge admin-protected routes
         .merge(v1_admin_protected_routes)
         // Query endpoints
