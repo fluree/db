@@ -384,6 +384,14 @@ impl Fluree {
 ///
 /// Used by `create_branch` when a caller specifies a historical commit — we
 /// only allow branching from commits on the source branch's ancestry.
+///
+/// "Ancestry" here is the full commit DAG, not the linear first-parent chain:
+/// `collect_dag_cids` walks every parent edge (including merge parents), so
+/// any commit reachable from `source_head` via any sequence of parent edges
+/// is a valid branch point. This is what enables branching at a commit that
+/// originally lived on a side branch that was later merged into the source
+/// — once merged in, those commits are part of the source's ancestry too.
+///
 /// Loads only the target commit's envelope (not its flakes) since we just
 /// need `t` for the ancestry walk's stop condition.
 async fn verify_ancestor<C: ContentStore + ?Sized>(
@@ -401,7 +409,8 @@ async fn verify_ancestor<C: ContentStore + ?Sized>(
         return Ok(target_envelope.t);
     }
 
-    // Walk backward from source_head, stopping once we pass below target's t.
+    // Walk backward from source_head over the full DAG (all parent edges,
+    // including merge parents), stopping once we pass below target's t.
     let stop_at = (target_envelope.t - 1).max(0);
     let dag = collect_dag_cids(store, source_head, stop_at).await?;
 
