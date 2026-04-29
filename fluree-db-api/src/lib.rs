@@ -57,6 +57,7 @@ mod indexer_fulltext_provider;
 mod ledger;
 pub mod ledger_info;
 mod merge;
+mod merge_preview;
 pub mod nameservice_query;
 pub(crate) mod ns_helpers;
 pub mod ontology_imports;
@@ -110,6 +111,10 @@ pub use dataset::{
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result};
 pub use fluree_db_core::ContentId;
+pub use fluree_db_core::{
+    commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
+    ConflictKey,
+};
 pub use format::{AgentJsonContext, FormatError, FormatterConfig, OutputFormat, QueryOutput};
 pub use graph::Graph;
 pub use graph_commit_builder::{CommitBuilder, CommitDetail, ResolvedFlake, ResolvedValue};
@@ -131,6 +136,9 @@ pub use ledger_manager::{
     RemoteWatermark, UpdatePlan,
 };
 pub use merge::MergeReport;
+pub use merge_preview::{
+    AncestorRef, BranchDelta, ConflictSummary, MergePreview, MergePreviewOpts,
+};
 pub use pack::{
     compute_missing_index_artifacts, full_ledger_pack_request, validate_pack_request, PackChunk,
     PackStreamError, PackStreamResult,

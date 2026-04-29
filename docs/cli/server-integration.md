@@ -122,6 +122,16 @@ listed below and, for JSON-LD bodies, also injects them into `opts`. To be
 CLI-compatible, your server must implement the contract in
 [Policy Enforcement Contract](#policy-enforcement-contract).
 
+### `fluree branch diff` (read-only merge preview)
+
+- `GET {api_base_url}/merge-preview/*ledger?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=`
+
+Returns the rich diff between two branches — ahead/behind commit summaries,
+common ancestor, conflict keys, fast-forward eligibility — without mutating
+any nameservice or content-store state. See
+[Merge Preview Contract](#merge-preview-contract) for the full semantic and
+response-shape spec.
+
 ## Policy Enforcement Contract
 
 CLI policy flags ride on every data API request as both HTTP headers and (for
@@ -202,6 +212,162 @@ The route-level wiring (header merge, gate, force-override, audit log,
 PolicyContext construction) lives in
 `fluree-db-server/src/routes/policy_auth.rs` — useful as a concrete
 implementation reference if you're porting the contract to another server.
+
+## Merge Preview Contract
+
+`fluree branch diff` issues a single read-only request:
+
+```
+GET {api_base_url}/merge-preview/{ledger}?source={source}&target={target}
+   &max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}
+```
+
+| Parameter | Type | Required | Server default | Description |
+|-----------|------|----------|----------------|-------------|
+| `ledger` (path) | string | Yes | — | Ledger name without branch suffix |
+| `source` | string | Yes | — | Source branch to merge **from** |
+| `target` | string | No | source's parent branch | Target branch to merge **into** |
+| `max_commits` | integer | No | `500` | Per-side cap on `ahead.commits` / `behind.commits` |
+| `max_conflict_keys` | integer | No | `200` | Cap on `conflicts.keys` |
+| `include_conflicts` | bool | No | `true` | When `false`, the conflict computation is skipped |
+
+Auth follows the same pattern as `GET /branch/*ledger` (read-only): require
+a Bearer when `data_auth.mode == required`; gate on `can_read(ledger)`;
+return `404` (not `403`) when the bearer cannot read it.
+
+### Required semantics
+
+These rules are not negotiable; the CLI and other clients depend on them:
+
+1. **Source resolution.** `source` must be a branch — its nameservice record
+   must have `source_branch != null`. Otherwise respond `400` with a message
+   containing `"no source branch"` so the CLI's error matcher works.
+2. **Target defaulting.** When `target` is omitted, resolve to
+   `source.source_branch`.
+3. **Self-merge.** If `source == resolved_target`, respond `400` with a
+   message containing `"itself"`.
+4. **Cross-branch ancestor lookup.** `ancestor` is the most recent common
+   commit between `source` HEAD and `target` HEAD. The walk **must** be able
+   to load commit envelopes from both branches' namespaces — sibling
+   branches off `main` must work. The reference implementation builds a
+   union view that fans out through both `BranchedContentStore` ancestries;
+   equivalents are fine.
+5. **Fast-forward predicate.**
+   `fast_forward = (ancestor.commit_id == target_head)` when both heads
+   exist; `true` when both heads are absent; `false` otherwise.
+6. **Per-side walks.** `ahead.count` is the total number of commits on
+   `source` since `ancestor.t` (uncapped). `ahead.commits` is the same set,
+   capped at `max_commits`, **strictly newest-first by `t`**.
+   `truncated = count > commits.len()`. Same shape for `behind`.
+7. **Conflict computation.** When
+   `include_conflicts == true && !fast_forward` and both heads exist:
+   - Walk both deltas: `(s, p, g)` tuples touched on each side since
+     `ancestor.t`.
+   - `conflicts.keys` is the intersection.
+   - **Sort the intersection before truncating** — `HashSet::intersection`
+     order is unspecified, and stable ordering matters for paginated UIs.
+     Lexicographic by `(s, p, g)` is fine; what matters is that two
+     requests against the same state return the same prefix.
+   - `count` is the unbounded intersection size; `truncated = count > cap`.
+8. **No mutations.** Implementations must not write to the nameservice,
+   advance any HEAD, copy commits between namespaces, or update any cache
+   that downstream operations depend on.
+9. **Server-side cap is mandatory.** Even if a client sends
+   `max_commits=10000000`, clamp to a defensive limit. The reference
+   server applies two layers: when no query param is present, it falls
+   back to the recommended defaults (`500` for commits, `200` for
+   conflict keys); when a param **is** present, the server clamps the
+   caller's value with `min(value, hard_max)` where the reference hard
+   maxes are `5_000` for commits and `5_000` for conflict keys
+   (constants `MERGE_PREVIEW_HARD_MAX_COMMITS` and
+   `MERGE_PREVIEW_HARD_MAX_CONFLICT_KEYS` in
+   `fluree-db-server/src/routes/ledger.rs`). The CLI assumes the server
+   enforces a cap, and unbounded responses must not be reachable over
+   HTTP regardless of what the client requests.
+
+   **Scope of the cap.** This bounds the **size of the returned lists**
+   and the per-summary `load_commit_by_id` reads (one full commit blob
+   per summary). It does *not* bound the underlying divergence walk:
+   `count` on each side reflects the unbounded divergence and is computed
+   by walking every commit envelope between HEAD and the ancestor.
+   Likewise, conflict computation walks the full per-side delta when
+   `include_conflicts=true`. If you need to refuse expensive previews,
+   add a separate operational guard before invoking the walk (for
+   example, reject when `target.t - ancestor.t` exceeds some threshold)
+   or document that clients should pass `include_conflicts=false` for a
+   cheaper preview.
+
+### Response (`200 OK`)
+
+```jsonc
+{
+  "source": "feature-x",
+  "target": "main",
+  "ancestor": { "commit_id": "bafy...", "t": 5 },
+  "ahead": {
+    "count": 3,
+    "commits": [
+      {
+        "t": 8,
+        "commit_id": "bafy...",
+        "time": "2026-04-25T12:00:00Z",
+        "asserts": 2,
+        "retracts": 0,
+        "flake_count": 2,
+        "message": null
+      }
+      // ... newest-first
+    ],
+    "truncated": false
+  },
+  "behind": { "count": 1, "commits": [], "truncated": false },
+  "fast_forward": false,
+  "conflicts": { "count": 0, "keys": [], "truncated": false }
+}
+```
+
+`ancestor` is `null` only when both heads are absent. Each `CommitSummary`
+sets `time` to `null` for legacy commits without a timestamp; `message` is
+extracted from `txn_meta` when an entry with predicate `f:message` (Fluree
+DB system namespace, local name `"message"`) and a string value is present.
+Other conventions are not recognized — return `null`.
+
+`ConflictKey` encodes a `(s, p, g)` tuple. The wire shape mirrors
+`fluree_db_core::ConflictKey`:
+
+```jsonc
+{
+  "s": [<namespace_code: u16>, "<local_name>"],
+  "p": [<namespace_code: u16>, "<local_name>"],
+  "g": [<namespace_code: u16>, "<local_name>"]   // or null for the default graph
+}
+```
+
+`Sid`s serialize as `[ns_code, name]` tuples. Changing the encoding will
+break the CLI.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `400` | Source has no parent (e.g., `main`); or `source == target`. Body must include `"no source branch"` or `"itself"` so the CLI's matcher works. |
+| `401` | Bearer required and absent/invalid. |
+| `404` | Ledger or branch does not exist; or the bearer cannot `can_read`. |
+| `5xx` | Storage / nameservice errors. |
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route + auth | `fluree-db-server/src/routes/ledger.rs::merge_preview` |
+| Orchestration | `fluree-db-api/src/merge_preview.rs::merge_preview_with` |
+| Per-commit summary + DAG walk | `fluree-db-core/src/commit.rs::walk_commit_summaries` |
+| Common ancestor (dual-frontier BFS) | `fluree-db-core/src/commit.rs::find_common_ancestor` |
+| Delta-key computation | `fluree-db-novelty/src/delta.rs::compute_delta_keys` |
+
+Validate compatibility by running `fluree branch diff dev --target feature
+--remote your-remote --json` against your server and diffing the response
+against output from the reference server on the same ledger state.
 
 ## Replication Auth Contract
 
