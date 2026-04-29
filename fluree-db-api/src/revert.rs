@@ -355,7 +355,7 @@ impl crate::Fluree {
             .await?;
 
         let staged = self
-            .resolve_revert_flakes(inverted, conflict_keys, strategy, &target_state)
+            .apply_two_way_strategy(inverted, conflict_keys, strategy, &target_state)
             .await?;
 
         // If every reverted flake was a conflict and the strategy dropped
@@ -416,43 +416,6 @@ impl crate::Fluree {
         Ok(RevertWriteOutcome::Wrote(receipt))
     }
 
-    async fn resolve_revert_flakes(
-        &self,
-        flakes: Vec<Flake>,
-        conflicting_keys: &[ConflictKey],
-        strategy: &ConflictStrategy,
-        target_state: &LedgerState,
-    ) -> Result<Vec<Flake>> {
-        if conflicting_keys.is_empty() {
-            return Ok(flakes);
-        }
-
-        let conflict_set: FxHashSet<&ConflictKey> = conflicting_keys.iter().collect();
-
-        match strategy {
-            ConflictStrategy::TakeSource => {
-                // Revert wins: keep inverse flakes + retract HEAD values for conflict keys.
-                let retractions = self
-                    .build_source_retractions(conflicting_keys, target_state)
-                    .await?;
-                let mut result = flakes;
-                result.extend(retractions);
-                Ok(result)
-            }
-            ConflictStrategy::TakeBranch => {
-                // HEAD wins: drop inverse flakes that touch a conflicting key.
-                Ok(flakes
-                    .into_iter()
-                    .filter(|f| {
-                        let key = ConflictKey::new(f.s.clone(), f.p.clone(), f.g.clone());
-                        !conflict_set.contains(&key)
-                    })
-                    .collect())
-            }
-            // Abort returns earlier; TakeBoth/Skip are rejected up front.
-            _ => Ok(flakes),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

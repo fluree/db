@@ -15,7 +15,6 @@ use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_nameservice::{NsRecord, NsRecordSnapshot};
 use fluree_db_novelty::compute_delta_keys;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
-use rustc_hash::FxHashSet;
 use serde::Serialize;
 use tracing::Instrument;
 
@@ -327,11 +326,15 @@ impl crate::Fluree {
 
         // Collect source flakes and metadata: walk source commits from HEAD
         // to ancestor, gathering flakes, namespace deltas, and graph deltas.
-        let source_data = collect_commit_data(source_store, source_head_id, ancestor.t).await?;
+        let CollectedCommitData {
+            flakes: source_flakes,
+            namespace_delta,
+            graph_delta,
+        } = collect_commit_data(source_store, source_head_id, ancestor.t).await?;
 
-        // Resolve conflicts.
+        // Resolve conflicts via the shared two-way strategy helper.
         let resolved_flakes = self
-            .resolve_merge_flakes(&source_data.flakes, &conflicts, strategy, &target_state)
+            .apply_two_way_strategy(source_flakes, &conflicts, strategy, &target_state)
             .await?;
 
         // Stage resolved flakes onto target state. An empty flake set is valid
@@ -349,11 +352,11 @@ impl crate::Fluree {
         let ns_registry = NamespaceRegistry::from_db(view.db());
         let mut commit_opts =
             CommitOpts::default().with_merge_parents(vec![source_head_id.clone()]);
-        if !source_data.namespace_delta.is_empty() {
-            commit_opts = commit_opts.with_namespace_delta(source_data.namespace_delta);
+        if !namespace_delta.is_empty() {
+            commit_opts = commit_opts.with_namespace_delta(namespace_delta);
         }
-        if !source_data.graph_delta.is_empty() {
-            commit_opts = commit_opts.with_graph_delta(source_data.graph_delta);
+        if !graph_delta.is_empty() {
+            commit_opts = commit_opts.with_graph_delta(graph_delta);
         }
 
         // Copy source commit chain to target namespace so the target is
@@ -399,56 +402,6 @@ impl crate::Fluree {
             conflict_count,
             strategy: Some(strategy.as_str().to_string()),
         })
-    }
-
-    /// Resolve flakes for a merge operation.
-    ///
-    /// In merge context the semantics are:
-    /// - `TakeBoth`: keep all source flakes as-is (both values coexist).
-    /// - `TakeSource` (incoming branch wins): keep source flakes + retract
-    ///   target's conflicting values.
-    /// - `TakeBranch` (target wins): drop source's conflicting flakes.
-    /// - `Abort`/`Skip`: handled before this method is called.
-    async fn resolve_merge_flakes(
-        &self,
-        flakes: &[Flake],
-        conflicting_keys: &[ConflictKey],
-        strategy: &ConflictStrategy,
-        target_state: &LedgerState,
-    ) -> Result<Vec<Flake>> {
-        if conflicting_keys.is_empty() {
-            return Ok(flakes.to_vec());
-        }
-
-        let conflict_set: FxHashSet<&ConflictKey> = conflicting_keys.iter().collect();
-
-        match strategy {
-            ConflictStrategy::TakeSource => {
-                // Incoming branch wins: keep source flakes + retract target's values.
-                // In rebase terms, this is like TakeBranch — we query the target
-                // state (the "other side") for retractions.
-                let retractions = self
-                    .build_source_retractions(conflicting_keys, target_state)
-                    .await?;
-                let mut result = flakes.to_vec();
-                result.extend(retractions);
-                Ok(result)
-            }
-            ConflictStrategy::TakeBranch => {
-                // Target wins: drop source's conflicting flakes.
-                Ok(flakes
-                    .iter()
-                    .filter(|f| {
-                        let key = ConflictKey::new(f.s.clone(), f.p.clone(), f.g.clone());
-                        !conflict_set.contains(&key)
-                    })
-                    .cloned()
-                    .collect())
-            }
-            // TakeBoth: keep all source flakes, both values coexist.
-            // Abort/Skip: handled before this method is called.
-            _ => Ok(flakes.to_vec()),
-        }
     }
 
     /// Copy commit blobs (and their referenced txn blobs) from a source
