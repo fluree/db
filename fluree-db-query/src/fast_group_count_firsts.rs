@@ -605,19 +605,21 @@ fn count_bound_object_v6(
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
 
         for (i, entry) in dir.entries.iter().enumerate() {
-            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+            if entry.row_count == 0 {
                 continue;
+            }
+            // For mixed-predicate leaflets (`p_const = None`) we cannot skip on
+            // p_const alone — the leaflet may still contain rows for our p_id.
+            if let Some(leaflet_p) = entry.p_const {
+                if leaflet_p != p_id {
+                    continue;
+                }
             }
 
             let prefix = prefix_v6_from_entry(entry);
-            if prefix < target_prefix {
-                continue;
-            }
-            if prefix > target_prefix {
-                break;
-            }
-
-            // Boundary-equality: check the next leaflet's first prefix.
+            // The next leaflet's first prefix bounds this leaflet's range from
+            // above: rows live in `[prefix, next_prefix)`. Without that bound,
+            // a leaflet that *starts* below the target may still *contain* it.
             let next_prefix = if i + 1 < dir.entries.len() {
                 Some(prefix_v6_from_entry(&dir.entries[i + 1]))
             } else if leaf_idx + 1 < leaf_range.end {
@@ -627,12 +629,28 @@ fn count_bound_object_v6(
                 None
             };
 
-            if next_prefix == Some(target_prefix) {
+            if prefix > target_prefix {
+                break;
+            }
+            // The leaflet's rows span `[prefix, next_prefix]` inclusive on both
+            // ends — `next_prefix` is the FIRST key of the *next* leaflet, but
+            // this leaflet's last row may equal target_prefix even when the
+            // next leaflet also starts at target_prefix. We can only skip when
+            // `next_prefix < target_prefix` (leaflet ends strictly before).
+            if let Some(np) = next_prefix {
+                if np < target_prefix {
+                    continue;
+                }
+            }
+
+            // Boundary-equality fast count: only valid when the leaflet is
+            // entirely target rows (it starts at the target value AND the next
+            // leaflet also starts at the target value).
+            if prefix == target_prefix && next_prefix == Some(target_prefix) {
                 total += entry.row_count as i64;
                 continue;
             }
 
-            // Decode columns (cached when available).
             let batch = load_v6_batch(
                 &bytes,
                 entry,
@@ -645,6 +663,14 @@ fn count_bound_object_v6(
             )?;
 
             for row in 0..batch.row_count {
+                // For mixed-predicate leaflets we must verify p_id per row —
+                // a `p_const = Some(p_id)` leaflet lets us skip the column read.
+                if entry.p_const.is_none() {
+                    let row_p_id = batch.p_id.get_or(row, 0);
+                    if row_p_id != p_id {
+                        continue;
+                    }
+                }
                 let ot = entry
                     .o_type_const
                     .unwrap_or_else(|| batch.o_type.get_or(row, 0));
