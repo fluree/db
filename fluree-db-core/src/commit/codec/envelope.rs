@@ -16,12 +16,12 @@ use super::varint::{
 };
 use crate::ns_encoding::NsSplitMode;
 use crate::ContentId;
-use crate::{CommitRef, TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_ENTRIES};
+use crate::{CommitId, TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_ENTRIES};
 use std::collections::HashMap;
 
 // --- Presence flag bits ---
 const FLAG_TXN_META: u8 = 0x01;
-const FLAG_PREVIOUS_REF: u8 = 0x02;
+const FLAG_PARENT: u8 = 0x02;
 const FLAG_NAMESPACE_DELTA: u8 = 0x04;
 const FLAG_TXN: u8 = 0x08;
 const FLAG_TIME: u8 = 0x10;
@@ -29,12 +29,8 @@ const FLAG_TIME: u8 = 0x10;
 const FLAG_TXN_SIGNATURE: u8 = 0x80;
 
 /// Mask of all flag bits the current encoder/decoder understands.
-const KNOWN_FLAGS: u8 = FLAG_TXN_META
-    | FLAG_PREVIOUS_REF
-    | FLAG_NAMESPACE_DELTA
-    | FLAG_TXN
-    | FLAG_TIME
-    | FLAG_TXN_SIGNATURE;
+const KNOWN_FLAGS: u8 =
+    FLAG_TXN_META | FLAG_PARENT | FLAG_NAMESPACE_DELTA | FLAG_TXN | FLAG_TIME | FLAG_TXN_SIGNATURE;
 
 /// Maximum number of named graph entries per commit.
 pub const MAX_GRAPH_DELTA_ENTRIES: usize = 256;
@@ -49,7 +45,7 @@ const MAX_CID_BYTES: usize = 128;
 
 /// Maximum number of parent commit references (merge parents).
 /// 16 is generous; real merges will almost always have 2.
-const MAX_PREVIOUS_REFS: usize = 16;
+const MAX_PARENTS: usize = 16;
 
 /// Commit envelope fields — the non-flake metadata in a v2 commit blob.
 ///
@@ -63,7 +59,7 @@ pub struct CodecEnvelope {
     /// Parent commit references (CID-based).
     /// Empty for genesis, one element for normal commits.
     /// V2 encoding only supports 0 or 1 parents; multi-parent requires v3.
-    pub previous_refs: Vec<CommitRef>,
+    pub parents: Vec<CommitId>,
     pub namespace_delta: HashMap<u16, String>,
     /// Transaction blob CID
     pub txn: Option<ContentId>,
@@ -83,7 +79,7 @@ impl CodecEnvelope {
     pub fn from_commit(commit: &crate::Commit) -> Self {
         Self {
             t: commit.t,
-            previous_refs: commit.previous_refs.clone(),
+            parents: commit.parents.clone(),
             namespace_delta: commit.namespace_delta.clone(),
             txn: commit.txn.clone(),
             time: commit.time.clone(),
@@ -104,10 +100,10 @@ pub fn encode_envelope_fields(
     envelope: &CodecEnvelope,
     buf: &mut Vec<u8>,
 ) -> Result<(), CommitCodecError> {
-    let num_parents = envelope.previous_refs.len();
-    if num_parents > MAX_PREVIOUS_REFS {
+    let num_parents = envelope.parents.len();
+    if num_parents > MAX_PARENTS {
         return Err(CommitCodecError::EnvelopeEncode(format!(
-            "previous_refs has {num_parents} entries, max is {MAX_PREVIOUS_REFS}"
+            "parents has {num_parents} entries, max is {MAX_PARENTS}"
         )));
     }
 
@@ -122,8 +118,8 @@ pub fn encode_envelope_fields(
     if !envelope.txn_meta.is_empty() {
         flags |= FLAG_TXN_META;
     }
-    if !envelope.previous_refs.is_empty() {
-        flags |= FLAG_PREVIOUS_REF;
+    if !envelope.parents.is_empty() {
+        flags |= FLAG_PARENT;
     }
     if !envelope.namespace_delta.is_empty() {
         flags |= FLAG_NAMESPACE_DELTA;
@@ -143,16 +139,16 @@ pub fn encode_envelope_fields(
     if !envelope.txn_meta.is_empty() {
         encode_txn_meta(&envelope.txn_meta, buf)?;
     }
-    if !envelope.previous_refs.is_empty() {
+    if !envelope.parents.is_empty() {
         if version == 3 {
             // v3: encode count followed by each commit ref.
             encode_varint(num_parents as u64, buf);
-            for prev_ref in &envelope.previous_refs {
-                encode_commit_ref(prev_ref, buf)?;
+            for parent in &envelope.parents {
+                encode_commit_id(parent, buf)?;
             }
         } else {
             // v2: single commit ref (no count prefix).
-            encode_commit_ref(&envelope.previous_refs[0], buf)?;
+            encode_commit_id(&envelope.parents[0], buf)?;
         }
     }
     if !envelope.namespace_delta.is_empty() {
@@ -257,23 +253,23 @@ pub fn decode_envelope(data: &[u8]) -> Result<CodecEnvelope, CommitCodecError> {
         Vec::new()
     };
 
-    let previous_refs = if flags & FLAG_PREVIOUS_REF != 0 {
+    let parents = if flags & FLAG_PARENT != 0 {
         if v == 3 {
             // v3: varint(count) followed by count commit refs.
             let count = decode_varint(data, &mut pos)? as usize;
-            if count > MAX_PREVIOUS_REFS {
+            if count > MAX_PARENTS {
                 return Err(CommitCodecError::EnvelopeDecode(format!(
-                    "previous_refs count {count} exceeds maximum {MAX_PREVIOUS_REFS}"
+                    "parents count {count} exceeds maximum {MAX_PARENTS}"
                 )));
             }
             let mut refs = Vec::with_capacity(count);
             for _ in 0..count {
-                refs.push(decode_commit_ref(data, &mut pos)?);
+                refs.push(decode_commit_id(data, &mut pos)?);
             }
             refs
         } else {
             // v2: single commit ref (no count prefix).
-            vec![decode_commit_ref(data, &mut pos)?]
+            vec![decode_commit_id(data, &mut pos)?]
         }
     } else {
         Vec::new()
@@ -362,7 +358,7 @@ pub fn decode_envelope(data: &[u8]) -> Result<CodecEnvelope, CommitCodecError> {
 
     Ok(CodecEnvelope {
         t: 0,
-        previous_refs,
+        parents,
         namespace_delta,
         txn,
         time,
@@ -422,18 +418,17 @@ fn decode_len_bytes<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8], Com
 }
 
 // =============================================================================
-// CommitRef (binary CID encoding)
+// CommitId (binary CID encoding)
 // =============================================================================
 
-fn encode_commit_ref(cr: &CommitRef, buf: &mut Vec<u8>) -> Result<(), CommitCodecError> {
-    encode_len_bytes(&cr.id.to_bytes(), buf)
+fn encode_commit_id(id: &CommitId, buf: &mut Vec<u8>) -> Result<(), CommitCodecError> {
+    encode_len_bytes(&id.to_bytes(), buf)
 }
 
-fn decode_commit_ref(data: &[u8], pos: &mut usize) -> Result<CommitRef, CommitCodecError> {
+fn decode_commit_id(data: &[u8], pos: &mut usize) -> Result<CommitId, CommitCodecError> {
     let cid_bytes = decode_len_bytes(data, pos)?;
-    let content_id = ContentId::from_bytes(cid_bytes)
-        .map_err(|e| CommitCodecError::EnvelopeDecode(format!("invalid commit ref CID: {e}")))?;
-    Ok(CommitRef::new(content_id))
+    ContentId::from_bytes(cid_bytes)
+        .map_err(|e| CommitCodecError::EnvelopeDecode(format!("invalid commit id CID: {e}")))
 }
 
 // =============================================================================
@@ -663,7 +658,7 @@ mod tests {
         encode_envelope(&commit, &mut buf).unwrap();
 
         let decoded = decode_envelope(&buf).unwrap();
-        assert!(decoded.previous_refs.is_empty());
+        assert!(decoded.parents.is_empty());
         assert!(decoded.namespace_delta.is_empty());
         assert!(decoded.txn.is_none());
         assert!(decoded.time.is_none());
@@ -671,17 +666,17 @@ mod tests {
     }
 
     #[test]
-    fn test_round_trip_with_previous_ref() {
+    fn test_round_trip_with_parent() {
         let prev_id = make_test_cid(ContentKind::Commit, "prev-commit");
         let mut commit = make_minimal_commit();
-        commit.previous_refs = vec![CommitRef::new(prev_id.clone())];
+        commit.parents = vec![prev_id.clone()];
 
         let mut buf = Vec::new();
         encode_envelope(&commit, &mut buf).unwrap();
 
         let decoded = decode_envelope(&buf).unwrap();
-        let decoded_prev = decoded.previous_refs.first().unwrap();
-        assert_eq!(decoded_prev.id, prev_id);
+        let decoded_prev = decoded.parents.first().unwrap();
+        assert_eq!(decoded_prev, &prev_id);
     }
 
     #[test]
@@ -825,10 +820,7 @@ mod tests {
         let parent1 = make_test_cid(ContentKind::Commit, "parent-one");
         let parent2 = make_test_cid(ContentKind::Commit, "parent-two");
         let mut commit = make_minimal_commit();
-        commit.previous_refs = vec![
-            CommitRef::new(parent1.clone()),
-            CommitRef::new(parent2.clone()),
-        ];
+        commit.parents = vec![parent1.clone(), parent2.clone()];
 
         let mut buf = Vec::new();
         encode_envelope(&commit, &mut buf).unwrap();
@@ -839,19 +831,19 @@ mod tests {
         assert_eq!(v, 3, "multi-parent should use v3 encoding");
 
         let decoded = decode_envelope(&buf).unwrap();
-        assert_eq!(decoded.previous_refs.len(), 2);
-        assert_eq!(decoded.previous_refs[0].id, parent1);
-        assert_eq!(decoded.previous_refs[1].id, parent2);
+        assert_eq!(decoded.parents.len(), 2);
+        assert_eq!(decoded.parents[0], parent1);
+        assert_eq!(decoded.parents[1], parent2);
     }
 
     #[test]
-    fn test_golden_bytes_previous_ref_and_txn() {
+    fn test_golden_bytes_parent_and_txn() {
         // Deterministic CIDs from fixed inputs
         let prev_id = ContentId::new(ContentKind::Commit, b"golden-prev");
         let txn_id = ContentId::new(ContentKind::Txn, b"golden-txn");
 
         let mut commit = make_minimal_commit();
-        commit.previous_refs = vec![CommitRef::new(prev_id.clone())];
+        commit.parents = vec![prev_id.clone()];
         commit.txn = Some(txn_id.clone());
 
         let mut buf = Vec::new();
@@ -861,9 +853,9 @@ mod tests {
         let mut expected = Vec::new();
         // v = zigzag(2) = 4
         encode_varint(zigzag_encode(2), &mut expected);
-        // flags = FLAG_PREVIOUS_REF | FLAG_TXN = 0x02 | 0x08 = 0x0A
+        // flags = FLAG_PARENT | FLAG_TXN = 0x02 | 0x08 = 0x0A
         expected.push(0x0A);
-        // previous_ref: varint(len) + CID binary bytes
+        // parent: varint(len) + CID binary bytes
         let prev_bytes = prev_id.to_bytes();
         encode_varint(prev_bytes.len() as u64, &mut expected);
         expected.extend_from_slice(&prev_bytes);
@@ -887,7 +879,7 @@ mod tests {
 
         // Decode the golden bytes back and verify CIDs
         let decoded = decode_envelope(&expected).unwrap();
-        assert_eq!(decoded.previous_refs.first().unwrap().id, prev_id);
+        assert_eq!(decoded.parents.first().unwrap(), &prev_id);
         assert_eq!(decoded.txn.as_ref(), Some(&txn_id));
     }
 }

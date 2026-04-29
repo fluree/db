@@ -3,7 +3,7 @@ use fluree_db_api::{
     ExportCommitsRequest, ExportCommitsResponse, NamespaceRegistry, PushCommitsRequest,
 };
 use fluree_db_core::{ContentId, Flake, FlakeMeta, FlakeValue, Sid};
-use fluree_db_novelty::{Commit, CommitRef};
+use fluree_db_novelty::Commit;
 use fluree_db_server::config::{AdminAuthMode, DataAuthMode, EventsAuthMode};
 use fluree_db_server::{routes::build_router, AppState, ServerConfig, TelemetryConfig};
 use fluree_vocab::namespaces::{FLUREE_DB, XSD};
@@ -54,7 +54,7 @@ fn json_contains_string(v: &JsonValue, needle: &str) -> bool {
 fn make_commit_bytes(t: i64, previous: Option<&ContentId>, flakes: Vec<Flake>) -> Vec<u8> {
     let mut c = Commit::new(t, flakes);
     if let Some(prev_cid) = previous {
-        c = c.with_previous_ref(CommitRef::new(prev_cid.clone()));
+        c = c.with_parent(prev_cid.clone());
     }
     let res = fluree_db_core::commit::codec::write_commit(&c, true, None).expect("write_commit");
     res.bytes
@@ -294,6 +294,108 @@ async fn insert_then_query_finds_value() {
         json_contains_string(&json, "Alice"),
         "Expected query response to contain 'Alice', got: {json}"
     );
+}
+
+#[tokio::test]
+async fn create_branch_at_historical_t() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create the ledger
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "hist:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Three inserts → commits at t=1, t=2, t=3
+    for i in 1..=3 {
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": format!("ex:item{i}"),
+            "ex:val": i,
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/insert")
+                    .header("content-type", "application/json")
+                    .header("fluree-ledger", "hist:main")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "insert {i} failed: {json}");
+        assert_eq!(
+            json.get("t").and_then(serde_json::Value::as_i64),
+            Some(i),
+            "insert {i} should have t={i}"
+        );
+    }
+
+    // Branch at t=2
+    let branch_body = serde_json::json!({
+        "ledger": "hist",
+        "branch": "historical",
+        "at": "t:2",
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(branch_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "branch create failed: {json}");
+    assert_eq!(
+        json.get("ledger_id").and_then(|v| v.as_str()),
+        Some("hist:historical")
+    );
+    assert_eq!(
+        json.get("t").and_then(serde_json::Value::as_i64),
+        Some(2),
+        "historical branch should be at t=2, got: {json}"
+    );
+    assert_eq!(json.get("source").and_then(|v| v.as_str()), Some("main"));
+
+    // Bad `at` value surfaces as 400
+    let bad = serde_json::json!({
+        "ledger": "hist",
+        "branch": "bad",
+        "at": "t:notanumber",
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(bad.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

@@ -299,7 +299,7 @@ async fn notify_branch_catch_up_resolves_pre_fork_parent() {
 
     // 2. Create branch dev from main at t=1
     fluree
-        .create_branch(ledger_name, "dev", None)
+        .create_branch(ledger_name, "dev", None, None)
         .await
         .expect("create_branch");
 

@@ -46,10 +46,10 @@ pub struct TrackingRecord {
     pub ledger_id: String,
 
     /// The remote's commit head (if known).
-    pub commit_ref: Option<RefValue>,
+    pub commit_head: Option<RefValue>,
 
     /// The remote's index head (if known).
-    pub index_ref: Option<RefValue>,
+    pub index_head: Option<RefValue>,
 
     /// Whether the ledger has been retracted on the remote.
     pub retracted: bool,
@@ -65,8 +65,8 @@ impl TrackingRecord {
             schema_version: 1,
             remote,
             ledger_id: ledger_id.into(),
-            commit_ref: None,
-            index_ref: None,
+            commit_head: None,
+            index_head: None,
             retracted: false,
             last_fetched: None,
         }
@@ -179,7 +179,7 @@ mod tests {
     async fn test_set_and_get_tracking() {
         let store = MemoryTrackingStore::new();
         let mut record = TrackingRecord::new(origin(), "mydb:main");
-        record.commit_ref = Some(RefValue { id: None, t: 5 });
+        record.commit_head = Some(RefValue { id: None, t: 5 });
         record.last_fetched = Some("2025-01-01T00:00:00Z".to_string());
 
         store.set_tracking(&record).await.unwrap();
@@ -191,7 +191,7 @@ mod tests {
             .unwrap();
         assert_eq!(fetched.ledger_id, "mydb:main");
         assert_eq!(fetched.schema_version, 1);
-        assert_eq!(fetched.commit_ref.as_ref().unwrap().t, 5);
+        assert_eq!(fetched.commit_head.as_ref().unwrap().t, 5);
         assert_eq!(
             fetched.last_fetched.as_deref(),
             Some("2025-01-01T00:00:00Z")
@@ -203,11 +203,11 @@ mod tests {
         let store = MemoryTrackingStore::new();
 
         let mut record = TrackingRecord::new(origin(), "mydb:main");
-        record.commit_ref = Some(RefValue { id: None, t: 1 });
+        record.commit_head = Some(RefValue { id: None, t: 1 });
         store.set_tracking(&record).await.unwrap();
 
         // Overwrite with newer data
-        record.commit_ref = Some(RefValue { id: None, t: 5 });
+        record.commit_head = Some(RefValue { id: None, t: 5 });
         store.set_tracking(&record).await.unwrap();
 
         let fetched = store
@@ -215,7 +215,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(fetched.commit_ref.as_ref().unwrap().t, 5);
+        assert_eq!(fetched.commit_head.as_ref().unwrap().t, 5);
     }
 
     #[tokio::test]
@@ -278,8 +278,8 @@ mod tests {
     #[test]
     fn test_tracking_record_serde_roundtrip() {
         let mut record = TrackingRecord::new(origin(), "mydb:main");
-        record.commit_ref = Some(RefValue { id: None, t: 5 });
-        record.index_ref = Some(RefValue { id: None, t: 3 });
+        record.commit_head = Some(RefValue { id: None, t: 5 });
+        record.index_head = Some(RefValue { id: None, t: 3 });
         record.retracted = false;
         record.last_fetched = Some("2025-06-15T12:00:00Z".to_string());
 
@@ -289,8 +289,8 @@ mod tests {
         assert_eq!(deserialized.schema_version, 1);
         assert_eq!(deserialized.remote, origin());
         assert_eq!(deserialized.ledger_id, "mydb:main");
-        assert_eq!(deserialized.commit_ref.as_ref().unwrap().t, 5);
-        assert_eq!(deserialized.index_ref.as_ref().unwrap().t, 3);
+        assert_eq!(deserialized.commit_head.as_ref().unwrap().t, 5);
+        assert_eq!(deserialized.index_head.as_ref().unwrap().t, 3);
         assert!(!deserialized.retracted);
     }
 

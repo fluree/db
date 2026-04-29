@@ -179,6 +179,22 @@ Each branch has its own transaction history. Query any branch at any point in ti
 fluree query --ledger mydb:experiment --at 3 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
 ```
 
+### Branch at a historical point
+
+By default, `branch create` starts the new branch at the source's current HEAD. Pass `--at` to start it at an earlier commit on the source branch instead — useful for recovering to a known-good state, forking off an older release, or experimenting with what-if scenarios from a past point in time.
+
+```bash
+# Start a branch at transaction 5 on main
+fluree branch create rewind --at t:5
+
+# Or use a hex-digest prefix of the commit
+fluree branch create rewind --at 3dd028a7
+```
+
+The commit must be reachable from the source branch's HEAD (branching from an unrelated branch's commit is rejected). The new branch starts with no index and replays from genesis on first query — acceptable for small/medium histories; if replay cost matters, transact a small no-op to force an index rebuild.
+
+Full CIDs are also accepted (`--at fluree:commit:sha256:...`) and resolve without requiring the source to be indexed; `t:N` and hex prefixes require an indexed source.
+
 ## Branch lifecycle
 
 ```
@@ -196,9 +212,14 @@ After merging, the branch is still alive. You can:
 
 ```bash
 # Create a branch
-curl -X POST 'http://localhost:8090/v1/fluree/branch' \
+curl -X POST http://localhost:8090/v1/fluree/branch \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb", "branch": "dev", "source": "main"}'
+
+# Branch at a historical commit
+curl -X POST http://localhost:8090/v1/fluree/branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "rewind", "at": "t:5"}'
 
 # Query a specific branch
 curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:dev' \
@@ -206,7 +227,7 @@ curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:dev' \
   -d 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
 
 # Merge
-curl -X POST 'http://localhost:8090/v1/fluree/merge' \
+curl -X POST http://localhost:8090/v1/fluree/merge \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb", "source": "dev"}'
 ```

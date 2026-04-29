@@ -593,7 +593,7 @@ mod tests {
         // Encode envelope (minimal: just v=0, no previous, no namespace_delta)
         let envelope = CodecEnvelope {
             t,
-            previous_refs: Vec::new(),
+            parents: Vec::new(),
             namespace_delta: HashMap::new(),
             txn: None,
             time: None,

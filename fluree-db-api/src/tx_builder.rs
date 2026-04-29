@@ -23,7 +23,7 @@ use crate::{
     Tracker, TrackingOptions,
 };
 use fluree_db_core::{ContentId, ContentKind};
-use fluree_db_ledger::{IndexConfig, LedgerState, LedgerView};
+use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_transact::{
     parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry, RawTrigMeta, Txn, TxnOpts,
     TxnType,
@@ -203,7 +203,7 @@ impl<'a> TransactCore<'a> {
 /// ```
 pub struct Staged {
     /// The queryable staged view (base + overlay with staged flakes).
-    pub view: LedgerView,
+    pub view: StagedLedger,
     /// Namespace registry needed for commit.
     pub ns_registry: NamespaceRegistry,
     /// Named graph IRI mappings introduced by this transaction (g_id → IRI).

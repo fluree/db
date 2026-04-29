@@ -384,7 +384,7 @@ Each flake is a tuple: `[subject, predicate, object, datatype, operation]`. Oper
 
 ### GET /commits/*ledger
 
-Export commit blobs from a ledger using stable cursors. Pages walk backward via `previous_ref` — O(limit) per page regardless of ledger size. Used by `fluree pull` and `fluree clone`.
+Export commit blobs from a ledger using stable cursors. Pages walk backward via each commit's `parents` — O(limit) per page regardless of ledger size. Used by `fluree pull` and `fluree clone`.
 
 **Requires replication-grade permissions** (`fluree.storage.*`). The storage proxy must be enabled on the server.
 
@@ -1407,7 +1407,8 @@ POST /branch
 {
   "ledger": "mydb",
   "branch": "feature-x",
-  "source": "main"
+  "source": "main",
+  "at": "t:5"
 }
 ```
 
@@ -1416,6 +1417,7 @@ POST /branch
 | `ledger` | string | Yes | Ledger name without branch suffix (e.g., "mydb") |
 | `branch` | string | Yes | New branch name to create (e.g., "feature-x") |
 | `source` | string | No | Source branch to create from. Default: `"main"` |
+| `at` | string | No | Commit on the source branch to start from. `"t:N"` for a transaction number, or a hex digest / full CID for prefix resolution. When omitted, the branch starts at the source's current HEAD. `t:` / prefix resolution requires the source to be indexed. |
 
 **Response:**
 
@@ -1433,13 +1435,13 @@ POST /branch
 | `ledger_id` | Full ledger:branch identifier for the new branch |
 | `branch` | Branch name |
 | `source` | Source branch this was created from |
-| `t` | Transaction time of the source commit at branch point |
+| `t` | Transaction time of the commit at the branch point |
 
 **Status Codes:**
 - `201 Created` - Branch created successfully
-- `400 Bad Request` - Invalid request body
+- `400 Bad Request` - Invalid request body (including malformed `at` value)
 - `401 Unauthorized` - Bearer token required (when admin auth enabled)
-- `404 Not Found` - Source branch does not exist
+- `404 Not Found` - Source branch does not exist, or `at` commit is not reachable from source HEAD
 - `409 Conflict` - Branch already exists
 - `500 Internal Server Error` - Server error
 
@@ -1455,6 +1457,11 @@ curl -X POST http://localhost:8090/v1/fluree/branch \
 curl -X POST http://localhost:8090/v1/fluree/branch \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb", "branch": "staging", "source": "dev"}'
+
+# Branch at a historical commit on main
+curl -X POST http://localhost:8090/v1/fluree/branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "rewind", "at": "t:5"}'
 ```
 
 ### GET /branch/{ledger-name}

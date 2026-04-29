@@ -137,8 +137,8 @@ impl SyncDriver {
             let changed = match &existing {
                 None => true,
                 Some(tr) => {
-                    tr.commit_ref != new_commit
-                        || tr.index_ref != new_index
+                    tr.commit_head != new_commit
+                        || tr.index_head != new_index
                         || tr.retracted != record.retracted
                 }
             };
@@ -148,8 +148,8 @@ impl SyncDriver {
                     schema_version: 1,
                     remote: remote.clone(),
                     ledger_id: ledger_id.clone(),
-                    commit_ref: new_commit,
-                    index_ref: new_index,
+                    commit_head: new_commit,
+                    index_head: new_index,
                     retracted: record.retracted,
                     last_fetched: Some(now.clone()),
                 };
@@ -184,9 +184,9 @@ impl SyncDriver {
             });
         };
 
-        let remote_index = tracking.index_ref.clone();
+        let remote_index = tracking.index_head.clone();
 
-        let Some(remote_commit) = &tracking.commit_ref else {
+        let Some(remote_commit) = &tracking.commit_head else {
             return Ok(PullResult::Current {
                 ledger_id: local_alias.to_string(),
             });
@@ -368,8 +368,8 @@ impl SyncDriver {
             .tracking
             .get_tracking(&upstream.remote, &upstream.remote_alias)
             .await?;
-        let expected = tracking.as_ref().and_then(|t| t.commit_ref.as_ref());
-        let expected_index = tracking.as_ref().and_then(|t| t.index_ref.clone());
+        let expected = tracking.as_ref().and_then(|t| t.commit_head.as_ref());
+        let expected_index = tracking.as_ref().and_then(|t| t.index_head.clone());
 
         let result = client
             .push_ref(
@@ -386,7 +386,7 @@ impl SyncDriver {
                 let mut tracking_record = tracking.unwrap_or_else(|| {
                     TrackingRecord::new(upstream.remote.clone(), upstream.remote_alias.clone())
                 });
-                tracking_record.commit_ref = Some(local_commit.clone());
+                tracking_record.commit_head = Some(local_commit.clone());
                 tracking_record.last_fetched = Some(chrono_now());
 
                 // Best-effort push of index head if we have one.
@@ -401,7 +401,7 @@ impl SyncDriver {
                             )
                             .await
                         {
-                            tracking_record.index_ref = Some(local_index.clone());
+                            tracking_record.index_head = Some(local_index.clone());
                         }
                     }
                 }
@@ -546,7 +546,7 @@ mod tests {
         let result = driver.fetch_remote(&origin()).await.unwrap();
         assert_eq!(result.updated.len(), 1);
         assert_eq!(result.updated[0].0, "mydb:main");
-        assert_eq!(result.updated[0].1.commit_ref.as_ref().unwrap().t, 5);
+        assert_eq!(result.updated[0].1.commit_head.as_ref().unwrap().t, 5);
         assert!(result.unchanged.is_empty());
     }
 

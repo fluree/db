@@ -86,9 +86,10 @@ where
         ledger_name: &str,
         new_branch: &str,
         source_branch: &str,
+        at_commit: Option<(ContentId, i64)>,
     ) -> Result<()> {
         self.inner
-            .create_branch(ledger_name, new_branch, source_branch)
+            .create_branch(ledger_name, new_branch, source_branch, at_commit)
             .await
     }
 
