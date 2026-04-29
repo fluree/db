@@ -543,35 +543,7 @@ fn build_commit_detail(
     // Resolve flakes
     let mut flakes = Vec::with_capacity(commit.flakes.len());
     for flake in &commit.flakes {
-        let s = compactor
-            .compact_sid_for_display(&flake.s)
-            .map_err(|e| ApiError::internal(format!("Failed to resolve subject IRI: {e}")))?;
-        let p = compactor
-            .compact_sid_for_display(&flake.p)
-            .map_err(|e| ApiError::internal(format!("Failed to resolve predicate IRI: {e}")))?;
-
-        let (o, dt) = resolve_object_and_dt(compactor, &flake.o, &flake.dt)?;
-
-        let lang = flake.m.as_ref().and_then(|m| m.lang.clone());
-        let i = flake.m.as_ref().and_then(|m| m.i);
-        let graph =
-            match &flake.g {
-                Some(g_sid) => Some(compactor.compact_sid_for_display(g_sid).map_err(|e| {
-                    ApiError::internal(format!("Failed to resolve graph IRI: {e}"))
-                })?),
-                None => None,
-            };
-
-        flakes.push(ResolvedFlake {
-            s,
-            p,
-            o,
-            dt,
-            op: flake.op,
-            lang,
-            i,
-            graph,
-        });
+        flakes.push(resolve_flake(compactor, flake)?);
     }
 
     Ok(CommitDetail {
@@ -589,6 +561,43 @@ fn build_commit_detail(
         retracts,
         context,
         flakes,
+    })
+}
+
+/// Resolve a flake into the same display tuple used by commit detail output.
+pub(crate) fn resolve_flake(
+    compactor: &IriCompactor,
+    flake: &fluree_db_core::Flake,
+) -> Result<ResolvedFlake> {
+    let s = compactor
+        .compact_sid_for_display(&flake.s)
+        .map_err(|e| ApiError::internal(format!("Failed to resolve subject IRI: {e}")))?;
+    let p = compactor
+        .compact_sid_for_display(&flake.p)
+        .map_err(|e| ApiError::internal(format!("Failed to resolve predicate IRI: {e}")))?;
+
+    let (o, dt) = resolve_object_and_dt(compactor, &flake.o, &flake.dt)?;
+
+    let lang = flake.m.as_ref().and_then(|m| m.lang.clone());
+    let i = flake.m.as_ref().and_then(|m| m.i);
+    let graph = match &flake.g {
+        Some(g_sid) => Some(
+            compactor
+                .compact_sid_for_display(g_sid)
+                .map_err(|e| ApiError::internal(format!("Failed to resolve graph IRI: {e}")))?,
+        ),
+        None => None,
+    };
+
+    Ok(ResolvedFlake {
+        s,
+        p,
+        o,
+        dt,
+        op: flake.op,
+        lang,
+        i,
+        graph,
     })
 }
 

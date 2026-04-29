@@ -3,7 +3,7 @@
 
 mod support;
 
-use fluree_db_api::{FlureeBuilder, MergePreviewOpts};
+use fluree_db_api::{ConflictStrategy, FlureeBuilder, MergePreviewOpts};
 use serde_json::json;
 
 // =============================================================================
@@ -40,6 +40,50 @@ async fn preview_fast_forward() {
     assert!(!preview.ahead.commits.is_empty());
     assert_eq!(preview.conflicts.count, 0);
     assert!(preview.ancestor.is_some());
+}
+
+#[tokio::test]
+async fn preview_fast_forward_with_conflict_details_is_empty_and_mergeable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+
+    let base = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+    });
+    fluree.insert(ledger, &base).await.unwrap();
+
+    fluree.create_branch("mydb", "dev", None).await.unwrap();
+    let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .insert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_conflict_details: true,
+                conflict_strategy: ConflictStrategy::Abort,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(preview.fast_forward);
+    assert_eq!(preview.conflicts.count, 0);
+    assert!(preview.conflicts.details.is_empty());
+    assert!(preview.mergeable);
 }
 
 // =============================================================================
@@ -123,7 +167,7 @@ async fn preview_diverged_with_conflicts() {
         .unwrap();
 
     fluree
-        .insert(
+        .upsert(
             main_ledger,
             &json!({
                 "@context": {"ex": "http://example.org/ns/"},
@@ -142,6 +186,362 @@ async fn preview_diverged_with_conflicts() {
         preview.conflicts
     );
     assert!(!preview.conflicts.keys.is_empty());
+}
+
+#[tokio::test]
+async fn preview_conflict_details_include_values_and_strategy_labels() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+
+    let base = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+    });
+    let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
+
+    fluree.create_branch("mydb", "dev", None).await.unwrap();
+
+    let mut dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
+    dev_ledger = fluree
+        .upsert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice-dev-stale"}]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .upsert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice-dev"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    fluree
+        .upsert(
+            main_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice-main"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_conflict_details: true,
+                conflict_strategy: ConflictStrategy::TakeSource,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(preview.conflicts.strategy.as_deref(), Some("take-source"));
+    assert_eq!(
+        preview.conflicts.details.len(),
+        preview.conflicts.keys.len()
+    );
+
+    let detail = preview
+        .conflicts
+        .details
+        .first()
+        .expect("conflict details should be returned");
+    assert_eq!(detail.resolution.source_action, "kept");
+    assert_eq!(detail.resolution.target_action, "retracted");
+    assert_eq!(detail.resolution.outcome, "source-wins");
+    assert!(preview.mergeable);
+
+    let source_values = serde_json::to_string(&detail.source_values).unwrap();
+    let target_values = serde_json::to_string(&detail.target_values).unwrap();
+    assert!(source_values.contains("Alice-dev"), "{source_values}");
+    assert!(
+        !source_values.contains("Alice-dev-stale"),
+        "{source_values}"
+    );
+    assert!(target_values.contains("Alice-main"), "{target_values}");
+}
+
+#[tokio::test]
+async fn preview_conflict_details_cover_take_branch_and_abort_labels() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+
+    let base = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+    });
+    let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
+    fluree.create_branch("mydb", "dev", None).await.unwrap();
+
+    let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .upsert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice-dev"}]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .upsert(
+            main_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice-main"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let take_branch = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_conflict_details: true,
+                conflict_strategy: ConflictStrategy::TakeBranch,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    let detail = take_branch.conflicts.details.first().unwrap();
+    assert_eq!(detail.resolution.source_action, "dropped");
+    assert_eq!(detail.resolution.target_action, "kept");
+    assert_eq!(detail.resolution.outcome, "target-wins");
+    assert!(take_branch.mergeable);
+
+    let abort = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_conflict_details: true,
+                conflict_strategy: ConflictStrategy::Abort,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    let detail = abort.conflicts.details.first().unwrap();
+    assert_eq!(detail.resolution.source_action, "unchanged");
+    assert_eq!(detail.resolution.target_action, "unchanged");
+    assert_eq!(detail.resolution.outcome, "merge-aborts");
+    assert!(!abort.mergeable);
+}
+
+#[tokio::test]
+async fn preview_conflict_details_follow_conflict_key_truncation() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+
+    let base = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:name": "Alice"},
+            {"@id": "ex:bob", "ex:name": "Bob"}
+        ]
+    });
+    let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
+    fluree.create_branch("mydb", "dev", None).await.unwrap();
+
+    let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .upsert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:alice", "ex:name": "Alice-dev"},
+                    {"@id": "ex:bob", "ex:name": "Bob-dev"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .upsert(
+            main_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:alice", "ex:name": "Alice-main"},
+                    {"@id": "ex:bob", "ex:name": "Bob-main"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                max_conflict_keys: Some(1),
+                include_conflict_details: true,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(preview.conflicts.truncated);
+    assert!(preview.conflicts.count >= 2);
+    assert_eq!(preview.conflicts.keys.len(), 1);
+    assert_eq!(preview.conflicts.details.len(), 1);
+    assert_eq!(preview.conflicts.details[0].key, preview.conflicts.keys[0]);
+}
+
+#[tokio::test]
+async fn preview_conflict_details_preserve_key_order() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+
+    let base = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:name": "Alice"},
+            {"@id": "ex:bob", "ex:name": "Bob"},
+            {"@id": "ex:carol", "ex:name": "Carol"}
+        ]
+    });
+    let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
+    fluree.create_branch("mydb", "dev", None).await.unwrap();
+
+    let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .upsert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:alice", "ex:name": "Alice-dev"},
+                    {"@id": "ex:bob", "ex:name": "Bob-dev"},
+                    {"@id": "ex:carol", "ex:name": "Carol-dev"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .upsert(
+            main_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:alice", "ex:name": "Alice-main"},
+                    {"@id": "ex:bob", "ex:name": "Bob-main"},
+                    {"@id": "ex:carol", "ex:name": "Carol-main"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_conflict_details: true,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(preview.conflicts.keys.len() >= 3);
+    assert_eq!(
+        preview.conflicts.details.len(),
+        preview.conflicts.keys.len()
+    );
+    for (detail, key) in preview
+        .conflicts
+        .details
+        .iter()
+        .zip(&preview.conflicts.keys)
+    {
+        assert_eq!(&detail.key, key);
+    }
+}
+
+#[tokio::test]
+async fn preview_conflict_details_work_after_binary_index_reload() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+
+    let base = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+    });
+    let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
+    support::rebuild_and_publish_index(&fluree, "mydb:main").await;
+    fluree.create_branch("mydb", "dev", None).await.unwrap();
+
+    let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .upsert(
+            dev_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice-dev"}]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .upsert(
+            main_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice-main"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_conflict_details: true,
+                conflict_strategy: ConflictStrategy::TakeSource,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(preview.conflicts.count, 1);
+    assert_eq!(preview.conflicts.details.len(), 1);
+    let detail = &preview.conflicts.details[0];
+    let source_values = serde_json::to_string(&detail.source_values).unwrap();
+    let target_values = serde_json::to_string(&detail.target_values).unwrap();
+    assert!(source_values.contains("Alice-dev"), "{source_values}");
+    assert!(target_values.contains("Alice-main"), "{target_values}");
 }
 
 // =============================================================================
@@ -364,6 +764,68 @@ async fn preview_include_conflicts_false_returns_empty_conflicts() {
     assert!(!preview.conflicts.truncated);
 }
 
+#[tokio::test]
+async fn preview_conflict_details_require_conflict_computation() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+
+    let base = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+    });
+    fluree.insert(ledger, &base).await.unwrap();
+    fluree.create_branch("mydb", "dev", None).await.unwrap();
+
+    let err = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_conflicts: false,
+                include_conflict_details: true,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .expect_err("conflict details without conflict computation should fail");
+
+    assert!(err
+        .to_string()
+        .contains("include_conflict_details requires include_conflicts=true"));
+}
+
+#[tokio::test]
+async fn preview_abort_strategy_requires_conflict_computation() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+
+    let base = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+    });
+    fluree.insert(ledger, &base).await.unwrap();
+    fluree.create_branch("mydb", "dev", None).await.unwrap();
+
+    let err = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_conflicts: false,
+                conflict_strategy: ConflictStrategy::Abort,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .expect_err("abort mergeability requires conflict computation");
+
+    assert!(err
+        .to_string()
+        .contains("strategy=abort requires include_conflicts=true"));
+}
+
 // =============================================================================
 // 10. Read-only invariant — no nameservice mutations
 // =============================================================================
@@ -577,6 +1039,7 @@ async fn preview_max_commits_none_is_unbounded() {
                 max_commits: None,
                 max_conflict_keys: None,
                 include_conflicts: true,
+                ..MergePreviewOpts::default()
             },
         )
         .await

@@ -20,7 +20,7 @@ WHERE {
 
 ### Default Prefixes
 
-When querying via the **Fluree HTTP server or CLI**, a ledger's [default context](../concepts/iri-and-context.md#default-context) prefix mappings are injected into SPARQL queries that have no explicit `PREFIX` declarations. For example, if the default context includes `{"ex": "http://example.org/ns/"}`, this query works without a `PREFIX` line:
+When querying via the **CLI**, a ledger's [default context](../concepts/iri-and-context.md#default-context) prefix mappings are injected into SPARQL queries that have no explicit `PREFIX` declarations. The HTTP API defaults this behavior off; pass `?default-context=true` on ledger-scoped query requests to opt in. For example, if the default context includes `{"ex": "http://example.org/ns/"}`, this query works without a `PREFIX` line when default-context injection is enabled:
 
 ```sparql
 SELECT ?name ?age

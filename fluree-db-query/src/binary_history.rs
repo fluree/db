@@ -242,11 +242,16 @@ impl BinaryHistoryScanOperator {
                             // needed to charge — so we short-circuit before the
                             // sidecar segment / column load on overrun. Overcharges
                             // on filter-rejected rows; that's the guardrail tradeoff.
-                            let sidecar_rows =
-                                if sidecar_in_range { leaflet.history_len as u64 } else { 0 };
+                            let sidecar_rows = if sidecar_in_range {
+                                leaflet.history_len as u64
+                            } else {
+                                0
+                            };
                             let base_rows = leaflet.row_count as u64;
                             ctx.tracker.consume_fuel(
-                                1000u64.saturating_add(sidecar_rows).saturating_add(base_rows),
+                                1000u64
+                                    .saturating_add(sidecar_rows)
+                                    .saturating_add(base_rows),
                             )?;
 
                             if sidecar_in_range {

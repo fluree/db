@@ -11,13 +11,17 @@
 //! branched-store construction for source/target, and parallel walks.
 
 use crate::error::{ApiError, Result};
+use crate::format::iri::IriCompactor;
+use crate::graph_commit_builder::resolve_flake;
+use crate::rebase::{current_asserted_for_key, ConflictStrategy};
 use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{
     find_common_ancestor, walk_commit_summaries, BranchedContentStore, CommitSummary, ConflictKey,
-    ContentId, ContentStore,
+    ContentId, ContentStore, Flake,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_novelty::compute_delta_keys;
+use futures::{stream, StreamExt, TryStreamExt};
 use serde::Serialize;
 use std::sync::Arc;
 use tracing::Instrument;
@@ -66,6 +70,12 @@ pub struct MergePreviewOpts {
     /// still contains commit counts but `conflicts` will be empty. The
     /// fastest way to bound preview cost on diverged branches.
     pub include_conflicts: bool,
+    /// When `true`, include source/target flake values for each returned
+    /// conflict key. Details are computed only for `conflicts.keys` after the
+    /// `max_conflict_keys` cap is applied.
+    pub include_conflict_details: bool,
+    /// Strategy used for human-readable conflict resolution labels.
+    pub conflict_strategy: ConflictStrategy,
 }
 
 impl Default for MergePreviewOpts {
@@ -74,6 +84,8 @@ impl Default for MergePreviewOpts {
             max_commits: Some(DEFAULT_MAX_COMMITS),
             max_conflict_keys: Some(DEFAULT_MAX_CONFLICT_KEYS),
             include_conflicts: true,
+            include_conflict_details: false,
+            conflict_strategy: ConflictStrategy::default(),
         }
     }
 }
@@ -105,6 +117,30 @@ pub struct ConflictSummary {
     pub count: usize,
     pub keys: Vec<ConflictKey>,
     pub truncated: bool,
+    /// Strategy used to annotate conflict details. Omitted when conflicts were
+    /// not computed or no conflict keys were returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    /// Per-key source/target values for the returned conflict keys.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<ConflictDetail>,
+}
+
+/// A conflict key with the source and target flakes that touched it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ConflictDetail {
+    pub key: ConflictKey,
+    pub source_values: Vec<crate::ResolvedFlake>,
+    pub target_values: Vec<crate::ResolvedFlake>,
+    pub resolution: ConflictResolutionPreview,
+}
+
+/// Human-readable strategy annotation for a single conflict row.
+#[derive(Clone, Debug, Serialize)]
+pub struct ConflictResolutionPreview {
+    pub source_action: &'static str,
+    pub target_action: &'static str,
+    pub outcome: &'static str,
 }
 
 impl ConflictSummary {
@@ -113,6 +149,8 @@ impl ConflictSummary {
             count: 0,
             keys: Vec::new(),
             truncated: false,
+            strategy: None,
+            details: Vec::new(),
         }
     }
 }
@@ -138,6 +176,9 @@ pub struct MergePreview {
     /// Always populated. Empty when `fast_forward` (no conflicts possible)
     /// or when the caller opted out via [`MergePreviewOpts::include_conflicts`].
     pub conflicts: ConflictSummary,
+
+    /// Whether the selected strategy can be applied without aborting.
+    pub mergeable: bool,
 }
 
 impl crate::Fluree {
@@ -189,6 +230,22 @@ impl crate::Fluree {
         target_branch: Option<&str>,
         opts: MergePreviewOpts,
     ) -> Result<MergePreview> {
+        if opts.include_conflict_details && !opts.include_conflicts {
+            return Err(ApiError::InvalidBranch(
+                "include_conflict_details requires include_conflicts=true".to_string(),
+            ));
+        }
+        if opts.conflict_strategy == ConflictStrategy::Abort && !opts.include_conflicts {
+            return Err(ApiError::InvalidBranch(
+                "strategy=abort requires include_conflicts=true for mergeable preview".to_string(),
+            ));
+        }
+        if opts.conflict_strategy == ConflictStrategy::Skip {
+            return Err(ApiError::InvalidBranch(
+                "Skip strategy is not supported for merge preview".to_string(),
+            ));
+        }
+
         // ---- Resolve records (mirrors merge_branch_inner). ----------------
         let source_id = format_ledger_id(ledger_name, source_branch);
         let source_record = self
@@ -335,15 +392,47 @@ impl crate::Fluree {
                         }
                         _ => false,
                     };
+
+                    let details = if opts.include_conflict_details && !keys.is_empty() {
+                        let source_state_fut = self.load_queryable_state_with_store(
+                            source_store.clone(),
+                            source_record.clone(),
+                        );
+                        let target_state_fut = self.load_queryable_state_with_store(
+                            target_branched.clone(),
+                            target_record.clone(),
+                        );
+                        let (source_state, target_state) =
+                            tokio::try_join!(source_state_fut, target_state_fut)?;
+
+                        build_conflict_details(
+                            &keys,
+                            &source_state,
+                            &target_state,
+                            &opts.conflict_strategy,
+                        )
+                        .await?
+                    } else {
+                        Vec::new()
+                    };
+
                     ConflictSummary {
                         count,
                         keys,
                         truncated,
+                        strategy: if count > 0 {
+                            Some(opts.conflict_strategy.as_str().to_string())
+                        } else {
+                            None
+                        },
+                        details,
                     }
                 }
                 _ => ConflictSummary::empty(),
             }
         };
+
+        let mergeable = opts.conflict_strategy != ConflictStrategy::Abort || conflicts.count == 0;
 
         // ---- Invariants (debug-only). -------------------------------------
         debug_assert!(ahead.commits.len() <= ahead.count);
@@ -367,6 +456,79 @@ impl crate::Fluree {
             behind,
             fast_forward,
             conflicts,
+            mergeable,
         })
+    }
+}
+
+async fn build_conflict_details(
+    keys: &[ConflictKey],
+    source_state: &LedgerState,
+    target_state: &LedgerState,
+    strategy: &ConflictStrategy,
+) -> Result<Vec<ConflictDetail>> {
+    let source_compactor = IriCompactor::from_namespaces(source_state.snapshot.namespaces());
+    let target_compactor = IriCompactor::from_namespaces(target_state.snapshot.namespaces());
+    let resolution = resolution_for_strategy(strategy);
+
+    stream::iter(keys.iter().cloned())
+        .map(|key| {
+            let source_compactor = &source_compactor;
+            let target_compactor = &target_compactor;
+            let resolution = resolution.clone();
+            async move {
+                let (source_flakes, target_flakes) = tokio::try_join!(
+                    current_asserted_for_key(source_state, &key),
+                    current_asserted_for_key(target_state, &key),
+                )?;
+                let source_values = resolve_flake_list(&source_flakes, source_compactor)?;
+                let target_values = resolve_flake_list(&target_flakes, target_compactor)?;
+
+                Ok::<_, ApiError>(ConflictDetail {
+                    key,
+                    source_values,
+                    target_values,
+                    resolution,
+                })
+            }
+        })
+        .buffered(8)
+        .try_collect()
+        .await
+}
+
+fn resolve_flake_list(
+    flakes: &[Flake],
+    compactor: &IriCompactor,
+) -> Result<Vec<crate::ResolvedFlake>> {
+    flakes
+        .iter()
+        .map(|flake| resolve_flake(compactor, flake))
+        .collect()
+}
+
+fn resolution_for_strategy(strategy: &ConflictStrategy) -> ConflictResolutionPreview {
+    match strategy {
+        ConflictStrategy::TakeBoth => ConflictResolutionPreview {
+            source_action: "kept",
+            target_action: "kept",
+            outcome: "both-values-kept",
+        },
+        ConflictStrategy::TakeSource => ConflictResolutionPreview {
+            source_action: "kept",
+            target_action: "retracted",
+            outcome: "source-wins",
+        },
+        ConflictStrategy::TakeBranch => ConflictResolutionPreview {
+            source_action: "dropped",
+            target_action: "kept",
+            outcome: "target-wins",
+        },
+        ConflictStrategy::Abort => ConflictResolutionPreview {
+            source_action: "unchanged",
+            target_action: "unchanged",
+            outcome: "merge-aborts",
+        },
+        ConflictStrategy::Skip => unreachable!("skip strategy is rejected before previewing"),
     }
 }

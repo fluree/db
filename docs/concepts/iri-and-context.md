@@ -276,11 +276,13 @@ Each ledger can store a **default context** — a JSON object mapping prefixes t
 
 When using `fluree-db-api` directly (e.g., embedding Fluree in a Rust application), queries must supply their own `@context` (JSON-LD) or `PREFIX` declarations (SPARQL). If a query omits context, IRIs are not compacted and compact IRIs without a matching prefix will produce an error.
 
-To opt in to default context injection when using the API directly, use the `with_default_context` builder:
+To opt in to default context injection when using the API directly, fetch the stored context and use the `with_default_context` builder:
 
 ```rust
+let ctx = fluree.get_default_context("mydb").await?;
+let ledger = fluree.ledger("mydb").await?;
 let view = GraphDb::from_ledger_state(&ledger)
-    .with_default_context(ledger.default_context.clone());
+    .with_default_context(ctx);
 ```
 
 Or use the convenience method:
@@ -291,9 +293,9 @@ let view = fluree.db_with_default_context("mydb").await?;
 
 ### Server and CLI behavior
 
-The **Fluree HTTP server** and **CLI** automatically inject the ledger's default context into queries that don't provide their own. This preserves ergonomic behavior for interactive use.
+The **CLI** automatically injects the ledger's default context into queries that don't provide their own. The HTTP API defaults this behavior off; pass `?default-context=true` on a query request to opt in.
 
-When the server or CLI injects the default context:
+When default context injection is enabled:
 
 1. **Query-level `@context`** (JSON-LD) or **`PREFIX` declarations** (SPARQL) — always win
 2. **Ledger default context** — applied only when the query provides no context of its own
@@ -301,7 +303,7 @@ When the server or CLI injects the default context:
 
 ### Use with SPARQL (server/CLI)
 
-The default context provides prefix definitions for SPARQL queries via the server or CLI, so you don't need to repeat `PREFIX` declarations in every query. If the ledger's default context includes `{"ex": "http://example.org/"}`, then you can write:
+The default context provides prefix definitions for SPARQL queries, so you don't need to repeat `PREFIX` declarations in every query when injection is enabled. If the ledger's default context includes `{"ex": "http://example.org/"}`, then you can write:
 
 ```sparql
 SELECT ?name WHERE {
@@ -309,11 +311,11 @@ SELECT ?name WHERE {
 }
 ```
 
-without an explicit `PREFIX ex: <http://example.org/>` declaration — the server injects it from the default context. If you declare any `PREFIX` in the query, the default context is not used at all — you must declare every prefix you need.
+without an explicit `PREFIX ex: <http://example.org/>` declaration. If you declare any `PREFIX` in the query, the default context is not used at all — you must declare every prefix you need.
 
 ### Use with JSON-LD queries (server/CLI)
 
-Similarly, JSON-LD queries sent to the server that omit `@context` receive the default context:
+Similarly, JSON-LD queries sent through an opt-in surface that omit `@context` receive the default context:
 
 ```json
 {
@@ -348,7 +350,7 @@ See [CLI context command](../cli/context.md) and [API endpoints](../api/endpoint
 
 ### Opting out of the default context
 
-When using the server or CLI, you may want full, unexpanded IRIs in query results — for debugging, interoperability with other RDF tools, or simply to avoid any prefix assumptions. You can opt out of the default context:
+When using a default-context-enabled surface, you may want full, unexpanded IRIs in query results — for debugging, interoperability with other RDF tools, or simply to avoid any prefix assumptions. You can opt out of the default context:
 
 **JSON-LD queries** — pass an empty `@context` object:
 

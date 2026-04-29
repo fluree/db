@@ -137,7 +137,8 @@ pub use ledger_manager::{
 };
 pub use merge::MergeReport;
 pub use merge_preview::{
-    AncestorRef, BranchDelta, ConflictSummary, MergePreview, MergePreviewOpts,
+    AncestorRef, BranchDelta, ConflictDetail, ConflictResolutionPreview, ConflictSummary,
+    MergePreview, MergePreviewOpts,
 };
 pub use pack::{
     compute_missing_index_artifacts, full_ledger_pack_request, validate_pack_request, PackChunk,
@@ -2210,6 +2211,11 @@ impl FlureeBuilder {
                     backend: backend.clone(),
                     nameservice: ns_for_provider,
                     leaflet_cache: Arc::new(fluree_db_binary_index::LeafletCache::with_max_mb(64)),
+                    cache_dir: self
+                        .ledger_cache_config
+                        .as_ref()
+                        .map(|config| config.cache_dir.clone())
+                        .unwrap_or_else(|| LedgerManagerConfig::default().cache_dir),
                 },
             ) as Arc<dyn fluree_db_indexer::FulltextConfigProvider>;
             let indexer_config = idx_config
@@ -2735,6 +2741,7 @@ impl Fluree {
                 backend: self.backend.clone(),
                 nameservice: self.nameservice_mode.as_arc_reader(),
                 leaflet_cache: Arc::clone(&self.leaflet_cache),
+                cache_dir: self.binary_store_cache_dir(),
             },
         )
     }

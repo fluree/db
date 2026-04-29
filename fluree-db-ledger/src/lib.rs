@@ -164,7 +164,7 @@ impl LedgerState {
     ///
     /// Shared implementation used by `load` for both regular and branched
     /// ledgers — the only difference is which `ContentStore` is provided.
-    async fn load_with_store<C: ContentStore + Clone + 'static>(
+    pub async fn load_with_store<C: ContentStore + Clone + 'static>(
         store: C,
         record: NsRecord,
     ) -> Result<Self> {

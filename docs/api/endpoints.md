@@ -803,6 +803,12 @@ GET  /query?query={urlencoded-sparql}   # SPARQL Protocol GET form
 
 The `GET` form is provided for W3C SPARQL Protocol compliance. It accepts SPARQL queries via the `query` query parameter; the body forms below are preferred for larger queries and for JSON-LD. The same form is available on the ledger-scoped `/query/{ledger}` route.
 
+**Optional Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `default-context` | boolean | `false` | When `true`, use the ledger's stored default JSON-LD context if the request omits its own `@context` (JSON-LD) or `PREFIX` declarations (ledger-scoped SPARQL). |
+
 **Request Headers:**
 ```http
 Content-Type: application/json
@@ -1843,9 +1849,9 @@ curl -X POST http://localhost:8090/v1/fluree/rebase \
 
 ### POST /fluree/merge
 
-Merge a source branch into a target branch (fast-forward only). Admin-protected.
+Merge a source branch into a target branch. Admin-protected.
 
-Currently only fast-forward merges are supported: the target branch must not have any new commits since the source branch was created from it. If the target has diverged, rebase the source branch first, then merge.
+Fast-forward merges copy the source commit chain into the target namespace and advance the target HEAD. When the target has diverged, Fluree performs a general merge: it computes the source and target deltas since their common ancestor, resolves overlapping `(s, p, g)` conflicts according to the requested strategy, and creates a merge commit on the target branch.
 
 **URL:**
 ```
@@ -1858,7 +1864,8 @@ POST /fluree/merge
 {
   "ledger": "mydb",
   "source": "feature-x",
-  "target": "dev"
+  "target": "dev",
+  "strategy": "take-both"
 }
 ```
 
@@ -1867,6 +1874,18 @@ POST /fluree/merge
 | `ledger` | string | Yes | Ledger name without branch suffix (e.g., "mydb") |
 | `source` | string | Yes | Source branch to merge from (e.g., "feature-x") |
 | `target` | string | No | Target branch to merge into (defaults to source's parent branch) |
+| `strategy` | string | No | Conflict resolution strategy for non-fast-forward merges. Defaults to `take-both`. Options: `take-both`, `abort`, `take-source`, `take-branch` |
+
+**Conflict strategies:**
+
+| Strategy | Behavior |
+|----------|----------|
+| `take-both` | Keep source flakes as-is, so both source and target values can coexist |
+| `abort` | Fail if conflicts are detected; no merge commit is created |
+| `take-source` | Source wins: keep source flakes and retract target's conflicting values |
+| `take-branch` | Target wins: drop source flakes for conflicting keys |
+
+`skip` is a rebase-only strategy and is not supported for non-fast-forward merges.
 
 **Response body (200 OK):**
 
@@ -1875,9 +1894,11 @@ POST /fluree/merge
   "ledger_id": "mydb:dev",
   "target": "dev",
   "source": "feature-x",
-  "fast_forward": true,
+  "fast_forward": false,
   "new_head_t": 8,
-  "commits_copied": 3
+  "commits_copied": 3,
+  "conflict_count": 1,
+  "strategy": "take-both"
 }
 ```
 
@@ -1886,16 +1907,18 @@ POST /fluree/merge
 | `ledger_id` | string | Full ledger:branch identifier of the target |
 | `target` | string | Target branch name |
 | `source` | string | Source branch name |
-| `fast_forward` | bool | Always `true` (only fast-forward is supported) |
+| `fast_forward` | bool | Whether this merge advanced the target directly to the source HEAD |
 | `new_head_t` | number | New commit HEAD transaction time of the target |
 | `commits_copied` | number | Number of commit blobs copied to the target namespace |
+| `conflict_count` | number | Number of overlapping `(s, p, g)` keys detected during a non-fast-forward merge |
+| `strategy` | string | Conflict strategy used for a non-fast-forward merge. Omitted for fast-forward merges |
 
 **Status codes:**
 
 - `200 OK` - Merge completed successfully
-- `400 Bad Request` - Source has no branch point (e.g., main), self-merge, or target mismatch
+- `400 Bad Request` - Source has no branch point (e.g., main), self-merge, unknown strategy, or unsupported merge strategy
 - `404 Not Found` - Ledger or branch does not exist
-- `409 Conflict` - Target has diverged; fast-forward not possible
+- `409 Conflict` - Merge aborted due to conflicts when using the `abort` strategy, or the target HEAD changed during commit publishing
 - `500 Internal Server Error` - Server error
 
 **Examples:**
@@ -1910,6 +1933,11 @@ curl -X POST http://localhost:8090/v1/fluree/merge \
 curl -X POST http://localhost:8090/v1/fluree/merge \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb", "source": "dev", "target": "main"}'
+
+# Non-fast-forward merge with source-winning conflict resolution
+curl -X POST http://localhost:8090/v1/fluree/merge \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "source": "dev", "target": "main", "strategy": "take-source"}'
 ```
 
 ### GET /fluree/merge-preview/{ledger}
@@ -1920,7 +1948,7 @@ Bearer token required when `data_auth.mode = required`; reads are gated on `bear
 
 **URL:**
 ```
-GET /fluree/merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}
+GET /fluree/merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}&include_conflict_details={bool}&strategy={strategy}
 ```
 
 **Path / Query Parameters:**
@@ -1933,6 +1961,8 @@ GET /fluree/merge-preview/{ledger-name}?source={source}&target={target}&max_comm
 | `max_commits` | number | No | Cap on per-side commit summaries returned (default 500). Server clamps to a hard maximum of 5,000 — values above are silently lowered. Bounds response size, **not** divergence-walk cost (the unbounded `count` is still computed). |
 | `max_conflict_keys` | number | No | Cap on conflict keys returned (default 200). Server clamps to a hard maximum of 5,000. Bounds response size, **not** the conflict-delta walks. |
 | `include_conflicts` | bool | No | When false, skips the conflict computation (default true). Use this to make the preview cheap on diverged branches. |
+| `include_conflict_details` | bool | No | When true, includes source/target flake values for the returned conflict keys. Defaults to false. Details are computed after `max_conflict_keys` is applied. |
+| `strategy` | string | No | Strategy used to annotate conflict details. Defaults to `take-both`. Options: `take-both`, `abort`, `take-source`, `take-branch`. |
 
 **Response body (200 OK):**
 
@@ -1951,10 +1981,24 @@ GET /fluree/merge-preview/{ledger-name}?source={source}&target={target}&max_comm
   },
   "behind": { "count": 1, "commits": [...], "truncated": false },
   "fast_forward": false,
+  "mergeable": true,
   "conflicts": {
-    "count": 0,
-    "keys": [],
-    "truncated": false
+    "count": 1,
+    "keys": [{ "s": [100, "alice"], "p": [100, "status"], "g": null }],
+    "truncated": false,
+    "strategy": "take-source",
+    "details": [
+      {
+        "key": { "s": [100, "alice"], "p": [100, "status"], "g": null },
+        "source_values": [["ex:alice", "ex:status", "active", "xsd:string", true]],
+        "target_values": [["ex:alice", "ex:status", "archived", "xsd:string", true]],
+        "resolution": {
+          "source_action": "kept",
+          "target_action": "retracted",
+          "outcome": "source-wins"
+        }
+      }
+    ]
   }
 }
 ```
@@ -1967,14 +2011,17 @@ GET /fluree/merge-preview/{ledger-name}?source={source}&target={target}&max_comm
 | `ahead` | object | Commits on source not on target (`count`, `commits`, `truncated`) |
 | `behind` | object | Commits on target not on source |
 | `fast_forward` | bool | True when target HEAD == ancestor (or both heads absent) |
+| `mergeable` | bool | False only when the selected preview strategy would abort, e.g. `strategy=abort` with conflicts. This is a strategy/conflict signal, not full transaction validation. `mergeable=true` does not guarantee a subsequent `POST /merge` will succeed; it only reflects the conflict/strategy interaction at preview time. |
 | `conflicts` | object | Overlapping `(s, p, g)` keys touched on both sides since the ancestor. Empty when `fast_forward` or `include_conflicts=false` |
 
 Per-commit summaries (`ahead.commits[]` / `behind.commits[]`) are newest-first and include assert/retract counts plus an optional `message` extracted from `txn_meta` when an `f:message` string entry is present.
 
+When `include_conflict_details=true`, `conflicts.details[]` contains one entry for each returned conflict key. `source_values` and `target_values` are the current asserted values for that key at each branch HEAD, using the same resolved flake tuple format as `/show`: `[subject, predicate, object, datatype, operation]`, with an optional metadata object as the 6th tuple item. The `resolution` object is an annotation only; preview does not apply the strategy or mutate state.
+
 **Status codes:**
 
 - `200 OK` — Preview computed successfully
-- `400 Bad Request` — Source has no branch point (e.g., main) or `source == target`
+- `400 Bad Request` — Source has no branch point (e.g., main), `source == target`, unknown strategy, unsupported preview strategy, `include_conflict_details=true` with `include_conflicts=false`, or `strategy=abort` with `include_conflicts=false`
 - `401 Unauthorized` — Bearer token required
 - `404 Not Found` — Ledger or branch does not exist (or bearer cannot read it)
 
@@ -1989,6 +2036,9 @@ curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&target=main&
 
 # Cap commit lists at 50 per side
 curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&max_commits=50"
+
+# Include value details and labels for a source-winning merge
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&target=main&include_conflict_details=true&strategy=take-source"
 ```
 
 ### GET /fluree/info
