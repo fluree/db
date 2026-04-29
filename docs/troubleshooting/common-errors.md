@@ -23,7 +23,7 @@ This document provides solutions for the most frequently encountered Fluree erro
 
 **Check ledger exists:**
 ```bash
-curl http://localhost:8090/ledgers
+curl http://localhost:8090/v1/fluree/ledgers
 ```
 
 **Create ledger:**
@@ -231,8 +231,8 @@ The opt-out applies to both queries and transactions. See [IRIs and @context —
 
 **Check indexing lag:**
 ```bash
-curl http://localhost:8090/ledgers/mydb:main
-# If (commit_t - index_t) is large, wait for indexing (or reduce write rate)
+curl http://localhost:8090/v1/fluree/info/mydb:main
+# If (t - index.t) is large, wait for indexing (or reduce write rate)
 ```
 
 **Simplify query:**
@@ -432,7 +432,7 @@ Not an error, but a warning condition.
 ### Symptoms
 
 ```bash
-curl http://localhost:8090/ledgers/mydb:main
+curl http://localhost:8090/v1/fluree/info/mydb:main
 ```
 
 ```json
@@ -559,11 +559,9 @@ const jws = await sign(payload, privateKey);
 }
 ```
 
-**Register public key:**
-```bash
-curl -X POST http://localhost:8090/admin/keys \
-  -d '{"did": "did:key:z6Mkh...", "publicKey": "..."}'
-```
+**Verify public-key material:** standalone server signed requests use the key
+material embedded in supported JWS/JWT headers (or configured OIDC JWKS). There
+is no `/admin/keys` registration endpoint.
 
 ## Memory Issues
 
@@ -578,7 +576,7 @@ curl -X POST http://localhost:8090/admin/keys \
 
 **Check memory:**
 ```bash
-curl http://localhost:8090/admin/memory
+curl http://localhost:8090/v1/fluree/stats
 ```
 
 **Reduce memory usage:**

@@ -166,7 +166,7 @@ Actual rates depend on:
 ### Check Indexing Status
 
 ```bash
-curl http://localhost:8090/ledgers/mydb:main
+curl http://localhost:8090/v1/fluree/info/mydb:main
 ```
 
 Response:
@@ -460,7 +460,7 @@ With 4× safety margin: ~50 flakes/second
 
 **Check:**
 ```bash
-curl http://localhost:8090/ledgers/mydb:main | jq '.commit_t - .index_t'
+curl http://localhost:8090/v1/fluree/info/mydb:main | jq '.t - .index.t'
 ```
 
 **Solution:** Wait for indexing or reduce write rate

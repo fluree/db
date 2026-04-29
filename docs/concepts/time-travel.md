@@ -220,7 +220,7 @@ Reader Lambda:
 
 **HTTP API:**
 
-The HTTP query endpoint does not yet expose `min_t` directly. For HTTP clients, use the SSE events endpoint (`GET /fluree/events`) to receive real-time commit notifications, or poll the ledger info endpoint until the desired `t` is reached.
+The HTTP query endpoint does not yet expose `min_t` directly. For HTTP clients, use the SSE events endpoint (`GET /v1/fluree/events`) to receive real-time commit notifications, or poll the ledger info endpoint until the desired `t` is reached.
 
 ### Rust API
 

@@ -24,4 +24,4 @@ See [Updates and forgetting](../concepts/supersession.md) for more detail.
 
 ## Forgetting accidentally-committed secrets
 
-Forgetting removes the memory from the ledger and the next `repo.ttl` export. If a secret value also ended up in **git history**, you need to scrub the history separately — see [Secrets and sensitivity](../concepts/secrets-and-sensitivity.md#what-if-i-slip).
+Forgetting removes the memory from the ledger and rewrites `repo.ttl` (or `.local/user.ttl`) immediately, so the deletion shows up in your next `git diff`. If a secret value also ended up in **git history**, you need to scrub the history separately — see [Secrets and sensitivity](../concepts/secrets-and-sensitivity.md#what-if-i-slip).

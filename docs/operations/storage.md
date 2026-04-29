@@ -543,18 +543,8 @@ tar -czf fluree-backup-$(date +%Y%m%d).tar.gz /var/lib/fluree/
 systemctl start fluree
 ```
 
-Online backup (without stopping):
-
-```bash
-# Enable read-only mode
-curl -X POST http://localhost:8090/admin/readonly
-
-# Backup
-rsync -a /var/lib/fluree/ /backup/fluree/
-
-# Disable read-only
-curl -X POST http://localhost:8090/admin/readonly/off
-```
+For online backups, prefer storage-level snapshots or object-store versioning.
+The standalone server does not currently expose HTTP read-only toggle endpoints.
 
 ### AWS Storage
 
@@ -596,8 +586,10 @@ chmod -R 755 /var/lib/fluree
 # Check space
 df -h /var/lib/fluree
 
-# Clean old indexes
-curl -X POST http://localhost:8090/admin/compact
+# Force a full index refresh
+curl -X POST http://localhost:8090/v1/fluree/reindex \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb:main"}'
 ```
 
 ### AWS Storage

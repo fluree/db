@@ -294,7 +294,7 @@ tenant2-orders:main
 A ledger may have a stored default JSON-LD `@context` that the **CLI** and **HTTP server** can auto-inject into queries that omit `@context` / `PREFIX`. Two ways to set it:
 
 1. **At import time:** `fluree create --from data.ttl` captures `@prefix` declarations from the Turtle source and stores them as the default.
-2. **Explicitly:** `fluree context set <ledger> <ctx.json>`, or `PUT /fluree/context/:ledger` over HTTP.
+2. **Explicitly:** `fluree context set <ledger> <ctx.json>`, or `PUT /v1/fluree/context/{ledger...}` over HTTP.
 
 Regular JSON-LD transactions (insert/update) do **not** update the default context — only the two paths above do.
 

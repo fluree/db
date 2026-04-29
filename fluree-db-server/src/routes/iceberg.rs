@@ -1,4 +1,4 @@
-//! Iceberg graph source endpoints: POST /fluree/iceberg/map
+//! Iceberg graph source endpoints: POST /v1/fluree/iceberg/map
 
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
@@ -15,7 +15,7 @@ use tracing::Instrument;
 
 use super::ledger::forward_write_request;
 
-/// Request body for `POST /fluree/iceberg/map`
+/// Request body for `POST /v1/fluree/iceberg/map`
 #[derive(Deserialize)]
 pub struct IcebergMapRequest {
     /// Graph source name
@@ -61,7 +61,7 @@ fn default_mode() -> String {
     "rest".to_string()
 }
 
-/// Response for `POST /fluree/iceberg/map`
+/// Response for `POST /v1/fluree/iceberg/map`
 #[derive(Serialize)]
 pub struct IcebergMapResponse {
     pub graph_source_id: String,
@@ -78,7 +78,7 @@ pub struct IcebergMapResponse {
 
 /// Map an Iceberg table as a graph source
 ///
-/// POST /fluree/iceberg/map
+/// POST /v1/fluree/iceberg/map
 pub async fn iceberg_map(State(state): State<Arc<AppState>>, request: Request) -> Response {
     if state.config.server_role == ServerRole::Peer {
         return forward_write_request(&state, request).await;

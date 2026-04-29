@@ -4,7 +4,7 @@ You have access to a persistent project memory system via MCP tools. Use it to m
 
 ## When to Recall
 
-Call `memory_recall` at the start of each task with a query describing what you're about to do. This surfaces relevant facts, decisions, constraints, and preferences from previous sessions.
+Call `memory_recall` at the start of each task with a query describing what you're about to do. This surfaces relevant facts, decisions, and constraints from previous sessions.
 
 Examples:
 - Starting a new feature: `memory_recall("building <feature name>")`
@@ -20,10 +20,12 @@ Call `memory_add` when you discover or decide something worth remembering:
 | `fact` | You learn how something works | "The index format uses postcard encoding with delta compression" |
 | `decision` | A design choice is made (with rationale) | "Chose keyword matching over embeddings for Phase 1 to avoid cloud dependency" |
 | `constraint` | A rule that must always be followed | "Never suppress dead code warnings with underscore prefix" |
-| `preference` | The user prefers something done a certain way | "Use thiserror for error types, not anyhow" |
-| `artifact` | An important file or resource | "fluree-db-core/src/error.rs defines the base error pattern for all crates" |
+
+Use `rationale` on any kind to explain *why* something is true, was decided, or must be followed.
 
 ## Tag Conventions
+
+**Tags are required.** Every memory must include at least one tag. Tags are the primary recall signal — memories without tags are hard to surface later.
 
 Use consistent, lowercase tags. Common tags:
 - Module names: `indexer`, `query`, `transact`, `api`, `cli`, `memory`
@@ -32,7 +34,7 @@ Use consistent, lowercase tags. Common tags:
 
 ## When to Update
 
-Call `memory_update` when a previously stored fact or decision changes. This creates a new version that supersedes the old one, preserving audit history.
+Call `memory_update` when a previously stored fact or decision changes. Only provide the fields you want to change — the memory keeps its ID. History is tracked via git.
 
 ## When to Forget
 

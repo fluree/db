@@ -411,6 +411,8 @@ Vector indexes are implemented using embedded [usearch](https://github.com/unum-
 
 ### Creating Vector Indexes
 
+> **HTTP/Docker users:** there is no HTTP endpoint for creating vector indexes today. Index creation is Rust-API-only. To use HNSW vector search from an HTTP-only deployment, create the index using a Rust program (or the Rust API embedded in your application) against the same storage path your Fluree server reads, then run queries normally via `POST /v1/fluree/query`.
+
 #### Rust API
 
 ```rust
@@ -594,58 +596,19 @@ Raw score range: [0, +inf). In HNSW index results, normalized to (0, 1] via `1 /
 
 ## Deployment Modes
 
-Vector indexes support two deployment modes: **embedded** (default) and **remote**. This mirrors the BM25 deployment architecture.
+Vector indexes support two deployment topologies: searching in-process (embedded) or via a dedicated `fluree-search-httpd` service that mounts the same storage. Both topologies use identical distance-metric computation, score normalization, and snapshot serialization, so results are identical.
 
 ### Embedded Mode (Default)
 
-In embedded mode, the vector index is loaded and searched within the same process as Fluree:
+The vector index is loaded and searched within the same process as the Fluree server. No additional services. This is the default and is appropriate for most deployments.
 
-```json
-{
-  "deployment": {
-    "mode": "embedded"
-  }
-}
-```
+### Dedicated Search Service
 
-**Advantages:** No network latency, simpler deployment, no additional services.
+For large indexes or when you want search traffic isolated from the main Fluree process, run the standalone `fluree-search-httpd` binary on the same storage volume and have your application send vector requests directly to it.
 
-### Remote Mode
+> **Note:** Today, vector search is invoked from a Fluree query (the `f:graphSource` / `f:queryVector` pattern) using the **embedded** path — the main Fluree server does not yet route those queries to a remote service. The dedicated service is reachable directly via its own `POST /v1/search` API (the same protocol BM25 uses), which is suitable for applications that issue vector queries outside of a Fluree query context. Transparent delegation from inside a Fluree query is a planned follow-up; the wiring is in place but the deployment config is not yet persisted by `create_vector_index`.
 
-In remote mode, vector search queries are delegated to a dedicated search service:
-
-```json
-{
-  "deployment": {
-    "mode": "remote",
-    "endpoint": "http://search.example.com:9090/v1/search",
-    "auth_token": "your-secret-token",
-    "request_timeout_ms": 10000
-  }
-}
-```
-
-**Configuration options:**
-- `mode`: `"remote"` to enable remote search
-- `endpoint`: URL of the search service (required)
-- `auth_token`: Bearer token for authentication (optional)
-- `connect_timeout_ms`: Connection timeout in milliseconds (default: 5000)
-- `request_timeout_ms`: Request timeout in milliseconds (default: 30000)
-
-**Advantages:** Scales independently, dedicated memory for large indexes, shared across instances.
-
-### Running the Search Service
-
-The `fluree-search-httpd` binary provides a standalone HTTP server for remote search:
-
-```bash
-fluree-search-httpd \
-  --storage-root file:///var/fluree/data \
-  --nameservice-path file:///var/fluree/ns \
-  --listen 0.0.0.0:9090
-```
-
-Both embedded and remote modes use identical distance metric computation, score normalization, and snapshot serialization -- ensuring identical results regardless of deployment mode.
+See [Remote Search Service](../graph-sources/bm25.md#remote-search-service) for `fluree-search-httpd` configuration, env vars, the request/response protocol (`vector` and `vector_similar_to` query kinds), and Docker deployment.
 
 ## Performance and Scaling
 

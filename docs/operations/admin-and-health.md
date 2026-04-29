@@ -188,12 +188,12 @@ curl "http://localhost:8090/v1/fluree/info/mydb:main"
   - `stats.properties[*].datatypes` are omitted only when `include_property_datatypes=false` is requested.
   - Class property ref-edge counts (`stats.classes[*].properties[*].refs`) fall back to the lighter indexed/fast path only when `realtime_property_details=false` is requested.
 
-### GET /fluree/exists
+### GET /v1/fluree/exists/<ledger...>
 
 Check if a ledger exists:
 
 ```bash
-curl "http://localhost:8090/fluree/exists?ledger=mydb:main"
+curl "http://localhost:8090/v1/fluree/exists/mydb:main"
 ```
 
 **Response:**
@@ -208,12 +208,12 @@ This is a lightweight check that only queries the nameservice without loading th
 
 ## Administrative Operations
 
-### POST /fluree/create
+### POST /v1/fluree/create
 
 Create a new ledger:
 
 ```bash
-curl -X POST http://localhost:8090/fluree/create \
+curl -X POST http://localhost:8090/v1/fluree/create \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb:main"}'
 ```
@@ -234,18 +234,18 @@ curl -X POST http://localhost:8090/fluree/create \
 
 See [Admin Authentication](../api/endpoints.md#admin-authentication) for details.
 
-### POST /fluree/drop
+### POST /v1/fluree/drop
 
 Drop (delete) a ledger:
 
 ```bash
 # Soft drop (retract from nameservice, preserve files)
-curl -X POST http://localhost:8090/fluree/drop \
+curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb:main"}'
 
 # Hard drop (delete all files - IRREVERSIBLE)
-curl -X POST http://localhost:8090/fluree/drop \
+curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb:main", "hard": true}'
 ```
@@ -304,7 +304,7 @@ done
 Periodically collect statistics:
 
 ```bash
-curl http://localhost:8090/fluree/stats | jq .
+curl http://localhost:8090/v1/fluree/stats | jq .
 ```
 
 Key metrics to track:
@@ -316,7 +316,7 @@ Key metrics to track:
 For each critical ledger:
 
 ```bash
-curl "http://localhost:8090/fluree/ledger-info?ledger=mydb:main" | jq .
+curl "http://localhost:8090/v1/fluree/info/mydb:main" | jq .
 ```
 
 Watch for:
@@ -355,7 +355,8 @@ fluree-server \
   --admin-auth-trusted-issuer did:key:z6Mk...
 ```
 
-This protects `/fluree/create` and `/fluree/drop` from unauthorized access.
+This protects `/v1/fluree/create`, `/v1/fluree/drop`, and other admin-protected
+API routes from unauthorized access.
 
 ### Limit Endpoint Exposure
 

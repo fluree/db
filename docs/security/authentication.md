@@ -169,7 +169,7 @@ Replication tokens are intended for **operator and service-account use** (e.g. a
 
 ### Query access (`fluree.ledger.read/write.*`)
 
-Query operations — `/:ledger/query`, `/:ledger/insert`, connection-scoped SPARQL, etc. — use `fluree.ledger.read/write.*` claims. These go through the full query engine and dataset policy enforcement. The server never exposes raw storage bytes through query endpoints.
+Query operations — `/v1/fluree/query/{ledger...}`, `/v1/fluree/insert/{ledger...}`, connection-scoped SPARQL, etc. — use `fluree.ledger.read/write.*` claims. These go through the full query engine and dataset policy enforcement. The server never exposes raw storage bytes through query endpoints.
 
 Query tokens are appropriate for **end users and application service accounts**. Combined with a `fluree.identity` claim and dataset policies, the server enforces fine-grained row- and property-level access control.
 

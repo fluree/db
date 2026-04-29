@@ -41,7 +41,7 @@ Check for unhealthy components.
 Check overall server state:
 
 ```bash
-curl http://localhost:8090/status
+curl http://localhost:8090/v1/fluree/stats
 ```
 
 Look for:
@@ -103,8 +103,8 @@ curl http://localhost:8090/health
 curl -X POST http://localhost:8090/v1/fluree/explain \
   -d '{...}'
 
-# Check query stats
-curl http://localhost:8090/admin/query-stats
+# Check server stats
+curl http://localhost:8090/v1/fluree/stats
 ```
 
 See [Debugging Queries](debugging-queries.md).
@@ -126,8 +126,8 @@ See [Debugging Queries](debugging-queries.md).
 curl -X POST http://localhost:8090/v1/fluree/update?dryRun=true \
   -d '{...}'
 
-# Check transaction stats
-curl http://localhost:8090/admin/transaction-stats
+# Check server stats
+curl http://localhost:8090/v1/fluree/stats
 ```
 
 ### Performance Issues
@@ -141,13 +141,13 @@ curl http://localhost:8090/admin/transaction-stats
 **Quick Checks:**
 ```bash
 # Check indexing lag
-curl http://localhost:8090/ledgers/mydb:main | jq '.commit_t - .index_t'
+curl http://localhost:8090/v1/fluree/info/mydb:main | jq '.t - .index.t'
 
 # Check resource usage
-curl http://localhost:8090/admin/memory
+curl http://localhost:8090/v1/fluree/stats
 
 # Check active operations
-curl http://localhost:8090/status | jq '.queries.active'
+curl http://localhost:8090/v1/fluree/stats
 ```
 
 ### Storage Issues
@@ -166,8 +166,8 @@ df -h /var/lib/fluree
 # Check AWS connectivity
 aws s3 ls s3://fluree-prod-data/
 
-# Check storage stats
-curl http://localhost:8090/admin/storage
+# Check server stats
+curl http://localhost:8090/v1/fluree/stats
 ```
 
 ## Error Code Reference
@@ -189,11 +189,8 @@ See [Common Errors](common-errors.md) for complete error code reference.
 ./fluree-db-server --log-level debug
 ```
 
-Or at runtime:
-```bash
-curl -X POST http://localhost:8090/admin/log-level \
-  -d '{"level": "debug"}'
-```
+Runtime log-level changes are not currently exposed through the standalone HTTP
+API; restart with the desired `--log-level` or `RUST_LOG`.
 
 ### Enable Query Tracing
 
@@ -226,7 +223,7 @@ When reporting issues, include:
 
 1. **Server version:**
    ```bash
-   curl http://localhost:8090/version
+   curl http://localhost:8090/health
    ```
 
 2. **Configuration:**

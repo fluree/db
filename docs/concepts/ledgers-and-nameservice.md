@@ -214,15 +214,8 @@ let results = fluree.query_nameservice(&query).await?;
 #### HTTP API
 
 ```bash
-# Query nameservice via POST /nameservice/query
-curl -X POST http://localhost:8090/nameservice/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "@context": {"f": "https://ns.flur.ee/db#"},
-    "select": ["?ledger", "?branch", "?t"],
-    "where": [{"@id": "?ns", "@type": "f:LedgerSource", "f:ledger": "?ledger", "f:branch": "?branch", "f:t": "?t"}],
-    "orderBy": [{"var": "?t", "desc": true}]
-  }'
+# List ledgers and graph sources from the nameservice
+curl http://localhost:8090/v1/fluree/ledgers
 ```
 
 #### Available Properties
@@ -555,7 +548,7 @@ curl -X POST http://localhost:8090/v1/fluree/drop-branch \
 fluree branch drop dev --ledger mydb
 ```
 
-See [POST /fluree/branch](../api/endpoints.md#post-flureebranch), [GET /fluree/branch/{ledger}](../api/endpoints.md#get-flureebranchledger), and [POST /fluree/drop-branch](../api/endpoints.md#post-flureedrop-branch) for full endpoint details.
+See [POST /branch](../api/endpoints.md#post-branch), [GET /branch/{ledger-name}](../api/endpoints.md#get-branchledger-name), and [POST /drop-branch](../api/endpoints.md#post-drop-branch) for full endpoint details.
 
 ### Rebasing a Branch
 
@@ -595,7 +588,7 @@ curl -X POST http://localhost:8090/v1/fluree/rebase \
 fluree branch rebase dev --ledger mydb --strategy take-both
 ```
 
-See [POST /fluree/rebase](../api/endpoints.md#post-flureerebase) for full endpoint details.
+See [POST /rebase](../api/endpoints.md#post-rebase) for full endpoint details.
 
 ## Architecture Deep Dive
 

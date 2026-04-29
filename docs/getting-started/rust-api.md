@@ -1070,7 +1070,7 @@ merge will succeed; it only reflects the conflict/strategy interaction at
 preview time.
 
 All types derive `Serialize` so the response is wire-stable; the HTTP
-endpoint at `GET /fluree/merge-preview/*ledger` returns the same struct.
+endpoint at `GET /v1/fluree/merge-preview/{ledger...}` returns the same struct.
 See `docs/api/endpoints.md` and `docs/cli/server-integration.md` for the
 HTTP contract.
 

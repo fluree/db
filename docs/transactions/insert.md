@@ -550,8 +550,8 @@ Always validate:
 Track indexing lag after large inserts:
 
 ```bash
-curl http://localhost:8090/ledgers/mydb:main
-# Check: commit_t - index_t
+curl http://localhost:8090/v1/fluree/info/mydb:main
+# Check: t - index.t
 ```
 
 ### 3. Use Efficient IRIs

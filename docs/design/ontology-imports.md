@@ -124,7 +124,7 @@ lives in `attach_schema_bundle` (both the single-view and dataset paths).
 
 RDFS and OWL extraction code reads schema triples out of the default graph
 (`g_id=0`). The resolver feeds that code via a
-[`SchemaBundleOverlay`](../../fluree-db-query/src/schema_bundle.rs) that
+`SchemaBundleOverlay` that
 **projects** whitelisted triples from every bundle source onto `g_id=0`,
 so the reasoner sees the full closure without being aware of it.
 

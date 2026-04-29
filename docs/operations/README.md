@@ -13,6 +13,15 @@ Server configuration options:
 - Runtime settings
 - Tuning parameters
 
+### [Running with Docker](docker.md)
+
+Configuring the official `fluree/server` image:
+- Image internals (entrypoint, volumes, runtime user)
+- Three configuration approaches: env vars, mounted JSON-LD/TOML config, CLI flags
+- Common recipes: LRU cache sizing, background indexing, auth, S3+DynamoDB, query peers
+- Full annotated Docker Compose example
+- Troubleshooting (volume permissions, `RUST_LOG` vs `FLUREE_LOG_LEVEL`, cache auto-sizing under cgroup limits)
+
 ### [Storage Modes](storage.md)
 
 Storage backend options:
@@ -63,9 +72,9 @@ Administrative operations:
 ### [Query peers and replication](query-peers.md)
 
 Run `fluree-server` as a read-only query peer:
-- SSE nameservice events (`GET /fluree/events`)
+- SSE nameservice events (`GET /v1/fluree/events`)
 - Peer mode (refresh on stale + write forwarding)
-- Storage proxy endpoints (`/fluree/storage/*`) for private-storage deployments
+- Storage proxy endpoints (`/v1/fluree/storage/*`) for private-storage deployments
 
 ## Deployment Patterns
 
@@ -158,7 +167,7 @@ Response:
 ### Server Statistics
 
 ```bash
-curl http://localhost:8090/status
+curl http://localhost:8090/v1/fluree/stats
 ```
 
 Response:
@@ -186,13 +195,8 @@ Response:
 
 ### Metrics Collection
 
-Fluree exposes metrics for monitoring systems:
-
-```bash
-curl http://localhost:8090/metrics
-```
-
-Prometheus-compatible format.
+Use `GET /v1/fluree/stats` for built-in server statistics. Prometheus-style
+`/metrics` export is not currently part of the standalone server API.
 
 ## Operational Tasks
 
@@ -201,14 +205,8 @@ Prometheus-compatible format.
 File storage backup:
 
 ```bash
-# Stop transactions (optional but recommended)
-curl -X POST http://localhost:8090/admin/maintenance-mode
-
 # Backup data directory
 tar -czf fluree-backup-$(date +%Y%m%d).tar.gz /var/lib/fluree/
-
-# Resume transactions
-curl -X POST http://localhost:8090/admin/maintenance-mode/off
 ```
 
 AWS storage backup:
@@ -240,16 +238,15 @@ systemctl start fluree
 Trigger indexing manually:
 
 ```bash
-curl -X POST http://localhost:8090/admin/index?ledger=mydb:main
+curl -X POST http://localhost:8090/v1/fluree/reindex \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb:main"}'
 ```
 
 ### Compaction
 
-Compact indexes:
-
-```bash
-curl -X POST http://localhost:8090/admin/compact?ledger=mydb:main
-```
+There is no standalone HTTP compaction endpoint. Reindexing rebuilds index
+artifacts when you need to force a full refresh.
 
 ## Performance Tuning
 
