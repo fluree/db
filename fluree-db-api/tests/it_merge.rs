@@ -294,7 +294,10 @@ async fn merge_take_source_works_after_binary_index_reload() {
     });
     let main_ledger = fluree.insert(ledger, &base_data).await.unwrap().ledger;
     support::rebuild_and_publish_index(&fluree, "mydb:main").await;
-    fluree.create_branch("mydb", "dev", None, None).await.unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
 
     let dev_ledger = fluree.ledger("mydb:dev").await.unwrap();
     fluree

@@ -1374,10 +1374,8 @@ mod tests {
         let branch_a = store_chain(&store, 2, 2, Some(shared[0].clone()), 100).await;
         let branch_b = store_chain(&store, 2, 1, Some(shared[0].clone()), 200).await;
 
-        let merge_commit = Commit::new(4, vec![]).with_merge_parents(vec![
-            branch_a.last().unwrap().clone(),
-            branch_b[0].clone(),
-        ]);
+        let merge_commit = Commit::new(4, vec![])
+            .with_merge_parents(vec![branch_a.last().unwrap().clone(), branch_b[0].clone()]);
         let merge_id = store_commit(&store, &merge_commit).await;
 
         let (summaries, total) = walk_commit_summaries(&store, &merge_id, 0, None)
