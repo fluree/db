@@ -1,0 +1,45 @@
+# cargo-release configuration for the Fluree DB workspace.
+#
+# All workspace crates use `version.workspace = true` and bump in lockstep
+# from `[workspace.package].version` in the root Cargo.toml.
+#
+# Tags follow the existing `vX.Y.Z` convention, which the cargo-dist
+# release workflow (.github/workflows/release.yml) listens for.
+#
+# Typical usage:
+#   cargo release patch              # preview (dry-run is the default)
+#   cargo release patch --execute    # cut the release
+#
+# See docs/contributing/releasing.md for the full workflow.
+
+# Bump the workspace version (and therefore every member crate) together.
+shared-version = true
+
+# Tag the release with the existing vX.Y.Z convention.
+tag = true
+tag-name = "v{{version}}"
+tag-message = "Release v{{version}}"
+
+# Single commit for the version bump + regenerated CHANGELOG.md, instead of
+# one commit per crate.
+consolidate-commits = true
+pre-release-commit-message = "release v{{version}}"
+
+# We ship binaries via cargo-dist; nothing in this workspace is published to
+# crates.io. Skip the publish step and the registry verification.
+publish = false
+verify = false
+
+# Push the release commit and tag automatically. cargo-dist's release.yml
+# triggers off the pushed tag from there.
+push = true
+
+# Regenerate CHANGELOG.md from conventional commits before the release commit
+# is created. cargo-release runs this hook once per crate from each crate's
+# directory, so we cd to the workspace root first — that way every invocation
+# writes the same file at the workspace root (idempotent) instead of creating
+# one CHANGELOG.md per crate.
+pre-release-hook = ["sh", "-c", "cd \"$(git rev-parse --show-toplevel)\" && git cliff --tag v{{version}} --output CHANGELOG.md"]
+
+# Allow releasing from main only.
+allow-branch = ["main"]

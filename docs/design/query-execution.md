@@ -2,7 +2,7 @@
 title: Query execution and overlay merge
 ---
 
-This document describes the **single query execution pipeline** in DB-R and how it combines:
+This document describes the **single query execution pipeline** in Fluree DB and how it combines:
 
 - **Indexed data** (binary columnar indexes)
 - **Overlay data** (novelty + staged flakes)
