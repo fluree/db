@@ -42,6 +42,47 @@ fluree iceberg map execution-log \
 
 Once mapped, graph sources appear in `fluree list`, can be inspected with `fluree info`, and removed with `fluree drop`. See [CLI iceberg reference](../cli/iceberg.md) for all options.
 
+### HTTP API
+
+When running the Fluree server (or Docker image) with the `iceberg` feature enabled, map a table by POSTing to `{api_base_url}/iceberg/map` (default: `/v1/fluree/iceberg/map`). The endpoint is admin-protected — include the admin Bearer token if admin auth is configured.
+
+```bash
+# REST catalog with R2RML mapping (mapping passed inline)
+curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d @- <<'JSON'
+{
+  "name": "warehouse-orders",
+  "mode": "rest",
+  "catalog_uri": "https://polaris.example.com/api/catalog",
+  "table": "sales.orders",
+  "warehouse": "my-warehouse",
+  "auth_bearer": "polaris-token-here",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "r2rml_type": "text/turtle"
+}
+JSON
+```
+
+```bash
+# Direct S3 mode (no catalog server)
+curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{
+    "name": "execution-log",
+    "mode": "direct",
+    "table_location": "s3://bucket/warehouse/logs/execution_log",
+    "r2rml": "...",
+    "r2rml_type": "text/turtle",
+    "s3_region": "us-east-1",
+    "s3_path_style": true
+  }'
+```
+
+R2RML can be omitted to auto-generate a direct mapping. AWS credentials for `direct` mode are read from the server's environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
+
 ### Rust API
 
 **REST catalog mode (Polaris-style):**

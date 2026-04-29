@@ -299,6 +299,65 @@ docker run -d --name fluree \
 
 `--connection-config` and `--storage-path` are mutually exclusive. See [Configuration → Connection Configuration](configuration.md#connection-configuration-s3-dynamodb-etc) and the [DynamoDB guide](dynamodb-guide.md) for backend-specific setup.
 
+### Search Service (`fluree-search-httpd`)
+
+Run a dedicated BM25 / vector search service alongside the main server when search traffic is heavy enough that you want it isolated from the transactional path. The service is a separate binary with its own listen port — it is **not** mounted under the main server's `api_base_url`. It needs read access to the same storage and nameservice paths the main server writes to.
+
+```bash
+docker run -d --name fluree-search \
+  -p 9090:9090 \
+  -v fluree-data:/var/lib/fluree \
+  -e FLUREE_STORAGE_ROOT=/var/lib/fluree/storage \
+  -e FLUREE_NAMESERVICE_PATH=/var/lib/fluree/ns \
+  fluree/search-httpd:latest
+```
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `FLUREE_STORAGE_ROOT` | (required) | Storage path (file:// optional) |
+| `FLUREE_NAMESERVICE_PATH` | (required) | Nameservice path |
+| `FLUREE_SEARCH_LISTEN` | `0.0.0.0:9090` | Listen address |
+| `FLUREE_SEARCH_CACHE_MAX_ENTRIES` | `100` | Max cached indexes |
+| `FLUREE_SEARCH_CACHE_TTL_SECS` | `300` | Cache TTL |
+| `FLUREE_SEARCH_MAX_LIMIT` | `1000` | Max results per query |
+| `FLUREE_SEARCH_DEFAULT_TIMEOUT_MS` | `30000` | Default request timeout |
+| `FLUREE_SEARCH_MAX_TIMEOUT_MS` | `300000` | Maximum allowed timeout |
+
+**Prerequisites.** The service only serves queries against indexes that already exist on the shared volume. BM25 / vector graph-source indexes are created via the Rust API today (`Bm25CreateConfig` + `create_full_text_index`, or `VectorCreateConfig` + `create_vector_index`). The `@fulltext` datatype and the `f:fullTextDefaults` config-graph paths are managed entirely through the main server's HTTP API and don't require this dedicated service.
+
+**Compose example with both services sharing a volume:**
+
+```yaml
+services:
+  fluree:
+    image: fluree/server:latest
+    ports:
+      - "8090:8090"
+    volumes:
+      - fluree-data:/var/lib/fluree
+    environment:
+      RUST_LOG: info
+      FLUREE_INDEXING_ENABLED: "true"
+
+  fluree-search:
+    image: fluree/search-httpd:latest
+    depends_on:
+      - fluree
+    ports:
+      - "9090:9090"
+    volumes:
+      - fluree-data:/var/lib/fluree:ro     # read-only is sufficient
+    environment:
+      RUST_LOG: info
+      FLUREE_STORAGE_ROOT: /var/lib/fluree/storage
+      FLUREE_NAMESERVICE_PATH: /var/lib/fluree/ns
+
+volumes:
+  fluree-data:
+```
+
+Clients send search requests to `POST http://fluree-search:9090/v1/search`. See [BM25 → Remote Search Service](../graph-sources/bm25.md#remote-search-service) for the request/response protocol.
+
 ### Query Peer
 
 Run as a read-only peer that subscribes to a transaction server's event stream:

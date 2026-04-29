@@ -2135,30 +2135,71 @@ See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
 ### POST /reindex
 
-Trigger a full manual reindex for a ledger.
+Trigger a full manual reindex for a ledger. Walks the entire commit chain and rebuilds the binary index from scratch using the server's configured indexer settings. Admin-protected — requires the admin Bearer token when admin auth is enabled.
 
-This endpoint triggers background indexing and returns immediately. If you call
-indexing through the Rust API via `trigger_index()`, the optional
-`TriggerIndexOptions.timeout_ms` is caller-owned: omit it to wait indefinitely,
-or set it explicitly when the calling environment has a hard runtime limit such
-as AWS Lambda's 15-minute maximum.
+This endpoint runs the reindex synchronously and returns when the new root is committed. For large ledgers it may run for many minutes; configure your HTTP client timeout accordingly. In peer mode, the request is forwarded to the transaction server.
 
 **URL:**
 ```
 POST /reindex
 ```
 
+**Request Body:**
+
+```json
+{
+  "ledger": "mydb:main"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger` | string | Ledger alias (`name` or `name:branch`). Required. |
+| `opts`   | object | Reserved for future per-request indexer overrides. Currently accepted but ignored. |
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/reindex \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <admin-token>' \
+  -d '{"ledger": "mydb:main"}'
+```
+
 **Response:**
 
 ```json
 {
-  "ledger": "mydb:main",
-  "status": "indexing",
-  "target_t": 10
+  "ledger_id": "mydb:main",
+  "index_t": 42,
+  "root_id": "fluree:cid:bafy…",
+  "stats": {
+    "flake_count": 184273,
+    "leaf_count": 614,
+    "branch_count": 23,
+    "total_bytes": 47185920
+  }
 }
 ```
 
-The request body is `{"ledger": "mydb:main"}`.
+| Field | Description |
+|-------|-------------|
+| `ledger_id` | Ledger alias the reindex was run against |
+| `index_t` | Transaction time the new index was built at (matches the head commit) |
+| `root_id` | ContentId of the newly written index root |
+| `stats.flake_count` | Total flakes in the rebuilt index |
+| `stats.leaf_count` | Number of leaf nodes written |
+| `stats.branch_count` | Number of branch nodes written |
+| `stats.total_bytes` | Bytes written to storage during the reindex |
+
+**Status Codes:**
+- `200 OK` — reindex complete
+- `400 Bad Request` — missing/invalid `ledger`
+- `401/403` — admin auth required
+- `404 Not Found` — ledger does not exist
+- `500 Internal Server Error` — reindex failed
+
+When triggering indexing through the Rust API instead, see `Fluree::reindex` and `ReindexOptions`. For background incremental indexing (which runs automatically as commits are made), see [Background indexing](../indexing-and-search/background-indexing.md).
 
 ## Admin Authentication
 
