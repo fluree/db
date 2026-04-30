@@ -396,6 +396,25 @@ impl Novelty {
     ///
     /// `epoch` bumps once per call, regardless of how many commits were
     /// merged. `t` advances to `max(self.t, max_commit_t)`.
+    ///
+    /// # Memory contract — differs from [`apply_commit`]
+    ///
+    /// Unlike [`apply_commit`] (which checks `fact_currently_asserted_in_graph`
+    /// **before** pushing into the arena, so deduped duplicates never enter
+    /// the [`FlakeStore`]), this method pushes every incoming flake into the
+    /// arena in Phase 1 and only drops `FlakeId`s during the post-sort
+    /// dedup walk. The underlying `Flake` records and their per-flake
+    /// sizes remain in [`FlakeStore::flakes`] / `FlakeStore::sizes` for
+    /// the lifetime of the [`Novelty`], and `self.size` (the
+    /// backpressure-relevant total) accounts for them.
+    ///
+    /// For the design call site (one fresh-load chain walk feeding an
+    /// otherwise-empty arena, after which the [`Novelty`] is consumed and
+    /// dropped), this bloat is bounded and operationally negligible — the
+    /// dedup count is logged at the end of every call so the cost stays
+    /// observable. **Do not wire this into hot-path mutation code without
+    /// either redesigning the dedup to gate `push_with_size` or adding a
+    /// post-walk arena rebuild.**
     pub fn bulk_apply_commits<I>(
         &mut self,
         commit_batches: I,
@@ -1321,5 +1340,116 @@ mod tests {
 
         assert_eq!(store.get(0).s.namespace_code, 1);
         assert_eq!(store.get(1).s.namespace_code, 2);
+    }
+
+    /// Drift guard: the file-local `cmp_object` / `cmp_meta` /
+    /// `same_identity` helpers exist because `fluree_db_core::comparator`'s
+    /// equivalents are private. They MUST stay byte-for-byte consistent
+    /// with the `(s, p, o, dt, t, op, m)` ordering encoded in
+    /// `IndexType::Spot.compare`, since [`Novelty::bulk_apply_commits`]'s
+    /// set-semantics dedup depends on `same_identity` matching the
+    /// identity used by `fact_currently_asserted_in_graph` in
+    /// [`Novelty::apply_commit`].
+    ///
+    /// If either side ever drifts, this test fires loudly. Symptoms of a
+    /// silent drift would be silently dropped or duplicated assertions
+    /// during first-load catch-up — extremely hard to track down at
+    /// runtime — so a deterministic compile-and-run guard is worth it.
+    #[test]
+    fn local_identity_helpers_match_core_spot_comparator_semantics() {
+        use fluree_db_core::IndexType;
+
+        // Two flakes that share `(s, p, o, dt, m)` but differ in `(t, op)`
+        // — `same_identity` must say `true`, and SPOT comparator must
+        // disagree only on the t/op tail.
+        let id_a = make_flake(101, 200, 42, 1, true);
+        let id_b = make_flake(101, 200, 42, 5, false);
+        assert!(
+            same_identity(&id_a, &id_b),
+            "same (s, p, o, dt, m) must be one identity"
+        );
+        let cmp = IndexType::Spot.compare(&id_a, &id_b);
+        assert_eq!(
+            cmp,
+            Ordering::Less,
+            "within an identity group, SPOT must order by ascending t"
+        );
+
+        // Differing on each prefix component must break identity.
+        let other_s = make_flake(102, 200, 42, 1, true);
+        let other_p = make_flake(101, 201, 42, 1, true);
+        let other_o = make_flake(101, 200, 99, 1, true);
+        for (label, b) in [
+            ("subject", other_s),
+            ("predicate", other_p),
+            ("object", other_o),
+        ] {
+            assert!(
+                !same_identity(&id_a, &b),
+                "identity must NOT collapse across differing {label}"
+            );
+            assert_ne!(
+                IndexType::Spot.compare(&id_a, &b),
+                Ordering::Equal,
+                "SPOT comparator must disagree when {label} differs"
+            );
+        }
+
+        // `cmp_meta` ordering: None < Some, and Some<m1> < Some<m2>
+        // when m1 < m2. Construct two flakes with explicit metadata
+        // and verify both `cmp_meta` and the SPOT tail behavior.
+        let m_lo = FlakeMeta::with_lang("aa");
+        let m_hi = FlakeMeta::with_lang("zz");
+        let f_none = make_flake_with_meta(101, 200, 42, 1, true, None);
+        let f_lo = make_flake_with_meta(101, 200, 42, 1, true, Some(m_lo.clone()));
+        let f_hi = make_flake_with_meta(101, 200, 42, 1, true, Some(m_hi.clone()));
+        assert_eq!(cmp_meta(&f_none, &f_lo), Ordering::Less);
+        assert_eq!(cmp_meta(&f_lo, &f_hi), Ordering::Less);
+        assert_eq!(cmp_meta(&f_lo, &f_lo), Ordering::Equal);
+        // `same_identity` must split on metadata: same (s,p,o,dt) but
+        // distinct m means distinct identity, just like `apply_commit`'s
+        // `fact_currently_asserted_in_graph` walks (s,p,o,dt) and then
+        // matches `existing.m == flake.m`.
+        assert!(
+            !same_identity(&f_none, &f_lo),
+            "identity must split on metadata"
+        );
+        assert!(
+            !same_identity(&f_lo, &f_hi),
+            "identity must split on differing metadata values"
+        );
+
+        // `cmp_object` mixes value and datatype: equal value + differing
+        // datatype must order. Use distinct datatype Sids on otherwise
+        // identical flakes.
+        let dt_long = Sid::new(2, "long");
+        let dt_int = Sid::new(2, "integer");
+        let with_long = Flake::new(
+            Sid::new(101, "s101"),
+            Sid::new(200, "p200"),
+            FlakeValue::Long(42),
+            dt_long,
+            1,
+            true,
+            None,
+        );
+        let with_int = Flake::new(
+            Sid::new(101, "s101"),
+            Sid::new(200, "p200"),
+            FlakeValue::Long(42),
+            dt_int,
+            1,
+            true,
+            None,
+        );
+        assert_ne!(
+            cmp_object(&with_long, &with_int),
+            Ordering::Equal,
+            "cmp_object must distinguish equal values across differing datatypes"
+        );
+        assert!(
+            !same_identity(&with_long, &with_int),
+            "datatype is part of identity — must split"
+        );
     }
 }

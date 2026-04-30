@@ -402,6 +402,21 @@ pub async fn load_commit_envelope_by_id<C: ContentStore + ?Sized>(
     store: &C,
     id: &ContentId,
 ) -> Result<CommitEnvelope> {
+    let (envelope, _version) = load_commit_envelope_with_version(store, id).await?;
+    Ok(envelope)
+}
+
+/// Internal sibling of [`load_commit_envelope_by_id`] that also reports the
+/// commit-blob version byte read from the header.
+///
+/// Lets envelope-only walkers (notably [`first_t_where_graph_registered`])
+/// distinguish v4 envelopes (which carry `graph_delta`) from v3 envelopes
+/// (which never encoded it) so they can avoid silently mis-reporting graph
+/// registration on legacy chains.
+async fn load_commit_envelope_with_version<C: ContentStore + ?Sized>(
+    store: &C,
+    id: &ContentId,
+) -> Result<(CommitEnvelope, u8)> {
     use codec::format::{CommitHeader, HEADER_LEN};
 
     let probe = store
@@ -416,6 +431,11 @@ pub async fn load_commit_envelope_by_id<C: ContentStore + ?Sized>(
             probe.len()
         )));
     }
+
+    // Header byte 4 is the codec version; capture it before the envelope
+    // decode dispatches on it. Re-validated against `CommitHeader::read_from`
+    // (which rejects unknown versions) below.
+    let version_byte = probe[4];
 
     let header =
         CommitHeader::read_from(&probe).map_err(|e| Error::invalid_commit(e.to_string()))?;
@@ -439,7 +459,7 @@ pub async fn load_commit_envelope_by_id<C: ContentStore + ?Sized>(
             tracing::debug_span!("load_commit_envelope_by_id", blob_bytes = data.len()).entered();
         codec::read_commit_envelope(&data).map_err(|e| Error::invalid_commit(e.to_string()))?
     };
-    Ok(envelope)
+    Ok((envelope, version_byte))
 }
 
 /// Walk a commit DAG from a head CID, collecting `(t, ContentId)` pairs for
@@ -473,15 +493,45 @@ pub async fn collect_dag_cids_with_split_mode<C: ContentStore + ?Sized>(
     walk_dag(store, head_id, stop_at_t, true).await
 }
 
+/// Outcome of an envelope-only probe for a named graph's registration.
+///
+/// Returned by [`first_t_where_graph_registered`]. Callers that gate
+/// expensive work on the absence of a registration must distinguish
+/// `NotFound` (definitively absent — safe to skip) from `Inconclusive`
+/// (probe couldn't determine — must fall through to a full-chain check).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphRegistrationProbe {
+    /// Graph IRI was registered at this `t`. Smallest `t` observed across
+    /// the walk; later parent paths could not yield a smaller value because
+    /// we visit every ancestor before returning.
+    Found(i64),
+    /// Probe completed and the IRI was not present in any commit's
+    /// `graph_delta`. Safe to short-circuit: no flake belonging to the
+    /// graph can exist in this chain.
+    NotFound,
+    /// Probe could not determine registration status — typically because
+    /// at least one envelope in the chain was a v3 commit, which never
+    /// encoded `graph_delta`. Callers must fall through to a full chain
+    /// load if correctness depends on knowing.
+    Inconclusive,
+}
+
 /// Probe the commit DAG envelope-only to discover whether a named graph
 /// IRI was ever registered, and at what `t` it first appeared.
 ///
-/// Walks the chain via [`load_commit_envelope_by_id`] (byte-range probe,
-/// ~128 KiB per envelope on range-capable backends), inspects each
-/// envelope's `graph_delta` for `graph_iri`, and returns the lowest `t`
-/// where it appears. Returns `Ok(None)` if the IRI never shows up — which
-/// means no flake belonging to that graph can exist anywhere in the chain
-/// (graph registrations are required before flakes can reference them).
+/// Walks the chain via byte-range envelope reads (~128 KiB per envelope on
+/// range-capable backends), inspects each envelope's `graph_delta` for
+/// `graph_iri`, and returns:
+///
+/// - [`Found(t)`](GraphRegistrationProbe::Found) — the smallest `t`
+///   where the IRI appears in any commit's `graph_delta`.
+/// - [`NotFound`](GraphRegistrationProbe::NotFound) — every commit was a
+///   v4 envelope and none registered the IRI.
+/// - [`Inconclusive`](GraphRegistrationProbe::Inconclusive) — at least one
+///   envelope was v3 (or an unknown future version) and could not be
+///   inspected for `graph_delta`. Walk short-circuits and returns
+///   immediately on first such envelope; callers must fall through to a
+///   full-chain load if correctness depends on the answer.
 ///
 /// Used by [`ApiFulltextConfigProvider`][^1] to short-circuit fulltext
 /// config resolution on first-ever reindex when the config graph was
@@ -489,17 +539,22 @@ pub async fn collect_dag_cids_with_split_mode<C: ContentStore + ?Sized>(
 /// avoids the per-commit full-blob read + zstd decompress + flake
 /// construction that `LedgerState::load` would otherwise perform.
 ///
-/// Note: v3 commits do not carry `graph_delta` on the envelope (the
-/// field was added in v4). On a v3 chain this function will always
-/// return `None`; callers that need v3 compatibility should fall back
-/// to a full chain scan.
+/// # Cost contract
+///
+/// Walks the **full DAG** even after a hit because earlier commits on
+/// alternate parent branches may carry an earlier registration; on a
+/// linear chain this is unavoidable. Per-commit cost is one byte-range
+/// envelope read on range-capable backends. The walk is sequential
+/// because each envelope reveals its parents; pipeline support is a
+/// future optimization (see follow-up notes in the PR description that
+/// added this helper).
 ///
 /// [^1]: `fluree-db-api/src/indexer_fulltext_provider.rs`
 pub async fn first_t_where_graph_registered<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
     graph_iri: &str,
-) -> Result<Option<i64>> {
+) -> Result<GraphRegistrationProbe> {
     let mut earliest: Option<i64> = None;
     let mut frontier = vec![head_id.clone()];
     let mut visited = std::collections::HashSet::new();
@@ -508,7 +563,18 @@ pub async fn first_t_where_graph_registered<C: ContentStore + ?Sized>(
         if !visited.insert(cid.clone()) {
             continue;
         }
-        let envelope = load_commit_envelope_by_id(store, &cid).await?;
+        let (envelope, version) = load_commit_envelope_with_version(store, &cid).await?;
+        // V3 envelopes (and any pre-v4 format that did not encode
+        // `graph_delta`) leave `envelope.graph_delta` empty regardless of
+        // what the underlying commit actually registered, so we cannot
+        // distinguish "no registration" from "field absent on the wire."
+        // Bail to `Inconclusive` so the caller falls through to a
+        // correctness-preserving full-chain scan. `CommitBlobVersion::V4`
+        // is the only version known to encode `graph_delta`; any other
+        // is treated conservatively.
+        if version != codec::VERSION {
+            return Ok(GraphRegistrationProbe::Inconclusive);
+        }
         if envelope.graph_delta.values().any(|iri| iri == graph_iri) {
             earliest = Some(match earliest {
                 Some(e) => e.min(envelope.t),
@@ -520,7 +586,10 @@ pub async fn first_t_where_graph_registered<C: ContentStore + ?Sized>(
         }
     }
 
-    Ok(earliest)
+    Ok(match earliest {
+        Some(t) => GraphRegistrationProbe::Found(t),
+        None => GraphRegistrationProbe::NotFound,
+    })
 }
 
 /// Shared DAG walk implementation backing [`collect_dag_cids`] and

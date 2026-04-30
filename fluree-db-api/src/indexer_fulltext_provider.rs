@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fluree_db_core::{config_graph_iri, first_t_where_graph_registered};
+use fluree_db_core::{config_graph_iri, first_t_where_graph_registered, GraphRegistrationProbe};
 use fluree_db_indexer::{ConfiguredFulltextProperty, FulltextConfigProvider};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NameService;
@@ -60,10 +60,17 @@ impl ApiFulltextConfigProvider {
         // (`read_commit_v4` per commit) just to discover an empty config
         // graph.
         //
-        // If the IRI was registered (or we can't determine, e.g. v3
-        // chain that doesn't carry envelope graph_delta), fall through
-        // to the full load path. That path is itself fast now after the
-        // novelty `bulk_apply_commits` switch in `load_novelty`.
+        // Only `NotFound` short-circuits. `Found(_)` and `Inconclusive`
+        // fall through to the full-load path:
+        //
+        // - `Found(_)`: the chain definitely registered the config graph,
+        //   so we need to read the actual flakes to extract config.
+        // - `Inconclusive`: at least one v3 envelope on the chain (which
+        //   never encoded `graph_delta`), so we can't tell from envelopes
+        //   alone whether the IRI is registered. Fall through to a full
+        //   `LedgerState::load` so legacy chains don't silently lose
+        //   their fulltext config — the full load is itself fast now
+        //   thanks to `bulk_apply_commits` in `load_novelty`.
         let record = self
             .nameservice
             .lookup(ledger_id)
@@ -84,24 +91,37 @@ impl ApiFulltextConfigProvider {
                     self.backend.content_store(&record.ledger_id)
                 };
                 let cfg_iri = config_graph_iri(ledger_id);
-                let registered = first_t_where_graph_registered(cs.as_ref(), head_id, &cfg_iri)
+                let probe = first_t_where_graph_registered(cs.as_ref(), head_id, &cfg_iri)
                     .await
                     .map_err(|e| format!("envelope walk for config graph: {e}"))?;
-                if registered.is_none() {
-                    tracing::debug!(
-                        ledger_id,
-                        cfg_iri = %cfg_iri,
-                        "fulltext config provider: config graph never registered; \
-                         skipping LedgerState::load + resolve_ledger_config"
-                    );
-                    return Ok(Vec::new());
+                match probe {
+                    GraphRegistrationProbe::NotFound => {
+                        tracing::debug!(
+                            ledger_id,
+                            cfg_iri = %cfg_iri,
+                            "fulltext config provider: config graph never registered; \
+                             skipping LedgerState::load + resolve_ledger_config"
+                        );
+                        return Ok(Vec::new());
+                    }
+                    GraphRegistrationProbe::Found(t) => {
+                        tracing::debug!(
+                            ledger_id,
+                            cfg_iri = %cfg_iri,
+                            first_t = t,
+                            "fulltext config provider: config graph registered; \
+                             proceeding with full state load + resolve"
+                        );
+                    }
+                    GraphRegistrationProbe::Inconclusive => {
+                        tracing::debug!(
+                            ledger_id,
+                            cfg_iri = %cfg_iri,
+                            "fulltext config provider: envelope-only probe inconclusive \
+                             (v3 envelope on chain); falling through to full state load"
+                        );
+                    }
                 }
-                tracing::debug!(
-                    ledger_id,
-                    first_t = ?registered,
-                    "fulltext config provider: config graph registered; \
-                     proceeding with full state load + resolve"
-                );
             }
         }
 

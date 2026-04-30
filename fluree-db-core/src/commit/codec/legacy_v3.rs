@@ -1051,4 +1051,48 @@ mod tests {
             crate::commit::codec::CommitCodecError::UnsupportedVersion(99)
         ));
     }
+
+    /// Regression guard: `first_t_where_graph_registered` must report
+    /// `Inconclusive` (not `NotFound`) when any envelope on the chain is
+    /// v3, because v3 didn't encode `graph_delta` on the wire — a `false`
+    /// answer there would silently lose configured fulltext on legacy
+    /// chains. See PR #1211 review item #1.
+    #[tokio::test]
+    async fn first_t_where_graph_registered_returns_inconclusive_on_v3_envelope() {
+        use crate::storage::MemoryStorage;
+        use crate::{content_store_for, ContentKind, ContentStore, GraphRegistrationProbe};
+
+        // Construct a v3 blob (single trivial flake) and put it in an
+        // in-memory store under its own SHA-256 CID via the v4 CID scheme
+        // (`ContentId::new(Commit, bytes)`). The probe's first action is
+        // `get_range(head_id, ...)`, which the memory store satisfies by
+        // returning the same bytes regardless of version.
+        let flake = test_flake(Sid::new(namespaces::XSD, "string"), 1);
+        let blob = build_v3_test_blob(std::slice::from_ref(&flake), 1);
+        assert_eq!(blob[4], format::VERSION_V3);
+
+        let storage = MemoryStorage::new();
+        let store = content_store_for(storage, "test/v3-probe:main");
+        let cid = store
+            .put(ContentKind::Commit, &blob)
+            .await
+            .expect("put v3 blob");
+
+        let probe = crate::commit::first_t_where_graph_registered(
+            &store,
+            &cid,
+            "urn:fluree:test/v3-probe:main#config",
+        )
+        .await
+        .expect("envelope walk");
+
+        assert_eq!(
+            probe,
+            GraphRegistrationProbe::Inconclusive,
+            "v3 envelopes never carry graph_delta — probe must report \
+             Inconclusive so the caller falls through to a full load \
+             instead of silently treating the chain as having no \
+             registration; got {probe:?}"
+        );
+    }
 }

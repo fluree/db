@@ -36,7 +36,7 @@ use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState, Novelty};
 use fluree_db_core::error::Result as StorageResult;
 use fluree_db_core::{
     config_graph_iri, first_t_where_graph_registered, ContentId, ContentKind, ContentStore,
-    LedgerSnapshot,
+    GraphRegistrationProbe, LedgerSnapshot,
 };
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -179,13 +179,15 @@ async fn first_t_where_graph_registered_no_full_reads_when_iri_absent() {
     let head = record.commit_head_id.expect("head");
 
     let cfg_iri = config_graph_iri(ledger_id);
-    let registered = first_t_where_graph_registered(&counted, &head, &cfg_iri)
+    let probe = first_t_where_graph_registered(&counted, &head, &cfg_iri)
         .await
         .expect("envelope walk");
 
-    assert!(
-        registered.is_none(),
-        "config graph never registered, expected None, got {registered:?}"
+    assert_eq!(
+        probe,
+        GraphRegistrationProbe::NotFound,
+        "config graph never registered on a v4-only chain, \
+         expected NotFound; got {probe:?}"
     );
 
     let get_calls = counters.get_calls.load(Ordering::Relaxed);
@@ -267,14 +269,13 @@ async fn first_t_where_graph_registered_returns_lowest_t_when_iri_present() {
         .expect("ns record");
     let head = record.commit_head_id.expect("head");
 
-    let registered =
-        first_t_where_graph_registered(&fluree.content_store(ledger_id), &head, &cfg_iri)
-            .await
-            .expect("envelope walk");
+    let probe = first_t_where_graph_registered(&fluree.content_store(ledger_id), &head, &cfg_iri)
+        .await
+        .expect("envelope walk");
 
     assert_eq!(
-        registered,
-        Some(1),
+        probe,
+        GraphRegistrationProbe::Found(1),
         "config graph was registered at the genesis commit (t=1)"
     );
 }

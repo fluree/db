@@ -1269,6 +1269,39 @@ mem:fact-01kj8k5nzpe59p5vp7zrehbrr9 a mem:Fact ;
     mem:branch "feature/memory" ;
     mem:createdAt "2026-02-24T19:49:14.358637+00:00"^^xsd:dateTime .
 
+mem:fact-01kqfy6r0w86fcsd9km0707xzg a mem:Fact ;
+    mem:content "v3 commit envelope reader at `legacy_v3.rs:305-309` deliberately stubs `graph_delta = HashMap::new()` since v3 never encoded the field. Envelope-only walkers (`first_t_where_graph_registered`) therefore return `None` on any chain that includes v3 commits, regardless of whether the named graph was actually registered. Callers that rely on the result for short-circuiting must either fall through to a full load on `None`, detect v3 envelopes and signal \"inconclusive\", or accept silent correctness regressions on legacy chains." ;
+    mem:tag "commit-envelope" ;
+    mem:tag "gotcha" ;
+    mem:tag "graph-delta" ;
+    mem:tag "legacy-v3" ;
+    mem:tag "short-circuit" ;
+    mem:tag "v3-compat" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/indexer_fulltext_provider.rs" ;
+    mem:artifactRef "fluree-db-core/src/commit.rs" ;
+    mem:artifactRef "fluree-db-core/src/commit/codec/legacy_v3.rs" ;
+    mem:branch "fix/reindex-pre-build-perf-regression" ;
+    mem:createdAt "2026-04-30T19:35:13.692947+00:00"^^xsd:dateTime ;
+    mem:rationale "Surfaced during PR #1211 review — code returned Vec::new() on None even though the PR description said it falls through to full load. Documenting so future envelope-only short-circuit work doesn't repeat the silent-fail shape." .
+
+mem:fact-01kqfy6txdrjppaf6756xzdz25 a mem:Fact ;
+    mem:content "`Novelty::bulk_apply_commits` is the O(N log N) bulk replacement for per-commit `apply_commit` on first-load / catch-up paths. Identity sort key is `(s, p, o, dt, m, t, op)`; dedup walk drops an assertion iff the prior kept flake for the same `(s, p, o, dt, m)` was also an assertion (mirrors `fact_currently_asserted_in_graph`). Used by `LedgerState::load_novelty` after reversing HEAD→oldest batches and populating dict_novelty in commit order. Delta vs apply_commit: deduped flakes remain in the FlakeStore arena and self.size over-reports — bounded for fresh-load callers but not appropriate for hot-path mutation." ;
+    mem:tag "bulk-apply" ;
+    mem:tag "dedup" ;
+    mem:tag "indexing" ;
+    mem:tag "lambda" ;
+    mem:tag "load-novelty" ;
+    mem:tag "novelty" ;
+    mem:tag "performance" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-core/src/comparator.rs" ;
+    mem:artifactRef "fluree-db-ledger/src/lib.rs" ;
+    mem:artifactRef "fluree-db-novelty/src/lib.rs" ;
+    mem:branch "fix/reindex-pre-build-perf-regression" ;
+    mem:createdAt "2026-04-30T19:35:16.653062+00:00"^^xsd:dateTime ;
+    mem:rationale "Captures the design contract and arena-bloat semantics from PR #1211 so future callers of bulk_apply_commits don't accidentally wire it into a hot-path mutation site." .
+
 mem:constraint-01kjte29y3cp8mae56xy6yfv2n a mem:Constraint ;
     mem:content "SPARQL↔JSON-LD Parity: both compile to the same IR (fluree-db-query/src/ir.rs) and share the entire execution engine. When adding SPARQL features: (1) shared IR changes already affect JSON-LD — verify JSON-LD tests pass, (2) if expressible in JSON-LD, add parallel tests, (3) execution path missing in JSON-LD lower → track follow-up.\n\nSPARQL tests: it_query_sparql.rs | JSON-LD tests: it_query.rs, it_query_analytical.rs, it_query_grouping.rs\nValidate: `cd testsuite-sparql && make test-eval-cat CAT=<cat>` then `cargo test -p fluree-db-api --test it_query`" ;
     mem:tag "compliance" ;
