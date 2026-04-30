@@ -10,7 +10,7 @@ use crate::query::helpers::{
 use crate::view::{DataSetDb, QueryInput};
 use crate::{ApiError, ExecutableQuery, Fluree, QueryResult, Result, Tracker, TrackingOptions};
 use fluree_db_query::execute::{
-    execute_prepared, prepare_execution_with_binary_store, ContextConfig,
+    execute_prepared, prepare_execution_with_config, ContextConfig, PrepareConfig,
 };
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
 
@@ -575,15 +575,21 @@ impl Fluree {
 
         let db = primary.as_graph_db_ref();
 
-        let prepared =
-            prepare_execution_with_binary_store(db, executable, primary.binary_store.as_ref())
-                .await
-                .map_err(query_error_to_api_error)?;
-
+        // Detect history mode from the dataset spec *before* prepare so the
+        // planner can construct mode-aware operators in a single pass.
         let (from_t, to_t, history_mode) = match dataset.history_time_range() {
             Some((hist_from, hist_to)) => (Some(hist_from), hist_to, true),
             None => (None, primary.t, false),
         };
+
+        let prepare_config = if history_mode {
+            PrepareConfig::history(primary.binary_store.as_ref())
+        } else {
+            PrepareConfig::current(primary.binary_store.as_ref())
+        };
+        let prepared = prepare_execution_with_config(db, executable, &prepare_config)
+            .await
+            .map_err(query_error_to_api_error)?;
 
         // Binary scans rely on a ledger-specific binary index store. For datasets that span
         // multiple ledgers, using only the primary view's store will silently drop results.
@@ -697,14 +703,19 @@ impl Fluree {
 
         let db = primary.as_graph_db_ref();
 
-        let prepared =
-            prepare_execution_with_binary_store(db, executable, primary.binary_store.as_ref())
-                .await?;
-
+        // Detect history mode from the dataset spec *before* prepare so the
+        // planner can construct mode-aware operators in a single pass.
         let (from_t, to_t, history_mode) = match dataset.history_time_range() {
             Some((hist_from, hist_to)) => (Some(hist_from), hist_to, true),
             None => (None, primary.t, false),
         };
+
+        let prepare_config = if history_mode {
+            PrepareConfig::history(primary.binary_store.as_ref())
+        } else {
+            PrepareConfig::current(primary.binary_store.as_ref())
+        };
+        let prepared = prepare_execution_with_config(db, executable, &prepare_config).await?;
 
         let primary_ledger_id: &str = primary.ledger_id.as_ref();
         let is_single_ledger_dataset = dataset

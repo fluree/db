@@ -26,13 +26,14 @@ use async_trait::async_trait;
 use fluree_db_core::{IndexType, ObjectBounds, Sid};
 
 use crate::binary_history::BinaryHistoryScanOperator;
-use crate::binary_scan::{schema_from_pattern_with_emit, EmitMask};
+use crate::binary_scan::{schema_from_pattern_with_emit, BinaryScanOperator, EmitMask};
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
 use crate::operator::inline::{extend_schema, InlineOperator};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::temporal_mode::TemporalMode;
 use crate::triple::TriplePattern;
 use crate::var_registry::VarId;
 
@@ -63,15 +64,19 @@ pub trait DatasetBuilder: Send + Sync {
 
 /// Builder for triple-pattern scans across dataset graphs.
 ///
-/// Produces a [`BinaryScanOperator`] for each graph. This is the primary
-/// builder implementation — other backends (BM25, vector, etc.) will add
-/// their own builders in follow-up steps.
+/// Produces a mode-specific scan operator for each graph:
+/// - [`TemporalMode::Current`] → [`BinaryScanOperator`] directly.
+/// - [`TemporalMode::History`] → [`BinaryHistoryScanOperator`].
+///
+/// Mode is captured at planner-time construction, not read from the runtime
+/// `ExecutionContext` — every operator in the tree is single-purpose.
 pub struct ScanDatasetBuilder {
     pattern: TriplePattern,
     object_bounds: Option<ObjectBounds>,
     inline_ops: Vec<InlineOperator>,
     emit: EmitMask,
     index_hint: Option<IndexType>,
+    mode: TemporalMode,
     schema: Arc<[VarId]>,
 }
 
@@ -82,6 +87,7 @@ impl ScanDatasetBuilder {
         inline_ops: Vec<InlineOperator>,
         emit: EmitMask,
         index_hint: Option<IndexType>,
+        mode: TemporalMode,
     ) -> Self {
         let (base_schema, _, _, _) = schema_from_pattern_with_emit(&pattern, emit);
         let schema: Arc<[VarId]> = extend_schema(&base_schema, &inline_ops).into();
@@ -91,27 +97,38 @@ impl ScanDatasetBuilder {
             inline_ops,
             emit,
             index_hint,
+            mode,
             schema,
         }
+    }
+
+    /// Returns the temporal mode this builder will use when constructing scans.
+    #[inline]
+    pub fn mode(&self) -> TemporalMode {
+        self.mode
     }
 }
 
 impl DatasetBuilder for ScanDatasetBuilder {
     fn build(&self) -> Result<BoxedOperator> {
-        // Use the history-aware wrapper at all scan sites. For non-history
-        // queries it transparently delegates to `BinaryScanOperator::open`
-        // — no behavior change on the hot path. For history queries
-        // (`ctx.history_mode == true`) it runs the dedicated sidecar+base
-        // +novelty merge in its own `open`.
-        Ok(Box::new(
-            BinaryHistoryScanOperator::new_with_emit_and_index(
+        match self.mode {
+            TemporalMode::History => Ok(Box::new(
+                BinaryHistoryScanOperator::new_with_emit_and_index(
+                    self.pattern.clone(),
+                    self.object_bounds.clone(),
+                    self.inline_ops.clone(),
+                    self.emit,
+                    self.index_hint,
+                ),
+            )),
+            TemporalMode::Current => Ok(Box::new(BinaryScanOperator::new_with_emit_and_index(
                 self.pattern.clone(),
                 self.object_bounds.clone(),
                 self.inline_ops.clone(),
                 self.emit,
                 self.index_hint,
-            ),
-        ))
+            ))),
+        }
     }
 
     fn schema(&self) -> &[VarId] {
@@ -163,14 +180,27 @@ impl DatasetOperator {
 
     /// Convenience constructor for a triple-pattern scan wrapped in a
     /// dataset operator.
+    ///
+    /// `mode` must be captured by the caller at planner-time. Late/dynamic
+    /// builders (joins, optionals, EXISTS/MINUS, etc.) capture mode at their
+    /// own construction time and pass it through here — they do not read it
+    /// from the runtime `ExecutionContext`.
     pub fn scan(
         pattern: TriplePattern,
         object_bounds: Option<ObjectBounds>,
         inline_ops: Vec<InlineOperator>,
         emit: EmitMask,
         index_hint: Option<IndexType>,
+        mode: TemporalMode,
     ) -> Self {
-        let builder = ScanDatasetBuilder::new(pattern, object_bounds, inline_ops, emit, index_hint);
+        let builder = ScanDatasetBuilder::new(
+            pattern,
+            object_bounds,
+            inline_ops,
+            emit,
+            index_hint,
+            mode,
+        );
         Self::new(Box::new(builder))
     }
 }
@@ -420,7 +450,14 @@ mod tests {
         let pattern =
             TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(100, "name")), Term::Var(o));
 
-        let builder = ScanDatasetBuilder::new(pattern, None, Vec::new(), EmitMask::ALL, None);
+        let builder = ScanDatasetBuilder::new(
+            pattern,
+            None,
+            Vec::new(),
+            EmitMask::ALL,
+            None,
+            TemporalMode::Current,
+        );
 
         let schema = builder.schema();
         assert_eq!(schema.len(), 2);

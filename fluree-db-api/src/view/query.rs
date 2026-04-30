@@ -11,7 +11,7 @@ use crate::query::helpers::{
 use crate::view::{GraphDb, QueryInput};
 use crate::{ApiError, ExecutableQuery, Fluree, QueryResult, Result, Tracker, TrackingOptions};
 use fluree_db_query::execute::{
-    execute_prepared, prepare_execution_with_binary_store, ContextConfig,
+    execute_prepared, prepare_execution_with_config, ContextConfig, PrepareConfig,
 };
 use fluree_db_query::ir::{GraphName, Pattern};
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
@@ -603,10 +603,11 @@ impl Fluree {
         r2rml_table_provider: &'b dyn fluree_db_query::r2rml::R2rmlTableProvider,
     ) -> Result<Vec<crate::Batch>> {
         let db_ref = db.as_graph_db_ref();
-        let prepared =
-            prepare_execution_with_binary_store(db_ref, executable, db.binary_store.as_ref())
-                .await
-                .map_err(query_error_to_api_error)?;
+        // Single-graph view: no dataset-level history detection — current state.
+        let prepare_config = PrepareConfig::current(db.binary_store.as_ref());
+        let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
+            .await
+            .map_err(query_error_to_api_error)?;
 
         let spatial_map = db.binary_store.as_ref().map(|s| s.spatial_provider_map());
         // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
@@ -673,9 +674,9 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
         let db_ref = db.as_graph_db_ref();
-        let prepared =
-            prepare_execution_with_binary_store(db_ref, executable, db.binary_store.as_ref())
-                .await?;
+        // Single-graph view: no dataset-level history detection — current state.
+        let prepare_config = PrepareConfig::current(db.binary_store.as_ref());
+        let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config).await?;
 
         let spatial_map = db.binary_store.as_ref().map(|s| s.spatial_provider_map());
         // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution

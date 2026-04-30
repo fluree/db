@@ -137,6 +137,48 @@ pub struct PreparedExecution {
     pub derived_overlay: Option<Arc<DerivedFactsOverlay>>,
 }
 
+/// Inputs that the preparation phase needs to know up front.
+///
+/// Lives here rather than as loose parameters so that future planner inputs
+/// (additional [`PlanningContext`] fields, alternate stats sources, etc.)
+/// don't keep extending the prepare-call signature.
+#[derive(Clone, Copy, Default)]
+pub struct PrepareConfig<'a> {
+    /// Optional shared binary index store used by the planner stats cache
+    /// and by mode-aware scan construction.
+    pub binary_store: Option<&'a Arc<BinaryIndexStore>>,
+    /// Planning-time decisions captured before prepare runs.
+    pub planning: crate::temporal_mode::PlanningContext,
+}
+
+impl<'a> PrepareConfig<'a> {
+    /// Construct a config for current-state queries with the given binary store.
+    ///
+    /// Canonical root for the planner-mode invariant: any production caller
+    /// that knows it wants current-state semantics goes through here. Calling
+    /// `PlanningContext::current()` directly outside of true roots is the
+    /// drift hazard the planner-mode refactor was designed to eliminate.
+    pub fn current(binary_store: Option<&'a Arc<BinaryIndexStore>>) -> Self {
+        Self {
+            binary_store,
+            planning: crate::temporal_mode::PlanningContext::current(),
+        }
+    }
+
+    /// Construct a config for history-range queries with the given binary store.
+    ///
+    /// Canonical root for history-range planning. Detection happens at the
+    /// dataset/view layer (`view::dataset_query::query_dataset` consults
+    /// `dataset.history_time_range()` before prepare runs) — never inside
+    /// the planner or operator construction.
+    pub fn history(binary_store: Option<&'a Arc<BinaryIndexStore>>) -> Self {
+        Self {
+            binary_store,
+            planning: crate::temporal_mode::PlanningContext::history(),
+        }
+    }
+}
+
 /// Prepare query execution with an overlay
 ///
 /// This performs all the common preparation steps:
@@ -152,16 +194,31 @@ pub async fn prepare_execution(
     db: GraphDbRef<'_>,
     query: &ExecutableQuery,
 ) -> Result<PreparedExecution> {
-    prepare_execution_with_binary_store(db, query, None).await
+    prepare_execution_with_config(db, query, &PrepareConfig::default()).await
 }
 
-/// Prepare execution, optionally allowing the planner stats path to reuse the
-/// shared cache attached to a binary store.
+/// Back-compat wrapper. Prefer [`prepare_execution_with_config`] for new code.
 pub async fn prepare_execution_with_binary_store(
     db: GraphDbRef<'_>,
     query: &ExecutableQuery,
     binary_store: Option<&Arc<BinaryIndexStore>>,
 ) -> Result<PreparedExecution> {
+    prepare_execution_with_config(db, query, &PrepareConfig::current(binary_store)).await
+}
+
+/// Prepare execution given an explicit [`PrepareConfig`].
+///
+/// This is the canonical entry point: callers compute the planning context
+/// (in particular [`crate::temporal_mode::TemporalMode`]) before invoking
+/// prepare, so the operator tree can be built mode-aware in subsequent
+/// phases of the planner-mode refactor.
+pub async fn prepare_execution_with_config(
+    db: GraphDbRef<'_>,
+    query: &ExecutableQuery,
+    config: &PrepareConfig<'_>,
+) -> Result<PreparedExecution> {
+    let binary_store = config.binary_store;
+    let planning = config.planning;
     let span = tracing::debug_span!(
         "query_prepare",
         db_t = db.snapshot.t,
@@ -367,13 +424,19 @@ pub async fn prepare_execution_with_binary_store(
         };
 
         // ---- plan: build operator tree from rewritten query ----
+        // Planning context is computed at the dataset/view layer before
+        // `prepare_execution_with_config` runs. The planner branches on
+        // `planning.mode` at scan-construction time (phase 3).
         let operator = {
-            let _plan_span =
-                tracing::debug_span!("plan", pattern_count = rewritten_query.patterns.len(),)
-                    .entered();
+            let _plan_span = tracing::debug_span!(
+                "plan",
+                pattern_count = rewritten_query.patterns.len(),
+                mode = ?planning.mode,
+            )
+            .entered();
 
             let stats_view = cached_stats_view_for_db(db, binary_store);
-            build_operator_tree(&rewritten_query, &query.options, stats_view)?
+            build_operator_tree(&rewritten_query, &query.options, stats_view, &planning)?
         };
 
         Ok(PreparedExecution {

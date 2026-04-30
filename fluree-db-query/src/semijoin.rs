@@ -21,6 +21,7 @@ use crate::group_aggregate::{binding_to_group_key_owned, CompositeGroupKey};
 use crate::ir::Pattern;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::{EmptyOperator, SeedOperator};
+use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::StatsView;
@@ -46,6 +47,8 @@ pub struct SemijoinOperator {
     key_col_indices: Vec<usize>,
     /// Stats for nested query building.
     stats: Option<Arc<StatsView>>,
+    /// Planning context captured at planner-time for the inner subplan.
+    planning: PlanningContext,
 }
 
 impl SemijoinOperator {
@@ -55,6 +58,7 @@ impl SemijoinOperator {
         key_vars: Vec<VarId>,
         negated: bool,
         stats: Option<Arc<StatsView>>,
+        planning: PlanningContext,
     ) -> Self {
         let schema: Arc<[VarId]> = Arc::from(child.schema().to_vec().into_boxed_slice());
         Self {
@@ -67,6 +71,7 @@ impl SemijoinOperator {
             key_set: FxHashSet::default(),
             key_col_indices: Vec::new(),
             stats,
+            planning,
         }
     }
 
@@ -104,6 +109,7 @@ impl SemijoinOperator {
             &self.inner_patterns,
             self.stats.clone(),
             None,
+            &self.planning,
         )?;
 
         inner_op.open(ctx).await?;
@@ -141,6 +147,7 @@ impl Operator for SemijoinOperator {
             &self.inner_patterns,
             self.stats.clone(),
             Some(&key_var_slice),
+            &self.planning,
         )?;
 
         // Compute column indices for key vars within the inner operator's schema.

@@ -37,6 +37,7 @@ use crate::operator::{
 use crate::project::ProjectOperator;
 use crate::seed::{EmptyOperator, SeedOperator};
 use crate::sort::SortOperator;
+use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::StatsView;
@@ -65,6 +66,8 @@ pub struct SubqueryOperator {
     buffer_pos: usize,
     /// Optional stats for selectivity-based pattern reordering in subquery
     stats: Option<Arc<StatsView>>,
+    /// Planning context captured at planner-time for the subquery subplan.
+    planning: PlanningContext,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
 }
@@ -75,6 +78,7 @@ impl SubqueryOperator {
         child: BoxedOperator,
         subquery: SubqueryPattern,
         stats: Option<Arc<StatsView>>,
+        planning: PlanningContext,
     ) -> Self {
         let parent_schema: HashSet<VarId> = child.schema().iter().copied().collect();
         let subquery_select_vars: HashSet<VarId> = subquery.select.iter().copied().collect();
@@ -122,6 +126,7 @@ impl SubqueryOperator {
             result_buffer: Vec::new(),
             buffer_pos: 0,
             stats,
+            planning,
             out_schema: None,
         }
     }
@@ -301,6 +306,7 @@ impl SubqueryOperator {
             &self.subquery.patterns,
             self.stats.clone(),
             None,
+            &self.planning,
         )?;
 
         // Apply GROUP BY / aggregates / HAVING for subqueries that use them.
@@ -400,7 +406,12 @@ mod tests {
             vec![], // patterns don't matter for this structural test
         );
 
-        let op = SubqueryOperator::new(Box::new(child), subquery, None);
+        let op = SubqueryOperator::new(
+            Box::new(child),
+            subquery,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
 
         // ?s is in both parent schema and subquery SELECT → correlated
         assert_eq!(op.correlation_vars, vec![v_s]);

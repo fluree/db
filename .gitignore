@@ -31,6 +31,9 @@ __pycache__/
 # Test database (generated data)
 /test-database/
 
+# Benchmark inputs/outputs — never tracked
+/benchmarks/
+
 benchmarks/bsbm/bsbm100m_results_quick.xml
 benchmarks/bsbm/bsbm100m_results_v2.xml
 benchmarks/bsbm/bsbm100m_results.xml

@@ -146,6 +146,7 @@ async fn test_optional_poison_blocks_subsequent() {
         None, // No object bounds
         Vec::new(),
         EmitMask::ALL,
+        fluree_db_query::TemporalMode::Current,
     );
 
     join.open(&ctx).await.unwrap();

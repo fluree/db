@@ -18,6 +18,7 @@ use crate::execute::build_where_operators_seeded;
 use crate::ir::Pattern;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::{EmptyOperator, SeedOperator};
+use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::StatsView;
@@ -47,6 +48,8 @@ pub struct ExistsOperator {
     uncorrelated_has_match: Option<bool>,
     /// Optional stats for nested query optimization (Arc for cheap cloning in nested operators)
     stats: Option<Arc<StatsView>>,
+    /// Planning context captured at planner-time. Used for the EXISTS subplan.
+    planning: PlanningContext,
 }
 
 impl ExistsOperator {
@@ -63,6 +66,7 @@ impl ExistsOperator {
         exists_patterns: Vec<Pattern>,
         negated: bool,
         stats: Option<Arc<StatsView>>,
+        planning: PlanningContext,
     ) -> Self {
         let schema: Arc<[VarId]> = Arc::from(child.schema().to_vec().into_boxed_slice());
 
@@ -84,6 +88,7 @@ impl ExistsOperator {
             uncorrelated,
             uncorrelated_has_match: None,
             stats,
+            planning,
         }
     }
 
@@ -92,8 +97,9 @@ impl ExistsOperator {
         child: BoxedOperator,
         patterns: Vec<Pattern>,
         stats: Option<Arc<StatsView>>,
+        planning: PlanningContext,
     ) -> Self {
-        Self::new(child, patterns, true, stats)
+        Self::new(child, patterns, true, stats, planning)
     }
 
     /// Check if the EXISTS subquery produces any results for a given input row
@@ -115,6 +121,7 @@ impl ExistsOperator {
             &self.exists_patterns,
             self.stats.clone(),
             None,
+            &self.planning,
         )?;
 
         exists_op.open(ctx).await?;
@@ -149,6 +156,7 @@ impl Operator for ExistsOperator {
                 &self.exists_patterns,
                 self.stats.clone(),
                 None,
+                &self.planning,
             )?;
             exists_op.open(ctx).await?;
             let has_result = loop {
@@ -250,7 +258,13 @@ mod tests {
             schema: child_schema.clone(),
         });
 
-        let op = ExistsOperator::new(child, vec![], false, None);
+        let op = ExistsOperator::new(
+            child,
+            vec![],
+            false,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
 
         // Output schema should match child schema (EXISTS doesn't add vars)
         assert_eq!(op.schema(), &*child_schema);
@@ -269,7 +283,12 @@ mod tests {
             Term::Var(VarId(1)),
         ))];
 
-        let op = ExistsOperator::not_exists(child, patterns, None);
+        let op = ExistsOperator::not_exists(
+            child,
+            patterns,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
 
         assert!(op.negated);
     }

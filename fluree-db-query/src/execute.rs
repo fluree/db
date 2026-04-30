@@ -72,7 +72,10 @@ use runner::{
     execute_prepared_with_overlay, execute_prepared_with_overlay_tracked,
     execute_prepared_with_policy, execute_prepared_with_r2rml,
 };
-pub use runner::{prepare_execution, prepare_execution_with_binary_store};
+pub use runner::{
+    prepare_execution, prepare_execution_with_binary_store, prepare_execution_with_config,
+    PrepareConfig,
+};
 
 /// Execute a query with an overlay
 ///
@@ -388,7 +391,12 @@ mod tests {
             post_values: None,
         };
 
-        let result = build_operator_tree(&query, &QueryOptions::default(), None);
+        let result = build_operator_tree(
+            &query,
+            &QueryOptions::default(),
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        );
         match result {
             Err(e) => assert!(e.to_string().contains("not found")),
             Ok(_) => panic!("Expected error for invalid select var"),
@@ -409,7 +417,12 @@ mod tests {
 
         let options = QueryOptions::new().with_order_by(vec![SortSpec::asc(VarId(99))]); // Invalid var
 
-        let result = build_operator_tree(&query, &options, None);
+        let result = build_operator_tree(
+            &query,
+            &options,
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        );
         match result {
             Err(e) => assert!(e.to_string().contains("Sort variable")),
             Ok(_) => panic!("Expected error for invalid sort var"),
@@ -420,7 +433,12 @@ mod tests {
     fn test_build_where_operators_single_triple() {
         let patterns = vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))];
 
-        let result = where_plan::build_where_operators(&patterns, None, None);
+        let result = where_plan::build_where_operators(
+            &patterns,
+            None,
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        );
         assert!(result.is_ok());
 
         let op = result.unwrap();
@@ -437,7 +455,12 @@ mod tests {
             )),
         ];
 
-        let result = where_plan::build_where_operators(&patterns, None, None);
+        let result = where_plan::build_where_operators(
+            &patterns,
+            None,
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        );
         assert!(result.is_ok());
     }
 

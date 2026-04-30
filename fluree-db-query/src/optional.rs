@@ -36,6 +36,7 @@ use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
 use crate::seed::SeedOperator;
+use crate::temporal_mode::PlanningContext;
 use crate::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -154,11 +155,17 @@ pub struct PatternOptionalBuilder {
     bind_instructions: Vec<BindInstruction>,
     /// Instructions for unification checks on shared vars
     unify_instructions: Vec<UnifyInstruction>,
+    /// Planning context captured at planner-time for the per-row substituted scan.
+    planning: PlanningContext,
 }
 
 impl PatternOptionalBuilder {
     /// Create a new pattern-based optional builder
-    pub fn new(required_schema: Arc<[VarId]>, pattern: TriplePattern) -> Self {
+    pub fn new(
+        required_schema: Arc<[VarId]>,
+        pattern: TriplePattern,
+        planning: PlanningContext,
+    ) -> Self {
         // Determine optional-only vars (in optional but not in required)
         let required_vars: std::collections::HashSet<_> = required_schema.iter().copied().collect();
         let pattern_vars = pattern.variables();
@@ -184,6 +191,7 @@ impl PatternOptionalBuilder {
             optional_only_vars,
             bind_instructions,
             unify_instructions,
+            planning,
         }
     }
 
@@ -402,6 +410,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
                 Vec::new(),
                 crate::binary_scan::EmitMask::ALL,
                 None,
+                self.planning.mode(),
             ),
         )))
     }
@@ -580,10 +589,16 @@ pub struct GroupedPatternOptionalBuilder {
     triples: Vec<TriplePattern>,
     optional_only_vars: Vec<VarId>,
     subject_left_col: usize,
+    /// Planning context captured at planner-time for the per-row chain.
+    planning: PlanningContext,
 }
 
 impl GroupedPatternOptionalBuilder {
-    pub fn new(required_schema: Arc<[VarId]>, triples: Vec<TriplePattern>) -> Result<Self> {
+    pub fn new(
+        required_schema: Arc<[VarId]>,
+        triples: Vec<TriplePattern>,
+        planning: PlanningContext,
+    ) -> Result<Self> {
         let Some(subject_var) = triples.first().and_then(|tp| tp.s.as_var()) else {
             return Err(QueryError::Internal(
                 "grouped optional builder requires variable subject".into(),
@@ -616,6 +631,7 @@ impl GroupedPatternOptionalBuilder {
             triples,
             optional_only_vars,
             subject_left_col,
+            planning,
         })
     }
 
@@ -665,6 +681,7 @@ impl GroupedPatternOptionalBuilder {
                 op,
                 current_schema.clone(),
                 triple.clone(),
+                self.planning,
             ));
             current_schema = Arc::from(op.schema().to_vec().into_boxed_slice());
         }
@@ -939,6 +956,8 @@ pub struct PlanTreeOptionalBuilder {
     shared_var_indices: Vec<usize>,
     /// Stats for nested query optimization
     stats: Option<Arc<StatsView>>,
+    /// Planning context captured at planner-time for the per-row inner subplan.
+    planning: PlanningContext,
 }
 
 impl PlanTreeOptionalBuilder {
@@ -953,6 +972,7 @@ impl PlanTreeOptionalBuilder {
         required_schema: Arc<[VarId]>,
         inner_patterns: Vec<Pattern>,
         stats: Option<Arc<StatsView>>,
+        planning: PlanningContext,
     ) -> Self {
         let required_vars: HashSet<VarId> = required_schema.iter().copied().collect();
 
@@ -1009,6 +1029,7 @@ impl PlanTreeOptionalBuilder {
             unify_instructions,
             shared_var_indices,
             stats,
+            planning,
         }
     }
 
@@ -1050,6 +1071,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
             &self.inner_patterns,
             self.stats.clone(),
             None,
+            &self.planning,
         )?;
 
         Ok(Some(op))
@@ -1182,8 +1204,10 @@ impl OptionalOperator {
         required: BoxedOperator,
         required_schema: Arc<[VarId]>,
         optional_pattern: TriplePattern,
+        planning: PlanningContext,
     ) -> Self {
-        let builder = PatternOptionalBuilder::new(required_schema.clone(), optional_pattern);
+        let builder =
+            PatternOptionalBuilder::new(required_schema.clone(), optional_pattern, planning);
         Self::with_builder(required, required_schema, Box::new(builder))
     }
 
@@ -1689,7 +1713,12 @@ mod tests {
             fn close(&mut self) {}
         }
 
-        let op = OptionalOperator::new(Box::new(MockOp), required_schema, optional_pattern);
+        let op = OptionalOperator::new(
+            Box::new(MockOp),
+            required_schema,
+            optional_pattern,
+            crate::temporal_mode::PlanningContext::current(),
+        );
 
         // Combined schema should be: [?s, ?name, ?email]
         assert_eq!(op.schema().len(), 3);
@@ -1703,7 +1732,11 @@ mod tests {
         let required_schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let optional_pattern = make_optional_pattern();
 
-        let builder = PatternOptionalBuilder::new(required_schema, optional_pattern);
+        let builder = PatternOptionalBuilder::new(
+            required_schema,
+            optional_pattern,
+            crate::temporal_mode::PlanningContext::current(),
+        );
 
         // Check schema
         assert_eq!(builder.schema().len(), 2); // ?s, ?email
@@ -1733,7 +1766,11 @@ mod tests {
         let required_schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let optional_pattern = make_optional_pattern();
 
-        let builder = PatternOptionalBuilder::new(required_schema.clone(), optional_pattern);
+        let builder = PatternOptionalBuilder::new(
+            required_schema.clone(),
+            optional_pattern,
+            crate::temporal_mode::PlanningContext::current(),
+        );
 
         // Create a batch with Poisoned in position 0 (which is used for correlation)
         let columns_poisoned = vec![
@@ -1784,7 +1821,12 @@ mod tests {
             fn close(&mut self) {}
         }
 
-        let op = OptionalOperator::new(Box::new(MockOp), required_schema.clone(), optional_pattern);
+        let op = OptionalOperator::new(
+            Box::new(MockOp),
+            required_schema.clone(),
+            optional_pattern,
+            crate::temporal_mode::PlanningContext::current(),
+        );
 
         // Create a required batch with one row
         let columns = vec![
@@ -1826,7 +1868,11 @@ mod tests {
         }
 
         // Create using with_builder
-        let builder = PatternOptionalBuilder::new(required_schema.clone(), optional_pattern);
+        let builder = PatternOptionalBuilder::new(
+            required_schema.clone(),
+            optional_pattern,
+            crate::temporal_mode::PlanningContext::current(),
+        );
         let op =
             OptionalOperator::with_builder(Box::new(MockOp), required_schema, Box::new(builder));
 
