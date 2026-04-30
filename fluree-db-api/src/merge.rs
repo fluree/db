@@ -4,13 +4,14 @@
 //! merges (target HEAD is the common ancestor) and general merges with
 //! conflict resolution strategies.
 
+use crate::commit_data::{collect_from_commits, CollectedCommitData};
 use crate::error::{ApiError, Result};
 use crate::rebase::ConflictStrategy;
 use fluree_db_core::commit::codec::read_commit_envelope;
 use fluree_db_core::content_kind::ContentKind;
 use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{collect_dag_cids, load_commit_by_id, CommonAncestor};
-use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore, Flake};
+use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore};
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_nameservice::{NsRecord, NsRecordSnapshot};
 use fluree_db_novelty::compute_delta_keys;
@@ -472,41 +473,19 @@ impl crate::Fluree {
     }
 }
 
-/// Collected flakes and metadata from a range of commits.
-struct CollectedCommitData {
-    flakes: Vec<Flake>,
-    namespace_delta: std::collections::HashMap<u16, String>,
-    graph_delta: std::collections::HashMap<u16, String>,
-}
-
 /// Collect all flakes, namespace deltas, and graph deltas from commits
-/// between `head_id` and `stop_at_t` (exclusive).
+/// between `head_id` and `stop_at_t` (exclusive). Walks the DAG newest-first
+/// then folds via [`collect_from_commits`] in oldest-first order so that
+/// earlier commits win on namespace and graph delta key collisions.
 async fn collect_commit_data(
     store: &impl ContentStore,
     head_id: &ContentId,
     stop_at_t: i64,
 ) -> Result<CollectedCommitData> {
     let dag = collect_dag_cids(store, head_id, stop_at_t).await?;
-    let mut all_flakes = Vec::new();
-    let mut namespace_delta = std::collections::HashMap::new();
-    let mut graph_delta = std::collections::HashMap::new();
-
-    // dag is in newest-first order; we want oldest-first for correct ordering.
+    let mut commits = Vec::with_capacity(dag.len());
     for (_, cid) in dag.iter().rev() {
-        let commit = load_commit_by_id(store, cid).await?;
-        all_flakes.extend(commit.flakes);
-        // Accumulate deltas: earlier commits take precedence (oldest-first).
-        for (code, prefix) in commit.namespace_delta {
-            namespace_delta.entry(code).or_insert(prefix);
-        }
-        for (g_id, iri) in commit.graph_delta {
-            graph_delta.entry(g_id).or_insert(iri);
-        }
+        commits.push(load_commit_by_id(store, cid).await?);
     }
-
-    Ok(CollectedCommitData {
-        flakes: all_flakes,
-        namespace_delta,
-        graph_delta,
-    })
+    Ok(collect_from_commits(commits, std::convert::identity))
 }

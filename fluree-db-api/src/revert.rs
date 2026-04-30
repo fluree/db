@@ -18,6 +18,7 @@
 //!   rejected — only `Abort`, `TakeSource`, and `TakeBranch` make sense for
 //!   revert.
 
+use crate::commit_data::{collect_from_commits, CollectedCommitData};
 use crate::error::{ApiError, Result};
 use crate::ledger_view::{CommitRef, LedgerView};
 use crate::rebase::ConflictStrategy;
@@ -25,7 +26,7 @@ use fluree_db_core::commit::{TxnMetaEntry, TxnMetaValue};
 use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{
     collect_dag_cids, load_commit_by_id, load_commit_envelope_by_id, trace_commits_by_id,
-    BranchedContentStore, CommitId, ConflictKey, ContentStore, Flake,
+    BranchedContentStore, CommitId, ConflictKey, ContentStore,
 };
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecordSnapshot;
@@ -34,7 +35,6 @@ use fluree_vocab::namespaces::FLUREE_DB;
 use futures::TryStreamExt;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
-use std::collections::HashMap;
 use tracing::Instrument;
 
 // ---------------------------------------------------------------------------
@@ -331,24 +331,19 @@ impl crate::Fluree {
         conflict_keys: &[ConflictKey],
         strategy: &ConflictStrategy,
     ) -> Result<RevertWriteOutcome> {
-        // Walk reverted commits oldest-first when gathering inverted flakes
-        // so namespace_delta and graph_delta accumulate with oldest-first
-        // precedence (matches the merge path's `collect_commit_data`).
-        let mut inverted: Vec<Flake> = Vec::new();
-        let mut namespace_delta: HashMap<u16, String> = HashMap::new();
-        let mut graph_delta: HashMap<u16, String> = HashMap::new();
+        // Load reverted commits oldest-first then fold via the shared
+        // accumulator: invert each flake's `op` (assertion ⇄ retraction) and
+        // accumulate `namespace_delta`/`graph_delta` with earlier-wins
+        // semantics, matching the merge path's `collect_commit_data`.
+        let mut commits = Vec::with_capacity(plan.ordered_commits.len());
         for commit_id in plan.ordered_commits.iter().rev() {
-            let commit = load_commit_by_id(branch_store, commit_id).await?;
-            for flake in commit.flakes {
-                inverted.push(flake.invert_at(0));
-            }
-            for (code, prefix) in commit.namespace_delta {
-                namespace_delta.entry(code).or_insert(prefix);
-            }
-            for (g_id, iri) in commit.graph_delta {
-                graph_delta.entry(g_id).or_insert(iri);
-            }
+            commits.push(load_commit_by_id(branch_store, commit_id).await?);
         }
+        let CollectedCommitData {
+            flakes: inverted,
+            namespace_delta,
+            graph_delta,
+        } = collect_from_commits(commits, |f| f.invert_at(0));
 
         let target_state = self
             .load_queryable_state_with_store(branch_store.clone(), branch_record)

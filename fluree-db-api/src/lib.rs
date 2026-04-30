@@ -36,6 +36,7 @@
 pub mod admin;
 pub mod block_fetch;
 pub mod bm25_worker;
+mod commit_data;
 pub mod commit_transfer;
 pub mod config_resolver;
 #[cfg(feature = "credential")]
