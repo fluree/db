@@ -1110,9 +1110,9 @@ fn reader_thread(
     let mut abs_pos = data_start;
     let mut chunk_idx: usize = 0;
 
-    // Line scanning state (fast path, mirrors scripts/split_ttl.py):
-    // scan for '\n', and treat a line as a statement boundary when its trimmed
-    // content ends with '.' and it's not a comment line.
+    // Line scanning state (fast path): scan for '\n', and treat a line as a
+    // statement boundary when its trimmed content ends with '.' and it's not
+    // a comment line.
     let mut scan_pos: usize = 0;
     let mut line_start: usize = 0;
     // Track whether we're inside a triple-quoted string (""" or ''').
@@ -2094,8 +2094,8 @@ ex:bob ex:name "Bob" .
 
     #[test]
     fn test_streaming_splits_without_newlines() {
-        // Streaming splitter uses a line-based boundary check (like split_ttl.py):
-        // only split at lines ending with '.'.
+        // Streaming splitter uses a line-based boundary check: only split at
+        // lines ending with '.'.
         //
         // We still validate it can split on long lines with no blank lines,
         // but we require newlines to exist for boundary detection.

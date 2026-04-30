@@ -373,17 +373,6 @@ fluree.create_ledger("test").await?;
 
 ---
 
-## 5. Helper Scripts
-
-Located in the `scripts/` directory:
-
-| Script | Purpose |
-|--------|---------|
-| `fluree_to_turtle.py` | Convert Fluree data to Turtle format |
-| `split_ttl.py` | Split large Turtle files for chunked import |
-
----
-
 ## Summary of Data Format Support
 
 | Format | Input | Output | Query Language |

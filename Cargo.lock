@@ -1086,20 +1086,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "bench-filter-query"
-version = "4.0.2"
-dependencies = [
- "fluree-db-api",
- "fluree-db-core",
- "fluree-db-nameservice",
- "fluree-db-novelty",
- "fluree-db-query",
- "rand 0.8.5",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "bigdecimal"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
