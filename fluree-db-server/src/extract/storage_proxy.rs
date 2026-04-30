@@ -131,11 +131,11 @@ fn verify_token(
 ) -> Result<StorageProxyBearer, ServerError> {
     // 1. Verify JWS (embedded JWK mode)
     let verified = verify_jws(token)
-        .map_err(|e| ServerError::unauthorized(format!("Invalid token: {}", e)))?;
+        .map_err(|e| ServerError::unauthorized(format!("Invalid token: {e}")))?;
 
     // 2. Parse combined payload
     let payload: EventsTokenPayload = serde_json::from_str(&verified.payload)
-        .map_err(|e| ServerError::unauthorized(format!("Invalid claims: {}", e)))?;
+        .map_err(|e| ServerError::unauthorized(format!("Invalid claims: {e}")))?;
 
     // 3. Validate standard claims (don't require identity - that's optional for storage proxy)
     payload

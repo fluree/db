@@ -269,8 +269,7 @@ impl Bm25SearchProvider for FlureeIndexProvider<'_> {
             #[cfg(not(feature = "search-remote-client"))]
             DeploymentMode::Remote => {
                 Err(QueryError::InvalidQuery(format!(
-                    "Remote search mode not available for graph source '{}': 'search-remote-client' feature not enabled",
-                    graph_source_id
+                    "Remote search mode not available for graph source '{graph_source_id}': 'search-remote-client' feature not enabled"
                 )))
             }
         }
@@ -454,8 +453,7 @@ impl VectorIndexProvider for FlureeIndexProvider<'_> {
             #[cfg(not(feature = "search-remote-client"))]
             DeploymentMode::Remote => {
                 Err(QueryError::InvalidQuery(format!(
-                    "Remote search mode not available for graph source '{}': 'search-remote-client' feature not enabled",
-                    graph_source_id
+                    "Remote search mode not available for graph source '{graph_source_id}': 'search-remote-client' feature not enabled"
                 )))
             }
         }

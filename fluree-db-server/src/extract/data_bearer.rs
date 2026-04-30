@@ -105,9 +105,9 @@ async fn verify_data_token(token: &str, state: &AppState) -> Result<MaybeDataBea
     #[cfg(not(feature = "oidc"))]
     let (payload, issuer, is_oidc) = {
         let verified = fluree_db_credential::verify_jws(token)
-            .map_err(|e| ServerError::unauthorized(format!("Invalid token: {}", e)))?;
+            .map_err(|e| ServerError::unauthorized(format!("Invalid token: {e}")))?;
         let payload: EventsTokenPayload = serde_json::from_str(&verified.payload)
-            .map_err(|e| ServerError::unauthorized(format!("Invalid claims: {}", e)))?;
+            .map_err(|e| ServerError::unauthorized(format!("Invalid claims: {e}")))?;
         // Use verified.did (did:key derived from the embedded signing key), NOT
         // payload.iss, so that validate() confirms iss matches the actual signer.
         (payload, verified.did, false)

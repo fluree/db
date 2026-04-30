@@ -1936,7 +1936,7 @@ pub async fn revert_preview(
         } else if let Some(commits_csv) = params.commits {
             let parsed: std::result::Result<Vec<_>, _> = commits_csv
                 .split(',')
-                .map(|s| s.trim())
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(parse_commit_ref)
                 .collect();
