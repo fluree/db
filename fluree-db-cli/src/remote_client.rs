@@ -159,6 +159,19 @@ pub struct RefreshedTokens {
     pub refresh_token: Option<String>,
 }
 
+/// Wire shape for [`RemoteLedgerClient::revert`] and
+/// [`RemoteLedgerClient::revert_preview`]: exactly one of a single commit
+/// reference, a set of references (cherry-pick), or a git-style range.
+///
+/// Lives next to the methods that serialize it. Callers (CLI commands)
+/// construct it from positional args / `--from`/`--to` flags.
+#[derive(Clone, Debug)]
+pub enum RevertPayload {
+    Single(String),
+    Set(Vec<String>),
+    Range { from: String, to: String },
+}
+
 /// HTTP client for ledger data operations against a remote Fluree server.
 ///
 /// Supports query (JSON-LD/SPARQL), insert, upsert, transact, ledger-info, and
@@ -1256,7 +1269,7 @@ impl RemoteLedgerClient {
         &self,
         ledger: &str,
         branch: &str,
-        payload: &crate::commands::branch::RevertPayload,
+        payload: &RevertPayload,
         strategy: Option<&str>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
         let url = self.op_url_root("revert");
@@ -1265,10 +1278,10 @@ impl RemoteLedgerClient {
             "branch": branch,
         });
         match payload {
-            crate::commands::branch::RevertPayload::Single(c) => {
+            RevertPayload::Single(c) => {
                 body["commit"] = serde_json::Value::String(c.clone());
             }
-            crate::commands::branch::RevertPayload::Set(items) => {
+            RevertPayload::Set(items) => {
                 body["commits"] = serde_json::Value::Array(
                     items
                         .iter()
@@ -1277,7 +1290,7 @@ impl RemoteLedgerClient {
                         .collect(),
                 );
             }
-            crate::commands::branch::RevertPayload::Range { from, to } => {
+            RevertPayload::Range { from, to } => {
                 body["range"] = serde_json::json!({ "from": from, "to": to });
             }
         }
@@ -1304,7 +1317,7 @@ impl RemoteLedgerClient {
         &self,
         ledger: &str,
         branch: &str,
-        payload: &crate::commands::branch::RevertPayload,
+        payload: &RevertPayload,
         strategy: Option<&str>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
         let mut url = self.op_url("revert-preview", ledger);
@@ -1323,7 +1336,7 @@ impl RemoteLedgerClient {
             urlencoding::encode(branch).into_owned(),
         );
         match payload {
-            crate::commands::branch::RevertPayload::Single(c) => {
+            RevertPayload::Single(c) => {
                 push(
                     &mut url,
                     &mut sep,
@@ -1331,7 +1344,7 @@ impl RemoteLedgerClient {
                     urlencoding::encode(c).into_owned(),
                 );
             }
-            crate::commands::branch::RevertPayload::Set(items) => {
+            RevertPayload::Set(items) => {
                 let csv = items.join(",");
                 push(
                     &mut url,
@@ -1340,7 +1353,7 @@ impl RemoteLedgerClient {
                     urlencoding::encode(&csv).into_owned(),
                 );
             }
-            crate::commands::branch::RevertPayload::Range { from, to } => {
+            RevertPayload::Range { from, to } => {
                 push(
                     &mut url,
                     &mut sep,

@@ -1,6 +1,7 @@
 use crate::cli::BranchAction;
 use crate::context::{self, LedgerMode};
 use crate::error::{CliError, CliResult};
+use crate::remote_client::RevertPayload;
 use comfy_table::{ContentArrangement, Table};
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_core::ledger_id::split_ledger_id;
@@ -642,17 +643,6 @@ fn print_merge_result(result: &serde_json::Value) -> CliResult<()> {
 // =============================================================================
 // Revert
 // =============================================================================
-
-/// Wire payload sent for the cherry-pick / single / range form of revert.
-///
-/// Constructed by the CLI from positional commits or `--from`/`--to` flags
-/// and consumed by [`crate::remote_client::RemoteLedgerClient::revert`] when
-/// posting the JSON body.
-pub enum RevertPayload {
-    Single(String),
-    Set(Vec<String>),
-    Range { from: String, to: String },
-}
 
 #[allow(clippy::too_many_arguments)]
 async fn run_revert(
