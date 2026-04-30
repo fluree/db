@@ -197,6 +197,25 @@ pub struct IndexerConfig {
     /// `None` by default. The api layer wires its own resolver via
     /// [`IndexerConfig::with_fulltext_config_provider`].
     pub fulltext_config_provider: Option<Arc<dyn FulltextConfigProvider>>,
+
+    /// Whether garbage collection runs in a detached `tokio::spawn` task after
+    /// each successful index publish.
+    ///
+    /// In both modes, **waiters are resolved before GC runs**, so callers of
+    /// `trigger_index` return as soon as the index is durable. The flag only
+    /// controls who waits on the GC future itself:
+    ///
+    /// `true` (default): GC is fire-and-forget — the worker is free to pick up
+    /// the next ledger immediately, GC continues in a detached task. Right for
+    /// long-lived processes (server, peer) where there's no shutdown race.
+    ///
+    /// `false`: GC is awaited inline by the worker before it processes the
+    /// next ledger. Adds GC time to the worker's per-ledger budget but
+    /// guarantees no detached task outlives the worker invocation. Right for
+    /// AWS Lambda and other contexts where the runtime may freeze/thaw the
+    /// worker between invocations and detached tasks holding S3/HTTP
+    /// connections become problematic.
+    pub gc_detached: bool,
 }
 
 /// Default run-sort budget: 256 MB.
@@ -227,6 +246,7 @@ impl Default for IndexerConfig {
             incremental_max_commit_bytes: None,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            gc_detached: true,
         }
     }
 }
@@ -256,6 +276,7 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            gc_detached: true,
         }
     }
 
@@ -278,6 +299,7 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            gc_detached: true,
         }
     }
 
@@ -300,6 +322,7 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            gc_detached: true,
         }
     }
 
@@ -369,6 +392,16 @@ impl IndexerConfig {
     /// Builder method to set the maximum concurrency for incremental branch updates
     pub fn with_incremental_max_concurrency(mut self, max_concurrency: usize) -> Self {
         self.incremental_max_concurrency = max_concurrency.max(1);
+        self
+    }
+
+    /// Builder method to set whether GC runs in a detached `tokio::spawn` task.
+    ///
+    /// See [`gc_detached`](Self::gc_detached) for semantics. Set to `false` in
+    /// AWS Lambda or other freeze/thaw runtimes to keep all indexer work
+    /// bounded by the worker's lifetime.
+    pub fn with_gc_detached(mut self, detached: bool) -> Self {
+        self.gc_detached = detached;
         self
     }
 }

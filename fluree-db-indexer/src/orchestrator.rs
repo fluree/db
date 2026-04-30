@@ -203,6 +203,12 @@ struct LedgerIndexState {
     retry_count: u32,
     /// When to retry next (if in backoff)
     next_retry_at: Option<tokio::time::Instant>,
+    /// Monotonically increasing run generation. Bumped on every `cancel()` /
+    /// `cancel_all()`. The worker captures this at build start and rechecks
+    /// before publish / GC / retry. If the value has advanced, the in-flight
+    /// build was superseded (timeout, drop, explicit cancel) and its result
+    /// must be discarded, even if a subsequent trigger has reset `cancelled`.
+    run_generation: u64,
 }
 
 impl Default for LedgerIndexState {
@@ -216,6 +222,7 @@ impl Default for LedgerIndexState {
             cancelled: false,
             retry_count: 0,
             next_retry_at: None,
+            run_generation: 0,
         }
     }
 }
@@ -470,6 +477,10 @@ impl IndexerHandle {
             if let Some(state) = states.get_mut(ledger_id) {
                 let had_work = state.has_pending_work();
                 state.cancelled = true;
+                // Bump run_generation so any in-flight build is treated as
+                // superseded when it eventually returns (the worker rechecks
+                // generation before publish / retry).
+                state.run_generation = state.run_generation.wrapping_add(1);
                 // Resolve all waiters as cancelled (they haven't been satisfied)
                 state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
                 state.pending_min_t = None;
@@ -495,6 +506,7 @@ impl IndexerHandle {
         let mut states = self.states.lock().await;
         for state in states.values_mut() {
             state.cancelled = true;
+            state.run_generation = state.run_generation.wrapping_add(1);
             state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
             state.pending_min_t = None;
             if state.phase == IndexPhase::Pending {
@@ -720,8 +732,10 @@ impl BackgroundIndexerWorker {
             }
         };
 
-        // Mark as in-progress
-        {
+        // Mark as in-progress and capture the run generation. The generation
+        // is rechecked before publish / retry; if it's been bumped by `cancel`
+        // while the build was in flight, the result is discarded.
+        let active_gen: u64 = {
             let lock_started = Instant::now();
             let mut states = self.states.lock().await;
             debug!(
@@ -742,8 +756,10 @@ impl BackgroundIndexerWorker {
                     ledger_id = %ledger_id,
                     pending_min_t = ?state.pending_min_t,
                     waiter_count = state.waiters.len(),
+                    run_generation = state.run_generation,
                     "Marked queued indexing work in progress"
                 );
+                state.run_generation
             } else {
                 debug!(
                     ledger_id = %ledger_id,
@@ -751,7 +767,7 @@ impl BackgroundIndexerWorker {
                 );
                 return;
             }
-        }
+        };
 
         info!(
             ledger_id = %ledger_id,
@@ -784,7 +800,8 @@ impl BackgroundIndexerWorker {
                         error = %e,
                         "Nameservice lookup failed, will retry"
                     );
-                self.schedule_retry(ledger_id, &e.to_string()).await;
+                self.schedule_retry(ledger_id, active_gen, &e.to_string())
+                    .await;
                 return;
             }
         };
@@ -1010,6 +1027,25 @@ impl BackgroundIndexerWorker {
                 );
                 let mut states = self.states.lock().await;
                 if let Some(state) = states.get_mut(ledger_id) {
+                    // Generation gate: if `cancel` fired while we were
+                    // building the content store, don't queue a retry —
+                    // just clear the lingering `InProgress` phase.
+                    if state.run_generation != active_gen {
+                        if state.phase == IndexPhase::InProgress {
+                            state.phase = if state.pending_min_t.is_some() {
+                                IndexPhase::Pending
+                            } else {
+                                IndexPhase::Idle
+                            };
+                        }
+                        debug!(
+                            ledger_id = %ledger_id,
+                            active_gen,
+                            error = %e,
+                            "Discarding branched-content-store error from superseded run"
+                        );
+                        return;
+                    }
                     state.last_error = Some(e.to_string());
                     state.phase = IndexPhase::Pending;
                     state.next_retry_at =
@@ -1022,6 +1058,26 @@ impl BackgroundIndexerWorker {
         let result =
             crate::build_index_for_record(content_store, &record, self.config.clone()).await;
 
+        // Check if our run was superseded while the build ran (timeout,
+        // drop, or explicit cancel). If so, abandon the result regardless
+        // of success — don't publish (the build's index_t may be stale),
+        // don't schedule_retry (the user cancelled), and don't touch
+        // waiters (cancel already resolved them as Cancelled).
+        //
+        // This is the single source of truth for "is this run still
+        // valid" after the build. It catches the race where `cancel()`
+        // bumped run_generation while the build was in flight, even if
+        // a subsequent `trigger()` reset `state.cancelled = false`.
+        if self.run_was_superseded(ledger_id, active_gen).await {
+            info!(
+                ledger_id = %ledger_id,
+                active_gen,
+                result_ok = result.is_ok(),
+                "Discarding superseded indexing run; not publishing or retrying"
+            );
+            return;
+        }
+
         match result {
             Ok(index_result) => {
                 // Try to publish
@@ -1033,7 +1089,11 @@ impl BackgroundIndexerWorker {
                             error = %e,
                             "Failed to publish index, will retry"
                         );
-                    self.schedule_retry(ledger_id, &e.to_string()).await;
+                    // `schedule_retry` itself rechecks `active_gen` before
+                    // mutating state, so a cancel that happened during the
+                    // publish (which can wedge on S3) is still discarded.
+                    self.schedule_retry(ledger_id, active_gen, &e.to_string())
+                        .await;
                 } else {
                     info!(
                     ledger_id = %ledger_id,
@@ -1041,14 +1101,58 @@ impl BackgroundIndexerWorker {
                             "Successfully indexed ledger"
                         );
 
-                    // Spawn garbage collection (fire-and-forget, non-fatal).
+                    // Re-check generation: a cancel during `publish_index_result`
+                    // (which can wedge on S3 for many seconds) means our run was
+                    // superseded. The publish itself is durable — fresh triggers
+                    // will see the new index_t — but THIS run must not resolve
+                    // its old waiters (already drained by `cancel`), reset retry
+                    // state, or trigger GC.
+                    if self.run_was_superseded(ledger_id, active_gen).await {
+                        info!(
+                            ledger_id = %ledger_id,
+                            active_gen,
+                            index_t = index_result.index_t,
+                            "Publish succeeded but run was superseded; skipping waiter resolution and GC"
+                        );
+                        return;
+                    }
+
+                    // Resolve waiters FIRST so callers (including
+                    // `trigger_index`) return as soon as the index is
+                    // durable — regardless of whether GC runs inline or
+                    // detached. Inline GC then only delays the worker
+                    // from picking up the next ledger, not the API
+                    // response.
+                    {
+                        let mut states = self.states.lock().await;
+                        if let Some(state) = states.get_mut(ledger_id) {
+                            let outcome = IndexOutcome::Completed {
+                                index_t: index_result.index_t,
+                                root_id: Some(index_result.root_id.clone()),
+                            };
+                            state.resolve_waiters_below(index_result.index_t, outcome);
+                            state.last_index_t = index_result.index_t;
+                            state.recalculate_pending_min_t();
+                            if state.pending_min_t.is_some() {
+                                state.phase = IndexPhase::Pending;
+                            }
+                            state.retry_count = 0;
+                            state.next_retry_at = None;
+                            state.last_error = None;
+                        }
+                    }
+
+                    // Garbage collection (non-fatal). Detached by default
+                    // for long-lived processes; awaited inline when
+                    // configured for bounded-lifetime runtimes (Lambda)
+                    // so no GC future outlives the worker invocation.
                     let gc_store = self.backend.content_store(&index_result.ledger_id);
                     let gc_root_id = index_result.root_id.clone();
                     let gc_config = crate::gc::CleanGarbageConfig {
                         max_old_indexes: Some(self.config.gc_max_old_indexes),
                         min_time_garbage_mins: Some(self.config.gc_min_time_mins),
                     };
-                    tokio::spawn(async move {
+                    let gc_fut = async move {
                         if let Err(e) =
                             crate::gc::clean_garbage(gc_store.as_ref(), &gc_root_id, gc_config)
                                 .await
@@ -1061,24 +1165,11 @@ impl BackgroundIndexerWorker {
                         } else {
                             debug!(root_id = %gc_root_id, "Background GC completed");
                         }
-                    });
-
-                    // Resolve waiters
-                    let mut states = self.states.lock().await;
-                    if let Some(state) = states.get_mut(ledger_id) {
-                        let outcome = IndexOutcome::Completed {
-                            index_t: index_result.index_t,
-                            root_id: Some(index_result.root_id.clone()),
-                        };
-                        state.resolve_waiters_below(index_result.index_t, outcome);
-                        state.last_index_t = index_result.index_t;
-                        state.recalculate_pending_min_t();
-                        if state.pending_min_t.is_some() {
-                            state.phase = IndexPhase::Pending;
-                        }
-                        state.retry_count = 0;
-                        state.next_retry_at = None;
-                        state.last_error = None;
+                    };
+                    if self.config.gc_detached {
+                        tokio::spawn(gc_fut);
+                    } else {
+                        gc_fut.await;
                     }
                 }
             }
@@ -1088,16 +1179,66 @@ impl BackgroundIndexerWorker {
                         error = %e,
                         "Indexing failed, will retry"
                     );
-                self.schedule_retry(ledger_id, &e.to_string()).await;
+                self.schedule_retry(ledger_id, active_gen, &e.to_string())
+                    .await;
             }
         }
     }
 
-    /// Schedule a retry with exponential backoff
-    async fn schedule_retry(&self, ledger_id: &str, error: &str) {
+    /// Return `true` if the build associated with `active_gen` was superseded
+    /// (the ledger's `run_generation` advanced via `cancel()` / `cancel_all()`
+    /// while the build was in flight). On `true`, also clears the lingering
+    /// `InProgress` phase so the worker can move on.
+    async fn run_was_superseded(&self, ledger_id: &str, active_gen: u64) -> bool {
+        let mut states = self.states.lock().await;
+        match states.get_mut(ledger_id) {
+            Some(state) if state.run_generation == active_gen => false,
+            Some(state) => {
+                if state.phase == IndexPhase::InProgress {
+                    state.phase = if state.pending_min_t.is_some() {
+                        IndexPhase::Pending
+                    } else {
+                        IndexPhase::Idle
+                    };
+                }
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// Schedule a retry with exponential backoff.
+    ///
+    /// `active_gen` is the run generation captured when this build attempt
+    /// was marked `InProgress`. If the ledger's `run_generation` has advanced
+    /// since (i.e. `cancel()` / `cancel_all()` fired while the build was in
+    /// flight), the retry is silently dropped — `cancel()` is the user's
+    /// intent and we must not bring the work back to life via retry.
+    async fn schedule_retry(&self, ledger_id: &str, active_gen: u64, error: &str) {
         let mut states = self.states.lock().await;
         if let Some(state) = states.get_mut(ledger_id) {
-            // Check if cancelled - don't retry
+            // Generation gate: any advance of `run_generation` since the
+            // build started means the run was superseded. Don't retry.
+            if state.run_generation != active_gen {
+                if state.phase == IndexPhase::InProgress {
+                    state.phase = if state.pending_min_t.is_some() {
+                        IndexPhase::Pending
+                    } else {
+                        IndexPhase::Idle
+                    };
+                }
+                debug!(
+                    ledger_id = %ledger_id,
+                    active_gen,
+                    error = %error,
+                    "Discarding retry from superseded run"
+                );
+                return;
+            }
+            // Defensive: cancel always bumps the generation, so the
+            // gen-gate above should already have caught this. Kept as a
+            // belt-and-braces guard for code paths that might set
+            // `cancelled` without bumping the generation.
             if state.cancelled {
                 state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
                 state.pending_min_t = None;
@@ -1920,8 +2061,20 @@ mod tests {
         // Ensure ledger state exists.
         let _c1 = handle.trigger("test:main", 1).await;
 
+        // Capture the current generation so the schedule_retry passes the
+        // gen-gate; `trigger` does not bump generation (only `cancel` does).
+        let active_gen = handle
+            .states
+            .lock()
+            .await
+            .get("test:main")
+            .expect("state exists")
+            .run_generation;
+
         // Put it into backoff.
-        worker.schedule_retry("test:main", "boom").await;
+        worker
+            .schedule_retry("test:main", active_gen, "boom")
+            .await;
         {
             let states = handle.states.lock().await;
             let state = states.get("test:main").expect("state exists");

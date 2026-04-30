@@ -913,6 +913,12 @@ impl crate::Fluree {
                                 "Index trigger timed out"
                             );
                         }
+                        // Cancel pending work and prevent retries on the in-progress
+                        // build. The build itself is not aborted here, but it will
+                        // fail-fast at its next S3 op (S3Storage send_timeout) and
+                        // schedule_retry will observe `cancelled=true` and clear the
+                        // ledger to Idle instead of retrying.
+                        handle.cancel(&ledger_id).await;
                         return Err(ApiError::IndexTimeout(timeout_ms));
                     }
                     _ = info_interval.tick() => {

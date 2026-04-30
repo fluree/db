@@ -40,7 +40,54 @@ use fluree_db_core::{
     StorageExtResult, StorageList, StorageRead, StorageWrite,
 };
 use std::fmt::Debug;
+use std::future::Future;
 use std::time::{Duration, Instant};
+
+/// Wrap an S3 operation future with a Tokio-level timeout backstop.
+///
+/// The AWS SDK's `TimeoutConfig::operation_timeout` is the primary defense,
+/// but in some observed wedge cases (notably S3 Express session reuse across
+/// Lambda freeze/thaw) the SDK future has been seen to never return. This
+/// helper guarantees the await returns within `timeout` regardless.
+///
+/// The inner future already returns `Result<T, E>` (with errors mapped at the
+/// callsite). On timeout we synthesize an `E` via `timeout_err` and log a
+/// structured `error!` event so wedges show up in observability.
+async fn with_timeout<T, E, F>(
+    op: &'static str,
+    bucket: &str,
+    key: &str,
+    timeout: Duration,
+    is_express: bool,
+    fut: F,
+    timeout_err: impl FnOnce(String) -> E,
+) -> std::result::Result<T, E>
+where
+    F: Future<Output = std::result::Result<T, E>>,
+{
+    let started = Instant::now();
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(res) => res,
+        Err(_) => {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            tracing::error!(
+                bucket,
+                key,
+                op,
+                elapsed_ms,
+                timeout_ms = timeout.as_millis() as u64,
+                is_express,
+                "s3 op timed out (Tokio backstop)"
+            );
+            Err(timeout_err(format!(
+                "S3 {} timed out after {} ms for key '{}'",
+                op,
+                timeout.as_millis(),
+                key
+            )))
+        }
+    }
+}
 
 /// S3 storage configuration
 #[derive(Debug, Clone, Default)]
@@ -280,13 +327,24 @@ impl StorageRead for S3Storage {
         }
 
         let body_collect_started = Instant::now();
-        let bytes = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| CoreError::io(format!("Failed to read S3 body: {e}")))?
-            .into_bytes()
-            .to_vec();
+        let bytes = with_timeout(
+            "get_object_body",
+            self.bucket.as_str(),
+            key.as_str(),
+            send_timeout,
+            Self::is_express_bucket(&self.bucket),
+            async {
+                response
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| CoreError::io(format!("Failed to read S3 body: {e}")))
+            },
+            CoreError::io,
+        )
+        .await?
+        .into_bytes()
+        .to_vec();
         let body_collect_elapsed_ms = body_collect_started.elapsed().as_millis() as u64;
         let total_elapsed_ms = total_started.elapsed().as_millis() as u64;
 
@@ -316,24 +374,46 @@ impl StorageRead for S3Storage {
         }
         let key = self.to_key(address)?;
         let range_header = format!("bytes={}-{}", range.start, range.end - 1);
+        let is_express = Self::is_express_bucket(&self.bucket);
 
-        let response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .range(range_header)
-            .send()
-            .await
-            .map_err(|e| map_s3_error_core(e, &key))?;
+        let response = with_timeout(
+            "get_object_range",
+            &self.bucket,
+            &key,
+            self.send_timeout,
+            is_express,
+            async {
+                self.client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .range(range_header)
+                    .send()
+                    .await
+                    .map_err(|e| map_s3_error_core(e, &key))
+            },
+            CoreError::io,
+        )
+        .await?;
 
-        let bytes = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| CoreError::io(format!("Failed to read S3 body: {e}")))?
-            .into_bytes()
-            .to_vec();
+        let bytes = with_timeout(
+            "get_object_range_body",
+            &self.bucket,
+            &key,
+            self.send_timeout,
+            is_express,
+            async {
+                response
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| CoreError::io(format!("Failed to read S3 body: {e}")))
+            },
+            CoreError::io,
+        )
+        .await?
+        .into_bytes()
+        .to_vec();
 
         Ok(bytes)
     }
@@ -341,32 +421,43 @@ impl StorageRead for S3Storage {
     async fn exists(&self, address: &str) -> std::result::Result<bool, CoreError> {
         let key = self.to_key(address)?;
 
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                // Pattern match on SdkError to avoid panic from into_service_error()
-                use aws_sdk_s3::error::SdkError;
-                match &e {
-                    SdkError::ServiceError(service_err) => {
-                        // Check HTTP status code for 404
-                        if service_err.raw().status().as_u16() == 404 {
-                            Ok(false)
-                        } else {
-                            Err(map_s3_error_core(e, &key))
+        with_timeout(
+            "head_object",
+            &self.bucket,
+            &key,
+            self.send_timeout,
+            Self::is_express_bucket(&self.bucket),
+            async {
+                match self
+                    .client
+                    .head_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(e) => {
+                        // Pattern match on SdkError to avoid panic from into_service_error()
+                        use aws_sdk_s3::error::SdkError;
+                        match &e {
+                            SdkError::ServiceError(service_err) => {
+                                // Check HTTP status code for 404
+                                if service_err.raw().status().as_u16() == 404 {
+                                    Ok(false)
+                                } else {
+                                    Err(map_s3_error_core(e, &key))
+                                }
+                            }
+                            // For non-service errors (timeout, dispatch, etc), propagate as storage error
+                            _ => Err(map_s3_error_core(e, &key)),
                         }
                     }
-                    // For non-service errors (timeout, dispatch, etc), propagate as storage error
-                    _ => Err(map_s3_error_core(e, &key)),
                 }
-            }
-        }
+            },
+            CoreError::io,
+        )
+        .await
     }
 
     async fn list_prefix(&self, prefix: &str) -> std::result::Result<Vec<String>, CoreError> {
@@ -382,16 +473,26 @@ impl StorageWrite for S3Storage {
     async fn write_bytes(&self, address: &str, bytes: &[u8]) -> std::result::Result<(), CoreError> {
         let key = self.to_key(address)?;
 
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(ByteStream::from(bytes.to_vec()))
-            .send()
-            .await
-            .map_err(|e| map_s3_error_core(e, &key))?;
-
-        Ok(())
+        with_timeout(
+            "put_object",
+            &self.bucket,
+            &key,
+            self.send_timeout,
+            Self::is_express_bucket(&self.bucket),
+            async {
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .body(ByteStream::from(bytes.to_vec()))
+                    .send()
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| map_s3_error_core(e, &key))
+            },
+            CoreError::io,
+        )
+        .await
     }
 
     async fn delete(&self, address: &str) -> std::result::Result<(), CoreError> {
@@ -451,15 +552,25 @@ impl StorageDelete for S3Storage {
         let key = address_to_key(address, self.prefix.as_deref())
             .map_err(|e| StorageExtError::io(format!("Invalid address: {e}")))?;
 
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|e| map_s3_error_ext(e, &key))?;
-
-        Ok(())
+        with_timeout(
+            "delete_object",
+            &self.bucket,
+            &key,
+            self.send_timeout,
+            Self::is_express_bucket(&self.bucket),
+            async {
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| map_s3_error_ext(e, &key))
+            },
+            StorageExtError::io,
+        )
+        .await
     }
 }
 
@@ -486,10 +597,16 @@ impl StorageList for S3Storage {
                 request = request.continuation_token(token);
             }
 
-            let response = request
-                .send()
-                .await
-                .map_err(|e| map_s3_error_ext(e, &full_prefix))?;
+            let response = with_timeout(
+                "list_objects_v2",
+                &self.bucket,
+                &full_prefix,
+                self.send_timeout,
+                Self::is_express_bucket(&self.bucket),
+                async { request.send().await.map_err(|e| map_s3_error_ext(e, &full_prefix)) },
+                StorageExtError::io,
+            )
+            .await?;
 
             for object in response.contents() {
                 if let Some(key) = object.key() {
@@ -529,10 +646,16 @@ impl StorageList for S3Storage {
             request = request.continuation_token(token);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| map_s3_error_ext(e, &full_prefix))?;
+        let response = with_timeout(
+            "list_objects_v2_paginated",
+            &self.bucket,
+            &full_prefix,
+            self.send_timeout,
+            Self::is_express_bucket(&self.bucket),
+            async { request.send().await.map_err(|e| map_s3_error_ext(e, &full_prefix)) },
+            StorageExtError::io,
+        )
+        .await?;
 
         let addresses: Vec<String> = response
             .contents()
@@ -556,21 +679,32 @@ const MAX_S3_CAS_RETRIES: u32 = 5;
 impl S3Storage {
     /// S3 put with `If-None-Match: *` (create-if-absent).
     async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> StorageExtResult<bool> {
-        let result = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(bytes.to_vec()))
-            .if_none_match("*")
-            .send()
-            .await;
+        with_timeout(
+            "put_object_if_absent",
+            &self.bucket,
+            key,
+            self.send_timeout,
+            Self::is_express_bucket(&self.bucket),
+            async {
+                let result = self
+                    .client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .body(ByteStream::from(bytes.to_vec()))
+                    .if_none_match("*")
+                    .send()
+                    .await;
 
-        match result {
-            Ok(_) => Ok(true),
-            Err(e) if is_precondition_failed_sdk(&e) => Ok(false),
-            Err(e) => Err(map_s3_error_ext(e, key)),
-        }
+                match result {
+                    Ok(_) => Ok(true),
+                    Err(e) if is_precondition_failed_sdk(&e) => Ok(false),
+                    Err(e) => Err(map_s3_error_ext(e, key)),
+                }
+            },
+            StorageExtError::io,
+        )
+        .await
     }
 
     /// S3 put with `If-Match: <etag>` (conditional update).
@@ -581,48 +715,82 @@ impl S3Storage {
             format!("\"{etag}\"")
         };
 
-        let result = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(bytes.to_vec()))
-            .if_match(&etag_quoted)
-            .send()
-            .await;
+        with_timeout(
+            "put_object_if_match",
+            &self.bucket,
+            key,
+            self.send_timeout,
+            Self::is_express_bucket(&self.bucket),
+            async {
+                let result = self
+                    .client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .body(ByteStream::from(bytes.to_vec()))
+                    .if_match(&etag_quoted)
+                    .send()
+                    .await;
 
-        match result {
-            Ok(output) => {
-                let new_etag = output.e_tag().map(normalize_etag).unwrap_or_default();
-                Ok(new_etag)
-            }
-            Err(e) if is_precondition_failed_sdk(&e) => {
-                Err(StorageExtError::PreconditionFailed("ETag mismatch".into()))
-            }
-            Err(e) => Err(map_s3_error_ext(e, key)),
-        }
+                match result {
+                    Ok(output) => {
+                        let new_etag = output.e_tag().map(normalize_etag).unwrap_or_default();
+                        Ok(new_etag)
+                    }
+                    Err(e) if is_precondition_failed_sdk(&e) => {
+                        Err(StorageExtError::PreconditionFailed("ETag mismatch".into()))
+                    }
+                    Err(e) => Err(map_s3_error_ext(e, key)),
+                }
+            },
+            StorageExtError::io,
+        )
+        .await
     }
 
     /// S3 get with ETag extraction.
     async fn get_with_etag(&self, key: &str) -> StorageExtResult<(Vec<u8>, String)> {
-        let response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| map_s3_error_ext(e, key))?;
+        let is_express = Self::is_express_bucket(&self.bucket);
+
+        let response = with_timeout(
+            "get_object_with_etag",
+            &self.bucket,
+            key,
+            self.send_timeout,
+            is_express,
+            async {
+                self.client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .map_err(|e| map_s3_error_ext(e, key))
+            },
+            StorageExtError::io,
+        )
+        .await?;
 
         let etag = response.e_tag().map(normalize_etag).unwrap_or_default();
 
-        let bytes = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| StorageExtError::io(format!("Failed to read S3 body: {e}")))?
-            .into_bytes()
-            .to_vec();
+        let bytes = with_timeout(
+            "get_object_with_etag_body",
+            &self.bucket,
+            key,
+            self.send_timeout,
+            is_express,
+            async {
+                response
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| StorageExtError::io(format!("Failed to read S3 body: {e}")))
+            },
+            StorageExtError::io,
+        )
+        .await?
+        .into_bytes()
+        .to_vec();
 
         Ok((bytes, etag))
     }

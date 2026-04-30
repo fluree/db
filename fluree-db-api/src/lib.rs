@@ -1691,6 +1691,28 @@ impl FlureeBuilder {
         self
     }
 
+    /// Set whether the background indexer runs garbage collection inline
+    /// (awaited) or in a detached `tokio::spawn` task.
+    ///
+    /// Default: detached (`true`). Set to `false` for AWS Lambda or other
+    /// freeze/thaw runtimes so no GC future outlives the indexing invocation.
+    /// See [`fluree_db_indexer::IndexerConfig::gc_detached`] for the full
+    /// rationale.
+    ///
+    /// **No-op when background indexing is disabled** (e.g. after
+    /// [`without_indexing`]): this method only mutates an existing indexing
+    /// config and will not silently re-enable indexing. Call
+    /// [`with_indexing`] first if that is what you want.
+    ///
+    /// [`without_indexing`]: FlureeBuilder::without_indexing
+    /// [`with_indexing`]: FlureeBuilder::with_indexing
+    pub fn with_indexer_gc_detached(mut self, detached: bool) -> Self {
+        if let Some(ref mut indexing_config) = self.indexing_config {
+            indexing_config.indexer_config.gc_detached = detached;
+        }
+        self
+    }
+
     /// Set novelty backpressure thresholds without enabling background indexing.
     ///
     /// Use this for short-lived processes (CLI, one-shot scripts) that need
