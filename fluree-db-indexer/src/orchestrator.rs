@@ -1117,35 +1117,20 @@ impl BackgroundIndexerWorker {
                         return;
                     }
 
-                    // Resolve waiters FIRST so callers (including
-                    // `trigger_index`) return as soon as the index is
-                    // durable — regardless of whether GC runs inline or
-                    // detached. Inline GC then only delays the worker
-                    // from picking up the next ledger, not the API
-                    // response.
-                    {
-                        let mut states = self.states.lock().await;
-                        if let Some(state) = states.get_mut(ledger_id) {
-                            let outcome = IndexOutcome::Completed {
-                                index_t: index_result.index_t,
-                                root_id: Some(index_result.root_id.clone()),
-                            };
-                            state.resolve_waiters_below(index_result.index_t, outcome);
-                            state.last_index_t = index_result.index_t;
-                            state.recalculate_pending_min_t();
-                            if state.pending_min_t.is_some() {
-                                state.phase = IndexPhase::Pending;
-                            }
-                            state.retry_count = 0;
-                            state.next_retry_at = None;
-                            state.last_error = None;
-                        }
-                    }
-
-                    // Garbage collection (non-fatal). Detached by default
-                    // for long-lived processes; awaited inline when
-                    // configured for bounded-lifetime runtimes (Lambda)
-                    // so no GC future outlives the worker invocation.
+                    // Two distinct ordering disciplines, switching on
+                    // `gc_detached`:
+                    //
+                    // - `gc_detached=true` (server / long-lived): resolve
+                    //   waiters FIRST so `trigger_index` returns as soon as
+                    //   the index is durable, then spawn GC into a detached
+                    //   task. This is the latency-friendly default.
+                    //
+                    // - `gc_detached=false` (Lambda / bounded-lifetime):
+                    //   AWAIT GC FIRST, then resolve waiters. The whole
+                    //   point of this mode is that no AWS-touching future
+                    //   outlives `trigger_index`'s return — so GC must
+                    //   complete before the caller is told the run is
+                    //   done. Adds GC time to the call's tail latency.
                     let gc_store = self.backend.content_store(&index_result.ledger_id);
                     let gc_root_id = index_result.root_id.clone();
                     let gc_config = crate::gc::CleanGarbageConfig {
@@ -1166,10 +1151,48 @@ impl BackgroundIndexerWorker {
                             debug!(root_id = %gc_root_id, "Background GC completed");
                         }
                     };
+
+                    let resolve_waiters = || async {
+                        let mut states = self.states.lock().await;
+                        if let Some(state) = states.get_mut(ledger_id) {
+                            let outcome = IndexOutcome::Completed {
+                                index_t: index_result.index_t,
+                                root_id: Some(index_result.root_id.clone()),
+                            };
+                            state.resolve_waiters_below(index_result.index_t, outcome);
+                            state.last_index_t = index_result.index_t;
+                            state.recalculate_pending_min_t();
+                            if state.pending_min_t.is_some() {
+                                state.phase = IndexPhase::Pending;
+                            }
+                            state.retry_count = 0;
+                            state.next_retry_at = None;
+                            state.last_error = None;
+                        }
+                    };
+
                     if self.config.gc_detached {
+                        resolve_waiters().await;
                         tokio::spawn(gc_fut);
                     } else {
                         gc_fut.await;
+                        // Inline GC can take seconds (S3 deletes), and a
+                        // caller can `cancel()` while we're inside it —
+                        // e.g. `trigger_index` timing out, `drop_ledger`,
+                        // explicit cancel. Re-check generation so we
+                        // don't resolve waiters that `cancel` already
+                        // drained as `Cancelled`, and don't reset
+                        // retry/error state on a superseded run.
+                        if self.run_was_superseded(ledger_id, active_gen).await {
+                            info!(
+                                ledger_id = %ledger_id,
+                                active_gen,
+                                index_t = index_result.index_t,
+                                "Run superseded during inline GC; skipping waiter resolution"
+                            );
+                            return;
+                        }
+                        resolve_waiters().await;
                     }
                 }
             }
@@ -2072,9 +2095,7 @@ mod tests {
             .run_generation;
 
         // Put it into backoff.
-        worker
-            .schedule_retry("test:main", active_gen, "boom")
-            .await;
+        worker.schedule_retry("test:main", active_gen, "boom").await;
         {
             let states = handle.states.lock().await;
             let state = states.get("test:main").expect("state exists");

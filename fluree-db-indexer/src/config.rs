@@ -201,20 +201,22 @@ pub struct IndexerConfig {
     /// Whether garbage collection runs in a detached `tokio::spawn` task after
     /// each successful index publish.
     ///
-    /// In both modes, **waiters are resolved before GC runs**, so callers of
-    /// `trigger_index` return as soon as the index is durable. The flag only
-    /// controls who waits on the GC future itself:
+    /// **The two modes use different ordering** — read carefully, this is
+    /// load-bearing for the Lambda freeze/thaw guarantee:
     ///
-    /// `true` (default): GC is fire-and-forget — the worker is free to pick up
-    /// the next ledger immediately, GC continues in a detached task. Right for
-    /// long-lived processes (server, peer) where there's no shutdown race.
+    /// `true` (default): waiters are resolved FIRST so `trigger_index`
+    /// returns as soon as the index is durable; GC then runs in a
+    /// detached `tokio::spawn` task. Latency-friendly for long-lived
+    /// processes (server, peer) where there's no shutdown race and a
+    /// detached future is harmless.
     ///
-    /// `false`: GC is awaited inline by the worker before it processes the
-    /// next ledger. Adds GC time to the worker's per-ledger budget but
-    /// guarantees no detached task outlives the worker invocation. Right for
-    /// AWS Lambda and other contexts where the runtime may freeze/thaw the
-    /// worker between invocations and detached tasks holding S3/HTTP
-    /// connections become problematic.
+    /// `false`: GC is AWAITED FIRST, before waiters are resolved.
+    /// `trigger_index` does not return until both publish AND GC have
+    /// completed. This adds GC time to the call's tail latency, but it
+    /// is the only way to guarantee no AWS-touching future outlives the
+    /// invocation. Use this in AWS Lambda and other freeze/thaw
+    /// runtimes where a detached GC task would carry stale S3/HTTP
+    /// connection state across invocations and can wedge the next run.
     pub gc_detached: bool,
 }
 

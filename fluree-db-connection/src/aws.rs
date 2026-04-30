@@ -206,3 +206,26 @@ pub async fn get_or_init_sdk_config() -> Result<&'static aws_config::SdkConfig> 
         .get()
         .ok_or_else(|| ConnectionError::storage("Failed to initialize AWS SDK config"))
 }
+
+/// Load a freshly-resolved AWS SDK config WITHOUT touching the global cache.
+///
+/// Each call invokes `aws_config::load_defaults`, which builds a new
+/// `SdkConfig` containing a new `HttpClient` (and therefore a new HTTP
+/// connector pool). The returned `SdkConfig` is owned by the caller; when
+/// it (and every AWS client built from it) is dropped, the underlying
+/// connector pool is torn down — every TCP/TLS connection it held is
+/// closed.
+///
+/// Use this in environments where AWS connection state must NOT survive
+/// across logical "runs" — most notably AWS Lambda freeze/thaw, where a
+/// long-lived `SdkConfig` cached in `SDK_CONFIG` would carry stale
+/// connections (especially S3 Express session-bound TLS) across
+/// invocations and can wedge subsequent requests.
+///
+/// Pair with [`crate::connect_from_config_with_sdk_config`] (and
+/// `FlureeBuilder::with_aws_sdk_config` in the api layer) to ensure every
+/// AWS client built by Fluree honours the fresh config rather than
+/// silently falling back to [`get_or_init_sdk_config`].
+pub async fn load_fresh_sdk_config() -> aws_config::SdkConfig {
+    aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await
+}

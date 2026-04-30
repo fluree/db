@@ -170,7 +170,14 @@ pub async fn connect_async(config_json: &serde_json::Value) -> Result<Connection
         ConnectionConfig::from_json(config_json)?
     };
 
-    create_async_connection(config).await
+    #[cfg(feature = "aws")]
+    {
+        create_async_connection(config, None).await
+    }
+    #[cfg(not(feature = "aws"))]
+    {
+        create_async_connection(config).await
+    }
 }
 
 /// Create an async connection from a pre-parsed `ConnectionConfig`.
@@ -178,7 +185,39 @@ pub async fn connect_async(config_json: &serde_json::Value) -> Result<Connection
 /// This avoids the JSON-LD parse round-trip when the config has already been
 /// parsed (e.g., by `FlureeBuilder::from_json_ld`).
 pub async fn connect_from_config(config: ConnectionConfig) -> Result<ConnectionHandle> {
-    create_async_connection(config).await
+    #[cfg(feature = "aws")]
+    {
+        create_async_connection(config, None).await
+    }
+    #[cfg(not(feature = "aws"))]
+    {
+        create_async_connection(config).await
+    }
+}
+
+/// Create an async connection from a pre-parsed `ConnectionConfig`, using the
+/// supplied `SdkConfig` for every AWS client created by this connection
+/// (index `S3Storage`, commit `S3Storage`, DynamoDB nameservice, and
+/// storage-publisher S3 — i.e. everything inside `create_aws_connection`).
+///
+/// This is the entry point for callers that need a fresh, isolated AWS
+/// connection pool (e.g. AWS Lambda invocations that must not share TCP/TLS
+/// state across freeze/thaw). Pair with
+/// [`aws::load_fresh_sdk_config`](crate::aws::load_fresh_sdk_config).
+///
+/// Address-identifier S3 storages built later by the api layer
+/// (`build_s3_storage_from_config`) are NOT covered here — the api layer
+/// must thread the same `SdkConfig` through its own override mechanism
+/// (`FlureeBuilder::with_aws_sdk_config`) for full isolation.
+///
+/// For non-AWS configs (file/memory) this behaves identically to
+/// [`connect_from_config`]; the override is silently ignored.
+#[cfg(feature = "aws")]
+pub async fn connect_from_config_with_sdk_config(
+    config: ConnectionConfig,
+    sdk_config: &aws_config::SdkConfig,
+) -> Result<ConnectionHandle> {
+    create_async_connection(config, Some(sdk_config)).await
 }
 
 /// Sync connection creation for local backends (file, memory)
@@ -216,9 +255,14 @@ fn create_sync_connection(config: ConnectionConfig) -> Result<ConnectionHandle> 
 
 /// Async connection creation that supports all backends
 #[cfg(feature = "aws")]
-async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionHandle> {
+async fn create_async_connection(
+    config: ConnectionConfig,
+    sdk_config_override: Option<&aws_config::SdkConfig>,
+) -> Result<ConnectionHandle> {
     match &config.index_storage.storage_type {
-        StorageType::S3(s3_config) => create_aws_connection(config.clone(), s3_config).await,
+        StorageType::S3(s3_config) => {
+            create_aws_connection(config.clone(), s3_config, sdk_config_override).await
+        }
         StorageType::File => {
             #[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
             {
@@ -246,7 +290,7 @@ async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionH
     }
 }
 
-/// Create async connection without AWS feature - fallback to sync
+/// Create async connection without AWS feature - fallback to sync.
 #[cfg(not(feature = "aws"))]
 async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionHandle> {
     match &config.index_storage.storage_type {
@@ -261,10 +305,16 @@ async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionH
 ///
 /// Uses StorageRegistry for storage sharing when the same @id is referenced
 /// multiple times (e.g., index and commit storage pointing to same storage node).
+///
+/// `sdk_config_override` lets a caller (typically Lambda) supply an
+/// already-loaded, freshly-allocated `SdkConfig`. When `None`, the global
+/// process-cached config from [`aws::get_or_init_sdk_config`] is used —
+/// preserving the original behavior for server / CLI / tests.
 #[cfg(feature = "aws")]
 async fn create_aws_connection(
     config: ConnectionConfig,
     _s3_config: &config::S3StorageConfig,
+    sdk_config_override: Option<&aws_config::SdkConfig>,
 ) -> Result<ConnectionHandle> {
     use crate::config::PublisherType;
     use crate::registry::StorageRegistry;
@@ -272,8 +322,14 @@ async fn create_aws_connection(
     use fluree_db_storage_aws::{DynamoDbConfig as RawDynamoDbConfig, DynamoDbNameService};
     use std::sync::Arc;
 
-    // Get or initialize SDK config
-    let sdk_config = aws::get_or_init_sdk_config().await?;
+    // Use the override when supplied, otherwise fall back to the
+    // process-cached SDK config. Every AWS client built below threads
+    // through the same `sdk_config` so they share (or don't share) HTTP
+    // pool state consistently.
+    let sdk_config: &aws_config::SdkConfig = match sdk_config_override {
+        Some(cfg) => cfg,
+        None => aws::get_or_init_sdk_config().await?,
+    };
 
     // Create storage registry for @id-based sharing
     let mut registry = StorageRegistry::new();

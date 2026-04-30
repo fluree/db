@@ -603,7 +603,12 @@ impl StorageList for S3Storage {
                 &full_prefix,
                 self.send_timeout,
                 Self::is_express_bucket(&self.bucket),
-                async { request.send().await.map_err(|e| map_s3_error_ext(e, &full_prefix)) },
+                async {
+                    request
+                        .send()
+                        .await
+                        .map_err(|e| map_s3_error_ext(e, &full_prefix))
+                },
                 StorageExtError::io,
             )
             .await?;
@@ -652,7 +657,12 @@ impl StorageList for S3Storage {
             &full_prefix,
             self.send_timeout,
             Self::is_express_bucket(&self.bucket),
-            async { request.send().await.map_err(|e| map_s3_error_ext(e, &full_prefix)) },
+            async {
+                request
+                    .send()
+                    .await
+                    .map_err(|e| map_s3_error_ext(e, &full_prefix))
+            },
             StorageExtError::io,
         )
         .await?;

@@ -1011,9 +1011,18 @@ fn decode_encryption_key_base64(key_str: &str) -> Result<[u8; 32]> {
 /// Returns an `Arc<dyn Storage>` which may be either:
 /// - `S3Storage` directly (if no encryption key is configured)
 /// - `EncryptedStorage<S3Storage, ...>` (if `aes256_key` is set)
+///
+/// `sdk_config_override` lets the caller pin every AWS client built by the
+/// builder to a single freshly-loaded `SdkConfig` (see
+/// [`FlureeBuilder::with_aws_sdk_config`]). When `None`, falls back to the
+/// process-cached config from [`fluree_db_connection::aws::get_or_init_sdk_config`].
+/// This is the orphan path the address-identifier S3 storages flow through —
+/// without the override here those storages silently keep using the global
+/// cache even when the caller asked for isolation.
 #[cfg(feature = "aws")]
 async fn build_s3_storage_from_config(
     storage_config: &fluree_db_connection::config::StorageConfig,
+    sdk_config_override: Option<&aws_config::SdkConfig>,
 ) -> Result<Arc<dyn Storage>> {
     use fluree_db_connection::config::StorageType;
     use fluree_db_storage_aws::{S3Config as RawS3Config, S3Storage};
@@ -1022,9 +1031,12 @@ async fn build_s3_storage_from_config(
         return Err(ApiError::config("Expected S3 storage config"));
     };
 
-    let sdk_config = fluree_db_connection::aws::get_or_init_sdk_config()
-        .await
-        .map_err(|e| ApiError::config(format!("Failed to get AWS SDK config: {e}")))?;
+    let sdk_config: &aws_config::SdkConfig = match sdk_config_override {
+        Some(cfg) => cfg,
+        None => fluree_db_connection::aws::get_or_init_sdk_config()
+            .await
+            .map_err(|e| ApiError::config(format!("Failed to get AWS SDK config: {e}")))?,
+    };
 
     let raw_config = RawS3Config {
         bucket: s3_config.bucket.to_string(),
@@ -1223,6 +1235,19 @@ pub struct FlureeBuilder {
     novelty_thresholds: Option<IndexConfig>,
     /// Remote Fluree connection registry for SERVICE federation.
     remote_connections: remote_service::RemoteConnectionRegistry,
+    /// Optional override for the AWS `SdkConfig` used by S3/DynamoDB clients.
+    ///
+    /// When `Some`, every AWS client constructed by the build path uses this
+    /// `SdkConfig` instead of the process-cached one in
+    /// `fluree_db_connection::aws::SDK_CONFIG`. The override owns its own
+    /// `HttpClient` (and therefore its own connector pool), so dropping the
+    /// `FlureeClient` drops every TCP/TLS connection it held.
+    ///
+    /// Intended for AWS Lambda freeze/thaw isolation. See
+    /// [`FlureeBuilder::with_aws_sdk_config`]. `None` for non-Lambda
+    /// callers (server, CLI, tests) — they keep the cached fast path.
+    #[cfg(feature = "aws")]
+    aws_sdk_config_override: Option<aws_config::SdkConfig>,
 }
 
 /// Configuration for background indexing in `FlureeBuilder`.
@@ -1322,6 +1347,8 @@ impl FlureeBuilder {
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            #[cfg(feature = "aws")]
+            aws_sdk_config_override: None,
         }
     }
 
@@ -1336,6 +1363,8 @@ impl FlureeBuilder {
             indexing_config: None,
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            #[cfg(feature = "aws")]
+            aws_sdk_config_override: None,
         }
     }
 
@@ -1401,6 +1430,8 @@ impl FlureeBuilder {
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            #[cfg(feature = "aws")]
+            aws_sdk_config_override: None,
         }
     }
 
@@ -1584,6 +1615,8 @@ impl FlureeBuilder {
             indexing_config,
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            #[cfg(feature = "aws")]
+            aws_sdk_config_override: None,
         })
     }
 
@@ -1688,6 +1721,31 @@ impl FlureeBuilder {
                 .unwrap_or_default(),
             index_config,
         });
+        self
+    }
+
+    /// Override the AWS `SdkConfig` used when constructing S3/DynamoDB clients
+    /// for this builder.
+    ///
+    /// By default, AWS-backed builders fetch a process-cached `SdkConfig` from
+    /// `fluree_db_connection::aws::SDK_CONFIG`. That cache is what makes warm
+    /// Lambda starts cheap, but it also means the same `HttpClient`
+    /// (connector pool) is reused across logical "runs" — including
+    /// across Lambda freeze/thaw, where stale TLS sessions can wedge
+    /// subsequent S3 requests (notably with S3 Express).
+    ///
+    /// Pass a freshly-loaded `SdkConfig` via this method to force every
+    /// AWS client built by this `FlureeBuilder` (index `S3Storage`,
+    /// commit `S3Storage`, DynamoDB nameservice, address-identifier
+    /// `S3Storage`s) to share the *fresh* connector pool. Drop the
+    /// resulting `FlureeClient` after the run to release every TCP/TLS
+    /// connection the pool held.
+    ///
+    /// Pair with [`fluree_db_connection::aws::load_fresh_sdk_config`].
+    /// **No-op for non-AWS builds** (file/memory).
+    #[cfg(feature = "aws")]
+    pub fn with_aws_sdk_config(mut self, sdk_config: aws_config::SdkConfig) -> Self {
+        self.aws_sdk_config_override = Some(sdk_config);
         self
     }
 
@@ -2058,7 +2116,10 @@ impl FlureeBuilder {
             .chain(s3_cfg.list_timeout_ms)
             .max();
 
-        let sdk_config = aws::get_or_init_sdk_config().await?;
+        let sdk_config: &aws_config::SdkConfig = match self.aws_sdk_config_override.as_ref() {
+            Some(cfg) => cfg,
+            None => aws::get_or_init_sdk_config().await?,
+        };
 
         let storage = S3Storage::new(
             sdk_config,
@@ -2134,7 +2195,10 @@ impl FlureeBuilder {
             .chain(s3_cfg.list_timeout_ms)
             .max();
 
-        let sdk_config = aws::get_or_init_sdk_config().await?;
+        let sdk_config: &aws_config::SdkConfig = match self.aws_sdk_config_override.as_ref() {
+            Some(cfg) => cfg,
+            None => aws::get_or_init_sdk_config().await?,
+        };
 
         let s3_storage = S3Storage::new(
             sdk_config,
@@ -2427,9 +2491,26 @@ impl FlureeBuilder {
     /// Build a type-erased S3-backed client.
     #[cfg(feature = "aws")]
     async fn build_client_s3(self) -> Result<FlureeClient> {
+        // Hold the SDK config override (if any) on the stack for the
+        // duration of construction. Every AWS client built below borrows
+        // from it. Owning it here keeps `&aws_config::SdkConfig` valid
+        // across all the awaits below.
+        let sdk_override = self.aws_sdk_config_override.as_ref();
+
         // Delegate to fluree_db_connection for AWS SDK init,
-        // storage registry sharing, and nameservice creation.
-        let handle = fluree_db_connection::connect_from_config(self.config.clone()).await?;
+        // storage registry sharing, and nameservice creation. When the
+        // builder has a fresh SdkConfig, route through the override path
+        // so the connection layer's main index/commit S3 storages and
+        // DynamoDB nameservice all share that fresh connector pool.
+        let handle = if let Some(sdk_config) = sdk_override {
+            fluree_db_connection::connect_from_config_with_sdk_config(
+                self.config.clone(),
+                sdk_config,
+            )
+            .await?
+        } else {
+            fluree_db_connection::connect_from_config(self.config.clone()).await?
+        };
         let fluree_db_connection::ConnectionHandle::Aws(aws_handle) = handle else {
             return Err(ApiError::config(
                 "Expected AWS connection handle for S3 config",
@@ -2446,9 +2527,12 @@ impl FlureeBuilder {
                 Arc::new(index)
             };
 
-        // Wrap with address identifier routing if configured
+        // Wrap with address identifier routing if configured. Forward the
+        // SDK override so per-identifier S3 storages share the same
+        // fresh SdkConfig (otherwise they'd silently fall back to the
+        // global cached one — the orphan path).
         let storage = self
-            .wrap_address_identifiers_aws(base_storage, aws_handle.config())
+            .wrap_address_identifiers_aws(base_storage, aws_handle.config(), sdk_override)
             .await?;
 
         let ns_arc: Arc<dyn NameServicePublisher> = aws_handle.nameservice_arc().clone();
@@ -2492,17 +2576,27 @@ impl FlureeBuilder {
     }
 
     /// Wrap base storage with address identifier routing for AWS backends.
+    ///
+    /// `sdk_config_override` is forwarded to every per-identifier S3 storage
+    /// built here, so they share the same fresh `SdkConfig` as the main
+    /// index/commit S3 storages built earlier in `build_client_s3`. Without
+    /// this, address-identifier storages would silently fall back to the
+    /// process-cached `SDK_CONFIG`, leaving stale connection state behind
+    /// even when the caller asked for isolation.
     #[cfg(feature = "aws")]
     async fn wrap_address_identifiers_aws(
         &self,
         base_storage: Arc<dyn Storage>,
         config: &ConnectionConfig,
+        sdk_config_override: Option<&aws_config::SdkConfig>,
     ) -> Result<Arc<dyn Storage>> {
         if let Some(addr_ids) = &config.address_identifiers {
             let mut identifier_map = std::collections::HashMap::new();
             for (identifier, storage_config) in addr_ids {
                 let id_storage: Arc<dyn Storage> = match &storage_config.storage_type {
-                    StorageType::S3(_) => build_s3_storage_from_config(storage_config).await?,
+                    StorageType::S3(_) => {
+                        build_s3_storage_from_config(storage_config, sdk_config_override).await?
+                    }
                     _ => build_local_storage_from_config(storage_config)?,
                 };
                 identifier_map.insert(identifier.to_string(), id_storage);
