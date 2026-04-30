@@ -1898,22 +1898,31 @@ pub async fn revert_preview(
                 })?;
         }
 
-        // Validate exactly one selection form supplied.
-        let has_single = params.commit.is_some();
-        let has_set = params.commits.is_some();
-        let has_range = params.from.is_some() || params.to.is_some();
-        let supplied = [has_single, has_set, has_range]
-            .iter()
-            .filter(|p| **p)
-            .count();
+        // Normalize the range pair: both supplied ⇒ Some(pair); both absent
+        // ⇒ None; partial ⇒ error. Doing this first lets the count check
+        // below treat range as a single boolean and lets the dispatch
+        // destructure without further unwrapping.
+        let range = match (params.from, params.to) {
+            (Some(f), Some(t)) => Some((f, t)),
+            (None, None) => None,
+            _ => {
+                return Err(ServerError::bad_request(
+                    "`from` and `to` must be supplied together".to_string(),
+                ));
+            }
+        };
+
+        let supplied = [
+            params.commit.is_some(),
+            params.commits.is_some(),
+            range.is_some(),
+        ]
+        .iter()
+        .filter(|p| **p)
+        .count();
         if supplied != 1 {
             return Err(ServerError::bad_request(
                 "Exactly one of `commit`, `commits`, or `from`+`to` must be provided".to_string(),
-            ));
-        }
-        if has_range && (params.from.is_none() || params.to.is_none()) {
-            return Err(ServerError::bad_request(
-                "`from` and `to` must be supplied together".to_string(),
             ));
         }
 
@@ -1943,9 +1952,9 @@ pub async fn revert_preview(
                 .await
                 .map_err(ServerError::Api)?
         } else {
-            // Range
-            let from = parse_commit_ref(params.from.as_deref().unwrap())?;
-            let to = parse_commit_ref(params.to.as_deref().unwrap())?;
+            let (from, to) = range.expect("count check guarantees range is Some here");
+            let from = parse_commit_ref(&from)?;
+            let to = parse_commit_ref(&to)?;
             state
                 .fluree
                 .revert_range_preview_with(&ledger, &params.branch, from, to, opts)
