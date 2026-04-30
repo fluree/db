@@ -130,8 +130,8 @@ fn verify_token(
     events_auth: &EventsAuthConfig,
 ) -> Result<StorageProxyBearer, ServerError> {
     // 1. Verify JWS (embedded JWK mode)
-    let verified = verify_jws(token)
-        .map_err(|e| ServerError::unauthorized(format!("Invalid token: {e}")))?;
+    let verified =
+        verify_jws(token).map_err(|e| ServerError::unauthorized(format!("Invalid token: {e}")))?;
 
     // 2. Parse combined payload
     let payload: EventsTokenPayload = serde_json::from_str(&verified.payload)

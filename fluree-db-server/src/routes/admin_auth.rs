@@ -103,8 +103,8 @@ fn verify_admin_token(
     events_auth: &crate::config::EventsAuthConfig,
 ) -> Result<AdminPrincipal, ServerError> {
     // 1. Verify JWS (embedded JWK mode)
-    let verified = verify_jws(token)
-        .map_err(|e| ServerError::unauthorized(format!("Invalid token: {e}")))?;
+    let verified =
+        verify_jws(token).map_err(|e| ServerError::unauthorized(format!("Invalid token: {e}")))?;
 
     // 2. Parse payload (reuse EventsTokenPayload for standard claims)
     let payload: EventsTokenPayload = serde_json::from_str(&verified.payload)
