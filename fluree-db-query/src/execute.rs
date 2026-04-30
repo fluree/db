@@ -180,7 +180,17 @@ pub async fn execute_with_dataset_tracked<'a>(
     execute_prepared_with_dataset(db, vars, prepared, dataset, Some(tracker)).await
 }
 
-/// Execute a query against a dataset in history mode
+/// Execute a query against a dataset in history mode.
+///
+/// The `_history` suffix is load-bearing: this helper prepares the operator
+/// tree with [`PrepareConfig::history`] so scan operators emit asserts +
+/// retracts and fast paths are gated off at planner-time. Callers that want
+/// current-state semantics should use [`execute_with_dataset`] instead.
+///
+/// The view layer (`view::dataset_query::query_dataset`) has its own
+/// detection logic and goes through `prepare_execution_with_config`
+/// directly; this top-level helper is for callers that already know they
+/// want history-range semantics without going through the view layer.
 pub async fn execute_with_dataset_history<'a>(
     db: GraphDbRef<'a>,
     vars: &VarRegistry,
@@ -188,8 +198,8 @@ pub async fn execute_with_dataset_history<'a>(
     dataset: &'a DataSet<'a>,
     tracker: Option<&'a Tracker>,
 ) -> Result<Vec<Batch>> {
-    let prepared = prepare_execution(db, query).await?;
-    execute_prepared_with_dataset_history(db, vars, prepared, dataset, tracker, true).await
+    let prepared = prepare_execution_with_config(db, query, &PrepareConfig::history(None)).await?;
+    execute_prepared_with_dataset_history(db, vars, prepared, dataset, tracker).await
 }
 
 /// Execute a query against a dataset (multi-graph) with policy enforcement

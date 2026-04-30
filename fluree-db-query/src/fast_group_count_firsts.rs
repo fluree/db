@@ -40,8 +40,10 @@ fn should_fallback(ctx: &ExecutionContext<'_>) -> bool {
 
 #[inline]
 fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
+    // History mode is filtered at the planner — see
+    // `execute::operator_tree::build_operator_tree_inner` — so this gate
+    // doesn't duplicate that check.
     !ctx.is_multi_ledger()
-        && !ctx.history_mode
         && ctx.from_t.is_none()
         && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
 }

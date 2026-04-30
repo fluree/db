@@ -2550,17 +2550,16 @@ mod tests {
         let tp = make_pattern(VarId(0), "name", VarId(1));
         let bounds = HashMap::new();
 
-        let op: BoxedOperator =
-            build_scan_or_join(
-                None,
-                &tp,
-                &bounds,
-                Vec::new(),
-                None,
-                EmitMask::ALL,
-                &[],
-                &crate::temporal_mode::PlanningContext::current(),
-            );
+        let op: BoxedOperator = build_scan_or_join(
+            None,
+            &tp,
+            &bounds,
+            Vec::new(),
+            None,
+            EmitMask::ALL,
+            &[],
+            &crate::temporal_mode::PlanningContext::current(),
+        );
 
         assert_eq!(op.schema(), &[VarId(0), VarId(1)]);
     }
@@ -2571,17 +2570,16 @@ mod tests {
         let tp2 = make_pattern(VarId(0), "age", VarId(2));
         let bounds = HashMap::new();
 
-        let first: BoxedOperator =
-            build_scan_or_join(
-                None,
-                &tp1,
-                &bounds,
-                Vec::new(),
-                None,
-                EmitMask::ALL,
-                &[],
-                &crate::temporal_mode::PlanningContext::current(),
-            );
+        let first: BoxedOperator = build_scan_or_join(
+            None,
+            &tp1,
+            &bounds,
+            Vec::new(),
+            None,
+            EmitMask::ALL,
+            &[],
+            &crate::temporal_mode::PlanningContext::current(),
+        );
         let second = build_scan_or_join(
             Some(first),
             &tp2,

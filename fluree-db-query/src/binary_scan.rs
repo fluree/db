@@ -185,10 +185,10 @@ pub struct BinaryScanOperator {
     /// When a bound subject IRI cannot be translated to a persisted `s_id`,
     /// keep a widened base scan correct by checking the resolved subject IRI row-by-row.
     unresolved_bound_subject_iri: Option<Arc<str>>,
-    /// Temporal mode captured at planner-time. Replaces what used to be the
-    /// runtime `ctx.history_mode` read for: `op` field on emitted bindings,
-    /// the `t` column projection, and the `RangeOptions::history_mode`
-    /// pass-through to `range_with_overlay` in the genesis fallback path.
+    /// Temporal mode captured at planner-time. Drives the `op` field on
+    /// emitted bindings, the `t` column projection, and the
+    /// `RangeOptions::history_mode` pass-through to `range_with_overlay` in
+    /// the genesis fallback path.
     ///
     /// Single-purpose: when `mode == History`, this operator is constructed
     /// only as the private inner of `BinaryHistoryScanOperator`. When

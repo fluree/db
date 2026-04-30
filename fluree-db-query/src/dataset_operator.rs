@@ -193,14 +193,8 @@ impl DatasetOperator {
         index_hint: Option<IndexType>,
         mode: TemporalMode,
     ) -> Self {
-        let builder = ScanDatasetBuilder::new(
-            pattern,
-            object_bounds,
-            inline_ops,
-            emit,
-            index_hint,
-            mode,
-        );
+        let builder =
+            ScanDatasetBuilder::new(pattern, object_bounds, inline_ops, emit, index_hint, mode);
         Self::new(Box::new(builder))
     }
 }

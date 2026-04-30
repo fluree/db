@@ -219,13 +219,7 @@ async fn eval_exists_uncorrelated(
 ) -> Result<bool> {
     #[expect(clippy::box_default)]
     let seed: BoxedOperator = Box::new(EmptyOperator::new());
-    let mut exists_op = build_where_operators_seeded(
-        Some(seed),
-        patterns,
-        None,
-        None,
-        planning,
-    )?;
+    let mut exists_op = build_where_operators_seeded(Some(seed), patterns, None, None, planning)?;
 
     exists_op.open(ctx).await?;
 
@@ -254,13 +248,8 @@ async fn eval_exists_for_row(
     planning: &crate::temporal_mode::PlanningContext,
 ) -> Result<bool> {
     let seed = SeedOperator::from_batch_row(batch, row_idx);
-    let mut exists_op = build_where_operators_seeded(
-        Some(Box::new(seed)),
-        patterns,
-        None,
-        None,
-        planning,
-    )?;
+    let mut exists_op =
+        build_where_operators_seeded(Some(Box::new(seed)), patterns, None, None, planning)?;
 
     exists_op.open(ctx).await?;
 
@@ -291,7 +280,8 @@ fn pre_resolve_uncorrelated<'a>(
         match expr {
             Expression::Exists { patterns, negated } => {
                 if is_uncorrelated_exists(patterns, batch_schema) {
-                    let result = eval_exists_uncorrelated(patterns, *negated, ctx, planning).await?;
+                    let result =
+                        eval_exists_uncorrelated(patterns, *negated, ctx, planning).await?;
                     Ok(Expression::Const(FilterValue::Bool(result)))
                 } else {
                     Ok(expr.clone())
@@ -504,7 +494,11 @@ impl FilterOperator {
     /// [`FilterOperator::new_with_planning`] instead so that FILTER EXISTS
     /// subplans inherit the same temporal mode.
     pub fn new(child: BoxedOperator, expr: Expression) -> Self {
-        Self::new_with_planning(child, expr, crate::temporal_mode::PlanningContext::current())
+        Self::new_with_planning(
+            child,
+            expr,
+            crate::temporal_mode::PlanningContext::current(),
+        )
     }
 
     /// Create a new filter operator that captures a planning context for any

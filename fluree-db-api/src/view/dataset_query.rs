@@ -659,7 +659,6 @@ impl Fluree {
             fulltext_providers: fulltext_map.as_ref(),
             english_lang_id,
             remote_service: self.remote_service_executor(),
-            history_mode,
             from_t,
             strict_bind_errors: true,
             ..Default::default()
@@ -776,7 +775,6 @@ impl Fluree {
             fulltext_providers: fulltext_map.as_ref(),
             english_lang_id,
             remote_service: self.remote_service_executor(),
-            history_mode,
             from_t,
             strict_bind_errors: true,
             ..Default::default()

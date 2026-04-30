@@ -457,12 +457,15 @@ pub async fn run_operator(
     ctx: &ExecutionContext<'_>,
 ) -> Result<Vec<Batch>> {
     let op_type = std::any::type_name_of_val(operator.as_ref());
+    // Temporal mode is captured at planner-time inside the operator tree, not on
+    // ExecutionContext, so it is no longer surfaced as a span field here. The
+    // `plan` span (in `prepare_execution_with_config`) records `mode` once at
+    // planning time.
     let span = tracing::debug_span!(
         "query_run",
         operator = op_type,
         to_t = ctx.to_t,
         from_t = tracing::field::Empty,
-        history_mode = ctx.history_mode,
         has_overlay = ctx.overlay.is_some(),
         batch_size = ctx.batch_size,
         open_ms = tracing::field::Empty,
@@ -563,8 +566,6 @@ pub struct ContextConfig<'a, 'b> {
     ///
     /// When set, vector search operators can load indexes from graph sources.
     pub vector_provider: Option<&'b dyn crate::vector::VectorIndexProvider>,
-    /// Enable history mode - captures op metadata in bindings for @op support
-    pub history_mode: bool,
     /// Optional lower time bound for history/range queries.
     /// Defaults to None (no lower bound).
     pub from_t: Option<i64>,
@@ -697,9 +698,6 @@ pub async fn execute_prepared<'a, 'b>(
     }
     if let Some(p) = config.vector_provider {
         ctx = ctx.with_vector_provider(p);
-    }
-    if config.history_mode {
-        ctx = ctx.with_history_mode();
     }
     if config.strict_bind_errors {
         ctx = ctx.with_strict_bind_errors();
@@ -854,17 +852,21 @@ pub async fn execute_prepared_with_dataset<'a>(
     dataset: &'a DataSet<'a>,
     tracker: Option<&'a Tracker>,
 ) -> Result<Vec<Batch>> {
-    execute_prepared_with_dataset_history(db, vars, prepared, dataset, tracker, false).await
+    execute_prepared_with_dataset_history(db, vars, prepared, dataset, tracker).await
 }
 
-/// Execute with dataset (multi-graph query), with optional history mode
+/// Execute against a prepared dataset query.
+///
+/// History mode is captured at planner-time inside `prepared` (see
+/// `prepare_execution_with_config` and `PrepareConfig::history`) — there is
+/// no execution-time history toggle. The function name is preserved for
+/// API stability; behavior is identical to `execute_prepared_with_dataset`.
 pub async fn execute_prepared_with_dataset_history<'a>(
     db: GraphDbRef<'a>,
     vars: &VarRegistry,
     prepared: PreparedExecution,
     dataset: &'a DataSet<'a>,
     tracker: Option<&'a Tracker>,
-    history_mode: bool,
 ) -> Result<Vec<Batch>> {
     execute_prepared(
         db,
@@ -873,7 +875,6 @@ pub async fn execute_prepared_with_dataset_history<'a>(
         ContextConfig {
             tracker,
             dataset: Some(dataset),
-            history_mode,
             strict_bind_errors: true,
             ..Default::default()
         },
@@ -890,13 +891,14 @@ pub async fn execute_prepared_with_dataset_and_policy<'a>(
     policy: &'a fluree_db_policy::PolicyContext,
     tracker: Option<&'a Tracker>,
 ) -> Result<Vec<Batch>> {
-    execute_prepared_with_dataset_and_policy_history(
-        db, vars, prepared, dataset, policy, tracker, false,
-    )
-    .await
+    execute_prepared_with_dataset_and_policy_history(db, vars, prepared, dataset, policy, tracker)
+        .await
 }
 
-/// Execute with dataset and policy, with optional history mode
+/// Execute with dataset and policy.
+///
+/// History mode is captured at planner-time inside `prepared` — see
+/// `execute_prepared_with_dataset_history` for the analogous note.
 pub async fn execute_prepared_with_dataset_and_policy_history<'a>(
     db: GraphDbRef<'a>,
     vars: &VarRegistry,
@@ -904,7 +906,6 @@ pub async fn execute_prepared_with_dataset_and_policy_history<'a>(
     dataset: &'a DataSet<'a>,
     policy: &'a fluree_db_policy::PolicyContext,
     tracker: Option<&'a Tracker>,
-    history_mode: bool,
 ) -> Result<Vec<Batch>> {
     // Create policy enforcer for async f:query support
     let enforcer = Arc::new(crate::policy::QueryPolicyEnforcer::new(Arc::new(
@@ -919,7 +920,6 @@ pub async fn execute_prepared_with_dataset_and_policy_history<'a>(
             tracker,
             policy_enforcer: Some(enforcer),
             dataset: Some(dataset),
-            history_mode,
             strict_bind_errors: true,
             ..Default::default()
         },

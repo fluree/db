@@ -1072,7 +1072,8 @@ mod tests {
     #[test]
     fn test_property_join_creation() {
         let patterns = make_property_join_patterns();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         assert_eq!(op.subject_var(), VarId(0));
         assert_eq!(op.predicates.len(), 2);
@@ -1082,7 +1083,8 @@ mod tests {
     #[test]
     fn test_property_join_schema() {
         let patterns = make_property_join_patterns();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         let schema = op.output_schema();
         assert_eq!(schema[0], VarId(0)); // subject
@@ -1093,7 +1095,8 @@ mod tests {
     #[test]
     fn test_property_join_schema_with_bound_object_predicate() {
         let patterns = make_property_join_patterns_with_bound_object();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         let schema = op.output_schema();
         assert_eq!(&schema[..], &[VarId(0), VarId(1), VarId(2)]);
@@ -1102,7 +1105,8 @@ mod tests {
     #[test]
     fn test_property_join_prefers_bound_object_driver_over_bounds() {
         let patterns = make_property_join_patterns_with_bound_object();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         let mut bounds = HashMap::new();
         bounds.insert(VarId(2), ObjectBounds::new());
@@ -1121,7 +1125,8 @@ mod tests {
     #[test]
     fn test_generate_rows_single_values() {
         let patterns = make_property_join_patterns();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         let subject_sid = Sid::new(1, "alice");
         let subject_binding = Binding::sid(subject_sid.clone());
@@ -1144,7 +1149,8 @@ mod tests {
     #[test]
     fn test_generate_rows_cartesian_product() {
         let patterns = make_property_join_patterns();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         let subject_binding = Binding::sid(Sid::new(1, "alice"));
         let values = vec![
@@ -1172,7 +1178,8 @@ mod tests {
     #[test]
     fn test_generate_rows_empty_pred() {
         let patterns = make_property_join_patterns();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         let subject_binding = Binding::sid(Sid::new(1, "alice"));
         let values = vec![

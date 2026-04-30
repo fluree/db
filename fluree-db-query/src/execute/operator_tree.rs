@@ -2163,6 +2163,14 @@ fn build_operator_tree_inner(
     enable_fused_fast_paths: bool,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
+    // Phase 5 of the planner-mode refactor: fast paths emit current-state
+    // bindings (no `op` channel, no retract events) and don't consult the
+    // history sidecar. In `History` mode they're semantically wrong, so the
+    // planner declines to construct them at all — this collapses the
+    // optimistic-then-fallback pattern in each operator's `open()` into a
+    // single planner-time decision.
+    let enable_fused_fast_paths = enable_fused_fast_paths && !planning.is_history();
+
     if enable_fused_fast_paths {
         tracing::debug!(
             patterns = ?query.patterns,
@@ -2180,7 +2188,8 @@ fn build_operator_tree_inner(
         if let Some((pred, scalar, out_var)) = detect_fused_scan_sum_i64(query, options) {
             // Build fallback operator tree without this fast path to preserve correctness in
             // pre-index / history / policy contexts.
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(fused_scan_sum_i64_operator(
                 pred,
                 scalar,
@@ -2194,7 +2203,8 @@ fn build_operator_tree_inner(
     // for homogeneous numeric predicates, scanning only POST `o_key` values.
     if enable_fused_fast_paths {
         if let Some((pred, out_var)) = detect_predicate_avg_numeric(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(predicate_avg_numeric_operator(
                 pred,
                 out_var,
@@ -2207,7 +2217,8 @@ fn build_operator_tree_inner(
     // by scanning POST and counting distinct encoded object IDs.
     if enable_fused_fast_paths {
         if let Some((pred, out_var)) = detect_predicate_count_distinct_object(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(count_distinct_object_operator(
                 pred,
                 out_var,
@@ -2220,7 +2231,8 @@ fn build_operator_tree_inner(
     // when the object is string-dict-backed. This inspects only POST leaflet directory keys.
     if enable_fused_fast_paths {
         if let Some((pred, mode, out_var)) = detect_predicate_minmax_string(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(predicate_min_max_string_operator(
                 pred,
                 mode,
@@ -2233,7 +2245,8 @@ fn build_operator_tree_inner(
     // Fast-path: `COUNT(*)` over one triple with an anchored string-prefix filter.
     if enable_fused_fast_paths {
         if let Some((pred, prefix, out_var)) = detect_string_prefix_count_all(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(string_prefix_count_all_operator(
                 pred,
                 prefix,
@@ -2246,7 +2259,8 @@ fn build_operator_tree_inner(
     // Fast-path: `SUM(xsd:integer(STRSTARTS(?o, "...")))` over one triple.
     if enable_fused_fast_paths {
         if let Some((pred, prefix, out_var)) = detect_string_prefix_sum_strstarts(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(string_prefix_sum_strstarts_operator(
                 pred,
                 prefix,
@@ -2267,7 +2281,8 @@ fn build_operator_tree_inner(
         if let Some((pred, lang_tag, out_var)) =
             detect_predicate_count_rows_lang_filter(query, options)
         {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(count_rows_lang_filter_operator(
                 pred,
                 lang_tag,
@@ -2281,7 +2296,8 @@ fn build_operator_tree_inner(
         if let Some((pred, compare, threshold, out_var)) =
             detect_predicate_count_rows_numeric_compare(query, options)
         {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(count_rows_numeric_compare_operator(
                 pred,
                 compare,
@@ -2295,7 +2311,8 @@ fn build_operator_tree_inner(
     if enable_fused_fast_paths {
         if let Some((tp, filters, out_var)) = detect_count_rows_with_encoded_filters(query, options)
         {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             let inline_ops: Vec<InlineOperator> = filters
                 .into_iter()
                 .map(|expr| InlineOperator::Filter(PreparedBoolExpression::new(expr)))
@@ -2325,7 +2342,8 @@ fn build_operator_tree_inner(
     // answered from PSOT leaflet directory row counts (no scan / no decoding).
     if enable_fused_fast_paths {
         if let Some((pred, out_var)) = detect_predicate_count_rows(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(count_rows_operator(pred, out_var, Some(fallback))));
         }
     }
@@ -2335,7 +2353,8 @@ fn build_operator_tree_inner(
     // Fires after trivial metadata-only counts but before the remaining specialized fast paths.
     if enable_fused_fast_paths {
         if let Some(plan) = crate::count_plan::try_build_count_plan(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(crate::count_plan_exec::count_plan_operator(
                 plan,
                 Some(fallback),
@@ -2346,7 +2365,8 @@ fn build_operator_tree_inner(
     // Fast-path: `COUNT(*)` for a 2-pattern multicolumn join `?s p1 ?o . ?s p2 ?o`.
     if enable_fused_fast_paths {
         if let Some((p1, p2, out_var)) = detect_multicolumn_join_count_all(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(multicolumn_join_count_all_operator(
                 p1,
                 p2,
@@ -2361,7 +2381,8 @@ fn build_operator_tree_inner(
         if let Some((count_pred, exists_pred, out_var)) =
             detect_exists_join_count_distinct_object(query, options)
         {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(exists_join_count_distinct_object_operator(
                 count_pred,
                 exists_pred,
@@ -2375,7 +2396,8 @@ fn build_operator_tree_inner(
     // answered from SPOT leaflet metadata by scanning the blank-node SubjectId range.
     if enable_fused_fast_paths {
         if let Some(out_var) = detect_count_blank_node_subjects(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(count_blank_node_subjects_operator(
                 out_var,
                 Some(fallback),
@@ -2387,7 +2409,8 @@ fn build_operator_tree_inner(
     // answered from PSOT leaflet metadata by counting non-node-ref `o_type` rows.
     if enable_fused_fast_paths {
         if let Some(out_var) = detect_count_literal_objects(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(count_literal_objects_operator(
                 out_var,
                 Some(fallback),
@@ -2399,7 +2422,8 @@ fn build_operator_tree_inner(
     // answered metadata-only from SPOT leaflet `lead_group_count` + boundary correction.
     if enable_fused_fast_paths {
         if let Some(out_var) = detect_count_distinct_subjects(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(count_distinct_subjects_operator(
                 out_var,
                 Some(fallback),
@@ -2411,7 +2435,8 @@ fn build_operator_tree_inner(
     // answered metadata-only from PSOT leaflet `p_const` transitions.
     if enable_fused_fast_paths {
         if let Some(out_var) = detect_count_distinct_predicates(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(count_distinct_predicates_operator(
                 out_var,
                 Some(fallback),
@@ -2423,7 +2448,8 @@ fn build_operator_tree_inner(
     // answered metadata-only by summing leaf row_count across a branch manifest.
     if enable_fused_fast_paths {
         if let Some(out_var) = detect_count_triples(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(count_triples_operator(out_var, Some(fallback))));
         }
     }
@@ -2434,7 +2460,8 @@ fn build_operator_tree_inner(
         if let Some((p1, p2, p3, out_var)) =
             detect_optional_chain_head_join_count_all(query, options)
         {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(predicate_optional_chain_head_count_all(
                 p1,
                 p2,
@@ -2451,7 +2478,8 @@ fn build_operator_tree_inner(
         if let Some((pred_sid, subject, out_var)) =
             detect_property_path_plus_fixed_subject_count_all(query, options)
         {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(property_path_plus_count_all_operator(
                 pred_sid,
                 subject,
@@ -2466,7 +2494,8 @@ fn build_operator_tree_inner(
         if let Some((union_preds, extra_preds, mode, out_var)) =
             detect_union_star_count_all(query, options)
         {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(UnionStarCountAllOperator::new(
                 union_preds,
                 extra_preds,
@@ -2481,7 +2510,8 @@ fn build_operator_tree_inner(
     // Avoids closure materialization by counting reachability.
     if enable_fused_fast_paths {
         if let Some((p1, p2, out_var)) = detect_transitive_path_plus_count_all(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(transitive_path_plus_count_all_operator(
                 p1,
                 p2,
@@ -2495,7 +2525,8 @@ fn build_operator_tree_inner(
     // answered metadata-only from OPST leaflet `lead_group_count` + boundary correction.
     if enable_fused_fast_paths {
         if let Some(out_var) = detect_count_distinct_objects(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(count_distinct_objects_operator(
                 out_var,
                 Some(fallback),
@@ -2506,7 +2537,8 @@ fn build_operator_tree_inner(
     // Fast-path: constant-object star constraints + numeric existence filter + label ORDER BY + LIMIT.
     if enable_fused_fast_paths {
         if let Some(spec) = detect_star_const_numeric_label_order_limit(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             let threshold = match spec.numeric_threshold {
                 Term::Value(v) => v,
                 _ => return Ok(fallback),
@@ -2527,7 +2559,8 @@ fn build_operator_tree_inner(
     // Fast-path: label scan + regex filter + rdf:type membership check.
     if enable_fused_fast_paths {
         if let Some(spec) = detect_label_regex_type(query, options) {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(label_regex_type_operator(
                 spec.subject_var,
                 spec.label_var,
@@ -2558,7 +2591,8 @@ fn build_operator_tree_inner(
             limit,
         )) = detect_group_by_object_star_topk(query, options)
         {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(GroupByObjectStarTopKOperator::new(
                 group_pred,
                 filter_preds,
@@ -2577,24 +2611,29 @@ fn build_operator_tree_inner(
     // Fast-path: `?s <p> ?o GROUP BY ?o COUNT(?s)` top-k using leaflet FIRST headers.
     //
     // This avoids decoding leaflets for long (p,o) runs that span leaflet boundaries.
-    if let Some((pred, s_var, o_var, count_var, limit)) =
-        detect_predicate_group_by_object_count_topk(query, options)
-    {
-        return Ok(Box::new(PredicateGroupCountFirstsOperator::new(
-            s_var,
-            o_var,
-            count_var,
-            pred,
-            limit,
-            planning.mode(),
-        )));
+    // Skipped in `History` mode for the same reason as the fused fast paths above:
+    // the path emits current-state counts and ignores retracts.
+    if !planning.is_history() {
+        if let Some((pred, s_var, o_var, count_var, limit)) =
+            detect_predicate_group_by_object_count_topk(query, options)
+        {
+            return Ok(Box::new(PredicateGroupCountFirstsOperator::new(
+                s_var,
+                o_var,
+                count_var,
+                pred,
+                limit,
+                planning.mode(),
+            )));
+        }
     }
 
     // Fast-path: SUM(STRLEN(GROUP_CONCAT(...))) over a single predicate.
     if enable_fused_fast_paths {
         if let Some((pred, sep, out_var)) = detect_sum_strlen_group_concat_subquery(query, options)
         {
-            let fallback = build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+            let fallback =
+                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
             return Ok(Box::new(sum_strlen_group_concat_operator(
                 pred,
                 sep,
@@ -2605,63 +2644,23 @@ fn build_operator_tree_inner(
     }
 
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s <p> <o> }` using leaflet FIRST headers.
-    if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query, options) {
-        let mut operator: BoxedOperator = Box::new(PredicateObjectCountFirstsOperator::new(
-            pred,
-            s_var,
-            obj,
-            count_var,
-            planning.mode(),
-        ));
-
-        // ORDER BY
-        if !options.order_by.is_empty() {
-            operator = Box::new(SortOperator::new(operator, options.order_by.clone()));
-        }
-
-        // PROJECT
-        if let Some(vars) = query.output.select_vars() {
-            if !vars.is_empty() {
-                operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
-            }
-        }
-
-        // DISTINCT
-        if options.distinct {
-            operator = Box::new(DistinctOperator::new(operator));
-        }
-
-        // OFFSET
-        if let Some(offset) = options.offset {
-            if offset > 0 {
-                operator = Box::new(OffsetOperator::new(operator, offset));
-            }
-        }
-
-        // LIMIT
-        if let Some(limit) = options.limit {
-            operator = Box::new(LimitOperator::new(operator, limit));
-        }
-
-        return Ok(operator);
-    }
-
-    // Fast-path: stats-based count-by-predicate query
-    // This avoids scanning all triples when we can answer directly from IndexStats.
-    if let Some(ref stats_view) = stats {
-        if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query, options) {
-            let mut operator: BoxedOperator = Box::new(StatsCountByPredicateOperator::new(
-                Arc::clone(stats_view),
-                pred_var,
+    // Skipped in `History` mode (current-state count semantics).
+    if !planning.is_history() {
+        if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query, options) {
+            let mut operator: BoxedOperator = Box::new(PredicateObjectCountFirstsOperator::new(
+                pred,
+                s_var,
+                obj,
                 count_var,
+                planning.mode(),
             ));
 
-            // ORDER BY (on predicate or count)
+            // ORDER BY
             if !options.order_by.is_empty() {
                 operator = Box::new(SortOperator::new(operator, options.order_by.clone()));
             }
 
-            // PROJECT (select specific columns)
+            // PROJECT
             if let Some(vars) = query.output.select_vars() {
                 if !vars.is_empty() {
                     operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
@@ -2670,7 +2669,7 @@ fn build_operator_tree_inner(
 
             // DISTINCT
             if options.distinct {
-                operator = Box::new(crate::distinct::DistinctOperator::new(operator));
+                operator = Box::new(DistinctOperator::new(operator));
             }
 
             // OFFSET
@@ -2686,6 +2685,53 @@ fn build_operator_tree_inner(
             }
 
             return Ok(operator);
+        }
+    }
+
+    // Fast-path: stats-based count-by-predicate query
+    // This avoids scanning all triples when we can answer directly from IndexStats.
+    // Skipped in `History` mode — IndexStats reflects current-state cardinality,
+    // not the asserts + retracts a history-range query needs.
+    if !planning.is_history() {
+        if let Some(ref stats_view) = stats {
+            if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query, options) {
+                let mut operator: BoxedOperator = Box::new(StatsCountByPredicateOperator::new(
+                    Arc::clone(stats_view),
+                    pred_var,
+                    count_var,
+                ));
+
+                // ORDER BY (on predicate or count)
+                if !options.order_by.is_empty() {
+                    operator = Box::new(SortOperator::new(operator, options.order_by.clone()));
+                }
+
+                // PROJECT (select specific columns)
+                if let Some(vars) = query.output.select_vars() {
+                    if !vars.is_empty() {
+                        operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
+                    }
+                }
+
+                // DISTINCT
+                if options.distinct {
+                    operator = Box::new(crate::distinct::DistinctOperator::new(operator));
+                }
+
+                // OFFSET
+                if let Some(offset) = options.offset {
+                    if offset > 0 {
+                        operator = Box::new(OffsetOperator::new(operator, offset));
+                    }
+                }
+
+                // LIMIT
+                if let Some(limit) = options.limit {
+                    operator = Box::new(LimitOperator::new(operator, limit));
+                }
+
+                return Ok(operator);
+            }
         }
     }
 
