@@ -6,9 +6,7 @@
 
 mod support;
 
-use fluree_db_api::{
-    CommitRef, ConflictStrategy, FlureeBuilder, RevertPreviewOpts,
-};
+use fluree_db_api::{CommitRef, ConflictStrategy, FlureeBuilder, RevertPreviewOpts};
 use serde_json::json;
 
 fn doc(id: &str, name: &str) -> serde_json::Value {
@@ -44,7 +42,10 @@ async fn seed_anchor(
 async fn preview_single_commit_no_conflicts() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = fluree.create_ledger("mydb").await.unwrap();
-    let r1 = fluree.insert(ledger, &doc("ex:alice", "Alice")).await.unwrap();
+    let r1 = fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap();
     let r2 = fluree
         .insert(r1.ledger, &doc("ex:bob", "Bob"))
         .await
@@ -91,7 +92,10 @@ async fn preview_single_commit_no_conflicts() {
 async fn preview_range_lists_inclusive_to_exclusive_from() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = fluree.create_ledger("mydb").await.unwrap();
-    let r1 = fluree.insert(ledger, &doc("ex:alice", "Alice")).await.unwrap();
+    let r1 = fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap();
     let alice_cid = r1.receipt.commit_id.clone();
     let r2 = fluree
         .insert(r1.ledger, &doc("ex:bob", "Bob"))
@@ -134,7 +138,10 @@ async fn preview_range_lists_inclusive_to_exclusive_from() {
 async fn preview_commits_set() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = fluree.create_ledger("mydb").await.unwrap();
-    let r1 = fluree.insert(ledger, &doc("ex:alice", "Alice")).await.unwrap();
+    let r1 = fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap();
     let r2 = fluree
         .insert(r1.ledger, &doc("ex:bob", "Bob"))
         .await
@@ -243,7 +250,10 @@ async fn preview_take_source_marks_conflict_revertable() {
 async fn preview_max_commits_truncates() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = fluree.create_ledger("mydb").await.unwrap();
-    let r1 = fluree.insert(ledger, &doc("ex:alice", "Alice")).await.unwrap();
+    let r1 = fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap();
     let alice_cid = r1.receipt.commit_id.clone();
     let r2 = fluree
         .insert(r1.ledger, &doc("ex:bob", "Bob"))
@@ -329,7 +339,10 @@ async fn preview_include_conflicts_false_skips_conflict_computation() {
 async fn preview_rejects_genesis_commit() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = fluree.create_ledger("mydb").await.unwrap();
-    let r1 = fluree.insert(ledger, &doc("ex:alice", "Alice")).await.unwrap();
+    let r1 = fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap();
     let genesis_cid = r1.receipt.commit_id.clone();
 
     let err = fluree

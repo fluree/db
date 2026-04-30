@@ -124,7 +124,8 @@ impl crate::Fluree {
             let source = RevertSource::try_set(commits).ok_or_else(|| {
                 ApiError::InvalidBranch("Revert requires at least one commit".to_string())
             })?;
-            self.revert_inner(ledger_name, branch, source, strategy).await
+            self.revert_inner(ledger_name, branch, source, strategy)
+                .await
         }
         .instrument(span)
         .await
@@ -181,7 +182,9 @@ impl crate::Fluree {
             _ => {}
         }
 
-        let ctx = self.build_revert_context(ledger_name, branch, source).await?;
+        let ctx = self
+            .build_revert_context(ledger_name, branch, source)
+            .await?;
 
         if strategy == ConflictStrategy::Abort && !ctx.conflict_keys.is_empty() {
             return Err(ApiError::BranchConflict(format!(
@@ -236,8 +239,7 @@ impl crate::Fluree {
                     error = %e,
                     "revert failed, rolling back nameservice state"
                 );
-                if let Err(rollback_err) =
-                    self.nameservice().reset_head(&branch_id, snapshot).await
+                if let Err(rollback_err) = self.nameservice().reset_head(&branch_id, snapshot).await
                 {
                     tracing::error!(
                         branch = %branch_id,
@@ -410,7 +412,6 @@ impl crate::Fluree {
 
         Ok(RevertWriteOutcome::Wrote(receipt))
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -534,8 +535,7 @@ async fn resolve_revert_plan<C: ContentStore + ?Sized>(
     // Walk the branch's full ancestry once for reachability validation.
     // `dag` is newest-first.
     let dag = collect_dag_cids(store, head_id, 0).await?;
-    let dag_index: FxHashMap<CommitId, i64> =
-        dag.iter().cloned().map(|(t, c)| (c, t)).collect();
+    let dag_index: FxHashMap<CommitId, i64> = dag.iter().cloned().map(|(t, c)| (c, t)).collect();
 
     // Build a list of (t, commit_id) pairs to revert. Each branch produces
     // a non-empty result (the cherry-pick branch via `NonEmpty`, the range
@@ -578,8 +578,7 @@ async fn resolve_revert_plan<C: ContentStore + ?Sized>(
             }
             // Confirm `from` is on `to`'s ancestry path, then collect (from, to].
             let to_ancestry = collect_dag_cids(store, to, 0).await?;
-            let to_set: FxHashSet<CommitId> =
-                to_ancestry.iter().map(|(_, c)| c.clone()).collect();
+            let to_set: FxHashSet<CommitId> = to_ancestry.iter().map(|(_, c)| c.clone()).collect();
             if !to_set.contains(from) {
                 return Err(ApiError::InvalidBranch(format!(
                     "Range start {from} is not an ancestor of {to}"
@@ -653,10 +652,7 @@ async fn compute_conflict_keys<C: ContentStore + Clone + 'static>(
     let mut intervening_keys: FxHashSet<ConflictKey> = FxHashSet::default();
 
     while let Some(commit) = stream.try_next().await? {
-        let commit_id = commit
-            .id
-            .as_ref()
-            .expect("loaded commit must have id set");
+        let commit_id = commit.id.as_ref().expect("loaded commit must have id set");
         let dest = if reverted_set.contains(commit_id) {
             &mut reverted_keys
         } else {

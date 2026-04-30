@@ -57,7 +57,10 @@ fn doc(id: &str, name: &str) -> serde_json::Value {
 /// Bootstrap an initial commit on `main` so subsequent commits aren't genesis
 /// (genesis commits cannot be reverted). Uses a predicate other than `ex:name`
 /// so it is invisible to `query_all_names`.
-async fn seed_anchor(fluree: &support::MemoryFluree, ledger: support::MemoryLedger) -> support::MemoryLedger {
+async fn seed_anchor(
+    fluree: &support::MemoryFluree,
+    ledger: support::MemoryLedger,
+) -> support::MemoryLedger {
     fluree
         .insert(
             ledger,
@@ -80,7 +83,10 @@ async fn revert_single_commit_undoes_assertions() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = fluree.create_ledger("mydb").await.unwrap();
 
-    let r1 = fluree.insert(ledger, &doc("ex:alice", "Alice")).await.unwrap();
+    let r1 = fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap();
     let r2 = fluree
         .insert(r1.ledger, &doc("ex:bob", "Bob"))
         .await
@@ -119,7 +125,10 @@ async fn revert_range_undoes_inclusive_to_exclusive_from() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = fluree.create_ledger("mydb").await.unwrap();
 
-    let r1 = fluree.insert(ledger, &doc("ex:alice", "Alice")).await.unwrap();
+    let r1 = fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap();
     let alice_cid = r1.receipt.commit_id.clone();
 
     let r2 = fluree
@@ -145,7 +154,11 @@ async fn revert_range_undoes_inclusive_to_exclusive_from() {
         .await
         .unwrap();
 
-    assert_eq!(report.reverted_commits.len(), 2, "both bob and carol reverted");
+    assert_eq!(
+        report.reverted_commits.len(),
+        2,
+        "both bob and carol reverted"
+    );
     assert_eq!(report.conflict_count, 0);
 
     let after = query_all_names(&fluree, "mydb:main").await;
@@ -161,7 +174,10 @@ async fn revert_commit_set_skips_intervening_commits() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = fluree.create_ledger("mydb").await.unwrap();
 
-    let r1 = fluree.insert(ledger, &doc("ex:alice", "Alice")).await.unwrap();
+    let r1 = fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap();
     let r2 = fluree
         .insert(r1.ledger, &doc("ex:bob", "Bob"))
         .await
@@ -308,8 +324,7 @@ async fn revert_take_source_overrides_intervening_value() {
     // Revert wins: ex:name on alice should now be empty.
     let names = query_all_names(&fluree, "mydb:main").await;
     assert!(
-        !names.contains(&"Alice".to_string())
-            && !names.contains(&"Alice-v2".to_string()),
+        !names.contains(&"Alice".to_string()) && !names.contains(&"Alice-v2".to_string()),
         "expected alice's name to be retracted, got: {names:?}"
     );
 }
@@ -544,7 +559,7 @@ async fn revert_rejects_range_with_no_commits() {
 
 #[tokio::test]
 async fn revert_records_reverted_commit_ids_in_txn_meta() {
-    use fluree_db_core::commit::{TxnMetaValue, load_commit_by_id};
+    use fluree_db_core::commit::{load_commit_by_id, TxnMetaValue};
     use fluree_db_core::ContentStore;
 
     let fluree = FlureeBuilder::memory().build_memory();

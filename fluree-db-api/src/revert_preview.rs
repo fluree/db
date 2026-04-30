@@ -161,14 +161,8 @@ impl crate::Fluree {
         from: CommitRef,
         to: CommitRef,
     ) -> Result<RevertPreview> {
-        self.revert_range_preview_with(
-            ledger_name,
-            branch,
-            from,
-            to,
-            RevertPreviewOpts::default(),
-        )
-        .await
+        self.revert_range_preview_with(ledger_name, branch, from, to, RevertPreviewOpts::default())
+            .await
     }
 
     /// Like [`Self::revert_range_preview`] but with explicit knobs.
@@ -215,13 +209,17 @@ impl crate::Fluree {
             plan,
             conflict_keys,
             ..
-        } = self.build_revert_context(ledger_name, branch, source).await?;
+        } = self
+            .build_revert_context(ledger_name, branch, source)
+            .await?;
 
         // Build per-commit summaries up to the requested cap. The full count
         // is `plan.ordered_commits.len()`; the cap only bounds the slice we
         // load and return.
         let reverted_count = plan.ordered_commits.len();
-        let take_n = opts.max_commits.map_or(reverted_count, |n| n.min(reverted_count));
+        let take_n = opts
+            .max_commits
+            .map_or(reverted_count, |n| n.min(reverted_count));
         let mut reverted_commits = Vec::with_capacity(take_n);
         for commit_id in plan.ordered_commits.iter().take(take_n) {
             let commit = load_commit_by_id(&branch_store, commit_id).await?;
@@ -250,8 +248,7 @@ impl crate::Fluree {
             RevertConflictSummary::empty()
         };
 
-        let revertable =
-            opts.conflict_strategy != ConflictStrategy::Abort || conflicts.count == 0;
+        let revertable = opts.conflict_strategy != ConflictStrategy::Abort || conflicts.count == 0;
 
         Ok(RevertPreview {
             branch: branch.to_string(),

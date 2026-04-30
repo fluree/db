@@ -1892,8 +1892,8 @@ pub async fn revert_preview(
             opts.include_conflicts = b;
         }
         if let Some(s) = params.strategy.as_deref() {
-            opts.conflict_strategy = fluree_db_api::ConflictStrategy::parse_canonical(s)
-                .map_err(|_| {
+            opts.conflict_strategy =
+                fluree_db_api::ConflictStrategy::parse_canonical(s).map_err(|_| {
                     ServerError::bad_request(format!("Unknown revert preview strategy: {s}"))
                 })?;
         }

@@ -681,8 +681,7 @@ async fn run_revert(
         }
         (true, None, None) => {
             return Err(CliError::Config(
-                "Specify at least one commit to revert (positional) or `--from --to`"
-                    .to_string(),
+                "Specify at least one commit to revert (positional) or `--from --to`".to_string(),
             ));
         }
         // Clap forbids these via `requires`; treat as a guard.
@@ -774,9 +773,7 @@ async fn run_revert(
                     RevertPayload::Set(items) => {
                         let mut refs = Vec::with_capacity(items.len());
                         for s in &items {
-                            refs.push(
-                                fluree_db_api::CommitRef::parse(s).map_err(CliError::from)?,
-                            );
+                            refs.push(fluree_db_api::CommitRef::parse(s).map_err(CliError::from)?);
                         }
                         fluree
                             .revert_commits_preview_with(
@@ -810,20 +807,13 @@ async fn run_revert(
                         let commit_ref =
                             fluree_db_api::CommitRef::parse(&s).map_err(CliError::from)?;
                         fluree
-                            .revert_commit(
-                                &ledger_name,
-                                branch_name,
-                                commit_ref,
-                                conflict_strategy,
-                            )
+                            .revert_commit(&ledger_name, branch_name, commit_ref, conflict_strategy)
                             .await?
                     }
                     RevertPayload::Set(items) => {
                         let mut refs = Vec::with_capacity(items.len());
                         for s in &items {
-                            refs.push(
-                                fluree_db_api::CommitRef::parse(s).map_err(CliError::from)?,
-                            );
+                            refs.push(fluree_db_api::CommitRef::parse(s).map_err(CliError::from)?);
                         }
                         fluree
                             .revert_commits(&ledger_name, branch_name, refs, conflict_strategy)
@@ -874,10 +864,7 @@ fn print_revert_preview_local(
 
     println!(
         "Would revert {} commit(s) on '{}' ({} conflicts, revertable={}).",
-        preview.reverted_count,
-        preview.branch,
-        preview.conflicts.count,
-        preview.revertable,
+        preview.reverted_count, preview.branch, preview.conflicts.count, preview.revertable,
     );
     if preview.truncated {
         println!(
