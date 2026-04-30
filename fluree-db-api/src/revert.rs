@@ -615,7 +615,7 @@ async fn resolve_revert_plan<C: ContentStore + ?Sized>(
     // mutation), then wrap the result back up. Non-emptiness is preserved
     // because sort doesn't change length.
     let mut sorted: Vec<(i64, CommitId)> = with_t.into_vec();
-    sorted.sort_by(|a, b| b.0.cmp(&a.0));
+    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
     // After sorting newest-first, the last element holds the oldest `t`.
     let oldest_t = sorted
