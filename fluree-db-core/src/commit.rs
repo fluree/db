@@ -352,6 +352,16 @@ pub struct CommitEnvelope {
     /// User-provided transaction metadata (replay-safe)
     pub txn_meta: Vec<TxnMetaEntry>,
 
+    /// Named-graph IRI registrations introduced by this commit.
+    ///
+    /// Same shape as [`Commit::graph_delta`] — `g_id → IRI`. Carried on the
+    /// envelope so envelope-only walkers (`walk_dag`, callers of
+    /// [`load_commit_envelope_by_id`]) can detect that a particular named
+    /// graph has ever been registered without paying for a full ops fetch.
+    /// Used by `ApiFulltextConfigProvider` to short-circuit when the config
+    /// graph was never registered anywhere in the chain.
+    pub graph_delta: HashMap<u16, String>,
+
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set once in the genesis commit; absent in subsequent commits.
     pub ns_split_mode: Option<crate::ns_encoding::NsSplitMode>,
@@ -461,6 +471,56 @@ pub async fn collect_dag_cids_with_split_mode<C: ContentStore + ?Sized>(
     stop_at_t: i64,
 ) -> Result<(Vec<(i64, ContentId)>, crate::ns_encoding::NsSplitMode)> {
     walk_dag(store, head_id, stop_at_t, true).await
+}
+
+/// Probe the commit DAG envelope-only to discover whether a named graph
+/// IRI was ever registered, and at what `t` it first appeared.
+///
+/// Walks the chain via [`load_commit_envelope_by_id`] (byte-range probe,
+/// ~128 KiB per envelope on range-capable backends), inspects each
+/// envelope's `graph_delta` for `graph_iri`, and returns the lowest `t`
+/// where it appears. Returns `Ok(None)` if the IRI never shows up — which
+/// means no flake belonging to that graph can exist anywhere in the chain
+/// (graph registrations are required before flakes can reference them).
+///
+/// Used by [`ApiFulltextConfigProvider`][^1] to short-circuit fulltext
+/// config resolution on first-ever reindex when the config graph was
+/// never written to. For a chain with no config graph at all, this
+/// avoids the per-commit full-blob read + zstd decompress + flake
+/// construction that `LedgerState::load` would otherwise perform.
+///
+/// Note: v3 commits do not carry `graph_delta` on the envelope (the
+/// field was added in v4). On a v3 chain this function will always
+/// return `None`; callers that need v3 compatibility should fall back
+/// to a full chain scan.
+///
+/// [^1]: `fluree-db-api/src/indexer_fulltext_provider.rs`
+pub async fn first_t_where_graph_registered<C: ContentStore + ?Sized>(
+    store: &C,
+    head_id: &ContentId,
+    graph_iri: &str,
+) -> Result<Option<i64>> {
+    let mut earliest: Option<i64> = None;
+    let mut frontier = vec![head_id.clone()];
+    let mut visited = std::collections::HashSet::new();
+
+    while let Some(cid) = frontier.pop() {
+        if !visited.insert(cid.clone()) {
+            continue;
+        }
+        let envelope = load_commit_envelope_by_id(store, &cid).await?;
+        if envelope.graph_delta.values().any(|iri| iri == graph_iri) {
+            earliest = Some(match earliest {
+                Some(e) => e.min(envelope.t),
+                None => envelope.t,
+            });
+        }
+        for parent_id in envelope.parent_ids() {
+            frontier.push(parent_id.clone());
+        }
+    }
+
+    Ok(earliest)
 }
 
 /// Shared DAG walk implementation backing [`collect_dag_cids`] and
@@ -867,6 +927,7 @@ mod tests {
             txn: None,
             namespace_delta: HashMap::from([(100, "ex:".to_string())]),
             txn_meta: Vec::new(),
+            graph_delta: HashMap::new(),
             ns_split_mode: None,
         };
 

@@ -302,6 +302,10 @@ pub fn read_commit_envelope_v3(bytes: &[u8]) -> Result<CommitEnvelope, CommitCod
         txn: env.txn,
         namespace_delta: env.namespace_delta,
         txn_meta,
+        // v3 commits did not encode graph_delta on the envelope; surface as
+        // empty so envelope-only callers don't have to special-case the
+        // version.
+        graph_delta: std::collections::HashMap::new(),
         ns_split_mode: env.ns_split_mode,
     })
 }

@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use fluree_db_core::{config_graph_iri, first_t_where_graph_registered};
 use fluree_db_indexer::{ConfiguredFulltextProperty, FulltextConfigProvider};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NameService;
@@ -42,6 +43,68 @@ impl std::fmt::Debug for ApiFulltextConfigProvider {
 
 impl ApiFulltextConfigProvider {
     async fn resolve(&self, ledger_id: &str) -> Result<Vec<ConfiguredFulltextProperty>, String> {
+        // 0. Envelope-only short-circuit.
+        //
+        // The config graph (`config_graph_iri(ledger_id)`) must be
+        // registered in some commit's `graph_delta` before any flake can
+        // belong to it. Probe the chain envelope-only (byte-range
+        // ~128 KiB per commit on range-capable backends) — if the IRI
+        // never appears, no `f:LedgerConfig` can exist and we can return
+        // immediately without paying for `LedgerState::load`'s full
+        // chain walk + novelty build.
+        //
+        // This is the common case on a fresh reindex of a ledger that
+        // never set up fulltext config, which is what was driving Lambda
+        // first-reindex past the 900s ceiling — `LedgerState::load`
+        // walked all 787 commits via `load_commit_by_id`
+        // (`read_commit_v4` per commit) just to discover an empty config
+        // graph.
+        //
+        // If the IRI was registered (or we can't determine, e.g. v3
+        // chain that doesn't carry envelope graph_delta), fall through
+        // to the full load path. That path is itself fast now after the
+        // novelty `bulk_apply_commits` switch in `load_novelty`.
+        let record = self
+            .nameservice
+            .lookup(ledger_id)
+            .await
+            .map_err(|e| format!("nameservice lookup: {e}"))?;
+        if let Some(record) = &record {
+            if let Some(head_id) = record.commit_head_id.as_ref() {
+                let cs = if record.source_branch.is_some() {
+                    let branched = fluree_db_nameservice::build_branched_store(
+                        &self.backend,
+                        self.nameservice.as_ref(),
+                        record,
+                    )
+                    .await
+                    .map_err(|e| format!("build_branched_store: {e}"))?;
+                    Arc::new(branched) as Arc<dyn fluree_db_core::ContentStore>
+                } else {
+                    self.backend.content_store(&record.ledger_id)
+                };
+                let cfg_iri = config_graph_iri(ledger_id);
+                let registered = first_t_where_graph_registered(cs.as_ref(), head_id, &cfg_iri)
+                    .await
+                    .map_err(|e| format!("envelope walk for config graph: {e}"))?;
+                if registered.is_none() {
+                    tracing::debug!(
+                        ledger_id,
+                        cfg_iri = %cfg_iri,
+                        "fulltext config provider: config graph never registered; \
+                         skipping LedgerState::load + resolve_ledger_config"
+                    );
+                    return Ok(Vec::new());
+                }
+                tracing::debug!(
+                    ledger_id,
+                    first_t = ?registered,
+                    "fulltext config provider: config graph registered; \
+                     proceeding with full state load + resolve"
+                );
+            }
+        }
+
         // 1. Load ledger state (snapshot + novelty).
         let mut state = LedgerState::load(self.nameservice.as_ref(), ledger_id, &self.backend)
             .await
