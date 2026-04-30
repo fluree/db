@@ -363,6 +363,202 @@ impl Novelty {
         Ok(())
     }
 
+    /// Bulk-apply many commits' flakes in a single pass.
+    ///
+    /// Designed for first-load / catch-up paths (e.g. `LedgerState::load_novelty`
+    /// walking a long commit chain) where calling [`apply_commit`] per commit
+    /// degrades to O(N²) cumulative cost: each call's
+    /// `merge_batch_into_index` is O(target.len() + batch.len()), so over
+    /// `M` commits with average batch `B` it accrues `O(M·N̄)` work, where
+    /// `N̄` is the running novelty size.
+    ///
+    /// This method instead:
+    /// 1. Routes every flake into a per-graph bucket in one ingest pass.
+    /// 2. Sorts each graph's flakes once (parallel) by an identity-then-t
+    ///    key (`s, p, o, dt, m, t, op`).
+    /// 3. Walks each `(s, p, o, dt, m)` group linearly to apply set
+    ///    semantics — assertion is dropped iff the prior kept flake for the
+    ///    same identity was also an assertion (mirroring
+    ///    [`apply_commit`]'s `fact_currently_asserted_in_graph` skip rule);
+    ///    retractions are always kept.
+    /// 4. Re-sorts the deduped set into the 4 index orders (SPOT, PSOT,
+    ///    POST, OPST) once each.
+    ///
+    /// Total cost is `O(N log N)` over the merged set instead of `O(N²)` —
+    /// for a 787-commit / ~7M-flake chain this drops the catch-up from
+    /// minutes to seconds on Lambda single-CPU.
+    ///
+    /// Existing graph contents (if any) are preserved by merging their
+    /// alive `FlakeId`s into the dedup pass alongside the incoming batches,
+    /// so the post-condition matches what a sequential per-commit
+    /// `apply_commit` chain would have produced — minus retraction-noise
+    /// duplicates that the per-commit path never emits anyway.
+    ///
+    /// `epoch` bumps once per call, regardless of how many commits were
+    /// merged. `t` advances to `max(self.t, max_commit_t)`.
+    pub fn bulk_apply_commits<I>(
+        &mut self,
+        commit_batches: I,
+        reverse_graph: &HashMap<Sid, GraphId>,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (Vec<Flake>, i64)>,
+    {
+        use rayon::prelude::*;
+
+        let span = tracing::debug_span!(
+            "novelty_bulk_apply_commits",
+            rayon_threads = rayon::current_num_threads()
+        );
+        let _guard = span.enter();
+
+        let started = std::time::Instant::now();
+
+        // ---- Phase 1: ingest into arena, partition by graph ----
+        let mut per_graph: HashMap<GraphId, Vec<FlakeId>> = HashMap::new();
+        let mut max_t = self.t;
+        let mut commit_count: u64 = 0;
+        let mut total_flakes: usize = 0;
+
+        for (flakes, commit_t) in commit_batches {
+            if flakes.is_empty() {
+                commit_count += 1;
+                max_t = max_t.max(commit_t);
+                continue;
+            }
+            let new_count = self.store.len() + flakes.len();
+            if new_count > MAX_FLAKE_ID as usize {
+                return Err(NoveltyError::overflow(
+                    "FlakeId overflow during bulk apply: too many flakes in novelty, trigger reindex",
+                ));
+            }
+            commit_count += 1;
+            total_flakes += flakes.len();
+            max_t = max_t.max(commit_t);
+
+            for flake in flakes {
+                let g_id = Self::resolve_flake_g_id(&flake, reverse_graph)?;
+                let size = flake.size_bytes();
+                self.size += size;
+                let id = self.store.push_with_size(flake, size);
+                per_graph.entry(g_id).or_default().push(id);
+            }
+        }
+
+        if per_graph.is_empty() {
+            self.t = max_t;
+            self.epoch += 1;
+            return Ok(());
+        }
+
+        // Ensure graph slots so we can take existing index vectors.
+        for &g_id in per_graph.keys() {
+            self.ensure_graph(g_id);
+        }
+
+        // ---- Phase 2: per-graph dedup + 4-index sort ----
+        let store = &self.store;
+        let mut total_dedup: u64 = 0;
+
+        for (g_id, mut new_ids) in per_graph {
+            // Pull in the graph's existing alive FlakeIds (any prior
+            // novelty content) so the dedup pass sees the full universe.
+            // SPOT/PSOT/POST/OPST have identical alive sets (apply_commit
+            // pushes the same batch_ids to all four), so taking SPOT is
+            // the canonical choice.
+            let graph_vecs = self.graphs[g_id as usize]
+                .as_mut()
+                .expect("ensure_graph above");
+            let existing_spot = std::mem::take(&mut graph_vecs.spot);
+            // Other indexes get rebuilt below; clear them so we don't
+            // double-count if the dedup walk drops some.
+            graph_vecs.psot.clear();
+            graph_vecs.post.clear();
+            graph_vecs.opst.clear();
+
+            let mut combined = existing_spot;
+            combined.append(&mut new_ids);
+
+            // Sort by (s, p, o, dt, m, t, op) so each (s, p, o, dt, m)
+            // identity forms a contiguous t-ascending run.
+            combined.par_sort_unstable_by(|&a, &b| {
+                let fa = store.get(a);
+                let fb = store.get(b);
+                fa.s.cmp(&fb.s)
+                    .then_with(|| fa.p.cmp(&fb.p))
+                    .then_with(|| cmp_object(fa, fb))
+                    .then_with(|| cmp_meta(fa, fb))
+                    .then_with(|| fa.t.cmp(&fb.t))
+                    .then_with(|| fa.op.cmp(&fb.op))
+            });
+
+            // Linear set-semantics dedup: for each (s, p, o, dt, m)
+            // identity group, walk in ascending t and drop any assertion
+            // whose prior kept flake for the same identity was also an
+            // assertion. Retractions are always kept.
+            let mut kept: Vec<FlakeId> = Vec::with_capacity(combined.len());
+            let mut group_start = 0usize;
+            while group_start < combined.len() {
+                let head = store.get(combined[group_start]);
+                let mut group_end = group_start + 1;
+                while group_end < combined.len() {
+                    let f = store.get(combined[group_end]);
+                    if !same_identity(head, f) {
+                        break;
+                    }
+                    group_end += 1;
+                }
+                let mut currently_asserted = false;
+                for &id in &combined[group_start..group_end] {
+                    let f = store.get(id);
+                    if !f.op {
+                        kept.push(id);
+                        currently_asserted = false;
+                    } else if !currently_asserted {
+                        kept.push(id);
+                        currently_asserted = true;
+                    } else {
+                        total_dedup += 1;
+                    }
+                }
+                group_start = group_end;
+            }
+
+            // Build the 4 sorted index vectors from the deduped set. Each
+            // sort is independently O(N log N); kept.clone() copies only
+            // the small `FlakeId` (u32) array, not the underlying flakes.
+            let mut spot = kept.clone();
+            spot.par_sort_unstable_by(|&a, &b| IndexType::Spot.compare(store.get(a), store.get(b)));
+            let mut psot = kept.clone();
+            psot.par_sort_unstable_by(|&a, &b| IndexType::Psot.compare(store.get(a), store.get(b)));
+            let mut post = kept.clone();
+            post.par_sort_unstable_by(|&a, &b| IndexType::Post.compare(store.get(a), store.get(b)));
+            let mut opst = kept;
+            opst.par_sort_unstable_by(|&a, &b| IndexType::Opst.compare(store.get(a), store.get(b)));
+
+            let graph_vecs = self.graphs[g_id as usize]
+                .as_mut()
+                .expect("ensure_graph above");
+            graph_vecs.spot = spot;
+            graph_vecs.psot = psot;
+            graph_vecs.post = post;
+            graph_vecs.opst = opst;
+        }
+
+        self.t = max_t;
+        self.epoch += 1;
+
+        tracing::debug!(
+            commits = commit_count,
+            total_flakes,
+            deduped = total_dedup,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "novelty bulk apply complete"
+        );
+
+        Ok(())
+    }
+
     /// Clear flakes with t <= cutoff_t (after index merge)
     ///
     /// Uses bitmap instead of HashSet for cache-friendly O(n) clear.
@@ -567,6 +763,38 @@ impl OverlayProvider for Novelty {
 // =============================================================================
 // Parallel merge helpers (read-only store + disjoint mutable index vectors)
 // =============================================================================
+
+/// Compare two flakes by their object value (datatype-aware).
+///
+/// Mirrors the hidden `cmp_object` in `fluree_db_core::comparator` so the
+/// bulk-apply identity sort can group flakes by `(s, p, o, dt, m)` without
+/// reaching into core's private comparators.
+fn cmp_object(f1: &Flake, f2: &Flake) -> Ordering {
+    f1.o.cmp(&f2.o).then_with(|| f1.dt.cmp(&f2.dt))
+}
+
+/// Compare two flakes by their metadata (None < Some, then m1 < m2).
+///
+/// Mirrors `fluree_db_core::comparator::cmp_meta` for the same reason as
+/// [`cmp_object`].
+fn cmp_meta(f1: &Flake, f2: &Flake) -> Ordering {
+    match (&f1.m, &f2.m) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(m1), Some(m2)) => m1.cmp(m2),
+    }
+}
+
+/// True iff `a` and `b` have identical `(s, p, o, dt, m)` — the fact
+/// identity used by [`Novelty::apply_commit`]'s `fact_currently_asserted_in_graph`
+/// dedup rule and the [`Novelty::bulk_apply_commits`] dedup walk.
+fn same_identity(a: &Flake, b: &Flake) -> bool {
+    a.s == b.s
+        && a.p == b.p
+        && cmp_object(a, b) == Ordering::Equal
+        && cmp_meta(a, b) == Ordering::Equal
+}
 
 /// LSM-style merge: sort batch by index comparator, then merge with existing target.
 fn merge_batch_into_index(
