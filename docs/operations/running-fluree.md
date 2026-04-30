@@ -1,6 +1,6 @@
 # Running & Interfacing with Fluree DB
 
-This guide covers every way to run and interact with Fluree DB-R — from a local CLI to a distributed HTTP service to embedding it directly in a Rust application.
+This guide covers every way to run and interact with Fluree DB — from a local CLI to a distributed HTTP service to embedding it directly in a Rust application.
 
 ---
 
@@ -370,17 +370,6 @@ let fluree = FlureeBuilder::memory().build_memory();
 fluree.create_ledger("test").await?;
 // ... use normally, no network calls
 ```
-
----
-
-## 5. Helper Scripts
-
-Located in the `scripts/` directory:
-
-| Script | Purpose |
-|--------|---------|
-| `fluree_to_turtle.py` | Convert Fluree data to Turtle format |
-| `split_ttl.py` | Split large Turtle files for chunked import |
 
 ---
 

@@ -37,12 +37,11 @@ members = [
     "fluree-search-httpd",
     "fluree-db-cli",
     "fluree-db-memory",
-    "bench-filter-query",
 ]
 exclude = ["testsuite-sparql"]
 
 [workspace.package]
-version = "4.0.1"
+version = "4.0.2"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/fluree/db"
