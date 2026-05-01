@@ -621,6 +621,22 @@ impl<'a, 'b> Default for ContextConfig<'a, 'b> {
     }
 }
 
+impl<'a, 'b> ContextConfig<'a, 'b> {
+    /// Attach a policy enforcer built from a `&PolicyContext`.
+    ///
+    /// Wraps the `Arc::new(QueryPolicyEnforcer::new(Arc::new(policy.clone())))`
+    /// boilerplate so callers handing in a raw `&PolicyContext` don't have to
+    /// reconstruct it. Callers that already hold a cached
+    /// `Arc<QueryPolicyEnforcer>` (e.g., the view layer via
+    /// `db.policy_enforcer().cloned()`) should set `policy_enforcer` directly.
+    pub fn with_policy(mut self, policy: &fluree_db_policy::PolicyContext) -> Self {
+        self.policy_enforcer = Some(Arc::new(crate::policy::QueryPolicyEnforcer::new(
+            Arc::new(policy.clone()),
+        )));
+        self
+    }
+}
+
 /// Parameters for query execution with dataset, policy, and search providers.
 ///
 /// Bundles the common parameters needed for full-featured query execution
